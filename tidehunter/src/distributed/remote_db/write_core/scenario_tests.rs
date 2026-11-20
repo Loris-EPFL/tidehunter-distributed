@@ -4,12 +4,15 @@
 //! only deadline-driven case is the caller timeout, whose resolution is held
 //! by a hook until the caller has returned.
 
+mod crash_cut;
+
 use super::core::WriteCore;
 use super::sequencer::Resolution;
+use super::write::Retried;
 use crate::distributed::codec::Mutation;
+use crate::distributed::remote_db::RemoteDatabase;
 use crate::distributed::remote_db::concurrent::AdmissionCharges;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
-use crate::distributed::remote_db::{IndexReadCut, RemoteDatabase};
 use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::{BatchId, BatchVersion};
 use crate::key_shape::{KeyShape, KeySpace, KeyType};
@@ -117,12 +120,12 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
         hooks.fail_prepared_operation = Some(aborted);
         hooks.before_preparation = Some(hook);
     }
-    // Sequence 0 is allocated (identity Active, keys 1 and 2 registered),
+    // Sequence 0 is allocated (one in-flight owner, keys 1 and 2 registered),
     // then held before encoding; its injected encoding failure aborts it.
     let first = spawn_write(&core, aborted, vec![put(1, 1), put(2, 1)]);
     encoding.recv_timeout(WAIT).unwrap();
     assert_eq!(core.sequencer.resolution(0), Some(Resolution::Allocated));
-    assert_eq!(core.active_identities(), 1);
+    assert_eq!(core.in_flight.len(), 1);
     assert_eq!(core.pending_dependencies(), 2);
     // Sequence 1 shares key 1: durable, but parked behind its predecessor.
     let second = spawn_write(&core, fixture.operation(1, 2), vec![put(1, 2)]);
@@ -141,7 +144,6 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
     assert_eq!(independent, version(&core, 2));
     assert!(core.is_published(independent));
     assert_eq!(core.published_next(), 0);
-    assert!(matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
     assert_eq!(value(&mut db, 9), Some(vec![9; 32]));
     assert_eq!(value(&mut db, 1), None);
     // The allocated head has neither resolved nor released: no slot returns.
@@ -165,24 +167,17 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
     assert_eq!(core.sequencer.resolution(1), Some(Resolution::Published));
     assert_eq!(core.published_next(), 3);
     assert_eq!(core.sequencer.reuse_next(), 3);
-    assert!(!matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
     assert!(core.publisher.lock().dependents.is_empty());
-    assert!(
-        core.identities
-            .with_operation(aborted, |entries| entries.get(&aborted).copied())
-            .is_none()
-    );
-    assert_eq!(core.active_identities(), 0);
+    // The aborted generation left no in-flight owner and no receipt.
+    assert!(core.in_flight.lookup(aborted).is_none());
+    assert_eq!(core.in_flight.len(), 0);
+    assert!(core.lookup_receipt(aborted).unwrap().is_none());
     assert_eq!(core.pending_dependencies(), 0);
-    let charges = core.admission.charges();
-    // Two published identities and tail batches remain until checkpoint;
-    // the abort returned its own identity and tail charge.
-    assert_eq!((charges.identities, charges.replay_batches), (2, 2));
     assert_eq!(value(&mut db, 1), Some(vec![2; 32]));
     assert_eq!(value(&mut db, 2), None);
     db.flush_index().unwrap();
     assert_eq!(core.admission.charges(), AdmissionCharges::default());
-    // The aborted identity left no effect: its retry is a fresh allocation.
+    // The aborted id left no effect: its retry is a fresh allocation.
     assert_eq!(
         core.write(aborted, vec![put(1, 1), put(2, 1)], None)
             .unwrap(),
@@ -394,12 +389,12 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
         "{error}"
     );
     // A caller timeout is not fail-stop. It released its caller credit, but
-    // the unresolved generation keeps its slot and identity.
+    // the unresolved generation keeps its slot and its in-flight ownership.
     core.ensure_healthy().unwrap();
     assert_eq!(core.sequencer.resolution(0), Some(Resolution::Ready));
     let charges = core.admission.charges();
     assert_eq!((charges.requests, charges.bytes, charges.slots), (0, 0, 1));
-    assert_eq!(core.active_identities(), 1);
+    assert_eq!(core.in_flight.len(), 1);
     for seed in 1..CAPACITY {
         assert_eq!(
             core.write(
@@ -450,98 +445,20 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
 }
 
 #[test]
-fn abort_and_checkpoint_return_one_identity_credit_and_retry_gets_new_version() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let core = Arc::clone(&db.core);
-    assert_eq!(
-        core.write(fixture.operation(1, 1), vec![put(5, 5)], None)
-            .unwrap(),
-        version(&core, 0)
-    );
-    core.wait_settled().unwrap();
-    assert_eq!(core.admission.charges().identities, 1);
-    // A checkpoint freezes cut = sequence 0, then pauses before persistence.
-    let (hook, checkpointing, resume_checkpoint) = gate();
-    core.test_hooks.lock().checkpoint_pause = Some(hook);
-    core.start_checkpoint().unwrap();
-    checkpointing.recv_timeout(WAIT).unwrap();
-
-    let operation = fixture.operation(0, 2);
-    let (hook, encoding, resume_encoding) = gate();
-    {
-        let mut hooks = core.test_hooks.lock();
-        hooks.fail_prepared_operation = Some(operation);
-        hooks.before_preparation = Some(hook);
-    }
-    let first = spawn_write(&core, operation, vec![put(6, 6)]);
-    encoding.recv_timeout(WAIT).unwrap();
-    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Allocated));
-    assert_eq!(core.admission.charges().identities, 2);
-    // The retry finds the active identity: request credit only, then waits.
-    let retry = spawn_write(&core, operation, vec![put(6, 6)]);
-    wait_for("retry admitted against the active identity", || {
-        core.admission.charges().requests == 2
-    });
-    let charges = core.admission.charges();
-    assert_eq!((charges.slots, charges.identities), (1, 2));
-
-    resume_encoding.send(()).unwrap();
-    let error = first.recv_timeout(WAIT).unwrap().unwrap_err();
-    assert!(
-        error.message().contains("injected caller encoding failure"),
-        "{error}"
-    );
-    // The abort removed its identity before exposing ABORTED, so the waiting
-    // retry became a fresh, effect-free first write with a new version.
-    let retried = retry.recv_timeout(WAIT).unwrap().unwrap();
-    assert_eq!(retried, version(&core, 2));
-    core.wait_settled().unwrap();
-    assert_eq!(core.sequencer.resolution(1), Some(Resolution::Aborted));
-    assert_eq!(core.published_next(), 3);
-    // Baseline plus retry; the aborted identity's credit was returned once.
-    assert_eq!(core.admission.charges().identities, 2);
-
-    resume_checkpoint.send(()).unwrap();
-    core.progress_checkpoint(true).unwrap();
-    // The paused checkpoint retires only identities at or below its cut.
-    assert_eq!(core.admission.charges().identities, 1);
-    db.flush_index().unwrap();
-    // A second return of the aborted credit would fail the core here.
-    core.ensure_healthy().unwrap();
-    let charges = core.admission.charges();
-    assert_eq!(
-        (
-            charges.identities,
-            charges.replay_batches,
-            charges.replay_bytes
-        ),
-        (0, 0, 0)
-    );
-    assert_eq!(
-        core.write(operation, vec![put(6, 6)], None).unwrap(),
-        retried
-    );
-    assert_eq!(core.next_sequence(), 3);
-    assert_eq!(value(&mut db, 6), Some(vec![6; 32]));
-    drop(core);
-    db.shutdown().unwrap();
-}
-
-#[test]
 fn concurrent_first_writes_of_one_id_allocate_once() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let core = Arc::clone(&db.core);
     let operation = fixture.operation(0, 1);
     let batch = vec![put(1, 1), put(2, 1)];
-    // The late writer missed the identity and holds a first-write grant.
+    // The late writer missed both owners and holds a first-write grant.
     let (hook, granted, resume_granted) = gate();
     core.test_hooks.lock().after_grant = Some(hook);
     let late = spawn_write(&core, operation, batch.clone());
     granted.recv_timeout(WAIT).unwrap();
     let charges = core.admission.charges();
-    assert_eq!((charges.slots, charges.identities), (1, 1));
+    assert_eq!(charges.slots, 1);
+    assert_eq!(core.in_flight.len(), 0);
     // The winner allocates sequence 0 and is held before publication.
     let (hook, publishing, resume_publish) = gate();
     core.test_hooks.lock().before_publish = Some(hook);
@@ -556,10 +473,11 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     );
 
     resume_granted.send(()).unwrap();
-    // The late writer replans as a retry and returns its slot and identity.
+    // The late writer replans as a retry: it returns its slot, keeps only its
+    // request credit, and observes the winner's in-flight generation.
     wait_for("late first writer replanned as a retry", || {
         let charges = core.admission.charges();
-        charges.requests == 2 && charges.slots == 1 && charges.identities == 1
+        charges.requests == 2 && charges.slots == 1 && core.in_flight.len() == 1
     });
     assert_eq!(core.next_sequence(), 1);
     resume_publish.send(()).unwrap();
@@ -567,8 +485,13 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     assert_eq!(late.recv_timeout(WAIT).unwrap().unwrap(), original);
     core.wait_settled().unwrap();
     assert_eq!(core.next_sequence(), 1);
-    assert_eq!(core.admission.charges().identities, 1);
-    assert_eq!(core.active_identities(), 0);
+    // One published generation: its in-flight entry is retired and the retry
+    // window answers the id from now on.
+    assert_eq!(core.in_flight.len(), 0);
+    assert_eq!(
+        core.lookup_receipt(operation).unwrap().unwrap().version,
+        original
+    );
     assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
     assert_eq!(value(&mut db, 2), Some(vec![1; 32]));
     drop(core);
@@ -576,15 +499,16 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     db.shutdown().unwrap();
 }
 
-/// PR #63 P1: caller A misses the identity table and the retry window and is
-/// held after its first-write grant. Caller B then allocates the same
-/// operation, publishes, and a checkpoint relabels B's identity `Recent`; it
-/// stays only while the WAL replay retry window holds the same version and
-/// digest. A's stale miss must not allocate a second version: it revalidates
-/// against the retry window, takes the retry path and returns B's outcome, or
-/// the conflict error when its batch differs.
+/// PR #63 P1, re-expressed for retry-window plus in-flight ownership: caller A
+/// misses both owners and is held after its first-write grant. Caller B then
+/// allocates the same operation and publishes it, and a snapshot stores the
+/// window. A's stale miss must not allocate a second version: the
+/// authoritative probe inside A's allocation section sees B's receipt,
+/// replans as a retry, and returns B's outcome — or the conflict error when its
+/// batch differs. Without that probe A allocates sequence 1 and overwrites a
+/// newer value with an older payload.
 #[test]
-fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
+fn stale_miss_revalidates_against_the_retry_window() {
     for same_batch in [true, false] {
         let fixture = Fixture::new();
         let mut db = fixture.open();
@@ -603,12 +527,12 @@ fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
         let winner = core.write(operation, original, None).unwrap();
         assert_eq!(winner, version(&core, 0));
         core.flush_index().unwrap();
+        // The winner is published: no in-flight owner remains and the retry
+        // window is the only owner of its id, before and after the snapshot.
+        assert_eq!(core.in_flight.len(), 0);
         assert_eq!(
-            core.identities.with_operation(operation, |entries| entries
-                .get(&operation)
-                .map(|entry| (entry.class, entry.version))),
-            Some((super::identity::IdentityClass::Recent, winner)),
-            "checkpoint relabels the winner's identity Recent while the retry window holds it"
+            core.lookup_receipt(operation).unwrap().unwrap().version,
+            winner
         );
         assert_eq!(core.next_sequence(), 1);
 
@@ -624,6 +548,7 @@ fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
             );
             assert_eq!(error.uncertain_version, None);
         }
+        // A stale miss never allocates: the winner's version stays unique.
         assert_eq!(core.next_sequence(), 1);
         core.ensure_healthy().unwrap();
         core.wait_settled().unwrap();
@@ -633,6 +558,117 @@ fn negative_identity_lookup_revalidates_after_checkpoint_retirement() {
         drop(core);
         db.shutdown().unwrap();
     }
+}
+
+/// A retry for a version of another epoch is already authoritative: the epoch
+/// that produced it is closed, so its outcome is not re-derived here.
+#[test]
+fn a_retry_for_another_epoch_is_answered_as_published() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let other = BatchVersion {
+        epoch: core.epoch + 1,
+        sequence: 3,
+    };
+    assert_eq!(
+        core.wait_retry([7; 16], other, Instant::now() + WAIT)
+            .unwrap(),
+        Retried::Published(other)
+    );
+    drop(core);
+    db.shutdown().unwrap();
+}
+
+/// The two answers a reused slot can give, asserted where the code lives:
+/// a published id is answered from the retry window without a second write, and
+/// an id the window no longer holds **re-applies** — the only answer in this
+/// design that makes the engine write another batch for one operation id, so a
+/// future window-size change cannot silently turn it into `Published`.
+#[test]
+fn a_reused_slot_answers_from_the_window_or_reapplies() {
+    let fixture = Fixture::new_with_config(128, shape(), 2, |config| {
+        config.max_pending_batches = 2;
+    });
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let published = fixture.operation(0, 1);
+    assert_eq!(
+        core.write(published, vec![put(1, 1)], None).unwrap(),
+        version(&core, 0)
+    );
+    assert_eq!(
+        core.write(fixture.operation(1, 2), vec![put(2, 1)], None)
+            .unwrap(),
+        version(&core, 1)
+    );
+    // Both slots released and resolved, so sequence 2 reuses slot 0.
+    core.wait_settled().unwrap();
+    assert_eq!(
+        core.write(fixture.operation(0, 3), vec![put(3, 1)], None)
+            .unwrap(),
+        version(&core, 2)
+    );
+    assert_eq!(core.sequencer.generation(0), Some(2));
+    let deadline = Instant::now() + WAIT;
+    assert_eq!(
+        core.wait_retry(published, version(&core, 0), deadline)
+            .unwrap(),
+        Retried::Published(version(&core, 0))
+    );
+    assert_eq!(
+        core.wait_retry([9; 16], version(&core, 0), deadline)
+            .unwrap(),
+        Retried::Reapply
+    );
+    assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
+    drop(core);
+    db.shutdown().unwrap();
+}
+
+/// A retry already waiting when its original aborts must become a fresh write,
+/// never inherit the abort. The deleted identity test covered this through the
+/// class table; class-free ownership keeps the property through the abort's
+/// in-flight retirement plus `validate_retry`'s replan, and this is its cover.
+#[test]
+fn a_retry_waiting_on_an_aborted_original_reapplies_as_a_fresh_write() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let operation = fixture.operation(1, 1);
+    let (hook, encoding, resume) = gate();
+    {
+        let mut hooks = core.test_hooks.lock();
+        hooks.fail_prepared_operation = Some(operation);
+        hooks.before_preparation = Some(hook);
+    }
+    let first = spawn_write(&core, operation, vec![put(4, 1)]);
+    encoding.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.sequencer.resolution(0), Some(Resolution::Allocated));
+    // The retry observes the in-flight owner and waits on that generation.
+    let retry = spawn_write(&core, operation, vec![put(4, 1)]);
+    wait_for("retry admitted against the in-flight generation", || {
+        core.admission.charges().requests == 2
+    });
+    resume.send(()).unwrap();
+    let error = first.recv_timeout(WAIT).unwrap().unwrap_err();
+    assert!(
+        error.message().contains("injected caller encoding failure"),
+        "{error}"
+    );
+    // The abort had no effect, so the retry is a fresh write with a new version.
+    let reapplied = retry.recv_timeout(WAIT).unwrap().unwrap();
+    assert_eq!(reapplied, version(&core, 1));
+    assert_eq!(value(&mut db, 4), Some(vec![1; 32]));
+    // From now on the id is answered by the retry window, not by a new version.
+    assert_eq!(
+        core.write(operation, vec![put(4, 1)], None).unwrap(),
+        reapplied
+    );
+    assert_eq!(core.in_flight.len(), 0);
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
 }
 
 #[test]
@@ -687,11 +723,15 @@ fn sequence_zero_flush_checkpoint_and_publication_wait() {
     assert_eq!(core.published_next(), 1);
     core.wait_settled().unwrap();
     {
-        // The index flush snapshotted next = 1, so its checkpoint covers 0.
+        // The snapshot that the flush took must record the published batch: the
+        // retry window is what recovery restores, and there is no Exact tail.
         let mut publisher = core.publisher.lock();
         let state = publisher.checkpoint_state();
-        assert_eq!(*state.checkpoint_tail_batches, 0);
-        assert!(state.known.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent.iter().next().map(|receipt| receipt.version),
+            Some(original)
+        );
     }
     assert_eq!(core.admission.charges(), AdmissionCharges::default());
     core.flush_index().unwrap();
@@ -722,10 +762,10 @@ fn caller_granted_before_shutdown_gets_closed_error_and_returns_its_grant() {
     let paused = spawn_write(&core, operation, vec![put(2, 2)]);
     granted.recv_timeout(WAIT).unwrap();
     let held = core.admission.charges();
-    assert_eq!(
-        (held.requests, held.slots, held.identities),
-        (1, 1, before.identities + 1)
-    );
+    assert_eq!((held.requests, held.slots), (1, 1));
+    // Byte credit is held for the paused batch, and no generation exists yet.
+    assert!(held.bytes > before.bytes);
+    assert_eq!(core.in_flight.len(), 0);
     // Shutdown closes allocations, drains and pauses in its final checkpoint.
     let (hook, checkpointing, resume_checkpoint) = gate();
     core.test_hooks.lock().checkpoint_pause = Some(hook);
@@ -802,7 +842,6 @@ fn uncertain_append_fail_stops_with_unknown_everywhere() {
     );
     assert!(core.write(held_operation, vec![put(2, 2)], None).is_err());
     assert!(db.get(KeySpace(0), &1u32.to_be_bytes()).is_err());
-    assert!(db.published_cut().is_err());
     assert!(core.drain().is_err());
     assert!(core.flush_durable().is_err());
     assert!(core.flush_index().is_err());
@@ -977,14 +1016,18 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
 
         let mut reopened = fixture.open();
         // The acknowledged batch and both owner-0 groups, each exactly once:
-        // a duplicate identity or version would fail recovery.
+        // a duplicate version or a lost receipt would fail recovery.
         assert_eq!(reopened.recovery_stats().tail_batches, 5);
         for ((operation, value, _), receipt) in callers.iter().zip(&receipts) {
-            let recovered = reopened.core.lookup_identity(*operation).unwrap().unwrap();
+            let recovered = reopened
+                .core
+                .lookup_receipt(*operation)
+                .unwrap()
+                .unwrap_or_else(|| panic!("recovered window lost {operation:?}"));
             assert_eq!(recovered.version, original(u64::from(*value)));
             if let Some(receipt) = receipt {
                 // The recovered batch is the one whose receipt was accepted.
-                assert_eq!(recovered.digest, Some(receipt.appended().digest()));
+                assert_eq!(recovered.digest, receipt.appended().digest());
             }
         }
         assert_eq!(
@@ -1024,9 +1067,9 @@ fn identical_retry_during_flight_and_after_publication_returns_original() {
     wait_for("retry admitted during flight", || {
         core.admission.charges().requests == 2
     });
-    // The retry charged no slot or identity and allocated nothing.
+    // The retry charged no slot and allocated nothing.
     let charges = core.admission.charges();
-    assert_eq!((charges.slots, charges.identities), (1, 1));
+    assert_eq!(charges.slots, 1);
     assert_eq!(core.next_sequence(), 1);
     resume.send(()).unwrap();
     assert_eq!(first.recv_timeout(WAIT).unwrap().unwrap(), original);
@@ -1055,13 +1098,15 @@ fn identical_retry_during_flight_and_after_publication_returns_original() {
         error.message().contains("retry changed original batch"),
         "{error}"
     );
-    // After checkpoint retirement the retry is answered from the retained
-    // receipt window, still without allocation or identity charge.
-    // Publication returns index/partition charges after waking its caller.
+    // After publication the retry is answered from the retained receipt
+    // window, still without allocation.
     core.wait_settled().unwrap();
     db.flush_index().unwrap();
-    assert_eq!(core.active_identities(), 0);
-    assert!(core.recent_identity(operation));
+    assert_eq!(core.in_flight.len(), 0);
+    assert_eq!(
+        core.lookup_receipt(operation).unwrap().unwrap().version,
+        original
+    );
     assert_eq!(core.write(operation, batch, None).unwrap(), original);
     assert_eq!(core.next_sequence(), 2);
     assert_eq!(core.admission.charges(), AdmissionCharges::default());

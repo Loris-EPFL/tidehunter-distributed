@@ -111,8 +111,6 @@ pub struct WorkloadGenerator {
     distribution: KeyDistribution,
     put_key_policy: PutKeyPolicy,
     next_put_index: Arc<AtomicU64>,
-    /// A1 index-fixture build: `new` IDs are exactly `0..key_count`.
-    build_ids: bool,
 }
 
 impl WorkloadGenerator {
@@ -134,16 +132,7 @@ impl WorkloadGenerator {
             distribution,
             put_key_policy,
             next_put_index,
-            build_ids: false,
         }
-    }
-
-    /// A1 index-fixture build: `new` puts take IDs `0..key_count` once each;
-    /// a put past the dataset is an error, never a wrap.
-    #[must_use]
-    pub fn with_build_ids(mut self) -> Self {
-        self.build_ids = true;
-        self
     }
 
     /// Reads stay in the prepared range. Each put uses a new logical id above that range.
@@ -255,14 +244,11 @@ impl WorkloadGenerator {
         // Relaxed reserves unique ids only; it does not publish any other shared state.
         // With K>1 clients, ID assignment follows thread interleaving; uniqueness
         // and coverage remain exact. K=1 retains its fully deterministic sequence.
-        let base = if self.build_ids { 0 } else { self.key_count };
+        let base = self.key_count;
         let index = self
             .next_put_index
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |index| {
                 base.checked_add(index)?;
-                if self.build_ids && index >= self.key_count {
-                    return None;
-                }
                 index.checked_add(1)
             })
             .map_err(|_| std::io::Error::other("new put key range overflow"))?;

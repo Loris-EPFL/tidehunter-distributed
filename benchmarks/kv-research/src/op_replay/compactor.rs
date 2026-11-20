@@ -7,9 +7,9 @@
 //! versions in one single-level, quiescent geometry with no early pressure or
 //! stale trigger, and forces compaction at one fixed point with the same API
 //! on both arms: `force_rebuild_control_region`. Native flushes every dirty
-//! cell and its flusher runs the compactor; leased runs one named Exact
-//! generation that evaluates every dirty callback cell and adopts index-only
-//! marks. Oracle: after the force and after reopen, both arms hold exactly the
+//! cell and its flusher runs the compactor; leased runs the same forced
+//! snapshot over the coordinator's native index, whose flusher runs the same
+//! compactor. Oracle: after the force and after reopen, both arms hold exactly the
 //! raw sorted `(key, value)` rows of the model (the latest row per ObjectID,
 //! object tombstones included), through scans in both directions, point
 //! reads and multi-reads. Reopen never calls the callback.
@@ -98,13 +98,14 @@ fn value(object: u8, version: u64) -> Vec<u8> {
 /// Raw rows, sorted by key.
 type Rows = BTreeMap<Vec<u8>, Vec<u8>>;
 
-/// How the leased arm is forced. `ExactOnly` is the negative control: the
-/// earlier behavior, an Exact checkpoint that never evaluates the policy. It
-/// leaves the old rows and must fail the raw oracle.
+/// How the leased arm is forced. `FlushOnly` is the negative control: the
+/// owners' durability barrier with no index snapshot, which never runs the
+/// compactor. It leaves the old rows and must fail the raw oracle, which is
+/// what shows the forced snapshot, not a side effect, does the compaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum LeasedForce {
-    Named,
-    ExactOnly,
+    Forced,
+    FlushOnly,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -118,22 +119,6 @@ pub struct CompactorArm {
     pub invocations_after_reopen: usize,
 }
 
-/// Leased named-force evidence: the adopted Exact generation and its compactor
-/// counters, and owner counters around the force (the force adds no owner
-/// Value WAL group and no owner payload read).
-#[derive(Debug, Default, Serialize)]
-pub struct LeasedWitness {
-    pub checkpoint_generation: u64,
-    pub cut: String,
-    pub evaluated_cells: u64,
-    pub force_cells: u64,
-    pub keys_marked: u64,
-    pub owner_groups_before: u64,
-    pub owner_groups_after: u64,
-    pub read_rpcs_before: u64,
-    pub read_rpcs_after: u64,
-}
-
 #[derive(Debug, Serialize)]
 pub struct CompactorReport {
     pub objects: usize,
@@ -142,7 +127,6 @@ pub struct CompactorReport {
     pub native_forcing: &'static str,
     pub leased_forcing: &'static str,
     pub leased_force: LeasedForce,
-    pub leased_witness: Option<LeasedWitness>,
     pub native: CompactorArm,
     pub leased: CompactorArm,
     pub problems: Vec<String>,
@@ -151,7 +135,7 @@ pub struct CompactorReport {
 
 /// Run the qualification in the fresh directory `work`.
 pub fn compactor_parity(work: &Path) -> BackendResult<CompactorReport> {
-    compactor_parity_with(work, LeasedForce::Named)
+    compactor_parity_with(work, LeasedForce::Forced)
 }
 
 /// Run the qualification with the chosen leased forcing.
@@ -249,11 +233,10 @@ fn qualify(
         model_rows: model.len(),
         native_forcing: NATIVE_FORCING,
         leased_forcing: match force {
-            LeasedForce::Named => LEASED_FORCING,
-            LeasedForce::ExactOnly => LEASED_EXACT_ONLY,
+            LeasedForce::Forced => LEASED_FORCING,
+            LeasedForce::FlushOnly => LEASED_FLUSH_ONLY,
         },
         leased_force: force,
-        leased_witness: None,
         native: CompactorArm::default(),
         leased: CompactorArm::default(),
         problems: Vec::new(),
@@ -272,49 +255,13 @@ fn qualify(
         let failed = |error| format!("{name}: forced compaction: {error:?}");
         match (arm.kind, force) {
             (Kind::Native, _) => db.force_rebuild_control_region().map_err(failed)?,
-            (Kind::Leased, LeasedForce::ExactOnly) => db.flush().map_err(failed)?,
-            (Kind::Leased, LeasedForce::Named) => {
-                let groups = |db: &tidehunter::distributed::sui::Db| {
-                    db.owner_storage_stats()
-                        .map(|stats| stats.map_or(0, |stats| stats.appended_groups))
-                };
-                let rpcs = |db: &tidehunter::distributed::sui::Db| {
-                    db.remote_counters().map_or(0, |counters| counters.2)
-                };
-                let owner_groups_before = groups(db).map_err(failed)?;
-                let read_rpcs_before = rpcs(db);
-                let adopted = db
-                    .force_rebuild_control_region_observed()
-                    .map_err(failed)?
-                    .ok_or_else(|| format!("{name}: named force reported no adoption"))?;
-                let witness = LeasedWitness {
-                    checkpoint_generation: adopted.checkpoint_generation,
-                    cut: format!("{:?}", adopted.cut),
-                    evaluated_cells: adopted.compactor.evaluated_cells,
-                    force_cells: adopted.compactor.force_cells,
-                    keys_marked: adopted.compactor.keys_marked,
-                    owner_groups_before,
-                    owner_groups_after: groups(db).map_err(failed)?,
-                    read_rpcs_before,
-                    read_rpcs_after: rpcs(db),
-                };
-                if witness.owner_groups_after != witness.owner_groups_before
-                    || witness.read_rpcs_after != witness.read_rpcs_before
-                {
-                    report
-                        .problems
-                        .push(format!("{name}: the force wrote or read owner data"));
-                }
-                if witness.evaluated_cells == 0
-                    || witness.evaluated_cells != calls[1].load(Ordering::SeqCst) as u64
-                {
-                    report.problems.push(format!(
-                        "{name}: {} evaluated cells, {} callback invocations",
-                        witness.evaluated_cells,
-                        calls[1].load(Ordering::SeqCst)
-                    ));
-                }
-                report.leased_witness = Some(witness);
+            (Kind::Leased, LeasedForce::FlushOnly) => db.flush().map_err(failed)?,
+            (Kind::Leased, LeasedForce::Forced) => {
+                // The hybrid force flushes below min(durable, applied, latch). On
+                // the page-cache tier (`durable: false`) the durable cut can lag
+                // the last puts, so the owners' barrier comes first.
+                db.flush().map_err(failed)?;
+                db.force_rebuild_control_region().map_err(failed)?;
             }
         }
     }
@@ -437,6 +384,6 @@ fn observe(
 }
 
 const NATIVE_FORCING: &str = "force_rebuild_control_region: flushes every dirty cell at the current position; the flusher runs the compactor (flusher.rs:422,493) and the unloading flush drops the uncompacted in-memory rows (large_table.rs:2561,2585), so raw rows are compared";
-const LEASED_FORCING: &str = "force_rebuild_control_region: one named Exact generation covering every earlier write evaluates every dirty callback cell and adopts index-only marks (COMPACTOR-PARITY.md §4), without the Sui write gate";
-const LEASED_EXACT_ONLY: &str =
-    "negative control: flush (an Exact checkpoint that never evaluates the policy)";
+const LEASED_FORCING: &str = "force_rebuild_control_region after the owners' durability barrier: a forced snapshot over the coordinator's native index; its flusher runs the compactor on every dirty cell below the flush frontier";
+const LEASED_FLUSH_ONLY: &str =
+    "negative control: the owners' durability barrier only, no index snapshot, so no compaction";

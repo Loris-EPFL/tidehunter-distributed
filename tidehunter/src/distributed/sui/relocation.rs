@@ -15,12 +15,55 @@
 //! one start bit and one test slot.
 use crate::distributed::remote_db::{ConcurrentRemoteDatabase, RelocationReport};
 use crate::distributed::storage::LocalDbError;
+#[cfg(feature = "test_methods")]
+use crate::distributed::types::BatchVersion;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+/// What one distributed relocation pass persisted, beside the native-shaped
+/// `RelocationObservation`.
+///
+/// Native relocation has no persistence step to report: a pass is complete when
+/// the worker returns. The distributed pass re-points index entries and may
+/// adopt callback starts and retire owner files only after a *covering*
+/// snapshot stores those re-points (plan A18/A22-A24), so the observation alone
+/// would show `DidWork` for a pass that was deferred and reclaimed nothing.
+///
+/// The three outcomes of a pass, without a third gate value:
+/// * `NoWork` gate: nothing to do;
+/// * `DidWork`, `deferred == false`, `stored_target: Some`: starts adopted,
+///   files retired;
+/// * `DidWork`, `deferred == true`, `stored_target: None`: the pass may have
+///   mutated the index, persisted nothing and retired nothing (the routine
+///   outcome under a held checkpoint latch).
+///
+/// Compared between runs of the same fixture: `deferred`, `stored_target`
+/// presence, `stored_forced`, `copied_survivors`, `rejected_survivors`.
+/// Versions (`scan_cut`, `promotion_cut`, the `stored_target` value) are run
+/// identities, recorded but never compared across runs.
+#[cfg(feature = "test_methods")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelocationReceipt {
+    /// The pass may have mutated the index and did not persist that mutation.
+    pub deferred: bool,
+    /// The scan cut `Q` the pass copied against.
+    pub scan_cut: BatchVersion,
+    /// The stored target that covered the pass's re-points; `None` when no
+    /// store covered them.
+    pub stored_target: Option<BatchVersion>,
+    /// The covering store was the forced relocation store.
+    pub stored_forced: bool,
+    /// The flush frontier the attempted store used; `None` when none was tried.
+    pub promotion_cut: Option<BatchVersion>,
+    /// Survivors copied to the serving generation and re-pointed.
+    pub copied_survivors: u64,
+    /// Survivors whose bytes failed the indexed CRC and kept their old position.
+    pub rejected_survivors: u64,
+}
 
 /// Capacity-one reply of one observed pass. The worker uses `try_send`, so a
 /// requester that timed out (dropped receiver) never blocks it.

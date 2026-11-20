@@ -396,42 +396,6 @@ impl ReplayBackend for TidehunterReplayBackend {
         }
         Ok(())
     }
-    fn capacity_r0_start(
-        &self,
-        request: &crate::capacity_r0::R0Request,
-        header: &crate::capacity_r0::R0Header,
-        output: &std::path::Path,
-    ) -> BackendResult<Vec<crate::capacity_r0::R0Session>> {
-        let mut sessions = Vec::with_capacity(self.databases.len());
-        for (id, backend) in &self.databases {
-            let configuration = &backend.effective_configuration;
-            let mut header = header.clone();
-            header.durability_tier = configuration["durability_tier"].clone();
-            header.route = configuration
-                .get("write_backend")
-                .or_else(|| configuration.get("backend"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            header.fixture = configuration["fixture_route"].clone();
-            let path = crate::capacity_r0::report_path(output, *id, self.databases.len());
-            sessions.push(crate::capacity_r0::R0Session::start(
-                backend.db.as_ref().ok_or("replay DB closed")?,
-                request,
-                &header,
-                &path,
-            )?);
-        }
-        Ok(sessions)
-    }
-
-    fn index_checkpoint_targets(
-        &self,
-    ) -> BackendResult<Vec<crate::index_checkpoint::IndexCheckpointTarget>> {
-        self.databases
-            .iter()
-            .map(|(id, backend)| backend.index_checkpoint_target(&format!("db{id}")))
-            .collect()
-    }
 }
 
 mod resources;

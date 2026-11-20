@@ -29,8 +29,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub use compactor::{
-    CompactorArm, CompactorReport, LeasedForce, LeasedWitness, compactor_parity,
-    compactor_parity_with,
+    CompactorArm, CompactorReport, LeasedForce, compactor_parity, compactor_parity_with,
 };
 pub use stream::{Divergence, Gap, StreamReport, StreamStatus};
 

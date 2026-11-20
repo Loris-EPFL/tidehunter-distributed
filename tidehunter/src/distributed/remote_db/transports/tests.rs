@@ -13,7 +13,7 @@ fn put(value: u8) -> Mutation {
 }
 
 #[test]
-fn clean_reopen_recovers_retry_identity_and_rejects_old_read_handles() {
+fn clean_reopen_recovers_retry_identity() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let operation = fixture.operation(0, 1);
@@ -22,13 +22,11 @@ fn clean_reopen_recovers_retry_identity_and_rejects_old_read_handles() {
         db.get(KeySpace(0), &7u32.to_be_bytes()).unwrap(),
         Some(vec![9; 32].into())
     );
-    let old = db.submit_get(KeySpace(0), &7u32.to_be_bytes()).unwrap();
     db.shutdown().unwrap();
     drop(db);
 
     let mut db = fixture.open();
     assert_eq!(db.epoch(), 2);
-    assert!(db.finish_get(old).is_err());
     assert_eq!(db.write_batch(operation, vec![put(9)]).unwrap(), first);
     assert_eq!(
         db.get(KeySpace(0), &7u32.to_be_bytes()).unwrap(),

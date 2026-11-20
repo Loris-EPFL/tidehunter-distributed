@@ -12,8 +12,8 @@ use super::*;
 
 /// Upper bound of entries in one page, before the negotiated frame bound.
 pub(crate) const MAX_INVENTORY_PAGE: usize = 256;
-/// Fixed-width bincode bytes per entry (u64 + u8), rounded up with headroom.
-const PAGE_ENTRY_BYTES: usize = 16;
+/// Fixed-width bincode bytes per entry (u64 + u8 + u64), rounded up with headroom.
+const PAGE_ENTRY_BYTES: usize = 24;
 /// Envelope, enum tags, incarnation, revision and cursor fields.
 const PAGE_FIXED_BYTES: usize = 128;
 
@@ -32,6 +32,11 @@ pub enum OwnerGenerationState {
 pub struct InventoryGeneration {
     pub generation: u64,
     pub state: OwnerGenerationState,
+    /// End of the highest durable frame of this generation's log, computed by
+    /// the owner from the log (zero when it holds no log for the generation).
+    /// The coordinator seeds a retained older stream's position from it: replay
+    /// cannot know a tail it did not read.
+    pub durable_end: u64,
 }
 
 /// Owner answer to a trim readiness check. `Blocked` defers the candidate; it is

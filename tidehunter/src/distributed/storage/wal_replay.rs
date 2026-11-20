@@ -70,6 +70,20 @@ const ROOT_FORMAT: u32 = 2;
 const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
 pub(super) const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
 
+/// Fragment-aligned start of a replay of `offset`.
+///
+/// A stored stream front is fragment aligned, and an aligned offset is always a
+/// frame boundary, which is what the owner's page read requires. Flooring an
+/// unaligned offset widens the replay instead of narrowing it, and re-applying a
+/// batch below the true start is idempotent by version, so the floor is the safe
+/// direction for both the writer of a front and the reader of one.
+pub(crate) fn aligned_replay_start(offset: u64, fragment_bytes: u64) -> u64 {
+    if fragment_bytes == 0 {
+        return offset;
+    }
+    offset - offset % fragment_bytes
+}
+
 /// Format 2: fixed-width bincode plus a trailing little-endian CRC32. Format 1
 /// (one offset per retired file) is refused: deployments use fresh databases.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,7 +207,7 @@ pub struct ReplayPage {
 }
 
 fn position_lifecycle(state: &State) -> (bool, bool, bool) {
-    (state.sealed, state.writer.is_some(), state.sealing)
+    (state.sealed, state.writer.is_some(), state.is_sealing())
 }
 
 impl PartitionLog {
@@ -946,7 +960,7 @@ impl PartitionLog {
                 next_live_extent: None,
                 last_live_adoption: None,
                 live,
-                sealing: false,
+                lifecycle: Lifecycle::Running,
                 live_tail: None,
                 live_root_end: physical_end,
                 writer: None,

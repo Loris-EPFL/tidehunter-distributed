@@ -285,7 +285,21 @@ fn cold_grant_bypasses_close_and_metadata_gate_without_promoting_a_prefix() {
             let persistence = log.persistence.lock();
             let lease = log.resolve_live_record(&reference).unwrap();
             assert_eq!(cold_frontiers(&log), before);
-            assert!(lease._plan.authority_bytes() > 0);
+            // A hybrid member address names the frame itself, so this plan
+            // carries no batch descriptor authority (storage/leased_member.rs
+            // documents `authority_bytes() == 0` for that path). The positive
+            // premise is the pinned member range; the payload CRC check runs on
+            // the read below.
+            let member_address = member_address_of_reference(&reference).unwrap();
+            assert_eq!(lease._plan.authority_bytes(), 0);
+            assert_eq!(
+                (lease.offset, lease.len),
+                (
+                    member_address.offset % config.wal_file_bytes,
+                    member_address.len,
+                ),
+                "the cold grant pins exactly the member frame range"
+            );
             log.evict_authority_cache();
             let mut member = vec![0; lease.len as usize];
             lease
@@ -295,8 +309,17 @@ fn cold_grant_bypasses_close_and_metadata_gate_without_promoting_a_prefix() {
                 .read_exact_at(&mut member, lease.offset)
                 .unwrap();
             assert_eq!(
-                CompleteBatch::decode_record(&shape(), &reference, member.into()).unwrap(),
+                CompleteBatch::decode_record(&shape(), &reference, member.clone().into()).unwrap(),
                 batch(&config, 2).mutations()[0],
+            );
+            let mut corrupted = member;
+            corrupted[8] ^= 0xff;
+            assert!(
+                matches!(
+                    CompleteBatch::decode_record(&shape(), &reference, corrupted.into()),
+                    Err(CodecError::ChecksumMismatch)
+                ),
+                "a corrupted member byte must fail the payload checksum"
             );
             assert_eq!(log.live_read_pins.load(Ordering::Acquire), 1);
             drop(lease);
@@ -413,7 +436,7 @@ fn cold_grant_failure_cuts_discard_authority_and_pins() {
             let read = std::thread::spawn(move || reader.resolve_live_record(&reference));
             entered.recv_timeout(Duration::from_secs(5)).unwrap();
             if sealing {
-                log.state.lock().sealing = true;
+                log.state.lock().lifecycle = Lifecycle::Sealing;
             } else {
                 log.poison_writer();
             }
@@ -421,7 +444,7 @@ fn cold_grant_failure_cuts_discard_authority_and_pins() {
             assert!(read.join().unwrap().is_err());
             assert_eq!(log.live_read_pins.load(Ordering::Acquire), 0);
             assert_eq!(cold_frontiers(&log), before);
-            log.state.lock().sealing = false;
+            log.state.lock().lifecycle = Lifecycle::Running;
         }
     }
 }

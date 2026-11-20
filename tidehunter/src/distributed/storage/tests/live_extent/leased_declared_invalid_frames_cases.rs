@@ -864,7 +864,7 @@ fn leased_seal_refuses_an_unlocked_close_without_poisoning_it() {
         Err(StorageError::Invalid("live extent is closing"))
     ));
     assert!(log.state.lock().poison.is_none());
-    assert!(!log.state.lock().sealing);
+    assert!(!log.state.lock().is_sealing());
     resume.send(()).unwrap();
     assert!(close.join().unwrap().unwrap().0.closed);
     log.persist_appended().unwrap();

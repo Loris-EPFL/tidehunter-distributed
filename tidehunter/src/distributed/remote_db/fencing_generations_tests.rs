@@ -1,9 +1,16 @@
 //! L1 fencing generations: monotone allocation, bounded retained state and
 //! crash cuts at every persisted step. Two owners, so partial fences are real.
-//! An injected coordinator crash returns an error at a durable boundary and
-//! suppresses the graceful shutdown checkpoint (see `injected`); every earlier
-//! step was installed with a synced rename, so the next open sees exactly the
-//! durable state at that boundary. Owner crash points restart the owners.
+//! An injected coordinator crash returns an error at a durable boundary;
+//! every earlier step was installed with a synced rename, so the next open
+//! sees exactly the durable state at that boundary. Owner crash points restart
+//! the owners.
+//!
+//! Trim eligibility is the native value watermark, not an index root: the
+//! durable control region must cover each stream of the candidate and no
+//! adopted relocation start may leave a suffix. Native reclaims owner WAL only
+//! from relocation, so a cycle first seeds both terms at the stream ends
+//! ([`Harness::settle`]) and retires the sealed files; a generation whose files
+//! never retire stays retained, which is asserted too.
 
 use super::super::pipeline_tests::Fixture;
 use super::super::tests::fail_stop_without_checkpoint;
@@ -105,6 +112,11 @@ impl Harness {
     }
 
     /// Open, check the seeded values, close cleanly.
+    ///
+    /// No watermark is seeded here: a generation that holds live values can
+    /// only be reclaimed by a real relocation pass, and the empty or aborted
+    /// generations that this matrix trims are already `EmptySealed`/`Absent`
+    /// on the owners without any retirement.
     fn cycle(&self) -> u64 {
         let mut db = self.open().unwrap();
         assert_eq!(value(&mut db, 1), Some(vec![7; 32]));
@@ -133,25 +145,17 @@ impl Harness {
             Seed::RootByTwo => fail_stop_without_checkpoint(db),
         }
         assert_eq!(harness.cycle(), 2);
-        let root = harness.manifest().checkpoint.unwrap();
-        let expected = match seed {
-            Seed::RootByOne => 1,
-            Seed::RootByTwo => 2,
-        };
-        assert_eq!(root.epoch, expected);
         harness
     }
 }
 
-/// The committed root when generation 2 becomes the trim candidate.
+/// Whether generation 1 left a durable snapshot behind for generation 2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Seed {
-    /// Generation 1 produced the root, which cannot name generation 2: the
-    /// trim is a plain manifest replacement.
+    /// Generation 1 closed cleanly and stored its snapshot.
     RootByOne,
-    /// Generation 1 stopped without a checkpoint, so the open of generation 2
-    /// committed the recovery baseline: the root is produced by generation 2
-    /// and the trim adopts a replacement root produced by generation 3.
+    /// Generation 1 stopped without a snapshot, so the open of generation 2
+    /// commits the recovery baseline itself.
     RootByTwo,
 }
 
@@ -240,26 +244,28 @@ fn reservation_folds_the_previous_reservation_and_never_reuses_a_generation() {
 }
 
 #[test]
-fn adoption_trim_excludes_the_generation_only_at_root_adoption() {
+fn a_trim_is_one_manifest_replacement_with_no_index_root() {
     let mut manifest = sample_manifest();
     reserve(&mut manifest, [1; 16]).unwrap();
     mark_served(&mut manifest, 2).unwrap();
-    manifest.adopt_trim = Some(1);
-    // The staging install never carries the in-memory intent.
+    // The durable commit excludes the generation and names it as pending in
+    // the same replacement; no index root takes part (there is none).
+    manifest.generations.retain(|entry| entry.generation != 1);
+    manifest.trim_pending = Some(1);
     let staged: AuthorityManifest =
         serde_yaml::from_str(&serde_yaml::to_string(&manifest).unwrap()).unwrap();
-    assert_eq!(staged.adopt_trim, None);
-    assert_eq!(ids(&staged), vec![1, 2]);
-    apply_adoption_trim(&mut manifest);
-    assert_eq!(ids(&manifest), vec![2]);
-    assert_eq!(manifest.trim_pending, Some(1));
-    assert_eq!(manifest.adopt_trim, None);
-    validate(&manifest).unwrap();
+    assert_eq!(ids(&staged), vec![2]);
+    assert_eq!(staged.trim_pending, Some(1));
+    validate(&staged).unwrap();
+    let mut cleared = staged.clone();
+    cleared.trim_pending = None;
+    assert_eq!(ids(&cleared), vec![2]);
+    validate(&cleared).unwrap();
 }
 
 fn cycles(synchronous: bool, cycles: usize, failed: usize) {
-    // Every open trims its predecessor through a replacement root: the root
-    // committed by the previous open is produced by the trim candidate.
+    // Every open trims its predecessor: the cycle seeded both watermark terms
+    // and retired its sealed files before closing.
     let harness = Harness::seeded_with(synchronous, Seed::RootByTwo);
     let base_bytes = harness.manifest_bytes();
     let mut next = harness.manifest().next_generation;
@@ -405,16 +411,10 @@ fn coordinator_crash_cuts_inside_the_trim_transaction() {
                     assert_eq!(owners, vec![vec![1, 2, 3]; 2]);
                 }
                 TrimCrash::AfterCommit => {
-                    // The exclusion, the pending trim and (when the root named
-                    // generation 2) the replacement root are durable together;
+                    // The exclusion and the pending trim are durable together;
                     // generation 2 is never planned for default replay again.
                     assert_eq!(ids(&manifest), vec![1, 3]);
                     assert_eq!(manifest.trim_pending, Some(2));
-                    let root = manifest.checkpoint.as_ref().unwrap().epoch;
-                    match seed {
-                        Seed::RootByOne => assert_eq!(root, 1),
-                        Seed::RootByTwo => assert_eq!(root, 3),
-                    }
                     assert_eq!(owners, vec![vec![1, 2, 3]; 2]);
                 }
                 TrimCrash::AfterOwnerAcks(1) => {
@@ -495,7 +495,6 @@ fn aborted_generation_with_accepted_data_fails_closed() {
     db.core.test_hooks.lock().skip_shutdown_checkpoint = true;
     drop(db);
     let mut manifest = harness.manifest();
-    assert!(manifest.checkpoint.is_none());
     manifest.generations[0].state = GenerationState::Aborted;
     persist_manifest(&harness.root, &manifest, CoordinatorIoCategory::Open).unwrap();
     let error = harness.open().err().unwrap();
@@ -594,65 +593,27 @@ fn unreferenced_generation_with_data_stays_retained_until_its_files_retire() {
 }
 
 #[test]
-fn adopted_callback_start_keeps_a_generation_with_a_remaining_suffix() {
-    let harness = Harness::new(true);
-    let db = harness.open().unwrap();
-    let generation = db.epoch();
-    let key = (0, generation);
-    let end = harness.fixture.config.storage.wal_file_bytes;
-    {
-        // Isolate the eligibility check: a complete stream, no retained
-        // references or receipts, and one file in the adopted callback suffix.
-        let mut state = db.core.publisher.lock();
-        let state = state.checkpoint_state();
-        state.positions.insert(
-            key,
-            StreamPosition {
-                partition: 0,
-                epoch: generation,
-                replay_from: end,
-                last_offset: None,
-                durable_end: end,
-                complete: true,
-            },
-        );
-        state.callback_starts.insert(key, 0);
-    }
-    assert!(!coordinator_eligible(&db.core, None, generation));
-    db.core.publisher.lock().callback_starts.insert(key, end);
-    assert!(coordinator_eligible(&db.core, None, generation));
-    fail_stop_without_checkpoint(db);
-}
-
-#[test]
-fn empty_generation_the_root_does_not_name_is_trimmed_without_a_replacement_root() {
+fn empty_generation_without_data_is_trimmed() {
     for synchronous in [false, true] {
         let harness = Harness::new(synchronous);
-        // The root is produced by generation 1. Generation 2 starts after it,
-        // writes nothing and stops without a checkpoint, so no root names it.
+        // Generation 1 writes and stores its snapshot. Generation 2 starts
+        // after it and writes nothing, so it needs no replay and no owner file.
         let db = harness.open().unwrap();
         harness.put(&db, 1, 7);
-        db.flush_index().unwrap();
+        db.core.table.snapshot().unwrap();
         fail_stop_without_checkpoint(db);
         let db = harness.open().unwrap();
         assert_eq!(db.epoch(), 2);
         fail_stop_without_checkpoint(db);
-        let root = harness.manifest().checkpoint.unwrap();
-        assert_eq!(root.epoch, 1);
 
         let mut db = harness.open().unwrap();
         assert_eq!(db.epoch(), 3);
         assert_eq!(value(&mut db, 1), Some(vec![7; 32]));
-        // A plain manifest replacement trimmed generation 2: the root is the
-        // same committed image, and no replay of generation 2 is planned.
+        // One plain manifest replacement trimmed generation 2: no replay of it
+        // is planned and no index root takes part.
         let manifest = harness.manifest();
         assert_eq!(ids(&manifest), vec![1, 3]);
         assert_eq!(manifest.trim_pending, None);
-        let after = manifest.checkpoint.unwrap();
-        assert_eq!(
-            (after.epoch, after.generation, after.metadata_digest),
-            (root.epoch, root.generation, root.metadata_digest)
-        );
         assert_eq!(harness.owner_generations(), vec![vec![1, 3]; 2]);
         db.shutdown().unwrap();
         drop(db);
@@ -662,4 +623,172 @@ fn empty_generation_the_root_does_not_name_is_trimmed_without_a_replacement_root
         db.shutdown().unwrap();
         assert_eq!(ids(&harness.manifest()), vec![1, 4]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trim eligibility on the native watermark (pure predicate cases).
+// ---------------------------------------------------------------------------
+
+fn stream_position(
+    partition: u32,
+    generation: u64,
+    durable_end: u64,
+    complete: bool,
+) -> ((u32, u64), StreamPosition) {
+    (
+        (partition, generation),
+        StreamPosition {
+            partition,
+            epoch: generation,
+            replay_from: 0,
+            last_offset: None,
+            durable_end,
+            complete,
+        },
+    )
+}
+
+fn front(partition: u32, generation: u64, replay_from: u64) -> StreamFront {
+    StreamFront {
+        partition,
+        generation,
+        replay_from,
+    }
+}
+
+#[test]
+fn a_generation_whose_streams_are_covered_is_unused() {
+    let positions = BTreeMap::from([
+        stream_position(0, 3, 8 << 20, true),
+        stream_position(1, 3, 4 << 20, true),
+    ]);
+    let fronts = [front(0, 3, 8 << 20), front(1, 3, 4 << 20)];
+    let starts = BTreeMap::from([((0, 3), 8 << 20), ((1, 3), 4 << 20)]);
+    assert!(generation_unused(&positions, &starts, &fronts, 3, &[0, 1]));
+}
+
+/// The old predicate was `!positions.any(blocking)`: an absent entry never
+/// blocked. This is that logic, kept only so the fail-closed tests below can
+/// show they fail against it.
+fn fail_open_predicate(
+    positions: &BTreeMap<(u32, u64), StreamPosition>,
+    callback_starts: &BTreeMap<(u32, u64), u64>,
+    fronts: &[StreamFront],
+    generation: u64,
+) -> bool {
+    !positions
+        .iter()
+        .filter(|(key, _)| key.1 == generation)
+        .any(|(key, position)| {
+            let covered = fronts
+                .iter()
+                .find(|front| (front.partition, front.generation) == *key)
+                .map_or(position.durable_end == 0, |front| {
+                    front.replay_from >= position.durable_end
+                });
+            !position.complete
+                || !covered
+                || callback_starts.get(key).copied().unwrap_or(0) < position.durable_end
+        })
+}
+
+#[test]
+fn a_generation_with_no_position_entry_is_not_unused() {
+    let positions = BTreeMap::from([stream_position(0, 5, 8 << 20, true)]);
+    let fronts = [front(0, 5, 8 << 20)];
+    let starts = BTreeMap::new();
+    assert!(!generation_unused(&positions, &starts, &fronts, 3, &[0]));
+    // Negative control: the old predicate calls the same state unused.
+    assert!(fail_open_predicate(&positions, &starts, &fronts, 3));
+    // No owner at all is no proof either.
+    assert!(!generation_unused(&BTreeMap::new(), &starts, &[], 3, &[]));
+}
+
+#[test]
+fn a_position_for_only_some_owner_partitions_is_not_unused() {
+    let positions = BTreeMap::from([stream_position(0, 3, 8 << 20, true)]);
+    let fronts = [front(0, 3, 8 << 20)];
+    let starts = BTreeMap::from([((0, 3), 8 << 20)]);
+    assert!(!generation_unused(&positions, &starts, &fronts, 3, &[0, 1]));
+    // Negative control: the old predicate retires it on the strength of the
+    // one owner that happened to have an entry.
+    assert!(fail_open_predicate(&positions, &starts, &fronts, 3));
+    // With the second owner's entry present and covered it is unused.
+    let positions = BTreeMap::from([
+        stream_position(0, 3, 8 << 20, true),
+        stream_position(1, 3, 0, true),
+    ]);
+    assert!(generation_unused(&positions, &starts, &fronts, 3, &[0, 1]));
+}
+
+#[test]
+fn a_control_region_front_below_the_stream_end_blocks() {
+    let positions = BTreeMap::from([stream_position(0, 3, 8 << 20, true)]);
+    // The relocation term is satisfied, so only the region term decides.
+    let starts = BTreeMap::from([((0, 3), 8 << 20)]);
+    let fronts = [front(0, 3, (8 << 20) - 4096)];
+    assert!(!generation_unused(&positions, &starts, &fronts, 3, &[0]));
+    // A non-empty stream the durable region never named cannot be proven
+    // replay-free.
+    assert!(!generation_unused(&positions, &starts, &[], 3, &[0]));
+}
+
+#[test]
+fn a_relocation_start_below_the_stream_end_blocks() {
+    let positions = BTreeMap::from([stream_position(0, 3, 8 << 20, true)]);
+    let fronts = [front(0, 3, 8 << 20)];
+    let starts = BTreeMap::from([((0, 3), (8 << 20) - 4096)]);
+    assert!(!generation_unused(&positions, &starts, &fronts, 3, &[0]));
+    // A start at the stream end leaves no suffix to scan.
+    let starts = BTreeMap::from([((0, 3), 8 << 20)]);
+    assert!(generation_unused(&positions, &starts, &fronts, 3, &[0]));
+}
+
+#[test]
+fn an_incomplete_position_blocks() {
+    let positions = BTreeMap::from([stream_position(0, 3, 8 << 20, false)]);
+    let fronts = [front(0, 3, 8 << 20)];
+    assert!(!generation_unused(
+        &positions,
+        &BTreeMap::new(),
+        &fronts,
+        3,
+        &[0]
+    ));
+}
+
+#[test]
+fn another_generations_state_never_blocks_or_proves() {
+    // The serving generation's own state must not make an older generation
+    // look retained: only keys of the candidate count.
+    let positions = BTreeMap::from([
+        stream_position(0, 5, 8 << 20, true),
+        stream_position(0, 3, 8 << 20, true),
+    ]);
+    let fronts = [front(0, 5, 8 << 20), front(0, 3, 8 << 20)];
+    let starts = BTreeMap::from([((0, 5), 0), ((0, 3), 8 << 20)]);
+    assert!(generation_unused(&positions, &starts, &fronts, 3, &[0]));
+    assert!(!generation_unused(&positions, &starts, &fronts, 5, &[0]));
+}
+
+#[test]
+fn an_empty_stream_needs_no_control_region_front() {
+    // An empty stream holds no byte to replay, so a region that never named it
+    // still covers it; a stream with bytes and no front does not.
+    let positions = BTreeMap::from([stream_position(0, 3, 0, true)]);
+    assert!(generation_unused(
+        &positions,
+        &BTreeMap::new(),
+        &[],
+        3,
+        &[0]
+    ));
+    let positions = BTreeMap::from([stream_position(0, 3, 4096, true)]);
+    assert!(!generation_unused(
+        &positions,
+        &BTreeMap::new(),
+        &[],
+        3,
+        &[0]
+    ));
 }

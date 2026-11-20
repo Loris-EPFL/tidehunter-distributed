@@ -470,82 +470,62 @@ impl Client {
     }
 
     /// Validate member geometry against a retained file grant without copying it.
+    ///
+    /// Everything is derived from the requested address: its segment generation
+    /// names the epoch/generation of the segment and its offset the file.
     pub(super) fn valid_live_record_geometry(
         &self,
         segment: &LiveWalSegment,
         binding: &LiveTargetBinding,
-        reference: &ValueRecordReference,
+        member: &PhysicalValueAddress,
         offset: u64,
         len: u64,
     ) -> bool {
-        self.valid_live_segment(
-            segment,
-            binding,
-            reference.batch_version.epoch,
-            reference.batch_address.offset,
-        ) && self.valid_record_range(segment.bytes, reference, offset, len)
+        self.valid_live_segment(segment, binding, member.segment_generation, member.offset)
+            && self.valid_record_range(segment.bytes, member, offset, len)
     }
 
+    /// The reply range must be exactly the member frame the address names,
+    /// inside one WAL file: in-file offset, the address length, no overflow.
     pub(super) fn valid_record_range(
         &self,
         file_bytes: u64,
-        reference: &ValueRecordReference,
+        member: &PhysicalValueAddress,
         offset: u64,
         len: u64,
     ) -> bool {
-        reference.batch_id.database == self.expected.inventory.database
-            && self
-                .expected
-                .inventory
-                .partition_for(reference.batch_id)
-                .ok()
-                == Some(self.expected.partition)
-            && reference.batch_address.partition == self.expected.partition
-            && reference.batch_address.segment_generation == reference.batch_version.epoch
-            && reference
-                .batch_address
-                .len
-                .checked_sub(8)
-                .is_some_and(|len| {
-                    reference
-                        .descriptor
-                        .offset
-                        .checked_add(reference.descriptor.len)
-                        .is_some_and(|end| end <= len)
-                })
-            && len == u64::from(reference.descriptor.len)
-            && (reference.batch_address.offset % file_bytes)
-                .checked_add(8)
-                .and_then(|offset| offset.checked_add(u64::from(reference.descriptor.offset)))
-                == Some(offset)
+        member.partition == self.expected.partition
+            && (member.len as usize) >= crate::crc::CrcFrame::CRC_HEADER_LENGTH
+            && len == u64::from(member.len)
+            && member.offset.checked_rem(file_bytes) == Some(offset)
             && offset.checked_add(len).is_some_and(|end| end <= file_bytes)
     }
 
     pub fn resolve_live_records(
         &mut self,
         authority_epoch: u64,
-        references: &[ValueRecordReference],
+        members: &[PhysicalValueAddress],
     ) -> Result<LiveRecordLocations, TcpError> {
-        if references.is_empty() || references.len() > self.max_reads.min(256) {
+        if members.is_empty() || members.len() > self.max_reads.min(256) {
             return Err(TcpError::new("live record count exceeds negotiated bound"));
         }
         match self.request(Request::ResolveLiveRecords {
             authority_epoch,
-            references: references.to_vec(),
+            members: members.to_vec(),
         })? {
             Response::LiveRecords(locations) => {
                 if locations.epoch_pin_token == [0; 16]
-                    || locations.entries.len() != references.len()
+                    || locations.entries.len() != members.len()
                     || !locations
                         .entries
                         .iter()
-                        .zip(references)
-                        .all(|(entry, reference)| {
-                            entry.reference == *reference
+                        .zip(members)
+                        .all(|(entry, member)| {
+                            entry.member == *member
                                 && self.valid_live_record_geometry(
                                     &entry.segment,
                                     &entry.binding,
-                                    reference,
+                                    member,
                                     entry.offset,
                                     entry.len,
                                 )

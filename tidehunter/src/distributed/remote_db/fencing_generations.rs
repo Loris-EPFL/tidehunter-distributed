@@ -13,10 +13,11 @@
 //!    load and replay of the retained union;
 //! 3. the open-time durable-cut record, then `Served(g)`;
 //! 4. offline trim of each eligible older generation `s`, one at a time:
-//!    owner readiness from every owner, then ONE manifest replacement that
-//!    excludes `s`, sets `trim_pending = Some(s)` and, when the current Exact
-//!    root names `s`, adopts a replacement root produced by `g`; owner trims;
-//!    the cut truncation of `s` is forgotten; `trim_pending` is cleared.
+//!    the coordinator proves the durable control region covers every stream of
+//!    `s` and no relocation callback start leaves a suffix (the native value
+//!    watermark), the owners report readiness, then ONE manifest replacement
+//!    excludes `s` and sets `trim_pending = Some(s)`; owner trims; the cut
+//!    truncation of `s` is forgotten; `trim_pending` is cleared.
 //!
 //! Step 4 runs on the constructed core before the durable-cut actor starts and
 //! before the handle is returned, so no foreground write, read or durability
@@ -25,6 +26,7 @@
 use super::durable_cut::{self, CutRecord};
 use super::write_core::core::WriteCore;
 use super::*;
+use crate::distributed::hybrid::region::StreamFront;
 use crate::distributed::tcp::{
     InventoryGeneration, NodeStatus, OwnerGenerationState, TrimReadiness,
 };
@@ -139,7 +141,7 @@ pub(super) fn reserve(
 }
 
 /// Record that `generation` may serve. Persisted after the open-time cut
-/// record and before any `generation`-owned Exact adoption or trim.
+/// record and before any `generation`-owned retention or trim.
 pub(super) fn mark_served(
     manifest: &mut AuthorityManifest,
     generation: u64,
@@ -251,41 +253,6 @@ pub(super) fn owner_history(
     Ok(history)
 }
 
-/// Charge the actual retained streams, not a configured lifetime quota, against
-/// the checkpoint metadata budget before the replayed root can be built.
-pub(super) fn check_stream_budget(
-    config: &RemoteDatabaseConfig,
-    histories: &[Vec<u64>],
-) -> Result<(), LocalDbError> {
-    let streams = histories
-        .iter()
-        .try_fold(config.endpoints.len(), |total, history| {
-            total.checked_add(history.len())
-        });
-    let receipts = config
-        .replay_limits
-        .max_batches
-        .min(config.max_admitted_batches);
-    if streams.is_none_or(|streams| !checkpoint_metadata_fits(streams, receipts)) {
-        return Err(LocalDbError::new(format!(
-            "checkpoint retained-stream metadata exceeds {MAX_CHECKPOINT_METADATA_BYTES} bytes"
-        )));
-    }
-    Ok(())
-}
-
-/// Apply a trim prepared for this checkpoint at its root adoption, in the same
-/// manifest replacement that adopts the root. `adopt_trim` is never persisted,
-/// so the staging install before the image keeps the stream retained.
-pub(super) fn apply_adoption_trim(manifest: &mut AuthorityManifest) {
-    if let Some(generation) = manifest.adopt_trim.take() {
-        manifest
-            .generations
-            .retain(|entry| entry.generation != generation);
-        manifest.trim_pending = Some(generation);
-    }
-}
-
 /// Test-only coordinator crash points inside the trim transaction.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,40 +314,74 @@ pub(super) fn maintain(
     Ok(())
 }
 
-/// Coordinator-side proof that no selectable state needs bytes, positions or
-/// proofs of `generation`: no index value, tail receipt, retry identity or
-/// incomplete replay position names it, the tracked cut does not, and no
-/// adopted relocation callback start leaves a suffix to scan in it.
+/// Coordinator-side proof that no durable or selectable state needs bytes,
+/// positions or proofs of `generation`: the Version B cut does not name it,
+/// the durable control region covers every one of its streams (per stream
+/// `replay_from`, the native watermark term), no relocation callback start
+/// leaves a suffix to scan, and no incomplete replay position remains. The
+/// owner proves its own side (no unretired file, no pin) in
+/// `check_trim_generation`.
 fn coordinator_eligible(core: &WriteCore, record: Option<&CutRecord>, generation: u64) -> bool {
     if record.is_some_and(|record| record.live_generation() == Some(generation)) {
         return false;
     }
-    {
-        let publisher = core.publisher.lock();
-        if publisher
-            .recent
-            .iter()
-            .any(|receipt| receipt.version.epoch == generation)
-            || publisher
-                .known
-                .values()
-                .any(|receipt| receipt.version().epoch == generation)
-            || publisher.positions.iter().any(|(key, position)| {
-                key.1 == generation
-                    && (!position.complete
-                        || publisher
-                            .callback_starts
-                            .get(key)
-                            .is_some_and(|&from| from < position.durable_end))
-            })
-        {
-            return false;
-        }
-    }
-    !core.config.endpoints.iter().any(|endpoint| {
-        core.index
-            .references_wal_file(endpoint.partition, generation, 0, u64::MAX)
-    })
+    let fronts = core.table.stored_fronts();
+    let partitions: Vec<u32> = core
+        .config
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.partition)
+        .collect();
+    let mut publisher = core.publisher.lock();
+    let state = publisher.checkpoint_state();
+    generation_unused(
+        &state.positions,
+        &state.callback_starts,
+        &fronts,
+        generation,
+        &partitions,
+    )
+}
+
+/// The pure eligibility predicate, **fail closed**: `generation` is unused only
+/// when every owner partition has a position for it and each one needs no
+/// replay (the durable control region covers the stream), no relocation suffix
+/// (the adopted start reaches the stream end) and nothing incomplete. A missing
+/// position is "no proof of no live position", never "empty": open records an
+/// explicit empty entry where an owner's complete ledger proves the generation
+/// holds nothing.
+pub(super) fn generation_unused(
+    positions: &BTreeMap<(u32, u64), StreamPosition>,
+    callback_starts: &BTreeMap<(u32, u64), u64>,
+    fronts: &[StreamFront],
+    generation: u64,
+    partitions: &[u32],
+) -> bool {
+    !partitions.is_empty()
+        && partitions.iter().all(|&partition| {
+            let key = (partition, generation);
+            let Some(position) = positions.get(&key) else {
+                return false;
+            };
+            // A stream the durable region never named is covered only when it
+            // holds no byte at all: an empty stream needs no replay start, while
+            // a non-empty one absent from the region predates the last snapshot.
+            // A named stream is covered when the region's `replay_from` reaches
+            // its whole durable prefix.
+            let covered = fronts
+                .iter()
+                .find(|front| (front.partition, front.generation) == key)
+                .map_or(position.durable_end == 0, |front| {
+                    front.replay_from >= position.durable_end
+                });
+            // The relocation term, per stream: no adopted start means no pass
+            // has copied the survivors, so a stream with bytes is never
+            // trim-eligible. Only a stream with nothing to copy (empty) passes
+            // with a start of zero.
+            position.complete
+                && covered
+                && callback_starts.get(&key).copied().unwrap_or(0) >= position.durable_end
+        })
 }
 
 /// Every owner must accept the candidate; `Blocked` defers it. An unreachable
@@ -398,27 +399,16 @@ fn owners_ready(core: &WriteCore, generation: u64) -> Result<bool, LocalDbError>
     Ok(true)
 }
 
-/// The atomic authority commit: exclude `generation`, record `trim_pending`
-/// and, when the current root names it, adopt a replacement root produced by
-/// the already served current generation, all in one manifest replacement.
+/// The atomic authority commit: exclude `generation` from the retained state
+/// and record `trim_pending`, in one manifest replacement. No index root names
+/// a generation any more: the stored index carries addresses, and the
+/// eligibility proof already showed the control region covers the stream.
 fn commit_trim(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbError> {
-    let names_generation = {
+    let manifest = {
         let mut publisher = core.publisher.lock();
         let state = publisher.checkpoint_state();
-        // The committed root, not the in-memory positions: a stream that only
-        // appeared after the root (an empty generation after a crash without
-        // checkpoint) needs no replacement root.
-        let names = state
-            .manifest
-            .checkpoint
-            .as_ref()
-            .is_some_and(|commit| commit.epoch == generation)
-            || state
-                .committed_streams
-                .iter()
-                .any(|(_, stream)| *stream == generation);
-        // Checkpoint inputs and in-memory histories drop the stream now; a
-        // replacement capture therefore has complete coverage without it.
+        // Replay planning and the watermark drop the stream now; a crash
+        // before the owners trim repeats `finish_trim` from `trim_pending`.
         for streams in state.retained_epochs.iter_mut() {
             streams.retain(|stream| *stream != generation);
         }
@@ -429,41 +419,13 @@ fn commit_trim(core: &Arc<WriteCore>, generation: u64) -> Result<(), LocalDbErro
             .callback_starts
             .retain(|(_, stream), _| *stream != generation);
         state
-            .committed_complete
-            .retain(|(_, stream)| *stream != generation);
-        state
-            .committed_streams
-            .retain(|(_, stream)| *stream != generation);
-        state
-            .stream_last
-            .retain(|(_, stream), _| *stream != generation);
-        if names {
-            state.manifest.adopt_trim = Some(generation);
-        } else {
-            state
-                .manifest
-                .generations
-                .retain(|entry| entry.generation != generation);
-            state.manifest.trim_pending = Some(generation);
-        }
-        names
+            .manifest
+            .generations
+            .retain(|entry| entry.generation != generation);
+        state.manifest.trim_pending = Some(generation);
+        state.manifest.clone()
     };
-    if names_generation {
-        // Obsolete-root cleanup completes inside the commit, before any Trim.
-        let result = core.commit_recovery_baseline();
-        let mut publisher = core.publisher.lock();
-        publisher.manifest.adopt_trim = None;
-        result?;
-        if publisher.manifest.trim_pending != Some(generation) {
-            return Err(LocalDbError::new(
-                "replacement checkpoint did not commit the generation trim",
-            ));
-        }
-        Ok(())
-    } else {
-        let manifest = core.publisher.lock().manifest.clone();
-        persist_manifest(&core.path, &manifest, CoordinatorIoCategory::Open).map(|_| ())
-    }
+    persist_manifest(&core.path, &manifest, CoordinatorIoCategory::Open).map(|_| ())
 }
 
 /// Owner trims, then the cut truncation, then the authority intent. Repeatable

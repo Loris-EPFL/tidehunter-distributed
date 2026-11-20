@@ -21,6 +21,8 @@ use std::thread::JoinHandle;
 #[path = "control_forced_pause_tests.rs"]
 mod forced_pause_tests;
 #[cfg(test)]
+mod retired_syncer_tests;
+#[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
 
@@ -352,10 +354,8 @@ impl Shared {
                 .map(|index| slots.swap_remove(index))
         };
         if let Some(SyncerSlot { log, syncer }) = slot {
-            let result = syncer.shutdown().map_err(|error| error.to_string());
-            // Fence and retirement also catch up a deferred live root.
-            let result =
-                result.and_then(|()| log.persist_live_root().map_err(|error| error.to_string()));
+            // The log marks its retirement transition before the frontier stops.
+            let result = log.retire_syncer(syncer).map_err(|error| error.to_string());
             drop(log);
             result.map_err(|error| {
                 self.context.poison_readers();
@@ -648,9 +648,9 @@ impl Drop for ControlOwner {
         // The registry lock is released before any join or file sync.
         let syncers = std::mem::take(&mut *self.shared.syncers.lock());
         for SyncerSlot { log, syncer } in syncers {
-            let drained = syncer.shutdown().is_ok();
-            let drained = drained && log.persist_live_root().is_ok();
-            if !drained {
+            // Retirement marks its transition before the frontier stops, so
+            // its drain may adopt and cover a written frame.
+            if log.retire_syncer(syncer).is_err() {
                 self.shared.context.poison_readers();
             }
         }
@@ -1904,44 +1904,43 @@ impl ControlContext {
             )),
             Request::ResolveLiveRecords {
                 authority_epoch,
-                references,
+                members,
             } => {
-                if references
+                if members
                     .iter()
-                    .any(|reference| reference.batch_version.epoch == authority_epoch)
+                    .any(|member| member.segment_generation == authority_epoch)
                     && self.inventory.lock().live_target_configured
                 {
                     return Err(TcpError::new(
                         "live record resolution is disabled for the active epoch in permanent export mode",
                     ));
                 }
-                if references.is_empty()
-                    || references.len() > self.effective_max_reads(limits).min(256)
-                {
+                if members.is_empty() || members.len() > self.effective_max_reads(limits).min(256) {
                     return Err(TcpError::new("live record count exceeds negotiated bound"));
                 }
                 let snapshot =
                     self.readers
                         .read()
-                        .snapshot(authority_epoch, &references, &self.terminal)?;
+                        .snapshot(authority_epoch, &members, &self.terminal)?;
                 let mut plans = Vec::with_capacity(snapshot.members.len());
-                for (log, reference) in &snapshot.members {
-                    plans.push(
-                        log.resolve_live_record(reference)
-                            .map_err(TcpError::component)?,
-                    );
+                for (log, member) in &snapshot.members {
+                    // The storage error's kind is the wire kind: flattening a
+                    // retired member's `NotFound` would disable the retry.
+                    plans.push(log.resolve_live_member(*member).map_err(|error| {
+                        TcpError::with_kind(error.wire_kind(), error.to_string())
+                    })?);
                 }
                 let (token, locations) = self.publish_live_leases(
                     authority_epoch,
                     plans,
                     super::inventory::InlineExport::Resolve,
                 )?;
-                let entries = references
+                let entries = members
                     .into_iter()
                     .zip(locations)
                     .map(
-                        |(reference, (segment, binding, offset, len))| LiveRecordLocation {
-                            reference,
+                        |(member, (segment, binding, offset, len))| LiveRecordLocation {
+                            member,
                             segment,
                             binding,
                             offset,

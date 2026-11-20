@@ -15,12 +15,11 @@
 //! calls, drains, flushes, and writes `final.status`. The controller must wait
 //! for that receipt before terminating the node. Background events after the
 //! explicit cutoff are outside the capture window. No signal handler is added.
-//! Native content fingerprints are not physical WAL versions. Exact immutable
-//! remote references are recorded separately. Never infer causal checkpoint
+//! Native content fingerprints are not physical WAL versions; the distributed
+//! index records no reference identity. Never infer causal checkpoint
 //! ownership from timestamps: checkpoint execution overlaps.
 
 use super::{DbIterator, KeyShape, KeySpace, Result};
-use crate::distributed::types::ValueRecordReference;
 use crate::minibytes::Bytes;
 use std::cell::Cell;
 use std::fs::{self, File};
@@ -646,64 +645,6 @@ impl Iterator for CapturedIterator {
 impl Drop for CapturedIterator {
     fn drop(&mut self) {
         self.end(0);
-    }
-}
-
-/// Exact-reference event. `event`: 11 association, 12 cache lookup, 13 cache
-/// preparation, 14 insertion, 15 route. Outcomes are documented by the caller.
-/// The fingerprint uses the reference's Hash implementation without allocating.
-/// Logical versions and database bytes are also stored as separate fields.
-pub(crate) fn reference(
-    event: u64,
-    reference: &ValueRecordReference,
-    key: Option<&[u8]>,
-    outcome: u64,
-    aux: u64,
-) {
-    let Some(owner) = recorder() else {
-        return;
-    };
-    let (db, call) = CURRENT.get();
-    // Full identity fields are reduced to a diagnostic fingerprint; store the
-    // logical version and member separately for checks and collision detection.
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    reference.hash(&mut hasher);
-    owner.send(Record {
-        event,
-        db,
-        call,
-        ks: u64::from(reference.descriptor.keyspace),
-        op: if reference.descriptor.kind == crate::distributed::types::RecordKind::Delete {
-            DELETE
-        } else {
-            PUT
-        },
-        key: key.map_or(0, hash),
-        position: u64::from(key.is_some()),
-        key_len: u64::from(reference.descriptor.key_len),
-        value_len: u64::from(reference.descriptor.value_len),
-        reference: hasher.finish(),
-        epoch: reference.batch_version.epoch,
-        version: reference.batch_version.sequence,
-        member: u64::from(reference.descriptor.operation_index),
-        outcome,
-        aux,
-        data: {
-            let mut data = [0; 32];
-            data[..16].copy_from_slice(&reference.batch_id.database);
-            data
-        },
-        ..Record::default()
-    });
-}
-
-pub(crate) fn routes(references: &[ValueRecordReference], nvme: bool, flight: u64) {
-    if !enabled() {
-        return;
-    }
-    for item in references {
-        reference(15, item, None, if nvme { 2 } else { 1 }, flight);
     }
 }
 

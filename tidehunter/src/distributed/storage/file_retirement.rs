@@ -1,4 +1,4 @@
-//! Owner whole-file retirement of exact-dead WAL files.
+//! Owner whole-file retirement of dead WAL files (native value watermark).
 //!
 //! Order for every retired file: durable root (offset retired, exact inode in
 //! `cleanup_pending`, seal removed) -> detach from the in-process lookup ->
@@ -8,6 +8,11 @@
 //! pending entry that recovery and the next retirement repeat. A different
 //! inode at a retired offset, or a retired dirent without its pending entry,
 //! is an error, never a permit to unlink.
+//!
+//! The coordinator decides death with the native two-term watermark
+//! `min(relocation callback start, this stream's control-region replay_from)`
+//! ([`RetirementWitness`]); the owner rechecks it against its own durable root
+//! and its exact file seals. No index root and no reference walk take part.
 //!
 //! Lock order: `persistence` -> `state`, as for every root writer. `state` is
 //! dropped across root, unlink and directory syncs on the active stream; the
@@ -33,22 +38,20 @@ pub struct RetireProof {
     pub seal_generation: Option<u64>,
 }
 
-/// Coordinator witness for active-stream victims, taken from one adopted
-/// Exact root and its persisted Version B record. The owner rechecks every
-/// bound it can compare with its own state.
+/// Coordinator witness for active-stream victims: the native two-term value
+/// watermark `min(relocation callback start, this stream's replay_from)`,
+/// from the durable control region and the adopted callback start. The owner
+/// rechecks every bound it can compare with its own state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RetirementWitness {
-    pub checkpoint_generation: u64,
-    pub metadata_digest: [u8; 32],
-    /// Adopted `StreamPosition.replay_from` of the victim stream.
+    /// Durable control-region `replay_from` of this stream: every byte below
+    /// it is represented by the stored index, so recovery never replays it.
+    /// Per stream, never one global term (independent owner offset spaces).
     pub replay_from: u64,
-    /// Adopted Exact durable end of the victim stream.
-    pub durable_end: u64,
     /// First byte relocation callbacks may still scan in this stream, over
-    /// every selectable adopted root and registered in-flight pass.
+    /// every adopted pass start. Bytes below it hold no live value: a `Keep`
+    /// survivor is copied to the serving generation and re-pointed first.
     pub callback_from: u64,
-    /// Every batch sequence below this is covered by the adopted Exact root.
-    pub covered_next: u64,
     /// Persisted Version B `CutRecord.live.next` (Native tier); `None` for
     /// the Synchronous tier, which has no B cut.
     pub persisted_cut_next: Option<u64>,
@@ -181,7 +184,7 @@ impl PartitionLog {
         let (outcome, done) = if self.state.lock().sealed {
             if witness.is_some() {
                 return Err(StorageError::Invalid(
-                    "older sealed stream retirement takes no Exact witness",
+                    "older sealed stream retirement takes no watermark witness",
                 ));
             }
             let outcome = self.retire_sealed_stream_files(proofs)?;
@@ -194,7 +197,7 @@ impl PartitionLog {
             (outcome, done)
         } else {
             let witness = witness.ok_or(StorageError::Invalid(
-                "active stream retirement requires an Exact witness",
+                "active stream retirement requires the value watermark witness",
             ))?;
             let outcome = self.authorize_file_retirement(proofs, witness)?;
             (outcome, self.finish_file_retirement()?)
@@ -541,7 +544,7 @@ impl PartitionLog {
     }
 
     fn check_active_retirement_state(state: &State) -> Result<(), StorageError> {
-        let live = state.live && !state.sealing;
+        let live = state.live && !state.is_sealing();
         if state.sealed || state.writer.is_none() || !live {
             return Err(StorageError::Invalid(
                 "active retirement requires the serving live stream",
@@ -700,7 +703,7 @@ fn retirement_entries(
                 "WAL path no longer names the sealed inode",
             ));
         }
-        check_witness(current, &seal, witness)?;
+        check_witness(&seal, witness)?;
         entries.push(PendingRetirement {
             start: seal.start,
             device: seal.device,
@@ -720,21 +723,18 @@ fn pending_outcome(current: &WalRoot, entries: &[PendingRetirement]) -> Retireme
     }
 }
 
-/// Owner-side recheck of the coordinator witness for one sealed file.
-fn check_witness(
-    root: &WalRoot,
-    seal: &FileSeal,
-    witness: &RetirementWitness,
-) -> Result<(), StorageError> {
+/// Owner-side recheck of the coordinator witness for one sealed file. Only the
+/// two watermark terms are rechecked: the owner has no position root and no
+/// reference information, exactly as native's `Wal::gc` has none.
+fn check_witness(seal: &FileSeal, witness: &RetirementWitness) -> Result<(), StorageError> {
     let end = seal.end;
-    let windows = end <= root.scan_from
-        && end <= root.synced_end
-        && end <= witness.replay_from
-        && end <= witness.durable_end
-        && end <= witness.callback_from;
-    let sequences = seal.last_batch_sequence.is_none_or(|last| {
-        last < witness.covered_next && witness.persisted_cut_next.is_none_or(|next| last < next)
-    });
+    // The two watermark terms are independent proofs: `replay_from` says the
+    // durable index represents the bytes, `callback_from` says relocation
+    // already copied every live value out of them.
+    let windows = end <= witness.replay_from && end <= witness.callback_from;
+    let sequences = seal
+        .last_batch_sequence
+        .is_none_or(|last| witness.persisted_cut_next.is_none_or(|next| last < next));
     if !windows || !sequences {
         return Err(StorageError::Invalid(
             "retirement witness does not cover the sealed file",

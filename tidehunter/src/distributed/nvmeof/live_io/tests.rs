@@ -930,3 +930,89 @@ impl LiveIo {
         Ok(out)
     }
 }
+
+/// Unit test of `MemberBuffer` alone: a member slice is a refcounted view of a
+/// lent read block, and the block cannot return to its queue, and so cannot be
+/// reused for another read, while any slice lives. The lane-level statement is
+/// `a_retained_read_is_never_overwritten_and_its_block_returns_after_the_drop`.
+#[test]
+fn a_lent_block_returns_only_after_its_last_member_slice_is_dropped() {
+    let (sender, returns) = mpsc::sync_channel(4);
+    let lane = Arc::new(ReturnLane {
+        sender,
+        queued_bytes: AtomicUsize::new(0),
+        max_bytes: 1 << 20,
+    });
+    let mut buffer = Buffer::new(4096, 512);
+    buffer.slice_mut()[..8].copy_from_slice(b"member-A");
+    buffer.slice_mut()[8..16].copy_from_slice(b"member-B");
+    let whole = Bytes::from_owner(MemberBuffer {
+        buffer: Some(buffer),
+        lane,
+    });
+    let first = whole.slice(0..8);
+    let second = whole.slice(8..16);
+    drop(whole);
+    assert!(returns.try_recv().is_err(), "returned with slices alive");
+    drop(second);
+    assert!(returns.try_recv().is_err(), "returned with one slice alive");
+    assert_eq!(&first[..], b"member-A", "a live slice changed");
+    drop(first);
+    assert!(returns.try_recv().is_ok(), "the block was never returned");
+}
+
+/// The lane half of the frame-ownership contract documented on
+/// `ReadRequest::finish_member`, on a real `LiveIo` with a budget of exactly
+/// one block: read A and keep it, read B through the same lane while A is
+/// held, then drop A and read C.
+///
+/// * Lending released A's charge (`allocated_bytes` is 0 and `credit` is
+///   unchanged), so B is admitted and gets a fresh block rather than A's:
+///   different pointers, A's bytes
+///   unchanged. A broken lend (block pooled at completion) would hand B A's
+///   block and overwrite it, and fail here.
+/// * The block is in the pool only after A's last slice drops: while A is held
+///   the pool is empty after `reclaim`, afterwards it holds exactly A's block,
+///   and C reads into that same block (pointer equality).
+/// * The budget bounds only the pool, not caller-held memory: B's block is
+///   dropped last and, the one-block budget being full, is freed instead of
+///   pooled.
+#[test]
+fn a_retained_read_is_never_overwritten_and_its_block_returns_after_the_drop() {
+    let block = 4096 + 4095;
+    let (_dir, mut io) = fixture_limits(8192, 2, block);
+    let first = write_pattern(&mut io, 0, 1);
+    let second = write_pattern(&mut io, 4096, 2);
+    let initial = io.credit();
+
+    let a = read_member(&mut io, 1, 0, 64);
+    let a_ptr = a.as_ptr();
+    assert_eq!(&a[..], &first[..64]);
+    // Lent: the block left the byte budget and is not in the pool.
+    io.reclaim();
+    assert_eq!((io.pool.len(), io.allocated_bytes), (0, 0));
+    assert_eq!(io.credit(), initial, "a retained A holds in-flight credit");
+
+    let b = read_member(&mut io, 2, 4096, 64);
+    assert_eq!(&b[..], &second[..64]);
+    assert_ne!(a_ptr, b.as_ptr(), "B was read into A's block");
+    assert_eq!(&a[..], &first[..64], "reading B changed the retained A");
+    assert_ne!(&a[..], &b[..]);
+    io.reclaim();
+    assert_eq!(io.pool.len(), 0, "a block was pooled while it was retained");
+
+    drop(a);
+    io.reclaim();
+    assert_eq!(io.pool.len(), 1, "A's block did not return after the drop");
+    assert_eq!(io.pool[0].slice().as_ptr(), a_ptr);
+
+    drop(b);
+    io.reclaim();
+    assert_eq!(io.pool.len(), 1, "a block beyond the budget was pooled");
+
+    let c = read_member(&mut io, 3, 0, 64);
+    assert_eq!(c.as_ptr(), a_ptr, "C did not reuse the returned block");
+    assert_eq!(&c[..], &first[..64]);
+    drop(c);
+    assert!(io.shutdown().unwrap().is_empty());
+}

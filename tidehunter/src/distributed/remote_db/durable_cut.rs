@@ -41,7 +41,8 @@ use super::super::tcp::{
     Client, DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport, TcpError, WakeFd,
 };
 use super::super::types::BatchVersion;
-use parking_lot::Mutex;
+use crate::distributed::hybrid::loader::CutSources;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -162,11 +163,11 @@ impl CutRecord {
             ))
         })?;
         // Coordinator device attribution: not Exact output.
-        super::checkpoint_attribution::record_installed(
+        super::coordinator_io::record_installed(
             path,
             RECORD,
             bytes.len(),
-            super::checkpoint_attribution::CoordinatorIoCategory::DurableCut,
+            super::coordinator_io::CoordinatorIoCategory::DurableCut,
         );
         Ok(())
     }
@@ -549,13 +550,24 @@ struct Counters {
     persist_failures: AtomicU64,
     poll_failures: AtomicU64,
     certifications: AtomicU64,
+    /// Syncs requested by `wait_through` callers (relocation copies).
+    targeted_syncs: AtomicU64,
 }
 
 struct Shared {
     epoch: u64,
     /// The publisher's exclusive contiguous floor. Written under the publisher lock.
     published: AtomicU64,
+    /// Version B's consistent prefix (exclusive): every batch of `epoch` below
+    /// it is synced on its owner or aborted. Written by the actor after it read
+    /// the published floor and every owner's receipted end, so it never exceeds
+    /// the floor; monotone. Read by the index loader as the durable term of its
+    /// flush frontier (plan I2). Zero means "no batch covered yet".
+    consistent: AtomicU64,
     owners: Box<[OwnerShared]>,
+    /// Wakes `wait_through`: notified by the actor after each cut advance.
+    advanced: Mutex<()>,
+    advanced_cv: Condvar,
     counters: Counters,
     /// Test hook: every persisted cut, sent with `try_send` (capacity 4096).
     #[cfg(test)]
@@ -584,6 +596,8 @@ pub struct DurableCutStats {
     pub persist_failures: u64,
     pub poll_failures: u64,
     pub certifications: u64,
+    /// Targeted syncs requested by relocation copies (`wait_through`).
+    pub targeted_syncs: u64,
 }
 
 enum Message {
@@ -636,6 +650,7 @@ impl DurableCut {
         config: DurableCutConfig,
         record: CutRecord,
         targets: Vec<PollTarget>,
+        cuts: CutSources,
     ) -> Result<Self, LocalDbError> {
         // Open every first session now, before open returns: the owner's Status
         // handshake flushes its logs, and here they hold nothing of this epoch,
@@ -662,7 +677,10 @@ impl DurableCut {
         let shared = Arc::new(Shared {
             epoch,
             published: AtomicU64::new(0),
+            consistent: AtomicU64::new(0),
             owners: (0..owners).map(|_| OwnerShared::default()).collect(),
+            advanced: Mutex::new(()),
+            advanced_cv: Condvar::new(),
             counters: Counters::default(),
             #[cfg(test)]
             persisted_events: Mutex::new(None),
@@ -680,6 +698,7 @@ impl DurableCut {
                     record,
                     &path,
                     (wait / 4).max(Duration::from_millis(1)),
+                    &cuts,
                 );
             })
             .map_err(LocalDbError::component)?;
@@ -737,6 +756,18 @@ impl DurableCut {
         self.shared.published.fetch_max(next, Ordering::Release);
     }
 
+    /// Version B's consistent prefix as the index loader's durable term (plan
+    /// I2): every batch of the tracked epoch below the returned cut is synced on
+    /// its owner or aborted, and no batch at or above it may be named by a
+    /// durable index artifact. Monotone; `{epoch, 0}` before the first
+    /// evaluation, which `BatchVersion` reserves as "none".
+    pub(super) fn cut(&self) -> BatchVersion {
+        BatchVersion {
+            epoch: self.shared.epoch,
+            sequence: self.shared.consistent.load(Ordering::Acquire),
+        }
+    }
+
     /// Explicit flush: every batch below `next` is synced or aborted. Returns
     /// after the record covers `next`.
     pub(super) fn certify(&self, next: u64) -> Result<(), LocalDbError> {
@@ -753,6 +784,58 @@ impl DurableCut {
         result
             .recv()
             .map_err(|_| LocalDbError::new("durable cut actor stopped"))?
+    }
+
+    /// Active, bounded wait for the persisted cut to cover `next`: every batch
+    /// of this epoch below it is synced on its owner (or aborted) and the record
+    /// names it. Used by relocation before it re-points the index at a copy: an
+    /// index entry must never name a position that is not durable-proven.
+    ///
+    /// The wait first raises every owner's immediate-nudge flag so each poller
+    /// asks its owner to sync now instead of waiting for the cut lag to reach
+    /// `lag_ms`/`lag_bytes`, then parks on the actor's advance notification.
+    /// While the cut has not covered `next` the flag is raised again once per
+    /// `renudge` (a failed poll re-arms itself, but a poll that raced the first
+    /// request could have consumed it before the copy was receipted).
+    ///
+    /// # Errors
+    /// `timeout` elapsed first. Nothing is rolled back; the caller skips its
+    /// re-points and the next pass retries.
+    pub(super) fn wait_through(
+        &self,
+        next: u64,
+        timeout: Duration,
+        renudge: Duration,
+    ) -> Result<(), LocalDbError> {
+        let shared = &self.shared;
+        let deadline = Instant::now() + timeout;
+        let mut guard = shared.advanced.lock();
+        let mut nudge_at = Instant::now();
+        loop {
+            // Acquire pairs with the actor's Release store of the persisted cut.
+            if shared.consistent.load(Ordering::Acquire) >= next {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(LocalDbError::new(format!(
+                    "durable cut did not cover sequence {next} within {timeout:?}"
+                )));
+            }
+            if now >= nudge_at {
+                for state in shared.owners.iter() {
+                    // AcqRel pairs with the poller's swap. Counted only when the
+                    // flag was clear, as the actor counts its own nudges.
+                    if !state.nudge.swap(true, Ordering::AcqRel) {
+                        Shared::bump(&shared.counters.nudges);
+                    }
+                }
+                Shared::bump(&shared.counters.targeted_syncs);
+                nudge_at = now + renudge;
+            }
+            let wake = deadline.min(nudge_at);
+            let _ = shared.advanced_cv.wait_until(&mut guard, wake);
+        }
     }
 
     /// Test hook: receive every cut the actor persists from now on.
@@ -776,6 +859,7 @@ impl DurableCut {
             persist_failures: load(&counters.persist_failures),
             poll_failures: load(&counters.poll_failures),
             certifications: load(&counters.certifications),
+            targeted_syncs: load(&counters.targeted_syncs),
         }
     }
 
@@ -944,6 +1028,7 @@ fn run_actor(
     mut record: CutRecord,
     path: &Path,
     tick: Duration,
+    cuts: &CutSources,
 ) {
     let drain = shared.owners.len() + 8;
     let mut persisted = 0u64;
@@ -1027,6 +1112,28 @@ fn run_actor(
                         .counters
                         .persisted_next
                         .store(persisted, Ordering::Relaxed);
+                    // Version B's frontier for the index loader, published only
+                    // once the record names it: a crash-cut that truncates the
+                    // record must also lower this cut, or the index would flush
+                    // at a `replay_from` recovery no longer covers. Every batch
+                    // below it is owner-synced; a batch replayed from a record
+                    // that lags by a later persist is re-applied idempotently by
+                    // version. Monotone, and Release pairs with `cut`'s Acquire.
+                    shared.consistent.store(persisted, Ordering::Release);
+                    // Wake `wait_through` callers: the store above happens before
+                    // the lock is taken, so a waiter that checked the cut under
+                    // the lock either saw it or is parked when this notify runs.
+                    drop(shared.advanced.lock());
+                    shared.advanced_cv.notify_all();
+                    // The index loader's durable front (A25), fed only from the
+                    // persisted prefix and never from the tracker's live target:
+                    // a native-tier persist still in flight must not let a
+                    // snapshot name a batch the record does not carry. Cold path,
+                    // one monotone advance per persist.
+                    cuts.set_durable(BatchVersion {
+                        epoch: shared.epoch,
+                        sequence: persisted,
+                    });
                     Shared::bump(&shared.counters.persists);
                     #[cfg(test)]
                     if let Some(events) = shared.persisted_events.lock().as_ref() {

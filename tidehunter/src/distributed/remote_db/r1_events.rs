@@ -60,7 +60,7 @@ impl R1EventSlot {
     }
 
     /// One request is about to be sent: claim each victim, then record that
-    /// no walked reference can still need it. Returns the request's
+    /// the native value watermark covers it. Returns the request's
     /// `attempt_id` and the events the reply follows, or `None` if disabled.
     pub(crate) fn claimed(
         &self,
@@ -69,7 +69,6 @@ impl R1EventSlot {
         file_bytes: u64,
         proofs: &[RetireProof],
         witness: &RetirementWitness,
-        install_seq: u64,
     ) -> Option<(u64, Vec<EventId>)> {
         let mut slot = self.0.lock();
         let events = slot.as_mut()?;
@@ -93,25 +92,22 @@ impl R1EventSlot {
                 &[],
                 json!({
                     "seal_generation": proof.seal_generation,
-                    "checkpoint_generation": witness.checkpoint_generation,
-                    "metadata_digest": crate::distributed::r1_events::hex(&witness.metadata_digest),
                     "replay_from": witness.replay_from,
-                    "durable_end": witness.durable_end,
                     "callback_from": witness.callback_from,
-                    "covered_next": witness.covered_next,
                     "persisted_cut_next": witness.persisted_cut_next,
-                    "install_seq": install_seq,
                 }),
             );
-            // Every remote read flight owns its `IndexReadPin` until its
-            // terminal completion, and the walk that chose this victim saw
-            // every reference such a pin retains (see `dead_wal_files`).
+            // The owner revokes the victims' exact namespaces and drains their
+            // target I/O before the unlink; a read that resolves an old
+            // address afterwards fails cleanly (no export) and is never served
+            // a wrong value. The watermark keeps the file itself until both
+            // terms cover it, so this is a drain, not an ordering accident.
             if let Some(id) = events.log.emit(
                 "initiator_cq_drained",
                 file,
                 Some(attempt),
                 claim.as_slice(),
-                json!({"basis": "no_reference_index_pins_to_terminal_cqe"}),
+                json!({"basis": "owner_revoke_and_drain_before_unlink"}),
             ) {
                 drained.push(id);
             }

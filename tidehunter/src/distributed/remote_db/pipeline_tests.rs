@@ -93,7 +93,6 @@ pub(super) fn coordinator_config(
         pipelined_writes: true,
         leased_submit_redrain: true,
         read_cache_bytes: 64 * 1024,
-        index_shards: super::super::native_index::DEFAULT_INDEX_SHARDS,
         read_memory_allowance_bytes: 512 * 1024 * 1024,
         scan_prefetch_pages: 2,
         read_lanes: Some(2),
@@ -104,7 +103,7 @@ pub(super) fn coordinator_config(
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
         relocation_max_reclaim_pct: 100,
-        compactor_cadence: Default::default(),
+        index: Default::default(),
     }
 }
 

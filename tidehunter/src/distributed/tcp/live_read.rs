@@ -24,7 +24,9 @@
 //! values are slices of the aligned I/O blocks (no copy); a retained value keeps
 //! its whole block alive, so a long-lived cache should copy before retaining.
 use super::LiveRecordLocation;
-use super::{Client, CompleteBatch, Mutation, TcpError, ValueRecordReference};
+use super::{Client, TcpError};
+use crate::crc::CrcFrame;
+use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
 use crate::distributed::nvmeof::live_io::{
     LiveCompletion, LiveIo, LiveIoResult, LiveIoStats, LiveSubmitOutcome, NamespaceSlot,
@@ -38,6 +40,7 @@ use crate::distributed::nvmeof::live_storage::{
     FILES_PER_SUBSYSTEM, LiveWalSegment, wal_export_name,
 };
 use crate::distributed::remote_db::ReadTraceChild;
+use minibytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -130,7 +133,7 @@ pub(crate) struct LiveReadToken(u64);
 
 /// Members of one logical read, in caller order.
 pub(crate) struct LiveReadRequest {
-    pub(crate) references: Vec<ValueRecordReference>,
+    pub(crate) positions: Vec<VersionPosition>,
     /// Bound of each submitted flight and grant connect, counted from its own
     /// start. Time a member waits for grant credit does not count.
     pub(crate) timeout: Duration,
@@ -145,10 +148,10 @@ pub(crate) enum LiveReadSubmitError {
     Failed(TcpError),
 }
 
-/// A finished request. On success the values keep the request's member order.
+/// A finished request. On success the member frames keep the request's order.
 pub(crate) struct LiveReadDone {
     pub(crate) token: LiveReadToken,
-    pub(crate) result: Result<Vec<Mutation>, TcpError>,
+    pub(crate) result: Result<Vec<Bytes>, TcpError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,7 +313,10 @@ struct Grant {
 enum GrantScope {
     File(LiveRecordLocation),
     Subsystem {
-        epoch: u64,
+        /// Owner WAL file generation these exports belong to. Grants are keyed
+        /// by the address, never the batch epoch: a relocated position keeps its
+        /// logical batch and names the generation that holds its bytes.
+        generation: u64,
         partition: u32,
         subsystem: u64,
         files_per_subsystem: u64,
@@ -326,25 +332,24 @@ impl GrantScope {
             Self::Subsystem { file_bytes, .. } => *file_bytes,
         }
     }
-    fn covers(&self, reference: &ValueRecordReference) -> bool {
+    fn covers(&self, position: &VersionPosition) -> bool {
         match self {
-            Self::File(location) => grant_matches(&location.segment, reference),
+            Self::File(location) => grant_matches(&location.segment, position),
             Self::Subsystem {
-                epoch,
+                generation,
                 partition,
                 subsystem,
                 files_per_subsystem,
                 file_bytes,
                 ..
             } => {
-                reference.batch_version.epoch == *epoch
-                    && reference.batch_address.partition == *partition
-                    && reference.batch_address.offset / file_bytes / files_per_subsystem
-                        == *subsystem
+                position.address.segment_generation == *generation
+                    && position.address.partition == *partition
+                    && position.address.offset / file_bytes / files_per_subsystem == *subsystem
             }
         }
     }
-    fn slot(&self, reference: &ValueRecordReference) -> Option<NamespaceSlot> {
+    fn slot(&self, position: &VersionPosition) -> Option<NamespaceSlot> {
         match self {
             Self::File(_) => None,
             Self::Subsystem {
@@ -352,13 +357,11 @@ impl GrantScope {
                 file_bytes,
                 slots,
                 ..
-            } => {
-                slots[(reference.batch_address.offset / file_bytes % files_per_subsystem) as usize]
-            }
+            } => slots[(position.address.offset / file_bytes % files_per_subsystem) as usize],
         }
     }
-    fn ready(&self, reference: &ValueRecordReference) -> bool {
-        self.covers(reference) && (matches!(self, Self::File(_)) || self.slot(reference).is_some())
+    fn ready(&self, position: &VersionPosition) -> bool {
+        self.covers(position) && (matches!(self, Self::File(_)) || self.slot(position).is_some())
     }
 }
 
@@ -390,14 +393,14 @@ struct Flight {
 }
 
 struct InFlightRequest {
-    references: Vec<ValueRecordReference>,
+    positions: Vec<VersionPosition>,
     timeout: Duration,
     /// Deadline of the latest submitted flight; `None` while no flight is
     /// outstanding.
     io_deadline: Option<Instant>,
     trace: Option<ReadTraceChild>,
     slots: Vec<Slot>,
-    output: Vec<Option<Mutation>>,
+    output: Vec<Option<Bytes>>,
     /// Members not yet submitted.
     pending: usize,
     /// Index below which no member is `Pending`.
@@ -440,11 +443,17 @@ fn failed(error: impl std::fmt::Display) -> ConnectError {
     ConnectError::Failed(TcpError::component(error))
 }
 
-fn grant_matches(segment: &LiveWalSegment, reference: &ValueRecordReference) -> bool {
-    segment.epoch == reference.batch_version.epoch
-        && segment.partition == reference.batch_address.partition
+/// A file grant covers a position when the position's address names a member of
+/// that grant's generation and file.
+///
+/// The batch epoch is deliberately not compared: relocation and owner
+/// compaction move a value between generations without changing its logical
+/// version, and the bytes live in the generation the address names.
+fn grant_matches(segment: &LiveWalSegment, position: &VersionPosition) -> bool {
+    segment.generation == position.address.segment_generation
+        && segment.partition == position.address.partition
         && segment.bytes != 0
-        && segment.file_index == reference.batch_address.offset / segment.bytes
+        && segment.file_index == position.address.offset / segment.bytes
 }
 
 /// The grant to evict: the least recently used one that is idle and healthy.
@@ -483,38 +492,21 @@ fn drain_failed_io(grant: &mut Grant) {
     }
 }
 
-fn member_range(
-    client: &Client,
-    grant: &Grant,
-    reference: &ValueRecordReference,
-) -> Result<(u64, usize), TcpError> {
+fn member_range(grant: &Grant, position: &VersionPosition) -> Result<(u64, usize), TcpError> {
+    // The position names the member frame itself: `offset` already includes the
+    // batch's 8-byte CRC header and the member's descriptor offset, and `len`
+    // covers the member header plus its native entry. A member never straddles
+    // a WAL file, so the file index computed from it equals the batch's.
     let bytes = grant.scope.file_bytes();
-    let offset = (reference.batch_address.offset % bytes)
-        .checked_add(8)
-        .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
-        .ok_or_else(|| TcpError::new("live record offset overflow"))?;
-    let valid = match &grant.scope {
-        GrantScope::File(location) => client.valid_live_record_geometry(
-            &location.segment,
-            &location.binding,
-            reference,
-            offset,
-            u64::from(reference.descriptor.len),
-        ),
-        GrantScope::Subsystem { epoch, .. } => {
-            reference.batch_version.epoch == *epoch
-                && client.valid_record_range(
-                    bytes,
-                    reference,
-                    offset,
-                    u64::from(reference.descriptor.len),
-                )
-        }
-    };
-    if !valid {
-        return Err(TcpError::new("invalid cached live record geometry"));
+    let offset = position.address.offset % bytes;
+    let len = position.address.len as usize;
+    if len < CrcFrame::CRC_HEADER_LENGTH as usize
+        || !grant.scope.covers(position)
+        || offset.checked_add(len as u64).is_none_or(|end| end > bytes)
+    {
+        return Err(TcpError::new("invalid cached live member geometry"));
     }
-    Ok((offset, reference.descriptor.len as usize))
+    Ok((offset, len))
 }
 
 /// Lane state: file grants, requests in flight and unreleased owner pins.
@@ -597,210 +589,6 @@ impl LiveReadCache {
         self.requests.len()
     }
 
-    /// Only an exclusive idle lane may borrow its cached grant. No control
-    /// exchange, controller setup, eviction or pin release runs on this path.
-    pub(crate) fn inline_ready(&self, reference: &ValueRecordReference) -> bool {
-        self.requests.is_empty()
-            && self.unreleased.is_empty()
-            && self.grants.iter().all(|grant| grant.outstanding() == 0)
-            && self.find_grant(reference).is_some()
-    }
-
-    pub(crate) fn inline_credit(&self, reference: &ValueRecordReference) -> bool {
-        let Some(index) = self.find_grant(reference) else {
-            return false;
-        };
-        let grant = &self.grants[index];
-        let Some(offset) = (reference.batch_address.offset % grant.scope.file_bytes())
-            .checked_add(8)
-            .and_then(|n| n.checked_add(u64::from(reference.descriptor.offset)))
-        else {
-            return false;
-        };
-        let io = grant.inline_io();
-        let (slots, bytes) = io.credit();
-        let charge = match grant.scope.slot(reference) {
-            Some(slot) => {
-                io.read_request_charge_at(slot, &[(offset, reference.descriptor.len as usize)])
-            }
-            None => io.read_request_charge(&[(offset, reference.descriptor.len as usize)]),
-        };
-        charge.is_ok_and(|(needed_slots, charge)| needed_slots <= slots && charge <= bytes)
-    }
-
-    /// Read one member under the lane's exclusive driver/client ownership.
-    /// The cached grant retains the file pin through every terminal CQE,
-    /// including deadline and wait failures. The caller poisons on any error.
-    pub(crate) fn read_inline_cached(
-        &mut self,
-        client: &Client,
-        reference: &ValueRecordReference,
-        deadline: Instant,
-        trace: Option<&ReadTraceChild>,
-    ) -> Result<Vec<Mutation>, TcpError> {
-        let result = self.read_inline_cached_inner(client, reference, deadline, trace);
-        if result.is_err()
-            && let Some(counters) = &client.live_counters
-        {
-            counters.record_error();
-        }
-        result
-    }
-
-    fn read_inline_cached_inner(
-        &mut self,
-        client: &Client,
-        reference: &ValueRecordReference,
-        deadline: Instant,
-        trace: Option<&ReadTraceChild>,
-    ) -> Result<Vec<Mutation>, TcpError> {
-        let index = self
-            .find_grant(reference)
-            .ok_or_else(|| TcpError::new("inline live grant disappeared"))?;
-        let config = client
-            .live_config
-            .as_ref()
-            .ok_or_else(|| TcpError::new("live NVMe is not configured"))?;
-        let deadline = deadline.min(Instant::now() + Duration::from_millis(config.io_timeout_ms));
-        self.clock += 1;
-        let grant = &mut self.grants[index];
-        grant.last_used = self.clock;
-        let ranges = {
-            let _validation =
-                LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
-            [member_range(client, grant, reference)?]
-        };
-        let flight = self.next_flight;
-        self.next_flight += 1;
-        let _io = LiveReadTiming::start(&client.live_counters, LiveTimingStage::ReadIo);
-        let slot = grant.scope.slot(reference);
-        let result = match slot {
-            Some(slot) => grant
-                .inline_io_mut()
-                .submit_reads_at(flight, slot, &ranges, deadline, trace),
-            None => grant
-                .inline_io_mut()
-                .submit_reads_traced(flight, &ranges, deadline, trace),
-        };
-        match result.map_err(TcpError::component)? {
-            LiveSubmitOutcome::Submitted => {}
-            LiveSubmitOutcome::Full => return Err(TcpError::new("inline live credit disappeared")),
-        }
-        if let Some(counters) = &client.live_counters {
-            counters.record_grant_hit();
-            counters.record_lane_inflight(1, grant.outstanding() as u64);
-        }
-        // Past the deadline, retain ownership until the terminal CQE.
-        // LiveIo bounds both polled waits and terminal retirement.
-        let bound = deadline + DRAIN_BOUND;
-        #[cfg(test)]
-        if let Some((entered, resume)) = self.inline_submitted_pause.take() {
-            entered.send(()).unwrap();
-            resume.recv().unwrap();
-        }
-        while Instant::now() < bound {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = if remaining.is_zero() {
-                Duration::from_millis(100)
-            } else {
-                remaining
-            };
-            #[cfg(test)]
-            let waited = if std::mem::take(&mut self.fail_inline_wait) {
-                Err(crate::distributed::nvmeof::live_io::LiveIoError::Invalid(
-                    "injected inline wait failure",
-                ))
-            } else {
-                grant.inline_io_mut().wait(timeout)
-            };
-            #[cfg(not(test))]
-            let waited = grant.inline_io_mut().wait(timeout);
-            if let Err(error) = waited {
-                drain_failed_io(grant);
-                grant.broken = true;
-                if let GrantScope::Subsystem {
-                    epoch, subsystem, ..
-                } = &grant.scope
-                {
-                    self.failed_subsystems.insert((*epoch, *subsystem));
-                }
-                fold_stats(client.live_counters.as_deref(), grant);
-                return Err(TcpError::component(error));
-            }
-            let completions = match grant.inline_io_mut().progress() {
-                Ok(completions) => completions,
-                Err(error) => {
-                    drain_failed_io(grant);
-                    grant.broken = true;
-                    if let GrantScope::Subsystem {
-                        epoch, subsystem, ..
-                    } = &grant.scope
-                    {
-                        self.failed_subsystems.insert((*epoch, *subsystem));
-                    }
-                    fold_stats(client.live_counters.as_deref(), grant);
-                    return Err(TcpError::component(error));
-                }
-            };
-            fold_stats(client.live_counters.as_deref(), grant);
-            if let Some(completion) = completions.into_iter().next() {
-                let _delivery = client
-                    .live_counters
-                    .as_ref()
-                    .map(|counters| LiveReadTiming {
-                        counters: counters.clone(),
-                        stage: LiveTimingStage::Delivery,
-                        started: completion.completed_at,
-                    });
-                if completion.id != flight {
-                    return Err(TcpError::new("unexpected inline live completion"));
-                }
-                let result = match completion.result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        if matches!(
-                            error,
-                            crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
-                        ) && let GrantScope::Subsystem {
-                            epoch, subsystem, ..
-                        } = &grant.scope
-                        {
-                            grant.broken = true;
-                            self.failed_subsystems.insert((*epoch, *subsystem));
-                        }
-                        return Err(TcpError::component(error));
-                    }
-                };
-                let LiveIoResult::Reads(mut records) = result else {
-                    return Err(TcpError::new("unexpected live write completion"));
-                };
-                if records.len() != 1 {
-                    return Err(TcpError::new("live read count mismatch"));
-                }
-                let bytes = records
-                    .pop()
-                    .ok_or_else(|| TcpError::new("missing live read result"))?;
-                let _validation =
-                    LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
-                let value = CompleteBatch::decode_record(&client.shape, reference, bytes)
-                    .map_err(TcpError::component)?;
-                if let Some(trace) = trace {
-                    trace.event("live_validation_completed");
-                }
-                return Ok(vec![value]);
-            }
-        }
-        drain_failed_io(grant);
-        grant.broken = true;
-        if let GrantScope::Subsystem {
-            epoch, subsystem, ..
-        } = &grant.scope
-        {
-            self.failed_subsystems.insert((*epoch, *subsystem));
-        }
-        Err(TcpError::new("inline live read did not retire"))
-    }
-
     /// The lane's waker. Create it once; every clone wakes `wait`.
     pub(crate) fn waker(&mut self) -> Result<LiveReadWaker, TcpError> {
         if let Some(waker) = &self.waker {
@@ -833,9 +621,9 @@ impl LiveReadCache {
         }
         let token = LiveReadToken(self.next_token);
         self.next_token += 1;
-        let members = request.references.len();
+        let members = request.positions.len();
         let mut state = InFlightRequest {
-            references: request.references,
+            positions: request.positions,
             timeout: request.timeout,
             io_deadline: None,
             trace: request.trace,
@@ -874,7 +662,7 @@ impl LiveReadCache {
                 Ok(completions) => {
                     fold_stats(client.live_counters.as_deref(), &mut self.grants[index]);
                     for completion in completions {
-                        self.complete_flight(client, completion)?;
+                        self.complete_flight(completion)?;
                     }
                 }
                 Err(error) => self.fail_grant(client, index, &error),
@@ -995,10 +783,12 @@ impl LiveReadCache {
         let mut grant = self.grants.remove(index);
         if grant.broken
             && let GrantScope::Subsystem {
-                epoch, subsystem, ..
+                generation,
+                subsystem,
+                ..
             } = &grant.scope
         {
-            self.failed_subsystems.insert((*epoch, *subsystem));
+            self.failed_subsystems.insert((*generation, *subsystem));
         }
         fold_stats(client.live_counters.as_deref(), &mut grant);
         let token = grant.token;
@@ -1036,10 +826,10 @@ impl LiveReadCache {
         }
     }
 
-    fn find_grant(&self, reference: &ValueRecordReference) -> Option<usize> {
+    fn find_grant(&self, position: &VersionPosition) -> Option<usize> {
         self.grants
             .iter()
-            .position(|grant| !grant.broken && grant.scope.ready(reference))
+            .position(|grant| !grant.broken && grant.scope.ready(position))
     }
 
     /// Starts as many of the request's pending members as credit allows. A
@@ -1085,7 +875,7 @@ impl LiveReadCache {
         let mut blocked: Vec<u64> = Vec::new();
         let mut no_new_grant = false;
         // Each pass starts members, blocks one grant, or stops new grants.
-        for _ in 0..state.references.len() + LIVE_READ_CACHE_CAPACITY + 2 {
+        for _ in 0..state.positions.len() + LIVE_READ_CACHE_CAPACITY + 2 {
             let Some((position, found)) = self.next_group(state, &blocked, no_new_grant) else {
                 return Ok(());
             };
@@ -1124,7 +914,7 @@ impl LiveReadCache {
             if state.slots[position] != Slot::Pending {
                 continue;
             }
-            match self.find_grant(&state.references[position]) {
+            match self.find_grant(&state.positions[position]) {
                 Some(index) if !blocked.contains(&self.grants[index].id) => {
                     return Some((position, Some(index)));
                 }
@@ -1145,9 +935,13 @@ impl LiveReadCache {
         position: usize,
         connect_timeout: Duration,
     ) -> Result<Opened, TcpError> {
-        // Active-generation records are read through the permanent per-owner
-        // export; older fencing generations resolve a pinned read-only grant.
-        if client.live_config.is_some() && state.references[position].batch_version.epoch == epoch {
+        // A member whose address names this open's generation is read through
+        // the permanent per-owner export; another generation (a relocated or
+        // older position) resolves a pinned read-only grant. Selection is by the
+        // address, never the batch epoch.
+        if client.live_config.is_some()
+            && state.positions[position].address.segment_generation == epoch
+        {
             return self.open_permanent(client, epoch, state, position, connect_timeout);
         }
         if self.grants.len() >= LIVE_READ_CACHE_CAPACITY {
@@ -1175,7 +969,7 @@ impl LiveReadCache {
         }
         let locations = {
             let _control = LiveReadTiming::start(&client.live_counters, LiveTimingStage::Control);
-            client.resolve_live_records(epoch, std::slice::from_ref(&state.references[position]))?
+            client.resolve_live_records(epoch, &[state.positions[position].address])?
         };
         if let Some(trace) = &state.trace {
             trace.event("live_resolve_completed");
@@ -1224,9 +1018,9 @@ impl LiveReadCache {
         position: usize,
         connect_timeout: Duration,
     ) -> Result<Opened, TcpError> {
-        let reference = &state.references[position];
+        let position_ref = &state.positions[position];
         let file_bytes = client.expected.wal_file_bytes;
-        let file = reference.batch_address.offset / file_bytes;
+        let file = position_ref.address.offset / file_bytes;
         let files = FILES_PER_SUBSYSTEM;
         self.failed_subsystems
             .retain(|(current, _)| *current == epoch);
@@ -1265,7 +1059,7 @@ impl LiveReadCache {
         if let Some(index) = self
             .grants
             .iter()
-            .position(|grant| !grant.broken && grant.scope.covers(reference))
+            .position(|grant| !grant.broken && grant.scope.covers(position_ref))
         {
             let grant = &mut self.grants[index];
             let _setup =
@@ -1334,7 +1128,9 @@ impl LiveReadCache {
             }
         }
         let scope = GrantScope::Subsystem {
-            epoch,
+            // Entering this path means the member's address names the active
+            // generation, which is this open's fencing epoch.
+            generation: epoch,
             partition: client.expected.partition,
             subsystem: name.subsystem,
             files_per_subsystem: files,
@@ -1600,14 +1396,13 @@ impl LiveReadCache {
                 if state.slots[position] != Slot::Pending {
                     continue;
                 }
-                let reference = &state.references[position];
-                let file = reference.batch_address.offset / grant.scope.file_bytes();
-                if !grant.scope.ready(reference) || selected_file.is_some_and(|first| first != file)
-                {
+                let member = &state.positions[position];
+                let file = member.address.offset / grant.scope.file_bytes();
+                if !grant.scope.ready(member) || selected_file.is_some_and(|first| first != file) {
                     continue;
                 }
                 selected_file = Some(file);
-                let (offset, len) = member_range(client, grant, reference)?;
+                let (offset, len) = member_range(grant, member)?;
                 if selected.len() == 32 {
                     break;
                 }
@@ -1619,7 +1414,7 @@ impl LiveReadCache {
         // shorten at most 32 times. Do not binary-search: a later bridging
         // range can reduce the SQE count of an earlier prefix.
         for _ in 0..ranges.len() {
-            let slot = grant.scope.slot(&state.references[selected[0]]);
+            let slot = grant.scope.slot(&state.positions[selected[0]]);
             let charge = match slot {
                 Some(slot) => grant.io.read_request_charge_at(slot, &ranges),
                 None => grant.io.read_request_charge(&ranges),
@@ -1639,7 +1434,7 @@ impl LiveReadCache {
         }
         let flight = self.next_flight;
         let deadline = Instant::now() + io_timeout.min(state.timeout);
-        let slot = grant.scope.slot(&state.references[selected[0]]);
+        let slot = grant.scope.slot(&state.positions[selected[0]]);
         let submitted = match slot {
             Some(slot) => {
                 grant
@@ -1715,11 +1510,7 @@ impl LiveReadCache {
         self.requests.get(&token)?.io_deadline
     }
 
-    fn complete_flight(
-        &mut self,
-        client: &Client,
-        completion: LiveCompletion,
-    ) -> Result<(), TcpError> {
+    fn complete_flight(&mut self, completion: LiveCompletion) -> Result<(), TcpError> {
         let Some(flight) = self.flights.remove(&completion.id) else {
             return Err(TcpError::new("unexpected live read completion"));
         };
@@ -1732,8 +1523,7 @@ impl LiveReadCache {
         match completion.result {
             Ok(LiveIoResult::Reads(records)) => {
                 if state.error.is_none()
-                    && let Err(error) =
-                        Self::decode_flight(client, state, &flight.positions, records)
+                    && let Err(error) = Self::deliver_members(state, &flight.positions, records)
                 {
                     state.fail(error);
                     cancel = true;
@@ -1764,34 +1554,36 @@ impl LiveReadCache {
             // their flight records until that list and the ring are drained.
             grant.broken = true;
             if let GrantScope::Subsystem {
-                epoch, subsystem, ..
+                generation,
+                subsystem,
+                ..
             } = &grant.scope
             {
-                self.failed_subsystems.insert((*epoch, *subsystem));
+                self.failed_subsystems.insert((*generation, *subsystem));
             }
         }
         Ok(())
     }
 
-    fn decode_flight(
-        client: &Client,
+    /// Hand the member frames of one harvested flight to their request slots.
+    ///
+    /// No keyspace, key or descriptor is available here by design: the lane
+    /// transfers exactly the bytes the position names, and the caller verifies
+    /// the position's CRC and decodes the native entry.
+    fn deliver_members(
         state: &mut InFlightRequest,
-        positions: &[usize],
+        slots: &[usize],
         records: Vec<minibytes::Bytes>,
     ) -> Result<(), TcpError> {
-        if records.len() != positions.len() {
+        if records.len() != slots.len() {
             return Err(TcpError::new("live read count mismatch"));
         }
-        let _validation = LiveReadTiming::start(&client.live_counters, LiveTimingStage::Validation);
-        for (&position, bytes) in positions.iter().zip(records) {
-            let mutation =
-                CompleteBatch::decode_record(&client.shape, &state.references[position], bytes)
-                    .map_err(TcpError::component)?;
-            state.output[position] = Some(mutation);
+        for (&position, bytes) in slots.iter().zip(records) {
+            state.output[position] = Some(bytes);
             state.slots[position] = Slot::Done;
         }
         if let Some(trace) = &state.trace {
-            trace.event("live_validation_completed");
+            trace.event("live_members_delivered");
         }
         Ok(())
     }
@@ -1805,10 +1597,12 @@ impl LiveReadCache {
         drain_failed_io(grant);
         grant.broken = true;
         if let GrantScope::Subsystem {
-            epoch, subsystem, ..
+            generation,
+            subsystem,
+            ..
         } = &grant.scope
         {
-            self.failed_subsystems.insert((*epoch, *subsystem));
+            self.failed_subsystems.insert((*generation, *subsystem));
         }
         fold_stats(client.live_counters.as_deref(), grant);
         let id = grant.id;
@@ -1881,19 +1675,72 @@ impl Client {
         self.live_counters.clone()
     }
 
-    /// Blocking read of `references` through `cache`. For callers that own a
+    /// Read one member frame by index position (the raw `[length][crc][entry]`
+    /// bytes). Integrity and decoding are the value reader's: the lane only
+    /// transfers the exact range the position names.
+    pub(crate) fn read_record(
+        &mut self,
+        epoch: u64,
+        position: &VersionPosition,
+    ) -> Result<Bytes, TcpError> {
+        self.read_records(epoch, std::slice::from_ref(position))?
+            .pop()
+            .ok_or_else(|| TcpError::new("empty record response"))
+    }
+    /// Direct live reads with a fresh published-index cache. The read-service
+    /// lanes retain their own bounded, trusted-index grants across requests.
+    pub(crate) fn read_records(
+        &mut self,
+        epoch: u64,
+        positions: &[VersionPosition],
+    ) -> Result<Vec<Bytes>, TcpError> {
+        if self.live_config.is_none() {
+            return Err(TcpError::new("reads require live NVMe-oF configuration"));
+        }
+        if !self.live_unreleased_tokens.is_empty() {
+            return Err(TcpError::new("live read has quarantined owner grants"));
+        }
+        let mut cache = LiveReadCache::default();
+        let result = self.live_read_records(
+            &mut cache,
+            epoch,
+            positions,
+            Instant::now() + self.timeout,
+            None,
+        );
+        let cleanup = cache.close(self, epoch);
+        self.live_unreleased_tokens.extend(
+            cache
+                .take_unreleased()
+                .into_iter()
+                .map(|token| (epoch, token)),
+        );
+        // Live I/O and validation clocks come from live_nvmeof_stats.
+        match (result, cleanup) {
+            (Ok(values), Ok(())) => Ok(values),
+            (Err(error), Ok(())) => Err(error),
+            (result, Err(cleanup)) => {
+                self.broken = true;
+                Err(TcpError::new(format!(
+                    "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
+                    result.err(),
+                )))
+            }
+        }
+    }
+    /// Blocking read of `positions` through `cache`. For callers that own a
     /// lane exclusively and keep one request at a time; lane workers use the
     /// multi-flight calls of [`LiveReadCache`] instead.
     pub(crate) fn live_read_records(
         &mut self,
         cache: &mut LiveReadCache,
         epoch: u64,
-        references: &[ValueRecordReference],
+        positions: &[VersionPosition],
         deadline: Instant,
         trace: Option<&ReadTraceChild>,
-    ) -> Result<Vec<Mutation>, TcpError> {
+    ) -> Result<Vec<Bytes>, TcpError> {
         let request = LiveReadRequest {
-            references: references.to_vec(),
+            positions: positions.to_vec(),
             timeout: deadline.saturating_duration_since(Instant::now()),
             trace: trace.cloned(),
         };
@@ -1917,13 +1764,17 @@ impl Client {
     }
 }
 
+mod inline;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::distributed::codec::CompleteBatch;
     use crate::distributed::nvmeof::live_namespace::LiveNamespace;
     use crate::distributed::test_bounds::PROGRESS_CAP;
     use crate::distributed::types::PhysicalValueAddress;
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
 
     /// Ported from the per-file active-epoch export fixture: on-demand and
     /// per-file export modes were removed (R2), active-epoch exports are now
@@ -2088,19 +1939,22 @@ pub(crate) mod tests {
     pub(crate) fn install_owner_local(
         cache: &mut LiveReadCache,
         node: &super::super::StorageNode,
-        reference: ValueRecordReference,
+        position: VersionPosition,
     ) -> std::path::PathBuf {
         use crate::distributed::nvmeof::live_storage::LiveTargetBinding;
+        // The position names the member frame itself: no descriptor to derive it from.
+        let member = position.address;
+        let generation = member.segment_generation;
         let mut inventory = node.inventory.lock();
         let lease = inventory
-            .active(reference.batch_version.epoch)
+            .active(generation)
             .unwrap()
-            .resolve_live_record(&reference)
+            .resolve_live_member(member)
             .unwrap();
         let segment = lease.segment.clone();
         let path = segment.path.clone();
         let location = LiveRecordLocation {
-            reference,
+            member,
             offset: lease.offset,
             len: u64::from(lease.len),
             binding: LiveTargetBinding {
@@ -2121,7 +1975,7 @@ pub(crate) mod tests {
         assert!(
             inventory
                 .live_pins
-                .insert(token, (reference.batch_version.epoch, vec![lease]))
+                .insert(token, (generation, vec![lease]))
                 .is_none()
         );
         drop(inventory);
@@ -2224,28 +2078,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cached_scalar_corruption_returns_credit_and_records_error() {
+    fn cached_scalar_corruption_returns_credit_and_the_hybrid_decode_refuses() {
         let mut lane = lane(4);
         let before = local_snapshot(&lane.cache);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(lane._dir.path().join("wal-0"))
             .unwrap();
-        let offset = 8 + u64::from(lane.a.descriptor.offset) + u64::from(lane.a.descriptor.len) - 1;
+        let offset = lane.a.address.offset % 8192 + u64::from(lane.a.address.len) - 1;
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&[0xff]).unwrap();
-        assert!(
-            lane.cache
-                .read_inline_cached(
-                    &lane.client,
-                    &lane.a,
-                    Instant::now() + Duration::from_secs(10),
-                    None
-                )
-                .is_err()
-        );
+        // The primitive returns the bytes and releases the credit; the payload
+        // CRC is refused upstream by `hybrid::read::decode_entry_at`.
+        let frame = lane
+            .cache
+            .read_inline_cached(
+                &lane.client,
+                &lane.a,
+                Instant::now() + Duration::from_secs(10),
+                None,
+            )
+            .expect("the primitive returns the corrupted member bytes");
+        assert_ne!(crc32fast::hash(&frame[0][8..]), lane.a.payload_crc);
         assert_eq!(local_snapshot(&lane.cache), before);
-        assert_eq!(lane.metrics.snapshot().counts.errors, 1);
     }
 
     #[test]
@@ -2300,7 +2155,6 @@ pub(crate) mod tests {
     fn local_file_reads_decode_order_duplicates_and_corruption() {
         let dir = tempdir::TempDir::new("live-read-members").unwrap();
         let config = super::super::tests::config(dir.path());
-        let shape = crate::key_shape::KeyShape::from_yaml(&config.shape_yaml).unwrap();
         let first = super::super::tests::batch(&config, 1, 0);
         let second = super::super::tests::batch(&config, 1, 1);
         let address = |offset, batch: &CompleteBatch| PhysicalValueAddress {
@@ -2309,8 +2163,8 @@ pub(crate) mod tests {
             offset,
             len: (batch.encoded().len() + 8) as u32,
         };
-        let a = first.record_reference(address(0, &first), 0).unwrap();
-        let b = second.record_reference(address(2048, &second), 0).unwrap();
+        let a = position(address(0, &first), &first);
+        let b = position(address(2048, &second), &second);
         let path = dir.path().join("wal");
         let mut file = std::fs::File::create(&path).unwrap();
         file.set_len(8192).unwrap();
@@ -2323,15 +2177,10 @@ pub(crate) mod tests {
             LiveNamespace::open_local_file(&path, 8192, 4096, LiveNamespaceAccess::ReadOnly)
                 .unwrap();
         let mut io = LiveIo::new(namespace, 4, 65536, false).unwrap();
-        let refs = [b, a, b];
-        let ranges: Vec<_> = refs
+        let positions = [b, a, b];
+        let ranges: Vec<_> = positions
             .iter()
-            .map(|r| {
-                (
-                    r.batch_address.offset + 8 + u64::from(r.descriptor.offset),
-                    r.descriptor.len as usize,
-                )
-            })
+            .map(|p| (p.address.offset % 8192, p.address.len as usize))
             .collect();
         let deadline = Instant::now() + Duration::from_secs(10);
         assert_eq!(
@@ -2348,25 +2197,45 @@ pub(crate) mod tests {
         let LiveIoResult::Reads(records) = completion.result.unwrap() else {
             panic!("expected member reads")
         };
-        let values: Vec<_> = refs
-            .iter()
-            .zip(&records)
-            .map(|(reference, bytes)| {
-                CompleteBatch::decode_record(&shape, reference, bytes.clone()).unwrap()
-            })
-            .collect();
-        assert_eq!(
-            values,
-            vec![
-                second.mutations()[0].clone(),
-                first.mutations()[0].clone(),
-                second.mutations()[0].clone()
-            ]
-        );
+        // The transport returns exactly the member frame of each requested
+        // position, in request order. Expectation comes from the batch encoding,
+        // not from the file the lane reads, so an address bug cannot move both.
+        let expected = vec![
+            member_frame(&second, &b),
+            member_frame(&first, &a),
+            member_frame(&second, &b),
+        ];
+        assert_eq!(records, expected);
+        // Each fetched frame carries a length header that matches its payload;
+        // bytes 4..8 are the identity checksum, not a plain CRC of the entry.
+        let batches = [&second, &first, &second];
+        for (frame, batch) in records.iter().zip(batches) {
+            let declared = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+            assert_eq!(declared, frame.len() - 8);
+            match crate::db::WalEntry::from_bytes(Bytes::copy_from_slice(&frame[8..])) {
+                crate::db::WalEntry::Record(_, key, value, _) => {
+                    let crate::distributed::codec::Mutation::Put {
+                        key: expected_key,
+                        value: expected_value,
+                        ..
+                    } = &batch.mutations()[0]
+                    else {
+                        panic!("fixture batch holds a put");
+                    };
+                    assert_eq!(&key, expected_key);
+                    assert_eq!(&value, expected_value);
+                }
+                _ => panic!("member entry is a record"),
+            }
+        }
         let mut corrupt = records[0].to_vec();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
-        assert!(CompleteBatch::decode_record(&shape, &b, corrupt.into()).is_err());
+        // The reader's integrity check is the payload CRC over `frame[8..]`.
+        assert_ne!(
+            crc32fast::hash(&corrupt[8..]),
+            crc32fast::hash(&records[0][8..])
+        );
         assert!(io.shutdown().unwrap().is_empty());
     }
 
@@ -2431,10 +2300,48 @@ pub(crate) mod tests {
         metrics: Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics>,
         first: CompleteBatch,
         second: CompleteBatch,
-        a: ValueRecordReference,
-        b: ValueRecordReference,
+        a: VersionPosition,
+        b: VersionPosition,
         // Keeps the node behind the client alive.
         _running: super::super::tests::multiplexed::Running,
+    }
+
+    /// The member position of a fixture batch's first record at `batch_address`.
+    ///
+    /// `payload_crc` is `crc32` of the member's native entry — the slice a
+    /// publisher CRCs and the slice the reader recomputes — not the identity
+    /// `MemberChecksum` stored at bytes 4..8 of the member frame, which binds
+    /// identity, version, bounds and the entry and is not a plain CRC.
+    fn position(batch_address: PhysicalValueAddress, batch: &CompleteBatch) -> VersionPosition {
+        let descriptor = batch.record_descriptors()[0];
+        let entry = &batch.encoded()
+            [descriptor.offset as usize + 8..(descriptor.offset + descriptor.len) as usize];
+        VersionPosition::member(
+            batch.version(),
+            batch_address,
+            0,
+            descriptor,
+            crc32fast::hash(entry),
+        )
+    }
+
+    /// The member frame `position` names, derived from the batch encoding
+    /// rather than from the file the lane will read.
+    ///
+    /// Deriving it here is what makes the oracle independent: a wrong `+8` in
+    /// `VersionPosition::member` would otherwise move the read and the
+    /// expectation together and still pass. The descriptor is the same one the
+    /// position was built from, so the length must agree as well.
+    fn member_frame(batch: &CompleteBatch, position: &VersionPosition) -> Bytes {
+        let descriptor = batch.record_descriptors()[position.operation_index as usize];
+        assert_eq!(
+            descriptor.len, position.address.len,
+            "the position names this member's frame"
+        );
+        Bytes::copy_from_slice(
+            &batch.encoded()
+                [descriptor.offset as usize..(descriptor.offset + descriptor.len) as usize],
+        )
     }
 
     /// A lane over two local-file grants: `a` lives in file 0, `b` in file 1.
@@ -2456,8 +2363,8 @@ pub(crate) mod tests {
             offset,
             len: (batch.encoded().len() + 8) as u32,
         };
-        let a = first.record_reference(address(0, &first), 0).unwrap();
-        let b = second.record_reference(address(8192, &second), 0).unwrap();
+        let a = position(address(0, &first), &first);
+        let b = position(address(8192, &second), &second);
         let mut client = running.client();
         let metrics = LiveNvmeMetrics::new();
         client.live_counters = Some(metrics.register().unwrap());
@@ -2479,7 +2386,7 @@ pub(crate) mod tests {
             queue_geometry: Default::default(),
         });
         let mut cache = LiveReadCache::with_max_requests(4);
-        for (file, (batch, reference)) in [(&first, a), (&second, b)].into_iter().enumerate() {
+        for (file, (batch, position)) in [(&first, a), (&second, b)].into_iter().enumerate() {
             let path = dir.path().join(format!("wal-{file}"));
             let mut data = std::fs::File::create(&path).unwrap();
             data.set_len(8192).unwrap();
@@ -2518,7 +2425,7 @@ pub(crate) mod tests {
             cache.grants.push(Grant {
                 id: file as u64 + 1,
                 scope: GrantScope::File(LiveRecordLocation {
-                    reference,
+                    member: position.address,
                     segment,
                     binding,
                     offset: 0,
@@ -2563,28 +2470,26 @@ pub(crate) mod tests {
         assert!(lane.collect(1)[0].result.is_err());
         assert!(lane.cache.failed_subsystems.is_empty());
         assert!(!lane.cache.grants[0].broken);
-        // The real ring returns corrupt fixture bytes. The existing CRC check
-        // must reject them without a controller quarantine.
+        // The real ring returns these corrupted fixture bytes. The lane transfers
+        // them; the reader's CRC over the frame is what rejects them, so the
+        // corruption must not quarantine the subsystem.
         use std::os::unix::fs::FileExt;
         std::fs::OpenOptions::new()
             .write(true)
             .open(lane._dir.path().join("wal-0"))
             .unwrap()
-            .write_all_at(
-                &vec![0; a.descriptor.len as usize],
-                8 + u64::from(a.descriptor.offset),
-            )
+            .write_all_at(&vec![0; a.address.len as usize], a.address.offset % 8192)
             .unwrap();
-        assert!(
-            lane.cache
-                .read_inline_cached(
-                    &lane.client,
-                    &a,
-                    Instant::now() + Duration::from_secs(1),
-                    None
-                )
-                .is_err()
-        );
+        let corrupt = lane
+            .cache
+            .read_inline_cached(
+                &lane.client,
+                &a,
+                Instant::now() + Duration::from_secs(1),
+                None,
+            )
+            .expect("the transfer completes");
+        assert_ne!(crc32fast::hash(&corrupt[0][8..]), a.payload_crc);
         assert!(lane.cache.failed_subsystems.is_empty());
         assert!(!lane.cache.grants[0].broken);
     }
@@ -2641,7 +2546,7 @@ pub(crate) mod tests {
         lane.cache.grants.push(Grant {
             id: 1,
             scope: GrantScope::Subsystem {
-                epoch: 1,
+                generation: 1,
                 partition: 2,
                 subsystem: 0,
                 files_per_subsystem: 1024,
@@ -2706,7 +2611,7 @@ pub(crate) mod tests {
             1,
             member(2),
             GrantScope::Subsystem {
-                epoch: 1,
+                generation: 1,
                 partition: 2,
                 subsystem: 0,
                 files_per_subsystem: 1024,
@@ -2731,21 +2636,66 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn subsystem_grant_reads_two_files_as_two_flights_and_checks_epoch() {
+    fn subsystem_grant_reads_two_files_as_two_flights_and_checks_generation() {
         let mut lane = subsystem_lane();
         assert!(lane.cache.inline_ready(&lane.a));
         assert!(lane.cache.inline_ready(&lane.b));
         let mut unattached = lane.a;
-        unattached.batch_address.offset += 2 * 8192;
+        unattached.address.offset += 2 * 8192;
         assert!(!lane.cache.inline_ready(&unattached));
-        let mut other_epoch = lane.a;
-        other_epoch.batch_version.epoch = 2;
+        // A member whose address names another generation is not covered by a
+        // grant of this generation, however its logical batch compares.
+        let mut other_generation = lane.a;
+        other_generation.address.segment_generation = 2;
         assert_eq!(
-            member_range(&lane.client, &lane.cache.grants[0], &other_epoch)
+            member_range(&lane.cache.grants[0], &other_generation)
                 .unwrap_err()
                 .to_string(),
-            "invalid cached live record geometry"
+            "invalid cached live member geometry"
         );
+        // The positive half of decision (a): a position whose *batch* epoch is
+        // older than its address generation, served by that generation's grant.
+        // The second grant covers the same file range in generation 2, so the
+        // only difference from the refused case is which grant is asked.
+        let second_generation = GrantScope::Subsystem {
+            generation: 2,
+            partition: 2,
+            subsystem: 0,
+            files_per_subsystem: 1024,
+            file_bytes: 8192,
+            slots: vec![None; 1024],
+        };
+        let mut second = Grant {
+            id: lane.cache.grants[0].id + 100,
+            scope: second_generation,
+            token: None,
+            io: LiveIo::new(
+                LiveNamespace::open_local_file(
+                    &lane._dir.path().join("wal-0"),
+                    8192,
+                    4096,
+                    LiveNamespaceAccess::ReadOnly,
+                )
+                .unwrap(),
+                4,
+                16 * (4096 + 4095),
+                false,
+            )
+            .unwrap(),
+            inline_io: None,
+            inline_recorded: LiveIoStats::default(),
+            recorded: LiveIoStats::default(),
+            last_used: 0,
+            broken: false,
+            lease: None,
+        };
+        second.recorded = second.io.stats();
+        lane.cache.grants.push(second);
+        let served = &lane.cache.grants[1];
+        // `batch.epoch = 1` is older than the address generation 2 and must not
+        // matter: the grant is selected by the address.
+        assert!(member_range(served, &other_generation).is_ok());
+        assert!(served.scope.covers(&other_generation));
         let (a, b) = (lane.a, lane.b);
         let token = lane.submit(vec![a, b, a]);
         assert_eq!(lane.cache.flights.len(), 2);
@@ -2754,9 +2704,9 @@ pub(crate) mod tests {
         assert_eq!(
             done[0].result.as_ref().unwrap(),
             &vec![
-                lane.first.mutations()[0].clone(),
-                lane.second.mutations()[0].clone(),
-                lane.first.mutations()[0].clone()
+                member_frame(&lane.first, &a),
+                member_frame(&lane.second, &b),
+                member_frame(&lane.first, &a)
             ]
         );
         assert_eq!(lane.metrics.snapshot().counts.completed_read_ops, 2);
@@ -2785,7 +2735,7 @@ pub(crate) mod tests {
         assert_eq!(after.metadata_requests, before.metadata_requests);
         assert_eq!(after.namespace_connects, before.namespace_connects);
         let mut state = InFlightRequest {
-            references: vec![a],
+            positions: vec![a],
             timeout: Duration::from_secs(1),
             io_deadline: None,
             trace: None,
@@ -2800,7 +2750,7 @@ pub(crate) mod tests {
             retry_at: None,
             connect_since: None,
         };
-        state.references[0].batch_version.epoch = 2;
+        state.positions[0].address.segment_generation = 2;
         let _ =
             lane.cache
                 .open_permanent(&mut lane.client, 2, &mut state, 0, Duration::from_secs(1));
@@ -2809,7 +2759,7 @@ pub(crate) mod tests {
                 .cache
                 .failed_subsystems
                 .iter()
-                .any(|(epoch, _)| *epoch == 1)
+                .any(|(generation, _)| *generation == 1)
         );
     }
 
@@ -2869,14 +2819,16 @@ pub(crate) mod tests {
         ));
         for _ in 0..2 {
             let a = lane.a;
+            let frame = member_frame(&lane.first, &a);
             lane.submit(vec![a]);
             let done = lane.collect(1);
-            assert_eq!(done[0].result.as_ref().unwrap(), lane.first.mutations());
+            assert_eq!(done[0].result.as_ref().unwrap(), &vec![frame]);
             assert!(!lane.cache.inline_ready(&lane.b));
             let b = lane.b;
+            let frame = member_frame(&lane.second, &b);
             lane.submit(vec![b]);
             let done = lane.collect(1);
-            assert_eq!(done[0].result.as_ref().unwrap(), lane.second.mutations());
+            assert_eq!(done[0].result.as_ref().unwrap(), &vec![frame]);
             assert!(lane.cache.inline_ready(&lane.b));
             lane.cache.retire(&mut lane.client, 1, 0).unwrap();
             assert!(lane.cache.failed_subsystems.is_empty());
@@ -2891,9 +2843,9 @@ pub(crate) mod tests {
     }
 
     impl Lane {
-        fn submit(&mut self, references: Vec<ValueRecordReference>) -> LiveReadToken {
+        fn submit(&mut self, positions: Vec<VersionPosition>) -> LiveReadToken {
             let request = LiveReadRequest {
-                references,
+                positions,
                 timeout: Duration::from_secs(10),
                 trace: None,
             };
@@ -2936,8 +2888,8 @@ pub(crate) mod tests {
             found.result.as_ref().ok().unwrap().clone()
         };
         let (one, two) = (
-            lane.first.mutations()[0].clone(),
-            lane.second.mutations()[0].clone(),
+            member_frame(&lane.first, &a),
+            member_frame(&lane.second, &b),
         );
         assert_eq!(result(first), vec![one.clone()]);
         assert_eq!(result(second), vec![two.clone(), one, two]);
@@ -2968,7 +2920,7 @@ pub(crate) mod tests {
         let other = lane.submit(vec![a]);
         assert_eq!(lane.cache.requests[&other].pending, 1);
         let done = lane.collect(2);
-        let one = lane.first.mutations()[0].clone();
+        let one = member_frame(&lane.first, &a);
         for finished in &done {
             let values = finished.result.as_ref().ok().unwrap();
             assert!(values.iter().all(|value| *value == one));
@@ -2999,10 +2951,8 @@ pub(crate) mod tests {
         assert_eq!((request.pending, request.flights), (0, 1));
         assert_eq!(lane.cache.grants[0].io.outstanding(), 1);
         let mut done = lane.collect(1);
-        assert_eq!(
-            done.pop().unwrap().result.unwrap(),
-            vec![lane.first.mutations()[0].clone(); 8]
-        );
+        let one = member_frame(&lane.first, &lane.a);
+        assert_eq!(done.pop().unwrap().result.unwrap(), vec![one; 8]);
         assert_eq!(lane.cache.grants[0].io.stats().completed_read_ops, 1);
         assert_eq!(lane.cache.grants[0].io.credit(), (1, 4096 + 4095));
     }
@@ -3011,7 +2961,9 @@ pub(crate) mod tests {
     fn lane_rejects_invalid_cached_member_geometry_before_io() {
         let mut lane = lane(4);
         let mut outside = lane.a;
-        outside.descriptor.offset = outside.batch_address.len;
+        // A member that would run past the end of its WAL file is not read: the
+        // lane rejects the geometry before submitting any I/O.
+        outside.address.offset = 8192 - u64::from(outside.address.len) + 1;
         let invalid = lane.submit(vec![outside]);
         assert!(
             lane.cache
@@ -3039,21 +2991,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn lane_fails_a_corrupt_member_alone_and_keeps_serving_other_requests() {
+    fn lane_keeps_serving_after_a_corrupt_member_and_the_reader_rejects_it() {
         let mut lane = lane(4);
         let (a, b) = (lane.a, lane.b);
-        let mut corrupt = a;
-        corrupt.descriptor.checksum.0 ^= 1;
-        let bad = lane.submit(vec![corrupt]);
+        // The lane transfers bytes; integrity is the reader's CRC over the
+        // fetched frame. Corrupt one byte of `a`'s entry in the owner file.
+        let offset = a.address.offset % 8192 + u64::from(a.address.len) - 1;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(lane._dir.path().join("wal-0"))
+            .unwrap()
+            .write_all_at(&[0xff], offset)
+            .unwrap();
+        let bad = lane.submit(vec![a]);
         let good = lane.submit(vec![b]);
         let done = lane.collect(2);
-        assert!(
-            done.iter()
-                .find(|d| d.token == bad)
-                .unwrap()
-                .result
-                .is_err()
-        );
+        let corrupt = done.iter().find(|d| d.token == bad).unwrap();
+        let frame = corrupt.result.as_ref().expect("the transfer completes");
+        assert_ne!(crc32fast::hash(&frame[0][8..]), a.payload_crc);
         assert!(
             done.iter()
                 .find(|d| d.token == good)
@@ -3061,9 +3016,8 @@ pub(crate) mod tests {
                 .result
                 .is_ok()
         );
-        assert_eq!(lane.metrics.snapshot().counts.errors, 1);
-        // The grant survived the verification failure and serves the next read.
-        let again = lane.submit(vec![a]);
+        // The grant survived the corrupted member and serves the next read.
+        let again = lane.submit(vec![b]);
         let done = lane.collect(1);
         assert_eq!(done[0].token, again);
         assert!(done[0].result.is_ok());
@@ -3078,12 +3032,12 @@ pub(crate) mod tests {
             lane.submit(vec![a]);
         }
         let request = LiveReadRequest {
-            references: vec![a],
+            positions: vec![a],
             timeout: Duration::from_secs(10),
             trace: None,
         };
         match lane.cache.submit(&mut lane.client, 1, request) {
-            Err(LiveReadSubmitError::Full(request)) => assert_eq!(request.references.len(), 1),
+            Err(LiveReadSubmitError::Full(request)) => assert_eq!(request.positions.len(), 1),
             _ => panic!("a full lane must hand the request back"),
         }
         lane.collect(4);
@@ -3100,7 +3054,7 @@ pub(crate) mod tests {
         let first = lane.submit(vec![a]);
         let timeout = Duration::from_millis(50);
         let request = LiveReadRequest {
-            references: vec![a],
+            positions: vec![a],
             timeout,
             trace: None,
         };
@@ -3112,7 +3066,7 @@ pub(crate) mod tests {
         assert_eq!(lane.cache.io_deadline(parked), None);
         std::thread::sleep(3 * timeout);
         let done = lane.collect(2);
-        let one = lane.first.mutations()[0].clone();
+        let one = member_frame(&lane.first, &a);
         for finished in &done {
             assert_eq!(finished.result.as_ref().unwrap(), &vec![one.clone()]);
         }

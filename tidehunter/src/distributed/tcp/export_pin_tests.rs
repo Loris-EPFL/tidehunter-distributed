@@ -8,6 +8,7 @@ use crate::distributed::nvmeof::{
     live_pool::LiveControllerPool,
     live_storage::LiveGroupDescriptor,
 };
+use crate::distributed::storage::member_address_of_reference;
 use std::os::unix::fs::FileExt;
 
 fn close_next(client: &mut Client, lease: &LiveLeased, frame: &[u8]) -> LiveLeased {
@@ -182,7 +183,7 @@ fn assert_export_deadline_classes() {
             "resolve",
             Request::ResolveLiveRecords {
                 authority_epoch: 1,
-                references: Vec::new(),
+                members: Vec::new(),
             },
             true,
         ),
@@ -236,6 +237,7 @@ fn export_creation_held_past_the_data_deadline_keeps_the_session() {
         .receipt_page(0, 1)
         .unwrap()[0];
     let reference = batch.record_reference(receipt.address(), 0).unwrap();
+    let member = member_address_of_reference(&reference).unwrap();
     // The fence revokes every export, so the resolution must create one.
     writer.fence_to(2).unwrap();
     let before = owner.node.live_inline_export_stats();
@@ -244,7 +246,7 @@ fn export_creation_held_past_the_data_deadline_keeps_the_session() {
         &writer.shape,
         Request::ResolveLiveRecords {
             authority_epoch: 2,
-            references: vec![reference],
+            members: vec![member],
         },
     );
     let locations = match response {
@@ -252,7 +254,7 @@ fn export_creation_held_past_the_data_deadline_keeps_the_session() {
         other => panic!("unexpected resolution response: {}", other.as_ref()),
     };
     assert_eq!(locations.entries.len(), 1);
-    assert_eq!(locations.entries[0].reference, reference);
+    assert_eq!(locations.entries[0].member, member);
     assert_eq!(
         owner.node.live_inline_export_stats(),
         LiveInlineExportStats {
@@ -327,8 +329,9 @@ impl HistoryPool {
             .receipt_page(0, 1)
             .unwrap()[0];
         let reference = batch.record_reference(receipt.address(), 0).unwrap();
+        let member = member_address_of_reference(&reference).unwrap();
         client.fence_to(2).unwrap();
-        let locations = client.resolve_live_records(2, &[reference]).unwrap();
+        let locations = client.resolve_live_records(2, &[member]).unwrap();
         let location = locations.entries[0].clone();
         let temp = tempdir::TempDir::new("history-controller-retirement").unwrap();
         let pool = Arc::new(
@@ -443,13 +446,16 @@ fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
         .unwrap()
         .receipt_page(0, 2)
         .unwrap();
-    let references: Vec<_> = receipts
+    let members: Vec<_> = receipts
         .iter()
         .zip([owner.batch(0), owner.batch(1)])
-        .map(|(receipt, batch)| batch.record_reference(receipt.address(), 0).unwrap())
+        .map(|(receipt, batch)| {
+            let reference = batch.record_reference(receipt.address(), 0).unwrap();
+            member_address_of_reference(&reference).unwrap()
+        })
         .collect();
     client.fence_to(2).unwrap();
-    let locations = client.resolve_live_records(2, &references).unwrap();
+    let locations = client.resolve_live_records(2, &members).unwrap();
     assert_eq!(locations.entries.len(), 2);
     let (old, new) = (&locations.entries[0], &locations.entries[1]);
     assert_ne!(old.segment.file_index, new.segment.file_index);
@@ -745,5 +751,242 @@ fn idle_connection_pins_do_not_delay_poison_publication_and_drain_after_disconne
     fixture
         .pool
         .shutdown(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+}
+
+/// A leased owner with one batch written into generation 1 and fenced up to
+/// authority `through` (at least 2). Returns the owner, a coordinator client at
+/// that authority, generation 1's log (taken before the fences, because
+/// `active` only reaches the current epoch) and the member's address.
+fn sealed_member(
+    through: u64,
+) -> (
+    leased_tests::Fixture,
+    Client,
+    Arc<crate::distributed::storage::PartitionLog>,
+    PhysicalValueAddress,
+) {
+    let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
+    let mut client = owner.writer();
+    let first = client.lease_live_extent(1).unwrap();
+    let batch = owner.batch(0);
+    let group = CompleteGroup::new_live(
+        &client.shape,
+        vec![batch.clone()],
+        owner.config.partition.batch_limits,
+        owner.config.partition.group_limits,
+    )
+    .unwrap();
+    let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+    let next = close_next(&mut client, &first, &frame);
+    close_next(&mut client, &next, &[]);
+    let log = owner.node.log_for_test(1);
+    let receipt = log.receipt_page(0, 1).unwrap()[0];
+    let reference = batch.record_reference(receipt.address(), 0).unwrap();
+    let member = member_address_of_reference(&reference).unwrap();
+    for epoch in 2..=through {
+        client.fence_to(epoch).unwrap();
+    }
+    (owner, client, log, member)
+}
+
+/// The hard condition of the S8 retry: the owner's `NotFound` for a retired
+/// member is produced by `resolve_live_member`, crosses the wire with its kind
+/// (`TcpError::with_kind(error.wire_kind(), ..)` in the handler) and makes the
+/// value path's single re-resolve fire exactly once.
+#[test]
+fn a_retired_member_reaches_the_client_as_not_found_and_the_retry_fires_once() {
+    use crate::distributed::hybrid::read::retry_once;
+    use crate::distributed::remote_db::pending_read::transport_error;
+    use crate::distributed::storage::{LocalDbError, StorageError};
+    let (owner, mut client, log, member) = sealed_member(2);
+    let version = owner.batch(0).version();
+    // Control: before retirement the address resolves, to the member it names.
+    let located = client.resolve_live_records(2, &[member]).unwrap();
+    assert_eq!(located.entries[0].member, member);
+    client
+        .release_live_epoch_pin(2, located.epoch_pin_token)
+        .unwrap();
+    client.retire_wal_files(2, 1, vec![0]).unwrap();
+    // Producer: the owner's resolve of the retired member is `Io(NotFound)`, not
+    // a lookup failure in the reader snapshot (generation 1's log is still held).
+    let produced = log
+        .resolve_live_member(member)
+        .err()
+        .expect("a retired member must not resolve");
+    assert!(
+        matches!(&produced, StorageError::Io(error) if error.kind() == io::ErrorKind::NotFound),
+        "unexpected producer error: {produced:?}"
+    );
+    assert_eq!(produced.wire_kind(), io::ErrorKind::NotFound);
+    // Flattening through `TcpError::component` would drop the kind: this is the
+    // mapping the handler must not use, and why the retry would never fire.
+    assert_eq!(TcpError::component(&produced).kind(), io::ErrorKind::Other);
+    // Wire: the client sees `NotFound`.
+    let error = client.resolve_live_records(2, &[member]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    // Discriminate the handler's `with_kind(wire_kind)` from the reader
+    // snapshot's own `NotFound` ("retired member generation", `inventory.rs`):
+    // the kind alone cannot tell them apart, the message can. The handler
+    // forwards the storage error's text, so the producer's marker is present
+    // and the snapshot's is not. `contains`, not equality: a future prefix on
+    // the wire text must not fail this.
+    let wire_text = error.to_string();
+    assert!(wire_text.contains(&produced.to_string()), "{wire_text}");
+    assert!(
+        !wire_text.contains("retired member generation"),
+        "{wire_text}"
+    );
+    // NEGATIVE CONTROL OWED at the first compile pass (not yet run): replace
+    // `TcpError::with_kind(error.wire_kind(), error.to_string())` in the
+    // `ResolveLiveRecords` arm of `tcp/control.rs` by `TcpError::component(&error)`;
+    // this test must then fail at the `NotFound` kind assertion above. Restore
+    // the line and record the result in the S12 report.
+    // Value path: one re-resolve, and its value is returned.
+    let mut reresolves = 0;
+    let first: Result<u32, LocalDbError> = Err(transport_error(error));
+    let value = retry_once(
+        first,
+        version,
+        || Ok(()),
+        || {
+            reresolves += 1;
+            Ok(7)
+        },
+    )
+    .unwrap();
+    assert_eq!((value, reresolves), (7, 1));
+    // A second `NotFound` is the typed eviction, still after exactly one retry.
+    let again = client.resolve_live_records(2, &[member]).unwrap_err();
+    let first: Result<u32, LocalDbError> = Err(transport_error(again));
+    let mut reresolves = 0;
+    let evicted = retry_once(
+        first,
+        version,
+        || Ok(()),
+        || {
+            reresolves += 1;
+            Err(transport_error(TcpError::with_kind(
+                io::ErrorKind::NotFound,
+                "still retired",
+            )))
+        },
+    )
+    .unwrap_err();
+    assert!(evicted.is_evicted_during_read(), "{evicted:?}");
+    assert_eq!(reresolves, 1);
+}
+
+/// Negative control for the retry: an address the owner refuses as invalid is
+/// `InvalidData` on the wire and never re-resolved.
+#[test]
+fn a_foreign_partition_member_is_invalid_data_and_never_retried() {
+    use crate::distributed::hybrid::read::retry_once;
+    use crate::distributed::remote_db::pending_read::transport_error;
+    use crate::distributed::storage::LocalDbError;
+    let (owner, mut client, _log, member) = sealed_member(2);
+    let version = owner.batch(0).version();
+    let foreign = PhysicalValueAddress {
+        partition: member.partition + 1,
+        ..member
+    };
+    let error = client.resolve_live_records(2, &[foreign]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let mut reresolves = 0;
+    let first: Result<u32, LocalDbError> = Err(transport_error(error));
+    let outcome = retry_once(
+        first,
+        version,
+        || Ok(()),
+        || {
+            reresolves += 1;
+            Ok(7)
+        },
+    );
+    assert_eq!(reresolves, 0);
+    assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    // A generation the owner does not hold is `NotFound` (retryable), distinct
+    // from the invalid foreign address above.
+    let absent = PhysicalValueAddress {
+        segment_generation: 9,
+        ..member
+    };
+    let error = client.resolve_live_records(2, &[absent]).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+/// A relocated position keeps its logical batch epoch but names the generation
+/// that holds its bytes. The request carries the address only, so the owner and
+/// the client both key on `segment_generation`, never on the batch epoch.
+#[test]
+fn a_relocated_position_resolves_against_its_address_generation() {
+    use crate::distributed::hybrid::position::VersionPosition;
+    use crate::distributed::types::BatchVersion;
+    let (_owner, mut client, _log, member) = sealed_member(3);
+    // Batch epoch 0 is older than the address generation 1 that holds the bytes.
+    let relocated = VersionPosition::from_member(
+        BatchVersion {
+            epoch: 0,
+            sequence: 0,
+        },
+        0,
+        member,
+        0,
+    );
+    let located = client
+        .resolve_live_records(3, &[relocated.address])
+        .unwrap();
+    let entry = &located.entries[0];
+    assert_eq!(entry.member, relocated.address);
+    assert_eq!(entry.segment.epoch, member.segment_generation);
+    let valid = |client: &Client, member: &PhysicalValueAddress, offset, len| {
+        client.valid_live_record_geometry(&entry.segment, &entry.binding, member, offset, len)
+    };
+    assert!(valid(&client, &member, entry.offset, entry.len));
+    // The client refuses a reply that disagrees with the address: another
+    // generation, a different length, a shifted offset or another partition.
+    let moved = PhysicalValueAddress {
+        segment_generation: member.segment_generation + 1,
+        ..member
+    };
+    let longer = PhysicalValueAddress {
+        len: member.len + 1,
+        ..member
+    };
+    let foreign = PhysicalValueAddress {
+        partition: member.partition + 1,
+        ..member
+    };
+    assert!(!valid(&client, &moved, entry.offset, entry.len));
+    assert!(!valid(&client, &longer, entry.offset, entry.len));
+    assert!(!valid(&client, &foreign, entry.offset, entry.len));
+    assert!(!valid(&client, &member, entry.offset + 1, entry.len));
+    let token = located.epoch_pin_token;
+    client.release_live_epoch_pin(3, token).unwrap();
+}
+
+/// The request's `authority_epoch` is the fence: an address carries no epoch, so
+/// a coordinator fenced out by a newer authority is refused by the owner's
+/// reader snapshot before any lease is published, whatever address it names.
+#[test]
+fn a_fenced_coordinator_cannot_resolve_members() {
+    let (owner, mut client, _log, member) = sealed_member(3);
+    let error = owner
+        .node
+        .handle(
+            Request::ResolveLiveRecords {
+                authority_epoch: 2,
+                members: vec![member],
+            },
+            TcpLimits::default(),
+        )
+        .err()
+        .expect("a fenced authority must be refused");
+    assert_eq!(error.to_string(), "stale or sealed request authority");
+    assert_eq!(owner.node.inventory.lock().live_pins.len(), 0);
+    // Control: the current authority resolves the same address.
+    let located = client.resolve_live_records(3, &[member]).unwrap();
+    client
+        .release_live_epoch_pin(3, located.epoch_pin_token)
         .unwrap();
 }

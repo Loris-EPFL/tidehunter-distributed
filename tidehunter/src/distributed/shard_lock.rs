@@ -1,20 +1,19 @@
-//! Sharded lock wrappers with per-shard wait and hold accounting, plus the
-//! deterministic routing hash shared by the sharded index and read cache.
+//! Mutex wrappers with per-shard wait and hold accounting, plus the
+//! deterministic routing hash shared by the read cache shards.
 //!
 //! Tidehunter paper §4.1 protects index rows with sharded mutexes so that
-//! different key ranges never synchronize. These wrappers keep that model and
-//! make every shard's load visible. Accounting cost is bounded:
+//! different key ranges never synchronize. The read cache keeps that model and
+//! these wrappers make every shard's load visible. Accounting cost is bounded:
 //!
 //! * An uncontended acquisition adds one relaxed `fetch_add` on a counter that
 //!   shares the lock's cache line, nothing else.
-//! * Wait time is measured only on the slow path (`try_*` failed).
-//! * Hold time is sampled: every write/exclusive hold, one in
-//!   [`HOLD_SAMPLE_PERIOD`] read holds.
+//! * Wait time is measured only on the slow path (`try_lock` failed).
+//! * Every hold is timed.
 //!
 //! No wrapper here ever holds two locks. Callers that need several shards lock
 //! them in ascending shard index and document why.
 
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, MutexGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -22,11 +21,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod tests;
 
-/// One in this many shared acquisitions measures its hold time. Power of two.
-pub(crate) const HOLD_SAMPLE_PERIOD: u64 = 64;
-
-/// Cumulative lock activity of one shard. `hold_ns` covers only the
-/// `hold_samples` sampled holds, not every acquisition.
+/// Cumulative lock activity of one shard. `hold_ns` covers the `hold_samples`
+/// timed holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShardLockStats {
     pub acquisitions: u64,
@@ -50,10 +46,10 @@ fn nanos(duration: Duration) -> u64 {
 }
 
 impl LockCounters {
-    /// Returns the acquisition ordinal. Relaxed: these are independent
-    /// statistics; no data is published through them.
-    fn enter(&self) -> u64 {
-        self.acquisitions.fetch_add(1, Ordering::Relaxed)
+    /// Relaxed: these are independent statistics; no data is published
+    /// through them.
+    fn enter(&self) {
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
     }
 
     fn waited(&self, since: Instant) {
@@ -79,125 +75,7 @@ impl LockCounters {
     }
 }
 
-fn sampled(ordinal: u64) -> Option<Instant> {
-    ordinal
-        .is_multiple_of(HOLD_SAMPLE_PERIOD)
-        .then(Instant::now)
-}
-
-/// Reader/writer lock of one shard. Aligned to a cache line so neighbouring
-/// shards in a slice never share one.
-#[repr(align(64))]
-pub(crate) struct ShardRwLock<T> {
-    lock: RwLock<T>,
-    counters: LockCounters,
-}
-
-pub(crate) struct ShardReadGuard<'a, T> {
-    guard: RwLockReadGuard<'a, T>,
-    counters: &'a LockCounters,
-    held_since: Option<Instant>,
-}
-
-pub(crate) struct ShardWriteGuard<'a, T> {
-    guard: RwLockWriteGuard<'a, T>,
-    counters: &'a LockCounters,
-    held_since: Instant,
-}
-
-impl<T> ShardRwLock<T> {
-    pub(crate) fn new(value: T) -> Self {
-        Self {
-            lock: RwLock::new(value),
-            counters: LockCounters::default(),
-        }
-    }
-
-    pub(crate) fn read(&self) -> ShardReadGuard<'_, T> {
-        let ordinal = self.counters.enter();
-        let guard = self.lock.try_read().unwrap_or_else(|| {
-            let waiting = Instant::now();
-            let guard = self.lock.read();
-            self.counters.waited(waiting);
-            guard
-        });
-        ShardReadGuard {
-            guard,
-            counters: &self.counters,
-            held_since: sampled(ordinal),
-        }
-    }
-
-    pub(crate) fn try_read(&self) -> Option<ShardReadGuard<'_, T>> {
-        let ordinal = self.counters.enter();
-        let guard = self.lock.try_read()?;
-        Some(ShardReadGuard {
-            guard,
-            counters: &self.counters,
-            held_since: sampled(ordinal),
-        })
-    }
-
-    pub(crate) fn write(&self) -> ShardWriteGuard<'_, T> {
-        self.counters.enter();
-        let guard = self.lock.try_write().unwrap_or_else(|| {
-            let waiting = Instant::now();
-            let guard = self.lock.write();
-            self.counters.waited(waiting);
-            guard
-        });
-        ShardWriteGuard {
-            guard,
-            counters: &self.counters,
-            held_since: Instant::now(),
-        }
-    }
-
-    /// Exclusive access without locking, for single-owner construction.
-    pub(crate) fn get_mut(&mut self) -> &mut T {
-        self.lock.get_mut()
-    }
-
-    pub(crate) fn stats(&self) -> ShardLockStats {
-        self.counters.snapshot()
-    }
-}
-
-impl<T> Deref for ShardReadGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<T> Drop for ShardReadGuard<'_, T> {
-    fn drop(&mut self) {
-        if let Some(since) = self.held_since {
-            self.counters.held(since);
-        }
-    }
-}
-
-impl<T> Deref for ShardWriteGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<T> DerefMut for ShardWriteGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<T> Drop for ShardWriteGuard<'_, T> {
-    fn drop(&mut self) {
-        self.counters.held(self.held_since);
-    }
-}
-
-/// Mutex of one shard, with the same accounting as [`ShardRwLock`].
+/// Mutex of one shard. A cache line apart from its neighbours.
 #[repr(align(64))]
 pub(crate) struct ShardMutex<T> {
     lock: Mutex<T>,
@@ -281,14 +159,6 @@ impl StableHasher {
         self
     }
 
-    pub(crate) fn byte(self, byte: u8) -> Self {
-        self.bytes(&[byte])
-    }
-
-    pub(crate) fn u64(self, value: u64) -> Self {
-        self.bytes(&value.to_le_bytes())
-    }
-
     pub(crate) fn finish(self) -> u64 {
         let mut hash = self.0;
         hash ^= hash >> 33;
@@ -297,9 +167,4 @@ impl StableHasher {
         hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
         hash ^ (hash >> 33)
     }
-}
-
-/// `Some(mask)` when `count` is a nonzero power of two.
-pub(crate) fn shard_mask(count: usize) -> Option<usize> {
-    count.is_power_of_two().then(|| count - 1)
 }

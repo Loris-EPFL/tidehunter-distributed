@@ -1,21 +1,23 @@
 //! Bounded caller allocation, per-owner handoff and publication state.
 //!
-//! Lock order: identity shard, key shards in ascending index, owner order.
-//! Release all three before acquiring index writer, publisher, then slot data.
-//! Admission is never held with any of these locks or across encoding or I/O.
-//! A `DropCells` allocation alone takes publisher before identity shards (see
-//! `drop_cells`); no path holds an identity, key or owner lock and then takes
-//! publisher, so the two orders cannot form a cycle.
+//! Lock order: key shards in ascending index, then owner order; release both
+//! before acquiring publisher, then slot data. Admission is never held with any
+//! of these locks or across encoding, owner I/O or index flush. A `DropCells`
+//! allocation alone takes publisher before any key or owner lock (see
+//! `drop_cells`); no path holds a key or owner lock and then takes publisher, so
+//! the two orders cannot form a cycle.
 
+pub(super) mod allocation;
 pub(super) mod completion;
 mod control;
 pub(super) mod core;
 mod dependencies;
 mod drop_cells;
-mod identity;
+pub(super) mod inflight;
 pub(super) mod owner_queue;
 pub(super) mod owner_sender;
 mod publisher;
+pub(super) mod receipts;
 #[cfg(test)]
 mod scenario_tests;
 mod sequencer;

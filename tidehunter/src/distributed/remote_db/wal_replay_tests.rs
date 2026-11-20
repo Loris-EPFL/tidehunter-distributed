@@ -456,3 +456,80 @@ fn wal_replay_short_sealed_stream_and_wrong_image_format_fail_open() {
         );
     }
 }
+
+#[test]
+fn a_corrupted_durable_value_is_refused_and_counted() {
+    // End-to-end integrity: the index stores each member's payload CRC, so a
+    // corrupted value on the owner is refused instead of served, and the
+    // refusal is counted in the operator-visible `value_decode_failures`.
+    let mut fixture = Fixture::new_with_config(
+        8192,
+        KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1)),
+        2,
+        |config| {
+            config.storage.fragment_bytes = 64 * 1024;
+            config.storage.wal_file_bytes = 1024 * 1024;
+            // The read must reach the owner, not the coordinator cache.
+            config.read_cache_bytes = 0;
+        },
+    );
+    let mut db = fixture.open();
+    db.write_batch(
+        fixture.operation(0, 0),
+        vec![checkpoint_put(7, 0xAB), checkpoint_put(8, 0xCD)],
+    )
+    .unwrap();
+    db.core.flush_durable().unwrap();
+    // Key 7's value is `[0xAB; 32]`; flip one of its durable bytes in the
+    // owner's WAL. The owner serves member bytes from the file, so the next
+    // read sees the damage while key 8's frame stays intact.
+    let root = fixture.owner_database_root(0).to_path_buf();
+    let marker = [0xABu8; 32];
+    let mut flipped = false;
+    for entry in std::fs::read_dir(root.join("epoch_0000000000000001")).unwrap() {
+        let path = entry.unwrap().path();
+        // The same value bytes can also sit in a control or metadata file;
+        // flipping them there would fail the read for an unrelated reason, so
+        // only the owner's `wal_` files are candidates.
+        if !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("wal_"))
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        if let Some(offset) = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&file, &[0xAA], offset as u64).unwrap();
+            file.sync_all().unwrap();
+            flipped = true;
+            break;
+        }
+    }
+    assert!(flipped, "the written value must be in the owner WAL");
+    let error = db
+        .get(KeySpace(0), &7u32.to_be_bytes())
+        .expect_err("a corrupted durable value must be refused");
+    assert!(
+        error.to_string().contains("member payload CRC mismatch"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        db.reader.decode_failure_count(),
+        1,
+        "the CRC refusal is counted once"
+    );
+    assert_eq!(
+        db.get(KeySpace(0), &8u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[0xCD; 32],
+        "an untouched frame still reads"
+    );
+    drop(db);
+    fixture.stop_owners();
+}

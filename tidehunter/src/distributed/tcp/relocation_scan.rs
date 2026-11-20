@@ -65,8 +65,15 @@ fn valid_page(page: &RelocationPage, partition: u32, generation: u64, from: u64,
             && address.segment_generation == generation
             && batch.version.epoch == generation
             && batch.puts.iter().all(|put| {
-                put.reference.batch_address == address
-                    && put.reference.batch_version == batch.version
+                let member = put.position.address;
+                put.position.batch == batch.version
+                    && member.partition == partition
+                    && member.segment_generation == generation
+                    && member.offset >= address.offset
+                    && member
+                        .offset
+                        .checked_add(u64::from(member.len))
+                        .is_some_and(|member_end| member_end <= batch_end)
             })
     });
     batches_valid

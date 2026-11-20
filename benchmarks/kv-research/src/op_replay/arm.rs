@@ -19,7 +19,6 @@ use tidehunter::config::Config;
 use tidehunter::distributed::codec::BatchLimits;
 use tidehunter::distributed::durability::DurabilityTier;
 use tidehunter::distributed::group::GroupLimits;
-use tidehunter::distributed::native_index::CompactorCadence;
 use tidehunter::distributed::sui;
 use tidehunter::key_shape::{
     Compactor, KeyIndexing, KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeyType,
@@ -293,16 +292,13 @@ pub(super) fn leased_owner(
             max_pending_batches: 64,
             max_pending_bytes: MAX_PENDING_BYTES,
             read_memory_allowance_bytes: 256 * MIB,
-            index_shards: None,
-            replay_limits: None,
         },
         live: LiveSpec {
             write_window: None,
             per_frame_fua: false,
         },
     };
-    // Callback keyspaces use the same compactor cadence as the recorded native arm.
-    LeasedOwner::start(&spec, CompactorCadence::from_native(native))
+    LeasedOwner::start(&spec)
 }
 
 /// One arm's open database and its filter decisions.

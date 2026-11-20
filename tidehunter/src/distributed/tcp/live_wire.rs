@@ -7,7 +7,7 @@ use crate::distributed::nvmeof::NvmeofTransport;
 use crate::distributed::nvmeof::live_storage::{
     LiveAdoption, LiveTargetBinding, LiveWalSegment, LiveWriteExtent,
 };
-use crate::distributed::types::ValueRecordReference;
+use crate::distributed::types::PhysicalValueAddress;
 use serde::{Deserialize, Serialize};
 
 /// The owner's permanent per-owner export (`OpenLiveExports`).
@@ -55,9 +55,12 @@ pub struct AdoptProfile {
     pub close_scan_bytes: u64,
 }
 
+/// One resolved member: the owner-pinned file range of `member`, the member
+/// frame address the request named. The reply is keyed by the address alone
+/// (no batch version or descriptor), exactly what a hybrid index position holds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LiveRecordLocation {
-    pub reference: ValueRecordReference,
+    pub member: PhysicalValueAddress,
     pub segment: LiveWalSegment,
     pub binding: LiveTargetBinding,
     pub offset: u64,

@@ -22,13 +22,12 @@ pub(super) enum Resolution {
     Unknown = 6,
 }
 
-/// Prepared before READY, with no publisher or index-writer lock held. The
-/// owner worker receives its own batch handle; this payload stays with the
-/// logical generation until its authenticated native-index publication.
+/// Prepared before READY, with no publisher lock held. The owner worker receives
+/// its own batch handle; this payload stays with the logical generation until its
+/// authenticated native-index publication.
 pub(super) struct SlotPublication {
     pub(super) batch: CompleteBatch,
     pub(super) routing: NativePublicationRouting,
-    pub(super) metadata_charge: usize,
     pub(super) last_mutation: MutationVersion,
 }
 
@@ -40,6 +39,17 @@ pub(super) struct SlotData {
     pub(super) receipt: Option<DurableBatch>,
     pub(super) publication: Option<SlotPublication>,
     pub(super) last_mutation: Option<MutationVersion>,
+    /// The caller-visible outcome, installed exactly once and read under the
+    /// same `slot.data` guard.
+    ///
+    /// Shape invariant (T8): an outcome is either an **abort** (a definite error
+    /// with **no** `uncertain_version`: the generation ended before READY, so it
+    /// had no effect and a retry may re-apply), a **possibly-landed failure**
+    /// with `uncertain_version` set, or `Ok`. Never a non-abort error without an
+    /// `uncertain_version`: the retry path reads that field to decide whether
+    /// re-applying is safe, and such an error re-applied would duplicate a
+    /// batch. Every install site asserts this at the point of writing; the typed
+    /// fix is a three-variant outcome enum (T8 in the S7 handoff).
     pub(super) outcome: Option<Result<BatchVersion, LocalDbError>>,
 }
 

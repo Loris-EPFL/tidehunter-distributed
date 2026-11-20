@@ -18,12 +18,11 @@
     unsafe_op_in_unsafe_fn
 )]
 
-pub mod capacity;
 pub mod codec;
 pub mod durability;
 pub mod group;
-pub mod index_reference;
-pub mod native_index;
+pub(crate) mod hybrid;
+pub use hybrid::position::HYBRID_POSITION_ENCODED_LEN;
 pub mod native_publication;
 pub mod nvmeof;
 pub mod owner_events;

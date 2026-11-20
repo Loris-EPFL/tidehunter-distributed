@@ -514,6 +514,9 @@ fn saturated_inbox_handles_every_report_and_certification() {
         epoch: 1,
         published: AtomicU64::new(FLOOR),
         owners: (0..OWNERS).map(|_| OwnerShared::default()).collect(),
+        consistent: AtomicU64::new(0),
+        advanced: Mutex::new(()),
+        advanced_cv: Condvar::new(),
         counters: Counters::default(),
         persisted_events: Mutex::new(None),
     };
@@ -565,6 +568,7 @@ fn saturated_inbox_handles_every_report_and_certification() {
         stored,
         directory.path(),
         Duration::from_millis(1),
+        &CutSources::new(1, crate::distributed::durability::DurabilityTier::Native),
     );
     let certified = replies.len() as u64;
     for result in replies {
@@ -661,6 +665,7 @@ fn poller_stops_instead_of_reconnecting_to_a_route_that_cannot_wait() {
         DurableCutConfig::default(),
         record(Some(EpochCut { epoch: 1, next: 0 }), Vec::new()),
         vec![target],
+        CutSources::new(1, crate::distributed::durability::DurabilityTier::Native),
     )
     .unwrap();
     assert_eq!(attempts.recv_timeout(WATCHDOG), Ok(0));

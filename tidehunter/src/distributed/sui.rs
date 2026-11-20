@@ -8,14 +8,12 @@
 //! on one background worker per database (`relocation`): it calls the filters
 //! over the original WAL puts in logical order up to the first Stop, removes
 //! index entries only below whole-file targets, and takes no write gate.
-//! Pinned iterator/checkpoint cuts protect their immutable backing. Only
-//! wholly unreferenced WAL files are reclaimed by the authority lifecycle.
+//! Iterators are native live iterators over the coordinator's index and a held
+//! checkpoint is native's latch (`iter`): a view reads versions below its
+//! pinned cut and keeps promotion from passing it. Owner WAL files are retired
+//! on the native watermark, never while a retained position can name them.
 use super::codec::Mutation;
-use super::native_index::{IndexReadCut, IndexReadPin};
-use super::remote_db::{
-    ConcurrentRemoteDatabase, PendingScanPage, RemoteDatabase, RemoteDatabaseConfig,
-};
-use super::types::ValueRecordReference;
+use super::remote_db::{ConcurrentRemoteDatabase, RemoteDatabase, RemoteDatabaseConfig};
 use super::write_timeline::{WriteTimelineExport, WriteTimelineSample, WriteTimelineStage};
 use crate::config::Config;
 use crate::db::{Db as NativeDb, DbError};
@@ -23,7 +21,6 @@ use crate::key_shape::{KeyShape, KeySpace};
 use crate::metrics::Metrics;
 use crate::minibytes::Bytes;
 use parking_lot::RwLock;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,8 +28,11 @@ use std::time::Instant;
 
 mod drop_cells;
 mod index_checkpoint;
+mod iter;
 pub(crate) mod kv_capture;
 mod relocation;
+#[cfg(feature = "test_methods")]
+pub use relocation::RelocationReceipt;
 
 pub type Result<T, E = DbError> = std::result::Result<T, E>;
 fn error(e: impl std::fmt::Display) -> DbError {
@@ -523,7 +523,8 @@ pub struct Db {
     operations: AtomicU64,
     pub read_calls: AtomicU64,
     pub read_keys: AtomicU64,
-    pub scan_records: AtomicU64,
+    /// Rows returned by remote iterators; read by the Sui metrics sampler.
+    pub scan_records: Arc<AtomicU64>,
 }
 // One adapter is allocated per database, not per read. Keeping remote state
 // inline avoids another allocation and pointer indirection on remote operations.
@@ -542,6 +543,10 @@ struct Remote {
     bulk_read: Stage,
     write_commit: Stage,
     profile: super::remote_db::ReadProfileMonitor,
+    /// Entries skipped by held-checkpoint iterators after a bounded re-resolve
+    /// (see `iter`), reported as `iterator_latched_skips`: a rise means a latch
+    /// may have failed to keep a row. Tombstones are not counted.
+    latched_skips: Arc<AtomicU64>,
 }
 impl Remote {
     /// Join the relocation worker, then take the database out of its `Arc`.
@@ -584,24 +589,6 @@ impl Db {
         match &self.backend {
             Backend::Remote(remote) => Some(remote.db.durable_cut_stats()),
             Backend::Native(_) => None,
-        }
-    }
-
-    /// Start R0 shadow capacity observation on a remote database. Physical WAL
-    /// retirement is suppressed while the observer runs; logical pruning,
-    /// checkpoints and floor advancement are unchanged. Finish the returned
-    /// observer before closing the database.
-    pub fn start_capacity_observer(
-        &self,
-        config: super::capacity::CapacityObserverConfig,
-        sink: Box<dyn super::capacity::R0Sink>,
-    ) -> Result<super::remote_db::CapacityObserver> {
-        match &self.backend {
-            Backend::Remote(remote) => remote
-                .db
-                .start_capacity_observer(config, sink)
-                .map_err(error),
-            Backend::Native(_) => Err(error("capacity observation requires a remote database")),
         }
     }
 
@@ -726,8 +713,8 @@ impl Db {
         let capture_id = kv_capture::open(path, &shape, Some(&db.database_id())).map_err(error)?;
         db.configure_sui_read_cache();
         let epoch = db.epoch();
-        let profile = db.read_profile_monitor();
         let db = Arc::new(ConcurrentRemoteDatabase::new(db).map_err(error)?);
+        let profile = db.read_profile_monitor();
         let relocator =
             relocation::RemoteRelocator::start_worker(Arc::clone(&db)).map_err(error)?;
         Ok(Self::new(
@@ -739,6 +726,7 @@ impl Db {
                 bulk_read: Stage::default(),
                 write_commit: Stage::default(),
                 profile,
+                latched_skips: Arc::new(AtomicU64::new(0)),
             }),
             shape,
             capture_id,
@@ -756,7 +744,7 @@ impl Db {
             operations: AtomicU64::new(0),
             read_calls: AtomicU64::new(0),
             read_keys: AtomicU64::new(0),
-            scan_records: AtomicU64::new(0),
+            scan_records: Arc::new(AtomicU64::new(0)),
         })
     }
     fn write_gate(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
@@ -958,44 +946,20 @@ impl Db {
             let read_timing_available = u64::from(remote.db.read_profile_enabled());
             set("scalar_read_ns_available", read_timing_available);
             set("read_index_ns_available", read_timing_available);
-            let index = remote.db.index_stats();
-            set(
-                "index_resident_metadata_bytes",
-                index.charged_metadata_bytes as u64,
-            );
-            set(
-                "index_transient_metadata_bytes",
-                index.transient_metadata_bytes as u64,
-            );
-            set(
-                "index_reader_held_view_bytes",
-                index.reader_held_view_bytes as u64,
-            );
-            set(
-                "index_history_bytes",
-                remote.db.index_history_bytes() as u64,
-            );
-            set("index_retained_versions", index.retained_versions as u64);
             set(
                 "coordinator_outcome_resident_bytes",
                 remote.db.metadata_history_bytes() as u64,
             );
-            let floor = remote.db.retention_floor();
-            let (at, epoch, sequence, operation_index) = match floor {
-                IndexReadCut::At(version) => (
-                    1,
-                    version.batch.epoch,
-                    version.batch.sequence,
-                    u64::from(version.operation_index),
-                ),
-                _ => (0, 0, 0, 0),
-            };
-            set("retention_floor_at", at);
-            set("retention_floor_epoch", epoch);
-            set("retention_floor_sequence", sequence);
-            set("retention_floor_operation_index", operation_index);
             visit_stages!(set, remote, scalar_read, bulk_read, write_commit);
             remote.profile.visit(&mut set);
+            set(
+                "iterator_latched_skips",
+                remote.latched_skips.load(Ordering::Relaxed),
+            );
+            set(
+                "snapshot_latch_deferrals",
+                remote.db.snapshot_latch_deferrals(),
+            );
             remote.db.visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
                 set(
@@ -1048,7 +1012,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
-                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
+                index_checkpoint::visit_coordinator_io(&mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1114,7 +1078,6 @@ impl Db {
                 set("cache_inserts", cache.inserts);
                 set("cache_bypass_admission", cache.bypass_admission);
                 set("cache_rejected_oversize", cache.rejected_oversize);
-                set("cache_rejected_mismatch", cache.rejected_mismatch);
                 set("cache_bypass_disabled", cache.bypass_disabled);
                 set("cache_bypass_eviction_limit", cache.bypass_eviction_limit);
                 set("cache_admitted_bytes", cache.admitted_bytes);
@@ -1224,40 +1187,20 @@ impl Db {
             let read_timing_available = u64::from(remote.db.read_profile_enabled());
             set("scalar_read_ns_available", read_timing_available);
             set("read_index_ns_available", read_timing_available);
-            let (index, history_bytes, floor) = remote.db.try_index_metrics()?;
-            set(
-                "index_resident_metadata_bytes",
-                index.charged_metadata_bytes as u64,
-            );
-            set(
-                "index_transient_metadata_bytes",
-                index.transient_metadata_bytes as u64,
-            );
-            set(
-                "index_reader_held_view_bytes",
-                index.reader_held_view_bytes as u64,
-            );
-            set("index_history_bytes", history_bytes as u64);
-            set("index_retained_versions", index.retained_versions as u64);
             set(
                 "coordinator_outcome_resident_bytes",
                 remote.db.try_metadata_history_bytes()? as u64,
             );
-            let (at, epoch, sequence, operation_index) = match floor {
-                IndexReadCut::At(version) => (
-                    1,
-                    version.batch.epoch,
-                    version.batch.sequence,
-                    u64::from(version.operation_index),
-                ),
-                _ => (0, 0, 0, 0),
-            };
-            set("retention_floor_at", at);
-            set("retention_floor_epoch", epoch);
-            set("retention_floor_sequence", sequence);
-            set("retention_floor_operation_index", operation_index);
             visit_stages!(set, remote, scalar_read, bulk_read, write_commit);
             remote.profile.visit(&mut set);
+            set(
+                "iterator_latched_skips",
+                remote.latched_skips.load(Ordering::Relaxed),
+            );
+            set(
+                "snapshot_latch_deferrals",
+                remote.db.snapshot_latch_deferrals(),
+            );
             remote.db.try_visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
                 set(
@@ -1310,7 +1253,7 @@ impl Db {
                     capacity_error_count,
                     progress_error_count,
                 );
-                index_checkpoint::visit_attribution(&checkpoint.attribution, &mut set);
+                index_checkpoint::visit_coordinator_io(&mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1376,7 +1319,6 @@ impl Db {
                 set("cache_inserts", cache.inserts);
                 set("cache_bypass_admission", cache.bypass_admission);
                 set("cache_rejected_oversize", cache.rejected_oversize);
-                set("cache_rejected_mismatch", cache.rejected_mismatch);
                 set("cache_bypass_disabled", cache.bypass_disabled);
                 set("cache_bypass_eviction_limit", cache.bypass_eviction_limit);
                 set("cache_admitted_bytes", cache.admitted_bytes);
@@ -1526,11 +1468,7 @@ impl Db {
             Backend::Remote(remote) if !self.shape.ks(ks).need_check_index_key() => {
                 self.read_calls.fetch_add(1, Ordering::Relaxed);
                 self.read_keys.fetch_add(1, Ordering::Relaxed);
-                remote
-                    .db
-                    .index_reference(ks, key, IndexReadCut::Latest)
-                    .map(|v| v.is_some())
-                    .map_err(error)
+                remote.db.contains(ks, key).map_err(error)
             }
             Backend::Remote(_) => self.get(ks, key).map(|v| v.is_some()),
         }
@@ -1585,56 +1523,22 @@ impl Db {
             }
             return Vec::new();
         }
-        let mut output = Vec::with_capacity(keys.len());
-        if keys.len() <= 256 {
-            // One bounded window resolves under one index guard and pins only
-            // misses. Cache-only bulk reads allocate no retention pin.
-            let values = remote.bulk_read.run(|| {
-                if let Some(trace) = trace.as_ref() {
-                    remote
-                        .db
-                        .traced_get_many_cut(ks, keys, IndexReadCut::Latest, Some(trace), 0)
-                } else {
-                    remote.db.get_many_cut(ks, keys, IndexReadCut::Latest)
-                }
-            });
-            match values {
-                Ok(values) => output.extend(values.into_iter().map(|value| value.map_err(error))),
-                Err(e) => output.extend(keys.iter().map(|_| Err(error(&e)))),
+        // One call for any key count: the table pages internally at the value
+        // reader's bounded window, so no separate large-read path exists.
+        let values = remote.bulk_read.run(|| {
+            if let Some(trace) = trace.as_ref() {
+                remote.db.traced_get_many(ks, keys, Some(trace))
+            } else {
+                remote.db.get_many(ks, keys)
             }
-        } else {
-            // One cut for every window, with no owner charge and so no view
-            // budget failure: every key is looked up first (never waiting for
-            // admission), then the view is dropped and the windows fetch
-            // under one floor pin (see `StandingViewBudget`). The references
-            // are one per key, bounded like `output` by the caller's keys.
-            match remote.db.resolve_published_keys(ks, keys) {
-                Ok(resolved) => {
-                    let pin = resolved.pin;
-                    let mut references = resolved.references.into_iter();
-                    for (window, chunk) in keys.chunks(256).enumerate() {
-                        let window_references: Vec<_> =
-                            references.by_ref().take(chunk.len()).collect();
-                        match remote.bulk_read.run(|| {
-                            remote.db.fetch_resolved_window(
-                                ks,
-                                chunk,
-                                window_references,
-                                pin.as_ref(),
-                                trace.as_ref(),
-                                window * 256,
-                            )
-                        }) {
-                            Ok(values) => {
-                                output.extend(values.into_iter().map(|value| value.map_err(error)))
-                            }
-                            Err(e) => output.extend(chunk.iter().map(|_| Err(error(&e)))),
-                        }
-                    }
-                }
-                Err(e) => output.extend(keys.iter().map(|_| Err(error(&e)))),
-            }
-        }
+        });
+        let output: Vec<_> = match values {
+            Ok(values) => values
+                .into_iter()
+                .map(|value| value.map_err(error))
+                .collect(),
+            Err(e) => keys.iter().map(|_| Err(error(&e))).collect(),
+        };
         if let Some(trace) = trace {
             trace.event("api_finished");
             trace.finish(output.iter().all(Result::is_ok));
@@ -1667,21 +1571,10 @@ impl Db {
         }
         match &self.backend {
             Backend::Native(db) => keys.iter().map(|key| db.exists(ks, key)).collect(),
-            Backend::Remote(remote) => {
-                let db = &remote.db;
-                // The cut ends with this call: no owner charge.
-                let (cut, _pin) = match db.call_protected_cut() {
-                    Ok(protected) => protected,
-                    Err(e) => return keys.iter().map(|_| Err(error(&e))).collect(),
-                };
-                keys.iter()
-                    .map(|key| {
-                        db.index_reference(ks, key, cut.clone())
-                            .map(|v| v.is_some())
-                            .map_err(error)
-                    })
-                    .collect()
-            }
+            Backend::Remote(remote) => keys
+                .iter()
+                .map(|key| remote.db.contains(ks, key).map_err(error))
+                .collect(),
         }
     }
     pub fn insert(
@@ -1796,32 +1689,25 @@ impl Db {
         }
     }
 
+    /// Native: persist the value WAL. Remote: the owners' durability barrier
+    /// (`flush_durable`). Neither stores an index root: the hybrid index is
+    /// persisted by its own byte-driven snapshot cadence or by
+    /// `force_rebuild_control_region`, as native's `flush` leaves the control
+    /// region alone.
     pub fn flush(&self) -> Result<()> {
         let _guard = self.write_gate();
         match &self.backend {
             Backend::Native(db) => db.persist_value_wal_for_benchmark(),
-            Backend::Remote(remote) => remote.db.flush_index().map_err(error),
+            Backend::Remote(remote) => remote.db.flush_durable().map_err(error),
         }
     }
-    /// Native: rebuild the control region. Remote: one named Exact generation
-    /// covering every earlier write, which runs the compactor of every dirty
-    /// callback cell (native's index-flush compactor). No write gate is taken.
+    /// Native: rebuild the control region. Remote: the same forced snapshot
+    /// over the coordinator's native index (every dirty cell flushed, one
+    /// region stored). No write gate is taken.
     pub fn force_rebuild_control_region(&self) -> Result<()> {
         match &self.backend {
             Backend::Native(db) => db.force_rebuild_control_region().map(|_| ()),
             Backend::Remote(remote) => remote.db.force_rebuild_index().map(|_| ()).map_err(error),
-        }
-    }
-    /// Test fixtures: the same force, returning the remote named completion
-    /// (adopted Exact generation, cut and compactor counters). `None` on the
-    /// native backend.
-    #[cfg(feature = "test-utils")]
-    pub fn force_rebuild_control_region_observed(
-        &self,
-    ) -> Result<Option<super::remote_db::IndexForceReport>> {
-        match &self.backend {
-            Backend::Native(db) => db.force_rebuild_control_region().map(|_| None),
-            Backend::Remote(remote) => remote.db.force_rebuild_index().map(Some).map_err(error),
         }
     }
     pub fn wait_for_background_threads_to_finish(self: Arc<Self>) -> Result<()> {
@@ -1837,22 +1723,21 @@ impl Db {
     }
     pub fn iterator(self: &Arc<Self>, ks: KeySpace) -> DbIterator {
         let iterator = match &self.backend {
-            Backend::Native(db) => DbIterator::Native(db.iterator(ks)),
-            Backend::Remote(remote) => DbIterator::Remote(RemoteIterator::new(
-                self.clone(),
-                ks,
-                remote.db.protected_published_cut().map_err(error),
-            )),
+            Backend::Native(db) => db.iterator(ks),
+            Backend::Remote(remote) => {
+                iter::live_iterator(&remote.db, Arc::clone(&self.scan_records), ks)
+            }
         };
-        kv_capture::CapturedIterator::wrap(iterator, self.capture_id, ks)
+        kv_capture::CapturedIterator::wrap(DbIterator::Index(iterator), self.capture_id, ks)
     }
     pub fn checkpoint(self: &Arc<Self>) -> Checkpoint {
         let checkpoint = match &self.backend {
             Backend::Native(db) => Checkpoint::Native(db.checkpoint()),
-            Backend::Remote(remote) => Checkpoint::Remote(
-                self.clone(),
-                remote.db.protected_published_cut().map_err(error),
-            ),
+            Backend::Remote(remote) => Checkpoint::Remote(iter::RemoteCheckpoint::new(
+                Arc::clone(&remote.db),
+                Arc::clone(&self.scan_records),
+                Arc::clone(&remote.latched_skips),
+            )),
         };
         if kv_capture::enabled() {
             Checkpoint::Captured(Box::new(checkpoint), self.capture_id)
@@ -1939,18 +1824,27 @@ impl Db {
     }
 
     /// One named observed pass, waited for until `deadline` (the deadline
-    /// drops only the waiter). Remote returns the native report shape: one
-    /// stream per scanned `(partition, fencing generation)` and no copied
-    /// survivors, because leased relocation never copies.
+    /// drops only the waiter). Both backends return the native report shape
+    /// (streams, ordered callbacks, copied survivors), so a native and a
+    /// leased pass compare field by field. A remote pass also returns its
+    /// [`RelocationReceipt`], the persistence evidence native has no analogue
+    /// for; it is `None` on native.
     #[cfg(feature = "test_methods")]
     pub fn start_relocation_for_test(
         &self,
         deadline: Instant,
-    ) -> std::result::Result<crate::RelocationObservation, crate::RelocationTestError> {
+    ) -> std::result::Result<
+        (crate::RelocationObservation, Option<RelocationReceipt>),
+        crate::RelocationTestError,
+    > {
         use super::remote_db::{CallbackDecision, RelocationGate};
         use crate::RelocationTestError;
         let remote = match &self.backend {
-            Backend::Native(db) => return db.start_relocation_for_test(deadline),
+            Backend::Native(db) => {
+                return db
+                    .start_relocation_for_test(deadline)
+                    .map(|observation| (observation, None));
+            }
             Backend::Remote(remote) => remote,
         };
         let relocator = &remote.relocator;
@@ -1962,7 +1856,16 @@ impl Db {
                 relocation::TestError::WorkerStopped => RelocationTestError::WorkerStopped,
                 relocation::TestError::Pass(cause) => RelocationTestError::Native(error(cause)),
             })?;
-        Ok(crate::RelocationObservation {
+        let receipt = RelocationReceipt {
+            deferred: report.deferred,
+            scan_cut: report.scan_cut,
+            stored_target: report.stored_target,
+            stored_forced: report.stored_forced,
+            promotion_cut: report.promotion_cut,
+            copied_survivors: report.copied_survivors,
+            rejected_survivors: report.rejected_survivors,
+        };
+        let observation = crate::RelocationObservation {
             gate: match report.gate {
                 RelocationGate::NoWork => crate::RelocationGate::NoWork,
                 RelocationGate::DidWork => crate::RelocationGate::DidWork,
@@ -1995,9 +1898,10 @@ impl Db {
                     },
                 })
                 .collect(),
-            copied_survivors: 0,
+            copied_survivors: report.copied_survivors,
             witness: crate::RelocationWorkerWitness::Completed,
-        })
+        };
+        Ok((observation, Some(receipt)))
     }
     pub fn drop_cells_in_range(
         self: &Arc<Self>,
@@ -2119,14 +2023,14 @@ impl WriteBatch {
 
 pub enum Checkpoint {
     Native(Arc<crate::checkpoint::DbCheckpoint>),
-    Remote(Arc<Db>, Result<(IndexReadCut, IndexReadPin)>),
+    Remote(iter::RemoteCheckpoint),
     Captured(Box<Checkpoint>, u64),
 }
 impl Checkpoint {
     pub fn iterator(self, ks: KeySpace) -> DbIterator {
         match self {
-            Self::Native(checkpoint) => DbIterator::Native(checkpoint.iterator(ks)),
-            Self::Remote(db, cut) => DbIterator::Remote(RemoteIterator::new(db, ks, cut)),
+            Self::Native(checkpoint) => DbIterator::Index(checkpoint.iterator(ks)),
+            Self::Remote(checkpoint) => DbIterator::Index(checkpoint.iterator(ks)),
             Self::Captured(checkpoint, db) => {
                 kv_capture::CapturedIterator::wrap(checkpoint.iterator(ks), db, ks)
             }
@@ -2134,49 +2038,38 @@ impl Checkpoint {
     }
 }
 pub enum DbIterator {
-    Native(crate::iterators::db_iterator::DbIterator),
-    Remote(RemoteIterator),
+    /// The native iterator over either backend: a native database, or the
+    /// coordinator index of a remote one (see `iter`).
+    Index(crate::iterators::db_iterator::DbIterator),
     Captured(Box<kv_capture::CapturedIterator>),
 }
 impl DbIterator {
     pub fn set_lower_bound(&mut self, bound: impl Into<Bytes>) {
         match self {
-            Self::Native(iter) => iter.set_lower_bound(bound),
+            Self::Index(iter) => iter.set_lower_bound(bound),
             Self::Captured(iter) => {
                 let bound = bound.into();
                 iter.bound(&bound, false);
                 iter.inner.set_lower_bound(bound);
             }
-            Self::Remote(iter) => {
-                iter.lower = Some(bound.into());
-                iter.reset();
-            }
         }
     }
     pub fn set_upper_bound(&mut self, bound: impl Into<Bytes>) {
         match self {
-            Self::Native(iter) => iter.set_upper_bound(bound),
+            Self::Index(iter) => iter.set_upper_bound(bound),
             Self::Captured(iter) => {
                 let bound = bound.into();
                 iter.bound(&bound, true);
                 iter.inner.set_upper_bound(bound);
             }
-            Self::Remote(iter) => {
-                iter.upper = Some(bound.into());
-                iter.reset();
-            }
         }
     }
     pub fn reverse(&mut self) {
         match self {
-            Self::Native(iter) => iter.reverse(),
+            Self::Index(iter) => iter.reverse(),
             Self::Captured(iter) => {
                 iter.reverse();
                 iter.inner.reverse();
-            }
-            Self::Remote(iter) => {
-                iter.reverse = !iter.reverse;
-                iter.reset();
             }
         }
     }
@@ -2185,286 +2078,8 @@ impl Iterator for DbIterator {
     type Item = Result<(Bytes, Bytes)>;
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Native(iter) => iter.next(),
-            Self::Remote(iter) => iter.next(),
+            Self::Index(iter) => iter.next(),
             Self::Captured(iter) => iter.next(),
-        }
-    }
-}
-const SCAN_INITIAL_LOOKAHEAD: usize = 4;
-const SCAN_MAX_LOOKAHEAD: usize = 256;
-
-pub struct RemoteIterator {
-    db: Arc<Db>,
-    ks: KeySpace,
-    cut: IndexReadCut,
-    _pin: Option<IndexReadPin>,
-    lower: Option<Bytes>,
-    upper: Option<Bytes>,
-    reverse: bool,
-    after: Option<Bytes>,
-    started: bool,
-    exhausted: bool,
-    done: bool,
-    page: VecDeque<(Bytes, Bytes)>,
-    pending: VecDeque<PendingScanPage>,
-    ready: Option<Vec<(Bytes, ValueRecordReference)>>,
-    lookahead: usize,
-    failure: Option<DbError>,
-}
-impl RemoteIterator {
-    fn new(db: Arc<Db>, ks: KeySpace, cut: Result<(IndexReadCut, IndexReadPin)>) -> Self {
-        let (cut, pin, failure) = match cut {
-            Ok((cut, pin)) => (cut, Some(pin), None),
-            Err(e) => (IndexReadCut::BeforeAll, None, Some(e)),
-        };
-        Self {
-            db,
-            ks,
-            cut,
-            _pin: pin,
-            lower: None,
-            upper: None,
-            reverse: false,
-            after: None,
-            started: false,
-            exhausted: false,
-            done: false,
-            page: VecDeque::new(),
-            pending: VecDeque::new(),
-            ready: None,
-            lookahead: SCAN_INITIAL_LOOKAHEAD,
-            failure,
-        }
-    }
-    fn reset(&mut self) {
-        if matches!(
-            self.db.shape.ks(self.ks).key_indexing(),
-            crate::key_shape::KeyIndexing::Hash
-        ) {
-            self.failure = Some(error(
-                "hash keyspaces do not support application-key bounds or reversal",
-            ));
-        }
-        self.page.clear();
-        self.pending.clear();
-        self.ready = None;
-        self.after = None;
-        self.started = false;
-        self.exhausted = false;
-        self.done = false;
-        self.lookahead = SCAN_INITIAL_LOOKAHEAD;
-    }
-    fn next_references(&mut self) -> Result<Vec<(Bytes, ValueRecordReference)>> {
-        let Backend::Remote(remote) = &self.db.backend else {
-            unreachable!()
-        };
-        let descriptor = self.db.shape.ks(self.ks);
-        let target = self.lookahead;
-        let mut references = Vec::with_capacity(target);
-        if !self.started {
-            self.started = true;
-            let bound = if self.reverse {
-                &self.upper
-            } else {
-                &self.lower
-            };
-            if let Some(bound) = bound {
-                let reduced = descriptor.reduced_key_bytes(bound.clone());
-                if let Some(reference) = remote
-                    .db
-                    .index_reference(self.ks, bound, self.cut.clone())
-                    .map_err(error)?
-                {
-                    references.push((reduced.clone(), reference));
-                }
-                self.after = Some(reduced);
-            }
-        }
-        if !self.exhausted && references.len() < target {
-            let rows = remote
-                .db
-                .scan_index_page(
-                    self.ks,
-                    self.after.as_deref(),
-                    self.reverse,
-                    target - references.len(),
-                    self.cut.clone(),
-                )
-                .map_err(error)?;
-            if rows.is_empty() {
-                self.exhausted = true;
-            } else {
-                references.extend(rows);
-            }
-        }
-        if references.is_empty() {
-            return Ok(references);
-        }
-        let mut references = remote
-            .db
-            .bound_scan_page(references, target)
-            .map_err(error)?;
-        // Reduced keys can be lossy: include the boundary candidate, but never
-        // submit rows strictly past its reduced key. Full-key checks follow I/O.
-        let terminal = if self.reverse {
-            &self.lower
-        } else {
-            &self.upper
-        };
-        if let Some(bound) = terminal {
-            let reduced = descriptor.reduce_key(bound);
-            if let Some(end) = references.iter().position(|(key, _)| {
-                if self.reverse {
-                    key.as_ref() < reduced.as_ref()
-                } else {
-                    key.as_ref() > reduced.as_ref()
-                }
-            }) {
-                references.truncate(end);
-                self.exhausted = true;
-            }
-        }
-        // Apply terminal bounds after byte bounding: a shortened page must not
-        // mark the unreturned, still-in-bounds suffix exhausted.
-        if let Some((reduced, _)) = references.last() {
-            self.after = Some(reduced.clone());
-        }
-        self.lookahead = (self.lookahead * 2).min(SCAN_MAX_LOOKAHEAD);
-        Ok(references)
-    }
-
-    #[allow(
-        clippy::expect_used,
-        reason = "a scan iterator pins its cut for its whole lifetime"
-    )]
-    fn fill_page(&mut self) -> Result<()> {
-        let limit = match &self.db.backend {
-            Backend::Remote(remote) => remote.db.scan_prefetch_pages(),
-            Backend::Native(_) => unreachable!(),
-        };
-        while self.pending.len() < limit {
-            if self
-                .pending
-                .back()
-                .is_some_and(PendingScanPage::has_unsubmitted)
-                || self.pending.front().is_some_and(PendingScanPage::oversized)
-            {
-                break;
-            }
-            let references = if let Some(ready) = self.ready.take() {
-                ready
-            } else if self.exhausted {
-                break;
-            } else {
-                self.next_references()?
-            };
-            if references.is_empty() {
-                break;
-            }
-            let Backend::Remote(remote) = &self.db.backend else {
-                unreachable!()
-            };
-            // A legal oversized singleton cannot compete with another page.
-            let oversized = remote.db.scan_page_oversized(&references).map_err(error)?;
-            if oversized && !self.pending.is_empty() {
-                self.ready = Some(references);
-                break;
-            }
-            self.pending.push_back(
-                remote
-                    .db
-                    .submit_scan_page(
-                        references,
-                        self._pin
-                            .as_ref()
-                            .expect("valid iterator owns its captured cut")
-                            .clone(),
-                    )
-                    .map_err(error)?,
-            );
-        }
-        let Some(pending) = self.pending.pop_front() else {
-            return Ok(());
-        };
-        let Backend::Remote(remote) = &self.db.backend else {
-            unreachable!()
-        };
-        let rows = remote
-            .db
-            .finish_scan_page(self.ks, pending)
-            .map_err(error)?;
-        for (key, value) in rows {
-            if self
-                .lower
-                .as_ref()
-                .is_some_and(|bound| key.as_ref() < bound.as_ref())
-            {
-                if self.reverse {
-                    self.exhausted = true;
-                    self.pending.clear();
-                    self.ready = None;
-                    break;
-                }
-                continue;
-            }
-            if self
-                .upper
-                .as_ref()
-                .is_some_and(|bound| key.as_ref() >= bound.as_ref())
-            {
-                if self.reverse {
-                    continue;
-                }
-                self.exhausted = true;
-                self.pending.clear();
-                self.ready = None;
-                break;
-            }
-            self.page.push_back((key, value));
-        }
-        Ok(())
-    }
-    fn next_row(&mut self) -> Result<Option<(Bytes, Bytes)>> {
-        let Backend::Remote(remote) = &self.db.backend else {
-            unreachable!()
-        };
-        remote.db.validate_cached_read().map_err(error)?;
-        while self.page.is_empty()
-            && (!self.exhausted || !self.pending.is_empty() || self.ready.is_some())
-        {
-            self.fill_page()?;
-        }
-        if self.page.is_empty() {
-            return Ok(None);
-        }
-        self.db.scan_records.fetch_add(1, Ordering::Relaxed);
-        Ok(self.page.pop_front())
-    }
-}
-impl Iterator for RemoteIterator {
-    type Item = Result<(Bytes, Bytes)>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        if let Some(e) = self.failure.take() {
-            self.done = true;
-            return Some(Err(e));
-        }
-        match self.next_row() {
-            Ok(Some(row)) => Some(Ok(row)),
-            Ok(None) => {
-                self.done = true;
-                None
-            }
-            Err(e) => {
-                self.pending.clear();
-                self.ready = None;
-                self.page.clear();
-                self.done = true;
-                Some(Err(e))
-            }
         }
     }
 }

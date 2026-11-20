@@ -210,7 +210,7 @@ fn retirement_controls_require_current_authority_and_an_older_sealed_stream() {
 }
 
 #[test]
-fn live_resolution_rejects_forged_reference_and_stale_authority() {
+fn live_resolution_rejects_foreign_address_and_stale_authority() {
     let temp = tempdir::TempDir::new("live-owner-reference").unwrap();
     let config = config(&temp.path().join("node"));
     let node = StorageNode::open(config.clone(), metrics()).unwrap();
@@ -229,16 +229,19 @@ fn live_resolution_rejects_forged_reference_and_stale_authority() {
     let reference = batch(&config, 1, 0)
         .record_reference(appended.address(), 0)
         .unwrap();
-    let mut forged = reference;
-    forged.descriptor.checksum.0 ^= 1;
-    for (id, epoch, reference) in [(2, 1, forged), (3, 2, reference)] {
+    let member = crate::distributed::storage::member_address_of_reference(&reference).unwrap();
+    let foreign = crate::distributed::types::PhysicalValueAddress {
+        partition: member.partition + 1,
+        ..member
+    };
+    for (id, epoch, member) in [(2, 1, foreign), (3, 2, member)] {
         assert!(
             command(
                 &node,
                 id,
                 Request::ResolveLiveRecords {
                     authority_epoch: epoch,
-                    references: vec![reference],
+                    members: vec![member],
                 },
                 4096,
                 &completed
@@ -1117,23 +1120,18 @@ pub(super) mod live_fencing {
     fn permanent_owner_rejects_active_record_resolution() {
         let temp = tempdir::TempDir::new("permanent-controls").unwrap();
         let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let batch = batch(&config, 1, 0);
-        let reference = batch
-            .record_reference(
-                PhysicalValueAddress {
-                    partition: config.partition.partition,
-                    segment_generation: 1,
-                    offset: 0,
-                    len: (batch.encoded().len() + 8) as u32,
-                },
-                0,
-            )
-            .unwrap();
+        // The refusal precedes address validation: naming the active generation suffices.
+        let member = PhysicalValueAddress {
+            partition: config.partition.partition,
+            segment_generation: 1,
+            offset: 0,
+            len: 64,
+        };
         let error = node
             .handle(
                 Request::ResolveLiveRecords {
                     authority_epoch: 1,
-                    references: vec![reference],
+                    members: vec![member],
                 },
                 TcpLimits::default(),
             )
@@ -2441,8 +2439,8 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 34);
-    preface[4..6].copy_from_slice(&33u16.to_be_bytes());
+    assert_eq!(PROTOCOL, 35);
+    preface[4..6].copy_from_slice(&u16::try_from(PROTOCOL - 1).unwrap().to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
 
@@ -2521,12 +2519,14 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
             let reference = batch(&config, 1, 0)
                 .record_reference(appended.address(), 0)
                 .unwrap();
+            let member =
+                crate::distributed::storage::member_address_of_reference(&reference).unwrap();
             let over_bound = |count: usize| {
                 matches!(
                     node.handle(
                         Request::ResolveLiveRecords {
                             authority_epoch: 1,
-                            references: vec![reference; count],
+                            members: vec![member; count],
                         },
                         limits,
                     ),

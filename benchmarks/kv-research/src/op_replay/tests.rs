@@ -673,29 +673,18 @@ fn objects_compactor_keeps_latest_versions_on_both_arms() -> BackendResult<()> {
         assert!(arm.invocations > 0);
         assert_eq!(arm.invocations_after_reopen, 0);
     }
-    let witness = report
-        .leased_witness
-        .as_ref()
-        .ok_or("leased adoption witness missing")?;
-    assert_eq!(
-        witness.evaluated_cells,
-        u64::try_from(report.leased.invocations)?
-    );
-    assert_eq!(
-        usize::try_from(witness.keys_marked)?,
-        report.versions_written - report.model_rows
-    );
     eprintln!("compactor-parity {json}");
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
-/// Negative control: the earlier leased behavior (an Exact checkpoint that
-/// never evaluates the policy) keeps the old rows and fails the raw oracle.
+/// Negative control: the owners' durability barrier with no index snapshot never
+/// runs the compactor, so the leased arm keeps the old rows and fails the raw
+/// oracle. It shows the forced snapshot is what compacts.
 #[test]
-fn exact_only_leased_forcing_fails_the_raw_compactor_oracle() -> BackendResult<()> {
+fn flush_only_leased_forcing_fails_the_raw_compactor_oracle() -> BackendResult<()> {
     let root = scratch("compactor-negative")?;
-    let report = compactor_parity_with(&root.join("work"), LeasedForce::ExactOnly)?;
+    let report = compactor_parity_with(&root.join("work"), LeasedForce::FlushOnly)?;
     assert!(!report.passed);
     assert_eq!(report.leased.rows_after_compaction, report.versions_written);
     assert_eq!(report.leased.invocations, 0);

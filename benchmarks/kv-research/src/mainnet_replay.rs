@@ -67,9 +67,6 @@ pub struct ReplayConfig {
     pub measurement_completion_gate: Option<MeasurementGateConfig>,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
-    /// R0 shadow capacity measurement; absent stays absent when echoed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity_r0: Option<crate::capacity_r0::R0Request>,
 }
 /// Largest admitted checkpoint pipeline depth; Sui's default is 4 (sui-config node.rs).
 const MAX_PIPELINE_DEPTH: u32 = 64;
@@ -1866,23 +1863,12 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         config.execution.request_timeout_ms,
     )?;
     let mut m = Measurements::new(&trace, prepared.len())?;
-    // Opt-in A0 collector over every replay coordinator; finished before close.
-    let index_checkpoint = if config.diagnostics.index_checkpoint {
-        Some(crate::index_checkpoint::IndexCheckpointCollector::start(
-            backend.index_checkpoint_targets()?,
-            output,
-        )?)
-    } else {
-        None
-    };
     let preload_start = Instant::now();
     let mut preload_ns = 0;
     let mut window_start = None;
     let mut elapsed = Duration::ZERO;
     let mut physical_before = serde_json::Value::Null;
     let mut physical_after = serde_json::Value::Null;
-    let mut capacity_sessions = Vec::new();
-    let mut capacity_r0 = serde_json::Value::Null;
     let mut result: BackendResult<()> = async {
         for rep in 0..prepared.len() {
             pool.dispatch(0, rep, Operation::Preload, Instant::now(), deadline)?;
@@ -1895,40 +1881,9 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         }
         backend.check_background_health()?;
         physical_before = backend.physical_counts();
-        // R0 is telemetry: a start or begin failure is reported, never fails
-        // the replay. The initial inventory follows preload, before timing.
-        if let Some(request) = &config.capacity_r0 {
-            let header = crate::capacity_r0::R0Header {
-                run_id: config
-                    .case_id
-                    .clone()
-                    .unwrap_or_else(|| format!("{started_unix:.3}")),
-                engine_revision: resources["binary"].clone(),
-                workload: request.workload,
-                input_digest: Some(config.workload.manifest_sha256.clone()),
-                durability_tier: serde_json::Value::Null,
-                route: serde_json::Value::Null,
-                fixture: serde_json::Value::Null,
-                prewrite: None,
-            };
-            match backend.capacity_r0_start(request, &header, output) {
-                Ok(sessions) => {
-                    capacity_sessions = sessions;
-                    for session in &capacity_sessions {
-                        if let Err(error) = session.begin() {
-                            capacity_r0 = serde_json::json!({"begin_error": error.to_string()});
-                        }
-                    }
-                }
-                Err(error) => capacity_r0 = serde_json::json!({"start_error": error.to_string()}),
-            }
-        }
         reporter.set_phase("measurement");
         let begin = Instant::now();
         window_start = Some(begin);
-        if let Some(collector) = &index_checkpoint {
-            collector.mark("timed").await;
-        }
         Scheduler::new(
             &trace,
             &prepared,
@@ -1941,9 +1896,6 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         .await?;
         elapsed = begin.elapsed();
         physical_after = backend.physical_counts();
-        if let Some(collector) = &index_checkpoint {
-            collector.mark("gate").await;
-        }
         backend.check_background_health()?;
         if let Some(gate) = &config.measurement_completion_gate {
             crate::runner::wait_for_measurement_gate(gate, deadline).await?;
@@ -1954,25 +1906,6 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         )
     }
     .await;
-    let index_export = match index_checkpoint {
-        Some(collector) => {
-            collector.mark("drain").await;
-            match collector.finish().await {
-                Ok(export) => {
-                    crate::runner::write_index_checkpoint_diagnostics(
-                        output,
-                        &info.name,
-                        &export.details,
-                    )?;
-                    Some(export.summary)
-                }
-                Err(error) => {
-                    Some(serde_json::json!({"status": "failed", "error": error.to_string()}))
-                }
-            }
-        }
-        None => None,
-    };
     if let Some(begin) = window_start
         && elapsed.is_zero()
     {
@@ -1988,23 +1921,6 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         .await?;
     }
     let unresolved_workers = pool.close().await?;
-    // Finish (end inventory, join) before the caller tears the fixture down.
-    if !capacity_sessions.is_empty() {
-        let begin_error = capacity_r0.take();
-        capacity_r0 = serde_json::json!({
-            "begin_error": begin_error.get("begin_error"),
-            "reports": capacity_sessions
-                .into_iter()
-                .map(|session| {
-                    let path = session.path().to_owned();
-                    match session.finish() {
-                        Ok(summary) => serde_json::json!({"path": path, "summary": summary}),
-                        Err(error) => serde_json::json!({"path": path, "error": error.to_string()}),
-                    }
-                })
-                .collect::<Vec<_>>(),
-        });
-    }
     let mut final_verification = serde_json::Value::Null;
     if result.is_ok() {
         let expected = expected_final_rows(&prepared);
@@ -2046,7 +1962,6 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
         result.is_ok(),
     );
     metrics["final_verification"] = final_verification;
-    metrics["capacity_r0"] = capacity_r0;
     metrics["functional_qualification"] =
         serde_json::json!(result.is_ok() && unresolved_workers == 0);
     metrics["minimum_measurement_seconds"] =
@@ -2098,7 +2013,7 @@ pub(crate) async fn run_prepared<B: ReplayBackend + ?Sized>(
     let summary=RunSummary {status:if result.is_ok(){"completed"}else{"failed"}.into(),durability:replay_durability(&info),started_unix_seconds:started_unix,finished_unix_seconds:now_unix(),backend:info,
         execution:serde_json::json!({"effective_client_shards":1}),
         phase_counts:serde_json::json!({"scope":trace.scope(),"profile":metrics,"preload_ns":preload_ns,"counts":m.counts,"error":result.as_ref().err().map(ToString::to_string),"resources":resources,"sustained_30s_qualified":result.is_ok() && unresolved_workers==0 && elapsed.as_secs_f64()>=30.0,"run_status":run_status,"unknown_outcomes":unknown_outcomes,"unresolved_workers":unresolved_workers,"shutdown_contract":"join completed callers; after deadline plus grace detach only unresolved calls, under external process supervision; no cancellation or rollback"}),
-        distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()],index_checkpoint:index_export};
+        distributions:reporter.distribution_summaries(),limitations:vec![trace.scope(),"Package reads, accumulator materialization, JSON-RPC indexes, source node caches, pruning and epoch transitions are not represented; device read counters unmeasured".into()]};
     reporter.finish(&summary,result.is_err(),&serde_json::json!({"scope":trace.scope(),"config":config,"binary":resources["binary"],"trace_manifest":trace.manifest,"profile":metrics}))?;
     result
 }

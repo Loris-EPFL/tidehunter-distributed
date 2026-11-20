@@ -3,8 +3,7 @@
 
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::native_index::IndexReadPin;
-use crate::distributed::types::{BatchVersion, MutationVersion};
+use crate::distributed::types::BatchVersion;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
@@ -40,20 +39,6 @@ pub struct LocalDbStats {
     pub value_read_ns: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct LocalCheckpoint {
-    pub(crate) database: [u8; 16],
-    pub(crate) cut: Option<MutationVersion>,
-    /// Holds the index cut pinned for the checkpoint's lifetime.
-    pub(crate) _pin: Option<IndexReadPin>,
-}
-
-impl LocalCheckpoint {
-    pub fn cut(&self) -> Option<MutationVersion> {
-        self.cut
-    }
-}
-
 #[derive(Debug)]
 pub struct LocalDbError {
     message: String,
@@ -65,6 +50,7 @@ impl LocalDbError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self::with_kind(io::ErrorKind::Other, message)
     }
+
     pub(crate) fn with_kind(kind: io::ErrorKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -80,6 +66,44 @@ impl LocalDbError {
     }
     pub(crate) fn component(error: impl fmt::Display) -> Self {
         Self::new(error.to_string())
+    }
+
+    /// A value read failed twice: the member's file was retired between the
+    /// index lookup and the fetch, and the one re-resolve did not find a live
+    /// address either. Both causes stay in the message; the kind is fixed so a
+    /// caller can tell this apart from corruption without matching prose.
+    pub(crate) fn evicted_during_read(
+        version: BatchVersion,
+        first: impl fmt::Display,
+        second: impl fmt::Display,
+    ) -> Self {
+        // `Other`, not `NotFound`: `NotFound` is the value path's "retry this
+        // once" marker, and a typed eviction is terminal.
+        Self::with_kind(
+            io::ErrorKind::Other,
+            format!("value evicted during read: {version:?}: {first}; re-resolve: {second}"),
+        )
+    }
+
+    /// True for [`Self::evicted_during_read`].
+    pub(crate) fn is_evicted_during_read(&self) -> bool {
+        self.message.starts_with("value evicted during read:")
+    }
+
+    /// A relocation pass copied survivors but the durable cut did not cover the
+    /// copies in time, so the pass applied nothing. Not a failure of the
+    /// database: the copies stay unreferenced and the next pass retries.
+    pub(crate) fn copies_not_durable(next: u64, cause: impl fmt::Display) -> Self {
+        Self::with_kind(
+            io::ErrorKind::TimedOut,
+            format!("relocation copies not durable through sequence {next}: {cause}"),
+        )
+    }
+
+    /// True for [`Self::copies_not_durable`].
+    pub(crate) fn is_copies_not_durable(&self) -> bool {
+        self.kind == io::ErrorKind::TimedOut
+            && self.message.starts_with("relocation copies not durable")
     }
     pub(crate) fn unknown(version: BatchVersion, error: impl fmt::Display) -> Self {
         Self {

@@ -123,7 +123,6 @@ impl Fixture {
             timeout: Duration::from_secs(60),
             max_admitted_batches: 8192,
             max_index_bytes: 64 * MIB,
-            index_shards: 64,
             max_pending_batches: 64,
             max_pending_bytes: 32 * MIB,
             replay_limits,
@@ -141,7 +140,7 @@ impl Fixture {
             live_nvme: live_config(tier),
             durable_cut: Default::default(),
             relocation_max_reclaim_pct: 100,
-            compactor_cadence: Default::default(),
+            index: Default::default(),
         };
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
             .map(|path| tempdir::TempDir::new_in(path, "tail-target").unwrap());

@@ -4,9 +4,18 @@ use super::super::{
 };
 use super::completion::DrainStop;
 use super::core::WriteCore;
+use crate::distributed::hybrid::StoredSnapshot;
+use crate::distributed::types::BatchVersion;
 use std::collections::VecDeque;
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Lags of waiting a relocation copy's durability is allowed; see
+/// [`WriteCore::await_copies_durable`].
+const COPY_DURABLE_LAG_MULTIPLE: u32 = 8;
+/// Hard cap of the wait: it runs while a relocation cell latch is held, so a
+/// large `lag_ms` must not turn it into an hours-long stall.
+const COPY_DURABLE_WAIT_CAP: Duration = Duration::from_secs(120);
 
 impl WriteCore {
     pub(in crate::distributed::remote_db) fn drain(&self) -> Result<(), LocalDbError> {
@@ -23,16 +32,20 @@ impl WriteCore {
         self.wait_published_before(next)
     }
 
+    /// Native `flush`: waits for the published prefix, then runs one native
+    /// snapshot pass. The pass stores at `min(durable, applied, held latch)`, so a
+    /// native-tier flush does not claim more than the owners made durable (A25).
+    /// A failed pass is fail-stop, as native's snapshot thread is.
     pub(in crate::distributed::remote_db) fn flush_index(
         self: &Arc<Self>,
-    ) -> Result<(), LocalDbError> {
+    ) -> Result<StoredSnapshot, LocalDbError> {
         let next = self.sequencer.next();
         self.wait_published_before(next)?;
-        // Finish any older capture before freezing one that covers this cut.
-        // Writes allocated after the snapshot do not extend the caller's wait.
-        self.progress_checkpoint(true)?;
-        self.start_checkpoint()?;
-        self.progress_checkpoint(true)
+        let result = self.table.snapshot();
+        if let Err(error) = &result {
+            self.fail(LocalDbError::new(error.message()));
+        }
+        result
     }
 
     pub(in crate::distributed::remote_db) fn flush_durable(&self) -> Result<(), LocalDbError> {
@@ -53,6 +66,58 @@ impl WriteCore {
             cut.certify(next)?;
         }
         self.ensure_healthy()
+    }
+
+    /// Blocks until the owners made every relocation copy up to `last` durable
+    /// and the durable cut says so; the relocation pass calls it before it
+    /// re-points the index at those copies.
+    ///
+    /// A re-point keeps the entry's original version, so no cut check on the
+    /// index ever looks at the copy's version: the invariant "an index entry
+    /// never names a position that is not durable-proven" has to be enforced
+    /// here. On the native tier an owner acknowledges at its page cache, so the
+    /// copy can be lost by a crash that the old bytes survive; re-pointing first
+    /// and retiring the old file would then lose the value. A synchronous owner
+    /// (no durable cut) acknowledged at fsync: nothing to wait for.
+    ///
+    /// The wait is active, not passive: it asks every owner to sync now
+    /// ([`DurableCut::wait_through`]), because an idle native tier would
+    /// otherwise sync only when the cut lag reached `lag_ms`/`lag_bytes`. It
+    /// targets the copy's own version, so later writes cannot extend it.
+    ///
+    /// # Errors
+    /// [`LocalDbError::copies_not_durable`] when the cut did not cover the copy
+    /// within the bound. The caller applies nothing; the copies stay unreferenced
+    /// and the next pass retries.
+    pub(in crate::distributed::remote_db) fn await_copies_durable(
+        &self,
+        last: BatchVersion,
+    ) -> Result<(), LocalDbError> {
+        let Some(cut) = self.durable_cut.get() else {
+            return Ok(());
+        };
+        let next = (last.epoch == self.epoch)
+            .then(|| last.sequence.checked_add(1))
+            .flatten()
+            .ok_or_else(|| LocalDbError::new("relocation copy version is outside this epoch"))?;
+        let lag = Duration::from_millis(self.config.durable_cut.lag_ms);
+        // The cut reaches a nudged owner's sync through three stages, each at
+        // most a quarter of the lag (poller pickup, parked progress poll, actor
+        // tick), plus one failed-poll retry of one lag; the owner's own sync is
+        // bounded by the request timeout. Eight lags cover the stages with
+        // margin, so the bound is configuration-derived, not a constant.
+        let timeout = lag
+            .saturating_mul(COPY_DURABLE_LAG_MULTIPLE)
+            .saturating_add(self.config.timeout)
+            .min(COPY_DURABLE_WAIT_CAP);
+        #[cfg(test)]
+        let timeout = self
+            .test_hooks
+            .lock()
+            .copy_durable_timeout
+            .unwrap_or(timeout);
+        cut.wait_through(next, timeout, lag)
+            .map_err(|error| LocalDbError::copies_not_durable(next, error))
     }
 
     pub(in crate::distributed::remote_db) fn durable_cut_stats(
@@ -106,6 +171,10 @@ impl WriteCore {
             stats.owner_drain_stop_fence += stop(DrainStop::Fence);
             stats.owner_drain_stop_limit += stop(DrainStop::Limit);
             stats.owner_drain_stop_credit += stop(DrainStop::Credit);
+            // Allocations this owner could not queue at the cap. Nonzero is not a
+            // loss (the dropped floor keeps the replay start at or below them), but
+            // sustained growth means the index is a whole snapshot interval behind.
+            stats.allocation_cap_hits += accounting.cap_hits.load(Ordering::Relaxed);
         }
         stats
     }
@@ -126,26 +195,23 @@ impl WriteCore {
             return Err(LocalDbError::new("write profile limit exceeds 65536"));
         }
         self.drain()?;
-        self.progress_checkpoint(true)?;
         {
             let mut publisher = self.publisher.lock();
-            // Armed index checkpoint diagnostics own the ring for the whole run:
-            // a profile window must not clear unread rows or reset the counters.
-            if publisher.index_suffix.is_none() {
-                if limit == 0 {
-                    publisher.checkpoint_diagnostics = None;
-                } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
-                    records.clear();
-                } else {
-                    publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
-                }
-                publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
-                    available: limit != 0,
-                    ..CheckpointDiagnosticSummary::default()
-                };
-                publisher.dropped_checkpoint_diagnostics = 0;
-                publisher.last_checkpoint_diagnostic = None;
+            // Armed index diagnostics are gone with the Exact lifecycle: a profile
+            // window owns the ring and its counters.
+            if limit == 0 {
+                publisher.checkpoint_diagnostics = None;
+            } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
+                records.clear();
+            } else {
+                publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
             }
+            publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
+                available: limit != 0,
+                ..CheckpointDiagnosticSummary::default()
+            };
+            publisher.dropped_checkpoint_diagnostics = 0;
+            publisher.last_checkpoint_diagnostic = None;
         }
         *self.write_profile.lock() = WriteProfileSnapshot {
             limit_per_connection: limit,
@@ -252,7 +318,31 @@ impl WriteCore {
         #[cfg(not(test))]
         let skip_checkpoint = false;
         if result.is_ok() && !skip_checkpoint {
-            result = self.commit_checkpoint();
+            // Test hooks at the shutdown snapshot: park here (so a test can
+            // observe the closed allocation state), or fail before it stores
+            // anything (a crash between the drain and the region).
+            #[cfg(test)]
+            let (pause, interruption) = {
+                let mut hooks = self.test_hooks.lock();
+                (
+                    hooks.checkpoint_pause.take(),
+                    hooks.checkpoint_interruption.take(),
+                )
+            };
+            #[cfg(test)]
+            if let Some((entered, resume)) = pause {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+            #[cfg(test)]
+            let interrupted = interruption.is_some();
+            #[cfg(not(test))]
+            let interrupted = false;
+            result = if interrupted {
+                Err(LocalDbError::new("injected shutdown snapshot interruption"))
+            } else {
+                self.table.snapshot().map(|_| ())
+            };
         }
         self.stats.lock().shutdown.checkpoint_ns = elapsed(started);
         // After the checkpoint: its owner syncs end every parked poll, and the
@@ -342,10 +432,6 @@ impl WriteCore {
             self.fail(LocalDbError::new(error.message()));
         }
         let started = Instant::now();
-        // A checkpoint may own worker senders: take its handle under publisher,
-        // then join outside that mutex while controls can still be serviced.
-        let checkpoint = self.publisher.lock().background_checkpoint.take();
-        drop(checkpoint);
         for worker in &self.clients {
             if let Err(error) = worker.stop() {
                 combine_error(&mut result, error);

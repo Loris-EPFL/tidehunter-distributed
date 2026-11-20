@@ -80,6 +80,41 @@ fn live_write_into_a_reopened_versioned_cell_keeps_its_cadence() {
     assert_eq!(only_cadence(&table), 0);
 }
 
+/// The engine restores a reopened cell's own counter with `set_flushed_at`:
+/// it sticks across a live write and is what `flushed_at_snapshot` reports.
+#[cfg(feature = "experimental-distributed")]
+#[test]
+fn set_flushed_at_restores_a_reopened_versioned_cell() {
+    let shape = shape();
+    let loader = CadenceLoader::<TestPosition>::new(|cut| cut.0 * 1_000 + 7);
+    let table = reopened(&shape, TestCut(40), &loader);
+    assert_eq!(only_cadence(&table), 0, "the cut carries no byte meaning");
+
+    let context = table.ks_context(KeySpace::first());
+    let cell = context.ks_config.cell_id(&key(1));
+    table.set_flushed_at(context, &cell, 12_345);
+    assert_eq!(only_cadence(&table), 12_345);
+    assert_eq!(
+        table.flushed_at_snapshot(),
+        BTreeMap::from([((KeySpace::first().0, cell), 12_345)]),
+        "the snapshot lists every cell with its cadence"
+    );
+
+    // A live write into the restored (Unloaded) cell must not re-derive it.
+    let at = TestPosition(WalPosition::test_value(900));
+    table
+        .insert(
+            context,
+            key(1),
+            key(1),
+            at,
+            &Bytes::from_static(b"v"),
+            &loader,
+        )
+        .expect("the cadence loader cannot fail");
+    assert_eq!(only_cadence(&table), 12_345);
+}
+
 /// The live insert asks the loader for the cadence once, on the Empty -> dirty
 /// transition only: later writes to the same dirty cell leave it alone.
 #[test]

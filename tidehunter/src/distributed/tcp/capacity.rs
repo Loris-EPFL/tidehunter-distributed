@@ -1,6 +1,6 @@
-//! Coordinator side of the read-only R0 `FileInventoryPage` request.
+//! Coordinator side of the read-only `FileInventoryPage` request.
 use super::*;
-use crate::distributed::capacity::{FileInventoryReply, MAX_FILE_INVENTORY_PAGE};
+use crate::distributed::remote_db::file_inventory::{FileInventoryReply, MAX_FILE_INVENTORY_PAGE};
 
 impl Client {
     /// One sorted owner WAL file page of `source_generation`, strictly after

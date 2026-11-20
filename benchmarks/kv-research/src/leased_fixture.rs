@@ -32,9 +32,8 @@ use std::time::{Duration, Instant};
 use tidehunter::distributed::codec::BatchLimits;
 use tidehunter::distributed::durability::DurabilityTier;
 use tidehunter::distributed::group::GroupLimits;
-use tidehunter::distributed::native_index::CompactorCadence;
 use tidehunter::distributed::nvmeof::NvmeofTransport;
-use tidehunter::distributed::remote_db::{RemoteDatabaseConfig, ReplayLimits};
+use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
 use tidehunter::distributed::sui;
 use tidehunter::distributed::tcp::host::identity::database_hex;
 use tidehunter::distributed::tcp::{
@@ -69,10 +68,6 @@ pub(crate) struct CoordinatorSpec {
     pub max_pending_batches: usize,
     pub max_pending_bytes: usize,
     pub read_memory_allowance_bytes: usize,
-    /// `None` keeps the engine default.
-    pub index_shards: Option<usize>,
-    /// `None` keeps the engine default envelope.
-    pub replay_limits: Option<ReplayLimits>,
 }
 
 /// Leased write tuning; the route itself is fixed.
@@ -267,7 +262,7 @@ impl FixtureSpec {
                     "server_name": SERVER_NAME})
             })
             .collect();
-        let mut document = json!({
+        let document = json!({
             "storage": {"partitions": partitions,
                 "batch_limits": self.batch_limits, "group_limits": self.group_limits,
                 "fragment_bytes": self.fragment_bytes, "wal_file_bytes": self.wal_file_bytes,
@@ -284,12 +279,6 @@ impl FixtureSpec {
             "read_lanes": 2, "max_pending_reads": 64, "max_pending_read_bytes": 16 * MIB,
             "live_nvme": live,
         });
-        if let Some(shards) = coordinator.index_shards {
-            document["index_shards"] = json!(shards);
-        }
-        if let Some(limits) = coordinator.replay_limits {
-            document["replay_limits"] = serde_json::to_value(limits)?;
-        }
         let config: RemoteDatabaseConfig = serde_json::from_value(document)?;
         config
             .validate()
@@ -362,9 +351,8 @@ pub(crate) struct LeasedOwner {
 }
 
 impl LeasedOwner {
-    pub(crate) fn start(spec: &FixtureSpec, cadence: CompactorCadence) -> BackendResult<Self> {
-        let mut config = spec.remote_config()?;
-        config.compactor_cadence = cadence;
+    pub(crate) fn start(spec: &FixtureSpec) -> BackendResult<Self> {
+        let config = spec.remote_config()?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut owner = Self {
             stop,
@@ -440,10 +428,6 @@ struct OwnerLaunch {
 pub(crate) struct OwnerChild {
     child: Option<Child>,
     stop_file: PathBuf,
-    pub address: SocketAddr,
-    pub pid: u32,
-    /// Start receipt the child published before readiness.
-    pub receipt_file: PathBuf,
 }
 
 impl OwnerChild {
@@ -494,14 +478,10 @@ impl OwnerChild {
             .stdout(Stdio::from(log("stdout")?))
             .stderr(Stdio::from(log("stderr")?))
             .spawn()?;
-        let pid = child.id();
         match wait_ready(&mut child, &launch.ready_file) {
             Ok(ready) if ready == address => Ok(Self {
                 child: Some(child),
                 stop_file: launch.stop_file,
-                address,
-                pid,
-                receipt_file: launch.receipt_file,
             }),
             outcome => {
                 // A std `Child` does not kill its process on drop.
@@ -689,7 +669,7 @@ pub(crate) fn maybe_run_owner_child() -> BackendResult<bool> {
     Ok(true)
 }
 
-/// Fixture geometry used by A1, the Q1 local proof and the shared synthetic
+/// Fixture geometry used by the Q1 local proof and the shared synthetic
 /// route, from the benchmark adapter's checked overrides: batch 32 ops /
 /// 320 KiB, group at most 32 batches / 2 MiB, pending 64 batches / 32 MiB,
 /// reference metadata 64 MiB, read memory 128 MiB per side, one leased write
@@ -699,7 +679,6 @@ pub(crate) struct BenchmarkGeometry {
     pub wal_file_bytes: u64,
     pub max_admitted_batches: usize,
     pub max_index_bytes: usize,
-    pub replay_limits: Option<ReplayLimits>,
 }
 
 impl BenchmarkGeometry {
@@ -734,8 +713,6 @@ impl BenchmarkGeometry {
                 max_pending_batches: 64,
                 max_pending_bytes: 32 * MIB,
                 read_memory_allowance_bytes: 128 * MIB,
-                index_shards: Some(64),
-                replay_limits: self.replay_limits,
             },
             live: LiveSpec {
                 write_window: Some(1),

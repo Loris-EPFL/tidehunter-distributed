@@ -1,131 +1,103 @@
-//! R1 coordinator pass: retire exact-dead, durably sealed owner WAL files of
-//! the serving fencing generation (CAPACITY-R0-R1.md §4), without an
-//! authority restart and without any foreground wait.
+//! Coordinator pass: retire dead owner WAL files of every retained stream,
+//! keyed to the native value watermark (CAPACITY-R0-R1.md §4 on the native
+//! index). No Exact root and no reference walk decide a victim.
 //!
 //! One pass, under the cold `WriteCore::retirement` gate (the caller holds
-//! it; foreground writes, reads and checkpoints never take it):
-//! 1. Callback history: with any relocation filter in the shape, WAL at or
-//!    after the adopted `CallbackStart` of the serving stream is a callback
-//!    obligation (absent start: every file); without a filter no callback
-//!    can scan history again.
-//! 2. Between two equal even values of the R0 install seqlock, copy the
-//!    adopted Exact identity, the adopted stream positions and the installed
-//!    cut, and walk every retained reference of the installed image plus the
-//!    volatile overlay and captured layers. The walk decodes immutable cell
-//!    blocks off-lock (shard read locks only, per shard).
-//! 3. Page the serving stream of each owner over a dedicated authenticated
-//!    session, never the owner worker's control lane (a worker control
-//!    settles the open leased extent). Evaluate each durably sealed file
-//!    with the R0 blocker table plus the Exact coverage bound.
-//! 4. Send inode- and seal-bound proofs with the Exact witness. The owner
-//!    rechecks every bound it can compare, drains and disables the exact
-//!    namespace, and answers `Busy` without any durable decision when a pin,
-//!    an unprepared successor or the pending bound stands in the way.
+//! it; foreground writes, reads and snapshots never take it):
+//! 1. Freeze, per retained stream `(partition, fencing generation)`, the
+//!    native two-term watermark `min(adopted relocation callback start,
+//!    durable control-region replay_from)`. Bytes below `replay_from` are
+//!    represented by the stored index, so recovery never replays them; bytes
+//!    below the callback start hold no live value, because a `Keep` survivor
+//!    was copied to the serving generation and re-pointed before the start
+//!    moved past it. A held checkpoint clamps the control-region frontier
+//!    (I6), so its files stay.
+//! 2. Serving stream: page the owner inventory over a dedicated authenticated
+//!    session, never the owner worker's control lane. A victim needs an exact
+//!    durable seal of the observed inode, its file end at or below the
+//!    watermark, every batch below the persisted Version B cut, and a whole
+//!    file inside the per-owner span budget. The owner rechecks every bound
+//!    it can compare, drains and disables the exact namespace, and answers
+//!    `Busy` without a durable decision when a pin, an unprepared successor
+//!    or the pending bound stands in the way.
+//! 3. Older retained generations: page the owner's retirement list and push
+//!    the same watermark as a bare proof (`retire_files_if_idle`); the owner
+//!    runs its sealed-stream path. Readiness to trim a generation is a
+//!    separate check (see `fencing_generations`).
 //!
-//! In-flight reads need no extra file guard here: every remote read flight
-//! owns its `IndexReadPin` until its terminal completion (reactor lanes
-//! complete a request only when all of its flights returned their CQE;
-//! inline reads return only after the terminal CQE or abort the process), and
-//! a registered pin keeps the retention floor at or below its cut, so every
-//! reference such a read can still use stays in the installed image and
-//! blocks its file in step 2.
+//! In-flight reads need no extra file guard here: a read holds the checkpoint
+//! latch of its cut (I6), which clamps `Loader::last_processed`, which clamps
+//! the durable flush target and so the control-region frontier. Retirement
+//! therefore never passes a cut a read can still use.
 //!
 //! Nothing here is fatal for the authority: a failed or refused request made
 //! no coordinator state change, and the next pass re-pages the owner.
 
+use super::file_inventory::{
+    FileInventoryReply, FileUseState, MAX_FILE_INVENTORY_PAGE, OwnerSpan, WalFileObservation,
+    span_budget_end,
+};
 use super::write_core::core::WriteCore;
 use super::{Client, LocalDbError};
-use crate::distributed::capacity::{
-    FileInputs, FileInventoryReply, MAX_FILE_INVENTORY_PAGE, OwnerSpan, PositionFacts, StreamFacts,
-    WalFileObservation, evaluate, span_budget_end,
-};
 use crate::distributed::storage::{RetireProof, RetirementWitness, WalInode};
 use crate::distributed::tcp::checkpoint::RetirementResult;
-use crate::distributed::types::{RecordKind, ValueRecordReference};
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::collections::BTreeMap;
 
 /// Owner inventory pages per pass and owner; a stream has far fewer files.
 const MAX_PAGES_PER_STREAM: usize = 1 << 16;
-/// Bounded wait (1 ms each) for an in-progress image installation.
-const INSTALL_WAIT_TRIES: u32 = 1000;
 /// Proofs per request; equal to the owner's bounded pending set.
 const MAX_PROOFS_PER_REQUEST: usize = 256;
+/// Sealed-stream files per owner page and retirement request.
+const MAX_FILES_PER_PAGE: usize = 256;
 
-/// Publisher state copied once, inside the stable seqlock window.
-struct Snapshot {
-    checkpoint_generation: u64,
-    metadata_digest: [u8; 32],
-    obsolete_root: bool,
-    positions: BTreeMap<u32, PositionFacts>,
-    /// Adopted callback starts of the serving generation, per partition.
-    callback_starts: BTreeMap<u32, u64>,
+/// One stream's frozen watermark and the terms it was taken from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamWatermark {
+    /// Exclusive end of the dead prefix: `min(callback_from, replay_from)`.
+    end: u64,
+    /// Durable control-region `replay_from` of this stream.
+    replay_from: u64,
+    /// Adopted relocation callback start; `0` when no pass has adopted one,
+    /// whatever the shape. An unfiltered shape still copies every record it
+    /// reclaims, so this term is never vacuous.
+    callback_from: u64,
 }
 
-/// Retire every exact-dead sealed file of the serving generation. The caller
-/// holds `core.retirement`; no other coordinator lock is held across a walk
-/// step or an RPC. Every early `Ok(())` below is a deferral that made no
-/// decision; the next pass (after a later root, roll or unpin) retries.
+/// Frozen per-pass evidence: one watermark per retained stream plus the
+/// Version B cut of the serving generation.
+struct Snapshot {
+    watermark: BTreeMap<(u32, u64), StreamWatermark>,
+    /// Contiguous durable end per stream, from the publisher positions. It
+    /// bounds the per-owner span budget, never a victim's coverage.
+    durable_end: BTreeMap<(u32, u64), u64>,
+    /// Persisted `CutRecord.live.next` of the serving generation.
+    ///
+    /// `None` means one of exactly two states, never "unknown": Version B is
+    /// disabled at the native tier, where every acknowledged write is already
+    /// durable by the tier's own contract, so the B term is redundant; or the
+    /// record belongs to another generation, which defers the pass entirely.
+    /// A future config that disables Version B at the native tier must keep
+    /// that invariant or make this `None` impossible for a serving stream.
+    persisted_cut_next: Option<u64>,
+    /// Retained generations per owner, read once with the watermark.
+    retained: Vec<Vec<u64>>,
+}
+
+/// Retire every dead sealed file of every retained stream. The caller holds
+/// `core.retirement`; no other coordinator lock is held across a page, an RPC
+/// or an unlink. Every early `Ok(())` below is a deferral that made no
+/// decision; the next pass retries.
 pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     core: &WriteCore,
 ) -> Result<(), LocalDbError> {
-    // Destroyed keyspaces count too: their filter is not called, but the
-    // conservative bound never deletes a file a decision might need.
-    let filtered = core
-        .shape
-        .iter_ks()
-        .any(|keyspace| keyspace.relocation_filter().is_some());
-    // An installation that keeps running defers the pass.
-    let Some(seq) = stable_install_seq(core) else {
-        return Ok(());
-    };
-    // No image installed by this process yet: the covered cut is unknown.
-    let Some(installed) = core.capacity.installed_cut() else {
-        return Ok(());
-    };
-    // Every batch strictly below this sequence is covered by the installed
-    // image. The cut's own batch is excluded: a file ending in it waits for
-    // the next checkpoint rather than relying on member-level coverage.
-    let covered_next = match installed {
-        Some(cut) if cut.batch.epoch == core.epoch => cut.batch.sequence,
-        Some(cut) if cut.batch.epoch > core.epoch => {
-            return Err(LocalDbError::new(
-                "installed Exact cut names a future fencing generation",
-            ));
-        }
-        _ => 0,
-    };
-    // No root adopted by this generation, or a previous root still
-    // selectable until its cleanup completes.
-    let Some(snapshot) = take_snapshot(core).filter(|snapshot| !snapshot.obsolete_root) else {
-        return Ok(());
-    };
-    let persisted_cut_next = match core.durable_cut.get() {
-        None => None,
-        Some(cut) => {
-            let stats = cut.stats();
-            // The durable cut tracks another generation or is disabled.
-            if !stats.enabled || stats.epoch != core.epoch {
-                return Ok(());
-            }
-            Some(stats.persisted_next)
-        }
-    };
-    let referenced = referenced_files(core).map_err(|error| {
-        LocalDbError::new(format!(
-            "R1 retirement walk of the installed image failed: {error}"
-        ))
-    })?;
-    // An image installed during the walk: its result is discarded.
-    if core.capacity.install_seq() != seq {
-        return Ok(());
-    }
+    let snapshot = take_snapshot(core);
     let tls_config = core
         .config
         .tls
         .client_config_with_identity()
         .map_err(LocalDbError::component)?;
-    for endpoint in &core.config.endpoints {
+    for node in 0..core.config.endpoints.len() {
+        let endpoint = &core.config.endpoints[node];
         let mut tls = core.config.tls.clone();
         tls.server_name = endpoint.server_name.clone();
         let mut client = Client::connect_shared(
@@ -138,204 +110,261 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
         )
         .map_err(|error| {
             LocalDbError::new(format!(
-                "R1 retirement session to partition {} failed: {error}",
+                "retirement session to partition {} failed: {error}",
                 endpoint.partition
             ))
         })?;
-        let (header, rows, stable) = page_serving_stream(&mut client, core.epoch)?;
-        // The owner's allocator, leases or root moved during paging.
-        if !stable {
-            continue;
-        }
-        let facts = StreamFacts {
-            same_generation: true,
-            complete_stream: false,
-            position: snapshot.positions.get(&endpoint.partition).copied(),
-            owner_root_scan_from: header.wal_scan_from,
-            owner_root_synced_end: header.wal_synced_end,
-            processed_end: header.processed_end,
-            page_stable: stable,
-            persisted_cut_next,
-        };
-        // Absent start: the first unretired file of the stream, so no file.
-        let callback_from = if filtered {
-            snapshot
-                .callback_starts
-                .get(&endpoint.partition)
-                .copied()
-                .unwrap_or(0)
-        } else {
-            u64::MAX
-        };
-        let proofs = victims(
-            core,
-            endpoint.partition,
-            &rows,
-            &facts,
-            &referenced,
-            covered_next,
-            callback_from,
-        )?;
-        let Some(position) = facts.position else {
+        let Some(generations) = snapshot.retained.get(node) else {
             continue;
         };
-        let witness = RetirementWitness {
-            checkpoint_generation: snapshot.checkpoint_generation,
-            metadata_digest: snapshot.metadata_digest,
-            replay_from: position.replay_from,
-            durable_end: position.durable_end,
-            callback_from,
-            covered_next,
-            persisted_cut_next,
-        };
-        let file_bytes = core
-            .config
-            .partition_config(1, endpoint.partition)
-            .wal_file_bytes;
-        for chunk in proofs.chunks(MAX_PROOFS_PER_REQUEST) {
-            // Revalidate the walked image identity at submission.
-            if core.capacity.install_seq() != seq {
-                return Ok(());
-            }
-            let claim =
-                core.r1_events
-                    .claimed(core, endpoint.partition, file_bytes, chunk, &witness, seq);
-            let outcome = client
-                .retire_sealed_files(core.epoch, chunk.to_vec(), witness)
-                .map_err(|error| {
-                    LocalDbError::new(format!(
-                        "R1 retirement request to partition {} failed: {error}",
-                        endpoint.partition
-                    ))
-                })?;
-            if let Some((attempt, after)) = claim {
-                let files: Vec<u64> = chunk.iter().map(|proof| proof.file_start).collect();
-                core.r1_events.replied(
+        for &generation in generations {
+            let key = (endpoint.partition, generation);
+            let (Some(&watermark), Some(&stream_end)) =
+                (snapshot.watermark.get(&key), snapshot.durable_end.get(&key))
+            else {
+                continue;
+            };
+            if generation == core.epoch {
+                retire_serving_stream(
+                    core,
+                    &mut client,
                     endpoint.partition,
-                    core.epoch,
-                    attempt,
-                    &after,
-                    &files,
-                    outcome,
-                );
-            }
-            // `Busy`: no durable decision; retry after a later root, roll or
-            // unpin (the next pass), never in a loop here.
-            if outcome == RetirementResult::Busy {
-                break;
+                    watermark,
+                    stream_end,
+                    snapshot.persisted_cut_next,
+                )?;
+            } else {
+                retire_sealed_stream(
+                    core,
+                    &mut client,
+                    endpoint.partition,
+                    generation,
+                    watermark,
+                    stream_end,
+                )?;
             }
         }
     }
     Ok(())
 }
 
-/// The current seqlock value once it is even, or `None` if an install keeps
-/// running for the whole bounded wait.
-fn stable_install_seq(core: &WriteCore) -> Option<u64> {
-    for _ in 0..INSTALL_WAIT_TRIES {
-        let seq = core.capacity.install_seq();
-        if seq.is_multiple_of(2) {
-            return Some(seq);
+fn take_snapshot(core: &WriteCore) -> Snapshot {
+    // Two guards of the deleted Exact design are replaced, not lost:
+    // `install_seq`/the installed-cut bound existed to freeze one image while
+    // walking its references, and `referenced_files` existed because a file
+    // could hold a live value the index still named. The watermark now supplies
+    // both: the control region is stored under Amendment 11's stored-target
+    // rule (never ahead of an unapplied batch), and the relocation term below
+    // guarantees every live value in a reclaimed file was copied first. Reads
+    // hold their cut latches (I6), which clamps the frontier they need.
+    let (starts, durable_end, retained) = {
+        let mut publisher = core.publisher.lock();
+        let state = publisher.checkpoint_state();
+        let mut starts = BTreeMap::new();
+        let mut durable_end = BTreeMap::new();
+        let retained = state.retained_epochs.clone();
+        for (node, generations) in state.retained_epochs.iter().enumerate() {
+            let partition = core.config.endpoints[node].partition;
+            for &generation in generations {
+                let key = (partition, generation);
+                // A stream without a position has no proven end: nothing of it
+                // can be proven dead, so it is skipped, never read as empty.
+                let Some(position) = state.positions.get(&key) else {
+                    continue;
+                };
+                // No adopted start means no relocation pass reached this
+                // stream yet: no byte of it can be proven dead, with or
+                // without a filter. An unfiltered shape still copies every
+                // record it reclaims, so the term is never vacuous.
+                let callback_from = state.callback_starts.get(&key).copied().unwrap_or(0);
+                starts.insert(key, callback_from);
+                durable_end.insert(key, position.durable_end);
+            }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        (starts, durable_end, retained)
+    };
+    // Per stream, never one global term: independent owner offset spaces.
+    let mut fronts: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+    for front in &core.table.stored_fronts() {
+        fronts.insert((front.partition, front.generation), front.replay_from);
     }
-    None
-}
-
-fn take_snapshot(core: &WriteCore) -> Option<Snapshot> {
-    let mut publisher = core.publisher.lock();
-    let state = publisher.checkpoint_state();
-    let commit = state
-        .manifest
-        .checkpoint
-        .as_ref()
-        .filter(|commit| commit.epoch == core.epoch)?;
-    Some(Snapshot {
-        checkpoint_generation: commit.generation,
-        metadata_digest: commit.metadata_digest,
-        // A previous root stays selectable until its cleanup completes; its
-        // references are not walked. A staged, unadopted image is not
-        // selectable, and it can only hold references published at or
-        // before its capture, which the walk already covers.
-        obsolete_root: state.manifest.checkpoint_obsolete.is_some(),
-        positions: state
-            .positions
-            .iter()
-            .filter(|((_, epoch), _)| *epoch == core.epoch)
-            .map(|((partition, _), position)| {
-                (
-                    *partition,
-                    PositionFacts {
-                        replay_from: position.replay_from,
-                        last_offset: position.last_offset,
-                        durable_end: position.durable_end,
-                    },
-                )
-            })
-            .collect(),
-        callback_starts: state
-            .callback_starts
-            .iter()
-            .filter(|((_, epoch), _)| *epoch == core.epoch)
-            .map(|(&(partition, _), &from)| (partition, from))
-            .collect(),
-    })
-}
-
-/// `(partition, file_start)` of every serving-generation file that a retained
-/// put of the installed image, the live overlay or a captured layer names.
-fn referenced_files(
-    core: &WriteCore,
-) -> Result<BTreeSet<(u32, u64)>, crate::distributed::native_index::NativeIndexError> {
-    let size = core.config.storage.wal_file_bytes;
-    let epoch = core.epoch;
-    let mut files = BTreeSet::new();
-    let mut mark = |reference: &ValueRecordReference| {
-        let address = reference.batch_address;
-        if reference.descriptor.kind != RecordKind::Put || address.segment_generation != epoch {
-            return;
-        }
-        let end = address.offset.saturating_add(u64::from(address.len));
-        let mut start = address.offset - address.offset % size;
-        while start < end {
-            files.insert((address.partition, start));
-            let Some(next) = start.checked_add(size) else {
-                break;
-            };
-            start = next;
+    let mut watermark = BTreeMap::new();
+    for (&key, &callback_from) in &starts {
+        // A stream the durable control region never covered has no replay
+        // floor yet: no byte of it can be proven dead.
+        let Some(&replay_from) = fronts.get(&key) else {
+            continue;
+        };
+        watermark.insert(
+            key,
+            StreamWatermark {
+                end: callback_from.min(replay_from),
+                replay_from,
+                callback_from,
+            },
+        );
+    }
+    let persisted_cut_next = match core.durable_cut.get() {
+        None => None,
+        Some(cut) => {
+            let stats = cut.stats();
+            // Disabled, or owned by another generation: no B term.
+            (stats.enabled && stats.epoch == core.epoch).then_some(stats.persisted_next)
         }
     };
-    core.index.visit_installed_references(|reference| {
-        if let Some(reference) = reference {
-            mark(reference);
-        }
-    })?;
-    core.index.visit_volatile_references(mark);
-    Ok(files)
+    // A stream with an adopted start but no control-region front (or the
+    // reverse) would never retire and nobody would notice; the two come from
+    // one snapshot, so they must name the same streams.
+    debug_assert_eq!(
+        starts.keys().collect::<Vec<_>>(),
+        fronts
+            .keys()
+            .filter(|key| starts.contains_key(key))
+            .collect::<Vec<_>>()
+    );
+    Snapshot {
+        watermark,
+        durable_end,
+        persisted_cut_next,
+        retained,
+    }
 }
 
-/// Page the serving stream to its end. `stable` is false when the owner
-/// reported a change during enumeration or its identity moved between pages.
+/// Serving stream: retire durably sealed whole files at or below the
+/// watermark, in owner page order, with the watermark as the witness.
+fn retire_serving_stream(
+    core: &WriteCore,
+    client: &mut Client,
+    partition: u32,
+    watermark: StreamWatermark,
+    durable_end: u64,
+    persisted_cut_next: Option<u64>,
+) -> Result<(), LocalDbError> {
+    // An owner whose allocator, lease or root moved during paging yields no
+    // trustworthy proof: defer it to the next pass.
+    let Some((header, rows)) = page_serving_stream(client, core.epoch)? else {
+        return Ok(());
+    };
+    let file_bytes = core.config.partition_config(1, partition).wal_file_bytes;
+    let proofs = victims(
+        core,
+        partition,
+        &rows,
+        watermark,
+        durable_end,
+        persisted_cut_next,
+    )?;
+    let witness = RetirementWitness {
+        replay_from: watermark.replay_from,
+        callback_from: watermark.callback_from,
+        persisted_cut_next,
+    };
+    for chunk in proofs.chunks(MAX_PROOFS_PER_REQUEST) {
+        let claim = core
+            .r1_events
+            .claimed(core, partition, file_bytes, chunk, &witness);
+        let outcome = client
+            .retire_sealed_files(core.epoch, chunk.to_vec(), witness)
+            .map_err(|error| {
+                LocalDbError::new(format!(
+                    "retirement request to partition {partition} failed: {error}"
+                ))
+            })?;
+        if let Some((attempt, after)) = claim {
+            let files: Vec<u64> = chunk.iter().map(|proof| proof.file_start).collect();
+            core.r1_events
+                .replied(partition, core.epoch, attempt, &after, &files, outcome);
+        }
+        // `Busy`: no durable decision; retry on the next pass, never in a loop.
+        if outcome == RetirementResult::Busy {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Older retained generation: push the same watermark as a bare proof. The
+/// owner's sealed-stream path rechecks its own pins and read admission.
+fn retire_sealed_stream(
+    core: &WriteCore,
+    client: &mut Client,
+    partition: u32,
+    generation: u64,
+    watermark: StreamWatermark,
+    stream_end: u64,
+) -> Result<(), LocalDbError> {
+    let mut after = None;
+    loop {
+        let files = client
+            .retirement_files(core.epoch, generation, after, MAX_FILES_PER_PAGE)
+            .map_err(|error| {
+                LocalDbError::new(format!(
+                    "retirement list of partition {partition} generation {generation} failed: {error}"
+                ))
+            })?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        after = files.last().copied();
+        // A sealed stream can never append, so its last file is dead once the
+        // watermark covers the whole stream: bytes after the stream end are the
+        // seal scan's zero or skip suffix. Without that full coverage a file is
+        // only dead when its *end* is at or below the watermark, exactly like
+        // the serving stream: a mid-file target leaves live bytes above it.
+        let size = core.config.partition_config(1, partition).wal_file_bytes;
+        let full = watermark.end >= stream_end;
+        let dead: Vec<u64> = files
+            .into_iter()
+            .filter(|&start| {
+                if full {
+                    start < watermark.end
+                } else {
+                    start
+                        .checked_add(size)
+                        .is_some_and(|end| end <= watermark.end)
+                }
+            })
+            .collect();
+        if dead.is_empty() {
+            return Ok(());
+        }
+        if client
+            .retire_files_if_idle(core.epoch, generation, dead)
+            .map_err(|error| {
+                LocalDbError::new(format!(
+                    "sealed retirement of partition {partition} generation {generation} failed: {error}"
+                ))
+            })?
+            == RetirementResult::Busy
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Page the serving stream to its end. Rows are ordered by `file_start`;
+/// `None` when the owner identity or allocator moved during pagination.
 fn page_serving_stream(
     client: &mut Client,
     authority: u64,
-) -> Result<(FileInventoryReply, Vec<WalFileObservation>, bool), LocalDbError> {
+) -> Result<Option<(FileInventoryReply, Vec<WalFileObservation>)>, LocalDbError> {
     let mut after = None;
     let mut rows = Vec::new();
     let mut header: Option<FileInventoryReply> = None;
-    let mut stable = true;
     for _ in 0..MAX_PAGES_PER_STREAM {
         let mut reply = client
             .file_inventory_page(authority, authority, after, MAX_FILE_INVENTORY_PAGE)
             .map_err(|error| {
-                LocalDbError::new(format!("R1 retirement inventory page failed: {error}"))
+                LocalDbError::new(format!("retirement inventory page failed: {error}"))
             })?;
-        stable &= reply.stable;
         if let Some(first) = &header
             && (first.owner_incarnation != reply.owner_incarnation
                 || first.owner_root_generation != reply.owner_root_generation)
         {
-            stable = false;
+            return Ok(None);
+        }
+        if !reply.stable {
+            return Ok(None);
         }
         let full = reply.rows.len() == usize::from(MAX_FILE_INVENTORY_PAGE);
         after = reply.rows.last().map(|row| row.file_start);
@@ -343,36 +372,27 @@ fn page_serving_stream(
         header = Some(reply);
         if !full {
             let header = header.ok_or_else(|| LocalDbError::new("inventory page missing"))?;
-            return Ok((header, rows, stable));
+            return Ok(Some((header, rows)));
         }
     }
     Err(LocalDbError::new(
-        "R1 retirement owner inventory exceeds its page bound",
+        "retirement owner inventory exceeds its page bound",
     ))
 }
 
-/// Proofs for the durably sealed files of one owner whose proven blocker set
-/// is empty and whose batches the installed image covers. The caller already
-/// deferred the pass while a previous root is still selectable.
+/// Proofs for the durably sealed files of one owner at or below the watermark.
 fn victims(
     core: &WriteCore,
     partition: u32,
     rows: &[WalFileObservation],
-    facts: &StreamFacts,
-    referenced: &BTreeSet<(u32, u64)>,
-    covered_next: u64,
-    callback_from: u64,
+    watermark: StreamWatermark,
+    processed_end: u64,
+    persisted_cut_next: Option<u64>,
 ) -> Result<Vec<RetireProof>, LocalDbError> {
     let size = core.config.storage.wal_file_bytes;
     let used = rows
         .iter()
-        .filter(|row| {
-            matches!(
-                row.state,
-                crate::distributed::capacity::FileUseState::Used
-                    | crate::distributed::capacity::FileUseState::Leased
-            )
-        })
+        .filter(|row| matches!(row.state, FileUseState::Used | FileUseState::Leased))
         .map(|row| row.file_start)
         .min();
     let budget_end = used.and_then(|lo| {
@@ -380,7 +400,7 @@ fn victims(
             &[OwnerSpan {
                 generation: core.epoch,
                 lo,
-                hi: facts.processed_end,
+                hi: processed_end,
             }],
             size,
             core.config.relocation_max_reclaim_pct,
@@ -393,7 +413,7 @@ fn victims(
         let file_end = row
             .file_start
             .checked_add(size)
-            .ok_or_else(|| LocalDbError::new("R1 retirement file bound overflow"))?;
+            .ok_or_else(|| LocalDbError::new("retirement file bound overflow"))?;
         // Only an exact durable seal of the observed inode is a candidate.
         let Some(seal) = row.seal.filter(|seal| {
             seal.start == row.file_start
@@ -403,43 +423,26 @@ fn victims(
         }) else {
             continue;
         };
-        // Callback history at or after the adopted start stays.
-        if file_end > callback_from {
+        if file_end > watermark.end {
             continue;
         }
         if seal
             .last_batch_sequence
-            .is_some_and(|last| last >= covered_next)
+            .is_some_and(|last| persisted_cut_next.is_some_and(|next| last >= next))
         {
             continue;
         }
-        let sequence_bound = match seal.last_batch_sequence {
-            None => Some(0),
-            Some(last) => last.checked_add(1),
-        };
-        let blockers = evaluate(&FileInputs {
-            file_start: row.file_start,
-            file_end,
-            observation: Some(row),
-            stream: facts,
-            adopted_root: true,
-            obsolete_root_pending: false,
-            retained_puts: u64::from(referenced.contains(&(partition, row.file_start))),
-            volatile_reference: false,
-            sequence_bound,
-            within_budget: budget_end.is_some_and(|end| file_end <= end),
-            changed: false,
-        });
-        if blockers.is_empty() {
-            proofs.push(RetireProof {
-                file_start: row.file_start,
-                inode: Some(WalInode {
-                    device: row.device,
-                    inode: row.inode,
-                }),
-                seal_generation: Some(seal.root_generation),
-            });
+        if !budget_end.is_some_and(|end| file_end <= end) {
+            continue;
         }
+        proofs.push(RetireProof {
+            file_start: row.file_start,
+            inode: Some(WalInode {
+                device: row.device,
+                inode: row.inode,
+            }),
+            seal_generation: Some(seal.root_generation),
+        });
     }
     Ok(proofs)
 }

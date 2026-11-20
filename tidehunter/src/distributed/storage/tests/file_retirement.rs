@@ -61,23 +61,19 @@ fn fill(log: &PartitionLog, config: &PartitionConfig, first: u64, extents: u64) 
 
 fn witness() -> RetirementWitness {
     RetirementWitness {
-        checkpoint_generation: 1,
-        metadata_digest: [0; 32],
         replay_from: u64::MAX,
-        durable_end: u64::MAX,
         callback_from: u64::MAX,
-        covered_next: u64::MAX,
         persisted_cut_next: None,
     }
 }
 
-/// Proofs for every sealed file wholly below the owner scan origin.
+/// Proofs for every durably sealed file. Eligibility is the coordinator's
+/// watermark (the `witness()` below covers everything), never an owner scan
+/// origin: the owner keeps no position root and no reference information.
 fn proofs(log: &PartitionLog) -> Vec<RetireProof> {
-    let scan_from = log.state.lock().wal_root.as_ref().unwrap().scan_from;
     log.file_retirement_state()
         .0
         .iter()
-        .filter(|seal| seal.end <= scan_from)
         .map(|seal| RetireProof {
             file_start: seal.start,
             inode: Some(WalInode {
@@ -89,14 +85,15 @@ fn proofs(log: &PartitionLog) -> Vec<RetireProof> {
         .collect()
 }
 
-/// Six fragments (three files), proved through the adopted end: the allocator
-/// passed files 0..2 but the root covers only files 0 and 1, which seal and
-/// lie wholly below the scan origin.
+/// Six fragments (three files), all past the allocator: every whole file seals.
+/// The seal proves completeness from the allocator position and the extents,
+/// never from an owner position root (native has none); durability is the
+/// Version B term of the retirement witness.
 fn sealed_stream() -> (tempdir::TempDir, PartitionConfig, PartitionLog) {
     let (temp, config, log) = fixture();
     fill(&log, &config, 0, 6);
     log.persist_wal_through(log.appended_frontier()).unwrap();
-    assert_eq!(log.seal_ready_files().unwrap(), 2);
+    assert_eq!(log.seal_ready_files().unwrap(), 3);
     (temp, config, log)
 }
 
@@ -179,12 +176,13 @@ fn seal_is_lease_logical_and_denies_any_stale_grant() {
     assert!(pending.is_empty());
     assert_eq!(
         seals.iter().map(|seal| seal.start).collect::<Vec<_>>(),
-        [0, FILE]
+        [0, FILE, 2 * FILE]
     );
     // Two groups per file, sequences 0..6 in order.
     assert_eq!(seals[0].last_batch_sequence, Some(1));
     assert_eq!(seals[1].last_batch_sequence, Some(3));
-    // File 2 is passed but not covered by the position root: no seal.
+    assert_eq!(seals[2].last_batch_sequence, Some(5));
+    // No further file is past the allocator.
     assert_eq!(log.seal_ready_files().unwrap(), 0);
     // A sealed file stays readable through its unchanged inode.
     let receipt = log.receipt_page(0, 1).unwrap()[0];
@@ -301,7 +299,7 @@ fn retirement_crash_cuts_match_the_no_gc_control() {
             }
             let (temp, config, log) = sealed_stream();
             let victims = proofs(&log);
-            assert_eq!(victims.len(), 2);
+            assert_eq!(victims.len(), 3);
             if phase != 0 {
                 log.fail_wal_root.store(phase, Ordering::Release);
             }
@@ -315,11 +313,10 @@ fn retirement_crash_cuts_match_the_no_gc_control() {
             let retired = recovered.is_retired(0).unwrap();
             // Before a durable root nothing is gone; after it recovery has
             // repeated every unlink from the exact pending identities.
-            for file in 0..2 {
+            for file in 0..3 {
                 assert_eq!(wal_exists(&path, file), !retired, "{phase} {cut:?}");
                 assert_eq!(recovered.is_retired(file * FILE).unwrap(), retired);
             }
-            assert!(wal_exists(&path, 2));
             assert_eq!(
                 (
                     recovered.receipt_page(0, 256).unwrap(),
@@ -330,7 +327,7 @@ fn retirement_crash_cuts_match_the_no_gc_control() {
             );
             // The next retirement (idempotent repeat) clears the pending set.
             recovered
-                .retire_wal_files(if retired { &[0, FILE] } else { &[] })
+                .retire_wal_files(if retired { &[0, FILE, 2 * FILE] } else { &[] })
                 .unwrap();
             assert!(recovered.file_retirement_state().1.is_empty());
         }
@@ -389,8 +386,13 @@ fn retirement_rejects_wrong_inode_seal_and_uncovered_witness() {
     victims[0].seal_generation = victims[0].seal_generation.map(|generation| generation + 1);
     assert!(log.retire_proved_files(&victims, Some(&witness())).is_err());
     let victims = proofs(&log);
+    // Each watermark term is independent: either one below the file end
+    // refuses the request, with no durable change.
     let mut uncovered = witness();
-    uncovered.callback_from = FILE;
+    uncovered.callback_from = FILE / 2;
+    assert!(log.retire_proved_files(&victims, Some(&uncovered)).is_err());
+    let mut uncovered = witness();
+    uncovered.replay_from = FILE / 2;
     assert!(log.retire_proved_files(&victims, Some(&uncovered)).is_err());
     let mut cut = witness();
     cut.persisted_cut_next = Some(1);
@@ -403,6 +405,7 @@ fn retirement_rejects_wrong_inode_seal_and_uncovered_witness() {
         RetirementOutcome::Completed
     );
     assert!(log.is_retired(0).unwrap() && log.is_retired(FILE).unwrap());
+    assert!(log.is_retired(2 * FILE).unwrap());
 }
 
 /// A prepared grant takes only `state`: it completes while maintenance holds

@@ -6,6 +6,7 @@
 //! no live values move and physical addresses are never reused.
 
 use super::codec::{BatchLimits, CodecError, CompleteBatch, Mutation};
+use super::durability::frontier::FrontierError;
 use super::group::{CompleteGroup, GROUP_HEADER_LEN, GroupError, GroupLimits};
 use super::reference_directory::{
     ConflictLookup, DirectoryError, LookupWork, ReferenceDirectory, ReferenceDirectoryWriter,
@@ -40,19 +41,19 @@ const SEAL: &str = "partition-seal-v5";
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const LIVE_REGISTRATION: &str = "partition-live-nvmeof-v1";
 const LIVE_FRONTIER: &str = "partition-live-frontier-v1";
-
 pub(crate) mod file_inventory;
 pub(crate) mod history;
 pub use history::WAL_REPLAY_WINDOW_BATCHES;
 mod wal_replay;
 use wal_replay::WalRoot;
+pub(crate) use wal_replay::aligned_replay_start;
 pub use wal_replay::{DecodedGroup, ReplayPage};
 mod durable_progress;
 pub use durable_progress::LogDurableProgress;
 use durable_progress::ProgressTail;
-mod capacity_inventory;
+mod file_inventory_page;
 mod local_types;
-pub use local_types::{LocalCheckpoint, LocalDbError, LocalDbStats, LocalInventoryConfig};
+pub use local_types::{LocalDbError, LocalDbStats, LocalInventoryConfig};
 mod retired_files;
 pub use retired_files::{FileSeal, PendingRetirement};
 use retired_files::{RetiredFiles, validate_root_sets};
@@ -66,6 +67,10 @@ pub use file_retirement::{
 mod relocation_scan;
 pub use relocation_scan::{RelocationBatch, RelocationPage, RelocationPut};
 mod file_seal;
+mod leased_member;
+mod lifecycle;
+pub(crate) use leased_member::{RecordReadPlan, member_address_of_reference};
+use lifecycle::Lifecycle;
 
 /// Full static inventory for one database epoch, copied durably to every node.
 /// The caller must hold the unique database authority; this is not a consensus
@@ -409,7 +414,7 @@ struct State {
     next_live_extent: Option<OpenLiveExtent>,
     last_live_adoption: Option<super::nvmeof::live_storage::LiveAdoption>,
     live: bool,
-    sealing: bool,
+    lifecycle: Lifecycle,
     live_tail: Option<LiveFrontierTail>,
     /// End below which this handle owes no live-frontier root. Zero after
     /// create, so the first barrier or fragment crossing installs a root. After
@@ -947,6 +952,10 @@ pub struct PartitionLog {
     #[cfg(test)]
     fail_persist: AtomicBool,
     #[cfg(test)]
+    fail_appended_persist: AtomicBool,
+    #[cfg(test)]
+    failed_appended_persist: AtomicBool,
+    #[cfg(test)]
     fail_namespace_persist: AtomicBool,
     #[cfg(test)]
     fail_live_frontier: AtomicU8,
@@ -964,22 +973,6 @@ pub struct PartitionLog {
     // A local database root cannot reopen while any partition/worker handle
     // survives. Drop this after the partition lock and all native WAL workers.
     _local_authority: Option<Arc<DbLock>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct RecordReadPlan {
-    pub(crate) member: crate::wal::WalMemberReadPlan,
-    // Descriptor authority survives cache eviction through completion retirement.
-    _authority: Arc<RegisteredBatch>,
-    // Holds both immutable segment ownership and the directory authority lock.
-    pub(crate) _log: Arc<PartitionLog>,
-}
-
-impl RecordReadPlan {
-    #[cfg(test)]
-    pub(crate) fn authority_bytes(&self) -> usize {
-        self._authority.authority_bytes()
-    }
 }
 
 impl PartitionLog {
@@ -1066,7 +1059,7 @@ impl PartitionLog {
                 next_live_extent: None,
                 last_live_adoption: None,
                 live: false,
-                sealing: false,
+                lifecycle: Lifecycle::Running,
                 live_tail: None,
                 live_root_end: 0,
                 writer: Some(writer),
@@ -1111,6 +1104,10 @@ impl PartitionLog {
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_appended_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            failed_appended_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_namespace_persist: AtomicBool::new(false),
             #[cfg(test)]
@@ -1272,6 +1269,7 @@ impl PartitionLog {
     /// Check local evidence for this exact immutable receipt without initiating
     /// I/O. A token from a different copy of the same configured stream must not
     /// promote this log's still-unpersisted group.
+    #[cfg(test)]
     pub(crate) fn validate_durable_receipt(
         &self,
         durable: DurableBatch,
@@ -1347,7 +1345,7 @@ impl PartitionLog {
         let live = |state: &State| {
             state.live
                 && !state.sealed
-                && !state.sealing
+                && !state.is_sealing()
                 && state.poison.is_none()
                 && state.writer.is_some()
         };
@@ -1566,7 +1564,7 @@ impl PartitionLog {
             state.poison = Some(WriterPoison::Fatal);
             StorageError::Unknown(WalError::Io(error))
         })?;
-        if state.sealing || state.sealed {
+        if state.is_sealing() || state.sealed {
             return Err(StorageError::Invalid("live stream is sealing"));
         }
         if state.poison.is_some() {
@@ -1599,7 +1597,7 @@ impl PartitionLog {
         if state.sealed {
             return Err(StorageError::Sealed);
         }
-        if state.sealing {
+        if state.is_sealing() {
             return Err(StorageError::Invalid("live stream is sealing"));
         }
         if !state.live {
@@ -2101,7 +2099,7 @@ impl PartitionLog {
         if state.poison.is_some() {
             return Err(StorageError::Poisoned);
         }
-        if state.sealing && opportunistic.is_none() {
+        if state.is_sealing() && opportunistic.is_none() {
             return Err(StorageError::Invalid("live stream is sealing"));
         }
         if let Some(observed) = opportunistic {
@@ -2382,7 +2380,7 @@ impl PartitionLog {
             if state.poison.is_some() {
                 return Err(StorageError::Poisoned);
             }
-            if state.sealing {
+            if state.is_sealing() {
                 return Err(StorageError::Invalid("live stream is sealing"));
             }
             let open = state
@@ -2581,9 +2579,23 @@ impl PartitionLog {
         // Adoption proves APPENDED bytes only. Synchronous reads and checkpoint
         // proofs still require the owner's separate covering persistence barrier.
         if let Some(frontier) = self.frontier.get() {
-            frontier
-                .publish_appended(group_end, group.batches().len() as u64)
-                .map_err(|_| StorageError::Invalid("durability frontier rejected a live group"))?;
+            match frontier.publish_appended(group_end, group.batches().len() as u64) {
+                Ok(()) => {}
+                // A lifecycle transition owns adoption while its frontier is
+                // stopped. The syncer drain at retirement adopts frames that
+                // external writers left below the extent end; the seal adopts
+                // the same way. Each transition persists the appended prefix
+                // itself, so the adopted frame is durable before that
+                // transition reports success (paper 3.1: the finalizing sync
+                // publishes the written bytes). Every other stopped frontier,
+                // and every other frontier error, still fails.
+                Err(FrontierError::Stopped) if state.lifecycle.owns_stopped_frontier() => {}
+                Err(_) => {
+                    return Err(StorageError::Invalid(
+                        "durability frontier rejected a live group",
+                    ));
+                }
+            }
         }
         let tail = group
             .batches()
@@ -3195,7 +3207,14 @@ impl PartitionLog {
                 return Ok(());
             };
             #[cfg(test)]
-            if self.fail_persist.swap(false, Ordering::AcqRel) {
+            let fail_appended = matches!(scope, PersistScope::Appended)
+                && self.fail_appended_persist.swap(false, Ordering::AcqRel);
+            #[cfg(test)]
+            if fail_appended {
+                self.failed_appended_persist.store(true, Ordering::Release);
+            }
+            #[cfg(test)]
+            if self.fail_persist.swap(false, Ordering::AcqRel) || fail_appended {
                 state.poison = Some(WriterPoison::Fatal);
                 return Err(StorageError::Unknown(WalError::Io(io::Error::other(
                     "injected persistence failure after append",
@@ -3653,21 +3672,30 @@ impl PartitionLog {
             .ok_or(StorageError::Invalid("authoritative record disappeared"))?;
         Ok(RecordReadPlan {
             member,
-            _authority: registered,
+            _authority: Some(registered),
             _log: self.clone(),
         })
     }
-    /// Cold leased authority is scoped to this exact record. The captured inode
+    /// Cold leased authority is scoped to this exact member. The captured inode
     /// and charged descriptors outlive unlocked I/O; neither adoption's round
     /// gate nor the durable-metadata gate participates in this read barrier.
-    fn resolve_leased_record(
+    ///
+    /// `address` names the member frame itself (offset including its native
+    /// 8-byte header, length the header plus entry), so no descriptor is needed:
+    /// the coordinator index holds the position and the payload CRC.
+    ///
+    /// `group_end` is the receipt group end of the batch that owns the member,
+    /// passed only by reference callers: their sparse sync proof requires the
+    /// whole group to be released. A hybrid address caller has no group, so the
+    /// member's own end is the only bound and `None` states that explicitly.
+    fn resolve_leased_member(
         self: &Arc<Self>,
-        reference: &ValueRecordReference,
+        address: PhysicalValueAddress,
+        group_end: Option<u64>,
     ) -> Result<Option<super::nvmeof::live_storage::LiveRecordLease>, StorageError> {
-        let address = reference.batch_address;
         let captured = {
             let state = self.state.lock();
-            self.check_cold_read_state(&state, reference)?;
+            self.check_cold_read_state(&state, address)?;
             let Some(open) = Self::record_extent(&state, address) else {
                 return Ok(None);
             };
@@ -3678,22 +3706,14 @@ impl PartitionLog {
             )
         };
         let (extent, file, synced_end) = captured;
-        // Do not use load_authority here: its opportunistic self-adoption can
-        // wait for a predecessor close or an adoption round unrelated to this
-        // exact batch, including a frame in the pre-leased successor.
-        let registered = match self.references.lookup(address)? {
-            Some(registered) => registered,
-            None => self.member_authority_from_file(address, &file)?,
-        };
-        registered.validate_reference(reference)?;
         #[cfg(test)]
         self.pause_live_at(LivePausePoint::ColdReadBeforeSync);
         if !self.serve_unsynced.load(Ordering::Acquire)
-            && registered.group_end() > self.readable_frontier()
+            && group_end.is_none_or(|end| end > self.readable_frontier())
             && address.offset + u64::from(address.len) > synced_end
         {
             // The lease made the inode and its name durable before export.
-            // fdatasync covers this checked batch independently of the owner's
+            // fdatasync covers this checked member independently of the owner's
             // receipt prefix. Never install this sparse proof in any frontier.
             #[cfg(test)]
             let result = if self.fail_persist.swap(false, Ordering::AcqRel) {
@@ -3718,19 +3738,22 @@ impl PartitionLog {
         self.pause_live_at(LivePausePoint::ColdReadAfterSync);
         {
             let state = self.state.lock();
-            if !self.check_cold_read_extent(&state, reference, &extent)? {
+            if !self.check_cold_read_extent(&state, address, &extent)? {
                 return Ok(None);
             }
         }
         let plan = RecordReadPlan {
             member: crate::wal::WalMemberReadPlan {
                 file,
-                offset: address.offset % self.config().wal_file_bytes
-                    + 8
-                    + u64::from(reference.descriptor.offset),
-                len: reference.descriptor.len as usize,
+                // One source of geometry: the WAL layout owns the file-offset
+                // arithmetic, so a config/layout disagreement cannot make this
+                // path read a different offset than `Wal::plan_frame`.
+                offset: self
+                    .wal
+                    .offset_in_file(WalPosition::new(address.offset, address.len)),
+                len: address.len as usize,
             },
-            _authority: registered,
+            _authority: None,
             _log: self.clone(),
         };
         #[cfg(test)]
@@ -3744,74 +3767,42 @@ impl PartitionLog {
         // Do not take state while holding read_admission: retirement takes them
         // in the reverse order. The installed live pin now excludes retirement.
         let state = self.state.lock();
-        if !self.check_cold_read_extent(&state, reference, &extent)? {
+        if !self.check_cold_read_extent(&state, address, &extent)? {
             return Ok(None);
         }
         Ok(Some(lease))
     }
 
-    fn record_extent(state: &State, address: PhysicalValueAddress) -> Option<&OpenLiveExtent> {
-        let end = address.offset.checked_add(u64::from(address.len))?;
-        state
-            .open_live_extent
-            .iter()
-            .chain(state.next_live_extent.iter())
-            .find(|open| address.offset >= open.extent.start && end <= open.extent.end)
-    }
-
-    fn check_cold_read_state(
-        &self,
-        state: &State,
-        reference: &ValueRecordReference,
-    ) -> Result<(), StorageError> {
-        if state.poison.is_some() {
-            return Err(StorageError::Poisoned);
-        }
-        if state.sealing {
-            return Err(StorageError::Invalid("live stream is sealing"));
-        }
-        if reference.batch_version.epoch != self.config().inventory.epoch {
-            return Err(StorageError::Fenced);
-        }
-        if reference.batch_address.partition != self.config().partition
-            || reference.batch_address.segment_generation
-                != self.config().inventory.segment_generation
-        {
-            return Err(StorageError::Invalid("foreign record reference"));
-        }
-        Ok(())
-    }
-
-    fn check_cold_read_extent(
-        &self,
-        state: &State,
-        reference: &ValueRecordReference,
-        extent: &super::nvmeof::live_storage::LiveWriteExtent,
-    ) -> Result<bool, StorageError> {
-        self.check_cold_read_state(state, reference)?;
-        if state.sealed {
-            return Err(StorageError::Sealed);
-        }
-        match Self::record_extent(state, reference.batch_address) {
-            Some(open) if open.extent == *extent => Ok(true),
-            Some(_) => Err(StorageError::Invalid("live record extent changed")),
-            // Healthy close is the only non-lifecycle removal of an extent.
-            // Its batches are now adopted. Discard this scoped proof/pin and
-            // let the normal serving path obtain authoritative coverage; a
-            // successful close must not cause a spurious value-read failure.
-            None => Ok(false),
-        }
-    }
-
-    /// Resolve a durable exact record reference to an owner-pinned file range.
+    /// Resolve a durable record reference to an owner-pinned file range.
+    ///
+    /// Kept for the reference-directory callers that still exist until S11
+    /// deletes them. The descriptor is validated before it is reduced to the
+    /// member address [`Self::resolve_live_member`] serves, so a forged or
+    /// foreign reference fails here exactly as before.
     pub fn resolve_live_record(
         self: &Arc<Self>,
         reference: &ValueRecordReference,
     ) -> Result<super::nvmeof::live_storage::LiveRecordLease, StorageError> {
-        if self.live_stream
-            && let Some(lease) = self.resolve_leased_record(reference)?
-        {
-            return Ok(lease);
+        if self.live_stream {
+            let captured = {
+                let state = self.state.lock();
+                self.check_cold_read_state(&state, reference.batch_address)?;
+                Self::record_extent(&state, reference.batch_address)
+                    .map(|open| Arc::clone(&open.allocation.file))
+            };
+            if let Some(file) = captured {
+                let registered = match self.references.lookup(reference.batch_address)? {
+                    Some(registered) => registered,
+                    None => self.member_authority_from_file(reference.batch_address, &file)?,
+                };
+                registered.validate_reference(reference)?;
+                let address = member_address_of_reference(reference)?;
+                if let Some(lease) =
+                    self.resolve_leased_member(address, Some(registered.group_end()))?
+                {
+                    return Ok(lease);
+                }
+            }
         }
         let registered = self.load_serving_record_authority(reference)?;
         let _admission = self.read_admission()?;
@@ -3858,7 +3849,7 @@ impl PartitionLog {
         member.len = member.len.checked_add(8).ok_or(StorageError::Capacity)?;
         let plan = RecordReadPlan {
             member,
-            _authority: registered,
+            _authority: Some(registered),
             _log: self.clone(),
         };
         self.live_lease(plan, receipt.address.offset)
@@ -4127,6 +4118,19 @@ impl PartitionLog {
     pub(crate) fn fail_next_persist(&self) {
         self.fail_persist.store(true, Ordering::Release);
     }
+
+    /// Fail one appended persist after its serialization lock is held.
+    #[cfg(test)]
+    pub(crate) fn fail_next_appended_persist(&self) {
+        self.failed_appended_persist.store(false, Ordering::Release);
+        self.fail_appended_persist.store(true, Ordering::Release);
+    }
+
+    /// Whether the dedicated appended failure was consumed.
+    #[cfg(test)]
+    pub(crate) fn appended_persist_failure_consumed(&self) -> bool {
+        self.failed_appended_persist.load(Ordering::Acquire)
+    }
     #[cfg(test)]
     pub(crate) fn fail_next_namespace_persist(&self) {
         // Force the next persistence through the required namespace-sync path.
@@ -4214,7 +4218,20 @@ impl PartitionLog {
         // another frame or drains pressure; the finite extent bounds progress.
         for _ in 0..2 * (self.config().fragment_bytes / 4096 + 2) {
             self.self_adopt_live_extent()?;
+            let adopted = self.state.lock().appended_end;
             self.persist_scope(PersistScope::Appended, None)?;
+            // Invariant: an appended persist that returns Ok covers every frame
+            // that was appended when it started. Persistence is monotone, and
+            // `PersistScope::Appended` names the whole appended prefix, so
+            // `durable_end` reaches `adopted`; a short persist is a defect, not
+            // a seal state to recover from. The syncer is already retired: this
+            // persist is the only barrier that makes the frames the seal just
+            // adopted durable (paper 3.1: the finalizing sync publishes them).
+            let durable = self.state.lock().durable_end;
+            debug_assert!(
+                durable >= adopted,
+                "the seal persist must cover {adopted} adopted bytes but covers {durable}"
+            );
             let _persistence = self.persistence.lock();
             let mut state = self.state.lock();
             if state.poison.is_some() {
@@ -4316,7 +4333,7 @@ impl PartitionLog {
         let exclusive = {
             let mut state = self.state.lock();
             if state.live && !state.sealed {
-                if state.sealing {
+                if state.is_sealing() {
                     return Err(StorageError::Invalid("live stream is sealing"));
                 }
                 if state
@@ -4330,7 +4347,7 @@ impl PartitionLog {
                 {
                     return Err(StorageError::Invalid("live extent is closing"));
                 }
-                state.sealing = true;
+                state.lifecycle = Lifecycle::Sealing;
                 true
             } else {
                 false
@@ -4338,7 +4355,7 @@ impl PartitionLog {
         };
         let result = self.seal_epoch_inner(authority, revoke_and_drain);
         if exclusive {
-            self.state.lock().sealing = false;
+            self.state.lock().lifecycle = Lifecycle::Running;
         }
         result
     }

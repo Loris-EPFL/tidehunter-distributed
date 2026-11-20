@@ -61,7 +61,7 @@ fn remote_config(id: u16, address: &str) -> RemoteDatabaseConfig {
         "max_pending_batches":64,"max_pending_bytes":33554432,"owner_append_occupancy":16,
         "pipelined_writes":true,"read_cache_bytes":0,"read_memory_allowance_bytes":134217728,
         "scan_prefetch_pages":1,"read_lanes":2,"pin_read_lanes":false,
-        "max_pending_reads":64,"max_pending_read_bytes":16777216,"write_profile_limit":0,"index_shards":64,
+        "max_pending_reads":64,"max_pending_read_bytes":16777216,"write_profile_limit":0,
         "live_nvme":{
             "host_nqn":format!("nqn.2026-01.test:mainnet-replay-{id}"),"host_id":vec![id as u8+1;16],
             "max_inflight_requests":16,"max_inflight_bytes":4194304,"connect_timeout_ms":10000,"io_timeout_ms":30000,
@@ -79,6 +79,22 @@ pub(crate) fn local_options(root: &Path) -> serde_json::Value {
         "transport":{"kind":"tcp-trusted"},"path":root.join(format!("db-{id}")),"owners":1,
         "external_remote_config":remote_config(id, &format!("127.0.0.1:{}", 19100 + id)),
     }})).collect::<Vec<_>>()})
+}
+/// The embedded coordinator document deserializes into the current
+/// `RemoteDatabaseConfig` (`deny_unknown_fields`), and a key of a deleted
+/// Exact-era setting is refused, never silently ignored.
+#[test]
+fn embedded_remote_config_parses_and_refuses_deleted_keys() {
+    let document = serde_json::to_value(remote_config(0, "127.0.0.1:19100")).unwrap();
+    serde_json::from_value::<RemoteDatabaseConfig>(document.clone()).unwrap();
+    for key in ["index_shards", "compactor_cadence"] {
+        let mut stale = document.clone();
+        stale[key] = serde_json::json!(1);
+        assert!(
+            serde_json::from_value::<RemoteDatabaseConfig>(stale).is_err(),
+            "{key} must be refused"
+        );
+    }
 }
 #[test]
 fn explicit_domains_and_complete_batch_limits_are_admitted_before_open() {
@@ -177,9 +193,9 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         let open_kind = if std::fs::read_dir(base.join("coordinator"))
             .is_ok_and(|mut entries| entries.next().is_some())
         {
-            crate::index_checkpoint::OpenKind::Reopen
+            crate::backends::tidehunter::OpenKind::Reopen
         } else {
-            crate::index_checkpoint::OpenKind::Create
+            crate::backends::tidehunter::OpenKind::Create
         };
         let open_start_ns = tidehunter::distributed::remote_db::diagnostics_clock_ns();
         let db = sui::Db::open_remote_with_local_live_fixture(
@@ -193,13 +209,8 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         assert_ne!(database, [0; 16]);
         assert!(identities.insert(database));
         assert_eq!(host.databases(), [database]);
-        let open_record = crate::index_checkpoint::OpenRecord {
-            kind: open_kind,
-            open_start_ns,
-            open_return_ns: tidehunter::distributed::remote_db::diagnostics_clock_ns(),
-            first_get_ns: Arc::default(),
-            recovery: db.remote_recovery_stats(),
-        };
+        let open_record =
+            crate::backends::tidehunter::OpenRecord::new(open_kind, open_start_ns, &db);
         let keyspace = db.ks(&trace
             .tables
             .iter()
@@ -212,10 +223,8 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
             effective_configuration:serde_json::json!({"fixture_route":"leased","database":tidehunter::distributed::tcp::host::identity::database_hex(&database),"remote":config}),
             read_evidence_written:false,owner_sample_gate:Default::default(),coordinator_interval_baseline:std::sync::Mutex::new(None),
-            coordinator_path:base.join("coordinator"),open_record,
+            open_record,
             live_write_profile:std::sync::Mutex::new(None),
-            #[cfg(all(feature = "test-utils", target_os = "linux"))]
-            index_fixture:None,
             #[cfg(all(feature = "test-utils", target_os = "linux"))]
             local_owners: Vec::new(),
         });
@@ -544,11 +553,12 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// R0 on the leased ordinary-file fixture through `run_prepared`: the report
-/// is written, nothing is unlinked, and a replay without a retention prune is
-/// labeled nonrepresentative instead of yielding a slope.
+/// A real local file replay through `run_prepared` writes its result
+/// document: the run reports completion with no unresolved call, the
+/// committed payload is counted, and the gate-boundary read evidence names
+/// the owner write counters for the single-database TCP backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_local_file_live_replay_writes_r0_json() {
+async fn real_local_file_live_replay_writes_its_result_document() {
     let root = root();
     let mut trace = trace();
     trace.select_node_databases(&[0]).unwrap();
@@ -563,8 +573,7 @@ async fn real_local_file_live_replay_writes_r0_json() {
         "execution":{"mode":"closed_loop","concurrency":4,"client_shards":1,"queue_capacity":8,
             "request_timeout_ms":30000,"offered_ops_per_second":null},
         "limits":{"max_keys":10000,"max_bytes":67108864,"max_operations":10000,
-            "deadline_seconds":120,"shutdown_grace_seconds":5},
-        "capacity_r0":{"workload":"sui_mainnet_retention"}
+            "deadline_seconds":120,"shutdown_grace_seconds":5}
     }))
     .unwrap();
     let output = root.join("result");
@@ -580,40 +589,32 @@ async fn real_local_file_live_replay_writes_r0_json() {
     )
     .await
     .unwrap();
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(output.join("r0.json")).unwrap()).unwrap();
-    assert_eq!(report["format_version"], 1);
-    assert_eq!(report["value_wal_unlinks"], 0, "{report}");
-    assert_eq!(report["complete"], true, "{report}");
-    assert_eq!(report["fixture"], "leased");
-    assert_eq!(report["prune_events"], 0);
-    assert_eq!(
-        report["worst_owner"]["net_allocated_growth_bytes_per_day"],
-        serde_json::Value::Null
-    );
-    let samples = report["samples"].as_array().unwrap();
-    assert_eq!(samples.first().unwrap()["event"], "begin");
-    assert_eq!(samples.last().unwrap()["event"], "end");
-    // The leased writer allocated at least one owner WAL file, observed by stat.
-    let end_files = samples.last().unwrap()["files"].as_array().unwrap();
-    assert!(
-        end_files
-            .iter()
-            .any(|file| file["allocated_bytes"].as_u64().unwrap_or(0) > 0),
-        "{report}"
-    );
-    // The open file is still leased: never an empty proven blocker set.
-    assert!(
-        end_files
-            .iter()
-            .any(|file| file["shadow_eligible"] == false)
-    );
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output.join("summary.json")).unwrap()).unwrap();
-    let capacity = &summary["phase_counts"]["profile"]["capacity_r0"];
-    assert_eq!(
-        capacity["reports"][0]["summary"]["value_wal_unlinks"], 0,
-        "{capacity}"
+    assert_eq!(summary["status"], "completed", "{summary}");
+    let phase = &summary["phase_counts"];
+    assert_eq!(phase["run_status"], "completed", "{phase}");
+    assert_eq!(phase["unresolved_workers"], 0, "{phase}");
+    assert_eq!(phase["unknown_outcomes"], 0, "{phase}");
+    assert_eq!(phase["error"], serde_json::Value::Null, "{phase}");
+    // One commit call per batch frame; each frame carries its keys and values.
+    let counts = &phase["counts"];
+    assert_eq!(counts["write_calls"], 6, "{counts}");
+    assert_eq!(counts["put_members"], 1308, "{counts}");
+    let profile = &phase["profile"];
+    assert_eq!(profile["functional_qualification"], true, "{profile}");
+    assert_eq!(profile["minimum_measurement_seconds"], 0.0, "{profile}");
+    // The same run writes the gate-boundary read evidence; the owner writer
+    // counters are the observation the amplification report is built on.
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(output.join("measurement-read-evidence.json")).unwrap(),
+    )
+    .unwrap();
+    let live = &evidence["live_nvmeof"];
+    assert_eq!(live["available"], true, "{evidence}");
+    assert!(
+        live["counters"]["completed_write_ops"].as_u64().unwrap() > 0,
+        "{evidence}"
     );
     drop(backend);
     drop(owners);

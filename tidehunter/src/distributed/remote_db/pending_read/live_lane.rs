@@ -106,7 +106,7 @@ impl LaneInbox<'_> {
                 self.state.poison();
                 continue;
             };
-            request.complete_nvme(finished.result.map_err(LocalDbError::component));
+            request.complete_nvme(finished.result.map_err(super::transport_error));
         }
         delivered
     }
@@ -256,7 +256,7 @@ pub(super) fn run(
                 continue;
             }
             let live = LiveReadRequest {
-                references: std::mem::take(&mut request.references),
+                positions: std::mem::take(&mut request.positions),
                 timeout: request.timeout,
                 trace: request.trace.clone(),
             };
@@ -269,12 +269,12 @@ pub(super) fn run(
                 }
                 Err(LiveReadSubmitError::Full(live)) => {
                     // The lane is at its request limit: keep order, retry after a poll.
-                    request.references = live.references;
+                    request.positions = live.positions;
                     inbox.waiting.push_front(request);
                     break;
                 }
                 Err(LiveReadSubmitError::Failed(error)) => {
-                    request.complete_nvme(Err(LocalDbError::component(error)));
+                    request.complete_nvme(Err(super::transport_error(error)));
                 }
             }
         }

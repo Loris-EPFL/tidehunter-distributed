@@ -76,13 +76,12 @@ mod tests;
 #[cfg(test)]
 mod transport_security_tests;
 
-use super::codec::{CompleteBatch, Mutation};
+use super::codec::CompleteBatch;
+#[cfg(test)]
+use super::codec::Mutation;
 use super::storage::StorageError;
 use super::storage::{DurableBatch, PartitionConfig, PartitionStats};
-use super::types::{
-    BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RequestAuthority,
-    ValueRecordReference,
-};
+use super::types::{BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, RequestAuthority};
 use crate::key_shape::KeyShape;
 use crate::metrics::Metrics;
 use bincode::Options;
@@ -127,7 +126,11 @@ pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// 33 (R1 logical) appends RelocationPage (request tag 30, response tag 27).
 /// 34 (L2) scopes Status and types Error in place, and appends ProvisionDatabase
 /// and DropDatabase (request tags 31–32, response tags 28–29).
-const PROTOCOL: u32 = 34;
+/// 35 (hybrid index) keys ResolveLiveRecords/LiveRecords by `PhysicalValueAddress`
+/// (payloads change in place; tags are unchanged), and adds `durable_end`, the
+/// end of the highest durable frame of the generation's log, to every
+/// `InventoryGeneration` of the inventory sweep.
+const PROTOCOL: u32 = 35;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -191,7 +194,7 @@ pub struct NodeConfig {
     #[serde(default = "default_wal_prewrite")]
     pub wal_prewrite: bool,
     /// With `wal_member_read_policy: async`, caps `NodeStatus::max_reads` and
-    /// the references of one `ResolveLiveRecords` request.
+    /// the members of one `ResolveLiveRecords` request.
     #[serde(default = "default_device_reads")]
     pub max_device_reads_per_status: usize,
     /// Optional live target. Once enabled, its persisted configuration is
@@ -655,10 +658,14 @@ enum Request {
     PartitionStats,
     /// Tag 13.
     ReleaseLiveEpochPin { epoch: u64, token: [u8; 16] },
-    /// Tag 14.
+    /// Tag 14. Resolve member frame addresses (a hybrid position's `address`)
+    /// to owner-pinned file ranges. Keyed by address alone: the serving
+    /// generation is `segment_generation`, never a batch epoch, because a
+    /// relocated position keeps its logical epoch but names the generation
+    /// that now holds its bytes. A retired member answers `NotFound`.
     ResolveLiveRecords {
         authority_epoch: u64,
-        references: Vec<ValueRecordReference>,
+        members: Vec<PhysicalValueAddress>,
     },
     /// Tag 15.
     LiveTargetStats,
@@ -921,7 +928,7 @@ enum Response {
     /// Tag 25.
     TrimGeneration(generation_control::TrimReply),
     /// Tag 26. Boxed so ordinary responses do not grow.
-    FileInventoryPage(Box<super::capacity::FileInventoryReply>),
+    FileInventoryPage(Box<super::remote_db::file_inventory::FileInventoryReply>),
     /// Tag 27. Boxed like FileInventoryPage.
     RelocationPage(Box<super::storage::RelocationPage>),
     /// Tag 28.
@@ -1330,6 +1337,7 @@ impl StorageNode {
                         InventoryGeneration {
                             generation: u64::MAX,
                             state: OwnerGenerationState::Abandoned,
+                            durable_end: u64::MAX,
                         };
                         generation_control::page_capacity(limits.max_frame_bytes)
                     ],
@@ -1940,56 +1948,6 @@ impl Client {
             ));
         }
         Ok(receipt.durable())
-    }
-    pub fn read_record(
-        &mut self,
-        epoch: u64,
-        reference: &ValueRecordReference,
-    ) -> Result<Mutation, TcpError> {
-        self.read_records(epoch, std::slice::from_ref(reference))?
-            .pop()
-            .ok_or_else(|| TcpError::new("empty record response"))
-    }
-    /// Direct live reads with a fresh published-index cache. The read-service
-    /// lanes retain their own bounded, trusted-index grants across requests.
-    pub fn read_records(
-        &mut self,
-        epoch: u64,
-        references: &[ValueRecordReference],
-    ) -> Result<Vec<Mutation>, TcpError> {
-        if self.live_config.is_none() {
-            return Err(TcpError::new("reads require live NVMe-oF configuration"));
-        }
-        if !self.live_unreleased_tokens.is_empty() {
-            return Err(TcpError::new("live read has quarantined owner grants"));
-        }
-        let mut cache = live_read::LiveReadCache::default();
-        let result = self.live_read_records(
-            &mut cache,
-            epoch,
-            references,
-            Instant::now() + self.timeout,
-            None,
-        );
-        let cleanup = cache.close(self, epoch);
-        self.live_unreleased_tokens.extend(
-            cache
-                .take_unreleased()
-                .into_iter()
-                .map(|token| (epoch, token)),
-        );
-        // Live I/O and validation clocks come from live_nvmeof_stats.
-        match (result, cleanup) {
-            (Ok(values), Ok(())) => Ok(values),
-            (Err(error), Ok(())) => Err(error),
-            (result, Err(cleanup)) => {
-                self.broken = true;
-                Err(TcpError::new(format!(
-                    "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
-                    result.err(),
-                )))
-            }
-        }
     }
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
         match self.request(Request::Seal { epoch })? {

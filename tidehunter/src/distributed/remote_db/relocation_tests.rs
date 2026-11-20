@@ -184,7 +184,6 @@ impl Fixture {
             timeout: Duration::from_secs(60),
             max_admitted_batches: 8192,
             max_index_bytes: 64 * 1024 * KIB as usize,
-            index_shards: 64,
             max_pending_batches: 64,
             max_pending_bytes: 32 * 1024 * KIB as usize,
             replay_limits: ReplayLimits {
@@ -222,7 +221,7 @@ impl Fixture {
             durable_cut: Default::default(),
             // Sui's native value (`typed-store/src/tidehunter_util.rs`).
             relocation_max_reclaim_pct: 100,
-            compactor_cadence: Default::default(),
+            index: Default::default(),
         };
         let mut node_roots = Vec::new();
         let mut started = Vec::new();

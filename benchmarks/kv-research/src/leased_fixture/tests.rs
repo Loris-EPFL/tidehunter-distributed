@@ -8,10 +8,6 @@ fn spec(root: PathBuf, tier: DurabilityTier, owners: Vec<FixtureOwner>) -> Fixtu
         wal_file_bytes: 64 * MIB as u64,
         max_admitted_batches: 262_144,
         max_index_bytes: 512 * MIB,
-        replay_limits: Some(ReplayLimits {
-            max_batches: 16_384,
-            max_encoded_bytes: 1 << 30,
-        }),
     }
     .spec(root, tier, owners)
 }
@@ -47,8 +43,6 @@ fn benchmark_spec_translates_to_the_leased_per_owner_route() {
         assert!(live.lease_ahead && live.inline_reads && !live.polled_writes);
         assert_eq!(live.host_id, spec.host_id);
         assert_eq!(config.read_cache_bytes, 0);
-        assert_eq!(config.index_shards, 64);
-        assert_eq!(config.replay_limits.max_batches, 16_384);
         assert_eq!(config.max_admitted_batches, 262_144);
         assert_eq!(config.storage.max_batches_per_partition, 262_144);
         assert_eq!(config.storage.partitions, [0, 1]);
@@ -129,7 +123,7 @@ fn in_process_owners_serve_reopen_with_owner_state_kept() {
         fresh_owners(2).unwrap(),
     );
     let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
-    let owner = LeasedOwner::start(&spec, CompactorCadence::default()).unwrap();
+    let owner = LeasedOwner::start(&spec).unwrap();
     let coordinator = root.join("coordinator");
     let ks = shape.iter_ks().next().unwrap().id();
     let db = owner.open(&coordinator, shape.clone()).unwrap();
@@ -149,7 +143,7 @@ fn in_process_owners_serve_reopen_with_owner_state_kept() {
     owner.stop().unwrap();
     // A second owner process lifetime recovers the same owner roots on the
     // same endpoints.
-    let owner = LeasedOwner::start(&spec, CompactorCadence::default()).unwrap();
+    let owner = LeasedOwner::start(&spec).unwrap();
     let db = owner.open(&coordinator, shape).unwrap();
     assert_eq!(
         db.get(ks, &[63; 32]).unwrap().as_deref(),

@@ -1,12 +1,21 @@
 //! Lease-logical seal of one passed live WAL file inside the serving stream.
 //!
 //! A seal proves that the allocator permanently passed the file, that no open,
-//! preleased or reserved extent owns it (so every coordinator write in it was
-//! closed and adopted), that every byte is a complete validated 4 KiB group or
-//! a validated skip marker plus zeros, and that the installed position root
-//! covers its end. The writable target namespace stays installed so live
-//! values in the file stay readable; the owner refuses any new grant inside a
-//! sealed file. A seal never proves that the file is unreachable.
+//! preleased or reserved extent owns it, and that every byte is a complete
+//! validated 4 KiB group or a validated skip marker plus zeros. The writable
+//! target namespace stays installed so live values in the file stay readable;
+//! the owner refuses any new grant inside a sealed file. A seal never proves
+//! that the file is unreachable.
+//!
+//! It also does not prove durability, and must not: native has no such
+//! precondition either (its `Wal::gc` reclaims on
+//! `min(relocation start, control-region position)` alone). A retired file's
+//! durability is the coordinator's Version B term of the retirement witness
+//! (the synchronous tier has no B cut because every write was already forced).
+//! A crash can therefore leave a durable seal over a tail the owner never
+//! synced, which loses nothing that the tier had acknowledged: at the native
+//! tier that tail was only in the page cache, exactly as it would be without
+//! this file's retirement.
 //!
 //! Steps: capture under `state` (no I/O) -> whole-file scan with no lock ->
 //! `persistence` -> recheck under `state` -> root install with `state`
@@ -61,7 +70,7 @@ impl PartitionLog {
             };
             let start = root.seal_cursor();
             let end = start.checked_add(size).ok_or(StorageError::Capacity)?;
-            if !Self::seal_allowed(&state, &root, start, end, size) {
+            if !Self::seal_allowed(&state, &root, start, size) {
                 return Ok(None);
             }
             (start, end)
@@ -84,19 +93,21 @@ impl PartitionLog {
         }))
     }
 
-    /// The stream serves, is healthy, the allocator passed the file, no
-    /// extent or reservation owns it and the position root covers its end.
-    fn seal_allowed(state: &State, root: &WalRoot, start: u64, end: u64, size: u64) -> bool {
+    /// The stream serves, is healthy, the allocator passed the file and no
+    /// extent or reservation owns it. Coverage by the durable index is the
+    /// coordinator's control-region frontier (the retirement witness, I8), the
+    /// same term native `Wal::gc` uses; an owner-local position root is no
+    /// longer a precondition, exactly as native has none.
+    fn seal_allowed(state: &State, root: &WalRoot, start: u64, size: u64) -> bool {
         let index = start / size;
         let owned = |segment: &crate::distributed::nvmeof::live_storage::LiveWalSegment| {
             segment.file_index == index
         };
         state.live
             && !state.sealed
-            && !state.sealing
+            && !state.is_sealing()
             && state.poison.is_none()
             && root.sealed_files.len() < retired_files::MAX_ROOT_ENTRIES
-            && end <= root.synced_end
             && state
                 .writer
                 .as_ref()
@@ -115,9 +126,10 @@ impl PartitionLog {
     /// must be complete live groups, then at most one validated skip marker
     /// plus zeros reaching the fragment end. Batch sequences must strictly
     /// ascend in file order (design §3 step 3); returns the first and last.
-    /// The bytes lie below the durable position root, so an invalid frame,
-    /// a repeated or backward sequence, or an unexplained hole is
-    /// corruption: the stream is poisoned. An I/O error is only "not sealed".
+    /// The file is past the allocator and no extent owns it, so every frame in
+    /// it was completed: an invalid frame, a repeated or backward sequence, or
+    /// an unexplained hole is corruption, and the stream is poisoned. An I/O
+    /// error is only "not sealed".
     fn validate_file_seal(
         &self,
         candidate: &SealCandidate,
@@ -214,7 +226,7 @@ impl PartitionLog {
                 return Ok(false);
             };
             if current.seal_cursor() != candidate.start
-                || !Self::seal_allowed(&state, &current, candidate.start, candidate.end, size)
+                || !Self::seal_allowed(&state, &current, candidate.start, size)
             {
                 return Ok(false);
             }

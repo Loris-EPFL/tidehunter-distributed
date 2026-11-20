@@ -29,14 +29,14 @@ impl ReadService {
     pub(in crate::distributed::remote_db) fn bench_install_owner_local(
         &self,
         node: &crate::distributed::tcp::StorageNode,
-        reference: ValueRecordReference,
+        position: VersionPosition,
     ) {
         let lanes = self.lanes.read();
         let mut driver = lanes[0][0].driver.lock();
         crate::distributed::tcp::live_read::tests::install_owner_local(
             driver.live_cache.as_mut().unwrap(),
             node,
-            reference,
+            position,
         );
     }
 }
@@ -48,7 +48,7 @@ impl ReadService {
         counter: fn(&ReadDiagnostics) -> &AtomicU64,
         reason: &'static str,
         trace: Option<&ReadTraceChild>,
-    ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+    ) -> Result<Option<Vec<Bytes>>, LocalDbError> {
         // Relaxed: diagnostics do not publish admission or completion state.
         counter(&self.state.diagnostics).fetch_add(1, Ordering::Relaxed);
         counter(&self.state.owner_diagnostics[node].1).fetch_add(1, Ordering::Relaxed);
@@ -58,18 +58,15 @@ impl ReadService {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_arguments)] // Same scalar route/pin contract as owner inline reads.
     pub(super) fn read_live_inline(
         &self,
         node: usize,
-        _epoch: u64,
-        reference: &ValueRecordReference,
+        position: &VersionPosition,
         extra_bytes: usize,
-        pin: Option<IndexReadPin>,
         trace: Option<&ReadTraceChild>,
-    ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+    ) -> Result<Option<Vec<Bytes>>, LocalDbError> {
         let bytes = self
-            .plan_member(reference)?
+            .plan_member(position)?
             .charge
             .checked_add(extra_bytes)
             .and_then(|n| n.checked_add(512))
@@ -79,7 +76,7 @@ impl ReadService {
         }
         let fallback = |counter, reason| self.live_inline_fallback(node, counter, reason, trace);
         let mut flights = self.state.flights.lock();
-        if flights.find(node, reference).is_some() {
+        if flights.find(node, position).is_some() {
             return fallback(
                 |d| &d.live_inline_fallback_coalesced,
                 "live_inline_fallback_coalesced",
@@ -194,13 +191,13 @@ impl ReadService {
                 "live_inline_fallback_busy",
             );
         };
-        if !cache.inline_ready(reference) {
+        if !cache.inline_ready(position) {
             return fallback(
                 |d| &d.live_inline_fallback_grant,
                 "live_inline_fallback_grant",
             );
         }
-        if !cache.inline_credit(reference) {
+        if !cache.inline_credit(position) {
             return fallback(
                 |d| &d.live_inline_fallback_credit,
                 "live_inline_fallback_credit",
@@ -209,12 +206,11 @@ impl ReadService {
         self.state.flight_ready[slot].begin();
         let flight = Arc::new(ReadFlight {
             node,
-            references: vec![*reference],
+            positions: vec![*position],
             slot,
             completion: FlightCompletion::new(),
             // Set at submission below: admission locks and pauses do not count.
             io_deadline: Mutex::new(None),
-            _pin: pin,
             _credit: credit,
         });
         flights.insert(&flight);
@@ -250,17 +246,23 @@ impl ReadService {
         let deadline = Instant::now() + self.timeout();
         *flight.io_deadline.lock() = Some(deadline);
         let result = cache
-            .read_inline_cached(&client, reference, deadline, trace)
+            .read_inline_cached(&client, position, deadline, trace)
             .map_err(|error| {
-                super::super::record_first_failure(
-                    &self.state.first_failure,
-                    Some(reference.batch_address.partition),
-                    None,
-                    "live_inline_read",
-                    &error,
-                );
-                self.state.poison();
-                LocalDbError::component(error)
+                let mapped = super::transport_error(error);
+                // A retired member address is not a lane failure: the value path
+                // re-resolves it once, so poisoning here would fail-stop the
+                // engine and kill the only recovery route.
+                if !super::member_read_is_retired(&mapped) {
+                    super::super::record_first_failure(
+                        &self.state.first_failure,
+                        Some(position.address.partition),
+                        None,
+                        "live_inline_read",
+                        &mapped,
+                    );
+                    self.state.poison();
+                }
+                mapped
             });
         if let Some(started) = started {
             let ns = elapsed(started);
@@ -286,7 +288,6 @@ impl ReadService {
                 }
             }
         }
-        kv_capture::routes(std::slice::from_ref(reference), true, slot as u64);
         #[cfg(test)]
         if let Some((entered, resume)) = self.state.inline_retirement_pause.lock().take() {
             entered.send(()).unwrap();

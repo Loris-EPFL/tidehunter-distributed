@@ -225,6 +225,81 @@ fn seal_with_open_and_preleased_extents_adopts_across_the_skip_marker() {
     assert_eq!(recovered.receipt_count(), 2);
 }
 
+/// A seal retires the syncer before it drains frames that were written but
+/// whose adoption was never queued (the crashed-coordinator shape). The seal
+/// must adopt them, and its own persist must be the covering barrier: the
+/// retired frontier must not reject the frame.
+#[test]
+fn seal_after_a_retired_syncer_adopts_a_written_unadopted_frame() {
+    let (temp, config, log) = fixture();
+    let frontier = log
+        .attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
+        .unwrap();
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (_, frame) = encoded(&config, vec![batch(&config, 0)]);
+    write(&extent, extent.start, &frame);
+    // inventory::seal_epoch retires the syncer before seal_live_epoch, so the
+    // frontier is already stopping when the seal drains the unadopted frame.
+    frontier.stop();
+    log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
+    let end = extent.start + frame.len() as u64;
+    assert_eq!(log.receipt_count(), 1);
+    assert_eq!(
+        log.synced_frontier(),
+        end,
+        "the seal persist covers the frame it adopted"
+    );
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&temp.path().join("stream"), &config, metrics(), || {
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(recovered.receipt_count(), 1);
+    let receipt = recovered.receipt_page(0, 1).unwrap().remove(0);
+    assert_eq!(
+        recovered.read_batch(receipt).unwrap().mutations(),
+        batch(&config, 0).mutations(),
+        "the adopted frame survives the seal and reopen"
+    );
+}
+
+/// A seal whose persist cannot cover the frame it adopted must fail instead of
+/// reporting success. Recovery then replays the frame.
+#[test]
+fn seal_fails_when_its_persist_cannot_cover_an_adopted_frame() {
+    let (temp, config, log) = fixture();
+    let frontier = log
+        .attach_frontier(&DurabilityConfig::with_tier(DurabilityTier::Native))
+        .unwrap();
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (_, frame) = encoded(&config, vec![batch(&config, 0)]);
+    write(&extent, extent.start, &frame);
+    frontier.stop();
+    log.fail_next_appended_persist();
+    let result = log.seal_live_epoch(authority(&config), || Ok(()));
+    assert!(
+        matches!(result, Err(StorageError::Unknown(WalError::Io(_)))),
+        "the seal must report Err(Unknown(Io)) but returned {result:?}"
+    );
+    assert!(
+        log.appended_persist_failure_consumed(),
+        "the injected appended persist failure fired"
+    );
+    assert!(matches!(log.state.lock().poison, Some(WriterPoison::Fatal)));
+    drop(log);
+    let recovered =
+        PartitionLog::recover_live_sealed(&temp.path().join("stream"), &config, metrics(), || {
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        recovered.receipt_count(),
+        1,
+        "recovery replays the frame the failed seal adopted"
+    );
+}
+
 #[test]
 fn seal_rejects_live_frames_beyond_a_torn_extent_tail() {
     let (_temp, config, log) = fixture();
@@ -798,7 +873,7 @@ fn leased_seal_during_validation_discards_the_stale_round() {
     let sealer = log.clone();
     let seal = std::thread::spawn(move || sealer.seal_live_epoch(auth, || Ok(())));
     sealing.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(log.state.lock().sealing);
+    assert!(log.state.lock().is_sealing());
     resume.send(()).unwrap();
     assert!(matches!(
         adopt.join().unwrap(),

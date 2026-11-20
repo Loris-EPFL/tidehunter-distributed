@@ -75,7 +75,7 @@ pub struct EventId {
     pub seq: u64,
 }
 
-/// Exact file identity; `None` fields serialize as explicit nulls.
+/// Precise file identity; `None` fields serialize as explicit nulls.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct FileRef {
     pub partition: Option<u32>,

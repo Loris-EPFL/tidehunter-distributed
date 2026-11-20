@@ -4,30 +4,24 @@
 //! owner never waits for a single append before accepting another batch. Like
 //! `FoundationDB` §§2.3–2.6, read cuts and durable ordered publication remain
 //! separate from scheduling. This RF1 path still requires synced WAL receipts.
-use super::checkpoint_attribution::{TailCount, diagnostics_clock_ns};
+use super::super::hybrid::read::ValueReader;
+use super::super::hybrid::table::HybridTable;
+use super::super::hybrid::{SnapshotConfig, StoredSnapshot, spawn_snapshot_thread};
+use super::super::native_publication::member_positions;
 #[allow(clippy::wildcard_imports)]
 // Private implementation shares its parent's internal types.
 use super::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 mod hard_wait;
-mod index_attribution;
+mod reads;
 pub use hard_wait::{HardWaitSnapshot, WaitReasonTotals};
 
 #[derive(Default)]
 struct CheckpointBudget {
     identities: usize,
-    replay_batches: usize,
-    replay_bytes: usize,
     partition_batches: Vec<usize>,
     partition_records: Vec<usize>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct CheckpointPressureSnapshot {
-    pub(super) identities: usize,
-    pub(super) replay_batches: usize,
-    pub(super) replay_bytes: usize,
 }
 
 #[derive(Default)]
@@ -42,9 +36,6 @@ struct WriteBudget {
     waiters: VecDeque<Arc<AdmissionWaiter>>,
     live_waiters: usize,
     checkpoint: CheckpointBudget,
-    /// Granted replay-tail high-water marks, updated at each charge.
-    peak_replay_batches: usize,
-    peak_replay_bytes: usize,
     hard_wait: hard_wait::HardWaitTracker,
     /// Test-only lower identity bound, applied inside the grant predicate.
     #[cfg(test)]
@@ -59,8 +50,6 @@ pub(in crate::distributed::remote_db) struct WriteGrant {
     pub slots: usize,
     pub identities: usize,
     pub index_bytes: usize,
-    pub replay_batches: usize,
-    pub replay_bytes: usize,
     pub partitions: SmallVec<[(usize, usize, usize); 4]>,
 }
 
@@ -104,8 +93,6 @@ pub(in crate::distributed::remote_db) struct AdmissionCharges {
     pub slots: usize,
     pub index_bytes: usize,
     pub identities: usize,
-    pub replay_batches: usize,
-    pub replay_bytes: usize,
     pub partition_batches: usize,
     pub partition_records: usize,
 }
@@ -121,7 +108,6 @@ pub(super) struct Admission {
     max_index_bytes: usize,
     partition_batches: usize,
     reference_bytes: usize,
-    index: Arc<NativeIndex>,
     timeout: Duration,
     first_failure: Arc<std::sync::OnceLock<FirstFailure>>,
 }
@@ -241,9 +227,9 @@ impl Admission {
         Arc::new(Self {
             budget: Mutex::new(WriteBudget {
                 checkpoint: CheckpointBudget {
-                    identities: database.publisher.known.len(),
-                    replay_batches: database.publisher.checkpoint_tail_batches,
-                    replay_bytes: database.publisher.checkpoint_tail_bytes,
+                    // A hybrid write carries no identity charge (S7): the retry
+                    // window is the receipt window, bounded by itself.
+                    identities: 0,
                     partition_batches: vec![0; database.clients.len()],
                     partition_records: vec![0; database.clients.len()],
                 },
@@ -256,7 +242,6 @@ impl Admission {
             max_index_bytes: database.config.max_index_bytes,
             partition_batches: database.config.storage.max_batches_per_partition.min(1024),
             reference_bytes: database.config.storage.max_reference_metadata_bytes,
-            index: Arc::clone(&database.index),
             timeout: database.config.timeout,
             first_failure: Arc::clone(&database.first_failure),
         })
@@ -289,8 +274,6 @@ impl Admission {
             slots: budget.slots,
             index_bytes: budget.index_bytes,
             identities: budget.checkpoint.identities,
-            replay_batches: budget.checkpoint.replay_batches,
-            replay_bytes: budget.checkpoint.replay_bytes,
             partition_batches: budget.checkpoint.partition_batches.iter().sum(),
             partition_records: budget.checkpoint.partition_records.iter().sum(),
         }
@@ -316,78 +299,27 @@ impl Admission {
         }
     }
 
-    pub(super) fn checkpoint_pressure(&self) -> CheckpointPressureSnapshot {
-        let budget = self.budget.lock();
-        CheckpointPressureSnapshot {
-            identities: budget.checkpoint.identities,
-            replay_batches: budget.checkpoint.replay_batches,
-            replay_bytes: budget.checkpoint.replay_bytes,
-        }
-    }
-
-    /// Granted checkpoint charge and the granted replay-tail high-water mark.
-    pub(super) fn checkpoint_charge_and_peak(&self) -> (CheckpointPressureSnapshot, TailCount) {
-        let budget = self.budget.lock();
-        let current = CheckpointPressureSnapshot {
-            identities: budget.checkpoint.identities,
-            replay_batches: budget.checkpoint.replay_batches,
-            replay_bytes: budget.checkpoint.replay_bytes,
-        };
-        let peak = TailCount::new(
-            budget.peak_replay_batches.max(current.replay_batches),
-            budget.peak_replay_bytes.max(current.replay_bytes),
-        );
-        (current, peak)
-    }
-
     pub(super) fn hard_wait_snapshot(&self) -> HardWaitSnapshot {
         let now = diagnostics_clock_ns();
         self.budget.lock().hard_wait.snapshot(now)
     }
 
-    /// Returns the granted replay tail immediately before and after the release,
-    /// both observed under this mutation's own lock.
-    pub(super) fn release_checkpoint(
-        &self,
-        released: super::write_core::core::CheckpointCredits,
-    ) -> Result<(TailCount, TailCount), LocalDbError> {
-        let mut budget = self.budget.lock();
-        let current = &mut budget.checkpoint;
-        if released.identities > current.identities
-            || released.replay_batches > current.replay_batches
-            || released.replay_bytes > current.replay_bytes
-        {
-            return Err(LocalDbError::new(
-                "checkpoint credit release exceeds admission charge",
-            ));
-        }
-        let before = TailCount::new(current.replay_batches, current.replay_bytes);
-        current.identities -= released.identities;
-        current.replay_batches -= released.replay_batches;
-        current.replay_bytes -= released.replay_bytes;
-        Ok((
-            before,
-            TailCount::new(current.replay_batches, current.replay_bytes),
-        ))
-    }
-
-    /// Publication converts reserved index bytes into native-index charges.
     /// Return every batch/record/slot dimension in one transaction, after all
     /// publisher, slot, identity and dependency guards have been dropped.
+    /// `_replay` is the old replay-tail dimension: no grant charges it any more
+    /// (the hybrid has no replay limit), so it is ignored. The parameter keeps
+    /// the three-argument call sites of the write path unchanged; the cleanup
+    /// that removes it lands with the Exact deletion.
     pub(super) fn release_publication(
         &self,
-        index_bytes: usize,
         slots: usize,
         partitions: &[(usize, usize)],
-        aborted_replay: (usize, usize),
+        _replay: (usize, usize),
     ) -> Result<(), LocalDbError> {
         let mut budget = self.budget.lock();
-        if index_bytes > budget.index_bytes
-            || slots > budget.slots
+        if slots > budget.slots
             || partitions.len() != budget.checkpoint.partition_batches.len()
             || partitions.len() != budget.checkpoint.partition_records.len()
-            || aborted_replay.0 > budget.checkpoint.replay_batches
-            || aborted_replay.1 > budget.checkpoint.replay_bytes
             || partitions
                 .iter()
                 .enumerate()
@@ -400,10 +332,7 @@ impl Admission {
                 "publication credit release exceeds admission charge",
             ));
         }
-        budget.index_bytes -= index_bytes;
         budget.slots -= slots;
-        budget.checkpoint.replay_batches -= aborted_replay.0;
-        budget.checkpoint.replay_bytes -= aborted_replay.1;
         for (partition, &(batches, records)) in partitions.iter().enumerate() {
             budget.checkpoint.partition_batches[partition] -= batches;
             budget.checkpoint.partition_records[partition] -= records;
@@ -412,45 +341,6 @@ impl Admission {
         drop(budget);
         wake_granted(granted);
         Ok(())
-    }
-
-    /// Nonblocking secondary index reservation for the masks of one
-    /// `DropCells` slot, taken after allocation and before any WAL byte. The
-    /// slot's metadata charge then includes it, so publication or a pre-READY
-    /// abort returns it through `release_publication`. A full budget rejects:
-    /// the caller aborts the slot instead of waiting with a barrier held.
-    pub(in crate::distributed::remote_db) fn reserve_index_bytes(
-        &self,
-        bytes: usize,
-    ) -> Result<(), LocalDbError> {
-        let mut budget = self.budget.lock();
-        if budget.closed {
-            return Err(self.closed_error());
-        }
-        budget.index_bytes = budget
-            .index_bytes
-            .checked_add(bytes)
-            .filter(|total| self.index.check_capacity(*total).is_ok())
-            .ok_or_else(|| LocalDbError::new("DropCells exceeds index metadata capacity"))?;
-        Ok(())
-    }
-
-    /// Return bytes taken by `reserve_index_bytes` outside publication: the
-    /// prune-mark reservation of a checkpoint image, after live install (the
-    /// index then charges the marks) or when the image is abandoned.
-    #[allow(
-        clippy::expect_used,
-        reason = "cross-call accounting invariant: a release returns only bytes an earlier `reserve_index_bytes` call charged"
-    )]
-    pub(in crate::distributed::remote_db) fn release_index_bytes(&self, bytes: usize) {
-        let mut budget = self.budget.lock();
-        budget.index_bytes = budget
-            .index_bytes
-            .checked_sub(bytes)
-            .expect("index reservation release exceeds its charge");
-        let granted = self.grant_waiters(&mut budget);
-        drop(budget);
-        wake_granted(granted);
     }
 
     pub(super) fn return_slots(&self, count: usize) -> Result<(), LocalDbError> {
@@ -528,15 +418,16 @@ impl Admission {
         budget: &WriteBudget,
         grant: &WriteGrant,
     ) -> Option<CheckpointPressure> {
-        let tail = &budget.checkpoint;
+        // A hybrid write carries no replay-tail charge (WAL replay has no hard
+        // bound), so only the identity and index dimensions can name a reason.
         let reason = self.checkpoint_block(budget, grant, false).0?;
         Some(CheckpointPressure {
             reason,
-            batches: tail.replay_batches,
-            encoded_bytes: tail.replay_bytes,
+            batches: 0,
+            encoded_bytes: 0,
             max_batches: usize::MAX,
             max_encoded_bytes: usize::MAX,
-            incoming_encoded_bytes: Some(grant.replay_bytes),
+            incoming_encoded_bytes: None,
         })
     }
 
@@ -567,7 +458,7 @@ impl Admission {
         let index = budget
             .index_bytes
             .checked_add(grant.index_bytes)
-            .is_none_or(|n| self.index.check_capacity(n).is_err());
+            .is_none_or(|n| n > self.max_index_bytes);
         let first = if identity {
             Some("identity")
         } else {
@@ -603,26 +494,18 @@ impl Admission {
         budget.slots += grant.slots;
         budget.index_bytes += grant.index_bytes;
         budget.checkpoint.identities += grant.identities;
-        budget.checkpoint.replay_batches += grant.replay_batches;
-        budget.checkpoint.replay_bytes += grant.replay_bytes;
         for &(partition, batches, records) in &grant.partitions {
             budget.checkpoint.partition_batches[partition] += batches;
             budget.checkpoint.partition_records[partition] += records;
         }
         budget.peak_requests = budget.peak_requests.max(budget.requests);
         budget.peak_bytes = budget.peak_bytes.max(budget.bytes);
-        budget.peak_replay_batches = budget
-            .peak_replay_batches
-            .max(budget.checkpoint.replay_batches);
-        budget.peak_replay_bytes = budget.peak_replay_bytes.max(budget.checkpoint.replay_bytes);
     }
 
     fn resources_owned(budget: &WriteBudget, grant: &WriteGrant) -> bool {
         grant.slots <= budget.slots
             && grant.index_bytes <= budget.index_bytes
             && grant.identities <= budget.checkpoint.identities
-            && grant.replay_batches <= budget.checkpoint.replay_batches
-            && grant.replay_bytes <= budget.checkpoint.replay_bytes
             && grant
                 .partitions
                 .iter()
@@ -644,8 +527,6 @@ impl Admission {
         budget.slots -= grant.slots;
         budget.index_bytes -= grant.index_bytes;
         budget.checkpoint.identities -= grant.identities;
-        budget.checkpoint.replay_batches -= grant.replay_batches;
-        budget.checkpoint.replay_bytes -= grant.replay_bytes;
         for &(partition, batches, records) in &grant.partitions {
             budget.checkpoint.partition_batches[partition] -= batches;
             budget.checkpoint.partition_records[partition] -= records;
@@ -928,7 +809,8 @@ pub struct LiveFinalShutdownEvidence {
 pub struct ConcurrentRemoteDatabase {
     database: Arc<RemoteDatabase>,
     admission: Arc<Admission>,
-    pub(super) index: Arc<NativeIndex>,
+    pub(super) table: Arc<HybridTable>,
+    pub(super) reader: Arc<ValueReader>,
     pub(super) reads: Arc<ReadService>,
     pub(super) cache: Arc<ReadCache>,
     write_profile: Arc<Mutex<WriteProfileSnapshot>>,
@@ -990,7 +872,8 @@ impl ConcurrentRemoteDatabase {
     pub fn published_frontier(
         &self,
     ) -> Result<Option<crate::distributed::types::MutationVersion>, LocalDbError> {
-        Ok(self.published_cut()?.upper())
+        self.ensure_healthy()?;
+        Ok(self.database.core.publisher.lock().latest)
     }
 
     pub fn live_nvmeof_stats(&self) -> Option<super::super::nvmeof::live_metrics::LiveNvmeStats> {
@@ -1168,10 +1051,12 @@ impl ConcurrentRemoteDatabase {
     pub fn new(db: RemoteDatabase) -> Result<Self, LocalDbError> {
         db.ensure_healthy()?;
         db.drain()?;
-        let core = &db.core;
-        Ok(Self {
+        let database = Arc::new(db);
+        let core = &database.core;
+        let this = Self {
             admission: Arc::clone(&core.admission),
-            index: Arc::clone(&core.index),
+            table: Arc::clone(&core.table),
+            reader: Arc::clone(&database.reader),
             reads: Arc::clone(&core.reads),
             cache: Arc::clone(&core.read_cache),
             write_profile: Arc::clone(&core.write_profile),
@@ -1190,8 +1075,21 @@ impl ConcurrentRemoteDatabase {
                 .zip(&core.clients)
                 .map(|(endpoint, worker)| (endpoint.partition, worker.control_handle()))
                 .collect(),
-            database: Arc::new(db),
-        })
+            database: Arc::clone(&database),
+        };
+        // Native cadence: a root per `snapshot_written_bytes` of published value
+        // bytes or per hour, never on a put or a get. The thread holds a `Weak`
+        // and ends with the database or at the first failed pass, which poisons
+        // the engine (native's fail-stop `expect`); dropping the handle detaches
+        // it.
+        drop(
+            spawn_snapshot_thread(
+                Arc::downgrade(&database),
+                SnapshotConfig::native(this.table.config().snapshot_written_bytes),
+            )
+            .map_err(|error| LocalDbError::new(format!("spawn snapshot thread: {error}")))?,
+        );
+        Ok(this)
     }
 
     pub(super) fn ensure_healthy(&self) -> Result<(), LocalDbError> {
@@ -1215,115 +1113,30 @@ impl ConcurrentRemoteDatabase {
         self.ensure_healthy()
     }
 
-    /// The caller can keep the cut: a standing-budget view takes its owner
-    /// charge first.
+    /// The coordinator's native index, for the iterator and snapshot paths.
+    pub(in crate::distributed) fn hybrid_table(&self) -> &HybridTable {
+        &self.table
+    }
+
+    /// The value path: a position names an owner member frame; the reader
+    /// fetches it, verifies the native CRC and decodes the entry.
+    pub(crate) fn value_reader(&self) -> &ValueReader {
+        &self.reader
+    }
+
+    /// The publication watermark: every batch below it is visible.
     ///
     /// # Errors
-    /// Rejects an unhealthy authority before or after capturing its committed
-    /// cut, and returns the index `Capacity` error when the view allowance
-    /// cannot hold the owner charge.
-    pub fn published_cut(&self) -> Result<IndexReadCut, LocalDbError> {
+    /// Rejects reads after an observed authority, transport, or shutdown failure.
+    pub fn published_cut(&self) -> Result<BatchVersion, LocalDbError> {
         self.ensure_healthy()?;
-        let cut = self.index.latest_cut().map_err(LocalDbError::component)?;
+        let cut = self.table.current();
         self.ensure_healthy()?;
         Ok(cut)
     }
 
-    /// Capture and protect one published cut without a retention race. The
-    /// caller can keep it: a standing-budget view takes its owner charge
-    /// (`Capacity` when full).
-    pub fn protected_published_cut(
-        &self,
-    ) -> Result<(IndexReadCut, super::super::native_index::IndexReadPin), LocalDbError> {
-        self.ensure_healthy()?;
-        let index = &self.index;
-        let cut = index.latest_cut().map_err(LocalDbError::component)?;
-        let pin = index
-            .pin_cut(cut.clone())
-            .map_err(LocalDbError::component)?;
-        self.ensure_healthy()?;
-        Ok((cut, pin))
-    }
-
-    /// Like [`Self::protected_published_cut`] without the owner charge. Hold
-    /// both only until the calling API returns (see `StandingViewBudget`).
-    pub(crate) fn call_protected_cut(
-        &self,
-    ) -> Result<(IndexReadCut, super::super::native_index::IndexReadPin), LocalDbError> {
-        self.ensure_healthy()?;
-        let index = &self.index;
-        let cut = index.call_cut();
-        let pin = index
-            .pin_call_cut(cut.clone())
-            .map_err(LocalDbError::component)?;
-        self.ensure_healthy()?;
-        Ok((cut, pin))
-    }
-
-    /// The caller can keep the pin: a standing-budget view takes its owner
-    /// charge (`Capacity` when full).
-    pub fn pin_cut(
-        &self,
-        cut: IndexReadCut,
-    ) -> Result<super::super::native_index::IndexReadPin, LocalDbError> {
-        self.ensure_healthy()?;
-        let pin = self.index.pin_cut(cut).map_err(LocalDbError::component)?;
-        self.ensure_healthy()?;
-        Ok(pin)
-    }
-
-    pub fn retention_floor(&self) -> IndexReadCut {
-        self.index.retention_floor()
-    }
-
-    pub fn index_stats(&self) -> super::super::native_index::NativeIndexStats {
-        self.index.stats()
-    }
-
-    pub fn index_history_bytes(&self) -> usize {
-        self.index.retained_metadata_bytes()
-    }
-
     pub fn metadata_history_bytes(&self) -> usize {
         self.database.core.metadata_history_bytes()
-    }
-
-    /// # Errors
-    /// Returns key/schema validation errors or an observed authority failure.
-    pub fn index_reference(
-        &self,
-        ks: KeySpace,
-        key: &[u8],
-        cut: IndexReadCut,
-    ) -> Result<Option<ValueRecordReference>, LocalDbError> {
-        self.ensure_healthy()?;
-        let started = Instant::now();
-        let result = self
-            .index
-            .get(ks, key, cut)
-            .map_err(LocalDbError::component);
-        self.read_resolve_ns
-            .fetch_add(elapsed(started), Ordering::Relaxed);
-        self.ensure_healthy()?;
-        result
-    }
-
-    /// # Errors
-    /// Returns index-bound validation errors or an observed authority failure.
-    pub fn index_page(
-        &self,
-        ks: KeySpace,
-        after_reduced: Option<&[u8]>,
-        reverse: bool,
-        cut: IndexReadCut,
-    ) -> Result<Vec<(Bytes, ValueRecordReference)>, LocalDbError> {
-        self.ensure_healthy()?;
-        let result = self
-            .index
-            .scan_reduced(ks, after_reduced, reverse, 256, cut)
-            .map_err(LocalDbError::component);
-        self.ensure_healthy()?;
-        result
     }
 
     /// Submit one complete batch and wait for synced, ordered publication.
@@ -1381,49 +1194,141 @@ impl ConcurrentRemoteDatabase {
         )
     }
 
-    /// # Errors
-    /// Returns authority, owner, or checkpoint persistence errors.
-    pub fn flush_index(&self) -> Result<(), LocalDbError> {
-        self.database.core.flush_index()
+    /// Native `relocation_batch_max_bytes`, bounded by the admission byte budget
+    /// so one chunk of copies never exceeds what the coordinator may hold.
+    pub(crate) fn relocation_batch_max_bytes(&self) -> usize {
+        self.table
+            .config()
+            .to_native_config()
+            .relocation_batch_max_bytes()
+            .min(self.config.max_pending_bytes)
     }
 
-    /// Named index rebuild: the leased equivalent of native
-    /// `force_rebuild_control_region`. Returns after one Exact generation that
-    /// covers every write allocated before the call has evaluated every dirty
-    /// compactor cell and is durably adopted and live-installed. Takes no
-    /// write gate; later writes proceed.
+    /// Writes one chunk of relocation copies to the serving generation and
+    /// returns where each landed, in input order.
+    ///
+    /// Each copy is a `Put` of the source member's own bytes (the key, the value
+    /// and the native record encoding are unchanged, so the payload CRC the
+    /// index stores still verifies the copy). The chunk is split into as many
+    /// format-5 batches as the batch limits require. A relocated batch takes an
+    /// allocator version and publishes in order but inserts nothing into the
+    /// index and is skipped by replay, so a copy can never override a later
+    /// write of its key. The caller must wait for the owners to make the copies
+    /// durable ([`WriteCore::await_copies_durable`]) before it re-points the
+    /// index at them: a native-tier acknowledgement is only the owner's page
+    /// cache.
     ///
     /// # Errors
-    /// `Busy` while another named force runs; `DeadlineExpired` withdraws the
-    /// force if no capture has taken it, otherwise drops only the waiter;
-    /// `Failed` carries the checkpoint or authority error.
-    pub fn force_rebuild_index(&self) -> Result<super::IndexForceReport, super::IndexForceError> {
-        self.database.core.force_rebuild_index()
-    }
-
-    #[cfg(test)]
-    /// Persist a Stop-aware floor and reclaim wholly unreachable sealed files.
-    /// Live retirement can return a non-fatal busy error while a read is held;
-    /// finish or drop the read and retry without reopening the authority.
-    pub(crate) fn retire_history_before(&self, floor: IndexReadCut) -> Result<(), LocalDbError> {
-        self.database.core.retire_history_before(floor)
-    }
-
-    /// Enable R0 shadow capacity observation (read-only; suppresses physical
-    /// retirement until the observer finishes). One observer per database.
-    pub fn start_capacity_observer(
+    /// A copy that cannot fit one batch, or any storage, publication or owner
+    /// error; the copies already written stay unreferenced in the log.
+    pub(crate) fn write_relocated_batch(
         &self,
-        config: crate::distributed::capacity::CapacityObserverConfig,
-        sink: Box<dyn crate::distributed::capacity::R0Sink>,
-    ) -> Result<super::CapacityObserver, crate::distributed::capacity::R0Error> {
-        super::CapacityObserver::start(&self.database.core, config, sink)
+        keyspace: KeySpace,
+        cell: &crate::cell::CellId,
+        copies: &[(Bytes, Bytes, BatchVersion)],
+    ) -> Result<RelocatedCopies, LocalDbError> {
+        let limits = self.config.storage.batch_limits;
+        let mutations: Vec<Mutation> = copies
+            .iter()
+            .map(|(key, value, _)| Mutation::Put {
+                keyspace,
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        let mut members = Vec::with_capacity(mutations.len());
+        let mut last_version: Option<BatchVersion> = None;
+        let mut start = 0;
+        while start < mutations.len() {
+            let take = CompleteBatch::fitting_prefix_len(&mutations[start..], limits);
+            if take == 0 {
+                return Err(LocalDbError::new(format!(
+                    "a relocation copy in cell {cell:?} exceeds the batch limits"
+                )));
+            }
+            let (written, version) =
+                self.write_relocated_chunk(mutations[start..start + take].to_vec())?;
+            members.extend(written);
+            last_version =
+                Some(last_version.map_or(version, |last: BatchVersion| last.max(version)));
+            start += take;
+        }
+        let last_version = last_version
+            .ok_or_else(|| LocalDbError::new("a relocation copy chunk wrote no batch"))?;
+        Ok(RelocatedCopies {
+            members,
+            last_version,
+        })
+    }
+
+    fn write_relocated_chunk(
+        &self,
+        mutations: Vec<Mutation>,
+    ) -> Result<(Vec<RelocatedMember>, BatchVersion), LocalDbError> {
+        let operation: [u8; 16] = rand::random();
+        let (version, address) = self
+            .database
+            .core
+            .write_relocated(operation, mutations.clone())?;
+        // The batch is deterministic in (id, version, members): encoding it again
+        // yields the frame the owner stored, from which every member address and
+        // payload CRC follows exactly as publication derives them.
+        let id = BatchId {
+            database: self.config.storage.database,
+            operation,
+        };
+        let batch = CompleteBatch::new_relocated(
+            &self.shape,
+            id,
+            version,
+            mutations,
+            self.config.storage.batch_limits,
+        )
+        .map_err(LocalDbError::component)?;
+        let members = member_positions(&batch, address)
+            .map_err(LocalDbError::component)?
+            .into_iter()
+            .map(|position| RelocatedMember {
+                address: position.address,
+                payload_crc: position.payload_crc,
+            })
+            .collect();
+        Ok((members, version))
+    }
+
+    /// One native snapshot pass: native `rebuild_control_region`. Flushes the
+    /// cells that are stale by value-byte distance, stores one region when the
+    /// flush frontier advanced and is a no-op otherwise (`stored == false`).
+    ///
+    /// # Errors
+    /// Returns an observed authority failure, an owner drain failure or an
+    /// index/control-region persistence error.
+    pub(crate) fn snapshot_index(&self) -> Result<StoredSnapshot, LocalDbError> {
+        self.ensure_healthy()?;
+        self.table.snapshot()
+    }
+
+    /// Snapshot passes that were a no-op only because a reader latch held the
+    /// flush frontier below the stored head. Diagnostic, exported as the
+    /// `snapshot_latch_deferrals` gauge.
+    pub(crate) fn snapshot_latch_deferrals(&self) -> u64 {
+        self.table.snapshot_latch_deferrals()
+    }
+
+    /// Named index rebuild: native `force_rebuild_control_region`. Force-flushes
+    /// every dirty cell at the current flush frontier and stores one region, even
+    /// when the head did not move. Takes no write gate; later writes proceed.
+    ///
+    /// # Errors
+    /// As [`Self::snapshot_index`].
+    pub(crate) fn force_rebuild_index(&self) -> Result<StoredSnapshot, LocalDbError> {
+        self.ensure_healthy()?;
+        let frontier = self.table.last_processed();
+        self.table.snapshot_for_relocation(frontier)
     }
 
     pub fn read_cache_stats(&self) -> ReadCacheStats {
         self.cache.stats()
-    }
-    pub fn index_shard_stats(&self) -> super::super::native_index::IndexShardStats {
-        self.index.shard_stats()
     }
     pub fn read_cache_shard_stats(&self) -> super::ReadCacheShardStats {
         self.cache.shard_stats()
@@ -1504,20 +1409,6 @@ impl ConcurrentRemoteDatabase {
         visit(snapshot);
         Some(())
     }
-    pub fn try_index_metrics(
-        &self,
-    ) -> Option<(
-        super::super::native_index::NativeIndexStats,
-        usize,
-        IndexReadCut,
-    )> {
-        let index = &self.index;
-        Some((
-            index.stats(),
-            index.retained_metadata_bytes(),
-            index.retention_floor(),
-        ))
-    }
     pub fn try_metadata_history_bytes(&self) -> Option<usize> {
         self.database.core.try_metadata_history_bytes()
     }
@@ -1550,6 +1441,11 @@ impl ConcurrentRemoteDatabase {
     /// Returns the first owner failure; owners that already flushed stay flushed.
     pub fn flush_durable(&self) -> Result<(), LocalDbError> {
         self.database.core.flush_durable()
+    }
+
+    /// Engine recovery evidence of this open.
+    pub fn recovery_stats(&self) -> RecoveryStats {
+        self.database.recovery_stats()
     }
     /// Durable-cut progress of this epoch; `enabled` is false when untracked.
     pub fn durable_cut_stats(&self) -> super::DurableCutStats {
@@ -1655,3 +1551,21 @@ impl Drop for ConcurrentRemoteDatabase {
 
 #[cfg(test)]
 mod tests;
+
+/// Where one relocation copy landed: the member frame address and the CRC-32 of
+/// its payload, which the pass compares with the indexed CRC of the source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RelocatedMember {
+    pub(crate) address: super::super::types::PhysicalValueAddress,
+    pub(crate) payload_crc: u32,
+}
+
+/// The copies of one chunk, as written: where each landed (input order) and
+/// the highest version a copy batch took. A relocated batch inserts nothing
+/// into the index, so that version is what the durable cut has to cover before
+/// the caller re-points at the copies.
+#[derive(Clone, Debug)]
+pub(crate) struct RelocatedCopies {
+    pub(crate) members: Vec<RelocatedMember>,
+    pub(crate) last_version: BatchVersion,
+}

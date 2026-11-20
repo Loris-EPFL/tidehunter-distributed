@@ -3,22 +3,36 @@
 //!
 //! The page names every complete batch that starts in `[from, end)`,
 //! including batches without a put (they still order Stop against other
-//! streams), and every put member with its exact reference and reduced key.
-//! Groups are read whole, so the cursor can pass `end`. No payload leaves the
-//! owner on this path: the coordinator reads a callback's value through its
-//! ordinary pinned member read. Recovery replay stays sealed-only.
+//! streams), and every put member with its exact index position and reduced
+//! key. Groups are read whole, so the cursor can pass `end`. No payload is
+//! copied into the page: the coordinator reads a callback's value at its
+//! position through the ordinary position read. Recovery replay stays
+//! sealed-only.
+//!
+//! The position is built by the one constructor publication uses,
+//! [`VersionPosition::member`], from the batch address and the member
+//! descriptor. Its `payload_crc` here is the CRC-32 of the member payload the
+//! owner just read (after the member's `[len u32][checksum u32]` header): it
+//! only verifies that transfer. It is never stored. The copy ladder re-points
+//! positions taken from the index view and reuses their `payload_crc`, so a
+//! corrupt survivor can never launder a matching CRC into the index.
 //!
 //! The scan reads only bytes the owner already adopted (`end` at or below the
 //! adopted end), so it never races a leased write; a corrupt group below that
 //! end is an error, never an end of history.
 use super::wal_replay::FRAME_BOUNDARY;
 use super::*;
+use crate::distributed::codec::MEMBER_HEADER_LEN;
+use crate::distributed::hybrid::position::VersionPosition;
+use minibytes::Bytes;
 
-/// One put member of a scanned batch: its exact reference and reduced key.
+/// One put member of a scanned batch: its keyspace, index position and reduced
+/// key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelocationPut {
-    pub reference: super::super::types::ValueRecordReference,
-    pub reduced_key: Vec<u8>,
+    pub keyspace: u8,
+    pub position: VersionPosition,
+    pub reduced_key: Bytes,
 }
 
 /// One original batch in stream order. `puts` keeps member order.
@@ -105,12 +119,42 @@ impl PartitionLog {
                     let Mutation::Put { keyspace, key, .. } = mutation else {
                         continue;
                     };
-                    let reference = batch
-                        .record_reference(receipt.address(), index)
+                    let descriptor = batch
+                        .record_descriptors()
+                        .get(index)
+                        .ok_or(StorageError::Invalid(FRAME_BOUNDARY))?;
+                    // The member is `[len u32][checksum u32]` plus its native
+                    // entry; the entry starts after that member header. The
+                    // batch's own outer `CrcFrame` header precedes the member
+                    // area and is already included in `descriptor.offset`.
+                    // The position's CRC here verifies this transfer only: the
+                    // copy ladder reuses the indexed `payload_crc`, so no CRC
+                    // read from owner bytes ever reaches the index.
+                    let member_start = usize::try_from(descriptor.offset)
                         .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?;
+                    let member_end = member_start
+                        .checked_add(
+                            usize::try_from(descriptor.len)
+                                .map_err(|_| StorageError::Invalid(FRAME_BOUNDARY))?,
+                        )
+                        .ok_or(StorageError::Invalid(FRAME_BOUNDARY))?;
+                    let payload = batch
+                        .encoded()
+                        .get(member_start + MEMBER_HEADER_LEN..member_end)
+                        .ok_or(StorageError::Invalid(FRAME_BOUNDARY))?;
+                    let position = VersionPosition::member(
+                        batch.version(),
+                        receipt.address(),
+                        descriptor.operation_index,
+                        *descriptor,
+                        crc32fast::hash(payload),
+                    );
                     puts.push(RelocationPut {
-                        reference,
-                        reduced_key: self.shape.ks(*keyspace).reduce_key(key).into_owned(),
+                        keyspace: keyspace.0,
+                        position,
+                        reduced_key: Bytes::from(
+                            self.shape.ks(*keyspace).reduce_key(key).into_owned(),
+                        ),
                     });
                 }
                 batches.push(RelocationBatch {

@@ -49,7 +49,16 @@ fn relocation_page_reads_whole_groups_and_names_batches_below_the_end() {
         );
         for batch in &page.batches {
             assert_eq!(batch.puts.len(), 1);
-            assert_eq!(batch.puts[0].reference.batch_address, batch.address);
+            let member = batch.puts[0].position.address;
+            assert_eq!(batch.puts[0].position.batch, batch.version);
+            assert_eq!(member.partition, batch.address.partition);
+            assert_eq!(member.segment_generation, batch.address.segment_generation);
+            assert!(
+                member.offset >= batch.address.offset
+                    && member.offset + u64::from(member.len)
+                        <= batch.address.offset + u64::from(batch.address.len),
+                "the member frame lies inside its batch frame"
+            );
             assert_eq!(batch.puts[0].reduced_key, b"key1");
         }
     }

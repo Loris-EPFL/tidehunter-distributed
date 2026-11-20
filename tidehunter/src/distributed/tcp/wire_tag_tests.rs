@@ -1,6 +1,6 @@
 //! Frozen owner-protocol wire tags. Bincode encodes an enum variant as its
 //! declaration index, so the ordered variant list below *is* the tag table of
-//! protocol 34. Changing it requires a protocol bump.
+//! protocol 35. Changing it requires a protocol bump.
 
 use super::{HARD_FRAME_LIMIT, PROTOCOL, Request, Response, wire_codec};
 use bincode::Options;
@@ -53,8 +53,8 @@ fn variants<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
 }
 
 #[test]
-fn protocol_34_request_tags_are_frozen() {
-    assert_eq!(PROTOCOL, 34);
+fn protocol_35_request_tags_are_frozen() {
+    assert_eq!(PROTOCOL, 35);
     assert_eq!(
         variants::<Request>(),
         [
@@ -96,7 +96,7 @@ fn protocol_34_request_tags_are_frozen() {
 }
 
 #[test]
-fn protocol_34_response_tags_are_frozen() {
+fn protocol_35_response_tags_are_frozen() {
     assert_eq!(
         variants::<Response>(),
         [
@@ -163,4 +163,46 @@ fn bincode_tag_is_the_declaration_index() {
         ))
         .expect("encode response");
     assert_eq!(reply[..4], 2u32.to_le_bytes());
+}
+
+/// `ResolveLiveRecords` is keyed by member address alone: tag 14, the authority
+/// epoch, then the addresses (`u32` partition, `u64` generation, `u64` offset,
+/// `u32` length, fixed width). The tag did not change, so the table above and
+/// `PROTOCOL` stay; this pins the payload so a reference-keyed request can never
+/// decode as an address list by accident.
+#[test]
+fn resolve_live_records_carries_member_addresses() {
+    use crate::distributed::types::PhysicalValueAddress;
+    let members = vec![
+        PhysicalValueAddress {
+            partition: 1,
+            segment_generation: 4,
+            offset: 8192,
+            len: 96,
+        },
+        PhysicalValueAddress {
+            partition: 1,
+            segment_generation: 2,
+            offset: 16,
+            len: 8,
+        },
+    ];
+    let request = Request::ResolveLiveRecords {
+        authority_epoch: 5,
+        members: members.clone(),
+    };
+    let bytes = wire_codec(HARD_FRAME_LIMIT)
+        .serialize(&request)
+        .expect("encode request");
+    assert_eq!(bytes[..4], 14u32.to_le_bytes());
+    assert_eq!(bytes[4..12], 5u64.to_le_bytes());
+    assert_eq!(bytes[12..20], 2u64.to_le_bytes());
+    assert_eq!(bytes.len(), 4 + 8 + 8 + 24 * members.len());
+    let decoded: Request = wire_codec(HARD_FRAME_LIMIT)
+        .deserialize(&bytes)
+        .expect("decode request");
+    assert!(matches!(
+        decoded,
+        Request::ResolveLiveRecords { authority_epoch: 5, members: decoded } if decoded == members
+    ));
 }

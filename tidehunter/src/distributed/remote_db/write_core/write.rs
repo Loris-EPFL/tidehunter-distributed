@@ -1,18 +1,19 @@
 use super::super::{
-    CheckpointPressure, CompleteBatch, DependencyKey, LocalDbError, Mutation, WriteTimelineSample,
-    WriteTimelineStage, WriteWait, elapsed,
+    CompleteBatch, DependencyKey, LocalDbError, Mutation, WriteTimelineSample, WriteTimelineStage,
+    WriteWait, elapsed,
 };
 use super::Dependency;
 use super::core::{RangeBarrier, WriteCore};
-use super::identity::{IdentityClass, IdentityEntry};
+use super::inflight::InFlightEntry;
 use super::owner_queue::OwnerQueue;
 use super::publisher::AbortedAllocation;
 use super::sequencer::{Resolution, SlotPublication};
 use crate::distributed::codec::ValidatedMutations;
 use crate::distributed::native_publication::UnboundNativePublicationRouting;
 use crate::distributed::reference_directory::ReferenceDirectory;
+use crate::distributed::remote_db::RecentReceipt;
 use crate::distributed::remote_db::concurrent::{WriteCredit, WriteGrant};
-use crate::distributed::types::{BatchId, BatchVersion};
+use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress};
 use crate::distributed::write_timeline::WriteBlockStage;
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -40,10 +41,15 @@ struct Planned<'a> {
     validated: ValidatedMutations<'a>,
     routing: Option<UnboundNativePublicationRouting<'a>>,
     owner: usize,
-    metadata_charge: usize,
     bytes: usize,
     keys: Vec<Dependency>,
-    identity: Option<IdentityEntry>,
+    /// A receipt already in the retry window: the window answers with the
+    /// original version and no owner byte is appended.
+    retry: Option<RecentReceipt>,
+    /// The generation that currently owns this operation id, when neither the
+    /// window nor this plan can answer. A retry waits on that generation's
+    /// outcome instead of allocating a second version.
+    in_flight: Option<InFlightEntry>,
     allocation: Option<Allocation>,
     publication: Option<SlotPublication>,
 }
@@ -68,10 +74,22 @@ impl Drop for QueuedWindow<'_> {
 
 enum AllocationResult {
     Allocated,
+    /// Another generation claimed an observed operation id between the lookup
+    /// and the freeze: re-look up outside the locks and retry the segment.
     Replan,
     /// Another fresh `DropCells` slot still holds the publication barrier.
     RangeBusy,
     Closed(LocalDbError),
+}
+
+/// What one admitted window carries. A `DropCells` member needs the publication
+/// barrier and a relocated-copy batch needs the format-5 header; both are
+/// admitted alone by their dedicated entry points.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowKind {
+    Point,
+    DropCells,
+    Relocated,
 }
 
 impl WriteCore {
@@ -82,31 +100,49 @@ impl WriteCore {
         sample: Option<WriteTimelineSample>,
     ) -> Result<BatchVersion, LocalDbError> {
         let inputs = [(operation, mutations)];
-        let queued = self.enqueue_window(&inputs, true, sample, false)?;
-        // No queued routing/value handle retains caller backing after bind.
-        // Release even arbitrarily large source allocations before waiting.
-        drop(inputs);
-        let version = *queued
-            .versions
-            .first()
-            .ok_or_else(|| LocalDbError::new("write allocated no version"))?;
         let started = Instant::now();
         let deadline = started + self.config.timeout;
-        let result = if queued.owned.contains(&version.sequence) && version.epoch == self.epoch {
-            self.sequencer.wait(version, deadline)
-        } else {
-            self.wait_retry(version, deadline)
-        };
-        #[cfg(test)]
-        {
-            // One-shot: the outcome is resolved but this caller has not yet
-            // released its slot. A dropped resume sender also unblocks.
-            let pause = self.test_hooks.lock().before_release.take();
-            if let Some((entered, resume)) = pause {
-                let _ = entered.try_send(());
-                let _ = resume.recv();
+        // One re-application is allowed: a retry whose observed generation
+        // aborted before publishing must behave as a fresh write, which is what
+        // the original caller asked for either way.
+        let mut reapplied = false;
+        let result = loop {
+            let queued = self.enqueue_window(&inputs, true, sample, WindowKind::Point)?;
+            let version = *queued
+                .versions
+                .first()
+                .ok_or_else(|| LocalDbError::new("write allocated no version"))?;
+            let result = if queued.owned.contains(&version.sequence) && version.epoch == self.epoch
+            {
+                self.sequencer.wait(version, deadline)
+            } else {
+                match self.wait_retry(operation, version, deadline)? {
+                    Retried::Published(version) => Ok(version),
+                    Retried::Reapply if !reapplied => {
+                        reapplied = true;
+                        drop(queued);
+                        continue;
+                    }
+                    Retried::Reapply => Err(LocalDbError::new(
+                        "retried write did not publish after re-applying",
+                    )),
+                }
+            };
+            #[cfg(test)]
+            {
+                // One-shot: the outcome is resolved but this caller has not yet
+                // released its slot. A dropped resume sender also unblocks.
+                let pause = self.test_hooks.lock().before_release.take();
+                if let Some((entered, resume)) = pause {
+                    let _ = entered.try_send(());
+                    let _ = resume.recv();
+                }
             }
-        }
+            break result;
+        };
+        // No queued routing/value handle retains caller backing after bind.
+        // Release even arbitrarily large source allocations before returning.
+        drop(inputs);
         self.stats.lock().database.storage_wait_ns += elapsed(started);
         result.and_then(|version| {
             self.ensure_healthy()
@@ -130,7 +166,7 @@ impl WriteCore {
             ));
         }
         let inputs = [(operation, vec![mutation])];
-        let queued = self.enqueue_window(&inputs, true, None, true)?;
+        let queued = self.enqueue_window(&inputs, true, None, WindowKind::DropCells)?;
         let version = *queued
             .versions
             .first()
@@ -139,7 +175,14 @@ impl WriteCore {
         let result = if queued.owned.contains(&version.sequence) && version.epoch == self.epoch {
             self.sequencer.wait(version, deadline)
         } else {
-            self.wait_retry(version, deadline)
+            match self.wait_retry(operation, version, deadline)? {
+                Retried::Published(version) => Ok(version),
+                // The range never published; a fresh submission gets the
+                // barrier and a new version, which is what the caller wants.
+                Retried::Reapply => Err(LocalDbError::new(
+                    "drop-cells retry observed an unpublished generation; submit again",
+                )),
+            }
         };
         result.and_then(|version| {
             self.ensure_healthy()
@@ -148,13 +191,51 @@ impl WriteCore {
         })
     }
 
+    /// Submits one batch of relocated copies and waits for its publication,
+    /// returning its version and the owner address of its batch frame.
+    ///
+    /// The batch takes an allocator version and publishes in order like any
+    /// other, so the cut cells advance over it, but it inserts nothing into the
+    /// index (`NativePublicationRouting::publish`) and replay skips it
+    /// (`CompleteBatch::is_relocated`). `operation` must be a fresh id: a retry
+    /// of a relocation pass re-reads the index and copies again.
+    pub(in crate::distributed::remote_db) fn write_relocated(
+        self: &Arc<Self>,
+        operation: [u8; 16],
+        mutations: Vec<Mutation>,
+    ) -> Result<(BatchVersion, PhysicalValueAddress), LocalDbError> {
+        let inputs = [(operation, mutations)];
+        let queued = self.enqueue_window(&inputs, true, None, WindowKind::Relocated)?;
+        let version = *queued
+            .versions
+            .first()
+            .ok_or_else(|| LocalDbError::new("write allocated no version"))?;
+        if !queued.owned.contains(&version.sequence) || version.epoch != self.epoch {
+            return Err(LocalDbError::new(
+                "relocation copy was answered by an earlier operation id",
+            ));
+        }
+        let version = self
+            .sequencer
+            .wait(version, Instant::now() + self.config.timeout)?;
+        // The slot is owned until `queued` drops, so its durable receipt is
+        // still the one this batch published under.
+        let address = self
+            .durable_receipt(version.sequence)
+            .map(|receipt| receipt.appended().address())
+            .ok_or_else(|| LocalDbError::unknown(version, "relocation copy lost its receipt"))?;
+        self.ensure_healthy()
+            .map_err(|error| LocalDbError::unknown(version, error))?;
+        Ok((version, address))
+    }
+
     pub(in crate::distributed::remote_db) fn submit(
         self: &Arc<Self>,
         operation: [u8; 16],
         mutations: Vec<Mutation>,
     ) -> Result<BatchVersion, LocalDbError> {
         let inputs = [(operation, mutations)];
-        let queued = self.enqueue_window(&inputs, false, None, false)?;
+        let queued = self.enqueue_window(&inputs, false, None, WindowKind::Point)?;
         queued
             .versions
             .first()
@@ -178,7 +259,7 @@ impl WriteCore {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut queued = self.enqueue_window(inputs, false, None, false)?;
+        let mut queued = self.enqueue_window(inputs, false, None, WindowKind::Point)?;
         Ok(std::mem::take(&mut queued.versions).into_vec())
     }
 
@@ -187,11 +268,11 @@ impl WriteCore {
         inputs: &[Input],
         block: bool,
         sample: Option<WriteTimelineSample>,
-        drop_cells: bool,
+        kind: WindowKind,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
         let first_allocated = Cell::new(None);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.enqueue_window_inner(inputs, block, sample, drop_cells, &first_allocated)
+            self.enqueue_window_inner(inputs, block, sample, kind, &first_allocated)
         })) {
             Ok(result) => result,
             Err(_) => {
@@ -212,9 +293,10 @@ impl WriteCore {
         inputs: &[Input],
         block: bool,
         sample: Option<WriteTimelineSample>,
-        drop_cells: bool,
+        kind: WindowKind,
         first_allocated: &Cell<Option<BatchVersion>>,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
+        let drop_cells = kind == WindowKind::DropCells;
         self.ensure_writable()?;
         if inputs.len() > self.config.max_pending_batches {
             return Err(LocalDbError::new("write exceeds admission request budget"));
@@ -240,17 +322,25 @@ impl WriteCore {
         let mut plans = SmallVec::<[Planned<'_>; 1]>::with_capacity(inputs.len());
         let mut aliases = SmallVec::<[usize; 1]>::with_capacity(inputs.len());
         // The scalar path needs no duplicate-id hash table or heap allocation.
-        let mut identities = (inputs.len() > 1)
+        let mut duplicate_inputs = (inputs.len() > 1)
             .then(|| HashMap::<[u8; 16], (usize, usize)>::with_capacity(inputs.len()));
         for (input_index, (operation, mutations)) in inputs.iter().enumerate() {
-            let validated = CompleteBatch::validated_mutations(
-                &self.shape,
-                mutations,
-                self.config.storage.batch_limits,
-            )
+            let validated = if kind == WindowKind::Relocated {
+                CompleteBatch::validated_relocated(
+                    &self.shape,
+                    mutations,
+                    self.config.storage.batch_limits,
+                )
+            } else {
+                CompleteBatch::validated_mutations(
+                    &self.shape,
+                    mutations,
+                    self.config.storage.batch_limits,
+                )
+            }
             .map_err(LocalDbError::component)?;
             if let Some(&(plan_index, first_input)) =
-                identities.as_ref().and_then(|ids| ids.get(operation))
+                duplicate_inputs.as_ref().and_then(|ids| ids.get(operation))
             {
                 if inputs[first_input].1 != *mutations {
                     return Err(LocalDbError::new("retry changed original batch"));
@@ -272,16 +362,11 @@ impl WriteCore {
                 .ok_or_else(|| LocalDbError::new("write names an unregistered owner"))?;
             let routing = UnboundNativePublicationRouting::prepare(&self.shape, &validated)
                 .map_err(LocalDbError::component)?;
-            let metadata_charge = self
-                .index
-                .estimated_routed_bytes(routing.operations())
-                .map_err(LocalDbError::component)?;
             let dependency_bytes = routing
-                .operations()
-                .iter()
-                .try_fold(0usize, |bytes, operation| {
-                    bytes.checked_add(if operation.reduced_key().len() > 32 {
-                        operation.reduced_key().len().checked_mul(2)?
+                .keys()
+                .try_fold(0usize, |bytes, (_, reduced_key)| {
+                    bytes.checked_add(if reduced_key.len() > 32 {
+                        reduced_key.len().checked_mul(2)?
                     } else {
                         0
                     })
@@ -307,17 +392,11 @@ impl WriteCore {
                 .and_then(|n| n.checked_add(2048))
                 .ok_or_else(|| LocalDbError::new("write admission byte overflow"))?;
             let keys = routing
-                .operations()
-                .iter()
-                .map(|operation| {
-                    (
-                        operation.ks(),
-                        DependencyKey::from_slice(operation.reduced_key().as_ref()),
-                    )
-                })
+                .keys()
+                .map(|(keyspace, reduced_key)| (keyspace, DependencyKey::from_slice(reduced_key)))
                 .collect();
             let plan_index = plans.len();
-            if let Some(ids) = &mut identities {
+            if let Some(ids) = &mut duplicate_inputs {
                 ids.insert(*operation, (plan_index, input_index));
             }
             aliases.push(plan_index);
@@ -326,10 +405,10 @@ impl WriteCore {
                 validated,
                 routing: Some(routing),
                 owner,
-                metadata_charge,
                 bytes: credit,
                 keys,
-                identity: None,
+                retry: None,
+                in_flight: None,
                 allocation: None,
                 publication: None,
             });
@@ -344,25 +423,19 @@ impl WriteCore {
         let segments = self.partition_segments(&plans, &aliases)?;
         if segments.len() > 1 {
             // Retry conflicts are deterministic input errors: reject them before
-            // the first segment allocates. Each segment rechecks under its grant.
-            let deadline = Instant::now() + self.config.timeout;
-            for plan in &plans {
-                let Some(identity) = self.wait_identity_ready(plan.operation, deadline)? else {
-                    continue;
-                };
-                let retry = plan
-                    .validated
-                    .encode(
-                        BatchId {
-                            database: self.config.storage.database,
-                            operation: plan.operation,
-                        },
-                        identity.version,
-                    )
-                    .map_err(LocalDbError::component)?;
-                if Some(retry.digest()) != identity.digest {
-                    return Err(LocalDbError::new("retry changed original batch"));
+            // the first segment allocates. Each segment rechecks under its grant,
+            // which is what makes the answer authoritative.
+            for plan in &mut plans {
+                let in_flight = self.in_flight.lookup(plan.operation);
+                if plan.retry.is_none() {
+                    plan.retry = self.lookup_receipt(plan.operation)?;
                 }
+                if plan.retry.is_none() && plan.in_flight.is_none() {
+                    plan.in_flight = in_flight;
+                }
+                // A stale observation is cleared here; the segment grant looks
+                // the operation up again under the freeze.
+                let _ = self.validate_retry(plan)?;
             }
         }
         let mut queued = None;
@@ -396,13 +469,14 @@ impl WriteCore {
         queued.versions.reserve(aliases.len());
         for &alias in &aliases {
             let plan = &plans[alias];
-            let version = match (&plan.allocation, plan.identity) {
-                (Some(allocation), _) => BatchVersion {
+            let version = match (&plan.allocation, plan.retry, plan.in_flight) {
+                (Some(allocation), ..) => BatchVersion {
                     epoch: self.epoch,
                     sequence: allocation.sequence,
                 },
-                (None, Some(identity)) => identity.version,
-                _ => return Err(LocalDbError::new("write window lost an allocated identity")),
+                (None, Some(receipt), _) => receipt.version,
+                (None, None, Some(entry)) => entry.version,
+                _ => return Err(LocalDbError::new("write window lost its version")),
             };
             queued.versions.push(version);
         }
@@ -491,14 +565,14 @@ impl WriteCore {
         drop_cells: bool,
     ) -> Result<QueuedWindow<'a>, LocalDbError> {
         let deadline = Instant::now() + self.config.timeout;
-        // Only no-effect identity races replan. The absolute deadline also
-        // bounds repeated aborts of the same operation id by other callers.
+        // The absolute deadline bounds repeated contention with another fresh
+        // range. No retry race can restart this segment: a receipt that appears
+        // between preflight and grant just turns that plan into a retry, which
+        // re-returns the published version without an owner byte.
         loop {
             self.ensure_writable()?;
             if Instant::now() >= deadline {
-                return Err(LocalDbError::new(
-                    "write identity preflight deadline expired",
-                ));
+                return Err(LocalDbError::new("write admission deadline expired"));
             }
             let mut grant = WriteGrant {
                 requests,
@@ -506,19 +580,20 @@ impl WriteCore {
                 ..WriteGrant::default()
             };
             for plan in plans.iter_mut() {
-                plan.identity = self.lookup_identity(plan.operation)?;
-                if plan.identity.is_none() {
+                // The in-flight table must be probed before the retry window,
+                // and the window wins when both answer. Publication pushes the
+                // receipt before it retires the in-flight entry, so any probe
+                // that misses the window (read second) still sees the entry;
+                // the reverse order leaves one instant where both are gone.
+                let in_flight = self.in_flight.lookup(plan.operation);
+                plan.retry = self.lookup_receipt(plan.operation)?;
+                plan.in_flight = if plan.retry.is_some() {
+                    None
+                } else {
+                    in_flight
+                };
+                if plan.retry.is_none() && plan.in_flight.is_none() {
                     grant.slots += 1;
-                    grant.identities += 1;
-                    grant.index_bytes = grant
-                        .index_bytes
-                        .checked_add(plan.metadata_charge)
-                        .ok_or_else(|| LocalDbError::new("index reservation overflow"))?;
-                    grant.replay_batches += 1;
-                    grant.replay_bytes = grant
-                        .replay_bytes
-                        .checked_add(plan.validated.encoded_len())
-                        .ok_or_else(|| LocalDbError::new("checkpoint tail reservation overflow"))?;
                     grant.add_partition(plan.owner, plan.validated.mutations().len())?;
                 }
             }
@@ -526,12 +601,31 @@ impl WriteCore {
                 self.write_timeline
                     .event(sample, WriteTimelineStage::AdmissionWaitStarted);
             }
+            debug_assert!(
+                grant.identities == 0 && grant.index_bytes == 0,
+                "a hybrid write grant carries no checkpoint-bound dimension",
+            );
             let block_started = self.write_timeline.block_started();
             let credit = self.admission.reserve_grant(
                 grant,
                 block,
                 || self.ensure_writable(),
-                |pressure| self.admission_pressure(pressure),
+                // The only dimensions that can block a grant on a checkpoint are
+                // `identities` and `index_bytes`. This site builds the grant from
+                // `WriteGrant::default()` and never sets either, so both stay zero
+                // (asserted above) and this callback cannot be reached from here.
+                // The parameter itself belongs to `concurrent.rs`; S11 removes it
+                // with the rest of the dead surface. It returns a typed error
+                // rather than `Ok`: if a later change gives the grant either
+                // dimension, a parked caller would otherwise wait for a snapshot
+                // trigger nothing issues, and a hang with no error is the worst
+                // failure on this path.
+                |_| {
+                    Err(LocalDbError::new(
+                        "checkpoint-bound admission is unreachable: identities and index bytes \
+                         are not part of a hybrid write grant",
+                    ))
+                },
             )?;
             self.write_timeline.block_finished(
                 WriteBlockStage::AdmissionCredit,
@@ -548,33 +642,21 @@ impl WriteCore {
                 owned: SmallVec::with_capacity(plans.len()),
                 _credit: credit,
             };
+            // A retry must be validated against its owner before any allocation;
+            // a vanished in-flight owner restarts the segment so the operation
+            // is looked up (and, if unowned, allocated) afresh.
             let mut replan = false;
-            // Fresh plans need no work here: the sparse-view budget is a
-            // standing reservation held by the publisher since open.
-            for plan in plans.iter_mut().filter(|plan| plan.identity.is_some()) {
-                let Some(identity) = self.wait_identity_ready(plan.operation, deadline)? else {
+            for plan in plans.iter_mut() {
+                if !self.validate_retry(plan)? {
                     replan = true;
-                    break;
-                };
-                let retry = plan
-                    .validated
-                    .encode(
-                        BatchId {
-                            database: self.config.storage.database,
-                            operation: plan.operation,
-                        },
-                        identity.version,
-                    )
-                    .map_err(LocalDbError::component)?;
-                if Some(retry.digest()) != identity.digest {
-                    return Err(LocalDbError::new("retry changed original batch"));
                 }
-                plan.identity = Some(identity);
             }
             if replan {
                 drop(queued);
                 continue;
             }
+            // Fresh plans need no work here: the sparse-view budget is a
+            // standing reservation held by the publisher since open.
             #[cfg(test)]
             {
                 let pause = self.test_hooks.lock().after_grant.take();
@@ -585,21 +667,19 @@ impl WriteCore {
                     })?;
                 }
             }
-            let operations: SmallVec<[[u8; 16]; 1]> =
-                plans.iter().map(|plan| plan.operation).collect();
             let shards = self
                 .dependencies
                 .shard_indices(plans.iter().flat_map(|plan| plan.keys.iter()));
             let mut owners: SmallVec<[(usize, &OwnerQueue); 2]> = plans
                 .iter()
-                .filter(|plan| plan.identity.is_none())
+                .filter(|plan| plan.retry.is_none())
                 .map(|plan| (plan.owner, self.clients[plan.owner].queue.as_ref()))
                 .collect();
             if owners.is_empty() {
                 owners.push((0, self.clients[0].queue.as_ref()));
             }
             // Option D: the owner-ordering stage is the caller's own allocation
-            // in the identity → key → owner-order critical section.
+            // in the key → owner-order critical section.
             if let Some(sample) = sample {
                 self.write_timeline
                     .event(sample, WriteTimelineStage::OwnerEnqueueStarted);
@@ -609,86 +689,113 @@ impl WriteCore {
             // A DropCells allocation takes the publisher mutex outside its short
             // allocate transaction and records the barrier before release, so
             // no higher sequence can publish ahead of it. Order: publisher →
-            // identity shards → key shards → owner order → slot; it never
-            // takes the index writer or Admission while holding publisher.
+            // key shards → owner order → slot; it never takes Admission while
+            // holding publisher.
             let mut range_publisher = drop_cells.then(|| self.publisher.lock());
-            let allocated = self.identities.with_operations(&operations, |identities| {
-                self.dependencies.with_shards(shards, |keys| {
-                    OwnerQueue::with_owners(&owners, |owners| {
-                        if let Err(error) = self.ensure_writable() {
-                            return Ok(AllocationResult::Closed(error));
-                        }
-                        if range_publisher
-                            .as_ref()
-                            .is_some_and(|publisher| publisher.range_barrier.is_some())
-                        {
-                            return Ok(AllocationResult::RangeBusy);
-                        }
-                        // Freeze every identity before allocating any member.
-                        // A newly inserted or changed identity must be encoded
-                        // and compared outside these locks, never admitted late.
-                        // Replan repeats the lookup outside these locks.
-                        for plan in plans.iter() {
-                            match (plan.identity, identities.get(plan.operation)) {
-                                (None, None) | (Some(_), None) => {}
-                                (Some(expected), Some(actual))
-                                    if expected.version == actual.version
-                                        && expected.digest == actual.digest => {}
-                                _ => return Ok(AllocationResult::Replan),
+            let owned_operations: SmallVec<[[u8; 16]; 1]> = plans
+                .iter()
+                .filter(|plan| plan.retry.is_none())
+                .map(|plan| plan.operation)
+                .collect();
+            let allocated = self
+                .in_flight
+                .with_operations(&owned_operations, |in_flight| {
+                    self.dependencies.with_shards(shards, |keys| {
+                        OwnerQueue::with_owners(&owners, |owners| {
+                            if let Err(error) = self.ensure_writable() {
+                                return Ok(AllocationResult::Closed(error));
                             }
-                        }
-                        queued._credit.mark_allocated();
-                        for plan in plans.iter_mut() {
-                            if plan.identity.is_some() {
-                                continue;
+                            if range_publisher
+                                .as_ref()
+                                .is_some_and(|publisher| publisher.range_barrier.is_some())
+                            {
+                                return Ok(AllocationResult::RangeBusy);
                             }
-                            let id = BatchId {
-                                database: self.config.storage.database,
-                                operation: plan.operation,
-                            };
-                            let (owner_sequence, sequence) = owners
-                                .reserve(plan.owner, || self.sequencer.allocate(id))
-                                .ok_or_else(|| {
-                                    LocalDbError::new("allocation lost its locked owner")
-                                })?;
-                            let version = BatchVersion {
-                                epoch: self.epoch,
-                                sequence,
-                            };
-                            if first_allocated.get().is_none() {
-                                first_allocated.set(Some(version));
+                            // Freeze every observed owner before allocating any
+                            // member: a generation that appeared since the
+                            // lookup must be waited on, not duplicated.
+                            for plan in plans.iter() {
+                                if plan.retry.is_some() {
+                                    continue;
+                                }
+                                if in_flight.get(plan.operation) != plan.in_flight {
+                                    return Ok(AllocationResult::Replan);
+                                }
                             }
-                            queued.owned.push(sequence);
-                            let slot = self.sequencer.slot(sequence);
-                            let mut data = slot.data.lock();
-                            keys.register(&plan.keys, sequence, &mut data.predecessors, |prior| {
-                                self.sequencer.resolved(prior)
-                            });
-                            data.keys.append(&mut plan.keys);
-                            identities.insert(
-                                plan.operation,
-                                IdentityEntry {
-                                    version,
-                                    digest: None,
-                                    seq: sequence,
-                                    class: IdentityClass::Active,
-                                },
-                            );
-                            plan.allocation = Some(Allocation {
-                                sequence,
-                                owner_sequence,
-                            });
-                            if let Some(publisher) = range_publisher.as_mut() {
-                                publisher.range_barrier = Some(RangeBarrier {
+                            // A window probe made before the grant can be stale:
+                            // a same-id generation may have published — and
+                            // retired its in-flight entry — while this caller
+                            // waited for admission. This section holds the
+                            // in-flight shards of these operations, which is what
+                            // excludes a concurrent allocation for the same id;
+                            // a receipt visible here is therefore authoritative and
+                            // the grant is replanned instead of allocating a second
+                            // version that would overwrite a newer value.
+                            for plan in plans.iter() {
+                                if plan.retry.is_none()
+                                    && plan.in_flight.is_none()
+                                    && self.receipts.get(&plan.operation).is_some()
+                                {
+                                    return Ok(AllocationResult::Replan);
+                                }
+                            }
+                            queued._credit.mark_allocated();
+                            for plan in plans.iter_mut() {
+                                if plan.retry.is_some() {
+                                    continue;
+                                }
+                                let id = BatchId {
+                                    database: self.config.storage.database,
+                                    operation: plan.operation,
+                                };
+                                let (owner_sequence, sequence) = owners
+                                    .reserve(plan.owner, || self.sequencer.allocate(id))
+                                    .ok_or_else(|| {
+                                        LocalDbError::new("allocation lost its locked owner")
+                                    })?;
+                                let version = BatchVersion {
+                                    epoch: self.epoch,
                                     sequence,
-                                    deferred_ready: Vec::new(),
+                                };
+                                if first_allocated.get().is_none() {
+                                    first_allocated.set(Some(version));
+                                }
+                                queued.owned.push(sequence);
+                                let slot = self.sequencer.slot(sequence);
+                                let mut data = slot.data.lock();
+                                keys.register(
+                                    &plan.keys,
+                                    sequence,
+                                    &mut data.predecessors,
+                                    |prior| self.sequencer.resolved(prior),
+                                );
+                                data.keys.append(&mut plan.keys);
+                                in_flight.insert(
+                                    plan.operation,
+                                    InFlightEntry {
+                                        version,
+                                        seq: sequence,
+                                    },
+                                );
+                                plan.in_flight = Some(InFlightEntry {
+                                    version,
+                                    seq: sequence,
                                 });
+                                plan.allocation = Some(Allocation {
+                                    sequence,
+                                    owner_sequence,
+                                });
+                                if let Some(publisher) = range_publisher.as_mut() {
+                                    publisher.range_barrier = Some(RangeBarrier {
+                                        sequence,
+                                        deferred_ready: Vec::new(),
+                                    });
+                                }
                             }
-                        }
-                        Ok(AllocationResult::Allocated)
+                            Ok(AllocationResult::Allocated)
+                        })
                     })
-                })
-            });
+                });
             drop(range_publisher);
             self.write_timeline.block_finished(
                 WriteBlockStage::Allocate,
@@ -751,31 +858,20 @@ impl WriteCore {
                     panic!("injected caller allocation panic");
                 }
             }
-            // DropCells preflight: after the lower prefix resolves and before
-            // READY, collect the occupied target cells and reserve their mask
-            // charge. Any failure here is a pre-effect abort of the slot.
-            let mut drop_targets = None;
+            // DropCells preflight: the slot waits for the contiguous lower
+            // prefix before READY, so no earlier publication can create a cell
+            // in the range. The range itself is applied by the native index at
+            // its version; nothing is enumerated here.
             if drop_cells
-                && let Some(plan) = plans.first_mut()
+                && let Some(plan) = plans.first()
                 && let Some(allocation) = &plan.allocation
             {
                 let sequence = allocation.sequence;
-                match self.prepare_drop_cells(
-                    plan.validated.mutations(),
-                    sequence,
-                    plan.metadata_charge,
-                    deadline,
-                ) {
-                    Ok((targets, metadata_charge)) => {
-                        plan.metadata_charge = metadata_charge;
-                        drop_targets = Some(targets);
-                    }
-                    Err(error) => {
-                        self.write_timeline
-                            .wait_leave(WriteWait::AdmittedToAppendEnqueue, queued.owned.len());
-                        self.abort_window(plans, &error)?;
-                        return Err(error);
-                    }
+                if let Err(error) = self.wait_drop_cells_prefix(sequence, deadline) {
+                    self.write_timeline
+                        .wait_leave(WriteWait::AdmittedToAppendEnqueue, queued.owned.len());
+                    self.abort_window(plans, &error)?;
+                    return Err(error);
                 }
             }
             let encoding_started = Instant::now();
@@ -819,17 +915,12 @@ impl WriteCore {
                         None,
                         None,
                     );
-                    let mut routing = plan
+                    let routing = plan
                         .routing
                         .take()
                         .ok_or_else(|| LocalDbError::new("allocation lost its routing token"))?
                         .bind(&batch)
                         .map_err(LocalDbError::component)?;
-                    if let Some(targets) = drop_targets.take() {
-                        routing
-                            .set_drop_targets(targets)
-                            .map_err(LocalDbError::component)?;
-                    }
                     let last_mutation = batch
                         .mutation_version(batch.mutations().len() - 1)
                         .ok_or_else(|| LocalDbError::new("empty admitted batch"))?;
@@ -837,7 +928,6 @@ impl WriteCore {
                         batch,
                         routing,
                         last_mutation,
-                        metadata_charge: plan.metadata_charge,
                     });
                 }
                 Ok::<(), LocalDbError>(())
@@ -873,16 +963,6 @@ impl WriteCore {
                         LocalDbError::new("encoded allocation lost its publication payload")
                     })?;
                     let batch = publication.batch.clone();
-                    self.identities.with_operation(plan.operation, |entries| {
-                        let entry = entries
-                            .get_mut(&plan.operation)
-                            .filter(|entry| entry.seq == allocation.sequence)
-                            .ok_or_else(|| {
-                                LocalDbError::new("encoded allocation lost its identity")
-                            })?;
-                        entry.digest = Some(batch.digest());
-                        Ok::<(), LocalDbError>(())
-                    })?;
                     let slot = self.sequencer.slot(allocation.sequence);
                     {
                         let mut data = slot.data.lock();
@@ -949,27 +1029,6 @@ impl WriteCore {
         }
     }
 
-    /// Called by a parked caller with no Admission or foreground lock held.
-    fn admission_pressure(
-        self: &Arc<Self>,
-        pressure: CheckpointPressure,
-    ) -> Result<(), LocalDbError> {
-        let hard =
-            super::super::checkpoint_attribution::CheckpointTriggerFlags::hard(pressure.reason);
-        if self.write_timeline.enabled() {
-            let generation = {
-                let publisher = self.publisher.lock();
-                publisher
-                    .background_checkpoint
-                    .as_ref()
-                    .map(|_| publisher.snapshot_generation)
-            };
-            self.write_timeline
-                .checkpoint_pressure(self.epoch, generation, pressure);
-        }
-        self.request_checkpoint_for(hard)
-    }
-
     fn abort_window(
         self: &Arc<Self>,
         plans: &[Planned<'_>],
@@ -986,7 +1045,7 @@ impl WriteCore {
                     sequence: allocation.sequence,
                     owner_sequence: allocation.owner_sequence,
                     owner: plan.owner,
-                    metadata_charge: plan.metadata_charge,
+                    operation: plan.operation,
                     records: plan.validated.mutations().len(),
                     encoded_bytes: plan.validated.encoded_len(),
                 },
@@ -996,52 +1055,81 @@ impl WriteCore {
         Ok(())
     }
 
-    fn wait_identity_ready(
+    /// A plan whose operation is already owned — by the receipt window or by an
+    /// in-flight generation — must carry the same payload as that owner. The
+    /// version is never the caller's to choose: the window's receipt names it,
+    /// and an in-flight generation names it through its slot.
+    ///
+    /// Returns `false` when the observed in-flight owner disappeared (aborted or
+    /// its slot was reused): the plan's `in_flight` is then cleared, and the
+    /// caller must re-look up and retry the segment instead of waiting on a
+    /// generation that no longer owns this operation.
+    fn validate_retry(&self, plan: &mut Planned<'_>) -> Result<bool, LocalDbError> {
+        let Some(version) = self.owned_version(plan) else {
+            return Ok(true);
+        };
+        let retry = plan
+            .validated
+            .encode(
+                BatchId {
+                    database: self.config.storage.database,
+                    operation: plan.operation,
+                },
+                version,
+            )
+            .map_err(LocalDbError::component)?;
+        let expected = match (&plan.retry, &plan.in_flight) {
+            (Some(receipt), _) => Some(receipt.digest),
+            (None, Some(entry)) => {
+                match self.in_flight_digest(*entry, Instant::now() + self.config.timeout)? {
+                    Some(digest) => Some(digest),
+                    None => {
+                        plan.in_flight = None;
+                        return Ok(false);
+                    }
+                }
+            }
+            (None, None) => None,
+        };
+        if expected.is_some_and(|digest| digest != retry.digest()) {
+            return Err(LocalDbError::new("retry changed original batch"));
+        }
+        Ok(true)
+    }
+
+    /// The digest of the generation that owns an in-flight operation, or `None`
+    /// when that generation was already aborted, reused or retired (the caller
+    /// then re-validates from the window or allocates afresh). Waits for the
+    /// generation to reach READY, so an in-flight retry is compared against the
+    /// original's encoded digest instead of silently accepted.
+    fn in_flight_digest(
         &self,
-        operation: [u8; 16],
+        entry: InFlightEntry,
         deadline: Instant,
-    ) -> Result<Option<IdentityEntry>, LocalDbError> {
+    ) -> Result<Option<PayloadDigest>, LocalDbError> {
+        let slot = self.sequencer.slot(entry.seq);
+        let mut data = slot.data.lock();
         loop {
             self.ensure_writable()?;
-            let Some(current) = self.lookup_identity(operation)? else {
+            if self.sequencer.generation(entry.seq) != Some(entry.seq) {
                 return Ok(None);
-            };
-            if current.class != IdentityClass::Active || current.version.epoch != self.epoch {
-                return Ok(Some(current));
             }
-            let slot = self.sequencer.slot(current.seq);
-            let mut data = slot.data.lock();
-            if self
-                .sequencer
-                .generation(current.seq)
-                .is_some_and(|generation| generation > current.seq)
-            {
-                drop(data);
-                return self.lookup_identity(operation);
-            }
-            match self.sequencer.resolution(current.seq) {
+            match self.sequencer.resolution(entry.seq) {
                 Some(Resolution::Ready | Resolution::Durable | Resolution::Published) => {
-                    let digest = data
-                        .digest
-                        .ok_or_else(|| LocalDbError::new("ready identity lost its digest"))?;
-                    return Ok(Some(IdentityEntry {
-                        digest: Some(digest),
-                        ..current
-                    }));
+                    return Ok(data.digest);
                 }
-                Some(Resolution::Aborted) => {
-                    drop(data);
-                    continue;
-                }
+                Some(Resolution::Aborted) => return Ok(None),
                 Some(Resolution::Unknown) => {
                     return Err(LocalDbError::unknown(
-                        current.version,
+                        entry.version,
                         "retry outcome requires recovery",
                     ));
                 }
                 Some(Resolution::Allocated) => {}
                 None => {
-                    drop(data);
+                    // A live in-flight entry names a generation this core no
+                    // longer knows: the ownership bookkeeping is inconsistent,
+                    // so continue only after recovery.
                     let error = LocalDbError::new("retry identity lost its slot generation");
                     self.fail(copy_error(&error));
                     return Err(error);
@@ -1049,7 +1137,7 @@ impl WriteCore {
             }
             if Instant::now() >= deadline {
                 return Err(LocalDbError::unknown(
-                    current.version,
+                    entry.version,
                     "retry encoding not resolved before deadline",
                 ));
             }
@@ -1057,14 +1145,33 @@ impl WriteCore {
         }
     }
 
-    fn wait_retry(
+    /// The version an already-owned operation must return: the window's receipt
+    /// version, else the in-flight generation's version.
+    fn owned_version(&self, plan: &Planned<'_>) -> Option<BatchVersion> {
+        match (&plan.retry, &plan.in_flight) {
+            (Some(receipt), _) => Some(receipt.version),
+            (None, Some(entry)) => Some(entry.version),
+            (None, None) => None,
+        }
+    }
+
+    /// Wait for the outcome of a generation another caller owns.
+    ///
+    /// A generation that is reused before this retry observes it has no outcome
+    /// left to read, so the answer comes from what outlived it: the retry window.
+    /// `Published` means the operation's receipt names exactly this version; an
+    /// aborted original retires its in-flight ownership before the slot is
+    /// reused and publishes no receipt, so `Reapply` is the only honest answer —
+    /// never a success for a write that did not land.
+    pub(super) fn wait_retry(
         &self,
+        operation: [u8; 16],
         version: BatchVersion,
         deadline: Instant,
-    ) -> Result<BatchVersion, LocalDbError> {
+    ) -> Result<Retried, LocalDbError> {
         if version.epoch != self.epoch {
             self.ensure_healthy()?;
-            return Ok(version);
+            return Ok(Retried::Published(version));
         }
         let slot = self.sequencer.slot(version.sequence);
         let mut data = slot.data.lock();
@@ -1075,10 +1182,30 @@ impl WriteCore {
                 .generation(version.sequence)
                 .is_some_and(|generation| generation > version.sequence)
             {
-                return Ok(version);
+                // A reused slot means the original is at or beyond the window
+                // edge, so re-applying is the documented out-of-window
+                // behaviour, not a new one.
+                let published = self
+                    .receipts
+                    .get(&operation)
+                    .is_some_and(|receipt| receipt.version == version);
+                return Ok(if published {
+                    Retried::Published(version)
+                } else {
+                    Retried::Reapply
+                });
             }
             if let Some(result) = &data.outcome {
-                return result.as_ref().copied().map_err(copy_error);
+                return match result {
+                    Ok(version) => Ok(Retried::Published(*version)),
+                    // An uncertain outcome is never silently re-applied: the
+                    // original may have landed. Fail-stop is already caught by
+                    // the health check above, so a definite error here is an
+                    // abort before READY, and the caller re-applies as a fresh
+                    // write (the abort had no effect).
+                    Err(error) if error.uncertain_version.is_some() => Err(copy_error(error)),
+                    Err(_) => Ok(Retried::Reapply),
+                };
             }
             if Instant::now() >= deadline {
                 return Err(LocalDbError::unknown(
@@ -1089,6 +1216,16 @@ impl WriteCore {
             slot.done.wait_until(&mut data, deadline);
         }
     }
+}
+
+/// What a retry learned from the generation that owned its operation id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Retried {
+    /// The generation published this exact version.
+    Published(BatchVersion),
+    /// The generation ended without publishing: the caller re-applies as a
+    /// fresh write instead of reporting a success that never happened.
+    Reapply,
 }
 
 /// Preserve the exact message and uncertain version of a fail-stop cause.

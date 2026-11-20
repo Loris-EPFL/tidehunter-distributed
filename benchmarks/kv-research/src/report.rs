@@ -201,9 +201,6 @@ pub struct RunSummary {
     pub phase_counts: serde_json::Value,
     pub distributions: serde_json::Value,
     pub limitations: Vec<String>,
-    /// Exact checkpoint attribution summary rows; details in write-diagnostics.json.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_checkpoint: Option<serde_json::Value>,
 }
 
 /// Replay-only identity, attached to a real get or the parent atomic batch call.

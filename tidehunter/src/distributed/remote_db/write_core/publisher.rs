@@ -1,9 +1,8 @@
-use super::super::checkpoint_attribution::{TailCount, diagnostics_clock_ns};
-use super::super::{CompleteBatch, DurableBatch, IndexReadCut, LocalDbError, WriteTimelineStage};
+use super::super::stream_positions;
+use super::super::{CompleteBatch, DurableBatch, LocalDbError, Mutation, WriteTimelineStage};
 use super::core::WriteCore;
-use super::identity::IdentityClass;
 use super::sequencer::{Resolution, SlotPublication};
-use crate::distributed::types::{BatchVersion, PhysicalValueAddress};
+use crate::distributed::types::{BatchVersion, MutationVersion, PhysicalValueAddress};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -11,7 +10,6 @@ struct Published {
     sequence: u64,
     batch: CompleteBatch,
     address: PhysicalValueAddress,
-    metadata_charge: usize,
 }
 
 /// Min-heap of the durable generations one publication call still has to
@@ -76,7 +74,8 @@ pub(super) struct AbortedAllocation {
     pub(super) sequence: u64,
     pub(super) owner_sequence: u64,
     pub(super) owner: usize,
-    pub(super) metadata_charge: usize,
+    /// The operation id whose in-flight ownership this abort releases.
+    pub(super) operation: [u8; 16],
     pub(super) records: usize,
     pub(super) encoded_bytes: usize,
 }
@@ -90,34 +89,16 @@ impl WriteCore {
     ) -> Result<(), LocalDbError> {
         let result = (|| {
             let sequence = allocation.sequence;
-            let id = {
-                let data = self.sequencer.slot(sequence).data.lock();
-                if self.sequencer.resolution(sequence) != Some(Resolution::Allocated) {
-                    return Err(LocalDbError::new("abort has no allocated generation"));
-                }
-                data.id
-            };
-            let removed = self.identities.with_operation(id.operation, |entries| {
-                if entries.get(&id.operation).is_some_and(|entry| {
-                    entry.seq == sequence && entry.class == IdentityClass::Active
-                }) {
-                    entries.remove(&id.operation);
-                    true
-                } else {
-                    false
-                }
-            });
-            if !removed {
-                return Err(LocalDbError::new("abort lost its active identity"));
+            if self.sequencer.resolution(sequence) != Some(Resolution::Allocated) {
+                return Err(LocalDbError::new("abort has no allocated generation"));
             }
-            // D6: remove the identity and return its sole identity credit before
-            // writer→publisher can expose ABORTED to the contiguous floor.
-            // A checkpoint covering this sequence therefore cannot retire that
-            // identity again. A racing retry is a fresh, effect-free allocation.
-            self.release_checkpoint_credits(super::core::CheckpointCredits {
-                identities: 1,
-                ..super::core::CheckpointCredits::default()
-            })?;
+            // Remove ownership before ABORTED becomes visible to the contiguous
+            // floor, so a racing retry cannot be left waiting on a dead slot: it
+            // re-looks up outside this lock and allocates a fresh generation.
+            self.in_flight.retire(allocation.operation, sequence);
+            // D6: the generation becomes ABORTED before writer→publisher can
+            // expose it to the contiguous floor, so no later publication pass
+            // waits on it and no retry observes it as in flight.
             if queue.abort(allocation.owner_sequence) {
                 self.wake_owner(allocation.owner)?;
             }
@@ -243,7 +224,6 @@ impl WriteCore {
         aborted: Option<(AbortedAllocation, LocalDbError)>,
     ) -> Result<(), LocalDbError> {
         let mut published = SmallVec::<[Published; 4]>::new();
-        let mut writer = self.index.writer();
         let mut publisher = self.publisher.lock();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.ensure_healthy()?;
@@ -258,6 +238,12 @@ impl WriteCore {
                 self.sequencer
                     .transition(sequence, Resolution::Allocated, Resolution::Aborted)?;
                 data.outcome = Some(Err(LocalDbError::new(error.message())));
+                debug_assert!(
+                    data.outcome.as_ref().is_some_and(|outcome| outcome
+                        .as_ref()
+                        .is_err_and(|error| error.uncertain_version.is_none())),
+                    "an abort must install a definite outcome with no uncertain version",
+                );
                 if let Some(dependents) = publisher.dependents.remove(&sequence) {
                     for dependent in dependents {
                         work.push(dependent);
@@ -335,7 +321,6 @@ impl WriteCore {
                     let SlotPublication {
                         batch,
                         routing,
-                        metadata_charge,
                         last_mutation,
                     } = data.publication.take().ok_or_else(|| {
                         LocalDbError::new("durable slot has no publication payload")
@@ -344,6 +329,21 @@ impl WriteCore {
                         return Err(LocalDbError::new(
                             "publication mutation frontier differs from its slot",
                         ));
+                    }
+                    // The position key is the address's (partition, segment
+                    // generation). It must be a retained fencing generation of that
+                    // owner, or the entry this publication creates is one no scan
+                    // reads and the stream's files could be retired unseen: fail the
+                    // database before anything publishes.
+                    {
+                        let address = durable.appended().address();
+                        stream_positions::admit_stream(
+                            &publisher.positions,
+                            &publisher.retained_epochs,
+                            &self.partition_indexes,
+                            address.partition,
+                            address.segment_generation,
+                        )?;
                     }
                     #[cfg(test)]
                     crate::failpoints::write_model::boundary("publication_before");
@@ -354,7 +354,7 @@ impl WriteCore {
                         return Err(LocalDbError::new("injected publication callback failure"));
                     }
                     routing
-                        .publish_authenticated(&batch, durable, &mut writer)
+                        .publish(&batch, durable, &self.table)
                         .map_err(LocalDbError::component)?;
                     #[cfg(test)]
                     crate::failpoints::write_model::boundary("publication_after");
@@ -363,6 +363,13 @@ impl WriteCore {
                         Resolution::Durable,
                         Resolution::Published,
                     )?;
+                    // The retry window answers a repeated operation id with this
+                    // receipt instead of appending the batch again.
+                    publisher.recent.push(super::super::RecentReceipt {
+                        id: batch.id(),
+                        version: batch.version(),
+                        digest: batch.digest(),
+                    });
                     publisher.upper = Some(
                         publisher
                             .upper
@@ -370,11 +377,6 @@ impl WriteCore {
                     );
                     {
                         let state = publisher.checkpoint_state();
-                        if state.known.insert(data.id, durable.appended()).is_some() {
-                            return Err(LocalDbError::new(
-                                "publication repeated a retained identity",
-                            ));
-                        }
                         *state.live_latest = Some(
                             state
                                 .live_latest
@@ -382,23 +384,23 @@ impl WriteCore {
                         );
                         *state.checkpoint_tail_batches += 1;
                         *state.checkpoint_tail_bytes += batch.encoded().len();
-                        // Record each publication exactly where it charges the suffix.
-                        if let Some(suffix) = state.index_suffix.as_mut() {
-                            suffix.on_publish(
-                                diagnostics_clock_ns(),
-                                TailCount::new(
-                                    *state.checkpoint_tail_batches,
-                                    *state.checkpoint_tail_bytes,
-                                ),
-                                self.index.charged_metadata_bytes(),
-                            );
-                        }
+                        // The relocation scan and file retirement read these: the
+                        // stream's durable end only grows. Written here and at open
+                        // only, always under the publisher lock; the stream was
+                        // admitted before the batch published.
+                        let address = durable.appended().address();
+                        stream_positions::record_extent(
+                            state.positions,
+                            address.partition,
+                            address.segment_generation,
+                            address.offset,
+                            address.len,
+                        );
                     }
                     published.push(Published {
                         sequence,
                         batch,
                         address: durable.appended().address(),
-                        metadata_charge,
                     });
                     if let Some(dependents) = publisher.dependents.remove(&sequence) {
                         for dependent in dependents {
@@ -411,9 +413,6 @@ impl WriteCore {
                         "publication dependency work exceeded the admitted window",
                     ));
                 }
-                writer
-                    .promote_committed()
-                    .map_err(LocalDbError::component)?;
                 for _ in 0..self.sequencer.capacity() {
                     let sequence = publisher.published_next;
                     match self.sequencer.resolution(sequence) {
@@ -460,9 +459,6 @@ impl WriteCore {
                     "publication barrier work exceeded its passes",
                 ));
             }
-            writer
-                .promote_committed()
-                .map_err(LocalDbError::component)?;
             for _ in 0..self.sequencer.capacity() {
                 let sequence = publisher.published_next;
                 match self.sequencer.resolution(sequence) {
@@ -481,41 +477,14 @@ impl WriteCore {
             if let Some(cut) = self.durable_cut.get() {
                 cut.published(publisher.published_next);
             }
-            if let Some(upper) = publisher
-                .upper
-                .filter(|upper| upper.batch.epoch == self.epoch)
-            {
-                let mut excluded = Vec::new();
-                for sequence in (publisher.published_next..=upper.batch.sequence)
-                    .take(self.sequencer.capacity())
-                {
-                    if self.sequencer.resolution(sequence) != Some(Resolution::Published) {
-                        if excluded.capacity() == 0 {
-                            // Allocate only for a real sparse view, and never
-                            // let geometric Vec growth exceed its reservation.
-                            excluded = Vec::with_capacity(self.sequencer.capacity() - 1);
-                        }
-                        excluded.push(BatchVersion {
-                            epoch: self.epoch,
-                            sequence,
-                        });
-                    }
-                }
-                if excluded.is_empty() {
-                    writer.publish_latest();
-                } else if !published.is_empty() || aborted.is_some() {
-                    let floor = publisher
-                        .checkpoint_state()
-                        .latest
-                        .map_or(IndexReadCut::BeforeAll, IndexReadCut::At);
-                    // The standing budget already holds this view's quota at
-                    // its worst-case size: no capacity failure after the WAL
-                    // write. Only invalid-view programming errors can fail.
-                    writer
-                        .install_standing_live_view(upper, floor, excluded, &publisher.view_budget)
-                        .map_err(LocalDbError::component)?;
-                }
-            }
+            // Every member of every batch below `published_next` is inserted
+            // into the native index; the aborted generations in between have no
+            // effect. This is the loader's contiguous applied cut and the
+            // exclusive flush bound (plan I2).
+            self.table.advance_applied(BatchVersion {
+                epoch: self.epoch,
+                sequence: publisher.published_next,
+            });
             self.floor_changed.notify_all();
             Ok(())
         }))
@@ -523,11 +492,7 @@ impl WriteCore {
         if let Err(error) = &result {
             self.begin_failure(error);
         }
-        // Sampled under publisher: batches published while a background
-        // checkpoint is in flight form its acknowledged suffix.
-        let during_checkpoint = publisher.background_checkpoint.is_some();
         drop(publisher);
-        drop(writer);
         if self.write_timeline.enabled() {
             for entry in &published {
                 self.write_timeline.batch_event(
@@ -538,21 +503,14 @@ impl WriteCore {
                 );
             }
         }
-        if during_checkpoint && !published.is_empty() {
-            // Counted before any caller outcome is installed below, so an
-            // acknowledged write always observes its own suffix contribution.
-            self.stats.lock().write.background_checkpoint_suffix_batches += published.len() as u64;
-        }
         if result.is_err() {
             self.finish_failure();
         }
-        let mut index_bytes = 0usize;
         let mut slots = 0usize;
         let mut partitions = SmallVec::<[(usize, usize); 4]>::new();
         partitions.resize(self.partition_indexes.len(), (0, 0));
         let mut aborted_replay = (0, 0);
         if let Some((allocation, _)) = &aborted {
-            index_bytes += allocation.metadata_charge;
             partitions[allocation.owner].0 += 1;
             partitions[allocation.owner].1 += allocation.records;
             aborted_replay = (1, allocation.encoded_bytes);
@@ -568,15 +526,13 @@ impl WriteCore {
                 .partition_indexes
                 .get(&entry.address.partition)
                 .ok_or_else(|| LocalDbError::new("published batch lost its owner"))?;
-            index_bytes += entry.metadata_charge;
             partitions[partition].0 += 1;
             partitions[partition].1 += entry.batch.mutations().len();
             slots += self.finalize_published(entry)?;
         }
         self.admission
-            .release_publication(index_bytes, slots, &partitions, aborted_replay)?;
-        result?;
-        self.request_checkpoint()
+            .release_publication(slots, &partitions, aborted_replay)?;
+        result
     }
 
     fn finalize_published(&self, entry: Published) -> Result<usize, LocalDbError> {
@@ -584,45 +540,45 @@ impl WriteCore {
             sequence,
             batch,
             address,
-            metadata_charge: _,
         } = entry;
         if self.config.read_cache_bytes != 0 {
-            if let Some((keyspace, first, last)) = batch.drop_cells() {
-                // No warming for DropCells. Masks already hide the covered
-                // references; evict them before the caller completes. Writer
-                // and publisher are released; one cache shard at a time.
-                let descriptor = self.shape.ks(keyspace);
-                let key_size = descriptor.index_key_size();
-                self.read_cache
-                    .evict_dropped(keyspace, batch.version(), |key: &[u8]| {
-                        let reduced = descriptor.reduce_key(key);
-                        if Some(reduced.len()) != key_size {
-                            return false;
-                        }
-                        let cell = descriptor.cell_id(&reduced);
-                        *first <= cell && cell <= *last
-                    });
-            } else {
+            if let Some((keyspace, _, _)) = batch.drop_cells() {
+                // No warming for DropCells. The index drop hides the covered rows
+                // from reads; the keyspace's older cached values are evicted
+                // before the caller completes (conservative: a hit is never
+                // authoritative). Writer and publisher are released; one cache
+                // shard at a time.
+                self.read_cache.evict_dropped(keyspace, batch.version());
+            } else if !batch.is_relocated() {
+                // A relocated copy is not indexed, so nothing would read it by
+                // its own identity; warming would only evict live entries.
                 for (operation, mutation) in batch.mutations().iter().enumerate() {
-                    let reference = batch
+                    let Mutation::Put {
+                        keyspace, value, ..
+                    } = mutation
+                    else {
+                        continue;
+                    };
+                    let descriptor = batch
                         .record_reference(address, operation)
-                        .map_err(LocalDbError::component)?;
-                    let prepared = self.read_cache.prepare_post_publish(reference, mutation);
+                        .map_err(LocalDbError::component)?
+                        .descriptor;
+                    let identity = MutationVersion {
+                        batch: batch.version(),
+                        operation_index: descriptor.operation_index,
+                    };
+                    let prepared = self
+                        .read_cache
+                        .prepare_post_publish(identity, keyspace.0, value);
                     self.read_cache.insert_prepared(prepared);
                 }
             }
         }
-        self.identities
-            .with_operation(batch.id().operation, |entries| {
-                if let Some(identity) = entries.get_mut(&batch.id().operation)
-                    && identity.seq == sequence
-                    && identity.class == IdentityClass::Active
-                {
-                    // Checkpoint may already have moved this identity to Recent;
-                    // never restore its retired identity charge by moving it back.
-                    identity.class = IdentityClass::Suffix;
-                }
-            });
+        // The receipt is already in the window (pushed under publisher), so the
+        // in-flight entry can go: a retry now answers from the window, and until
+        // this point both existed. The in-flight-first lookup sees one of them at
+        // every instant, which is what makes retiring after the push safe.
+        self.in_flight.retire(batch.id().operation, sequence);
         let slot = self.sequencer.slot(sequence);
         let mut data = slot.data.lock();
         if data.outcome.is_none() {
@@ -630,6 +586,13 @@ impl WriteCore {
                 self.ensure_healthy()
                     .map(|()| batch.version())
                     .map_err(|error| LocalDbError::unknown(batch.version(), error)),
+            );
+            debug_assert!(
+                data.outcome.as_ref().is_some_and(|outcome| outcome.is_ok()
+                    || outcome
+                        .as_ref()
+                        .is_err_and(|error| error.uncertain_version.is_some())),
+                "a published outcome is Ok or carries an uncertain version",
             );
         }
         drop(data);

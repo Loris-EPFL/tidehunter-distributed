@@ -20,7 +20,6 @@
 
 pub mod backend;
 pub mod backends;
-pub mod capacity_r0;
 pub mod config;
 pub mod report;
 pub mod runner;
@@ -29,8 +28,6 @@ pub mod workload;
 pub(crate) fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
-pub mod index_a1;
-pub mod index_checkpoint;
 pub(crate) mod leased_fixture;
 pub mod mainnet_replay;
 pub mod mainnet_trace;

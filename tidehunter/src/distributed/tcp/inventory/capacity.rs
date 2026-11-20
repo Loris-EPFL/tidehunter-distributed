@@ -1,10 +1,12 @@
-//! Owner side of the read-only R0 `FileInventoryPage` request.
+//! Owner side of the read-only `FileInventoryPage` request.
 //!
 //! The inventory mutex is held only to resolve the stream and later to copy
 //! per-file pin and binding counts; the directory scan runs with it released.
 //! Nothing here installs a root, revokes a grant or unlinks a file.
 use super::*;
-use crate::distributed::capacity::{FileInventoryReply, MAX_FILE_INVENTORY_PAGE, TargetAccess};
+use crate::distributed::remote_db::file_inventory::{
+    FileInventoryReply, MAX_FILE_INVENTORY_PAGE, TargetAccess,
+};
 
 impl NodeInventory {
     /// Same authentication as retirement: `authority_generation` must be the

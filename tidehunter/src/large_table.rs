@@ -79,6 +79,19 @@ type KsSnapshot<P> = (
     Option<<P as IndexPosition>::Cut>,
 );
 
+// The items below are used only by the distributed hybrid. Without the feature
+// they would be dead code in this crate, so they are gated rather than allowed.
+
+/// Why [`LargeTable::update_cell_index`] could not run its update.
+#[cfg(feature = "experimental-distributed")]
+#[derive(Debug)]
+pub(crate) enum CellUpdateError<E> {
+    /// A background worker failed, so the cell cannot be waited on.
+    Background(DbError),
+    /// The loader could not read the cell's on-disk index.
+    Loader(E),
+}
+
 pub struct LargeTable<P: IndexPosition = WalPosition> {
     table: Vec<KsTable<P>>,
     pub(crate) flusher: IndexFlusher<P>,
@@ -1121,6 +1134,52 @@ impl<P: IndexPosition> LargeTable<P> {
         entry.sync_flush(loader, true, relocation_updates, relocation_cutoff)
     }
 
+    /// Runs `f` on a cell's merged index table and, when `f` reports a change,
+    /// marks the cell dirty so the flusher persists it.
+    ///
+    /// For updates that rewrite positions of keys the cell already holds
+    /// (a relocation or compaction pass of a versioned engine); not for new
+    /// writes, which must go through [`Self::insert`] / [`Self::remove`] so the
+    /// cell's frontier is anchored. The cell is locked waiting out any async
+    /// flush, its pending table is promoted, and an unloaded L0 is loaded and
+    /// merged first, so `f` sees the full current index of the cell.
+    ///
+    /// The wait for an in-flight flush is load-bearing, not a convenience:
+    /// [`IndexTable::unmerge_flushed`] matches flushed entries to live ones by
+    /// logical identity, so a re-point (same identity, new address) applied
+    /// between a flush snapshot and its completion would be unmerged away as
+    /// "already flushed" and lost. [`LargeTableEntry::update_index`] asserts
+    /// that no flush is pending when the mutation applies.
+    ///
+    /// `last_processed` and `flushed_at` are left alone: the update changes no
+    /// write order, so the cell's durable frontier and byte cadence stay valid.
+    ///
+    /// `f` returns `(result, changed)`. `Ok(None)` means there is nothing to
+    /// update and `f` did not run: the cell does not exist, or it has never held
+    /// an entry (an empty cell). The cell is never created.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn update_cell_index<L: Loader<Position = P>, R>(
+        &self,
+        context: &KsContext,
+        cell: &CellId,
+        loader: &L,
+        f: impl FnOnce(&mut IndexTable<P>) -> (R, bool),
+    ) -> Result<Option<R>, CellUpdateError<L::Error>> {
+        let mut row = self
+            .lock_cell_waiting_for_flush(context, cell)
+            .map_err(CellUpdateError::Background)?;
+        let Some(entry) = row.try_entry_mut(cell) else {
+            return Ok(None);
+        };
+        entry.promote_pending();
+        if entry.state.is_empty() {
+            return Ok(None);
+        }
+        entry
+            .update_index(loader, f)
+            .map_err(CellUpdateError::Loader)
+    }
+
     fn ks_rows(&self, ks: &KeySpaceDesc) -> &ShardedMutex<Row<P>> {
         &self
             .table
@@ -1665,6 +1724,40 @@ impl<P: IndexPosition> LargeTable<P> {
         self.with_promoted_entry(context, cell, |entry| {
             entry.update_relocated_position(new_levels);
         });
+    }
+
+    /// Restores a cell's byte cadence (`flushed_at`). A versioned instantiation
+    /// calls this at open for every persisted cell, after construction, because
+    /// its per-cell value-byte counter lives in its own control-region side
+    /// data rather than in the frontier. One row lock; a cell that no longer
+    /// exists is a no-op (it was dropped concurrently).
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn set_flushed_at(&self, context: &KsContext, cell: &CellId, bytes: u64) {
+        let row = context.ks_config.mutex_for_cell(cell);
+        let ks_table = self.ks_rows(&context.ks_config);
+        let mut row = ks_table.lock(row, &context.large_table_contention);
+        if let Some(entry) = row.try_entry_mut(cell) {
+            entry.set_flushed_at(bytes);
+        }
+    }
+
+    /// Every cell's byte cadence (`flushed_at`) keyed by `(keyspace id, cell)`,
+    /// for a versioned instantiation to persist beside its control region (the
+    /// frontier alone cannot carry it). Takes each row lock in turn, one at a
+    /// time; the view is per-row consistent, not a single atomic cut.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn flushed_at_snapshot(&self) -> BTreeMap<(u8, CellId), u64> {
+        let mut snapshot = BTreeMap::new();
+        for ks_table in &self.table {
+            let ks = ks_table.context.id().0;
+            for mutex in ks_table.rows.mutexes() {
+                let row = mutex.lock();
+                for entry in row.entries.iter() {
+                    snapshot.insert((ks, entry.cell.clone()), entry.flushed_at);
+                }
+            }
+        }
+        snapshot
     }
 
     /// Test-only view of an entry's state name (the state enum is private).
@@ -2531,6 +2624,32 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             self.state = LargeTableEntryState::Loaded;
         }
         Ok(())
+    }
+
+    /// The locked half of [`LargeTable::update_cell_index`]: loads the cell if
+    /// needed, runs `f` on the merged table and marks the entry dirty when `f`
+    /// changed it. The entry is not `Empty` (the caller treats that as absent),
+    /// so the `Loaded -> DirtyLoaded` edge here never needs a frontier anchor.
+    #[cfg(feature = "experimental-distributed")]
+    fn update_index<L: Loader<Position = P>, R>(
+        &mut self,
+        loader: &L,
+        f: impl FnOnce(&mut IndexTable<P>) -> (R, bool),
+    ) -> Result<Option<R>, L::Error> {
+        debug_assert!(!self.state.is_empty(), "update_index on an empty entry");
+        // `unmerge_flushed` identifies flushed entries logically, so a mutation
+        // while a flush is in flight could be unmerged away at its completion.
+        debug_assert!(
+            self.pending_last_processed.is_none(),
+            "update_index while an async flush is in flight"
+        );
+        self.maybe_load(loader)?;
+        let (result, changed) = f(self.data.make_mut());
+        if changed {
+            self.state.mark_dirty();
+        }
+        self.report_loaded_keys_count();
+        Ok(Some(result))
     }
 
     /// Pass 1 helper: queues a normal async flush if this entry is dirty and its
@@ -4254,3 +4373,6 @@ mod cadence_tests;
 
 #[cfg(test)]
 mod flush_cut_tests;
+
+#[cfg(all(test, feature = "experimental-distributed"))]
+mod cell_update_tests;

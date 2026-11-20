@@ -60,6 +60,14 @@ pub(crate) struct WorkerAccounting {
     pub(crate) drains: AtomicU64,
     pub(crate) drain_batches: AtomicU64,
     pub(crate) drain_stops: [AtomicU64; DrainStop::COUNT],
+    /// Allocations the per-stream extent queue could not hold at its cap.
+    ///
+    /// A cap hit is not a loss: the queue publishes the lowest dropped offset as
+    /// its replay floor, so recovery re-reads that extent. The counter exists to
+    /// tell "the index is a whole snapshot interval behind the owners" (sustained
+    /// growth) apart from a single wide burst, and S12 reads it through
+    /// `PipelineStats::allocation_cap_hits`.
+    pub(crate) cap_hits: AtomicU64,
     /// Test-only exact membership of every formed group, in formation order.
     /// Pushed by the forming worker only; tests read it after durability.
     #[cfg(test)]
@@ -98,6 +106,19 @@ impl WorkerAccounting {
         self.drain_batches
             .fetch_add(batches as u64, Ordering::Relaxed);
         self.drain_stops[stop as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mirrors the extent queue's own cap-hit count for readers outside the
+    /// worker thread.
+    ///
+    /// The queue is the authority (it counts per `reserve`), so this stores the
+    /// cumulative value rather than adding one: the worker republishes after
+    /// every submission batch, and a repeated call for the same count must not
+    /// double it. A per-hit add would instead need the worker to remember which
+    /// hits it had already reported.
+    pub(crate) fn record_allocation_cap_hits(&self, hits: u64) {
+        // Relaxed: worker-only diagnostics; no payload or ordering depends on them.
+        self.cap_hits.store(hits, Ordering::Relaxed);
     }
 }
 

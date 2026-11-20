@@ -1,18 +1,18 @@
 //! Shared write engine. Callers allocate/encode; owner workers publish durable
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
-use super::super::checkpoint_attribution::{CheckpointTriggerFlags, SuffixTracker, TailCount};
 use super::super::{
-    AppendedBatch, AuthorityManifest, AuthorityWriteStats, BackgroundCheckpoint, BatchId,
-    CheckpointDiagnostic, CheckpointDiagnosticSummary, ControlHandle, IndexReadCut, LocalDbError,
-    LocalDbStats, MutationVersion, NativeIndex, ReadCache, ReadService, RecentReceipt,
-    RecoveryStats, RemoteDatabaseConfig, ShutdownStats, StaticInventory, StreamPosition,
-    WriteProfileSnapshot, WriteTimeline, concurrent, failure_context, record_first_failure,
+    AuthorityManifest, AuthorityWriteStats, CheckpointDiagnostic, CheckpointDiagnosticSummary,
+    ControlHandle, LocalDbError, LocalDbStats, MutationVersion, ReadCache, ReadService,
+    RecentReceipt, RecoveryStats, RemoteDatabaseConfig, ShutdownStats, StaticInventory,
+    StreamPosition, WriteProfileSnapshot, WriteTimeline, concurrent, failure_context,
+    record_first_failure,
 };
 use super::dependencies::DependencyRegistry;
-use super::identity::{IdentityClass, IdentityEntry, IdentityTable};
-use super::owner_sender::OwnerSender;
+use super::inflight::InFlight;
+use super::receipts::{ReceiptIndex, ReceiptWindow};
 use super::sequencer::{Resolution, Sequencer};
+use crate::distributed::hybrid::table::HybridTable;
 use crate::key_shape::KeyShape;
 use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::RandomState};
@@ -26,17 +26,16 @@ use std::sync::{
 };
 
 /// Only D9 publisher-owned fields cross this boundary. Returning disjoint field
-/// references permits capture to scan known receipts while updating stream cuts
+/// references permits capture to update stream cuts and the retry window
 /// without cloning maps or exposing the legacy authority's clients/admission.
 pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
-    pub known: &'a mut HashMap<BatchId, AppendedBatch>,
     pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
     pub committed_streams: &'a mut BTreeSet<(u32, u64)>,
     /// Adopted R1 callback starts, keyed by `(partition, fencing_generation)`.
     pub callback_starts: &'a mut BTreeMap<(u32, u64), u64>,
-    pub recent: &'a mut VecDeque<RecentReceipt>,
+    pub recent: &'a mut ReceiptWindow,
     pub latest: &'a mut Option<MutationVersion>,
     pub live_latest: &'a mut Option<MutationVersion>,
     pub snapshot_generation: &'a mut u64,
@@ -44,20 +43,18 @@ pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
     pub retained_epochs: &'a mut Vec<Vec<u64>>,
     pub checkpoint_tail_batches: &'a mut usize,
     pub checkpoint_tail_bytes: &'a mut usize,
-    pub background_checkpoint: &'a mut Option<BackgroundCheckpoint>,
     pub checkpoint_diagnostics: &'a mut Option<VecDeque<CheckpointDiagnostic>>,
     pub checkpoint_diagnostic_summary: &'a mut CheckpointDiagnosticSummary,
     pub next_checkpoint_diagnostic: &'a mut u64,
     pub dropped_checkpoint_diagnostics: &'a mut u64,
     pub last_checkpoint_diagnostic: &'a mut Option<CheckpointDiagnostic>,
-    pub index_suffix: &'a mut Option<SuffixTracker>,
 }
 
 pub(in crate::distributed::remote_db) struct PublisherState {
-    /// Constant sparse-view quota, reserved once at open. Only the serialized
-    /// publication path (writer → publisher) installs views from it.
-    pub view_budget: crate::distributed::native_index::StandingViewBudget,
-    pub known: HashMap<BatchId, AppendedBatch>,
+    /// The retry window: the last `WAL_REPLAY_WINDOW_BATCHES` published batches,
+    /// oldest first. Filled at publication and replaced by a persisted window at
+    /// open.
+    pub recent: ReceiptWindow,
     pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
     pub committed_complete: BTreeSet<(u32, u64)>,
@@ -67,7 +64,6 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub committed_streams: BTreeSet<(u32, u64)>,
     /// Adopted R1 callback starts; changed only by an Exact installation.
     pub callback_starts: BTreeMap<(u32, u64), u64>,
-    pub recent: VecDeque<RecentReceipt>,
     pub latest: Option<MutationVersion>,
     pub live_latest: Option<MutationVersion>,
     pub snapshot_generation: u64,
@@ -75,15 +71,11 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     pub retained_epochs: Vec<Vec<u64>>,
     pub checkpoint_tail_batches: usize,
     pub checkpoint_tail_bytes: usize,
-    pub background_checkpoint: Option<BackgroundCheckpoint>,
     pub checkpoint_diagnostics: Option<VecDeque<CheckpointDiagnostic>>,
     pub checkpoint_diagnostic_summary: CheckpointDiagnosticSummary,
     pub next_checkpoint_diagnostic: u64,
     pub dropped_checkpoint_diagnostics: u64,
     pub last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
-    /// Published-suffix debt tracker; present once index checkpoint
-    /// diagnostics are armed (checkpoint_attribution.rs).
-    pub index_suffix: Option<SuffixTracker>,
     /// Exclusive contiguous publication frontier, including an empty epoch 0.
     pub published_next: u64,
     pub upper: Option<MutationVersion>,
@@ -113,7 +105,6 @@ impl PublisherState {
         &mut self,
     ) -> PublisherCheckpoint<'_> {
         PublisherCheckpoint {
-            known: &mut self.known,
             stream_last: &mut self.stream_last,
             positions: &mut self.positions,
             committed_complete: &mut self.committed_complete,
@@ -127,13 +118,11 @@ impl PublisherState {
             retained_epochs: &mut self.retained_epochs,
             checkpoint_tail_batches: &mut self.checkpoint_tail_batches,
             checkpoint_tail_bytes: &mut self.checkpoint_tail_bytes,
-            background_checkpoint: &mut self.background_checkpoint,
             checkpoint_diagnostics: &mut self.checkpoint_diagnostics,
             checkpoint_diagnostic_summary: &mut self.checkpoint_diagnostic_summary,
             next_checkpoint_diagnostic: &mut self.next_checkpoint_diagnostic,
             dropped_checkpoint_diagnostics: &mut self.dropped_checkpoint_diagnostics,
             last_checkpoint_diagnostic: &mut self.last_checkpoint_diagnostic,
-            index_suffix: &mut self.index_suffix,
         }
     }
 }
@@ -147,35 +136,15 @@ pub(in crate::distributed::remote_db) struct CoreStats {
     pub pipeline: super::super::PipelineStats,
 }
 
-/// Releases are computed during checkpoint adoption, then applied only after
-/// dropping index writer/publisher. Recent-window identities are not charged.
-#[derive(Default)]
-pub(in crate::distributed::remote_db) struct CheckpointCredits {
-    pub identities: usize,
-    pub replay_batches: usize,
-    pub replay_bytes: usize,
-}
-
-pub(in crate::distributed::remote_db) type CheckpointJobs = Vec<(Arc<OwnerSender>, u32, Vec<u64>)>;
-
-#[cfg(test)]
-pub(in crate::distributed::remote_db) struct CheckpointTestHooks {
-    pub interruption: Option<u8>,
-    pub entered: Option<mpsc::SyncSender<()>>,
-    pub pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub prefix_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub corrupt_proof: bool,
-    pub adoption_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub cleanup_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-}
-
 /// Recovered, validated ownership transferred once at the end of open.
 pub(in crate::distributed::remote_db) struct OpenState {
     pub config: RemoteDatabaseConfig,
     pub shape: KeyShape,
     pub path: PathBuf,
     pub epoch: u64,
-    pub index: Arc<NativeIndex>,
+    /// The native index stack (LargeTable + IndexFlusher + index WAL) and its
+    /// loader. Publication inserts version-carrying positions here.
+    pub table: Arc<HybridTable>,
     pub partition_indexes: HashMap<u32, usize>,
     pub inventory: StaticInventory,
     pub reads: Arc<ReadService>,
@@ -194,19 +163,12 @@ pub(in crate::distributed::remote_db) struct OpenState {
 #[cfg(test)]
 #[derive(Default)]
 pub(in crate::distributed::remote_db) struct TestHooks {
-    pub checkpoint_interruption: Option<u8>,
     pub retire_preflight_busy_once: bool,
     pub after_grant: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_preparation: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_prepared_operation: Option<[u8; 16]>,
     pub concurrent_progress: Option<mpsc::SyncSender<super::super::PipelineStats>>,
     pub drain_wait_entered: Option<mpsc::SyncSender<()>>,
-    pub before_checkpoint_io: Option<mpsc::SyncSender<()>>,
-    pub checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub checkpoint_prefix_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub corrupt_checkpoint_proof: bool,
-    pub checkpoint_adoption_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    pub checkpoint_cleanup_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub panic_after_concurrent_admissions: Option<u64>,
     pub skip_shutdown_checkpoint: bool,
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
@@ -214,18 +176,26 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub fail_publication: Option<u64>,
     /// Named-force waiter deadline instead of `config.timeout`.
     pub force_timeout: Option<std::time::Duration>,
+    /// Replaces the configuration-derived bound of `await_copies_durable`.
+    pub copy_durable_timeout: Option<std::time::Duration>,
+    /// Parks the shutdown snapshot: sends on the first, waits on the second.
+    pub checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    /// Fails the shutdown snapshot before it stores anything.
+    pub checkpoint_interruption: Option<usize>,
 }
 
-/// Lock order for the final engine: identity → ascending key shards → owner
-/// order, release all, then index writer → publisher → slot data. Admission is
-/// never held with these locks. Transport I/O, encoding, checkpoint persistence
-/// and worker joins happen after all foreground/publication guards are dropped.
+/// Lock order for the final engine: ascending key shards → owner order,
+/// release all, then publisher → slot data. Admission is never held with these
+/// locks. Transport I/O, encoding, index flush, checkpoint persistence and
+/// worker joins happen after all foreground/publication guards are dropped.
 pub(in crate::distributed::remote_db) struct WriteCore {
     pub config: RemoteDatabaseConfig,
     pub shape: KeyShape,
     pub path: PathBuf,
     pub epoch: u64,
-    pub index: Arc<NativeIndex>,
+    /// Native index stack; publication inserts into it and the loader reads its
+    /// frontiers. No Exact index writer exists any more.
+    pub table: Arc<HybridTable>,
     pub partition_indexes: HashMap<u32, usize>,
     pub inventory: StaticInventory,
     pub reads: Arc<ReadService>,
@@ -235,8 +205,6 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub publisher: Mutex<PublisherState>,
     pub floor_changed: Condvar,
     pub(crate) retirement: Mutex<()>,
-    /// Opt-in R0 capacity observation; inert until an observer installs a hook.
-    pub capacity: super::super::capacity_observer::CapacitySlot,
     /// Opt-in ordered R1 evidence stream; inert until enabled.
     pub(crate) r1_events: super::super::r1_events::R1EventSlot,
     pub stats: Mutex<CoreStats>,
@@ -262,7 +230,12 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     owner_controls: Vec<(u32, ControlHandle)>,
     pub(super) sequencer: Sequencer,
     pub(super) dependencies: DependencyRegistry,
-    pub(super) identities: IdentityTable,
+    /// Operation id → the one generation that owns it between allocation and
+    /// publication. Sharded; taken before the key shards.
+    pub(super) in_flight: InFlight,
+    /// The retry window's probe index, shared with `publisher.recent`. Read on
+    /// the write hot path, so it never takes the publisher lock.
+    pub(super) receipts: Arc<ReceiptIndex>,
 }
 
 impl WriteCore {
@@ -270,33 +243,8 @@ impl WriteCore {
         let parallelism = crate::parallelism::available();
         let admission = concurrent::Admission::for_open(&open);
         let hash = RandomState::new();
-        let identities = IdentityTable::new(parallelism, hash.clone());
-        for receipt in &open.publisher.recent {
-            identities.with_operation(receipt.id.operation, |entries| {
-                entries.insert(
-                    receipt.id.operation,
-                    IdentityEntry {
-                        version: receipt.version,
-                        digest: Some(receipt.digest),
-                        seq: receipt.version.sequence,
-                        class: IdentityClass::Recent,
-                    },
-                );
-            });
-        }
-        for receipt in open.publisher.known.values() {
-            identities.with_operation(receipt.id().operation, |entries| {
-                entries.insert(
-                    receipt.id().operation,
-                    IdentityEntry {
-                        version: receipt.version(),
-                        digest: Some(receipt.digest()),
-                        seq: receipt.version().sequence,
-                        class: IdentityClass::Suffix,
-                    },
-                );
-            });
-        }
+        let in_flight = InFlight::new(parallelism, hash.clone());
+        let receipts = open.publisher.recent.probe();
         let capacity = open.config.max_pending_batches;
         let owner_controls = open
             .clients
@@ -309,7 +257,7 @@ impl WriteCore {
             shape: open.shape,
             path: open.path,
             epoch: open.epoch,
-            index: open.index,
+            table: open.table,
             partition_indexes: open.partition_indexes,
             inventory: open.inventory,
             reads: open.reads,
@@ -318,7 +266,6 @@ impl WriteCore {
             write_timeline: open.write_timeline,
             floor_changed: Condvar::new(),
             retirement: Mutex::new(()),
-            capacity: Default::default(),
             r1_events: Default::default(),
             stats: Mutex::new(open.stats),
             admission,
@@ -338,7 +285,8 @@ impl WriteCore {
             test_hooks: Mutex::new(TestHooks::default()),
             sequencer: Sequencer::new(capacity),
             dependencies: DependencyRegistry::new(parallelism, hash),
-            identities,
+            in_flight,
+            receipts,
             publisher: Mutex::new(open.publisher),
         })
     }
@@ -411,59 +359,40 @@ impl WriteCore {
         Ok(coalesced)
     }
 
-    /// Check the identity table, which holds in-flight, suffix and recent
-    /// WAL-replay retry identities. The allocation critical section must
-    /// recheck the shard, because a concurrent first writer can insert meanwhile.
-    pub(super) fn lookup_identity(
+    /// The published receipt of `operation`, when it is still in the retry
+    /// window. A hit returns the original version and spends no owner byte; a
+    /// miss allocates a fresh version and re-applies the write, which is the
+    /// owner-accepted behaviour outside the window. One index shard, never the
+    /// publisher lock.
+    pub(super) fn lookup_receipt(
         &self,
         operation: [u8; 16],
-    ) -> Result<Option<IdentityEntry>, LocalDbError> {
+    ) -> Result<Option<RecentReceipt>, LocalDbError> {
         self.ensure_healthy()?;
-        Ok(self.identities.lookup(operation))
+        Ok(self.receipts.get(&operation))
     }
 
     /// Resident completed/in-flight write bookkeeping, excluding allocator
-    /// overhead and the separately reported index.
-    /// Publisher, identity and key shards are locked one at a time.
+    /// overhead and the separately reported index. Publisher, in-flight and key
+    /// shards are locked one at a time.
     pub(in crate::distributed::remote_db) fn metadata_history_bytes(&self) -> usize {
         let publisher = Self::publisher_resident_bytes(&self.publisher.lock());
-        publisher + self.identities.resident_bytes() + self.dependencies.resident_bytes()
-    }
-
-    /// Retained operation identities of every class (Active, Suffix, Recent).
-    #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn resident_identities(&self) -> usize {
-        [
-            IdentityClass::Active,
-            IdentityClass::Suffix,
-            IdentityClass::Recent,
-        ]
-        .into_iter()
-        .map(|class| self.identities.count(class))
-        .sum()
+        publisher + self.in_flight.resident_bytes() + self.dependencies.resident_bytes()
     }
 
     /// Static upper bound of [`Self::metadata_history_bytes`] under the fixed
     /// WAL-replay retry window (`WAL_REPLAY_WINDOW_BATCHES` receipts), from
-    /// configuration and entry sizes only. Live entries: `known` ≤
-    /// `max_admitted_batches`; `recent` ≤ the window; identities ≤ the window
-    /// (Recent) plus one admission credit each for Active/Suffix (≤
-    /// `max_admitted_batches`); dependency keys belong to admitted batches. A
-    /// std `HashMap` holding at most `n` live entries never keeps more than
-    /// `4 * (n + 1) + 8` slots (it grows only when over half full, and both
-    /// registries shrink a shard above four slots per entry), so the shard sums
-    /// add at most 12 slots per shard. A `VecDeque` at most doubles past its
-    /// peak length or its initial window capacity.
+    /// configuration and entry sizes only. Live entries: the retry window is
+    /// bounded by its cap; one in-flight entry exists per unresolved admitted
+    /// generation, so at most `max_admitted_batches`; dependency keys belong to
+    /// admitted batches. A std `HashMap` holding at most `n` live entries never
+    /// keeps more than `4 * (n + 1) + 8` slots (it grows only when over half
+    /// full, and the registry shrinks a shard above four slots per entry), so the
+    /// shard sums add at most 12 slots per shard. A `VecDeque` at most doubles
+    /// past its peak length or its initial capacity.
     #[cfg(test)]
     pub(in crate::distributed::remote_db) fn metadata_history_bound(&self) -> usize {
-        let window = super::super::WAL_REPLAY_WINDOW_BATCHES;
         let admitted = self.config.max_admitted_batches;
-        let map = |live: usize| 4 * (live + 1) + 8;
-        let known =
-            map(admitted) * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>());
-        let recent = 2 * window * std::mem::size_of::<RecentReceipt>();
-        let identities = (4 * (window + admitted) + 12 * self.identities.shard_count())
-            * IdentityTable::entry_bytes();
         // Spilled key storage of one batch is below its encoded size; a
         // spilled buffer at most doubles past its length.
         let dependencies =
@@ -471,24 +400,25 @@ impl WriteCore {
                 + 12 * self.dependencies.shard_count())
                 * DependencyRegistry::entry_bytes()
                 + 2 * admitted * self.config.storage.batch_limits.max_encoded_bytes;
-        known + recent + identities + dependencies
+        let in_flight =
+            (4 * admitted + 12 * self.in_flight.shard_count()) * InFlight::entry_bytes();
+        ReceiptWindow::resident_bound() + in_flight + dependencies
     }
 
-    /// Metrics variant: contention on the publisher or on any identity or key
-    /// shard makes the value unavailable; sampling never blocks a writer.
+    /// Metrics variant: contention on the publisher, on an in-flight shard or on
+    /// any key shard makes the value unavailable; sampling never blocks a
+    /// writer.
     pub(in crate::distributed::remote_db) fn try_metadata_history_bytes(&self) -> Option<usize> {
         let publisher = Self::publisher_resident_bytes(&*self.publisher.try_lock()?);
         Some(
             publisher
-                + self.identities.try_resident_bytes()?
+                + self.in_flight.try_resident_bytes()?
                 + self.dependencies.try_resident_bytes()?,
         )
     }
 
     fn publisher_resident_bytes(publisher: &PublisherState) -> usize {
-        publisher.known.capacity()
-            * (std::mem::size_of::<BatchId>() + std::mem::size_of::<AppendedBatch>())
-            + publisher.recent.capacity() * std::mem::size_of::<RecentReceipt>()
+        publisher.recent.resident_bytes()
     }
 
     pub(super) fn release_sequence(&self, sequence: u64) -> Result<(), LocalDbError> {
@@ -574,29 +504,6 @@ impl WriteCore {
         self.ensure_healthy()
     }
 
-    pub(in crate::distributed::remote_db) fn checkpoint_jobs(
-        &self,
-        retained_epochs: &[Vec<u64>],
-    ) -> Result<CheckpointJobs, LocalDbError> {
-        if retained_epochs.len() != self.owner_controls.len() {
-            return Err(LocalDbError::new("checkpoint owner inventory differs"));
-        }
-        self.owner_controls
-            .iter()
-            .zip(retained_epochs)
-            .map(|((owner, handle), epochs)| {
-                Ok((
-                    handle
-                        .sender
-                        .upgrade()
-                        .ok_or_else(|| LocalDbError::new("TCP worker stopped"))?,
-                    *owner,
-                    epochs.clone(),
-                ))
-            })
-            .collect()
-    }
-
     pub(in crate::distributed::remote_db) fn control_owner<T: Send + 'static>(
         &self,
         owner: usize,
@@ -613,122 +520,12 @@ impl WriteCore {
             .control(operation)
     }
 
-    pub(in crate::distributed::remote_db) fn retire_checkpoint_identities(
-        &self,
-        cut: Option<MutationVersion>,
-        recent: &VecDeque<RecentReceipt>,
-    ) -> usize {
-        self.identities
-            .checkpoint(cut.map(|version| version.batch), recent)
-    }
-
-    #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn take_checkpoint_test_hooks(
-        &self,
-    ) -> CheckpointTestHooks {
-        let mut hooks = self.test_hooks.lock();
-        CheckpointTestHooks {
-            interruption: hooks.checkpoint_interruption,
-            entered: hooks.before_checkpoint_io.clone(),
-            pause: hooks.checkpoint_pause.take(),
-            prefix_pause: hooks.checkpoint_prefix_pause.take(),
-            corrupt_proof: hooks.corrupt_checkpoint_proof,
-            adoption_pause: hooks.checkpoint_adoption_pause.take(),
-            cleanup_pause: hooks.checkpoint_cleanup_pause.take(),
-        }
-    }
-
     #[cfg(test)]
     pub(in crate::distributed::remote_db) fn take_retirement_preflight_busy(&self) -> bool {
         std::mem::take(&mut self.test_hooks.lock().retire_preflight_busy_once)
     }
 
-    pub(in crate::distributed::remote_db) fn request_checkpoint(
-        self: &Arc<Self>,
-    ) -> Result<(), LocalDbError> {
-        self.request_checkpoint_for(CheckpointTriggerFlags::default())
-    }
-
-    /// Start a due checkpoint; `extra` names a hard admission request that
-    /// accompanies the soft predicates. Policy is unchanged: only a due
-    /// checkpoint starts.
-    pub(in crate::distributed::remote_db) fn request_checkpoint_for(
-        self: &Arc<Self>,
-        extra: CheckpointTriggerFlags,
-    ) -> Result<(), LocalDbError> {
-        super::super::checkpoint_lifecycle::core_request_checkpoint(self, extra)
-    }
-
-    pub(in crate::distributed::remote_db) fn start_checkpoint(
-        self: &Arc<Self>,
-    ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_start_checkpoint(self);
-        self.checkpoint_result(result)
-    }
-
-    pub(in crate::distributed::remote_db) fn progress_checkpoint(
-        self: &Arc<Self>,
-        wait: bool,
-    ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_progress_checkpoint(self, wait);
-        self.checkpoint_result(result)
-    }
-
-    pub(in crate::distributed::remote_db) fn commit_checkpoint(
-        self: &Arc<Self>,
-    ) -> Result<(), LocalDbError> {
-        self.commit_checkpoint_for(CheckpointTriggerFlags::EXPLICIT)
-    }
-
-    pub(in crate::distributed::remote_db) fn commit_checkpoint_for(
-        self: &Arc<Self>,
-        trigger: CheckpointTriggerFlags,
-    ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_commit_checkpoint(self, trigger);
-        self.checkpoint_result(result)
-    }
-
-    pub(in crate::distributed::remote_db) fn commit_recovery_baseline(
-        self: &Arc<Self>,
-    ) -> Result<(), LocalDbError> {
-        let result = super::super::checkpoint_lifecycle::core_commit_recovery_baseline(self);
-        self.checkpoint_result(result)
-    }
-
-    /// Named Exact force (`force_rebuild_control_region`). A failure of the
-    /// named checkpoint already failed the core; `Busy` and an expired
-    /// deadline do not.
-    pub(in crate::distributed::remote_db) fn force_rebuild_index(
-        self: &Arc<Self>,
-    ) -> Result<super::super::IndexForceReport, super::super::IndexForceError> {
-        super::super::checkpoint_lifecycle::core_force_rebuild_index(self)
-    }
-
-    pub(in crate::distributed::remote_db) fn retire_history_before(
-        self: &Arc<Self>,
-        floor: IndexReadCut,
-    ) -> Result<(), LocalDbError> {
-        super::super::checkpoint_lifecycle::core_retire_history_before(self, floor)
-    }
-
-    fn checkpoint_result(&self, result: Result<(), LocalDbError>) -> Result<(), LocalDbError> {
-        if let Err(error) = &result {
-            self.fail(LocalDbError::new(error.message()));
-        }
-        result
-    }
-
-    /// Returns the granted replay tail before and after the release.
-    pub(in crate::distributed::remote_db) fn release_checkpoint_credits(
-        &self,
-        credits: CheckpointCredits,
-    ) -> Result<(TailCount, TailCount), LocalDbError> {
-        let granted = self.admission.release_checkpoint(credits)?;
-        self.admission.regrant();
-        Ok(granted)
-    }
-
-    /// Called before dropping writer→publisher on a publication failure.
+    /// Called before dropping publisher and slot guards on a publication failure.
     /// Only the causal cell and atomic serving gates change here; notification
     /// locks, Admission and owner.order belong to finish_failure instead.
     pub(in crate::distributed::remote_db) fn begin_failure(&self, cause: &LocalDbError) {
@@ -777,6 +574,12 @@ impl WriteCore {
                     },
                     failure_context(&self.first_failure, "write outcome requires recovery"),
                 )));
+                debug_assert!(
+                    data.outcome.as_ref().is_some_and(|outcome| outcome
+                        .as_ref()
+                        .is_err_and(|error| error.uncertain_version.is_some())),
+                    "a fail-stop outcome must carry the uncertain version",
+                );
             }
             slot.done.notify_all();
         }
@@ -797,6 +600,19 @@ impl WriteCore {
     pub(in crate::distributed::remote_db) fn fail(&self, cause: LocalDbError) {
         self.begin_failure(&cause);
         self.finish_failure();
+    }
+    /// The receipt of a live generation (DURABLE or PUBLISHED). None before
+    /// its owner receipt arrives, or after its slot has been reused.
+    pub(in crate::distributed::remote_db) fn durable_receipt(
+        &self,
+        sequence: u64,
+    ) -> Option<super::super::DurableBatch> {
+        let data = self.sequencer.slot(sequence).data.lock();
+        if self.sequencer.generation(sequence) == Some(sequence) {
+            data.receipt
+        } else {
+            None
+        }
     }
 }
 
@@ -834,19 +650,6 @@ impl WriteCore {
         self.dependencies.len()
     }
 
-    pub(in crate::distributed::remote_db) fn active_identities(&self) -> usize {
-        self.identities.count(IdentityClass::Active)
-    }
-
-    /// True when the identity table holds `operation` in the recent window.
-    pub(in crate::distributed::remote_db) fn recent_identity(&self, operation: [u8; 16]) -> bool {
-        self.identities.with_operation(operation, |entries| {
-            entries
-                .get(&operation)
-                .is_some_and(|entry| entry.class == IdentityClass::Recent)
-        })
-    }
-
     /// Total bucket capacity across every key shard.
     pub(in crate::distributed::remote_db) fn dependency_capacity(&self) -> usize {
         self.dependencies.capacity()
@@ -857,20 +660,6 @@ impl WriteCore {
         (self.sequencer.reuse_next()..self.sequencer.next())
             .filter(|&sequence| !self.sequencer.resolved(sequence))
             .count()
-    }
-
-    /// The receipt of a live generation (DURABLE or PUBLISHED). None before
-    /// its owner receipt arrives, or after its slot has been reused.
-    pub(in crate::distributed::remote_db) fn durable_receipt(
-        &self,
-        sequence: u64,
-    ) -> Option<super::super::DurableBatch> {
-        let data = self.sequencer.slot(sequence).data.lock();
-        if self.sequencer.generation(sequence) == Some(sequence) {
-            data.receipt
-        } else {
-            None
-        }
     }
 
     /// Canonical encoded length of a READY or DURABLE generation whose
@@ -904,9 +693,8 @@ impl WriteCore {
 
     /// Wait until every allocated generation has returned its slot and every
     /// per-window and per-publication Admission charge has been released.
-    /// Identity and checkpoint-tail charges stay until checkpoint retirement.
-    /// Publication finalization runs after the published floor is notified,
-    /// so a drain alone does not order these releases.
+    /// Publication finalization runs after the published floor is notified, so
+    /// a drain alone does not order these releases.
     pub(in crate::distributed::remote_db) fn wait_settled(&self) -> Result<(), LocalDbError> {
         let settled = self.admission.wait_charges(
             std::time::Instant::now() + self.config.timeout,
@@ -915,7 +703,6 @@ impl WriteCore {
                     && charges.requests == 0
                     && charges.bytes == 0
                     && charges.slots == 0
-                    && charges.index_bytes == 0
                     && charges.partition_batches == 0
                     && charges.partition_records == 0
             },
@@ -936,36 +723,6 @@ mod tests {
     use crate::distributed::remote_db::pipeline_tests::Fixture;
 
     #[test]
-    fn checkpoint_boundary_delegates_real_capture_and_shutdown() {
-        let fixture = Fixture::new();
-        let database = fixture.open();
-        let core = Arc::clone(&database.core);
-        assert_eq!(core.next_sequence(), 0);
-        core.ensure_healthy().unwrap();
-        assert!(!super::super::super::checkpoint_lifecycle::core_checkpoint_due(&core));
-        core.request_checkpoint().unwrap();
-        {
-            let mut publisher = core.publisher.lock();
-            let checkpoint = publisher.checkpoint_state();
-            assert!(checkpoint.known.is_empty());
-            assert_eq!(*checkpoint.checkpoint_tail_batches, 0);
-            assert_eq!(*checkpoint.checkpoint_tail_bytes, 0);
-            assert_eq!(
-                core.checkpoint_jobs(checkpoint.retained_epochs)
-                    .unwrap()
-                    .len(),
-                5
-            );
-        }
-        core.start_checkpoint().unwrap();
-        core.progress_checkpoint(true).unwrap();
-        core.commit_checkpoint().unwrap();
-        core.release_checkpoint_credits(CheckpointCredits::default())
-            .unwrap();
-        core.shutdown().unwrap();
-    }
-
-    #[test]
     fn begin_failure_fences_cached_and_completed_values_before_notifications() {
         use crate::distributed::codec::Mutation;
         use crate::key_shape::KeySpace;
@@ -983,16 +740,14 @@ mod tests {
                 }],
             )
             .unwrap();
-        let cached = database.submit_get(KeySpace(0), &key).unwrap().wait();
-        let reference = database
-            .index_reference(KeySpace(0), &key, IndexReadCut::Latest)
-            .unwrap()
-            .unwrap();
-        database.clear_read_cache();
-        let record = database.submit_record(reference).unwrap().wait();
+        // A warm read: the value is resident and a later read must not serve it
+        // once the database failed.
+        assert!(database.get(KeySpace(0), &key).unwrap().is_some());
         let core = Arc::clone(&database.core);
         {
-            let _writer = core.index.writer();
+            // No index-writer lock exists in the hybrid: the coordinator's
+            // index lives in `table`, whose flusher threads the read gates never
+            // touch. The publication lock is the one this test holds.
             let _publisher = core.publisher.lock();
             core.begin_failure(&LocalDbError::new("injected publication failure"));
             // begin_failure is atomic-only: even while both publication locks
@@ -1001,10 +756,7 @@ mod tests {
             // these read gates takes the index writer or publisher.
             assert!(core.ensure_healthy().is_err());
             assert!(core.reads.failed());
-            assert!(database.finish_ready_get(cached).is_err());
-            assert!(database.finish_record(record, KeySpace(0), &key).is_err());
             assert!(database.get(KeySpace(0), &key).is_err());
-            assert!(database.published_cut().is_err());
         }
         core.finish_failure();
         core.finish_failure();
@@ -1025,7 +777,7 @@ mod tests {
         let fixture = Fixture::new();
         let database = fixture.open();
         let core = Arc::clone(&database.core);
-        let sequence = core.sequencer.allocate(BatchId {
+        let sequence = core.sequencer.allocate(crate::distributed::types::BatchId {
             database: fixture.config.storage.database,
             operation: fixture.operation(0, 18),
         });
@@ -1197,21 +949,6 @@ mod tests {
             "no slot passes the unresolved floor"
         );
         assert_eq!(core.retained_slots(), 5);
-        match core.index.call_cut() {
-            IndexReadCut::Sparse(view) => {
-                let (upper, floor, excluded) = view.parts();
-                assert_eq!(
-                    upper,
-                    MutationVersion {
-                        batch: independent,
-                        operation_index: 0,
-                    }
-                );
-                assert_eq!(floor, None);
-                assert_eq!(excluded, [0, 1, 2, 3].map(version));
-            }
-            cut => panic!("expected a sparse publication view, found {cut:?}"),
-        }
         assert_eq!(
             database
                 .get(KeySpace(0), &3u32.to_be_bytes())
@@ -1236,7 +973,6 @@ mod tests {
         drop(held);
         database.drain().unwrap();
         assert_eq!(core.published_next(), 5);
-        assert!(!matches!(core.index.call_cut(), IndexReadCut::Sparse(_)));
         for sequence in [0, 1, 2, 4] {
             assert!(core.is_published(version(sequence)));
         }

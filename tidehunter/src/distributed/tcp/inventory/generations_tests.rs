@@ -65,10 +65,12 @@ fn inventory_pages_are_sorted_bounded_and_frozen_at_one_revision() {
             InventoryGeneration {
                 generation: 1,
                 state: OwnerGenerationState::Sealed,
+                durable_end: 0,
             },
             InventoryGeneration {
                 generation: 2,
                 state: OwnerGenerationState::Sealed,
+                durable_end: 0,
             },
         ]
     );
@@ -81,6 +83,7 @@ fn inventory_pages_are_sorted_bounded_and_frozen_at_one_revision() {
         vec![InventoryGeneration {
             generation: 5,
             state: OwnerGenerationState::Active,
+            durable_end: 0,
         }]
     );
     assert_eq!(last.next, None);

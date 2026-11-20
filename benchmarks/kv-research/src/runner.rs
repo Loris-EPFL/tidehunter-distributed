@@ -69,16 +69,6 @@ pub async fn run<B: KvBackend>(
     reporter.snapshot()?;
 
     let backend = Arc::new(backend);
-    // Opt-in A0 collector: it shares coordinator handles until it finishes,
-    // always before backend shutdown.
-    let mut index_checkpoint = if config.diagnostics.index_checkpoint {
-        Some(crate::index_checkpoint::IndexCheckpointCollector::start(
-            backend.index_checkpoint_targets()?,
-            output,
-        )?)
-    } else {
-        None
-    };
     let mut failed = false;
     let mut fatal_reason = None;
     match qualify_on_worker(
@@ -284,9 +274,6 @@ pub async fn run<B: KvBackend>(
         }
         if fatal_reason.is_none() {
             measurement_attempted = true;
-            if let Some(collector) = &index_checkpoint {
-                collector.mark("timed").await;
-            }
             backend.set_measurement_window(true);
             reporter.set_phase("measurement");
             let phase_result = if config.execution.mode == ExecutionMode::Interference {
@@ -428,9 +415,6 @@ pub async fn run<B: KvBackend>(
             |previous| format!("{previous}; {reason}"),
         ));
     }
-    if measurement_attempted && let Some(collector) = &index_checkpoint {
-        collector.mark("gate").await;
-    }
     if measurement_attempted
         && let Some(gate) = &config.measurement_completion_gate
         && let Err(error) = wait_for_measurement_gate(gate, deadline).await
@@ -442,22 +426,6 @@ pub async fn run<B: KvBackend>(
         ));
         reporter.snapshot()?;
     }
-    let mut index_details = None;
-    let index_export = match index_checkpoint.take() {
-        Some(collector) => {
-            collector.mark("drain").await;
-            match collector.finish().await {
-                Ok(export) => {
-                    index_details = Some(export.details);
-                    Some(export.summary)
-                }
-                Err(error) => {
-                    Some(serde_json::json!({"status": "failed", "error": error.to_string()}))
-                }
-            }
-        }
-        None => None,
-    };
     let mut write_wait_metrics_exported = false;
     if config.diagnostics.write_timeline_limit > 0 {
         let (timeline, mut error) = if timeline_armed {
@@ -559,11 +527,6 @@ pub async fn run<B: KvBackend>(
             }
         }
     }
-    // After the profile export: write-diagnostics.json exists even when the
-    // legacy write profile is off. No request-profile samples are claimed.
-    if let Some(details) = &index_details {
-        write_index_checkpoint_diagnostics(output, &info.name, details)?;
-    }
     if config.diagnostics.read_profile_limit > 0 {
         let profile_deadline = deadline + Duration::from_secs(config.limits.shutdown_grace_seconds);
         match export_read_diagnostics(
@@ -636,28 +599,6 @@ pub async fn run<B: KvBackend>(
             |previous| format!("{previous}; {reason}"),
         ));
     }
-    // A1 index fixture: after post-workload qualification (its writes precede
-    // the stop record) and before shutdown (close or crash-style stop).
-    if backend.index_fixture().is_some() {
-        let finish = crate::index_a1::FixtureFinish {
-            namespace,
-            case_id: config.case_id.clone(),
-            output: output.to_path_buf(),
-            measurement_ok: measurement_drained && fatal_reason.is_none(),
-        };
-        if let Err(error) = boundary_on_worker(&backend, move |backend| {
-            backend.finish_index_fixture(&finish)
-        })
-        .await
-        {
-            failed = true;
-            let reason = format!("index fixture stage end failed: {error}");
-            fatal_reason = Some(fatal_reason.map_or_else(
-                || reason.clone(),
-                |previous| format!("{previous}; {reason}"),
-            ));
-        }
-    }
     if let Err(error) = shutdown_on_worker(
         backend,
         deadline,
@@ -712,7 +653,6 @@ pub async fn run<B: KvBackend>(
             "Read oracle: a missing value is accepted only when a delete of that key completed without a later clean put, or a delete or put of that key was in flight during the read; present values are always compared byte for byte. This is not a linearizability check.".to_owned(),
             "Synchronous adapters run on fixed dedicated workers; Tokio timeouts cannot preempt blocking calls, so overruns are retained and the process supervisor supplies the hard wall-clock bound.".to_owned(),
         ],
-        index_checkpoint: index_export,
     };
     let mut manifest_extra = serde_json::json!({
         "config_hash_blake2b512": config_hash,
@@ -984,7 +924,6 @@ pub(crate) fn measurement_read_evidence(
         "inserts",
         "evictions",
         "rejected_oversize",
-        "rejected_mismatch",
         "bypass_disabled",
         "bypass_admission",
         "bypass_eviction_limit",
@@ -2116,31 +2055,6 @@ async fn export_write_diagnostics<B: KvBackend>(
     )?;
     Ok(finish_error)
 }
-/// Insert the authoritative `index_checkpoint` object into
-/// `write-diagnostics.json`, creating the file when no profile was exported.
-pub(crate) fn write_index_checkpoint_diagnostics(
-    output: &Path,
-    backend: &str,
-    details: &serde_json::Value,
-) -> BackendResult<()> {
-    let path = output.join("write-diagnostics.json");
-    let mut evidence = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({
-            "schema_version": 1,
-            "backend": backend,
-            "runtime_observation_mode": "not_armed",
-            "profile": null,
-        }),
-        Err(error) => return Err(error.into()),
-    };
-    evidence
-        .as_object_mut()
-        .ok_or("write diagnostics must be an object")?
-        .insert("index_checkpoint".to_owned(), details.clone());
-    std::fs::write(path, serde_json::to_vec_pretty(&evidence)?)?;
-    Ok(())
-}
 
 fn write_timeline_owner_error(timeline: &serde_json::Value) -> Option<String> {
     if timeline
@@ -2468,14 +2382,9 @@ fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
     // Reserve new-key IDs across every client and phase. This atomic allocates IDs
     // only; oracle tracking is separate. K=1 retains the original seed and stream.
     let next_put_index = Arc::new(AtomicU64::new(0));
-    // Validated with the configuration: the A1 build writes IDs 0..N once.
-    let build_ids = matches!(
-        config.index_fixture_stage(),
-        Ok(Some(crate::index_a1::IndexFixtureStage::Build))
-    );
     (0..config.execution.effective_client_shards())
         .map(|shard| {
-            let generator = WorkloadGenerator::new(
+            WorkloadGenerator::new(
                 (config.seed ^ 0x6b76_7265_7365_6172)
                     .wrapping_add((shard as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
                 config.dataset.keys,
@@ -2484,12 +2393,7 @@ fn client_generators(config: &RunConfig) -> Vec<WorkloadGenerator> {
                 config.workload.distribution.clone(),
                 config.workload.put_key_policy,
                 Arc::clone(&next_put_index),
-            );
-            if build_ids {
-                generator.with_build_ids()
-            } else {
-                generator
-            }
+            )
         })
         .collect()
 }
@@ -2975,24 +2879,14 @@ async fn execute_item<B: KvBackend>(
         .iter()
         .map(|id| key_bytes(namespace, config.seed, *id))
         .collect::<Vec<_>>();
-    // Index fixture: measured puts write the run's value domain.
-    let fixture = backend.index_fixture().filter(|_| phase == "measurement");
-    let domain = fixture.map(crate::index_a1::FixtureRun::value_domain);
-    let make_value = |id: u64| match domain {
-        Some(domain) => domain.value(
+    let make_value = |id: u64| {
+        value_bytes(
             namespace,
             config.seed,
             id,
             config.dataset.value_size,
             config.dataset.entropy,
-        ),
-        None => value_bytes(
-            namespace,
-            config.seed,
-            id,
-            config.dataset.value_size,
-            config.dataset.entropy,
-        ),
+        )
     };
     let entries = if matches!(
         operation,
@@ -3274,23 +3168,6 @@ async fn execute_item<B: KvBackend>(
             Cow::Borrowed("request_deadline_timeout"),
         ),
     };
-    // Inside the worker-release clock, outside the API timer. A dispatched
-    // put without success may still have been applied: it is uncertain.
-    if let Some(fixture) = fixture
-        && operation == OperationKind::Put
-        && (sample.outcome == "success" || sample.dispatch_observed)
-        && let Some(id) = work.keys.first()
-    {
-        let recorded = if sample.outcome == "success" {
-            fixture.record_put(*id)
-        } else {
-            fixture.record_uncertain(*id)
-        };
-        if let Err(error) = recorded {
-            sample.outcome = "error";
-            sample.error_kind = Cow::Owned(format!("index fixture touched bitmap: {error}"));
-        }
-    }
     sample.released_ns = duration_ns(origin.elapsed()).max(sample.completed_ns);
     sample
 }
@@ -4638,7 +4515,7 @@ mod tests {
             let reads = self.read_count.load(Ordering::Relaxed);
             Ok(serde_json::json!({"available": true, "coordinator": {
                 "read_rpc_count": 0, "hits": reads, "misses": 0, "inserts": 0,
-                "evictions": 0, "rejected_oversize": 0, "rejected_mismatch": 0,
+                "evictions": 0, "rejected_oversize": 0,
                 "bypass_disabled": 0, "bypass_admission": 0, "bypass_eviction_limit": 0,
                 "admitted_bytes": 0, "served_bytes": 0,
                 "read_profile_live_inline": 0,
@@ -5186,7 +5063,6 @@ mod tests {
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),
-                index_checkpoint: None,
             };
             reporter
                 .finish(&summary, false, &serde_json::json!({}))
@@ -5395,7 +5271,6 @@ mod tests {
             phase_counts: serde_json::json!({}),
             distributions: reporter.distribution_summaries(),
             limitations: Vec::new(),
-            index_checkpoint: None,
         };
         assert!(
             reporter
@@ -5483,7 +5358,6 @@ mod tests {
                 phase_counts: serde_json::json!({}),
                 distributions: reporter.distribution_summaries(),
                 limitations: Vec::new(),
-                index_checkpoint: None,
             };
             reporter
                 .finish(&summary, true, &serde_json::json!({}))
@@ -7068,7 +6942,6 @@ mod tests {
             "inserts",
             "evictions",
             "rejected_oversize",
-            "rejected_mismatch",
             "bypass_disabled",
             "bypass_admission",
             "bypass_eviction_limit",

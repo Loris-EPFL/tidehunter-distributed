@@ -212,10 +212,9 @@ pub fn prepare_external_case(
         max_pending_reads: 256,
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
-        index_shards: tidehunter::distributed::native_index::DEFAULT_INDEX_SHARDS,
         durable_cut: Default::default(),
         relocation_max_reclaim_pct: 100,
-        compactor_cadence: Default::default(),
+        index: Default::default(),
     };
     fs::write(
         directory.join("remote.yaml"),

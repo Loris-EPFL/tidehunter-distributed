@@ -2258,6 +2258,40 @@ enum RecordFrame {
     Batch(Bytes),
 }
 
+/// Decodes one record frame's entry into `(full_key, value)`.
+///
+/// `indexed_key` is the key the index stores for this position. It is only
+/// needed for a `CompressedBatch`, whose payload holds several records and is
+/// searched by index key (reduced when the keyspace reduces keys), exactly as
+/// `Db::read_record_for_indexed_key` searches a decompressed batch body. A
+/// single record frame is returned as-is: its position addresses that exact
+/// frame and the caller has already verified the frame's integrity, so the
+/// indexed key is not compared against the stored key. A `Remove` yields
+/// `None` (a tombstone has no value).
+///
+/// The distributed coordinator reads the same native entry encoding from an
+/// owner, so it decodes through here instead of keeping a second decoder. Its
+/// first caller is the S8 read path, which lands in the same PR as this item.
+#[cfg(feature = "experimental-distributed")]
+pub(crate) fn decode_record_entry(
+    ks: &KeySpaceDesc,
+    indexed_key: &[u8],
+    entry: WalEntry,
+) -> DbResult<Option<(Bytes, Bytes)>> {
+    match entry {
+        WalEntry::Record(_, key, value, _) => Ok(Some((key, value))),
+        WalEntry::Remove(..) => Ok(None),
+        entry @ WalEntry::CompressedBatch(..) => {
+            let body =
+                decompress_wal_entry(entry).expect("matched WalEntry::CompressedBatch above");
+            Ok(find_record_by(&body, ks.id(), |full_key| {
+                ks.reduce_key(full_key).as_ref() == indexed_key
+            }))
+        }
+        other => panic!("Unexpected wal entry where expected record/batch: {other:?}"),
+    }
+}
+
 #[doc(hidden)] // Used by tools/tideconsole for WAL inspection
 #[derive(Debug)]
 pub enum WalEntry {
@@ -2341,6 +2375,76 @@ impl WalEntry {
 
     fn record_len(k: &[u8], v: &[u8]) -> usize {
         1 + 1 + 2 + k.len() + v.len()
+    }
+}
+
+/// Decode one native WAL entry payload taken from a distributed member frame.
+///
+/// The distributed value path verifies the member frame itself (its length
+/// header and the payload CRC the index carries) and then needs the native
+/// entry decode. This wrapper keeps one decoder for both routes and is gated
+/// because only the distributed build has a caller, so native code generation
+/// is unchanged. A distributed member is a put (`Record`) or a delete (`Remove`);
+/// anything else — including a compressed batch, whose lookup can answer `None`
+/// for a key it does not hold and would read as a false tombstone — is an error,
+/// never the native `panic!`: these bytes came from another host, so the entry
+/// type and the fixed header of a put or delete are checked before
+/// [`WalEntry::from_bytes`], which panics on an unknown type or a short header.
+/// A `Remove` is a tombstone only for the key it carries: native maps it to
+/// `None` without looking at its key, so it is bound to `indexed_key` here, and a
+/// delete of another key (a stale or mis-pointed position) is `InvalidData`,
+/// never `None`.
+///
+/// `entry` is the fetched frame sliced past its member header: the decoded key
+/// and value are further slices of the same allocation, so a read copies no
+/// payload bytes.
+#[cfg(feature = "experimental-distributed")]
+pub(crate) fn decode_record_frame(
+    ks: &KeySpaceDesc,
+    indexed_key: &[u8],
+    entry: Bytes,
+) -> DbResult<Option<(Bytes, Bytes)>> {
+    let invalid = |what: String| DbError::Io(io::Error::new(io::ErrorKind::InvalidData, what));
+    match entry.first().copied() {
+        Some(WalEntry::WAL_ENTRY_RECORD | WalEntry::WAL_ENTRY_RELOCATED_RECORD) => {
+            // `[type][keyspace][key length u16][key][value]`.
+            let key_len = entry
+                .get(2..4)
+                .map(|length| usize::from(u16::from_be_bytes([length[0], length[1]])));
+            if key_len.is_none_or(|key_len| entry.len() < 4 + key_len) {
+                return Err(invalid(
+                    "distributed member frame holds a truncated record entry".into(),
+                ));
+            }
+        }
+        Some(WalEntry::WAL_ENTRY_REMOVE) => {
+            if entry.len() < 2 {
+                return Err(invalid(
+                    "distributed member frame holds a truncated delete entry".into(),
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(invalid(format!(
+                "distributed member frame holds a non-record entry (type {other})"
+            )));
+        }
+        None => return Err(invalid("distributed member frame holds no entry".into())),
+    }
+    let entry = WalEntry::from_bytes(entry);
+    match entry {
+        WalEntry::Record(..) => decode_record_entry(ks, indexed_key, entry),
+        WalEntry::Remove(_, ref key) => {
+            if ks.reduce_key(key).as_ref() != indexed_key {
+                return Err(invalid(
+                    "distributed member frame deletes another key than the index asked for".into(),
+                ));
+            }
+            decode_record_entry(ks, indexed_key, entry)
+        }
+        other => Err(invalid(format!(
+            "distributed member frame holds a non-record entry: {other:?}"
+        ))),
     }
 }
 
@@ -2432,6 +2536,10 @@ mod cache_refill_tests;
 #[cfg(test)]
 #[path = "db_tests/test_background_health.rs"]
 mod background_health_tests;
+
+#[cfg(all(test, feature = "experimental-distributed"))]
+#[path = "db_tests/test_decode_record.rs"]
+mod decode_record_tests;
 
 #[cfg(test)]
 mod multi_flusher_tests {

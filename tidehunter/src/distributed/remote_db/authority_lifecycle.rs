@@ -22,7 +22,7 @@ pub(crate) use drop_tx::drop_db;
 pub(crate) use drop_tx::drop_remote;
 pub(crate) use namespace::{NamespaceGuard, NamespaceMode};
 
-use super::checkpoint_attribution::CoordinatorIoCategory;
+use super::coordinator_io::CoordinatorIoCategory;
 use super::fencing_generations::{AUTHORITY_FORMAT, read_authority_manifest};
 use super::{AuthorityManifest, MANIFEST, RemoteDatabaseConfig, RemoteEndpoint, persist_manifest};
 use crate::distributed::storage::{LocalDbError, LocalInventoryConfig, read_metadata};

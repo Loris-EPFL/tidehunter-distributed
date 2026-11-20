@@ -355,12 +355,11 @@ pub struct NodeInventory {
 pub(super) struct ReaderAuthority {
     active_epoch: Option<u64>,
     logs: BTreeMap<u64, Arc<PartitionLog>>,
-    database: [u8; 16],
     partition: u32,
 }
 
 pub(super) struct ReaderSnapshot {
-    pub(super) members: Vec<(Arc<PartitionLog>, ValueRecordReference)>,
+    pub(super) members: Vec<(Arc<PartitionLog>, PhysicalValueAddress)>,
 }
 
 impl ReaderAuthority {
@@ -372,10 +371,15 @@ impl ReaderAuthority {
         self.logs.clone_from(logs);
         self.active_epoch = Some(epoch);
     }
+    /// Resolve member addresses to the logs of their serving generations. The
+    /// key is the address alone (no batch epoch: a relocated position keeps its
+    /// logical epoch but names the generation holding its bytes); a foreign
+    /// partition is `InvalidData`, a generation no longer held is `NotFound`
+    /// (the kind the value path retries once).
     pub(super) fn snapshot(
         &self,
         epoch: u64,
-        references: &[ValueRecordReference],
+        members: &[PhysicalValueAddress],
         terminal: &AtomicBool,
     ) -> Result<ReaderSnapshot, TcpError> {
         if terminal.load(Ordering::Acquire) {
@@ -384,24 +388,19 @@ impl ReaderAuthority {
         if self.active_epoch != Some(epoch) {
             return Err(TcpError::new("stale or sealed request authority"));
         }
-        let mut members = Vec::with_capacity(references.len());
-        for reference in references {
-            if reference.batch_id.database != self.database
-                || reference.batch_address.partition != self.partition
-                || reference.batch_address.segment_generation != reference.batch_version.epoch
-            {
-                return Err(TcpError::new(
-                    "value reference belongs to another node/domain",
-                ));
+        let mut resolved = Vec::with_capacity(members.len());
+        for address in members {
+            if address.partition != self.partition {
+                let kind = io::ErrorKind::InvalidData;
+                return Err(TcpError::with_kind(kind, "foreign member partition"));
             }
-            let log = self
-                .logs
-                .get(&reference.batch_version.epoch)
-                .cloned()
-                .ok_or_else(|| TcpError::new("value reference names absent epoch"))?;
-            members.push((log, *reference));
+            let Some(log) = self.logs.get(&address.segment_generation) else {
+                let kind = io::ErrorKind::NotFound;
+                return Err(TcpError::with_kind(kind, "retired member generation"));
+            };
+            resolved.push((Arc::clone(log), *address));
         }
-        Ok(ReaderSnapshot { members })
+        Ok(ReaderSnapshot { members: resolved })
     }
     pub(super) fn active_valid(&self, epoch: u64, terminal: &AtomicBool) -> bool {
         !terminal.load(Ordering::Acquire) && self.active_epoch == Some(epoch)
@@ -645,7 +644,6 @@ impl NodeInventory {
         // down cleanly. It never resumes an old logical counter/writer epoch.
         persist(&config.root, &manifest)?;
         let readers = Arc::new(RwLock::new(ReaderAuthority {
-            database: config.partition.inventory.database,
             partition: config.partition.partition,
             ..ReaderAuthority::default()
         }));

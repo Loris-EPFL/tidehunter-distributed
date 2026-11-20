@@ -552,12 +552,12 @@ fn prepared_fast_validation_rejects_stale_terminal_and_wrong_epoch_requests() {
             ),
             Err(StorageError::Fenced)
         ));
-        owner.state.lock().sealing = true;
+        owner.state.lock().lifecycle = Lifecycle::Sealing;
         assert!(matches!(
             owner.prelease_live_extent(auth, current.token),
             Err(StorageError::Invalid("live stream is sealing"))
         ));
-        owner.state.lock().sealing = false;
+        owner.state.lock().lifecycle = Lifecycle::Running;
         owner.state.lock().sealed = true;
         assert!(matches!(
             owner.prelease_live_extent(auth, current.token),

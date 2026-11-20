@@ -1,30 +1,26 @@
 //! Bounded coordinator-owned reads use one actor per owner endpoint. Each lane
 //! has one progress owner at a time: its actor or an idle caller. Owner-local
 //! progress follows eRPC's per-core ownership principle, not its wire protocol.
-//! Exact-reference fill sharing adapts native DecompressCache::FillCell and
+//! Position-keyed fill sharing adapts native DecompressCache::FillCell and
 //! CacheLib's fill-context waiters, not its mutable-key tombstone protocol:
 //! <https://github.com/facebook/CacheLib/blob/a24370092f0bd6fa7145b2f01c3e50e63edd6a6e/cachelib/allocator/nvmcache/NvmCache.h#L767-L848>.
-//! Fixed weak slots and an exact-reference index are reserved from the pending
-//! byte allowance. Every caller owns bounded result/slot credits; only new
-//! storage work owns a request credit. Pins and authenticated completion checks
-//! survive delivery cancellation.
+//! Fixed weak slots and a position index are reserved from the pending byte
+//! allowance. Every caller owns bounded result/slot credits; only new storage
+//! work owns a request credit. A flight coalesces callers that want the same
+//! immutable position; no index pin, cut or reference descriptor crosses it.
 use super::*;
-use crate::distributed::native_index::IndexReadPin;
+use crate::distributed::hybrid::position::VersionPosition;
 use smallvec::SmallVec;
 use std::hash::BuildHasher;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-/// A batch member with the plan computed once at batch creation.
+/// One member of a batch: its result slot, its immutable position and its plan.
 struct PlannedMember {
     slot: usize,
-    reference: ValueRecordReference,
+    position: VersionPosition,
     plan: MemberPlan,
 }
-#[cfg(test)]
-mod kv_capture_tests;
 mod live_inline;
-#[cfg(test)]
-mod live_inline_tests;
 mod live_lane;
 mod read_trace;
 
@@ -43,7 +39,6 @@ struct PlannedMembers<'a> {
 struct CachedPlan {
     member: [MemberPlan; 1],
 }
-use crate::distributed::sui::kv_capture;
 use read_trace::ReadTrace;
 pub use read_trace::ReadTraceSnapshot;
 pub(crate) use read_trace::{ReadTraceCallGuard, ReadTraceChild};
@@ -52,7 +47,7 @@ const NO_INDEX: usize = usize::MAX;
 
 struct FlightIndexEntry {
     node: usize,
-    reference: ValueRecordReference,
+    position: VersionPosition,
     slot: usize,
     member: usize,
     bucket_next: usize,
@@ -99,26 +94,22 @@ impl FlightRegistry {
         None
     }
 
-    fn bucket(&self, node: usize, reference: &ValueRecordReference) -> usize {
-        (self.hasher.hash_one((node, reference)) as usize) % self.buckets.len()
+    fn bucket(&self, node: usize, position: &VersionPosition) -> usize {
+        (self.hasher.hash_one((node, position)) as usize) % self.buckets.len()
     }
 
     #[allow(
         clippy::expect_used,
         reason = "the bucket chain only holds allocated entries, so every index resolves"
     )]
-    fn find(
-        &self,
-        node: usize,
-        reference: &ValueRecordReference,
-    ) -> Option<(Arc<ReadFlight>, usize)> {
-        let mut index = self.buckets[self.bucket(node, reference)];
+    fn find(&self, node: usize, position: &VersionPosition) -> Option<(Arc<ReadFlight>, usize)> {
+        let mut index = self.buckets[self.bucket(node, position)];
         while index != NO_INDEX {
             let entry = self.entries[index]
                 .as_ref()
                 .expect("allocated flight entry");
             if entry.node == node
-                && entry.reference == *reference
+                && entry.position == *position
                 && let Some(flight) = self.slots[entry.slot].upgrade()
             {
                 return Some((flight, entry.member));
@@ -136,7 +127,7 @@ impl FlightRegistry {
         let mut index = std::mem::replace(&mut self.slot_heads[slot], NO_INDEX);
         while index != NO_INDEX {
             let entry = self.entries[index].take().expect("allocated flight entry");
-            let bucket = self.bucket(entry.node, &entry.reference);
+            let bucket = self.bucket(entry.node, &entry.position);
             let mut current = self.buckets[bucket];
             let mut previous = NO_INDEX;
             while current != index {
@@ -182,12 +173,12 @@ impl FlightRegistry {
         let slot = flight.slot;
         self.clear_slot(slot);
         self.slots[slot] = Arc::downgrade(flight);
-        for (member, reference) in flight.references.iter().enumerate() {
-            let bucket = self.bucket(flight.node, reference);
+        for (member, position) in flight.positions.iter().enumerate() {
+            let bucket = self.bucket(flight.node, position);
             let index = self.free.pop().expect("flight index capacity reserved");
             self.entries[index] = Some(FlightIndexEntry {
                 node: flight.node,
-                reference: *reference,
+                position: *position,
                 slot,
                 member,
                 bucket_next: self.buckets[bucket],
@@ -202,68 +193,78 @@ impl FlightRegistry {
 const BACKPRESSURE: &str = "remote read admission is full";
 const BYTE_BUDGET: &str = "request exceeds pending read byte budget";
 const MIN_MEMBER_BYTES: usize = 3 * 256
-    + 3 * std::mem::size_of::<ValueRecordReference>()
+    + 3 * std::mem::size_of::<VersionPosition>()
     + 64
-    + 3 * (std::mem::size_of::<(ValueRecordReference, usize)>() + 1);
+    + 3 * (std::mem::size_of::<(VersionPosition, usize)>() + 1);
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ReadClass {
-    Point,
-    ScanNoFill,
-}
-
-fn member_charge(reference: &ValueRecordReference) -> Result<usize, LocalDbError> {
-    let wire = (reference.descriptor.len as usize)
+fn member_charge(position: &VersionPosition) -> Result<usize, LocalDbError> {
+    let wire = (position.address.len as usize)
         .checked_add(256)
         .filter(|n| *n <= super::super::tcp::HARD_FRAME_LIMIT - 32)
-        .ok_or_else(|| LocalDbError::new("record exceeds read frame bound"))?;
+        .ok_or_else(|| LocalDbError::new("member exceeds read frame bound"))?;
     // Three buckets per member cover HashMap's power-of-two growth and
     // control bytes even immediately after a resize.
     Ok(wire * 3
-        + 3 * std::mem::size_of::<ValueRecordReference>()
+        + 3 * std::mem::size_of::<VersionPosition>()
         + 64
-        + 3 * (std::mem::size_of::<(ValueRecordReference, usize)>() + 1)
+        + 3 * (std::mem::size_of::<(VersionPosition, usize)>() + 1)
         // Cover geometric growth and the minimum allocation of both vectors.
         + 4 * (std::mem::size_of::<Weak<BatchSignal>>() + std::mem::size_of::<usize>())
         // Every admitted batch has at least one member; this covers its Arc.
         + std::mem::size_of::<BatchSignal>() + 2 * std::mem::size_of::<usize>())
 }
 
-pub(super) fn admission_error(error: &LocalDbError) -> bool {
+/// True when a member read failed because the owner no longer names its address.
+///
+/// Exactly one `NotFound` is recoverable by a re-resolve: it is the retired-file
+/// symptom, and it must neither poison the read service nor be retried more than
+/// once. Every other failure — corruption, poison, timeouts — is fatal or fails
+/// fast with its own error. This is the single predicate for both decisions.
+pub(crate) fn member_read_is_retired(error: &LocalDbError) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Map a transport error to a database error **without losing its kind**.
+///
+/// The wire carries the owner's `io::ErrorKind` code, so a retired address
+/// arrives as `NotFound` and a deadline as `TimedOut`. `LocalDbError::component`
+/// would flatten both to `Other`, which the value path needs to tell apart: it
+/// retries exactly one `NotFound` (the member's file is gone) and must fail fast
+/// on everything else.
+pub(crate) fn transport_error(error: crate::distributed::tcp::TcpError) -> LocalDbError {
+    LocalDbError::with_kind(error.kind(), error.to_string())
+}
+
+pub(crate) fn admission_error(error: &LocalDbError) -> bool {
     matches!(error.message(), BACKPRESSURE | BYTE_BUDGET)
 }
 
 struct ReadContext {
-    pin: Option<IndexReadPin>,
     trace: Option<ReadTraceChild>,
 }
 
+/// One completed owner read: the raw member frames in request order.
+///
+/// The lane returns exactly the bytes the owner's address names; the CRC and
+/// native entry decode happen in the caller (`hybrid::read::ValueReader`), so a
+/// lane never needs a keyspace, a key or a descriptor.
+type ReadCompletion = Result<Vec<Bytes>, LocalDbError>;
+
 /// A caller-bounded collection, submitted as the largest fitting shard groups.
-/// Only its admitted requests own transport/result credits; completed values
-/// move into the caller's collection before another internal wave is admitted.
-pub(super) struct ReadBatch {
-    pub(super) values: Vec<Option<Mutation>>,
-    pub(super) reads: VecDeque<(Vec<usize>, ReadRequest)>,
-    class: ReadClass,
-    pub(super) pin: Option<IndexReadPin>,
+/// Only its admitted requests own transport/result credits; completed member
+/// frames move into the caller's collection before another wave is admitted.
+pub(crate) struct ReadBatch {
+    pub(crate) values: Vec<Option<Bytes>>,
+    pub(crate) reads: VecDeque<(Vec<usize>, ReadRequest)>,
     groups: VecDeque<(usize, VecDeque<PlannedMember>)>,
     signal: Option<Arc<BatchSignal>>,
 }
 
 impl ReadBatch {
-    pub(super) fn new_scan(
+    pub(crate) fn new(
         service: &ReadService,
-        values: Vec<Option<Mutation>>,
-        groups: Vec<Vec<(usize, ValueRecordReference)>>,
-    ) -> Result<Self, LocalDbError> {
-        let mut batch = Self::new(service, values, groups)?;
-        batch.class = ReadClass::ScanNoFill;
-        Ok(batch)
-    }
-    pub(super) fn new(
-        service: &ReadService,
-        values: Vec<Option<Mutation>>,
-        groups: Vec<Vec<(usize, ValueRecordReference)>>,
+        values: Vec<Option<Bytes>>,
+        groups: Vec<Vec<(usize, VersionPosition)>>,
     ) -> Result<Self, LocalDbError> {
         // Plan every member once: dispatch and every admission retry reuse
         // these plans.
@@ -273,15 +274,15 @@ impl ReadBatch {
                 continue;
             }
             let mut members = VecDeque::with_capacity(group.len());
-            for (slot, reference) in group {
-                let plan = service.plan_member(&reference)?;
+            for (slot, position) in group {
+                let plan = service.plan_member(&position)?;
                 // Reject an impossible member before issuing any of this batch's RPCs.
                 if plan.charge > service.max_bytes().saturating_sub(512) {
                     return Err(LocalDbError::new(BYTE_BUDGET));
                 }
                 members.push_back(PlannedMember {
                     slot,
-                    reference,
+                    position,
                     plan,
                 });
             }
@@ -289,23 +290,27 @@ impl ReadBatch {
         }
         Ok(Self {
             values,
-            class: ReadClass::Point,
-            pin: None,
             reads: VecDeque::new(),
             signal: None,
             groups: planned,
         })
     }
 
-    pub(super) fn has_unsubmitted(&self) -> bool {
+    pub(crate) fn has_unsubmitted(&self) -> bool {
         !self.groups.is_empty()
     }
 
-    pub(super) fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         self.groups.is_empty() && self.reads.is_empty()
     }
 
-    pub(super) fn dispatch(&mut self, service: &ReadService) -> Result<(), LocalDbError> {
+    /// True when every admitted request finished and only unadmitted work is
+    /// left; the caller then parks on admission progress.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.reads.is_empty()
+    }
+
+    pub(crate) fn dispatch(&mut self, service: &ReadService) -> Result<(), LocalDbError> {
         self.dispatch_traced(service, None, 0)
     }
 
@@ -342,11 +347,11 @@ impl ReadBatch {
             // Other callers can reserve credits after the snapshot above.
             // Retain every source slot until this request is actually admitted.
             let mut slots = Vec::with_capacity(count);
-            let mut references = Vec::with_capacity(count);
+            let mut positions = Vec::with_capacity(count);
             let mut plans = SmallVec::<[MemberPlan; 32]>::new();
             for member in group.iter().take(count) {
                 slots.push(member.slot);
-                references.push(member.reference);
+                positions.push(member.position);
                 plans.push(member.plan);
             }
             let child = trace.and_then(|trace| {
@@ -354,17 +359,16 @@ impl ReadBatch {
             });
             let mut request = match service.submit_until_planned(
                 *node,
-                &references,
+                &positions,
                 0,
                 false,
                 ReadContext {
-                    pin: self.pin.clone(),
                     trace: child.clone(),
                 },
                 Some(PlannedMembers { members: &plans }),
             ) {
                 Ok(request) => request,
-                Err(error) if RemoteDatabase::read_backpressured(&error) => {
+                Err(error) if admission_error(&error) => {
                     if let Some(trace) = &child {
                         trace.event("admission_backpressured");
                     }
@@ -397,7 +401,7 @@ impl ReadBatch {
         clippy::expect_used,
         reason = "an admitted batch owns its signal, and the ready loop picked an existing request"
     )]
-    pub(super) fn finish_one(&mut self) -> Result<(), LocalDbError> {
+    pub(crate) fn finish_one(&mut self) -> Result<(), LocalDbError> {
         let (state, timeout) = {
             let request = &self
                 .reads
@@ -835,7 +839,7 @@ impl Drop for LaneCredit {
 }
 struct Request {
     lane: usize,
-    references: Vec<ValueRecordReference>,
+    positions: Vec<VersionPosition>,
     /// Bound of the transport I/O, counted from its submission.
     timeout: Duration,
     /// Deadline of this request's outstanding transport I/O; `None` while
@@ -881,7 +885,6 @@ impl Request {
                 .1
                 .nvme_complete(duration, result.is_err());
         }
-        kv_capture::routes(&self.flight.references, true, self.flight.slot as u64);
         if let Some(trace) = &self.trace {
             trace.event(if result.is_err() {
                 "flight_error"
@@ -892,9 +895,9 @@ impl Request {
         if let Err(error) = &result {
             let partition = self
                 .flight
-                .references
+                .positions
                 .first()
-                .map(|reference| reference.batch_address.partition);
+                .map(|position| position.address.partition);
             super::record_first_failure(
                 &self._credit.state.first_failure,
                 partition,
@@ -924,21 +927,19 @@ impl Request {
     }
 }
 
-/// One authenticated storage operation; exact reference matching happens before
+/// One authenticated storage operation; position matching happens before
 /// admission, under the finite registry lock. Results/credits outlive transport
-/// until every caller has consumed or dropped its part.
-/// Scan and point callers can join: only the initiating RPC chooses its cache
-/// class. Joining a scan never creates another fill or changes ScanNoFill work.
+/// until every caller has consumed or dropped its part. Every caller of the
+/// same position joins one flight and one owner read.
 struct ReadFlight {
     node: usize,
-    references: Vec<ValueRecordReference>,
+    positions: Vec<VersionPosition>,
     slot: usize,
     completion: FlightCompletion,
     /// Deadline of the outstanding transport I/O, set by the transport at
     /// submission; `None` before submission. Waiting callers time out only
     /// against it, never against time spent queued.
     io_deadline: Mutex<Option<Instant>>,
-    _pin: Option<IndexReadPin>,
     // Keep retained-result credit while any caller can consume the flight.
     _credit: Arc<Credit>,
 }
@@ -1264,7 +1265,7 @@ fn drive_live_reads(
     }
 }
 
-pub(super) struct ReadService {
+pub(crate) struct ReadService {
     state: Arc<State>,
     lanes: RwLock<Vec<Vec<Lane>>>,
     sender: Mutex<Vec<mpsc::SyncSender<ReadCommand>>>,
@@ -1353,7 +1354,7 @@ struct BatchSubscription {
     signal: Arc<BatchSignal>,
     slots: SmallVec<[usize; 1]>,
 }
-pub(super) struct ReadRequest {
+pub(crate) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
     credit: Arc<Credit>,
     admitted: Instant,
@@ -1394,7 +1395,7 @@ impl ReadRequest {
         self.credit.state.poison();
         LocalDbError::new(message)
     }
-    pub(super) fn try_result(&self) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+    pub(crate) fn try_result(&self) -> Result<Option<Vec<Bytes>>, LocalDbError> {
         // Do not allocate a result vector until all constituent operations have
         // completed. The original slot order (including duplicates) is retained.
         for (flight, _) in &self.parts {
@@ -1427,7 +1428,7 @@ impl ReadRequest {
         Ok(Some(values))
     }
 
-    pub(super) fn finish(self) -> ReadCompletion {
+    pub(crate) fn finish(self) -> ReadCompletion {
         for (flight, _) in &self.parts {
             let state = &flight._credit.state;
             // As in native, load never fails the read: only a submitted
@@ -1476,10 +1477,17 @@ impl Drop for ReadRequest {
     }
 }
 impl ReadService {
+    /// Number of owner endpoints this service reads from.
+    pub(crate) fn owner_count(&self) -> usize {
+        // Built from `config.endpoints.len()` at construction; the node index
+        // `ReadBatch` groups by is exactly this vector's index.
+        self.next.len()
+    }
+
     /// Charge of one member; callers keep the result.
-    fn plan_member(&self, reference: &ValueRecordReference) -> Result<MemberPlan, LocalDbError> {
+    fn plan_member(&self, position: &VersionPosition) -> Result<MemberPlan, LocalDbError> {
         Ok(MemberPlan {
-            charge: member_charge(reference)?,
+            charge: member_charge(position)?,
         })
     }
 
@@ -1494,12 +1502,12 @@ impl ReadService {
     fn cached_plan<'a>(
         &self,
         cached: &'a mut Option<CachedPlan>,
-        reference: &ValueRecordReference,
+        position: &VersionPosition,
     ) -> Result<PlannedMembers<'a>, LocalDbError> {
         let plan = match cached.take() {
             Some(plan) => plan,
             None => CachedPlan {
-                member: [self.plan_member(reference)?],
+                member: [self.plan_member(position)?],
             },
         };
         let plan = cached.insert(plan);
@@ -1749,6 +1757,17 @@ impl ReadService {
     pub(super) fn failed(&self) -> bool {
         self.state.failed.load(Ordering::Acquire)
     }
+    /// Fail closed when the read authority is poisoned or closed.
+    ///
+    /// A poisoned engine carries its own cause; the value path calls this before
+    /// any retry so that cause is returned as itself instead of being retried and
+    /// relabelled.
+    pub(crate) fn ensure_healthy(&self) -> Result<(), LocalDbError> {
+        if self.failed() || self.state.stopped.load(Ordering::Acquire) {
+            return Err(LocalDbError::new("read authority is poisoned or closed"));
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub(super) fn lane_client(&self, node: usize, lane: usize) -> Arc<Mutex<Client>> {
         self.lanes.read()[node][lane].client.clone()
@@ -1813,8 +1832,18 @@ impl ReadService {
         self.state.notify_admission();
     }
 
-    pub(super) fn admission_generation(&self) -> u64 {
+    pub(crate) fn admission_generation(&self) -> u64 {
         self.state.admission_generation.load(Ordering::Acquire)
+    }
+
+    /// Start a read-trace call record; `state` is private to this module, so the
+    /// concurrent facade reaches the trace through here.
+    pub(in crate::distributed::remote_db) fn begin_trace(
+        &self,
+        caller_id: u64,
+        members: usize,
+    ) -> Option<ReadTraceCallGuard> {
+        self.state.trace.begin(caller_id, members)
     }
 
     /// Wait until read credit changes after `observed`. `None` waits without
@@ -1822,7 +1851,7 @@ impl ReadService {
     /// held credit is released by its read's completion, failure or per-I/O
     /// timeout, and every release, poison, stop and unpause bumps the
     /// generation under `retained` before notifying, so no wakeup is lost.
-    pub(super) fn wait_admission(
+    pub(crate) fn wait_admission(
         &self,
         observed: u64,
         deadline: Option<Instant>,
@@ -1851,59 +1880,47 @@ impl ReadService {
     }
     /// A blocking scalar caller can own an idle lane directly. Deferred reads
     /// retain the reactor path; no active lane or outstanding credit is stolen.
-    pub(super) fn read_inline(
+    pub(crate) fn read_inline(
         &self,
         node: usize,
-        epoch: u64,
-        reference: &ValueRecordReference,
+        position: &VersionPosition,
         extra_bytes: usize,
-        pin: Option<IndexReadPin>,
-    ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
-        self.read_inline_traced(node, epoch, reference, extra_bytes, pin, None)
+    ) -> Result<Option<Vec<Bytes>>, LocalDbError> {
+        self.read_inline_traced(node, position, extra_bytes, None)
     }
 
     fn read_inline_traced(
         &self,
         node: usize,
-        epoch: u64,
-        reference: &ValueRecordReference,
+        position: &VersionPosition,
         extra_bytes: usize,
-        pin: Option<IndexReadPin>,
         trace: Option<&ReadTraceChild>,
-    ) -> Result<Option<Vec<Mutation>>, LocalDbError> {
+    ) -> Result<Option<Vec<Bytes>>, LocalDbError> {
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
         if self.live_inline_reads() {
-            return self.read_live_inline(node, epoch, reference, extra_bytes, pin, trace);
+            return self.read_live_inline(node, position, extra_bytes, trace);
         }
         Ok(None)
     }
-    pub(super) fn submit(
+    pub(crate) fn submit_positions(
         &self,
         node: usize,
-        references: Vec<ValueRecordReference>,
-        extra_bytes: usize,
-        profiled: bool,
-        pin: Option<IndexReadPin>,
+        positions: &[VersionPosition],
+        trace: Option<ReadTraceChild>,
     ) -> Result<ReadRequest, LocalDbError> {
-        self.submit_until(
-            node,
-            &references,
-            extra_bytes,
-            profiled,
-            ReadContext { pin, trace: None },
-        )
+        self.submit_until(node, positions, 0, false, ReadContext { trace })
     }
     fn submit_until(
         &self,
         node: usize,
-        references: &[ValueRecordReference],
+        positions: &[VersionPosition],
         extra_bytes: usize,
         profiled: bool,
         context: ReadContext,
     ) -> Result<ReadRequest, LocalDbError> {
-        self.submit_until_planned(node, references, extra_bytes, profiled, context, None)
+        self.submit_until_planned(node, positions, extra_bytes, profiled, context, None)
     }
     // Admission takes its context and optional precomputed member plans
     // explicitly; each belongs to a distinct concern.
@@ -1914,7 +1931,7 @@ impl ReadService {
     fn submit_until_planned(
         &self,
         node: usize,
-        references: &[ValueRecordReference],
+        positions: &[VersionPosition],
         extra_bytes: usize,
         profiled: bool,
         context: ReadContext,
@@ -1922,14 +1939,14 @@ impl ReadService {
     ) -> Result<ReadRequest, LocalDbError> {
         let admitted = Instant::now();
         let timeout = self.timeout();
-        let ReadContext { pin, trace } = context;
+        let ReadContext { trace } = context;
         if let Some(trace) = &trace {
             trace.event("admission_started");
         }
         if self.failed() || self.state.stopped.load(Ordering::Acquire) {
             return Err(LocalDbError::new("read authority is poisoned or closed"));
         }
-        if references.is_empty() || references.len() > 256 {
+        if positions.is_empty() || positions.len() > 256 {
             return Err(LocalDbError::new("read request count exceeds bound"));
         }
         // Each member's charge is computed once here, or by the batch that
@@ -1938,12 +1955,12 @@ impl ReadService {
         let plans: &[MemberPlan] = if let Some(planned) = planned {
             planned.members
         } else {
-            for reference in references {
-                computed.push(self.plan_member(reference)?);
+            for position in positions {
+                computed.push(self.plan_member(position)?);
             }
             &computed
         };
-        if plans.len() != references.len() {
+        if plans.len() != positions.len() {
             return Err(LocalDbError::new("read plan does not match request"));
         }
         let bytes = plans.iter().try_fold(extra_bytes + 512, |bytes, plan| {
@@ -1957,10 +1974,10 @@ impl ReadService {
         let mut flights = self.state.flights.lock();
         let mut missing = Vec::new();
         let mut parts: SmallVec<[(Option<Arc<ReadFlight>>, usize); 1]> =
-            SmallVec::with_capacity(references.len());
-        let mut missing_index = (references.len() > 1).then(HashMap::new);
-        for reference in references {
-            let existing = flights.find(node, reference);
+            SmallVec::with_capacity(positions.len());
+        let mut missing_index = (positions.len() > 1).then(HashMap::new);
+        for position in positions {
+            let existing = flights.find(node, position);
             if let Some((flight, slot)) = existing {
                 if let Some(trace) = &trace {
                     trace.event_io("coalesced_flight_slot", 0, flight.slot as u64);
@@ -1968,12 +1985,12 @@ impl ReadService {
                 parts.push((Some(flight), slot));
             } else {
                 let slot = if let Some(index) = missing_index.as_mut() {
-                    *index.entry(*reference).or_insert_with(|| {
-                        missing.push(*reference);
+                    *index.entry(*position).or_insert_with(|| {
+                        missing.push(*position);
                         missing.len() - 1
                     })
                 } else {
-                    missing.push(*reference);
+                    missing.push(*position);
                     0
                 };
                 parts.push((None, slot));
@@ -1987,7 +2004,7 @@ impl ReadService {
                     .filter_map(|(position, (flight, _))| flight.as_ref().map(|_| position)),
             );
         }
-        let coalesced_members = references.len() - missing.len();
+        let coalesced_members = positions.len() - missing.len();
         let new_request = usize::from(!missing.is_empty());
         let flight_slot = if new_request != 0 {
             Some(
@@ -2078,17 +2095,16 @@ impl ReadService {
             self.state.flight_ready[slot].begin();
             let flight = Arc::new(ReadFlight {
                 node,
-                references: missing.clone(),
+                positions: missing.clone(),
                 slot,
                 completion: FlightCompletion::new(),
                 io_deadline: Mutex::new(None),
-                _pin: pin,
                 _credit: credit.clone(),
             });
             flights.insert(&flight);
             let request = Request {
                 lane: lane.index,
-                references: missing,
+                positions: missing,
                 timeout,
                 io_deadline: None,
                 submitted: (profiled || sampled).then(Instant::now),
@@ -2182,923 +2198,4 @@ impl Drop for ReadService {
     }
 }
 
-// Keep a miss handle inline: boxing the larger variant would allocate for every
-// miss merely to shrink an already allocation-free cache-hit handle.
-#[allow(clippy::large_enum_variant)]
-enum GetState {
-    Ready(Option<Bytes>),
-    Pending {
-        read: ReadRequest,
-        reference: ValueRecordReference,
-        ks: KeySpace,
-        key: Bytes,
-    },
-    Resolved {
-        reference: ValueRecordReference,
-        ks: KeySpace,
-        key: Bytes,
-    },
-    Consumed,
-}
-/// A bounded read captured at submission. Dropping cancels delivery, not transport
-/// ownership; already-observed failures still poison its originating authority.
-pub struct PendingGet {
-    owner: Arc<State>,
-    state: GetState,
-}
-
-/// Exact immutable scan member; transport ownership is independent of Db locks.
-pub struct PendingRecord {
-    owner: Arc<State>,
-    reference: ValueRecordReference,
-    ready: Option<Mutation>,
-    read: Option<ReadRequest>,
-}
-
-pub struct CompletedRecord {
-    owner: Arc<State>,
-    reference: ValueRecordReference,
-    result: Result<Mutation, LocalDbError>,
-    wait_ns: u64,
-}
-
-impl PendingRecord {
-    #[allow(
-        clippy::expect_used,
-        reason = "an unfinished record owns its read, and the count check above leaves one member"
-    )]
-    pub fn wait(self) -> CompletedRecord {
-        let started = Instant::now();
-        let result = match self.ready {
-            Some(value) => Ok(value),
-            None => self
-                .read
-                .expect("pending record owns read")
-                .finish()
-                .and_then(|mut values| {
-                    if values.len() != 1 {
-                        return Err(LocalDbError::new("scan member count mismatch"));
-                    }
-                    Ok(values.pop().expect("one verified member"))
-                }),
-        };
-        CompletedRecord {
-            owner: self.owner,
-            reference: self.reference,
-            result,
-            wait_ns: elapsed(started),
-        }
-    }
-}
-
-type ReadCompletion = Result<Vec<Mutation>, LocalDbError>;
-
-/// A completed network wait, still requiring the authority's health/cache check.
-pub struct CompletedGet {
-    pending: PendingGet,
-    result: Option<ReadCompletion>,
-    wait_ns: u64,
-}
-
-impl PendingGet {
-    /// Wait without holding the publication/index owner lock.
-    pub fn wait(self) -> CompletedGet {
-        let PendingGet { owner, state } = self;
-        match state {
-            GetState::Pending {
-                read,
-                reference,
-                ks,
-                key,
-            } => {
-                let started = Instant::now();
-                let result = read.finish();
-                CompletedGet {
-                    pending: PendingGet {
-                        owner,
-                        state: GetState::Resolved { reference, ks, key },
-                    },
-                    result: Some(result),
-                    wait_ns: elapsed(started),
-                }
-            }
-            state => CompletedGet {
-                pending: PendingGet { owner, state },
-                result: None,
-                wait_ns: 0,
-            },
-        }
-    }
-}
-impl RemoteDatabase {
-    /// Configure once before serving Sui requests. The finite budget counts
-    /// actor enqueue attempts after byte/request admission, including failures.
-    pub fn set_read_profile_limit(&mut self, limit: u64) {
-        self.core
-            .reads
-            .state
-            .diagnostics
-            .limit
-            .store(limit, Ordering::Relaxed);
-        self.core
-            .reads
-            .state
-            .diagnostics
-            .remaining
-            .store(limit, Ordering::Relaxed);
-        self.core.reads.state.coordinator_diagnostics.arm(limit);
-    }
-    /// Cumulative first-N sampled RPC counters, never per-request means.
-    /// Server spans nest inside exchange/service. Failures without a profiled
-    /// owner reply are explicitly counted as unavailable.
-    pub fn read_profile_monitor(&self) -> ReadProfileMonitor {
-        ReadProfileMonitor {
-            state: self.core.reads.state.clone(),
-        }
-    }
-    pub fn live_read_submission_count(&self) -> u64 {
-        self.core
-            .reads
-            .state
-            .live_read_submissions
-            .load(Ordering::Relaxed)
-    }
-    pub fn submit_record(
-        &mut self,
-        reference: ValueRecordReference,
-    ) -> Result<PendingRecord, LocalDbError> {
-        self.ensure_healthy()?;
-        let pin = self
-            .core
-            .index
-            .pin_cut(IndexReadCut::At(MutationVersion {
-                batch: reference.batch_version,
-                operation_index: reference.descriptor.operation_index,
-            }))
-            .map_err(LocalDbError::component)?;
-        let ready = self.core.read_cache.get_scan(&reference);
-        let read = if ready.is_none() {
-            let node = *self
-                .core
-                .partition_indexes
-                .get(&reference.batch_address.partition)
-                .ok_or_else(|| LocalDbError::new("reference names unregistered partition"))?;
-            Some(self.core.reads.submit_until(
-                node,
-                std::slice::from_ref(&reference),
-                0,
-                false,
-                ReadContext {
-                    pin: Some(pin),
-                    trace: None,
-                },
-            )?)
-        } else {
-            None
-        };
-        Ok(PendingRecord {
-            owner: self.core.reads.state.clone(),
-            reference,
-            ready,
-            read,
-        })
-    }
-
-    pub fn finish_record(
-        &mut self,
-        completed: CompletedRecord,
-        ks: KeySpace,
-        reduced_key: &[u8],
-    ) -> Result<Mutation, LocalDbError> {
-        self.core
-            .value_read_ns
-            .fetch_add(completed.wait_ns, Ordering::Relaxed);
-        if !Arc::ptr_eq(&self.core.reads.state, &completed.owner) {
-            return Err(LocalDbError::new("record belongs to another authority"));
-        }
-        self.ensure_healthy()?;
-        let mutation = completed.result.inspect_err(|error| self.poison(error))?;
-        if !matches!(mutation, Mutation::Put { .. })
-            || mutation.keyspace() != ks
-            || completed.reference.descriptor.keyspace != ks.0
-            || mutation
-                .point_key()
-                .is_none_or(|key| self.core.shape.ks(ks).reduce_key(key).as_ref() != reduced_key)
-        {
-            let error = LocalDbError::new("scan member does not match its live index reference");
-            self.poison(&error);
-            return Err(error);
-        }
-        self.ensure_healthy()?;
-        Ok(mutation)
-    }
-
-    #[allow(
-        clippy::expect_used,
-        reason = "the resolved state is only set with a detached completion"
-    )]
-    pub fn finish_ready_get(
-        &mut self,
-        completed: CompletedGet,
-    ) -> Result<Option<Bytes>, LocalDbError> {
-        self.core
-            .value_read_ns
-            .fetch_add(completed.wait_ns, Ordering::Relaxed);
-        self.check_handle(&completed.pending)?;
-        match completed.pending.state {
-            GetState::Ready(value) => Ok(value),
-            GetState::Resolved { reference, ks, key } => {
-                let values = completed
-                    .result
-                    .expect("resolved read has completion")
-                    .inspect_err(|error| self.poison(error))?;
-                self.complete_get(reference, ks, &key, values)
-            }
-            _ => Err(LocalDbError::new("read is not a detached completion")),
-        }
-    }
-    /// Submit at the current published cut without retaining a coordinator borrow.
-    /// Admission errors are side-effect-free; use `read_backpressured` to drain a
-    /// previous handle and retry. Cache hits allocate/copy no key or value bytes.
-    pub fn submit_get(&mut self, ks: KeySpace, key: &[u8]) -> Result<PendingGet, LocalDbError> {
-        self.submit_get_cut(ks, key, IndexReadCut::Latest)
-    }
-    pub fn read_backpressured(error: &LocalDbError) -> bool {
-        error.message() == BACKPRESSURE
-    }
-    pub fn submit_get_cut(
-        &mut self,
-        ks: KeySpace,
-        key: &[u8],
-        cut: IndexReadCut,
-    ) -> Result<PendingGet, LocalDbError> {
-        self.prepare_get(ks, key, cut, None, false)
-    }
-    #[allow(
-        clippy::expect_used,
-        reason = "inline and dispatch timers are armed on exactly the branch that reads them"
-    )]
-    pub(super) fn prepare_get(
-        &mut self,
-        ks: KeySpace,
-        key: &[u8],
-        cut: IndexReadCut,
-        mut profile: Option<&mut RemoteReadProfile>,
-        inline: bool,
-    ) -> Result<PendingGet, LocalDbError> {
-        let mut sample = self
-            .core
-            .reads
-            .state
-            .coordinator_diagnostics
-            .select(false, 1);
-        self.ensure_healthy()?;
-        let index_started = Instant::now();
-        let (reference, pin, cached) = {
-            // Resolve the cut once; the lookup and a miss's pin must see the
-            // same cut. No lock or guard is held past each call.
-            let cut = self.core.index.resolve_cut(cut);
-            let clock = ResolutionSample::start(&sample);
-            let reference = self
-                .core
-                .index
-                .get(ks, key, cut.clone())
-                .map_err(LocalDbError::component);
-            if let Some(sample) = &sample {
-                sample.stage(ResolutionStage::IndexLookup, clock);
-            }
-            let reference = match reference {
-                Ok(reference) => reference,
-                Err(error) => {
-                    if let Some(sample) = &sample {
-                        sample.member(MemberOutcome::Error);
-                    }
-                    return Err(error);
-                }
-            };
-            let cached = if let Some(reference) = reference {
-                let clock = ResolutionSample::start(&sample);
-                let cached = self.core.read_cache.get_point(&reference, ks, key);
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::CacheLookup, clock);
-                }
-                cached
-            } else {
-                None
-            };
-            let pin = if reference.is_some() && cached.is_none() {
-                let clock = ResolutionSample::start(&sample);
-                // The lookup is done: only the retention floor is pinned.
-                let pin = self
-                    .core
-                    .index
-                    .pin_call_floor(cut)
-                    .map_err(LocalDbError::component);
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::PinPreparation, clock);
-                }
-                Some(pin?)
-            } else {
-                None
-            };
-            if let Some(sample) = &sample {
-                sample.member(if reference.is_none() {
-                    MemberOutcome::IndexMiss
-                } else if cached.is_some() {
-                    MemberOutcome::CacheHit
-                } else {
-                    MemberOutcome::RemoteMiss
-                });
-            }
-            (reference, pin, cached)
-        };
-        let index_ns = elapsed(index_started);
-        self.core
-            .read_resolve_ns
-            .fetch_add(index_ns, Ordering::Relaxed);
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.index_ns += index_ns;
-        }
-        let state = if let Some(reference) = reference {
-            if let Some(value) = cached {
-                if let Some(sample) = &mut sample {
-                    sample.success();
-                }
-                drop(sample);
-                if let Some(profile) = profile {
-                    profile.cache_hits += 1;
-                }
-                GetState::Ready(Some(value))
-            } else {
-                let dispatch_started = profile.as_ref().map(|_| Instant::now());
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.cache_misses += 1;
-                }
-                let clock = ResolutionSample::start(&sample);
-                let node = self
-                    .core
-                    .partition_indexes
-                    .get(&reference.batch_address.partition)
-                    .copied()
-                    .ok_or_else(|| LocalDbError::new("reference names unregistered partition"));
-                if let Some(sample) = &sample {
-                    sample.stage(ResolutionStage::RoutePreparation, clock);
-                }
-                let node = node?;
-                if let Some(sample) = &mut sample {
-                    sample.success();
-                }
-                drop(sample);
-                let inline_started = inline.then(Instant::now);
-                let immediate = if inline {
-                    self.core
-                        .reads
-                        .read_inline(node, self.core.epoch, &reference, key.len(), pin.clone())
-                        .inspect_err(|error| {
-                            if !admission_error(error) {
-                                self.poison(error);
-                            }
-                        })?
-                } else {
-                    None
-                };
-                if let Some(values) = immediate {
-                    let elapsed = elapsed(inline_started.expect("inline read"));
-                    self.core
-                        .value_read_ns
-                        .fetch_add(elapsed, Ordering::Relaxed);
-                    if let Some(profile) = profile {
-                        profile.inline_read_ns += elapsed;
-                    }
-                    GetState::Ready(self.complete_get(reference, ks, key, values)?)
-                } else {
-                    let read = self.core.reads.submit(
-                        node,
-                        vec![reference],
-                        key.len(),
-                        profile.is_some(),
-                        pin,
-                    )?;
-                    if let Some(profile) = profile {
-                        profile.dispatch_ns += elapsed(dispatch_started.expect("dispatched read"));
-                    }
-                    GetState::Pending {
-                        read,
-                        reference,
-                        ks,
-                        key: key.to_vec().into(),
-                    }
-                }
-            }
-        } else {
-            if let Some(sample) = &mut sample {
-                sample.success();
-            }
-            drop(sample);
-            GetState::Ready(None)
-        };
-        self.ensure_healthy()?;
-        Ok(PendingGet {
-            owner: self.core.reads.state.clone(),
-            state,
-        })
-    }
-    pub(super) fn point_value(
-        ks: KeySpace,
-        key: &[u8],
-        mutation: Mutation,
-    ) -> Result<Option<Bytes>, LocalDbError> {
-        match mutation {
-            Mutation::Put {
-                keyspace,
-                key: actual,
-                value,
-            } if keyspace == ks && actual.as_ref() == key => Ok(Some(value)),
-            Mutation::Put { .. } => Ok(None),
-            Mutation::Delete { .. } => Err(LocalDbError::new(
-                "live index reference resolves to tombstone",
-            )),
-            Mutation::DropCells { .. } => Err(LocalDbError::new(
-                "DropCells does not have a value reference",
-            )),
-        }
-    }
-    fn check_handle(&mut self, pending: &PendingGet) -> Result<(), LocalDbError> {
-        if !Arc::ptr_eq(&self.core.reads.state, &pending.owner) {
-            return Err(LocalDbError::new(
-                "read handle belongs to another authority/epoch",
-            ));
-        }
-        // A read-service failure not yet seen by the core is a new detection:
-        // fail-stop the core once. A core-initiated failure (begin_failure
-        // stores concurrent_failure before poisoning reads) is finalized by
-        // its own thread; observers only return the recorded error and never
-        // re-enter finish_failure, whose publisher lock that thread may hold.
-        if self.core.reads.failed()
-            && !self
-                .core
-                .concurrent_failure
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.poison(&LocalDbError::new(failure_context(
-                &self.core.first_failure,
-                "asynchronous read failed; recovery required",
-            )));
-        }
-        self.ensure_healthy()
-    }
-    #[allow(
-        clippy::expect_used,
-        reason = "the count check above leaves exactly one member"
-    )]
-    fn complete_get(
-        &mut self,
-        reference: ValueRecordReference,
-        ks: KeySpace,
-        key: &[u8],
-        mut values: Vec<Mutation>,
-    ) -> Result<Option<Bytes>, LocalDbError> {
-        self.ensure_healthy()?;
-        if values.len() != 1 {
-            let error = LocalDbError::new("point read count mismatch");
-            self.poison(&error);
-            return Err(error);
-        }
-        let mutation = values.pop().expect("one verified member");
-        if matches!(mutation, Mutation::Delete { .. }) {
-            let error = LocalDbError::new("live index reference resolves to tombstone");
-            self.poison(&error);
-            return Err(error);
-        }
-        let prepared = self.core.read_cache.prepare_verified(reference, &mutation);
-        self.core.read_cache.insert_prepared(prepared);
-        let result = Self::point_value(ks, key, mutation);
-        self.ensure_healthy()?;
-        result
-    }
-    /// `None` means pending; `Some(None)` is a completed absence. A completion
-    /// consumes the handle's result exactly once and refunds retained capacity.
-    pub fn poll_get(
-        &mut self,
-        pending: &mut PendingGet,
-    ) -> Result<Option<Option<Bytes>>, LocalDbError> {
-        self.check_handle(pending)?;
-        let result = match &pending.state {
-            GetState::Ready(_) => {
-                let GetState::Ready(value) =
-                    std::mem::replace(&mut pending.state, GetState::Consumed)
-                else {
-                    unreachable!()
-                };
-                return Ok(Some(value));
-            }
-            GetState::Consumed | GetState::Resolved { .. } => {
-                return Err(LocalDbError::new("read handle already consumed"));
-            }
-            GetState::Pending { read, .. } => match read.try_result() {
-                Ok(Some(completion)) => Ok(completion),
-                // A queued read stays pending; only submitted I/O expires.
-                Ok(None)
-                    if read
-                        .io_deadline()
-                        .is_none_or(|deadline| Instant::now() < deadline) =>
-                {
-                    return Ok(None);
-                }
-                Ok(None) => {
-                    return Err(read.failure("remote read deadline expired or worker stopped"));
-                }
-                Err(error) => Err(error),
-            },
-        };
-        let state = std::mem::replace(&mut pending.state, GetState::Consumed);
-        let GetState::Pending {
-            reference,
-            ks,
-            key,
-            read,
-        } = state
-        else {
-            unreachable!()
-        };
-        self.core
-            .value_read_ns
-            .fetch_add(elapsed(read.admitted), Ordering::Relaxed);
-        let values = result?;
-        self.complete_get(reference, ks, &key, values).map(Some)
-    }
-    pub fn finish_get(&mut self, pending: PendingGet) -> Result<Option<Bytes>, LocalDbError> {
-        self.finish_get_profiled(pending, None)
-    }
-    #[allow(
-        clippy::expect_used,
-        reason = "wait_started is set whenever a profile samples this path"
-    )]
-    pub(super) fn finish_get_profiled(
-        &mut self,
-        pending: PendingGet,
-        profile: Option<&mut RemoteReadProfile>,
-    ) -> Result<Option<Bytes>, LocalDbError> {
-        self.check_handle(&pending)?;
-        match pending.state {
-            GetState::Ready(value) => Ok(value),
-            GetState::Pending {
-                read,
-                reference,
-                ks,
-                key,
-            } => {
-                let value_started = read.admitted;
-                let wait_started = profile.as_ref().map(|_| Instant::now());
-                let result = read.finish();
-                self.core
-                    .value_read_ns
-                    .fetch_add(elapsed(value_started), Ordering::Relaxed);
-                let values = result.inspect_err(|error| self.poison(error))?;
-                if let Some(profile) = profile {
-                    profile.wait_ns += elapsed(wait_started.expect("profiled wait"));
-                }
-                self.complete_get(reference, ks, &key, values)
-            }
-            GetState::Consumed | GetState::Resolved { .. } => {
-                Err(LocalDbError::new("read handle already consumed"))
-            }
-        }
-    }
-}
-
 mod concurrent;
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod live_worker_tests {
-    use super::*;
-    use crate::distributed::remote_db::pipeline_tests::Fixture;
-
-    #[test]
-    fn live_grant_barrier_waits_for_lane_owner() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_lanes = Some(1);
-        let db = fixture.open();
-        let lanes = db.core.reads.lanes.read()[0].clone();
-        let client = lanes[0].client.clone();
-        let base = lanes[0].index;
-        let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
-        // Every lane is live since R3: stop the fixture's own reactor for this
-        // node so that two workers never drive the same lanes.
-        let (detached, _) = mpsc::sync_channel(1);
-        db.core.reads.sender.lock()[0] = detached;
-        let fixture_reactor = db.core.reads.thread.lock().remove(0);
-        fixture_reactor.join().unwrap();
-        let state = db.core.reads.state.clone();
-        let epoch = db.core.reads.epoch;
-        let max_requests = db.core.reads.max_requests;
-        let held = client.lock();
-        let worker = thread::spawn(move || {
-            drive_live_reads(state, receiver, lanes, 0, base, epoch, max_requests)
-        });
-        let (reply, response) = mpsc::sync_channel(1);
-        assert!(sender.send(ReadCommand::DrainLive(reply)).is_ok());
-        assert!(matches!(
-            response.recv_timeout(Duration::from_millis(20)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(held);
-        assert!(
-            response
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .is_ok()
-        );
-        drop(sender);
-        worker.join().unwrap();
-        assert!(!db.core.reads.failed());
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn retirement_pause_preserves_outstanding_read_and_can_retry() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_cache_bytes = 0;
-        fixture.config.read_lanes = Some(1);
-        let db = fixture.open();
-        db.write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
-            .unwrap();
-        let reference = db
-            .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
-            .unwrap()
-            .unwrap();
-        let node = db.core.partition_indexes[&reference.batch_address.partition];
-        let lane = db.core.reads.lane_client(node, 0);
-        let held = lane.lock();
-        let request = db
-            .core
-            .reads
-            .submit(node, vec![reference], 0, false, None)
-            .unwrap();
-        assert!(db.core.reads.pause_idle_nvmeof(false).is_err());
-        assert!(!db.core.reads.failed());
-        drop(held);
-        let values = request.finish().unwrap();
-        assert_eq!(values, vec![super::tests::put(0, 7)]);
-        drop(db.core.reads.pause_idle_nvmeof(false).unwrap());
-        db.shutdown().unwrap();
-    }
-
-    #[test]
-    fn missing_and_before_all_cut_do_not_send_live_payload_work() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_lanes = Some(1);
-        fixture.config.read_cache_bytes = 0;
-        let original = fixture.open();
-        original
-            .write_batch(fixture.operation(0, 0), vec![super::tests::put(0, 7)])
-            .unwrap();
-        let db = ConcurrentRemoteDatabase::new(original).unwrap();
-        // Every lane is live since R3: stop the fixture's own reactors before
-        // driving the same lanes, so that two lane workers never share one
-        // lane (an exiting fixture worker would shut down the lane's live
-        // cache under the test's worker and poison the read service).
-        let nodes = db.reads.lanes.read().len();
-        for node in 0..nodes {
-            let (detached, _) = mpsc::sync_channel(1);
-            db.reads.sender.lock()[node] = detached;
-        }
-        let fixture_reactors: Vec<_> = db.reads.thread.lock().drain(..).collect();
-        for reactor in fixture_reactors {
-            reactor.join().unwrap();
-        }
-        assert!(!db.reads.failed());
-        let mut workers = Vec::new();
-        for (node, lanes) in db.reads.lanes.read().iter().enumerate() {
-            let lanes = lanes.clone();
-            let base = lanes[0].index;
-            let (sender, receiver) = mpsc::sync_channel(db.reads.max_requests + 1);
-            let state = db.reads.state.clone();
-            let epoch = db.reads.epoch;
-            let max_requests = db.reads.max_requests;
-            workers.push(thread::spawn(move || {
-                drive_live_reads(state, receiver, lanes, node, base, epoch, max_requests)
-            }));
-            db.reads.sender.lock()[node] = sender;
-        }
-        // Every live lane client is configured since R3, so an accidentally
-        // submitted payload read would succeed: count submissions instead.
-        let keys = [0u32.to_be_bytes(), 2u32.to_be_bytes(), 0u32.to_be_bytes()];
-        let before = db
-            .get_many_cut(KeySpace(0), &keys, IndexReadCut::BeforeAll)
-            .unwrap();
-        assert!(before.into_iter().all(|result| matches!(result, Ok(None))));
-        let missing = db
-            .get_many_cut(KeySpace(0), &[2u32.to_be_bytes()], IndexReadCut::Latest)
-            .unwrap();
-        assert!(missing.into_iter().all(|result| matches!(result, Ok(None))));
-        assert!(!db.reads.failed());
-        assert_eq!(db.live_read_submission_count(), 0);
-        assert_eq!(*db.reads.state.retained.lock(), (0, 0));
-        db.reads.sender.lock().clear();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        db.shutdown().unwrap();
-    }
-
-    /// At least five references on one owner, each in its own flight.
-    fn one_owner_references(
-        fixture: &Fixture,
-        db: &RemoteDatabase,
-    ) -> (usize, Vec<ValueRecordReference>) {
-        // A batch holds at most four operations; two batches put eight members
-        // on one owner.
-        for batch in 0u32..2 {
-            let writes: Vec<_> = (batch * 4..batch * 4 + 4)
-                .map(|key| super::tests::put(key, 7))
-                .collect();
-            db.write_batch(fixture.operation(0, u64::from(batch)), writes)
-                .unwrap();
-        }
-        let references: Vec<_> = (0u32..8)
-            .map(|key| {
-                db.index_reference(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect();
-        let node = db.core.partition_indexes[&references[0].batch_address.partition];
-        let same_owner: Vec<_> = references
-            .into_iter()
-            .filter(|reference| {
-                db.core.partition_indexes[&reference.batch_address.partition] == node
-            })
-            .take(6)
-            .collect();
-        assert!(same_owner.len() >= 5, "need distinct flights on one lane");
-        (node, same_owner)
-    }
-
-    /// A live read actor for `node` whose single lane has a two-entry inbox.
-    /// Its worker parks at the unlocked top of its loop, after its first idle
-    /// receive and before it takes a lane mutex or drains the inbox, until
-    /// `resume` is sent. A parked worker receives nothing.
-    struct PausedLiveActor {
-        sender: mpsc::SyncSender<ReadCommand>,
-        parked: mpsc::Receiver<()>,
-        resume: mpsc::SyncSender<()>,
-        client: Arc<Mutex<Client>>,
-        actor: JoinHandle<()>,
-    }
-
-    fn paused_live_actor(db: &RemoteDatabase, node: usize) -> PausedLiveActor {
-        let lanes = db.core.reads.lanes.read()[node].clone();
-        let base = lanes[0].index;
-        let client = lanes[0].client.clone();
-        let (sender, receiver) = mpsc::sync_channel(db.core.reads.max_requests + 1);
-        db.core.reads.sender.lock()[node] = sender.clone();
-        // Replacing the sender stops the fixture's own reactor for this node.
-        // Join it so it cannot take the worker pause hook installed below.
-        let fixture_reactor = db.core.reads.thread.lock().remove(node);
-        fixture_reactor.join().unwrap();
-        let state = db.core.reads.state.clone();
-        let epoch = db.core.reads.epoch;
-        let (entered, parked) = mpsc::sync_channel(1);
-        let (resume, resumed) = mpsc::sync_channel(1);
-        *db.core.reads.state.reactor_pause[node].lock() = Some((entered, resumed));
-        let actor =
-            thread::spawn(move || drive_live_reads(state, receiver, lanes, node, base, epoch, 2));
-        PausedLiveActor {
-            sender,
-            parked,
-            resume,
-            client,
-            actor,
-        }
-    }
-
-    fn submit_one(
-        db: &RemoteDatabase,
-        node: usize,
-        reference: &ValueRecordReference,
-    ) -> ReadRequest {
-        db.core
-            .reads
-            .submit(node, vec![*reference], 0, false, None)
-            .unwrap()
-    }
-
-    /// Wait until the actor takes a wake sent now. The actor takes commands in
-    /// order and retries its overflow queue at the top of each loop, so after
-    /// this returns it has handled every earlier command.
-    fn actor_takes_wake(db: &RemoteDatabase, node: usize, sender: &mpsc::SyncSender<ReadCommand>) {
-        db.core.reads.state.wake_pending[node].store(true, Ordering::Release);
-        assert!(sender.try_send(ReadCommand::Wake).is_ok());
-        let deadline = Instant::now() + db.core.config.timeout;
-        while db.core.reads.state.wake_pending[node].load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < deadline,
-                "the actor blocked on a full lane"
-            );
-            thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn full_lane_inbox_never_blocks_the_actor() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_lanes = Some(1);
-        fixture.config.read_cache_bytes = 0;
-        let db = fixture.open();
-        let (node, same_owner) = one_owner_references(&fixture, &db);
-        // Once the worker is parked the inbox depth counter equals the inbox
-        // occupancy. While the worker is still taking requests the counter
-        // may run up to two above the inbox capacity: see `LiveLane`.
-        let paused = paused_live_actor(&db, node);
-        let mut pending = vec![submit_one(&db, node, &same_owner[0])];
-        // The worker parks after taking the first request, or after its idle
-        // wait if that request arrives later; it takes nothing while parked.
-        paused.parked.recv_timeout(db.core.config.timeout).unwrap();
-        pending.extend(
-            same_owner[1..]
-                .iter()
-                .map(|reference| submit_one(&db, node, reference)),
-        );
-        // The actor has offered every request above, and found the lane full,
-        // before it takes this wake: a full lane does not block the actor.
-        actor_takes_wake(&db, node, &paused.sender);
-        let diagnostics = &db.core.reads.state.diagnostics;
-        assert!(diagnostics.live_lane_full.load(Ordering::Relaxed) >= 1);
-        // The inbox held exactly its capacity. The parked worker holds at
-        // most the first request, so the actor queued every other request
-        // beyond the two inbox entries.
-        assert_eq!(diagnostics.live_lane_depth_max.load(Ordering::Relaxed), 2);
-        assert!(
-            diagnostics.live_lane_pending_max.load(Ordering::Relaxed)
-                >= same_owner.len() as u64 - 3
-        );
-        paused.resume.send(()).unwrap();
-        // Every live client is configured since R3: each queued request
-        // completes with its one member; none may be lost.
-        for request in pending {
-            assert_eq!(request.finish().unwrap().len(), 1);
-        }
-        assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
-        drop(paused.sender);
-        db.core.reads.sender.lock().clear();
-        paused.actor.join().unwrap();
-        drop(db);
-    }
-
-    #[test]
-    fn poisoned_live_worker_fails_inbox_requests_promptly() {
-        let mut fixture = Fixture::new();
-        fixture.config.read_lanes = Some(1);
-        fixture.config.read_cache_bytes = 0;
-        let db = fixture.open();
-        let (node, same_owner) = one_owner_references(&fixture, &db);
-        let paused = paused_live_actor(&db, node);
-        // With nothing submitted the worker parks after its idle wait, holding
-        // no request; the inbox is empty.
-        paused.parked.recv_timeout(db.core.config.timeout).unwrap();
-        let mut pending: VecDeque<_> = same_owner
-            .iter()
-            .map(|reference| submit_one(&db, node, reference))
-            .collect();
-        // Requests 0 and 1 fill the inbox; the actor queues the rest.
-        actor_takes_wake(&db, node, &paused.sender);
-        db.core.reads.state.poison();
-        // Resumed, the worker drains the inbox, failing 0 and 1 as poisoned,
-        // then blocks on the held client mutex without receiving.
-        let held = paused.client.lock();
-        paused.resume.send(()).unwrap();
-        for _ in 0..2 {
-            assert!(pending.pop_front().unwrap().finish().is_err());
-        }
-        // The first wake may be taken by a loop that retried the overflow
-        // queue before that drain; the loop taking the second one retried it
-        // after, so the inbox again holds two requests the worker never takes.
-        actor_takes_wake(&db, node, &paused.sender);
-        actor_takes_wake(&db, node, &paused.sender);
-        let started = Instant::now();
-        // The worker now sees the poison and exits with a full inbox.
-        drop(held);
-        for request in pending {
-            let error = request
-                .finish()
-                .expect_err("a poisoned live read must fail");
-            assert!(
-                error.to_string().contains("poisoned")
-                    || error.to_string().contains("live read worker stopped"),
-                "{error}"
-            );
-        }
-        // A request left in the inbox would only fail at its deadline, one
-        // configured timeout after submission.
-        assert!(started.elapsed() < db.core.config.timeout / 2);
-        assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
-        drop(paused.sender);
-        db.core.reads.sender.lock().clear();
-        paused.actor.join().unwrap();
-        drop(db);
-    }
-}

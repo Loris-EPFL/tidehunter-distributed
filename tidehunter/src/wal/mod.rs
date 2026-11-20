@@ -620,6 +620,59 @@ impl Wal {
         }))
     }
 
+    /// Plan a whole native frame, header included, for a valid position.
+    ///
+    /// [`Self::plan_record_payload_range`] plans a sub-range of one frame's
+    /// payload. A hybrid member read transfers the frame itself, because the
+    /// reader verifies the member CRC over `frame[8..]` and decodes the header;
+    /// this planner returns exactly `[length][crc][payload]`. It refuses direct
+    /// I/O and a frame that crosses a file boundary, like the payload planner.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn plan_frame(
+        &self,
+        position: WalPosition,
+    ) -> Result<Option<WalMemberReadPlan>, WalError> {
+        let invalid = || {
+            WalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid independently verified frame position",
+            ))
+        };
+        let len = position.frame_len();
+        let frame_end = position
+            .offset()
+            .checked_add(len as u64)
+            .ok_or_else(invalid)?;
+        if !position.is_valid()
+            || len < CrcFrame::CRC_HEADER_LENGTH
+            || self.layout.locate(position.offset()).0 != self.layout.locate(frame_end - 1).0
+            || self.layout.direct_io
+        {
+            return Err(invalid());
+        }
+        let file = self
+            .files
+            .load()
+            .get_checked(self.layout.locate_file(position.offset()))
+            .cloned();
+        Ok(file.map(|file| WalMemberReadPlan {
+            file,
+            offset: self.layout.offset_in_wal_file(position.offset()),
+            len: len as usize,
+        }))
+    }
+
+    /// The offset of `position` inside its WAL file, from the layout that owns the
+    /// file arithmetic.
+    ///
+    /// The leased value path holds its own file handle for an open extent, so it
+    /// needs the offset without a file-map lookup; calling this keeps one source of
+    /// geometry with [`Self::plan_frame`] instead of a second `% wal_file_bytes`.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn offset_in_file(&self, position: WalPosition) -> u64 {
+        self.layout.offset_in_wal_file(position.offset())
+    }
+
     #[cfg(feature = "experimental-distributed")]
     pub(crate) fn read_record_payload_range(
         &self,

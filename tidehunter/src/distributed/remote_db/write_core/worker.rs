@@ -1,11 +1,45 @@
 // The transport worker uses its enclosing database's private control types.
 #[allow(clippy::wildcard_imports)]
 use super::super::*;
+use super::allocation::ExtentQueue;
+use crate::distributed::hybrid::loader::AllocationView;
+
+/// Move every per-batch extent the leased writer allocated since the last call
+/// into this stream's allocation queue, in WAL offset order.
+///
+/// A frame is written contiguously by one worker, so reservation order is
+/// offset order. A frame whose reservation is not yet recorded only makes the
+/// next snapshot's `replay_from` over-wide (its `tail` is the end of the last
+/// recorded extent, which is where the unrecorded frame starts), never narrow;
+/// a reservation is what lets the queue drop an extent the snapshot's stored
+/// cut already covers.
+///
+/// The queue's cap hits are republished here, the only place the queue grows, so
+/// `PipelineStats::allocation_cap_hits` is readable without touching the worker
+/// thread's state.
+fn record_lease_reservations(
+    client: &mut Client,
+    queue: &mut ExtentQueue,
+    accounting: &WorkerAccounting,
+) {
+    client.take_lease_reservations(|version, address| {
+        let end = address
+            .offset
+            .checked_add(u64::from(address.len))
+            .unwrap_or(u64::MAX);
+        queue.reserve(version, address.offset, end);
+    });
+    accounting.record_allocation_cap_hits(queue.cap_hits());
+}
 
 impl ClientWorker {
     #[allow(
         clippy::expect_used,
         reason = "parked checkpoints, positions and queued controls are owned by this loop alone"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "construction takes the bounded control channels, the shared diagnostics and the one allocation stream; a builder would duplicate this list without removing a parameter"
     )]
     pub(in crate::distributed::remote_db) fn start(
         mut client: Client,
@@ -13,6 +47,10 @@ impl ClientWorker {
         failure: Arc<std::sync::atomic::AtomicBool>,
         diagnostics: WorkerDiagnostics,
         completion: Arc<dyn AppendCompletion>,
+        allocations: Arc<AllocationView>,
+        stream: u32,
+        allocation_generation: u64,
+        allocation_capacity: std::num::NonZeroUsize,
     ) -> std::io::Result<Self> {
         let WorkerDiagnostics {
             timeout,
@@ -26,6 +64,10 @@ impl ClientWorker {
         client.trace_controls(Arc::clone(&write_timeline), partition);
         let worker_wake = Arc::new(crate::distributed::sys::eventfd()?);
         client.set_worker_wake(std::os::fd::AsRawFd::as_raw_fd(&*worker_wake));
+        // The hybrid index needs every owner allocation (position and replay
+        // start); recording is opt-in so no other route retains an entry, and the
+        // worker drains it after each submission.
+        client.enable_lease_reservations();
         let thread_wake = Arc::clone(&worker_wake);
         let leased_write_window = client.leased_write_window();
         let client = Arc::new(Mutex::new(client));
@@ -39,10 +81,22 @@ impl ClientWorker {
         let caller_failure = Arc::clone(&failure);
         #[cfg(test)]
         let caller_first_failure = Arc::clone(&first_failure);
+        #[cfg(test)]
+        let test_allocation = Arc::clone(&allocations);
         let thread = thread::Builder::new()
             .name("value-wal-tcp".into())
             .spawn(move || {
                 let _thread_wake = thread_wake;
+                // The per-stream extent queue belongs to this thread alone (plan
+                // Amendment 14): it reserves on submission and drops extents only
+                // on a cold `DrainTo`, so it needs no lock.
+                let mut allocations = ExtentQueue::new(
+                    allocations,
+                    stream,
+                    partition,
+                    allocation_generation,
+                    allocation_capacity,
+                );
                 let mut write_profile_limit = write_profile_limit;
                 let mut profile_enabled = false;
                 let mut profile_requests = 0usize;
@@ -90,6 +144,7 @@ impl ClientWorker {
                             WorkerItem::Control(Command::Stats(_))
                             | WorkerItem::Control(Command::ArmProfile(..))
                             | WorkerItem::Control(Command::OwnerTimelineArm(..))
+                            | WorkerItem::Control(Command::DrainTo(..))
                             | WorkerItem::Control(Command::FinishProfile(_)) => {
                                 client.wait_leased_control(released, Some(&write_timeline))
                             }
@@ -357,6 +412,11 @@ impl ClientWorker {
                             queued.is_empty(),
                         ) {
                             Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
+                                record_lease_reservations(
+                                    &mut client,
+                                    &mut allocations,
+                                    &worker_accounting,
+                                );
                                 if let Some(counters) = client.live_counters() {
                                     counters.record_deferred_submit();
                                 }
@@ -590,6 +650,11 @@ impl ClientWorker {
                                 queued.is_empty(),
                             ) {
                                 Ok(crate::distributed::tcp::LeasedSubmit::Submitted(id)) => {
+                                    record_lease_reservations(
+                                        &mut client,
+                                        &mut allocations,
+                                        &worker_accounting,
+                                    );
                                     if let Some(counters) = client.live_counters() {
                                         counters.record_submit_ready_left(left, frame_full);
                                     }
@@ -799,6 +864,11 @@ impl ClientWorker {
                                         }
                                         WorkerItem::Control(Command::Control(_)) => {}
                                         WorkerItem::Control(Command::QueueReady) => {}
+                                        // The ack sender is dropped: the snapshot
+                                        // sees a disconnect and treats the drain as
+                                        // unperformed instead of covering a failed
+                                        // queue.
+                                        WorkerItem::Control(Command::DrainTo(..)) => {}
                                     }
                                 }
                                 break;
@@ -853,6 +923,7 @@ impl ClientWorker {
                             | Some(WorkerItem::Control(Command::Seal(_, _)))
                             | Some(WorkerItem::Control(Command::ArmProfile(_, _)))
                             | Some(WorkerItem::Control(Command::FinishProfile(_)))
+                            | Some(WorkerItem::Control(Command::DrainTo(..)))
                             | Some(WorkerItem::Control(Command::Control(_))) => {
                                 if let Some(command) = queued.front()
                                     && !prepare_leased_command(
@@ -867,6 +938,21 @@ impl ClientWorker {
                                 match queued.pop_front().expect("front control exists") {
                                     WorkerItem::Control(Command::Control(operation)) => {
                                         operation(&mut client)
+                                    }
+                                    WorkerItem::Control(Command::DrainTo(target, ack)) => {
+                                        // Cold path, at most once per real snapshot
+                                        // store. Reserve everything the writer has
+                                        // allocated first, then treat the
+                                        // snapshot's stored cut as authoritative:
+                                        // every extent below it is covered by the
+                                        // region and must not be replayed.
+                                        record_lease_reservations(
+                                            &mut client,
+                                            &mut allocations,
+                                            &worker_accounting,
+                                        );
+                                        allocations.drain_to(target);
+                                        let _ = ack.send(Ok(()));
                                     }
                                     WorkerItem::Control(Command::Stats(reply)) => {
                                         let _ = reply
@@ -1047,6 +1133,8 @@ impl ClientWorker {
             partition,
             #[cfg(test)]
             test_completion: None,
+            #[cfg(test)]
+            allocation: test_allocation,
         })
     }
 }

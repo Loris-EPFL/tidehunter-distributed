@@ -75,6 +75,14 @@ fn worker_with_completion(
             .unwrap(),
         },
         route,
+        Arc::new(crate::distributed::hybrid::loader::AllocationView::new(1)),
+        0,
+        fixture.config.partition.inventory.epoch,
+        crate::distributed::hybrid::loader::allocation_capacity(
+            64 * 1024 * 1024,
+            4096,
+            max_pending,
+        ),
     )
     .unwrap();
     worker.test_completion = Some(sink);
@@ -856,7 +864,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 config.storage.max_reference_metadata_bytes = 64 * 1024 * 1024;
                 config.timeout = Duration::from_secs(5);
                 config.max_admitted_batches = 16;
-                config.index_shards = 2;
                 config.max_pending_batches = 16;
                 config.max_pending_bytes = 4 * 1024 * 1024;
                 config.replay_limits = ReplayLimits {

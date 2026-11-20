@@ -7,15 +7,19 @@ use crate::key_shape::{KeySpace, KeySpaceDesc};
 use minibytes::Bytes;
 use std::sync::Arc;
 
-/// Backing store a [`DbIterator`] walks: either a live [`Db`] or a
-/// point-in-time [`DbCheckpoint`]. Holding the `Arc` keeps the source alive
-/// for the iterator's lifetime — for a checkpoint that also pins its latch.
-/// `ks`/`next_cell` are identical for both; only `next_entry` differs (the
-/// checkpoint filters to its frontier), so the read-mode distinction does not
-/// leak into the iterator logic.
+/// Backing store a [`DbIterator`] walks: a live [`Db`], a point-in-time
+/// [`DbCheckpoint`], or a database whose index lives outside the native `Db`
+/// (the distributed hybrid keeps it in the coordinator's `LargeTable`).
+/// Holding the `Arc` keeps the source alive for the iterator's lifetime — for a
+/// checkpoint that also pins its latch. `ks`/`next_cell` are identical for all
+/// three; only `next_entry` differs (the checkpoint filters to its frontier and
+/// the distributed source reads values by position), so the read-mode
+/// distinction does not leak into the iterator logic.
 pub(crate) enum IterationSource {
     Db(Arc<Db>),
     Checkpoint(Arc<DbCheckpoint>),
+    #[cfg(feature = "experimental-distributed")]
+    Distributed(Arc<dyn crate::iterators::DistributedIterSource>),
 }
 
 impl IterationSource {
@@ -23,6 +27,8 @@ impl IterationSource {
         match self {
             IterationSource::Db(db) => db.ks_desc(ks),
             IterationSource::Checkpoint(cp) => cp.ks(ks),
+            #[cfg(feature = "experimental-distributed")]
+            IterationSource::Distributed(source) => source.ks(ks),
         }
     }
 
@@ -30,6 +36,8 @@ impl IterationSource {
         match self {
             IterationSource::Db(db) => db.next_cell(ks, cell, reverse),
             IterationSource::Checkpoint(cp) => cp.next_cell(ks, cell, reverse),
+            #[cfg(feature = "experimental-distributed")]
+            IterationSource::Distributed(source) => source.next_cell(ks, cell, reverse),
         }
     }
 
@@ -48,6 +56,10 @@ impl IterationSource {
             }
             IterationSource::Checkpoint(cp) => {
                 cp.next_entry(ks, cell, prev_key, end_cell_exclusive, reverse, cache)
+            }
+            #[cfg(feature = "experimental-distributed")]
+            IterationSource::Distributed(source) => {
+                source.next_entry(ks, cell, prev_key, end_cell_exclusive, reverse, cache)
             }
         }
     }
@@ -307,6 +319,168 @@ mod tests {
         assert_eq!(
             saturated_increment_vec(&[255, 255, 255]).as_ref(),
             &[255, 255, 255]
+        );
+    }
+}
+
+/// The distributed source drives the same native walk: bounds, reversal and
+/// error handling live in `DbIterator`, so they must behave identically over
+/// any `DistributedIterSource`. The source here is a one-cell in-memory index.
+#[cfg(all(test, feature = "experimental-distributed"))]
+mod distributed_source_tests {
+    use super::*;
+    use crate::db::DbError;
+    use crate::iterators::DistributedIterSource;
+    use crate::key_shape::{KeyShape, KeyType};
+    use std::collections::BTreeMap;
+    use std::ops::Bound;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// One cell holding `rows`; `next_entry` answers strictly after (forward) or
+    /// strictly before (reverse) `prev_key`, exactly as the native index does.
+    struct OneCellSource {
+        shape: KeyShape,
+        rows: BTreeMap<Vec<u8>, Vec<u8>>,
+        calls: AtomicUsize,
+        /// Fail the `next_entry` call with this zero-based index.
+        fail_at: Option<usize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for OneCellSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl DistributedIterSource for OneCellSource {
+        fn ks(&self, ks: KeySpace) -> &KeySpaceDesc {
+            self.shape.ks(ks)
+        }
+
+        fn next_cell(&self, _ks: &KeySpaceDesc, _cell: &CellId, _reverse: bool) -> Option<CellId> {
+            None
+        }
+
+        fn next_entry(
+            &self,
+            _ks: KeySpace,
+            cell: CellId,
+            prev_key: Option<Bytes>,
+            _end_cell_exclusive: &Option<CellId>,
+            reverse: bool,
+            _cache: &mut IndexIterCaches,
+        ) -> DbResult<Option<IteratorResult<Bytes>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_at == Some(call) {
+                return Err(DbError::Io(std::io::Error::other(
+                    "injected source failure",
+                )));
+            }
+            let prev = prev_key.map(|key| key.to_vec());
+            let row = match (&prev, reverse) {
+                (Some(prev), false) => self
+                    .rows
+                    .range::<Vec<u8>, _>((Bound::Excluded(prev), Bound::Unbounded))
+                    .next(),
+                (None, false) => self.rows.iter().next(),
+                (Some(prev), true) => self
+                    .rows
+                    .range::<Vec<u8>, _>((Bound::Unbounded, Bound::Excluded(prev)))
+                    .next_back(),
+                (None, true) => self.rows.iter().next_back(),
+            };
+            Ok(row.map(|(key, value)| IteratorResult {
+                cell: Some(cell),
+                key: Bytes::from(key.clone()),
+                value: Bytes::from(value.clone()),
+            }))
+        }
+    }
+
+    fn key(n: u8) -> Vec<u8> {
+        let mut key = vec![0u8; 8];
+        key[7] = n;
+        key
+    }
+
+    fn iterator_over(rows: &[u8], fail_at: Option<usize>) -> (DbIterator, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = OneCellSource {
+            shape: KeyShape::new_single(8, 1, KeyType::uniform(1)),
+            rows: rows.iter().map(|n| (key(*n), vec![*n])).collect(),
+            calls: AtomicUsize::new(0),
+            fail_at,
+            dropped: Arc::clone(&dropped),
+        };
+        let iterator = DbIterator::new(IterationSource::Distributed(Arc::new(source)), KeySpace(0));
+        (iterator, dropped)
+    }
+
+    fn ids(iterator: DbIterator) -> Vec<u8> {
+        iterator
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                assert_eq!(value.as_ref(), &[key[7]], "value belongs to its key");
+                key[7]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forward_and_reverse_walk_the_whole_source() {
+        let (forward, _) = iterator_over(&[1, 2, 3, 4, 5], None);
+        assert_eq!(ids(forward), [1, 2, 3, 4, 5]);
+        let (mut reverse, _) = iterator_over(&[1, 2, 3, 4, 5], None);
+        reverse.reverse();
+        assert_eq!(ids(reverse), [5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn bounds_are_inclusive_below_and_exclusive_above_in_both_directions() {
+        let (mut forward, _) = iterator_over(&[1, 2, 3, 4, 5, 6], None);
+        forward.set_lower_bound(key(2));
+        forward.set_upper_bound(key(5));
+        assert_eq!(ids(forward), [2, 3, 4]);
+
+        let (mut reverse, _) = iterator_over(&[1, 2, 3, 4, 5, 6], None);
+        reverse.reverse();
+        reverse.set_lower_bound(key(2));
+        reverse.set_upper_bound(key(5));
+        assert_eq!(ids(reverse), [4, 3, 2]);
+    }
+
+    #[test]
+    fn empty_source_and_empty_range_yield_nothing() {
+        let (empty, _) = iterator_over(&[], None);
+        assert!(ids(empty).is_empty());
+        let (mut narrow, _) = iterator_over(&[1, 9], None);
+        narrow.set_lower_bound(key(3));
+        narrow.set_upper_bound(key(5));
+        assert!(ids(narrow).is_empty());
+    }
+
+    #[test]
+    fn a_source_error_is_yielded_once_and_ends_the_walk() {
+        let (mut iterator, _) = iterator_over(&[1, 2, 3, 4], Some(2));
+        assert_eq!(iterator.next().unwrap().unwrap().0[7], 1);
+        assert_eq!(iterator.next().unwrap().unwrap().0[7], 2);
+        assert!(iterator.next().unwrap().is_err());
+        assert!(iterator.next().is_none());
+    }
+
+    #[test]
+    fn the_source_lives_exactly_as_long_as_the_iterator() {
+        let (mut iterator, dropped) = iterator_over(&[1, 2], None);
+        assert_eq!(iterator.next().unwrap().unwrap().0[7], 1);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "a live iterator keeps its source (and any cut latch it owns)"
+        );
+        drop(iterator);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the iterator releases the source and its latch"
         );
     }
 }

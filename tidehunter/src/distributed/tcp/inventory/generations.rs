@@ -227,14 +227,32 @@ impl NodeInventory {
             self.manifest.epochs.partition_point(|e| e.epoch <= after)
         });
         let remaining = &self.manifest.epochs[start..];
-        let entries: Vec<_> = remaining
-            .iter()
-            .take(limit)
-            .map(|e| InventoryGeneration {
+        let mut entries = Vec::with_capacity(limit.min(remaining.len()));
+        for e in remaining.iter().take(limit) {
+            let state = owner_state(e.state);
+            let durable_end = match self.logs.get(&e.epoch) {
+                Some(log) => log.synced_frontier(),
+                // Owner open creates or recovers a log for every Sealed and Active
+                // generation. Reporting 0 for one would read as an empty stream
+                // (covered, trim-eligible, nothing to relocate), so refuse instead.
+                None if matches!(
+                    state,
+                    OwnerGenerationState::Sealed | OwnerGenerationState::Active
+                ) =>
+                {
+                    return Err(TcpError::new(format!(
+                        "owner {} holds no log for generation {}",
+                        self.config.partition.partition, e.epoch
+                    )));
+                }
+                None => 0,
+            };
+            entries.push(InventoryGeneration {
                 generation: e.epoch,
-                state: owner_state(e.state),
-            })
-            .collect();
+                state,
+                durable_end,
+            });
+        }
         let next = (remaining.len() > limit)
             .then(|| entries.last().map(|e| e.generation))
             .flatten();

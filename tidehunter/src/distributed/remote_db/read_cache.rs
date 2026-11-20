@@ -1,35 +1,41 @@
 //! Bounded, derivative cache of verified immutable Value-WAL members.
 //!
-//! Paper §3.2 keeps the index authoritative and follows its WAL position for a
-//! read. Here the key is the *entire* published reference: database, operation,
-//! logical version, physical generation/address and both member/batch digests.
-//! An overwrite, delete, checkpoint cut or reused offset cannot select a stale
-//! entry merely because its user key or offset matches. Fill only after the
-//! authenticated storage client has verified membership and member integrity.
+//! The native index is authoritative and yields the position of a read's newest
+//! write. Here the cache key is that write's *logical identity* only: the batch
+//! version and the member's operation index. The physical address is excluded on
+//! purpose, because relocation re-points a value's address without changing the
+//! version, and a re-pointed value must still hit its cached bytes. Key bytes are
+//! not retained either: the index already has the key, so an entry holds the
+//! decoded value bytes alone.
+//!
+//! Membership and integrity are settled before insertion: the read path verified
+//! the coordinator's per-member CRC-32 and decoded the native entry with the
+//! native helper. Reference digests and per-member identity checksums are not
+//! part of the hybrid design (owner-accepted parity weakening).
 //!
 //! This cache is private to one open authority and starts empty after replay.
-//! Authoritative index cuts and read pins gate retention and reclamation before
-//! lookup. A cached reference cannot authorize an expired cut or make a retired
-//! WAL file reachable. As in native `DecompressCache::get`, a cached
-//! good copy is not evidence of current node health or absence of later disk
+//! The native checkpoint latch and the index cut decide which position a read
+//! resolves to; a cached identity cannot authorize an expired cut or make a
+//! retired WAL file reachable. As in native `DecompressCache::get`, a cached good
+//! copy is not evidence of current node health or absence of later disk
 //! corruption, and must never be used as a durability acknowledgement.
 //!
 //! RocksDB's unique file identity plus offset cache keys inspire exact immutable
 //! identity; its CLOCK cache and Tidehunter's native decompression cache inspire
-//! second-chance eviction. A flat four-way table stores handles and full-reference
+//! second-chance eviction. A flat four-way table stores handles and identity
 //! tags. Tag matches dereference one Entry; full equality still decides a hit.
 //!
 //! # Concurrency
 //!
 //! The cache is `N` independent shards (power of two, chosen once at
-//! construction, never persisted). A reference routes to its shard by a stable
-//! hash of its operation id and member index ([`StableHasher`], never
-//! `RandomState`). A shard owns its CLOCK table, admission history and byte
-//! budget (`budget / N`); no operation touches two shards, so there is no lock
-//! order to respect. Each table sits behind its own mutex whose critical
-//! section is one bounded probe or insertion: no I/O or callback. Payload
-//! detachment stays outside the lock. A vacant slot allocates one small Entry;
-//! replacement reuses that slot's Box. Hits allocate nothing.
+//! construction, never persisted). An identity routes to its shard by a stable
+//! hash of the logical version ([`StableHasher`], never `RandomState`). A shard
+//! owns its CLOCK table, admission history and byte budget (`budget / N`); no
+//! operation touches two shards, so there is no lock order to respect. Each table
+//! sits behind its own mutex whose critical section is one bounded probe or
+//! insertion: no I/O or callback. Payload detachment stays outside the lock. A
+//! vacant slot allocates one small Entry; replacement reuses that slot's Box.
+//! Hits allocate nothing.
 //!
 //! Counters are per-shard relaxed atomics in their own cache line, outside the
 //! mutex, and are summed on read. Statistics never lock. A disabled cache has
@@ -42,24 +48,24 @@
 //!
 //! # Retained memory
 //!
-//! Every fill copies key and value into exact-size allocations before it is
+//! Every fill copies the value into an exact-size allocation before it is
 //! admitted (`detach`), whatever backs the caller's `Bytes`. A value that is a
 //! slice of a pooled or aligned read block (live/sealed NVMe-oF reads, up to
 //! several KiB for a 1 KiB value) therefore never pins that block, and the
 //! charged payload equals the bytes the cache really retains. There is no
 //! size threshold: the copy cost is one small memcpy per admitted fill.
 //!
-//! Every live entry pays key/value bytes, the existing nonempty byte-owner
-//! headers, and `size_of::<Entry>() + ENTRY_ALLOCATOR_BYTES`. The 8-byte Entry
-//! allowance models a 216-byte Box in a 224-byte glibc chunk on this build.
+//! Every live entry pays value bytes, the existing nonempty byte-owner header,
+//! and `size_of::<Entry>() + ENTRY_ALLOCATOR_BYTES`. The 8-byte Entry allowance
+//! models a 216-byte Box in a 224-byte glibc chunk on this build.
 //! This is an accounting model, not an RSS bound: allocator rounding of byte
 //! owners, instrumentation, shard locks and caller-held clones remain outside it.
 //! Per-slot fixed bytes are one optional Box handle, one u64 tag and one history
 //! item (32 bytes here). For shard budget b, allocate
 //! `4 * floor(b / (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE) / 4)` slots.
-//! The minimum realistic charge uses a 32-byte key and 64-byte value (384 bytes
-//! here). Fixed arrays use at most 7.70% of b. No payload floor is reserved per
-//! slot. Disabled tiny caches allocate no slot arrays. CLOCK uses at most 64 steps.
+//! The minimum realistic charge uses a 64-byte value. Fixed arrays use at most
+//! 7.70% of b. No payload floor is reserved per slot. Disabled tiny caches
+//! allocate no slot arrays. CLOCK uses at most 64 steps.
 //!
 //! Sources:
 //! <https://github.com/facebook/rocksdb/blob/main/cache/cache_key.h>
@@ -67,77 +73,24 @@
 //! Admission adapts CacheLib's bounded RejectFirstAP access history, but keeps
 //! first-touch probationary entries for native-style read-after-write. A reused
 //! entry beats a first-touch candidate; repeated misses can earn admission.
-//! F2 §7's second chance is applied to exact references, not mutable key chains.
+//! Second chance is applied to exact identities, not mutable key chains.
 //! <https://github.com/facebook/CacheLib/blob/a24370092f0bd6fa7145b2f01c3e50e63edd6a6e/cachelib/allocator/NvmAdmissionPolicy.h#L175-L249>.
 //! FASTER Appendix D and F2 §7 likewise use a bounded read-hot copy while the
-//! log/index remains authoritative. Placement hashes the full reference; full
-//! immutable-reference equality still decides a hit, including when a physical
-//! generation differs or tags collide.
+//! log/index remains authoritative. Placement hashes the identity; full
+//! immutable-identity equality still decides a hit, including when a physical
+//! address differs or tags collide.
 //! <https://doi.org/10.1145/3183713.3196898> (FASTER, Appendix D)
 //! <https://arxiv.org/abs/2305.01516v3> (F2, §7)
 //! <https://github.com/microsoft/garnet/blob/v1.0.82/libs/storage/Tsavorite/cs/src/core/Index/Tsavorite/Implementation/ReadCache.cs>
 
-use super::Mutation;
-use super::ValueRecordReference;
 use crate::distributed::shard_lock::{ShardLockStats, ShardMutex, StableHasher};
-use crate::distributed::sui::kv_capture;
-use crate::distributed::types::RecordKind;
+use crate::distributed::types::MutationVersion;
 use minibytes::Bytes;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-#[cfg(test)]
-mod trace_eval;
-
-#[derive(Clone, Copy, Default)]
-struct CacheLayout {
-    #[cfg(test)]
-    placement_seed: Option<u64>,
-}
-
-#[cfg(not(test))]
-type PlacementState = RandomState;
-
-#[cfg(test)]
-enum PlacementState {
-    Random(RandomState),
-    Seeded(u64),
-}
-
-#[cfg(test)]
-impl BuildHasher for PlacementState {
-    type Hasher = std::collections::hash_map::DefaultHasher;
-
-    fn build_hasher(&self) -> Self::Hasher {
-        match self {
-            Self::Random(state) => state.build_hasher(),
-            Self::Seeded(seed) => {
-                let mut hasher = Self::Hasher::new();
-                hasher.write_u64(*seed);
-                hasher
-            }
-        }
-    }
-}
-
-impl CacheLayout {
-    fn placement(self) -> PlacementState {
-        #[cfg(not(test))]
-        {
-            RandomState::new()
-        }
-        #[cfg(test)]
-        {
-            self.placement_seed.map_or_else(
-                || PlacementState::Random(RandomState::new()),
-                PlacementState::Seeded,
-            )
-        }
-    }
-}
 
 const WAYS: usize = 4;
 // Bound insertion latency independently of configured capacity.
@@ -150,7 +103,19 @@ const FIXED_SLOT_BYTES: usize =
     size_of::<Option<Box<Entry>>>() + size_of::<u64>() + size_of::<AccessHistory>();
 // Size the fixed arrays for a 32-byte key and a 64-byte value. Smaller records
 // can reach the slot ceiling; larger records reach the byte ceiling first.
-const MIN_ENTRY_CHARGE: usize = ENTRY_BYTES + 32 + 64 + 2 * BYTE_OWNER_BYTES;
+const COMPUTED_MIN_ENTRY_CHARGE: usize = ENTRY_BYTES + 32 + 64 + 2 * BYTE_OWNER_BYTES;
+// The fixed slot arrays are metadata held outside the byte budget: they may
+// not exceed 8 % of (metadata + charged bytes) even for the smallest record, so
+// the charge of one entry is floored at the value that makes the ratio exactly
+// 8 % (`FIXED * 92 / 8`, rounded up). Cost: very small entries hold fewer slots
+// per byte of budget.
+const BUDGET_MIN_ENTRY_CHARGE: usize = (FIXED_SLOT_BYTES * 92).div_ceil(8);
+const MIN_ENTRY_CHARGE: usize = if COMPUTED_MIN_ENTRY_CHARGE > BUDGET_MIN_ENTRY_CHARGE {
+    COMPUTED_MIN_ENTRY_CHARGE
+} else {
+    BUDGET_MIN_ENTRY_CHARGE
+};
+const _: () = assert!(FIXED_SLOT_BYTES * 100 <= (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE) * 8);
 // `Bytes::from_owner(Box<[u8]>)` owns an Arc allocation containing a box header
 // and its strong/weak counts, plus the exactly sized byte allocation itself.
 const BYTE_OWNER_BYTES: usize = size_of::<Box<[u8]>>() + 2 * size_of::<usize>();
@@ -211,20 +176,28 @@ struct AccessHistory {
     observations: u8,
 }
 
+/// Immutable logical identity of a cached member, with its keyspace.
+///
+/// The physical address is deliberately absent: relocation rewrites only the
+/// address, so a re-pointed value must still hit its cached bytes. The keyspace
+/// is part of the key because per-keyspace admission, protection and statistics
+/// are decided on it and the cache does not retain the user key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    identity: MutationVersion,
+    keyspace: u8,
+}
+
 struct Entry {
-    reference: ValueRecordReference,
-    mutation: Mutation,
+    key: CacheKey,
+    value: Bytes,
     benefit: u8,
     protected: bool,
 }
 
 impl Entry {
     fn payload_bytes(&self) -> usize {
-        let descriptor = self.reference.descriptor;
-        descriptor.key_len as usize
-            + descriptor.value_len as usize
-            + BYTE_OWNER_BYTES
-                * (usize::from(descriptor.key_len != 0) + usize::from(descriptor.value_len != 0))
+        self.value.len() + BYTE_OWNER_BYTES * usize::from(!self.value.is_empty())
     }
 
     fn charge(&self) -> usize {
@@ -233,8 +206,8 @@ impl Entry {
 }
 
 pub(super) struct PreparedEntry {
-    reference: ValueRecordReference,
-    mutation: Mutation,
+    key: CacheKey,
+    value: Bytes,
     payload_bytes: usize,
     fingerprint: u64,
 }
@@ -245,14 +218,13 @@ pub(super) struct PreparedEntry {
 pub(super) enum InsertPreparation {
     Prepared(PreparedEntry),
     Disabled,
-    Mismatch,
     Oversize,
     Admission,
 }
 
 /// A preparation bound to the shard that admitted it. Insertion must reach the
 /// same shard, because the entry's placement fingerprint is shard-local.
-pub(super) struct ShardedPreparation {
+pub(crate) struct ShardedPreparation {
     shard: usize,
     preparation: InsertPreparation,
 }
@@ -279,7 +251,6 @@ pub struct ReadCacheStats {
     pub inserts: u64,
     pub evictions: u64,
     pub rejected_oversize: u64,
-    pub rejected_mismatch: u64,
     pub bypass_disabled: u64,
     pub bypass_admission: u64,
     pub bypass_eviction_limit: u64,
@@ -303,7 +274,6 @@ impl ReadCacheStats {
         self.inserts += other.inserts;
         self.evictions += other.evictions;
         self.rejected_oversize += other.rejected_oversize;
-        self.rejected_mismatch += other.rejected_mismatch;
         self.bypass_disabled += other.bypass_disabled;
         self.bypass_admission += other.bypass_admission;
         self.bypass_eviction_limit += other.bypass_eviction_limit;
@@ -352,7 +322,6 @@ struct ShardCounters {
     inserts: AtomicU64,
     evictions: AtomicU64,
     rejected_oversize: AtomicU64,
-    rejected_mismatch: AtomicU64,
     bypass_disabled: AtomicU64,
     bypass_admission: AtomicU64,
     bypass_eviction_limit: AtomicU64,
@@ -379,7 +348,6 @@ impl ShardCounters {
             inserts: AtomicU64::default(),
             evictions: AtomicU64::default(),
             rejected_oversize: AtomicU64::default(),
-            rejected_mismatch: AtomicU64::default(),
             bypass_disabled: AtomicU64::default(),
             bypass_admission: AtomicU64::default(),
             bypass_eviction_limit: AtomicU64::default(),
@@ -414,7 +382,6 @@ impl ShardCounters {
         match preparation {
             InsertPreparation::Prepared(_) => {}
             InsertPreparation::Disabled => bump(&self.bypass_disabled),
-            InsertPreparation::Mismatch => bump(&self.rejected_mismatch),
             InsertPreparation::Oversize => bump(&self.rejected_oversize),
             InsertPreparation::Admission => bump(&self.bypass_admission),
         }
@@ -427,7 +394,6 @@ impl ShardCounters {
             &self.inserts,
             &self.evictions,
             &self.rejected_oversize,
-            &self.rejected_mismatch,
             &self.bypass_disabled,
             &self.bypass_admission,
             &self.bypass_eviction_limit,
@@ -457,7 +423,6 @@ impl ShardCounters {
             inserts: load(&self.inserts),
             evictions: load(&self.evictions),
             rejected_oversize: load(&self.rejected_oversize),
-            rejected_mismatch: load(&self.rejected_mismatch),
             bypass_disabled: load(&self.bypass_disabled),
             bypass_admission: load(&self.bypass_admission),
             bypass_eviction_limit: load(&self.bypass_eviction_limit),
@@ -488,7 +453,7 @@ struct CacheTable {
     tags: Box<[u64]>,
     history: Box<[AccessHistory]>,
     history_clock: usize,
-    hash: PlacementState,
+    hash: RandomState,
     clock: usize,
     policy: ReadCachePolicy,
     budget_bytes: usize,
@@ -517,19 +482,13 @@ impl CacheTable {
 
     #[cfg(test)]
     fn new_with_policy(budget_bytes: usize, policy: ReadCachePolicy) -> Self {
-        Self::with_counters(
-            budget_bytes,
-            policy,
-            Arc::new(ShardCounters::new()),
-            CacheLayout::default(),
-        )
+        Self::with_counters(budget_bytes, policy, Arc::new(ShardCounters::new()))
     }
 
     fn with_counters(
         budget_bytes: usize,
         policy: ReadCachePolicy,
         counters: Arc<ShardCounters>,
-        layout: CacheLayout,
     ) -> Self {
         let slot_count = Self::slot_count(budget_bytes);
         let slots: Box<[_]> = (0..slot_count).map(|_| None).collect();
@@ -542,7 +501,7 @@ impl CacheTable {
             tags,
             history,
             history_clock: 0,
-            hash: layout.placement(),
+            hash: RandomState::new(),
             clock: 0,
             policy,
             budget_bytes,
@@ -575,35 +534,17 @@ impl CacheTable {
         (fingerprint as usize % (self.slots.len() / WAYS)) * WAYS
     }
 
-    // Seed operation placement with RandomState, then fold every remaining
-    // reference field into the tag. This is not a cryptographic identity check:
-    // full equality remains mandatory, even when folded tags collide.
-    fn fingerprint(&self, reference: &ValueRecordReference) -> u64 {
+    // Seed identity placement with RandomState, then fold every identity field
+    // into the tag. This is not an identity check: full equality remains
+    // mandatory, even when folded tags collide.
+    fn fingerprint(&self, key: &CacheKey) -> u64 {
         let mut hasher = self.hash.build_hasher();
-        reference.batch_id.operation.hash(&mut hasher);
-        reference.descriptor.operation_index.hash(&mut hasher);
-        let mut tag = hasher.finish();
-        for word in reference.batch_id.database.as_chunks::<8>().0 {
-            tag ^= u64::from_le_bytes(*word);
-        }
-        for word in reference.batch_digest.0.as_chunks::<8>().0 {
-            tag ^= u64::from_le_bytes(*word).rotate_left(17);
-        }
-        let descriptor = reference.descriptor;
-        tag ^ reference.batch_version.epoch.rotate_left(3)
-            ^ reference.batch_version.sequence.rotate_left(7)
-            ^ reference.batch_address.segment_generation.rotate_left(11)
-            ^ reference.batch_address.offset.rotate_left(19)
-            ^ (u64::from(reference.batch_address.partition) << 32
-                | u64::from(reference.batch_address.len))
-            .rotate_left(23)
-            ^ (u64::from(descriptor.offset) << 32 | u64::from(descriptor.len)).rotate_left(29)
-            ^ (u64::from(descriptor.key_len) << 32 | u64::from(descriptor.value_offset))
-                .rotate_left(31)
-            ^ (u64::from(descriptor.value_len) << 32 | u64::from(descriptor.checksum.0))
-                .rotate_left(37)
-            ^ u64::from(descriptor.keyspace).rotate_left(41)
-            ^ u64::from(descriptor.kind == RecordKind::Delete).rotate_left(43)
+        key.identity.hash(&mut hasher);
+        hasher.finish()
+            ^ key.identity.batch.epoch.rotate_left(3)
+            ^ key.identity.batch.sequence.rotate_left(7)
+            ^ u64::from(key.identity.operation_index).rotate_left(11)
+            ^ u64::from(key.keyspace).rotate_left(17)
     }
 
     fn observe(&mut self, fingerprint: u64) -> u8 {
@@ -619,51 +560,27 @@ impl CacheTable {
         }
         history.observations
     }
-    fn get(&mut self, reference: &ValueRecordReference) -> Option<Mutation> {
-        self.lookup(reference, true)
-    }
 
-    fn get_scan(&mut self, reference: &ValueRecordReference) -> Option<Mutation> {
-        self.lookup(reference, false)
-    }
-
-    /// Scalar hits verify the requested key in place and retain only the value
-    /// owner. Exact-reference lookup remains the authority; the key comparison
-    /// prevents a same-reference association error from becoming a false hit.
-    fn get_point(
-        &mut self,
-        reference: &ValueRecordReference,
-        keyspace: crate::key_shape::KeySpace,
-        key: &[u8],
-    ) -> Option<Bytes> {
-        let found = if reference.descriptor.keyspace == keyspace.0 && !self.slots.is_empty() {
-            let fingerprint = self.fingerprint(reference);
+    /// Return the value bytes of `key`, or `None` when absent.
+    ///
+    /// The index already holds the user key, so a resident identity is a hit
+    /// without comparing keys; the value is the only payload retained.
+    fn get(&mut self, key: &CacheKey) -> Option<Bytes> {
+        let found = if !self.slots.is_empty() {
+            let fingerprint = self.fingerprint(key);
             let start = self.set_start(fingerprint);
             let found = self.slots[start..start + WAYS]
                 .iter_mut()
                 .zip(&self.tags[start..start + WAYS])
                 .filter(|(_, tag)| **tag == fingerprint)
                 .filter_map(|(slot, _)| slot.as_mut())
-                .find(|entry| entry.reference == *reference)
-                .and_then(|entry| {
-                    if let Mutation::Put {
-                        keyspace: stored_keyspace,
-                        key: stored_key,
-                        value,
-                    } = &entry.mutation
-                    {
-                        if *stored_keyspace == keyspace && stored_key.as_ref() == key {
-                            entry.benefit = entry.benefit.saturating_add(1).min(3);
-                            Some((value.clone(), entry.payload_bytes()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                .find(|entry| entry.key == *key)
+                .map(|entry| {
+                    entry.benefit = entry.benefit.saturating_add(1).min(3);
+                    (entry.value.clone(), entry.payload_bytes())
                 });
-            // Resident hits update their entry benefit; history is for misses
-            // that may earn admission after repeated demand.
+            // Only a miss feeds admission history, matching the scalar path the
+            // RejectFirst policy was calibrated on.
             if found.is_none() {
                 self.observe(fingerprint);
             }
@@ -672,49 +589,16 @@ impl CacheTable {
             None
         };
         if let Some((value, payload_bytes)) = found {
-            self.counters
-                .record_hit(reference.descriptor.keyspace, payload_bytes);
+            self.counters.record_hit(key.keyspace, payload_bytes);
             Some(value)
         } else {
-            self.counters.record_miss(reference.descriptor.keyspace);
+            self.counters.record_miss(key.keyspace);
             None
         }
     }
 
-    fn lookup(&mut self, reference: &ValueRecordReference, track_access: bool) -> Option<Mutation> {
-        let found = if !self.slots.is_empty() {
-            let fingerprint = self.fingerprint(reference);
-            if track_access {
-                self.observe(fingerprint);
-            }
-            let start = self.set_start(fingerprint);
-            self.slots[start..start + WAYS]
-                .iter_mut()
-                .zip(&self.tags[start..start + WAYS])
-                .filter(|(_, tag)| **tag == fingerprint)
-                .filter_map(|(slot, _)| slot.as_mut())
-                .find(|entry| entry.reference == *reference)
-                .map(|entry| {
-                    if track_access {
-                        entry.benefit = entry.benefit.saturating_add(1).min(3);
-                    }
-                    (entry.mutation.clone(), entry.payload_bytes())
-                })
-        } else {
-            None
-        };
-        if let Some((mutation, payload_bytes)) = found {
-            self.counters
-                .record_hit(reference.descriptor.keyspace, payload_bytes);
-            Some(mutation)
-        } else {
-            self.counters.record_miss(reference.descriptor.keyspace);
-            None
-        }
-    }
-
-    fn preflight(&mut self, reference: &ValueRecordReference, payload_bytes: usize) -> Option<u64> {
-        let protected = self.policy.protected_keyspace == Some(reference.descriptor.keyspace);
+    fn preflight(&mut self, key: &CacheKey, payload_bytes: usize) -> Option<u64> {
+        let protected = self.policy.protected_keyspace == Some(key.keyspace);
         let reserve = if protected {
             0
         } else {
@@ -727,7 +611,7 @@ impl CacheTable {
         if payload_bytes + ENTRY_BYTES > limit {
             return None;
         }
-        let fingerprint = self.fingerprint(reference);
+        let fingerprint = self.fingerprint(key);
         let history = &self.history[fingerprint as usize % self.history.len()];
         if history.observations != 0 && history.fingerprint == fingerprint {
             return Some(fingerprint);
@@ -735,8 +619,7 @@ impl CacheTable {
         let start = self.set_start(fingerprint);
         if self.slots[start..start + WAYS].iter().any(|slot| {
             slot.as_ref().is_none_or(|entry| {
-                entry.reference == *reference
-                    || (entry.benefit == 0 && self.can_evict_entry(entry, protected))
+                entry.key == *key || (entry.benefit == 0 && self.can_evict_entry(entry, protected))
             })
         }) {
             return Some(fingerprint);
@@ -767,32 +650,18 @@ impl CacheTable {
     /// preflight under the shard mutex; everything else here is lock-free.
     fn prepare_with(
         budget_bytes: usize,
-        reference: ValueRecordReference,
-        mutation: &Mutation,
+        key: CacheKey,
+        value: &Bytes,
         admit: impl FnOnce(usize) -> Option<u64>,
     ) -> InsertPreparation {
         let metadata_bytes = Self::metadata_bytes(budget_bytes);
         if metadata_bytes == 0 {
             return InsertPreparation::Disabled;
         }
-        let descriptor = reference.descriptor;
-        // A DropCells member has no value reference and is never cached.
-        let (kind, key, value_len) = match mutation {
-            Mutation::Put { key, value, .. } => (RecordKind::Put, key, value.len()),
-            Mutation::Delete { key, .. } => (RecordKind::Delete, key, 0),
-            Mutation::DropCells { .. } => return InsertPreparation::Mismatch,
-        };
-        if descriptor.kind != kind
-            || descriptor.keyspace != mutation.keyspace().0
-            || descriptor.key_len as usize != key.len()
-            || descriptor.value_len as usize != value_len
-        {
-            return InsertPreparation::Mismatch;
-        }
-        let Some(payload_bytes) = key.len().checked_add(value_len).and_then(|n| {
-            let owners = usize::from(!key.is_empty()) + usize::from(value_len > 0);
-            n.checked_add(owners * BYTE_OWNER_BYTES)
-        }) else {
+        let Some(payload_bytes) = value
+            .len()
+            .checked_add(BYTE_OWNER_BYTES * usize::from(!value.is_empty()))
+        else {
             return InsertPreparation::Oversize;
         };
         if payload_bytes
@@ -804,36 +673,19 @@ impl CacheTable {
         let Some(fingerprint) = admit(payload_bytes) else {
             return InsertPreparation::Admission;
         };
-        let mutation = match mutation {
-            Mutation::Put {
-                keyspace,
-                key,
-                value,
-            } => Mutation::Put {
-                keyspace: *keyspace,
-                key: detach(key),
-                value: detach(value),
-            },
-            Mutation::Delete { keyspace, key } => Mutation::Delete {
-                keyspace: *keyspace,
-                key: detach(key),
-            },
-            Mutation::DropCells { .. } => return InsertPreparation::Mismatch,
-        };
         InsertPreparation::Prepared(PreparedEntry {
-            reference,
-            mutation,
+            key,
+            value: detach(value),
             payload_bytes,
             fingerprint,
         })
     }
 
     #[cfg(test)]
-    fn insert_verified(&mut self, reference: ValueRecordReference, mutation: &Mutation) -> bool {
-        let prepared =
-            Self::prepare_with(self.budget_bytes, reference, mutation, |payload_bytes| {
-                self.preflight(&reference, payload_bytes)
-            });
+    fn insert_verified(&mut self, key: CacheKey, value: &Bytes) -> bool {
+        let prepared = Self::prepare_with(self.budget_bytes, key, value, |payload_bytes| {
+            self.preflight(&key, payload_bytes)
+        });
         self.insert_prepared(prepared)
     }
 
@@ -855,18 +707,18 @@ impl CacheTable {
     )]
     fn insert_entry(&mut self, prepared: PreparedEntry) -> bool {
         let PreparedEntry {
-            reference,
-            mutation,
+            key,
+            value,
             payload_bytes,
             fingerprint,
         } = prepared;
-        let keyspace_id = reference.descriptor.keyspace as usize;
-        let protected = self.policy.protected_keyspace == Some(keyspace_id as u8);
+        let keyspace_id = usize::from(key.keyspace);
+        let protected = self.policy.protected_keyspace == Some(key.keyspace);
         let start = self.set_start(fingerprint);
         if self.slots[start..start + WAYS]
             .iter()
             .flatten()
-            .any(|entry| entry.reference == reference)
+            .any(|entry| entry.key == key)
         {
             return true;
         }
@@ -936,8 +788,8 @@ impl CacheTable {
         }
         let allocation = self.remove_entry(slot);
         let entry = Entry {
-            reference,
-            mutation,
+            key,
+            value,
             benefit: u8::from(seen >= 2),
             protected,
         };
@@ -1024,18 +876,13 @@ impl CacheTable {
         }
         self.counters.entries.fetch_sub(1, Ordering::Relaxed);
         bump(&self.counters.evictions);
-        bump(
-            &self
-                .counters
-                .keyspace(entry.reference.descriptor.keyspace)
-                .evictions,
-        );
+        bump(&self.counters.keyspace(entry.key.keyspace).evictions);
         Some(entry)
     }
 
     #[cfg(test)]
-    fn set_start_for_ref(&self, reference: &ValueRecordReference) -> usize {
-        self.set_start(self.fingerprint(reference))
+    fn set_start_for_key(&self, key: &CacheKey) -> usize {
+        self.set_start(self.fingerprint(key))
     }
 }
 
@@ -1053,14 +900,13 @@ struct CacheShard {
 }
 
 /// The sharded cache. See the module documentation for the concurrency model.
-pub(super) struct ReadCache {
+pub(crate) struct ReadCache {
     shards: Box<[CacheShard]>,
     mask: usize,
     shard_budget_bytes: usize,
     shard_metadata_bytes: usize,
     budget_bytes: usize,
     enabled: bool,
-    layout: CacheLayout,
 }
 
 impl ReadCache {
@@ -1078,45 +924,22 @@ impl ReadCache {
         shards * CacheTable::metadata_bytes(budget_bytes / shards)
     }
 
-    pub(super) fn new(budget_bytes: usize) -> Self {
+    pub(crate) fn new(budget_bytes: usize) -> Self {
         Self::new_with_policy(budget_bytes, ReadCachePolicy::default())
     }
 
     pub(super) fn new_with_policy(budget_bytes: usize, policy: ReadCachePolicy) -> Self {
-        Self::build(
-            budget_bytes,
-            policy,
-            Self::shard_count_for(budget_bytes),
-            CacheLayout::default(),
-        )
+        Self::build(budget_bytes, policy, Self::shard_count_for(budget_bytes))
     }
 
     /// `shards` must be a nonzero power of two; callers pass constants.
     #[cfg(test)]
     fn new_with_shards(budget_bytes: usize, policy: ReadCachePolicy, shards: usize) -> Self {
         assert!(shards.is_power_of_two(), "shard count is a power of two");
-        Self::build(budget_bytes, policy, shards, CacheLayout::default())
+        Self::build(budget_bytes, policy, shards)
     }
 
-    #[cfg(test)]
-    fn new_seeded(budget_bytes: usize, seed: u64) -> Self {
-        let layout = CacheLayout {
-            placement_seed: Some(seed),
-        };
-        Self::build(
-            budget_bytes,
-            ReadCachePolicy::default(),
-            Self::shard_count_for(budget_bytes),
-            layout,
-        )
-    }
-
-    fn build(
-        budget_bytes: usize,
-        policy: ReadCachePolicy,
-        shards: usize,
-        layout: CacheLayout,
-    ) -> Self {
+    fn build(budget_bytes: usize, policy: ReadCachePolicy, shards: usize) -> Self {
         let shard_budget_bytes = budget_bytes / shards;
         let shard_metadata_bytes = CacheTable::metadata_bytes(shard_budget_bytes);
         let shards_vec: Box<[CacheShard]> = (0..shards)
@@ -1127,7 +950,6 @@ impl ReadCache {
                         shard_budget_bytes,
                         policy,
                         Arc::clone(&counters),
-                        layout,
                     )),
                     counters,
                 }
@@ -1140,7 +962,6 @@ impl ReadCache {
             shard_metadata_bytes,
             budget_bytes,
             enabled: shard_metadata_bytes != 0,
-            layout,
         }
     }
 
@@ -1149,117 +970,78 @@ impl ReadCache {
         self.enabled
     }
 
-    /// Stable routing: operation id and member index. Independent of the
+    /// Stable routing: logical version and member index. Independent of the
     /// per-table placement hash, which keeps its own random seed.
-    fn route(&self, reference: &ValueRecordReference) -> usize {
+    fn route(&self, identity: MutationVersion) -> usize {
         let hash = StableHasher::new()
-            .bytes(&reference.batch_id.operation)
-            .bytes(&reference.descriptor.operation_index.to_le_bytes())
+            .bytes(&identity.batch.epoch.to_le_bytes())
+            .bytes(&identity.batch.sequence.to_le_bytes())
+            .bytes(&identity.operation_index.to_le_bytes())
             .finish();
         (hash as usize) & self.mask
     }
 
-    pub(super) fn get(&self, reference: &ValueRecordReference) -> Option<Mutation> {
-        let shard = &self.shards[self.route(reference)];
+    /// Value bytes for `identity`, or `None` when it is not resident.
+    pub(crate) fn get(&self, identity: MutationVersion, keyspace: u8) -> Option<Bytes> {
+        let key = CacheKey { identity, keyspace };
+        let shard = &self.shards[self.route(identity)];
         if !self.enabled {
-            shard.counters.record_miss(reference.descriptor.keyspace);
-            kv_capture::reference(12, reference, None, 2, 0);
+            shard.counters.record_miss(keyspace);
             return None;
         }
-        let result = shard.table.lock().get(reference);
-        kv_capture::reference(12, reference, None, u64::from(result.is_some()), 0);
-        result
+        shard.table.lock().get(&key)
     }
 
-    pub(super) fn get_scan(&self, reference: &ValueRecordReference) -> Option<Mutation> {
-        let shard = &self.shards[self.route(reference)];
-        if !self.enabled {
-            shard.counters.record_miss(reference.descriptor.keyspace);
-            kv_capture::reference(12, reference, None, 2, 1);
-            return None;
-        }
-        let result = shard.table.lock().get_scan(reference);
-        kv_capture::reference(12, reference, None, u64::from(result.is_some()), 1);
-        result
-    }
-
-    pub(super) fn get_point(
+    /// Prepare a fill with the value bytes the read path just verified.
+    ///
+    /// The cache retains only the value; a tombstone or a missing member is
+    /// never inserted, so `None` never needs an entry of its own.
+    pub(crate) fn prepare(
         &self,
-        reference: &ValueRecordReference,
-        keyspace: crate::key_shape::KeySpace,
-        key: &[u8],
-    ) -> Option<Bytes> {
-        let shard = &self.shards[self.route(reference)];
-        if !self.enabled {
-            shard.counters.record_miss(reference.descriptor.keyspace);
-            kv_capture::reference(12, reference, Some(key), 2, 0);
-            return None;
-        }
-        let result = shard.table.lock().get_point(reference, keyspace, key);
-        kv_capture::reference(12, reference, Some(key), u64::from(result.is_some()), 0);
-        result
-    }
-
-    /// Admit only a mutation returned by the verified storage-client read of
-    /// this exact reference, or a canonical mutation bound to an authenticated
-    /// durable receipt after successful contiguous publication. Shape checks
-    /// catch association errors; they do not replace either provenance proof.
-    /// Rejections leave serving correctness and the existing entry untouched.
-    /// Advisory preflight precedes detached allocation. No slot reservation or
-    /// guard crosses copying, and insertion rechecks current cache state.
-    pub(super) fn prepare_verified(
-        &self,
-        reference: ValueRecordReference,
-        mutation: &Mutation,
+        identity: MutationVersion,
+        keyspace: u8,
+        value: &Bytes,
     ) -> ShardedPreparation {
-        let shard = self.route(&reference);
+        let key = CacheKey { identity, keyspace };
+        let shard = self.route(identity);
         let table = &self.shards[shard].table;
         let preparation =
-            CacheTable::prepare_with(self.shard_budget_bytes, reference, mutation, |payload| {
-                table.lock().preflight(&reference, payload)
+            CacheTable::prepare_with(self.shard_budget_bytes, key, value, |payload| {
+                table.lock().preflight(&key, payload)
             });
-        trace_preparation(&reference, mutation, &preparation, false);
         ShardedPreparation { shard, preparation }
     }
 
+    /// Warm the cache from a published put, exactly as native's
+    /// `DecompressCache` fills after a write. Shape checks are unnecessary: the
+    /// caller hands the bytes it just published and verified.
     pub(super) fn prepare_post_publish(
         &self,
-        reference: ValueRecordReference,
-        mutation: &Mutation,
+        identity: MutationVersion,
+        keyspace: u8,
+        value: &Bytes,
     ) -> ShardedPreparation {
-        let shard = self.route(&reference);
+        let key = CacheKey { identity, keyspace };
+        let shard = self.route(identity);
         let table = &self.shards[shard].table;
         let preparation =
-            CacheTable::prepare_with(self.shard_budget_bytes, reference, mutation, |payload| {
+            CacheTable::prepare_with(self.shard_budget_bytes, key, value, |payload| {
                 let mut table = table.lock();
-                if table
-                    .policy
-                    .skips_post_publish_warming(reference.descriptor.keyspace)
-                {
+                if table.policy.skips_post_publish_warming(keyspace) {
                     None
                 } else {
-                    table.preflight(&reference, payload)
+                    table.preflight(&key, payload)
                 }
             });
-        trace_preparation(&reference, mutation, &preparation, true);
         ShardedPreparation { shard, preparation }
     }
 
     /// Only a prepared entry reaches a table. Every rejection is counted with
     /// atomics alone, so a disabled cache never locks here.
-    pub(super) fn insert_prepared(&self, prepared: ShardedPreparation) -> bool {
+    pub(crate) fn insert_prepared(&self, prepared: ShardedPreparation) -> bool {
         let shard = &self.shards[prepared.shard & self.mask];
         match prepared.preparation {
-            InsertPreparation::Prepared(entry) => {
-                if kv_capture::enabled() {
-                    let reference = entry.reference;
-                    let inserted = shard.table.lock().insert_entry(entry);
-                    kv_capture::reference(14, &reference, None, u64::from(inserted), 0);
-                    inserted
-                } else {
-                    shard.table.lock().insert_entry(entry)
-                }
-            }
+            InsertPreparation::Prepared(entry) => shard.table.lock().insert_entry(entry),
             rejected => {
                 shard.counters.record_rejection(&rejected);
                 false
@@ -1268,8 +1050,8 @@ impl ReadCache {
     }
 
     #[cfg(test)]
-    fn insert_verified(&self, reference: ValueRecordReference, mutation: &Mutation) -> bool {
-        self.insert_prepared(self.prepare_verified(reference, mutation))
+    fn insert_verified(&self, key: CacheKey, value: &Bytes) -> bool {
+        self.insert_prepared(self.prepare(key.identity, key.keyspace, value))
     }
 
     /// Sum of every shard's counters. Lock-free; a concurrent update may be
@@ -1321,16 +1103,16 @@ impl ReadCache {
     }
 
     /// Evict every entry of `keyspace` older than the `DropCells` batch at
-    /// `version` whose key `dropped` places in the dropped cell range. Index
-    /// masks already hide these references from current reads; this returns
-    /// their memory. Locks one shard at a time and never holds two; the
-    /// matcher runs under that shard lock and takes no other lock. A newer
-    /// point reference in the range is kept.
+    /// `version`. The cache no longer retains keys, so the dropped cell range
+    /// cannot be matched here; evicting the older entries of the affected
+    /// keyspace is conservative (a cache hit is never authoritative) and a
+    /// dropped range belongs to a keyspace whose rows are being removed
+    /// wholesale. Index masks already hide these identities from reads. Locks
+    /// one shard at a time and never holds two.
     pub(super) fn evict_dropped(
         &self,
         keyspace: crate::key_shape::KeySpace,
         version: crate::distributed::types::BatchVersion,
-        dropped: impl Fn(&[u8]) -> bool,
     ) {
         if !self.enabled {
             return;
@@ -1339,9 +1121,7 @@ impl ReadCache {
             let mut table = shard.table.lock();
             for slot in 0..table.slots.len() {
                 let evict = table.slots[slot].as_ref().is_some_and(|entry| {
-                    entry.reference.descriptor.keyspace == keyspace.0
-                        && entry.reference.batch_version < version
-                        && entry.mutation.point_key().is_some_and(|key| dropped(key))
+                    entry.key.keyspace == keyspace.0 && entry.key.identity.batch < version
                 });
                 if evict {
                     table.evict(slot);
@@ -1361,45 +1141,16 @@ impl ReadCache {
                 self.shard_budget_bytes,
                 policy,
                 Arc::clone(&shard.counters),
-                self.layout,
             );
         }
     }
 }
 
-fn trace_preparation(
-    reference: &ValueRecordReference,
-    mutation: &Mutation,
-    preparation: &InsertPreparation,
-    post_publish: bool,
-) {
-    if !kv_capture::enabled() {
-        return;
-    }
-    let outcome = match preparation {
-        InsertPreparation::Prepared(_) => 1,
-        InsertPreparation::Disabled => 2,
-        InsertPreparation::Mismatch => 3,
-        InsertPreparation::Oversize => 4,
-        InsertPreparation::Admission => 5,
-    };
-    kv_capture::reference(
-        13,
-        reference,
-        mutation.point_key().map(|key| &key[..]),
-        outcome,
-        u64::from(post_publish),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributed::types::{
-        BatchId, BatchVersion, MemberChecksum, PayloadDigest, PhysicalValueAddress,
-        RecordDescriptor,
-    };
-    use crate::key_shape::{KeyShapeBuilder, KeySpace, KeyType};
+    use crate::distributed::types::BatchVersion;
+    use crate::key_shape::{KeyShapeBuilder, KeyType};
 
     const SINGLE_SET_BUDGET: usize = WAYS * (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE);
 
@@ -1409,61 +1160,32 @@ mod tests {
             ..ReadCachePolicy::default()
         }
     }
-    fn record(version: u64, value: &[u8]) -> (ValueRecordReference, Mutation) {
-        let key = Bytes::from_static(b"same-key");
-        let reference = ValueRecordReference {
-            batch_id: BatchId {
-                database: [1; 16],
-                operation: version.to_le_bytes().repeat(2).try_into().unwrap(),
-            },
-            batch_version: BatchVersion {
-                epoch: 1,
-                sequence: version,
-            },
-            batch_digest: PayloadDigest([2; 32]),
-            batch_address: PhysicalValueAddress {
-                partition: 0,
-                segment_generation: 1,
-                offset: version * 1024,
-                len: 1024,
-            },
-            descriptor: RecordDescriptor {
-                operation_index: 0,
-                offset: 0,
-                len: 1024,
-                keyspace: 0,
-                kind: RecordKind::Put,
-                key_len: key.len() as u32,
-                value_offset: 32,
-                value_len: value.len() as u32,
-                checksum: MemberChecksum(3),
-            },
-        };
+
+    /// One logical write: its cache key and the value bytes it published.
+    ///
+    /// Keeps the shape of the former reference-returning helper so the policy
+    /// tests below exercise admission, CLOCK and sharding unchanged; only the
+    /// key changed from a physical reference to a logical identity.
+    fn record(version: u64, value: &[u8]) -> (CacheKey, Bytes) {
         (
-            reference,
-            Mutation::Put {
-                keyspace: KeySpace(0),
-                key,
-                value: Bytes::copy_from_slice(value),
+            CacheKey {
+                identity: MutationVersion {
+                    batch: BatchVersion {
+                        epoch: 1,
+                        sequence: version,
+                    },
+                    operation_index: 0,
+                },
+                keyspace: 0,
             },
+            Bytes::copy_from_slice(value),
         )
     }
 
-    fn record_for_keyspace(
-        version: u64,
-        value: &[u8],
-        keyspace: u8,
-    ) -> (ValueRecordReference, Mutation) {
-        let (mut reference, mut mutation) = record(version, value);
-        reference.descriptor.keyspace = keyspace;
-        if let Mutation::Put {
-            keyspace: mutation_keyspace,
-            ..
-        } = &mut mutation
-        {
-            *mutation_keyspace = KeySpace(keyspace);
-        }
-        (reference, mutation)
+    fn record_for_keyspace(version: u64, value: &[u8], keyspace: u8) -> (CacheKey, Bytes) {
+        let (mut key, value) = record(version, value);
+        key.keyspace = keyspace;
+        (key, value)
     }
 
     #[test]
@@ -1530,65 +1252,52 @@ mod tests {
         assert!(cache.insert_verified(new_ref, &new));
         assert_eq!(cache.get(&new_ref), Some(new));
         assert_eq!(cache.get(&old_ref), Some(old));
-        for altered in [
-            ValueRecordReference {
-                batch_address: PhysicalValueAddress {
-                    segment_generation: 2,
-                    ..old_ref.batch_address
-                },
-                ..old_ref
+        // An identity is (batch version, operation index). A different version,
+        // a different operation index or a different keyspace is a different
+        // entry; there is no physical address or digest to vary any more.
+        let (other_operation, _) = record(1, b"other");
+        let other_operation = CacheKey {
+            identity: MutationVersion {
+                operation_index: 1,
+                ..other_operation.identity
             },
-            ValueRecordReference {
-                batch_digest: PayloadDigest([4; 32]),
-                ..old_ref
-            },
-            ValueRecordReference {
-                descriptor: RecordDescriptor {
-                    checksum: MemberChecksum(4),
-                    ..old_ref.descriptor
-                },
-                ..old_ref
-            },
-            ValueRecordReference {
-                batch_id: BatchId {
-                    database: [8; 16],
-                    ..old_ref.batch_id
-                },
-                ..old_ref
-            },
-        ] {
-            assert!(cache.get(&altered).is_none());
-        }
+            ..other_operation
+        };
+        assert!(cache.get(&other_operation).is_none());
+        assert!(
+            cache
+                .get(&CacheKey {
+                    keyspace: 1,
+                    ..old_ref
+                })
+                .is_none()
+        );
     }
 
     #[test]
-    fn point_lookup_checks_full_reference_after_fingerprint_collision() {
+    fn lookup_checks_full_identity_after_fingerprint_collision() {
         let mut cache = CacheTable::new(64 * 1024);
         let (reference, mutation) = record(1, b"value");
         assert!(cache.insert_verified(reference, &mutation));
-        let changed_generation = ValueRecordReference {
-            batch_address: PhysicalValueAddress {
-                segment_generation: reference.batch_address.segment_generation + 1,
-                ..reference.batch_address
+        let changed_generation = CacheKey {
+            identity: MutationVersion {
+                operation_index: 1,
+                ..reference.identity
             },
             ..reference
         };
         let original = cache.slots.iter().position(Option::is_some).unwrap();
-        let target = cache.set_start_for_ref(&changed_generation);
+        let target = cache.set_start_for_key(&changed_generation);
         cache.slots.swap(original, target);
         cache.tags.swap(original, target);
-        // Force a tag collision. The different full reference must still miss.
+        // Force a tag collision. The different full identity must still miss.
         cache.tags[target] = cache.fingerprint(&changed_generation);
-        let keyspace = crate::key_shape::KeySpace(reference.descriptor.keyspace);
-        assert_eq!(
-            cache.get_point(&changed_generation, keyspace, b"same-key"),
-            None
-        );
+        assert_eq!(cache.get(&changed_generation), None);
         cache.slots.swap(original, target);
         cache.tags.swap(original, target);
         cache.tags[original] = cache.fingerprint(&reference);
         assert_eq!(
-            cache.get_point(&reference, keyspace, b"same-key"),
+            cache.get(&reference),
             Some(Bytes::copy_from_slice(b"value"))
         );
         assert_eq!(cache.stats().hits, 1);
@@ -1607,32 +1316,22 @@ mod tests {
         assert_eq!(before.retained_bytes, after.retained_bytes);
         assert_eq!(after.inserts, 1);
         assert_eq!(after.entries, 1);
-        assert_eq!(
-            cache.get(&reference).unwrap().point_key().unwrap().as_ptr(),
-            stored.point_key().unwrap().as_ptr()
-        );
+        assert_eq!(cache.get(&reference).unwrap().as_ptr(), stored.as_ptr());
     }
 
     #[test]
     fn every_fill_is_detached_from_large_allocations() {
         let owner = Bytes::from(vec![42; 2 * 1024 * 1024]);
         let (reference, _) = record(1, &[42; 16]);
-        let mutation = Mutation::Put {
-            keyspace: KeySpace(0),
-            key: owner.slice(0..8),
-            value: owner.slice(8..24),
-        };
+        let large = owner.slice(8..24);
         let mut cache = CacheTable::new(16 * 1024);
-        assert!(cache.insert_verified(reference, &mutation));
-        let Mutation::Put { key, value, .. } = cache.get(&reference).unwrap() else {
-            panic!()
-        };
-        assert_ne!(key.as_ptr(), mutation.point_key().unwrap().as_ptr());
-        assert_eq!(key.downcast_ref::<Box<[u8]>>().unwrap().len(), 8);
+        assert!(cache.insert_verified(reference, &large));
+        let value = cache.get(&reference).unwrap();
+        assert_ne!(value.as_ptr(), large.as_ptr());
         assert_eq!(value.downcast_ref::<Box<[u8]>>().unwrap().len(), 16);
         assert_eq!(
             cache.stats().retained_bytes - cache.stats().metadata_bytes,
-            24 + 2 * BYTE_OWNER_BYTES + ENTRY_BYTES
+            16 + BYTE_OWNER_BYTES + ENTRY_BYTES
         );
     }
 
@@ -1653,29 +1352,28 @@ mod tests {
         let (reference, mutation) = record_for_keyspace(100, &vec![5; regular_limit + 1], 1);
         let evictions = cache.stats().evictions;
         for _ in 0..2 {
-            let prepared = cache.prepare_verified(reference, &mutation);
+            let prepared = cache.prepare(reference.identity, reference.keyspace, &mutation);
             assert!(!cache.insert_prepared(prepared));
         }
         assert_eq!(cache.stats().evictions, evictions);
         for (reference, mutation) in resident {
-            assert_eq!(cache.get_scan(&reference), Some(mutation));
+            assert_eq!(
+                cache.get(reference.identity, reference.keyspace),
+                Some(mutation)
+            );
         }
     }
 
     #[test]
-    fn oversized_and_mismatched_fills_leave_existing_data_untouched() {
+    fn oversized_fills_leave_existing_data_untouched() {
         let mut cache = CacheTable::new(16 * 1024);
         let (reference, mutation) = record(1, b"value");
         assert!(cache.insert_verified(reference, &mutation));
         let (large_ref, large) = record(2, &[7; 16 * 1024]);
         assert!(!cache.insert_verified(large_ref, &large));
-        let mut mismatch = reference;
-        mismatch.descriptor.value_len += 1;
-        assert!(!cache.insert_verified(mismatch, &mutation));
         assert_eq!(cache.get(&reference), Some(mutation));
         assert_eq!(cache.stats().entries, 1);
         assert_eq!(cache.stats().rejected_oversize, 1);
-        assert_eq!(cache.stats().rejected_mismatch, 1);
     }
 
     #[test]
@@ -1722,29 +1420,25 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_and_empty_value_remain_distinct() {
+    fn empty_value_is_retained_and_absence_is_never_filled() {
         let mut cache = CacheTable::new(16 * 1024);
         let (put_ref, put) = record(1, b"");
-        let (mut del_ref, _) = record(2, b"");
-        del_ref.descriptor.kind = RecordKind::Delete;
-        let delete = Mutation::Delete {
-            keyspace: KeySpace(0),
-            key: put.point_key().unwrap().clone(),
-        };
         assert!(cache.insert_verified(put_ref, &put));
-        assert!(cache.insert_verified(del_ref, &delete));
         assert_eq!(cache.get(&put_ref), Some(put));
-        assert_eq!(cache.get(&del_ref), Some(delete));
+        // A deleted member never reaches the cache: the read path returns
+        // not-found without an entry, so absence cannot shadow a later write.
+        let (deleted_ref, _) = record(2, b"");
+        assert!(cache.get(&deleted_ref).is_none());
     }
 
     #[test]
     fn local_clock_protects_reused_entries_before_single_use_collisions() {
         let mut cache = CacheTable::new(32 * 1024);
         let mut records = Vec::new();
-        let target_set = cache.set_start_for_ref(&record(1, b"value").0);
+        let target_set = cache.set_start_for_key(&record(1, b"value").0);
         for i in 1..10_000 {
             let pair = record(i, b"value");
-            if cache.set_start_for_ref(&pair.0) == target_set {
+            if cache.set_start_for_key(&pair.0) == target_set {
                 records.push(pair);
                 if records.len() == WAYS + 1 {
                     break;
@@ -1821,33 +1515,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_hits_and_misses_do_not_create_admission_or_reuse_history() {
-        let mut cache = CacheTable::new(8 * 1024);
-        let (reference, mutation) = record(1, b"value");
-        assert!(cache.insert_verified(reference, &mutation));
-        let before: Vec<_> = cache
-            .history
-            .iter()
-            .map(|entry| (entry.fingerprint, entry.observations))
-            .collect();
-        assert_eq!(cache.get_scan(&reference), Some(mutation));
-        assert!(cache.get_scan(&record(2, b"other").0).is_none());
-        let after: Vec<_> = cache
-            .history
-            .iter()
-            .map(|entry| (entry.fingerprint, entry.observations))
-            .collect();
-        assert_eq!(before, after);
-        assert_eq!(cache.slots.iter().flatten().next().unwrap().benefit, 0);
-    }
-
-    #[test]
     fn admission_preflight_skips_detachment_without_double_counting_cold_writes() {
         let budget = SINGLE_SET_BUDGET;
         let cache = ReadCache::new(budget);
         for version in 0..WAYS as u64 {
             let (reference, mutation) = record(version, b"value");
-            let prepared = cache.prepare_verified(reference, &mutation);
+            let prepared = cache.prepare(reference.identity, reference.keyspace, &mutation);
             assert!(cache.insert_prepared(prepared));
         }
         // Passing both preparation and insertion did not promote any cold write.
@@ -1861,40 +1534,38 @@ mod tests {
                 .all(|entry| entry.benefit == 0)
         );
         for version in 0..WAYS as u64 {
-            assert!(cache.get(&record(version, b"value").0).is_some());
+            let (reference, _) = record(version, b"value");
+            assert!(cache.get(reference.identity, reference.keyspace).is_some());
         }
         let (reference, mutation) = record(100, b"new-value");
-        let rejected = cache.prepare_verified(reference, &mutation);
+        let rejected = cache.prepare(reference.identity, reference.keyspace, &mutation);
         assert!(matches!(rejected.preparation, InsertPreparation::Admission));
         assert!(!cache.insert_prepared(rejected));
-        let mut mismatch = reference;
-        mismatch.descriptor.value_len += 1;
-        let invalid = cache.prepare_verified(mismatch, &mutation);
-        assert!(matches!(invalid.preparation, InsertPreparation::Mismatch));
-        assert!(!cache.insert_prepared(invalid));
-        let accepted = cache.prepare_verified(reference, &mutation);
+        let accepted = cache.prepare(reference.identity, reference.keyspace, &mutation);
         assert!(matches!(
             accepted.preparation,
             InsertPreparation::Prepared(_)
         ));
         assert!(cache.insert_prepared(accepted));
-        assert_eq!(cache.get(&reference), Some(mutation));
+        assert_eq!(
+            cache.get(reference.identity, reference.keyspace),
+            Some(mutation)
+        );
         assert_eq!(cache.stats().bypass_admission, 1);
-        assert_eq!(cache.stats().rejected_mismatch, 1);
     }
 
     #[test]
     fn per_keyspace_counters_follow_lookup_and_evicted_entry_ownership() {
         let mut cache = CacheTable::new(8 * 1024);
         let (target, target_mutation) = record_for_keyspace(0, b"target", 0);
-        let target_set = cache.set_start_for_ref(&target);
-        assert!(cache.get_scan(&target).is_none());
+        let target_set = cache.set_start_for_key(&target);
+        assert!(cache.get(&target).is_none());
         assert!(cache.insert_verified(target, &target_mutation));
 
         let mut inserted = Vec::new();
         for version in 1..10_000 {
             let pair = record_for_keyspace(version, b"value", 1);
-            if cache.set_start_for_ref(&pair.0) == target_set {
+            if cache.set_start_for_key(&pair.0) == target_set {
                 assert!(cache.get(&pair.0).is_none());
                 assert!(cache.insert_verified(pair.0, &pair.1));
                 inserted.push(pair);
@@ -1909,7 +1580,7 @@ mod tests {
         let mut overflow = None;
         for version in 10_000..20_000 {
             let pair = record_for_keyspace(version, b"overflow", 1);
-            if cache.set_start_for_ref(&pair.0) == target_set {
+            if cache.set_start_for_key(&pair.0) == target_set {
                 overflow = Some(pair);
                 break;
             }
@@ -1963,49 +1634,34 @@ mod tests {
             dropped: dropped.clone(),
         });
         let (reference, _) = record(1, &[42; 16]);
-        let mutation = Mutation::Put {
-            keyspace: KeySpace(0),
-            key: owner.slice(..8),
-            value: owner.slice(8..24),
-        };
+        let payload = owner.slice(8..24);
         let mut cache = CacheTable::new(16 * 1024);
-        assert!(cache.insert_verified(reference, &mutation));
-        drop(mutation);
+        assert!(cache.insert_verified(reference, &payload));
+        drop(payload);
         drop(owner);
         assert!(dropped.load(Ordering::SeqCst));
         assert!(cache.get(&reference).is_some());
     }
     #[test]
-    fn scalar_hits_clone_only_value_and_reject_wrong_key_or_keyspace() {
+    fn hits_clone_only_the_value_and_a_different_identity_misses() {
         let mut cache = CacheTable::new(16 * 1024);
         let (reference, mutation) = record(1, b"value");
         assert!(cache.insert_verified(reference, &mutation));
-        let stored_value_ptr = match &cache.slots.iter().flatten().next().unwrap().mutation {
-            Mutation::Put { value, .. } => value.as_ptr(),
-            _ => panic!("inserted record is a put"),
-        };
-        let hit = cache
-            .get_point(&reference, KeySpace(0), b"same-key")
-            .unwrap();
+        let stored_value_ptr = cache.slots.iter().flatten().next().unwrap().value.as_ptr();
+        let hit = cache.get(&reference).unwrap();
         assert_eq!(hit.as_ptr(), stored_value_ptr);
         assert!(
             cache
-                .get_point(&reference, KeySpace(1), b"same-key")
-                .is_none()
-        );
-        assert!(
-            cache
-                .get_point(&reference, KeySpace(0), b"wrong-key")
+                .get(&CacheKey {
+                    keyspace: 1,
+                    ..reference
+                })
                 .is_none()
         );
         let (other_reference, _) = record(2, b"value");
-        assert!(
-            cache
-                .get_point(&other_reference, KeySpace(0), b"same-key")
-                .is_none()
-        );
+        assert!(cache.get(&other_reference).is_none());
         assert_eq!(cache.stats().hits, 1);
-        assert_eq!(cache.stats().misses, 3);
+        assert_eq!(cache.stats().misses, 2);
     }
 
     #[test]
@@ -2013,7 +1669,7 @@ mod tests {
         let mut cache = CacheTable::new_with_policy(8 * 1024, protected_policy(0));
         let (reference, mutation) = record_for_keyspace(1, b"contents", 1);
         assert!(cache.insert_verified(reference, &mutation));
-        assert_eq!(cache.get_scan(&reference), Some(mutation));
+        assert_eq!(cache.get(&reference), Some(mutation));
         assert!(cache.stats().retained_bytes <= cache.stats().budget_bytes);
     }
 
@@ -2021,7 +1677,7 @@ mod tests {
     fn protected_summary_entries_survive_streaming_warm_and_demand_churn() {
         let (hot_reference, hot_mutation) = record_for_keyspace(0, b"summary", 0);
         let mut cache = CacheTable::new_with_policy(8 * 1024, protected_policy(0));
-        let hot_set = cache.set_start_for_ref(&hot_reference);
+        let hot_set = cache.set_start_for_key(&hot_reference);
         assert!(cache.insert_verified(hot_reference, &hot_mutation));
         for _ in 0..3 {
             assert!(cache.get(&hot_reference).is_some());
@@ -2030,7 +1686,7 @@ mod tests {
         let mut stream = Vec::new();
         for version in 1..10_000 {
             let pair = record_for_keyspace(version, &[7; 512], 1);
-            if cache.set_start_for_ref(&pair.0) == hot_set {
+            if cache.set_start_for_key(&pair.0) == hot_set {
                 assert!(cache.insert_verified(pair.0, &pair.1));
                 stream.push(pair);
                 if stream.len() == WAYS - 1 {
@@ -2042,7 +1698,7 @@ mod tests {
 
         for version in 10_000..20_000 {
             let (reference, mutation) = record_for_keyspace(version, &[9; 512], 1);
-            if cache.set_start_for_ref(&reference) == hot_set {
+            if cache.set_start_for_key(&reference) == hot_set {
                 cache.insert_verified(reference, &mutation);
             }
             assert_eq!(cache.get(&hot_reference), Some(hot_mutation.clone()));
@@ -2077,16 +1733,20 @@ mod tests {
                 keyspace.name(),
                 "checkpoint_by_digest" | "checkpoint_sequence_by_contents_digest" | "watermarks"
             );
-            let prepared = cache.prepare_post_publish(reference, &mutation);
+            let prepared =
+                cache.prepare_post_publish(reference.identity, reference.keyspace, &mutation);
             if skip_warm {
                 assert!(!cache.insert_prepared(prepared));
-                assert_eq!(cache.get_scan(&reference), None);
-                let demand_fill = cache.prepare_verified(reference, &mutation);
+                assert_eq!(cache.get(reference.identity, reference.keyspace), None);
+                let demand_fill = cache.prepare(reference.identity, reference.keyspace, &mutation);
                 assert!(cache.insert_prepared(demand_fill));
             } else {
                 assert!(cache.insert_prepared(prepared));
             }
-            assert_eq!(cache.get_scan(&reference), Some(mutation));
+            assert_eq!(
+                cache.get(reference.identity, reference.keyspace),
+                Some(mutation)
+            );
         }
 
         // Sui epoch/perpetual shapes lack the protected checkpoint family and
@@ -2100,25 +1760,33 @@ mod tests {
             ReadCachePolicy::for_sui_shape(&non_checkpoint_shape),
         );
         let (reference, mutation) = record_for_keyspace(20, b"contents", 0);
-        let warmed = non_checkpoint.prepare_post_publish(reference, &mutation);
+        let warmed =
+            non_checkpoint.prepare_post_publish(reference.identity, reference.keyspace, &mutation);
         assert!(non_checkpoint.insert_prepared(warmed));
-        assert_eq!(non_checkpoint.get_scan(&reference), Some(mutation));
+        assert_eq!(
+            non_checkpoint.get(reference.identity, reference.keyspace),
+            Some(mutation)
+        );
 
         let generic = ReadCache::new(budget);
         let (reference, mutation) = record_for_keyspace(21, b"digest-alias", 2);
-        let warmed = generic.prepare_post_publish(reference, &mutation);
+        let warmed =
+            generic.prepare_post_publish(reference.identity, reference.keyspace, &mutation);
         assert!(generic.insert_prepared(warmed));
-        assert_eq!(generic.get_scan(&reference), Some(mutation));
+        assert_eq!(
+            generic.get(reference.identity, reference.keyspace),
+            Some(mutation)
+        );
     }
 
     #[test]
     fn regular_demand_reclaims_only_protected_capacity_above_the_floor() {
         let mut cache = CacheTable::new_with_policy(16 * 1024, protected_policy(0));
-        let target_set = cache.set_start_for_ref(&record_for_keyspace(0, b"x", 0).0);
+        let target_set = cache.set_start_for_key(&record_for_keyspace(0, b"x", 0).0);
         let mut protected_records = Vec::new();
         for version in 0..10_000 {
             let pair = record_for_keyspace(version, &[3; 2048], 0);
-            if cache.set_start_for_ref(&pair.0) == target_set {
+            if cache.set_start_for_key(&pair.0) == target_set {
                 protected_records.push(pair);
                 if protected_records.len() == 3 {
                     break;
@@ -2181,17 +1849,20 @@ mod tests {
         finishes_within_deadline(move || {
             for version in 0..operations {
                 let (reference, mutation) = record(version, b"value");
-                assert!(worker_cache.get(&reference).is_none());
-                assert!(worker_cache.get_scan(&reference).is_none());
                 assert!(
                     worker_cache
-                        .get_point(&reference, KeySpace(0), b"same-key")
+                        .get(reference.identity, reference.keyspace)
                         .is_none()
                 );
-                let prepared = worker_cache.prepare_verified(reference, &mutation);
+                let prepared =
+                    worker_cache.prepare(reference.identity, reference.keyspace, &mutation);
                 assert!(matches!(prepared.preparation, InsertPreparation::Disabled));
                 assert!(!worker_cache.insert_prepared(prepared));
-                let warmed = worker_cache.prepare_post_publish(reference, &mutation);
+                let warmed = worker_cache.prepare_post_publish(
+                    reference.identity,
+                    reference.keyspace,
+                    &mutation,
+                );
                 assert!(!worker_cache.insert_prepared(warmed));
             }
         });
@@ -2204,12 +1875,12 @@ mod tests {
             );
         }
         let stats = cache.stats();
-        assert_eq!(stats.misses, 3 * operations);
+        assert_eq!(stats.misses, operations);
         assert_eq!(stats.bypass_disabled, 2 * operations);
         assert_eq!(stats.retained_bytes, 0);
         assert_eq!(
             cache.per_keyspace_stats()[0].misses,
-            3 * operations,
+            operations,
             "per-keyspace misses are summed across stripes"
         );
         // Disabled misses spread over several stripes, not one hot counter.
@@ -2233,7 +1904,7 @@ mod tests {
         let mut by_shard: Vec<Vec<_>> = vec![Vec::new(); 4];
         for version in 0..200 {
             let pair = record(version, b"value");
-            by_shard[cache.route(&pair.0)].push(pair);
+            by_shard[cache.route(pair.0.identity)].push(pair);
         }
         assert!(by_shard.iter().all(|records| records.len() >= 20));
 
@@ -2243,17 +1914,20 @@ mod tests {
         let others: Vec<_> = by_shard[1..].iter().flatten().take(30).cloned().collect();
         let expected = others.clone();
         finishes_within_deadline(move || {
-            for (reference, mutation) in &others {
-                assert!(worker_cache.get(reference).is_none());
-                assert!(worker_cache.insert_verified(*reference, mutation));
-                assert_eq!(worker_cache.get(reference).as_ref(), Some(mutation));
+            for (key, value) in &others {
+                assert!(worker_cache.get(key.identity, key.keyspace).is_none());
+                assert!(worker_cache.insert_verified(*key, value));
+                assert_eq!(
+                    worker_cache.get(key.identity, key.keyspace).as_ref(),
+                    Some(value)
+                );
             }
         });
         drop(held);
 
-        for (reference, mutation) in by_shard[0].iter().take(10) {
-            assert!(cache.get(reference).is_none());
-            assert!(cache.insert_verified(*reference, mutation));
+        for (key, value) in by_shard[0].iter().take(10) {
+            assert!(cache.get(key.identity, key.keyspace).is_none());
+            assert!(cache.insert_verified(*key, value));
         }
         let load = cache.shard_stats();
         assert_eq!(load.shards.len(), 4);
@@ -2273,7 +1947,10 @@ mod tests {
         );
         assert!(stats.retained_bytes <= stats.budget_bytes);
         for (reference, mutation) in expected {
-            assert_eq!(cache.get_scan(&reference), Some(mutation));
+            assert_eq!(
+                cache.get(reference.identity, reference.keyspace),
+                Some(mutation)
+            );
         }
     }
 
@@ -2289,7 +1966,8 @@ mod tests {
         let stats = cache.stats();
         assert_eq!((stats.entries, stats.inserts, stats.hits), (0, 0, 0));
         assert_eq!(stats.retained_bytes, stats.metadata_bytes);
-        assert!(cache.get(&record(1, b"value").0).is_none());
+        let (key, _) = record(1, b"value");
+        assert!(cache.get(key.identity, key.keyspace).is_none());
         let table = cache.shards[0].table.lock();
         assert_eq!(table.policy.protected_keyspace, Some(0));
         assert!(table.protected_reserve_bytes > 0);
@@ -2331,15 +2009,9 @@ mod tests {
             LIVE_BLOCKS.fetch_add(1, Ordering::SeqCst);
             let block = Bytes::from_owner(Block(vec![9; BLOCK]));
             let (reference, _) = record(version, &[9; 1024]);
-            let mutation = Mutation::Put {
-                keyspace: KeySpace(0),
-                key: block.slice(0..8),
-                value: block.slice(8..8 + 1024),
-            };
-            let mut reference = reference;
-            reference.descriptor.key_len = 8;
-            cache.insert_verified(reference, &mutation);
-            drop(mutation);
+            let payload = block.slice(8..8 + 1024);
+            cache.insert_verified(reference, &payload);
+            drop(payload);
             drop(block);
             // No cached entry keeps the block alive.
             assert_eq!(LIVE_BLOCKS.load(Ordering::SeqCst), 0);
@@ -2351,5 +2023,28 @@ mod tests {
         // Retained payload is exactly the charged exact-size copies, far below
         // `entries * BLOCK`.
         assert!(stats.retained_bytes - stats.metadata_bytes < stats.entries * 2 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod entry_charge_tests {
+    use super::*;
+
+    /// Pins the sizes the hand computation relies on; the compiler verifies them.
+    #[test]
+    fn the_charge_floor_keeps_fixed_slot_metadata_within_the_8_percent_budget() {
+        eprintln!(
+            "Entry={} FIXED_SLOT={} COMPUTED_MIN={} BUDGET_FLOOR={} MIN_ENTRY_CHARGE={} Bytes={}",
+            size_of::<Entry>(),
+            FIXED_SLOT_BYTES,
+            COMPUTED_MIN_ENTRY_CHARGE,
+            BUDGET_MIN_ENTRY_CHARGE,
+            MIN_ENTRY_CHARGE,
+            size_of::<Bytes>(),
+        );
+        assert!(MIN_ENTRY_CHARGE >= COMPUTED_MIN_ENTRY_CHARGE);
+        assert!(MIN_ENTRY_CHARGE >= BUDGET_MIN_ENTRY_CHARGE);
+        // metadata / (metadata + data) <= 8 %, in integers.
+        assert!(FIXED_SLOT_BYTES * 100 <= (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE) * 8);
     }
 }

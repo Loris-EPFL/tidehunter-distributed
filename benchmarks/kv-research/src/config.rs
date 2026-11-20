@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::backend::BackendResult;
-use crate::index_a1::IndexFixtureStage;
 
 /// Engine acknowledgement tier, re-used so the harness cannot drift from the engine. Comparisons
 /// never mix tiers: `Synchronous` matches native `value_wal_barrier`,
@@ -249,10 +248,6 @@ pub struct DiagnosticsConfig {
     /// Maximum retained Valkey owner-pipeline timing records; zero disables.
     #[serde(default)]
     pub valkey_profile_limit: usize,
-    /// Exact checkpoint attribution and device evidence (coordinator ring,
-    /// suffix debt, reopen evidence); off by default; Tidehunter only.
-    #[serde(default)]
-    pub index_checkpoint: bool,
 }
 
 fn default_write_timeline_sample_every() -> usize {
@@ -267,7 +262,6 @@ impl Default for DiagnosticsConfig {
             write_timeline_sample_every: 1,
             read_profile_limit: 0,
             valkey_profile_limit: 0,
-            index_checkpoint: false,
         }
     }
 }
@@ -286,8 +280,8 @@ pub struct RunConfig {
     /// Non-secret human label; does not select the physical key namespace.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// Explicit owned dataset identity; requires preload, full existing-data
-    /// verification, or an A1 `backend.options.index_fixture`.
+    /// Explicit owned dataset identity; requires preload or full existing-data
+    /// verification.
     #[serde(default)]
     pub key_namespace_hex: Option<String>,
     pub dataset: DatasetConfig,
@@ -327,67 +321,6 @@ impl RunConfig {
         }
     }
 
-    /// A1 index-fixture stage (`backend.options.index_fixture.stage`), if any.
-    pub fn index_fixture_stage(&self) -> BackendResult<Option<IndexFixtureStage>> {
-        let Some(fixture) = self.backend.options.get("index_fixture") else {
-            return Ok(None);
-        };
-        fixture
-            .get("stage")
-            .and_then(serde_json::Value::as_str)
-            .and_then(IndexFixtureStage::parse)
-            .map(Some)
-            .ok_or_else(|| "index_fixture.stage must be \"build\" or \"overwrite\"".into())
-    }
-
-    /// The A1 fixture builds exactly `N` scalar puts at IDs `0..N` from an
-    /// empty case, or overwrites uniform IDs below `N` of a validated build
-    /// receipt with no preload or full-dataset verification.
-    fn validate_index_fixture(&self, stage: IndexFixtureStage) -> BackendResult<()> {
-        let mix = &self.workload.mix;
-        let scalar_puts = mix.put > 0
-            && mix.read == 0
-            && mix.delete == 0
-            && mix.missing_read == 0
-            && mix.get_many == 0
-            && mix.put_batch == 0;
-        let common = self.backend.kind == "tidehunter"
-            && cfg!(all(feature = "test-utils", target_os = "linux"))
-            && self.key_namespace_hex.is_some()
-            && scalar_puts
-            && matches!(self.workload.distribution, KeyDistribution::Uniform)
-            && !self.phases.preload
-            && !self.phases.verify_existing_dataset
-            && !self.phases.evict_mapped_wal_before_measurement
-            && !self.phases.warmup_key_sweep
-            && !self.phases.measurement_key_sweep
-            && self.phases.warmup_operations == 0
-            && self.phases.aging_operations == 0
-            && !self.qualification_only
-            && self.interference.is_none()
-            && self.measurement_gate.is_none()
-            && self.measurement_completion_gate.is_none();
-        let staged = match stage {
-            IndexFixtureStage::Build => {
-                self.workload.put_key_policy == PutKeyPolicy::New
-                    && self.execution.mode == ExecutionMode::ClosedLoop
-                    && self.phases.measurement_operations == self.dataset.keys
-            }
-            IndexFixtureStage::Overwrite => {
-                self.workload.put_key_policy == PutKeyPolicy::Overwrite
-                    && self.execution.mode != ExecutionMode::Interference
-            }
-        };
-        if common && staged {
-            return Ok(());
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "index_fixture requires Linux with test-utils, tidehunter, an explicit namespace, scalar uniform puts only, no preload/verification/warmup/aging/sweeps/gates; build: put_key_policy=new, closed_loop, measurement_operations=dataset.keys; overwrite: put_key_policy=overwrite",
-        )
-        .into())
-    }
-
     // Keep all admission bounds together so their cross-field constraints remain visible.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> BackendResult<()> {
@@ -408,24 +341,16 @@ impl RunConfig {
                 "backend.options.durability_tier must be \"native\" or \"synchronous\"",
             );
         }
-        let Ok(index_fixture) = self.index_fixture_stage() else {
-            return invalid("index_fixture.stage must be \"build\" or \"overwrite\"");
-        };
         if let Some(namespace) = &self.key_namespace_hex
             && (namespace.len() != 32
                 || !namespace
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                || !(self.phases.preload
-                    || self.phases.verify_existing_dataset
-                    || index_fixture.is_some()))
+                || !(self.phases.preload || self.phases.verify_existing_dataset))
         {
             return invalid(
-                "key_namespace_hex requires 32 lowercase hex digits and preload, full existing-data verification, or an A1 index_fixture",
+                "key_namespace_hex requires 32 lowercase hex digits and preload or full existing-data verification",
             );
-        }
-        if let Some(stage) = index_fixture {
-            self.validate_index_fixture(stage)?;
         }
         if self.phases.verify_existing_dataset
             && (self.phases.preload
@@ -495,9 +420,6 @@ impl RunConfig {
             return invalid(
                 "write timeline cannot be combined with the admission-gated write profile",
             );
-        }
-        if self.diagnostics.index_checkpoint && !self.backend.kind.starts_with("tidehunter") {
-            return invalid("diagnostics.index_checkpoint is only supported by tidehunter");
         }
         if self.diagnostics.read_profile_limit > 65_536 {
             return invalid("diagnostics.read_profile_limit must not exceed 65536");
