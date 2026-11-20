@@ -2,7 +2,21 @@
 //! Embedded, application-integrated and service-level results remain distinct.
 // This unpublished CLI-support library documents its shared BackendResult and
 // failure/unknown-mutation contract once in backend.rs and the comparison protocol.
-#![allow(clippy::missing_errors_doc)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::mutex_atomic,
+    clippy::await_holding_lock,
+    clippy::await_holding_refcell_ref,
+    clippy::arc_with_non_send_sync,
+    unsafe_op_in_unsafe_fn
+)]
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "the shared BackendResult and failure/unknown-mutation contract is documented once in backend.rs and the comparison protocol"
+)]
 
 pub mod backend;
 pub mod backends;

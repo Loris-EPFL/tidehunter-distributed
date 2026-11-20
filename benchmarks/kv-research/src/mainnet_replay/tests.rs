@@ -477,6 +477,7 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     let trace = cfg.validate().unwrap();
     let prepared = Arc::new(prepare(&trace, 1).unwrap());
     let native = Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
+    #[allow(clippy::mutex_atomic, reason = "Condvar gate needs the mutex")]
     let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let backend = Arc::new(GatedNative {
         inner: Arc::clone(&native),
@@ -539,6 +540,7 @@ async fn injected_background_failure_rejects_each_replay_boundary() {
             Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
         // Delegate all storage to the real engine; inject only its typed health
         // result, since engine-owned worker panic hooks are private to that crate.
+        #[allow(clippy::mutex_atomic, reason = "Condvar gate needs the mutex")]
         let backend = Arc::new(GatedNative {
             inner: Arc::clone(&native),
             gate: Arc::new((std::sync::Mutex::new(true), std::sync::Condvar::new())),
@@ -1153,6 +1155,7 @@ impl ReplayBackend for HeldOutputs {
     fn check_background_health(&self) -> BackendResult<()> {
         self.inner.check_background_health()
     }
+    #[allow(clippy::mutex_atomic, reason = "Condvar gate needs the mutex")]
     fn get(&self, table: u16, key: &[u8]) -> BackendResult<Option<Bytes>> {
         if key == &self.release_key[..] {
             *self.gate.0.lock().unwrap() = true;
@@ -1271,6 +1274,7 @@ async fn later_checkpoint_reads_in_flight_output_through_overlay() {
     // K=2: the read happens while repetition 0's outputs are held uncommitted.
     let root = temp("cross-depth-two");
     let inner = native(&root, &selected);
+    #[allow(clippy::mutex_atomic, reason = "Condvar gate needs the mutex")]
     let held = Arc::new(HeldOutputs {
         inner: Arc::clone(&inner),
         release_key,

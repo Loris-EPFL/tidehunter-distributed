@@ -1,3 +1,15 @@
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::mutex_atomic,
+    clippy::await_holding_lock,
+    clippy::await_holding_refcell_ref,
+    clippy::arc_with_non_send_sync,
+    unsafe_op_in_unsafe_fn
+)]
+
 use kv_research::backend::BackendResult;
 use kv_research::{backends, config::RunConfig, runner};
 use prometheus::Registry;

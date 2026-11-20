@@ -6,6 +6,18 @@
 //! recovery and publication contract and the supported subset. No wire format
 //! or disk-format stability is promised yet.
 
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::mutex_atomic,
+    clippy::await_holding_lock,
+    clippy::await_holding_refcell_ref,
+    clippy::arc_with_non_send_sync,
+    unsafe_op_in_unsafe_fn
+)]
+
 pub mod capacity;
 pub mod codec;
 pub mod durability;

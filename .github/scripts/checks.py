@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments"))
 from resident_config import software_fabric_environment
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
-PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness", "all")
+PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness",
+            "file-length", "all")
 SOFTWARE_STREAM_TESTS = (
     "software_provider_preserves_stream_bytes_across_reused_buffers",
     "software_provider_timeout_poison_and_teardown_preserve_buffer_lifetimes",
@@ -97,10 +98,53 @@ def selected_ignored(env, target, selector, expected):
             raise RuntimeError(f"Selected test did not execute exactly once: {name}")
 
 
+FILE_LENGTH_LIMIT = 1500
+FILE_LENGTH_ROOTS = (
+    "tidehunter/src/distributed",
+    "benchmarks/kv-research/src",
+    "tidehunter-fabric/src",
+)
+FILE_LENGTH_BASELINE = ROOT / ".github/scripts/file-length-baseline.txt"
+
+
+def check_file_length():
+    """Ratchet: listed oversized files may not grow; unlisted files stay at or below 1500."""
+    baseline = {}
+    for line in FILE_LENGTH_BASELINE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, lines = line.rsplit(maxsplit=1)
+        baseline[path] = int(lines)
+    over = []
+    counts = {}
+    for root in FILE_LENGTH_ROOTS:
+        for path in sorted((ROOT / root).rglob("*.rs")):
+            relative = str(path.relative_to(ROOT))
+            lines = len(path.read_bytes().splitlines())
+            counts[relative] = lines
+            recorded = baseline.get(relative)
+            if recorded is None:
+                if lines > FILE_LENGTH_LIMIT:
+                    over.append(f"{relative}: {lines} (over cap, not in baseline)")
+            elif lines > recorded:
+                over.append(f"{relative}: {lines} (grew past baseline {recorded})")
+    for relative in sorted(baseline):
+        lines = counts.get(relative)
+        if lines is None or lines <= FILE_LENGTH_LIMIT:
+            over.append(f"{relative}: stale baseline entry (missing or within the cap); remove it")
+    if over:
+        raise RuntimeError(
+            "file-length ratchet failed; split or shrink, never raise the baseline:\n  "
+            + "\n  ".join(over))
+
+
 def check(profile, env):
     print(f"\n=== {profile}: correctness only; no hardware/performance claim ===", flush=True)
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
+    elif profile == "file-length":
+        check_file_length()
     elif profile == "lint":
         for features in ((), ("--features", "experimental-distributed,test-utils")):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
