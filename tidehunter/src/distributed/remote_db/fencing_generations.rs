@@ -33,16 +33,21 @@ use crate::distributed::tcp::{
 
 /// L2 requires a provisioned identity and owner lifecycle metadata.
 ///
-/// Format 10 is the native-index hybrid (I9). A format-9 manifest comes from
-/// the Exact era and carries a checkpoint this engine cannot read: the open
-/// refuses it before any fence. An older binary refuses a format-10 manifest
-/// by its own ceiling. Raising the constant is the only gate: a database must
-/// never open with its Exact checkpoint ignored.
+/// Format 10 is the native-index hybrid (I9). The archive branch wrote formats
+/// 6 to 9 with the Exact index; each of them can name a checkpoint that this
+/// engine cannot read. The open refuses every such manifest before any fence.
+/// An older binary refuses a format-10 manifest by its own ceiling. Raising the
+/// constant is the only gate: a database must never open with its Exact
+/// checkpoint ignored. A database that the archive branch created stays on that
+/// branch (`archive/multi-design`).
 pub(super) const AUTHORITY_FORMAT: u32 = 10;
 
-/// The last authority manifest format of the Exact-index engine. Its manifest
-/// names a checkpoint that this engine ignores, so it is refused by name.
-const EXACT_ERA_FORMAT: u32 = 9;
+/// The authority manifest formats of the Exact-index engine (`archive/multi-design`):
+/// 6 (unlimited fencing generations), 7 (`DropCells`), 8 (asynchronous
+/// relocation), 9 (multi-database owner host). Format 5 is the removed per-cell
+/// mode (`PER_CELL_MANIFEST_FORMAT`). Formats below 5 and above 10 get the
+/// generic refusal.
+const EXACT_ERA_FORMATS: std::ops::RangeInclusive<u32> = 6..=9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,14 +75,14 @@ struct FormatProbe {
 }
 
 /// Read the authority manifest; another format fails with its number before
-/// any current field is interpreted, and the store is never rewritten. The
+/// any current field is interpreted, and the store is never rewritten. Every
 /// Exact-era format is named as a removed mode: its checkpoint is not an index
 /// this engine can read.
 pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, LocalDbError> {
     let probe: FormatProbe = read_metadata(path).map_err(LocalDbError::component)?;
     probe.mode.reject_legacy_mode(probe.format)?;
     if probe.format != AUTHORITY_FORMAT {
-        if probe.format == EXACT_ERA_FORMAT {
+        if EXACT_ERA_FORMATS.contains(&probe.format) {
             return Err(legacy_mode_error(&format!(
                 "exact_index (authority manifest format {})",
                 probe.format

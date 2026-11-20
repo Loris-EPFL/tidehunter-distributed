@@ -41,10 +41,14 @@ removed setting (for example `history_persistence`, `checkpoint_mode`,
 `replay_limits`, `max_index_bytes`, `scan_prefetch_pages`, `index_shards` or
 `compactor_cadence`) fails the parse. A manifest of a removed mode fails the
 open with a named legacy-mode error (`unsupported legacy distributed mode
-<name>: use archive/multi-design`). The authority manifest is format 10; the
-Exact-era format 9 is refused by name before any fence. The index settings are
-the `index` field (`HybridIndexConfig`); Sui fills it from its native
-configuration (`RemoteDatabaseConfig::with_native_index`).
+<name>: use archive/multi-design`). The authority manifest is format 10. The
+open refuses the formats 5 to 9 by name before any fence: format 5 is the
+per-cell mode, and the formats 6 to 9 are the Exact index. Formats below 5 and
+above 10 get the generic refusal with the format number. The open never
+rewrites a refused manifest. A database that the archive branch created stays
+on that branch. Open it there. The index settings are the `index` field
+(`HybridIndexConfig`). Sui fills it from its native configuration
+(`RemoteDatabaseConfig::with_native_index`).
 
 ## 3. Acknowledgement tiers
 
@@ -77,19 +81,22 @@ position is 48 bytes: batch version, operation index, member CRC-32 and the
 physical address of the member frame (`hybrid/position.rs`). Order and equality
 of positions use the logical part only; every compare-and-swap uses the
 physical part. The value reader (`hybrid/read.rs`) checks the coordinator
-value cache first (`remote_db/read_cache.rs`). On a miss it fetches exactly the
-member frame through a bounded live read lane (`remote_db/pending_read.rs`): the
-lane obtains an authenticated owner mapping, opens the verified namespace and
-issues aligned block reads through the buffered live kernel target. The reader
-checks the CRC-32, decodes the native entry and caches the value bytes. The
-current extent and historical sealed WAL files read the same way, through grants
-and pins with revoke/drain (`nvmeof/live_namespace.rs`, `tcp/live_read.rs`).
-Grants are keyed by the position's address. A read that finds its file retired
-re-resolves once through the index. A second failure returns the typed error
-"value evicted during read". Flights are deduped (`pending_read.rs`
-`FlightRegistry`); an inline path serves a scalar read on the caller thread
-when its lane is idle and its grant is healthy and free
-(`pending_read/live_inline.rs`). Scans are native live iterators over the index.
+value cache first (`remote_db/read_cache.rs`). On a miss it fetches the member
+frame and nothing else. The fetch uses a bounded live read lane
+(`remote_db/pending_read.rs`). The lane obtains an authenticated owner
+mapping, opens the verified namespace and issues aligned block reads through
+the buffered live kernel target. The reader checks the CRC-32, decodes the
+native entry and caches the value bytes. The current extent and historical
+sealed WAL files read the same way, through grants and pins with revoke/drain
+(`nvmeof/live_namespace.rs`, `tcp/live_read.rs`).
+
+The owner keys a grant by the position's address. A read that finds its file
+retired re-resolves once through the index. A second failure returns the typed
+error "value evicted during read". The registry (`pending_read.rs`
+`FlightRegistry`) merges equal flights. An inline path serves a scalar read on
+the caller thread when its lane is idle and its grant is healthy and free
+(`pending_read/live_inline.rs`). Scans are native live iterators over the
+index.
 
 ## 5. Recovery
 
@@ -110,9 +117,9 @@ surviving versions above it. Replay applies a per-fencing-generation filter: it
 drops the unacknowledged tail of an older generation and keeps draining.
 Synchronous owners are per-batch durable and are never truncated. A stored
 region names only positions that are owner-synced or aborted. Owner recovery
-(`storage/wal_replay.rs`) validates everything inside the persisted root,
-adopts complete valid frames beyond it across skip markers, and stops at the
-first invalid frame, as native replay does. The recent-receipt window
+(`storage/wal_replay.rs`) validates everything inside the persisted root. It
+adopts complete valid frames beyond the root across skip markers. It stops at
+the first invalid frame, as native replay does. The recent-receipt window
 (`storage/history.rs`) serves retries only and is never persisted.
 
 | Owner event | Result | Operator action |
@@ -128,25 +135,33 @@ write.
 
 Transports: `Tcp` (mTLS), `TcpTrusted` (loopback tests and local benchmarks)
 and OFI verbs control (`remote_db/transports.rs` `connect`, `tcp.rs`).
-Protocol 35 (`tcp.rs` `PROTOCOL`). Every request/response variant has an
-explicit documented wire tag, frozen by `tcp/wire_tag_tests.rs`. Protocol
-history: 29 removed the owner-RPC payload path; 30 added unlimited fencing
-generations (L1); 31 file inventory; 32 retirement proofs; 33 logical relocation
-pages; 34 L2 provision/drop; 35 keyed `ResolveLiveRecords` by the member
-address and added `durable_end` to the inventory sweep. Remaining classes:
-control, live lease/grant/pin, lifecycle, durable progress, file inventory,
-relocation, host provision/drop.
+The protocol version is 35 (`PROTOCOL` in `tcp.rs`). Every request and
+response variant has an explicit documented wire tag. `tcp/wire_tag_tests.rs`
+freezes the tags.
+
+Protocol history:
+
+- 29: removed the owner-RPC payload path.
+- 30: added unlimited fencing generations (L1).
+- 31: file inventory.
+- 32: retirement proofs.
+- 33: logical relocation pages.
+- 34: L2 provision and drop.
+- 35: keyed `ResolveLiveRecords` by the member address. Added `durable_end` to
+  the inventory sweep.
+
+The remaining request classes are: control, live lease/grant/pin, lifecycle,
+durable progress, file inventory, relocation and host provision/drop.
 
 `ResolveLiveRecords` is keyed by address alone. The owner checks that each
 address names a range inside a live file of its own partition. The address has
 a partition, a generation, an offset inside one file and a length of at least
-the CRC header. The owner pins that range. It does not check member
+the CRC header. The owner pins that range. The owner does not check member
 boundaries. It does not check that the range holds the batch the caller
-expects. The coordinator holds that expectation: it verifies the member CRC-32
-from the
-index position. A relocated position keeps its logical epoch but names the
-generation that now holds its bytes, so the generation is never inferred from
-the epoch. A retired range answers `NotFound`.
+expects. The coordinator holds that expectation. It verifies the member CRC-32
+from the index position. A relocated position keeps its logical epoch. It
+names the generation that now holds its bytes. The generation is never
+inferred from the epoch. A retired range answers `NotFound`.
 
 ## 7. Lifecycle
 
@@ -156,8 +171,8 @@ the epoch. A retired range answers `NotFound`.
   `tcp/inventory.rs`; no `max_epochs` limit).
 - **Owner inventory:** partition high-water, generation seals and file
   inventory pages (`tcp/inventory.rs`).
-- **Export revoke/drain and retirement:** a live file retires only when no
-  lease, no retained reference and the allocator passed it
+- **Export revoke/drain and retirement:** a live file retires only when it has
+  no lease, it has no retained reference and the allocator is past it
   (`storage/{file_seal,file_retirement,retired_files}.rs`).
 - **Provision and drop (L2):** `ProvisionDatabase`/`DropDatabase` over
   authenticated control; the coordinator writes a durable drop intent, owners
@@ -172,13 +187,18 @@ generations + 1)` must not exceed it. The bound is a failure boundary, not a
 quota. Sizes: at 2 owners, 2047 retained generations per owner; at 16 owners,
 255.
 
-The open runs in this order: check the bound (`check_stream_bound`), reserve the
-new generation, run the fence sweep, seed the stream positions from the owner
-reports (`seed_positions`), then trim what is eligible. The bound check runs
-before the fence sweep. It counts the retained generations of the manifest, not
-the seeded positions. The trim runs only at open, after the generation is
-reserved (`fencing_generations` `maintain`, one caller). No trim runs while the
-database is open.
+The open runs these steps in this order:
+
+1. Check the bound (`check_stream_bound`). The check counts the retained
+   generations of the manifest, not the seeded positions.
+2. Reserve the new generation.
+3. Run the fence sweep.
+4. Seed the stream positions from the owner reports (`seed_positions`).
+5. Trim the eligible generations.
+
+The bound check runs before the fence sweep. The trim runs only at open, after
+the reservation (`fencing_generations` `maintain`, one caller). No trim runs
+while the database is open.
 
 - An open at bound−1 reserves its generation and trims what is eligible.
 - A coordinator that finds the database at the bound refuses the open with a
@@ -190,28 +210,40 @@ database is open.
 - The warning is the gauge `retained_stream_pressure` (75 % of the bound), with
   `retained_streams`. At 75 % the open also queues a priority relocation, which
   retires old generations while the database still opens.
-- Operator action: act on the gauge while the database still opens. If a
+- Operator action: watch the gauge while the database still opens. If a
   database is found at the bound, the open stays refused until a separate
   offline fenced trim tool runs. That tool does not exist. It is built only if
-  the gauge fires in a golden or qualification run. An online generation trim is
-  a possible later design (`checkpoint-work/research/ONLINE-GENERATION-TRIM-2026-11-20.md`).
+  the gauge fires in a golden or qualification run. An online generation trim
+  is a possible later design: after a relocation pass, a command to the
+  durable-cut actor forgets one retired generation, and only while the
+  pressure gauge is set. It is not scheduled. It is not proven safe next to
+  readers, grants and the relocation worker.
 
 ## 8. Capacity
 
-Relocation runs native `WalBased` semantics asynchronously on one background
-worker per database (`sui/relocation.rs` `RemoteRelocator`, `Db::start_relocation`
-in `sui.rs`). It evaluates the Sui filters on the native index, copies each
-surviving value to the current generation, waits until the owners made the
-copies durable, re-points the index entry with a compare-and-swap on the exact
-old physical position, stores a control region, and only then retires dead
-sealed files. A pass that cannot prove a stored region at its cut retires
-nothing. It takes no exclusive write gate; foreground writes keep the shared
-gate. Range drop is one singleton `DropCells` batch member (native tag 6,
+Relocation uses the native `WalBased` strategy (`RelocationStrategy` in
+`tidehunter/src/relocation/mod.rs`), which walks the WAL in order from the
+oldest position. It runs asynchronously on one background worker per database
+(`sui/relocation.rs` `RemoteRelocator`, `Db::start_relocation` in `sui.rs`).
+A pass has six steps:
+
+1. Evaluate the Sui filters on the native index.
+2. Copy each surviving value to the current generation.
+3. Wait until the owners made the copies durable.
+4. Re-point the index entry with a compare-and-swap on the exact old physical
+   position.
+5. Store a control region.
+6. Retire the dead sealed files.
+
+A pass that cannot prove a stored region at its cut retires nothing. A pass
+takes no exclusive write gate. Foreground writes keep the shared gate.
+
+Range drop is one singleton `DropCells` batch member (native tag 6,
 `WAL_ENTRY_DROP_CELLS`, `tidehunter/src/db.rs`) under the shared gate
-(`codec.rs`, `sui.rs` `drop_cells_in_range`); crash proofs are in
+(`codec.rs`, `sui.rs` `drop_cells_in_range`). Crash proofs are in
 `remote_db/{drop_cells_tests,drop_cells_crash}.rs`. The owner inventory
 (`storage/file_inventory.rs`) reports logical length and allocated bytes per
-file; it never deletes.
+file. It never deletes.
 
 Gauges of the capacity path (exported by `sui.rs`, with `snapshot_latch_deferrals`):
 

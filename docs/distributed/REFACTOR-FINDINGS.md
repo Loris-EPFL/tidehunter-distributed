@@ -4,8 +4,8 @@ Concurrency-audit findings from the R6 inventory §4 that need a main decision,
 plus the confirmed no-change entries. Each entry names the site, the observed
 behavior, the risk, and either the proposed fix or "no change". All anchors are
 on engine tree `e6c532fd` (counter names as of that tree: `read_rpcs`; R6Prod's
-rename to `live_read_submissions` lands after). The full table is
-`checkpoint-work/research/R6-INVENTORY-2026-11-19.md` §4.
+rename to `live_read_submissions` lands after). The entries below are the
+complete list of findings from the R6 concurrency audit that need a decision.
 
 ## Needs a main decision
 

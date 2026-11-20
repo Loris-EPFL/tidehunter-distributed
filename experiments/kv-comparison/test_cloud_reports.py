@@ -1178,14 +1178,6 @@ class CloudReports(unittest.TestCase):
                 result = cloud.write_diagnostic_summary(row)[0]
                 self.assertFalse(result["available"])
                 self.assertIsNone(result["mean_ns"])
-        for available in (None, False, True):
-            row = {"write_diagnostics": {"observed": {"phase_attempted": True, "profile": {
-                "coordinator_checkpoint_diagnostics_available": available,
-                "coordinator_interval": {"stages": {
-                    "write_checkpoint_diagnostic_root_adoption_ns": 24,
-                    "write_checkpoint_diagnostic_root_adoption_count": 3}}}}}}
-            result = cloud.write_diagnostic_summary(row)[0]
-            self.assertEqual(result["mean_ns"], 8 if available else None)
 
     def test_read_diagnostics_admission_checks_runtime_and_integrity(self):
         with tempfile.TemporaryDirectory() as temporary:

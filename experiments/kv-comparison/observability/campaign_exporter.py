@@ -36,11 +36,7 @@ COORDINATOR_INTERVAL_COUNTERS = {
     "write_background_checkpoint_suffix_batches", "write_durable_receipt_publication_blocked_ns",
     "write_durable_receipt_publication_blocked_batches", "write_append_requests",
     "write_concurrent_admitted",
-    "write_out_of_prefix_published_batches", "write_dependency_wait_batches",
-    "write_checkpoint_diagnostic_root_adoption_ns", "write_checkpoint_diagnostic_root_adoption_count",
-    "write_checkpoint_diagnostic_owner_adoption_ns", "write_checkpoint_diagnostic_owner_adoption_count",
-    "write_checkpoint_diagnostic_obsolete_cleanup_ns", "write_checkpoint_diagnostic_obsolete_cleanup_count",
-    "write_checkpoint_diagnostic_index_prepare_ns", "write_checkpoint_diagnostic_index_prepare_count"} | AUTHORITY_INTERVAL_COUNTERS
+    "write_out_of_prefix_published_batches", "write_dependency_wait_batches"} | AUTHORITY_INTERVAL_COUNTERS
 Q0_OVERHEAD_FIELDS = ("live_frontier_installs", "durable_cut_nudges")
 
 # Live NVMe-oF measurement deltas (kv-research `runner.rs` LIVE_NVMEOF_DELTA_FIELDS). The
@@ -1091,14 +1087,9 @@ def write_diagnostic_metrics(evidence, labels):
                     or not isinstance(pre["stages"], dict) or not pre["stages"]
                     or set(pre["stages"]) - COORDINATOR_INTERVAL_COUNTERS):
                 raise ValueError("invalid pre-completion-gate coordinator interval")
-            checkpoint_available = profile.get("coordinator_checkpoint_diagnostics_available") if profile else None
-            if checkpoint_available is not None and type(checkpoint_available) is not bool:
-                raise ValueError("invalid coordinator checkpoint diagnostic availability")
             for field, value in sorted(pre["stages"].items()):
                 value = count(value)
                 if not boundary_eligible:
-                    continue
-                if field.startswith("write_checkpoint_diagnostic_") and checkpoint_available is not True:
                     continue
                 if field.endswith("_ns"):
                     result += sample("kv_case_write_diagnostic_stage_seconds", value / 1e9,
@@ -1210,14 +1201,7 @@ def write_diagnostic_metrics(evidence, labels):
         boundary_available = boundary_eligible
         result += sample("kv_case_write_diagnostic_available", int(boundary_available), boundary_labels)
         if boundary_available:
-            checkpoint_available = profile.get("coordinator_checkpoint_diagnostics_available")
-            if checkpoint_available is not None and type(checkpoint_available) is not bool:
-                raise ValueError("invalid coordinator checkpoint diagnostic availability")
-            result += sample("kv_case_write_diagnostic_available", int(checkpoint_available is True),
-                             boundary_labels | {"component": "coordinator_checkpoint"})
             for field, value in sorted(coordinator["stages"].items()):
-                if field.startswith("write_checkpoint_diagnostic_") and checkpoint_available is not True:
-                    continue
                 if field.endswith("_ns"):
                     result += sample("kv_case_write_diagnostic_stage_seconds", value / 1e9,
                                      boundary_labels | {"component": "coordinator_interval", "stage": field})
@@ -1367,9 +1351,11 @@ def read_diagnostic_metrics(evidence, labels):
         for population in coverage_populations:
             result += sample("kv_case_read_diagnostic_operations", coverage[population], local | {"population": population})
     for partition, observations, group_counters in groups:
+        # A run that carries an error record keeps its per-owner populations: the counters
+        # do not depend on the removed coordinator resolution sampler.
         population_eligible = eligible or (
             evidence["phase_attempted"] and evidence["runtime_enabled"]
-            and profile is not None and profile.get("coordinator_resolution_valid") is True)
+            and profile is not None and evidence["error"] is not None)
         if population_eligible:
             for field in ("read_profile_completed", "read_profile_errors",
                           "read_profile_failed_owner_profile_retained", "read_profile_failed_owner_profile_unavailable",

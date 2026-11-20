@@ -794,6 +794,35 @@ class CaseIdentityTests(unittest.TestCase):
                 campaign.read_diagnostic_metrics(evidence | {
                     "profile": evidence["profile"] | {"owners": owners}}, {})
 
+    def test_errored_run_keeps_per_owner_populations(self):
+        # The Exact-era gate also read `profile.coordinator_resolution_valid`, which the
+        # tree no longer writes. A run with an error record must still emit the owner counters.
+        def errored():
+            evidence = read_diagnostics()
+            evidence["error"] = "one selected remote flight failed"
+            evidence["profile"]["counters"]["read_profile_errors"] = 1
+            evidence["profile"]["owners"] = {"0": {"stages": {}, "counters": {
+                "read_profile_completed": 1, "read_profile_errors": 1}}}
+            return evidence
+        evidence = errored()
+        self.assertNotIn("coordinator_resolution_valid", evidence["profile"])
+        text = campaign.read_diagnostic_metrics(evidence, {})
+        self.assertIn('partition="0",population="read_profile_errors"} 1', text)
+        self.assertIn('partition="0",population="read_profile_completed"} 1', text)
+        self.assertIn('partition="aggregate",population="read_profile_errors"} 1', text)
+        self.assertIn('partition="0"} 0', text)  # availability stays 0 for an errored run
+        # No data without a run, a runtime selection or a profile.
+        for changes in ({"runtime_enabled": False}, {"phase_attempted": False}):
+            with self.subTest(changes=changes):
+                text = campaign.read_diagnostic_metrics(errored() | changes, {})
+                self.assertNotIn('population="read_profile_errors"', text)
+        text = campaign.read_diagnostic_metrics(errored() | {"profile": None}, {})
+        self.assertNotIn('population="read_profile_errors"', text)
+        # A clean run is unchanged.
+        clean = errored() | {"error": None}
+        self.assertIn('partition="0",population="read_profile_errors"} 1',
+                      campaign.read_diagnostic_metrics(clean, {}))
+
     def test_resolution_is_an_independent_population_with_unavailable_stages(self):
         evidence = read_diagnostics()
         evidence["selection"]["selected_operations"] = 0
@@ -1046,12 +1075,10 @@ class CaseIdentityTests(unittest.TestCase):
             "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
             "clock_scope": "independent completion-charged counters",
             "stages": {"write_foreground_checkpoint_ns": 2000000000,
-                       "write_foreground_checkpoint_count": 2,
-                       "write_checkpoint_diagnostic_root_adoption_ns": 50}}
+                       "write_foreground_checkpoint_count": 2}}
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('scope="coordinator_arm_through_pre_completion_gate"', text)
         self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0', text)
-        self.assertNotIn('stage="write_checkpoint_diagnostic_root_adoption_ns"', text)
         evidence["pre_completion_gate"] = {"available": False, "reason": "missing"}
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('scope="coordinator_arm_through_pre_completion_gate",diagnostic_backend=', text)
@@ -1237,21 +1264,17 @@ class CaseIdentityTests(unittest.TestCase):
         self.assertIn('scope="sampled_prefix",diagnostic_backend="native"} 0', text)
         self.assertIn('scope="measurement_boundary_cumulative_delta",diagnostic_backend="native"} 1', text)
 
-    def test_unavailable_checkpoint_phases_do_not_export_stale_clocks(self):
-        value = write_diagnostics()
-        value["profile"]["coordinator_interval"] = {
-            "scope": "measurement_boundary_cumulative_delta",
-            "clock_scope": "completed checkpoint phases",
-            "stages": {"write_checkpoint_diagnostic_root_adoption_ns": 3000000,
-                       "write_checkpoint_diagnostic_root_adoption_count": 2}}
-        for available in (None, False, True):
-            value["profile"]["coordinator_checkpoint_diagnostics_available"] = available
-            text = campaign.write_diagnostic_metrics(value, {})
-            with self.subTest(available=available):
-                self.assertEqual('stage="write_checkpoint_diagnostic_root_adoption_ns"' in text,
-                                 available is True)
-                self.assertEqual('counter="write_checkpoint_diagnostic_root_adoption_count"' in text,
-                                 available is True)
+    def test_removed_checkpoint_phase_counters_are_not_admitted(self):
+        # The Exact index and its checkpoint diagnostic ring are gone: evidence that
+        # still names a phase counter is not from this tree and must not be exported.
+        for key in ("write_checkpoint_diagnostic_root_adoption_ns",
+                    "write_checkpoint_diagnostic_index_prepare_count"):
+            value = write_diagnostics()
+            value["profile"]["coordinator_interval"] = {
+                "scope": "measurement_boundary_cumulative_delta",
+                "clock_scope": "completed checkpoint phases", "stages": {key: 3}}
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                campaign.write_diagnostic_metrics(value, {})
 
     def test_coordinator_interval_absence_or_counter_reset_does_not_invent_zero(self):
         value = write_diagnostics()

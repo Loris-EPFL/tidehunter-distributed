@@ -1,6 +1,6 @@
 //! The authority manifest format gate (I9). Format 10 is the native-index
 //! hybrid. Manifests of earlier formats are refused before any fence, the file
-//! is never rewritten, and the Exact-era format is named as a removed mode.
+//! is never rewritten, and the Exact-era formats 6 to 9 are named as a removed mode.
 //! The engine-level cases (reopen of a refused and of a current manifest) are
 //! the last test of this file.
 
@@ -42,10 +42,24 @@ fn pre_generation_manifest_format_4_is_rejected_unchanged() {
     assert_eq!(fs::read(&path).unwrap(), MANIFEST_4);
 }
 
+/// The manifest of `MANIFEST_9` with only its `format` field changed. The
+/// archive branch wrote formats 6, 7 and 8 with the same fields that this
+/// reader probes; no real manifest of those formats exists in the repository.
+fn with_format(format: u32) -> Vec<u8> {
+    let (_temp, path) = install(MANIFEST_9);
+    let mut exact: serde_yaml::Value = read_metadata(&path).unwrap();
+    exact
+        .as_mapping_mut()
+        .unwrap()
+        .insert("format".into(), format.into());
+    encode_metadata(&exact).unwrap()
+}
+
 /// A manifest of the Exact era carries a committed `checkpoint` that this
 /// engine cannot read. Opening it would ignore that checkpoint, so the format
-/// gate must refuse it by name. With the format constant left at 9 the probe
-/// accepts it and this test fails.
+/// gate must refuse every such manifest by name. With the format constant left
+/// at 9, or with the Exact-era arm removed, the probe accepts or mislabels it
+/// and this test fails.
 #[test]
 fn exact_era_format_9_manifest_with_a_checkpoint_is_refused_by_name_and_unchanged() {
     let (_temp, path) = install(MANIFEST_9);
@@ -64,6 +78,57 @@ fn exact_era_format_9_manifest_with_a_checkpoint_is_refused_by_name_and_unchange
     assert!(message.contains("format 9"), "{message}");
     assert!(message.ends_with("use archive/multi-design"), "{message}");
     assert_eq!(fs::read(&path).unwrap(), MANIFEST_9);
+}
+
+/// Formats 6, 7 and 8 are Exact-era formats too (format 9 is the real
+/// fixture above); they get the same refusal with the archive pointer.
+#[test]
+fn exact_era_formats_6_7_and_8_are_refused_by_name_and_unchanged() {
+    for format in 6..=8u32 {
+        let bytes = with_format(format);
+        let (_temp, path) = install(&bytes);
+        let message = fencing_generations::read_authority_manifest(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.starts_with("unsupported legacy distributed mode exact_index"),
+            "{message}"
+        );
+        assert!(message.contains(&format!("format {format})")), "{message}");
+        assert!(message.ends_with("use archive/multi-design"), "{message}");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+/// Format 5 is the removed per-cell mode, named by its own sentence. Formats
+/// 4 (the fixture above) and 11 get the generic refusal without the pointer.
+#[test]
+fn format_5_is_per_cell_and_formats_below_5_and_above_10_stay_generic() {
+    let bytes = with_format(5);
+    let (_temp, path) = install(&bytes);
+    let message = fencing_generations::read_authority_manifest(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.starts_with("unsupported legacy distributed mode per_cell"),
+        "{message}"
+    );
+    assert!(message.ends_with("use archive/multi-design"), "{message}");
+    for format in [3u32, 11, 12] {
+        let bytes = with_format(format);
+        let (_temp, path) = install(&bytes);
+        let message = fencing_generations::read_authority_manifest(&path)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            format!(
+                "unsupported distributed authority manifest format {format} (expected {})",
+                fencing_generations::AUTHORITY_FORMAT
+            )
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }
 
 /// The hybrid writes format 10. A format-9 manifest of the Exact era names a

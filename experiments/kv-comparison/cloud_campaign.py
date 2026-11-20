@@ -3787,12 +3787,6 @@ def write_diagnostic_summary(row):
     observe("foreground_admission_pressure", coordinator, "write_foreground_checkpoint_ns",
             "write_foreground_checkpoint_count", interval_scope,
             boundary_eligible)
-    for phase in ("root_adoption", "owner_adoption", "obsolete_cleanup", "index_prepare"):
-        prefix = "write_checkpoint_diagnostic_" + phase
-        observe(phase, coordinator, prefix + "_ns", prefix + "_count",
-                interval_scope + "_completion_charged_checkpoint",
-                boundary_eligible
-                and profile.get("coordinator_checkpoint_diagnostics_available") is True)
     return clocks
 
 

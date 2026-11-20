@@ -362,18 +362,25 @@ Selected RDMA requires the actual Linux NVMe/RDMA initiator; there is no TCP pay
 Private loopback TCP commissioning is a target-control prerequisite, not the
 selected payload route.
 
-Address-keyed resolve (trust scope). `ResolveLiveRecords` carries member
-addresses only: partition, generation, offset and length. The owner checks that
-each address names a range inside a live file of its own partition, at least
-one frame header long, and pins that range. It does not check member
-boundaries. It does not check that the range holds the batch that the caller
-expects, and no batch digest travels with the request. The coordinator holds
-the expectation:
-it verifies the CRC-32 of the member payload that the index position carries. A
-caller that can authenticate to the owner control channel can already read any
-live range of that owner, so address keying adds no access. A retired range
-answers `NotFound`; the coordinator re-resolves once and then returns the typed
-error "value evicted during read".
+Address-keyed resolve (trust scope). `ResolveLiveRecords` (request tag 14)
+carries member addresses only: partition, generation, offset and length. The
+owner checks that each address names a range inside a live file of its own
+partition, at least one frame header long. Then it pins that range. It does not
+check member boundaries. It does not check that the range holds the batch that
+the caller expects. No batch digest travels with the request. The coordinator
+holds the expectation. It verifies the CRC-32 of the member payload that the
+index position carries.
+
+A caller that can authenticate to the owner control channel already has more
+access than one address. It can obtain whole live files of its own authority
+epoch and partition through `OpenLiveExports` (tag 19) and
+`AcquireLiveExportPin` (tag 22). It can read the frames of retained generations
+through `ReplayLiveWal` (tag 21). Address keying therefore adds no access to
+files of that owner. It narrows one thing: a pin now covers one range, not one
+whole file.
+
+A retired range answers `NotFound`. The coordinator re-resolves once. Then it
+returns the typed error "value evicted during read".
 
 Run `kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR`
 before admitting a physical campaign. `expected_route=local_file` is explicitly
@@ -525,9 +532,16 @@ unavailable for admission. These clocks overlap and include scheduling, kernel,
 fabric and target work where applicable; they are not device or wire latency
 or stage percentiles. See [live timing interpretation](../../experiments/nvmeof/LIVE_WAL.md#timing-interpretation).
 
-Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm through a snapshot **after the completion gate**, before profile finalization drains or sends control requests. Its legacy `measurement_boundary_cumulative_delta` scope name does not imply an exact measured-request window: background completions during gate observation can enter this delta. It is separate from sampled owner-prefix clocks and subtracts values already charged at arm time. These cumulative stage-clock deltas are not wall time or per-request durations; overlapping stages must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
+Distributed evidence also includes an optional `coordinator_interval`. It holds whitelisted monotone coordinator counters. The first snapshot comes immediately after the profile arm. The last snapshot comes **after the completion gate**, before profile finalization drains or sends control requests. The interval is the difference of the two. Its legacy `measurement_boundary_cumulative_delta` scope name does not imply an exact measured-request window: background completions during gate observation can enter this delta. It is separate from sampled owner-prefix clocks and subtracts values already charged at arm time. These cumulative stage-clock deltas are not wall time or per-request durations; overlapping stages must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
 
-The write-side checkpoint diagnostic ring is removed with the Exact index. The keys `write_checkpoint_diagnostics_available` and the 36 `write_checkpoint_diagnostic_*` keys no longer exist, and `coordinator_checkpoint_diagnostics_available` is no longer written. Analysis scripts skip those clocks when the flag is missing. A snapshot pass of the native index has its own native metrics.
+The native-index hybrid removes the write-side checkpoint diagnostic ring together with the Exact
+index. The keys `write_checkpoint_diagnostics_available`,
+`coordinator_checkpoint_diagnostics_available` and the
+`write_checkpoint_diagnostic_*` counters no longer exist. `campaign_exporter.py`
+and `cloud_campaign.py` no longer admit those counter names in
+`coordinator_interval`. Evidence from the archive branch that carries them
+fails the exporter validation: analyze it with the tooling of that branch. A
+snapshot pass of the native index has its own native metrics.
 
 Connection/transport counters and owner append samples are not interchangeable
 populations. The local functional run recorded 1280 sampled append requests
@@ -743,16 +757,15 @@ Existing cases default to false and retain their original warm-up.
 
 ### Coordinator, acquisition and output decomposition
 
-The coordinator resolution sampler is removed with the Exact index. The hybrid
-read path (`hybrid/read.rs`) reports only the physical remote-flight stages
-described above. The keys `profile.coordinator_resolution` and
-`profile.coordinator_resolution_valid` are no longer written. The analysis
-scripts that read them (`decomposition.py`, `focused_analysis.py`,
-`campaign_exporter.py`) treat a missing key as "unavailable". They still read
-the evidence of earlier runs. One effect: `campaign_exporter.py` gates the
-per-owner `read_profile_*` counters on `eligible or coordinator_resolution_valid`.
-A run that ended with an error no longer emits those owner counters. This is an
-accepted loss.
+The native-index hybrid removes the coordinator resolution sampler together with
+the Exact index. The hybrid read path (`hybrid/read.rs`) reports only the physical remote-flight
+stages described above. The runner no longer writes the keys
+`profile.coordinator_resolution` and `profile.coordinator_resolution_valid`.
+`decomposition.py` and `focused_analysis.py` treat a missing key as
+"unavailable". They still read the evidence of earlier runs.
+`campaign_exporter.py` keeps the per-owner `read_profile_*` counters of a run
+that carries an error record. It emits them when the run is eligible, or when
+the phase ran, the runtime was enabled, a profile exists and `error` is set.
 
 Batch cache lookup holds the cache for at most 32 consecutive request slots.
 Cache-lock-wait counts are actual acquisitions/windows; cache-lookup counts are
