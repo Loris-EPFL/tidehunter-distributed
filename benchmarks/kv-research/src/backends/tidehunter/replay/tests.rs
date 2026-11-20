@@ -57,10 +57,10 @@ fn remote_config(id: u16, address: &str) -> RemoteDatabaseConfig {
             "fragment_bytes":4194304,"wal_file_bytes":16777216,"max_batches_per_partition":8192,
             "max_reference_metadata_bytes":67108864},
         "endpoints":[{"partition":0,"address":address,"server_name":"local-replay-fixture"}],
-        "tls":tls(),"timeout":{"secs":30,"nanos":0},"max_admitted_batches":8192,"max_index_bytes":67108864,
+        "tls":tls(),"timeout":{"secs":30,"nanos":0},"max_admitted_batches":8192,
         "max_pending_batches":64,"max_pending_bytes":33554432,"owner_append_occupancy":16,
         "pipelined_writes":true,"read_cache_bytes":0,"read_memory_allowance_bytes":134217728,
-        "scan_prefetch_pages":1,"read_lanes":2,"pin_read_lanes":false,
+        "read_lanes":2,"pin_read_lanes":false,
         "max_pending_reads":64,"max_pending_read_bytes":16777216,"write_profile_limit":0,
         "live_nvme":{
             "host_nqn":format!("nqn.2026-01.test:mainnet-replay-{id}"),"host_id":vec![id as u8+1;16],
@@ -87,12 +87,21 @@ pub(crate) fn local_options(root: &Path) -> serde_json::Value {
 fn embedded_remote_config_parses_and_refuses_deleted_keys() {
     let document = serde_json::to_value(remote_config(0, "127.0.0.1:19100")).unwrap();
     serde_json::from_value::<RemoteDatabaseConfig>(document.clone()).unwrap();
-    for key in ["index_shards", "compactor_cadence"] {
+    for key in [
+        "index_shards",
+        "compactor_cadence",
+        "replay_limits",
+        "max_index_bytes",
+        "scan_prefetch_pages",
+    ] {
         let mut stale = document.clone();
         stale[key] = serde_json::json!(1);
+        let error = serde_json::from_value::<RemoteDatabaseConfig>(stale)
+            .expect_err("a deleted key must be refused")
+            .to_string();
         assert!(
-            serde_json::from_value::<RemoteDatabaseConfig>(stale).is_err(),
-            "{key} must be refused"
+            error.contains(&format!("unknown field `{key}`")),
+            "{key} must be refused as an unknown field: {error}"
         );
     }
 }

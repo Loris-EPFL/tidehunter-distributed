@@ -188,7 +188,7 @@ class AdmissionConfigTests(unittest.TestCase):
                             'durability_tier': campaign.durability_tier(job),
                             'owner_wal_geometry': job['owner_wal_geometry'],
                             'max_batches_per_partition': max(16384, cloud.planned_write_batches_per_partition(job)),
-                            'max_admitted_batches': 1000000, 'max_index_bytes': 512 * 1024**2,
+                            'max_admitted_batches': 1000000,
                             'coordinator_cache_bytes': job['coordinator_cache_bytes'],
                             'owner_wal_member_read': 'async',
                             'polling': job.get('owner_polling', 'adaptive'),

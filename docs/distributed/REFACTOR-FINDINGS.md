@@ -75,10 +75,8 @@ rename to `live_read_submissions` lands after). The full table is
 
 ### F6. Reply channels of capacity one (C5)
 
-- Site: `tidehunter/src/distributed/remote_db/durable_cut.rs:749`;
-  `remote_db/capacity_observer.rs:274, 291`;
-  `remote_db/checkpoint_lifecycle.rs:505` (one-reply control channels,
-  `sync_channel(1)`).
+- Site: `tidehunter/src/distributed/remote_db/durable_cut.rs:749`
+  (one-reply control channel, `sync_channel(1)`).
 - Behavior: exactly one reply per request; a late sender is dropped; callers
   use bounded `recv` (`control_until`).
 - No change.
@@ -128,7 +126,7 @@ rename to `live_read_submissions` lands after). The full table is
 - Sites: no per-line worklist is kept here; the measured files and the
   per-clone sites are in R6 inventory §3.4
   (`tcp/live_client.rs`, `remote_db/pending_read.rs`,
-  `remote_db/write_core/publisher.rs`, `native_index.rs` — `.clone()` of
+  `remote_db/write_core/publisher.rs`, `hybrid/replay.rs` — `.clone()` of
   `Vec`/`Bytes`/`String` on the put, get and replay paths).
 - Behavior: clones exist where ownership forces a copy or where an `Arc`
   conversion was judged not yet worth it.

@@ -3869,7 +3869,7 @@ class Controller:
         prep = {"guest_root": guest_root, "addresses": [h["address"] + ":" + str(9400 + (i if job.get("owner_topology") else 0)) for i, h in enumerate(owner_hosts)],
                 "transport": owner_control_settings(job)["owner_transport"],
                 "max_batches_per_partition": max(16384, storage_batches),
-                "max_admitted_batches": 1_000_000, "max_index_bytes": 512 * 1024**2,
+                "max_admitted_batches": 1_000_000,
                 "coordinator_cache_bytes": job["coordinator_cache_bytes"],
                 "owner_wal_member_read": "async",
                 "polling": polling, "owner_wal_geometry": job.get("owner_wal_geometry", "research")}
@@ -3907,6 +3907,7 @@ class Controller:
                 prep.update(owner_read_resident_first=job.get("owner_read_resident_first", False),
                             owner_read_memory_allowance_bytes=allowance)
                 prep["history_persistence"] = "wal_replay"
+                prep["max_index_bytes"] = 512 * 1024**2  # required by Exact-era archive binaries
                 prep["live_nvmeof"] = archive_live_preparation(prep["live_nvmeof"])
                 prep["live_nvmeof"].update(write_mode="leased", export_mode="per_owner")
         if "live_pin_read_lanes" in job:

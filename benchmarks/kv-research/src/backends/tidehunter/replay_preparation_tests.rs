@@ -17,7 +17,7 @@ fn synthetic_input() -> serde_json::Value {
     serde_json::json!({
         "guest_root":"/mnt/tidehunter-preparation-golden", "addresses":["127.0.0.1:9400"],
         "transport":{"kind":"tcp-trusted"}, "owner_wal_geometry":"research",
-        "max_batches_per_partition":16384,"max_admitted_batches":16384,"max_index_bytes":536870912,
+        "max_batches_per_partition":16384,"max_admitted_batches":16384,
         "coordinator_cache_bytes":0,"owner_wal_member_read":"async",
         "read_lanes":2,"polling":"adaptive",
         "live_nvmeof":test_live_nvmeof(1)

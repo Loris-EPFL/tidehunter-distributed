@@ -122,9 +122,8 @@ pub struct RemoteDatabaseConfig {
     pub tls: TlsFiles,
     pub timeout: Duration,
     /// Resident suffix identities and ordering slots, not a lifetime write limit.
-    /// Checkpoints move completed identities into the bounded WAL-replay retry window.
+    /// Completed identities leave the bounded retry window as newer batches publish.
     pub max_admitted_batches: usize,
-    pub max_index_bytes: usize,
     pub max_pending_batches: usize,
     pub max_pending_bytes: usize,
     /// Queued and active append commands per owner; one transport slot is reserved for control.
@@ -149,9 +148,6 @@ pub struct RemoteDatabaseConfig {
     /// Explicit host slice for cache ownership and bounded pending read buffers.
     #[serde(default = "default_read_memory_allowance_bytes")]
     pub read_memory_allowance_bytes: usize,
-    /// Bounded scan-page lookahead; one is the serial control.
-    #[serde(default = "default_scan_prefetch_pages")]
-    pub scan_prefetch_pages: usize,
     /// Absent resolves to the coordinator host's available CPU parallelism at open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_lanes: Option<usize>,
@@ -187,10 +183,6 @@ fn default_max_pending_reads() -> usize {
 }
 fn default_max_pending_read_bytes() -> usize {
     64 * 1024 * 1024
-}
-
-fn default_scan_prefetch_pages() -> usize {
-    2
 }
 
 fn default_pipeline() -> bool {
@@ -415,7 +407,6 @@ impl RemoteDatabaseConfig {
             || self.max_pending_batches > 4096
             || self.max_pending_bytes == 0
             || self.max_pending_bytes > 256 * 1024 * 1024
-            || !(1..=2).contains(&self.scan_prefetch_pages)
             || self.read_memory_allowance_bytes == 0
             // Cache bytes include all fixed arrays and charged live entries.
             || self

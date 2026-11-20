@@ -706,7 +706,6 @@ def _kernel_live_prepare_input(guest, control_endpoint, transport, addr, service
         "transport": {"kind": "tcp"}, "durability_tier": tier,
         "owner_wal_geometry": "research",
         "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
-        "max_index_bytes": 128 * 1024**2,
         "coordinator_cache_bytes": 4 * 1024**2,
         "owner_wal_member_read": "async", "polling": "adaptive",
         # One host slot: drop -> reprovision must reuse it.

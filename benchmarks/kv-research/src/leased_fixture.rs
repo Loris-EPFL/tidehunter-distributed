@@ -64,7 +64,6 @@ const MAX_OWNERS: u32 = 16;
 pub(crate) struct CoordinatorSpec {
     pub timeout_secs: u64,
     pub max_admitted_batches: usize,
-    pub max_index_bytes: usize,
     pub max_pending_batches: usize,
     pub max_pending_bytes: usize,
     pub read_memory_allowance_bytes: usize,
@@ -271,7 +270,6 @@ impl FixtureSpec {
             "endpoints": endpoints,
             "tls": trusted_tls(), "timeout": {"secs": coordinator.timeout_secs, "nanos": 0},
             "max_admitted_batches": coordinator.max_admitted_batches,
-            "max_index_bytes": coordinator.max_index_bytes,
             "max_pending_batches": coordinator.max_pending_batches,
             "max_pending_bytes": coordinator.max_pending_bytes,
             "owner_append_occupancy": 16, "read_cache_bytes": 0,
@@ -678,7 +676,6 @@ pub(crate) struct BenchmarkGeometry {
     pub fragment_bytes: u64,
     pub wal_file_bytes: u64,
     pub max_admitted_batches: usize,
-    pub max_index_bytes: usize,
 }
 
 impl BenchmarkGeometry {
@@ -709,7 +706,6 @@ impl BenchmarkGeometry {
             coordinator: CoordinatorSpec {
                 timeout_secs: 60,
                 max_admitted_batches: self.max_admitted_batches,
-                max_index_bytes: self.max_index_bytes,
                 max_pending_batches: 64,
                 max_pending_bytes: 32 * MIB,
                 read_memory_allowance_bytes: 128 * MIB,

@@ -170,7 +170,6 @@ struct ExternalPreparationInput {
     #[serde(default)]
     owner_wal_file_bytes: Option<u64>,
     max_admitted_batches: usize,
-    max_index_bytes: usize,
     coordinator_cache_bytes: usize,
     #[serde(default = "default_coordinator_read_memory_allowance_bytes")]
     coordinator_read_memory_allowance_bytes: usize,
@@ -323,7 +322,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         || input.max_batches_per_partition > 1_000_000
         || input.max_admitted_batches == 0
         || input.max_admitted_batches > 1_000_000
-        || input.max_index_bytes == 0
         || input
             .read_lanes
             .is_some_and(|lanes| !(1..=1024).contains(&lanes))
@@ -468,7 +466,6 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
         &shape,
         storage,
         input.max_admitted_batches,
-        input.max_index_bytes,
         input.transport.clone(),
         &owner_transports,
         input.read_lanes,
@@ -948,7 +945,6 @@ async fn open_with_shape(
         "client": {
             "timeout_ms": remote_config.timeout.as_millis(),
             "max_admitted_batches": remote_config.max_admitted_batches,
-            "max_index_bytes": remote_config.max_index_bytes,
             "max_pending_batches": remote_config.max_pending_batches,
             "max_pending_bytes": remote_config.max_pending_bytes,
             "owner_append_occupancy": remote_config.owner_append_occupancy,
@@ -956,7 +952,6 @@ async fn open_with_shape(
             "leased_submit_redrain": remote_config.leased_submit_redrain,
             "read_cache_bytes": remote_config.read_cache_bytes,
             "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes,
-            "scan_prefetch_pages": remote_config.scan_prefetch_pages,
             "read_lanes": remote_config.effective_read_lanes(),
             "pin_read_lanes": remote_config.pin_read_lanes,
             "max_pending_reads": remote_config.max_pending_reads,
@@ -1120,7 +1115,6 @@ fn open_local_fixture(
         fragment_bytes: NATIVE_FRAGMENT_BYTES,
         wal_file_bytes: NATIVE_WAL_FILE_BYTES,
         max_admitted_batches: max_batches,
-        max_index_bytes: 256 * 1024 * 1024,
     }
     .spec(root, tier, addresses);
     if let Some(limits) = batch_limits {
@@ -1951,6 +1945,19 @@ mod replay_preparation_tests;
 mod tests {
     use super::*;
 
+    /// A refused preparation must fail for its own reason: a deleted key left in
+    /// a test document would make `deny_unknown_fields` refuse it instead.
+    fn refusal(input: &Path, output: &Path) -> String {
+        let error = prepare_external_case_file(input, output)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("unknown field"),
+            "refused for a stale key, not for its reason: {error}"
+        );
+        error
+    }
+
     /// Owner storage samples run only at drained boundaries: inside the
     /// measurement window the gate refuses without calling the owner.
     #[test]
@@ -2087,7 +2094,7 @@ mod tests {
         let config = serde_json::json!({
             "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
             "transport": {"kind": "tcp"}, "max_batches_per_partition": 16384,
-            "max_admitted_batches": 16384, "max_index_bytes": 536870912,
+            "max_admitted_batches": 16384,
             "coordinator_cache_bytes": 0,
             "owner_wal_member_read": "async", "polling": "adaptive",
             "live_nvmeof": test_live_nvmeof(1)
@@ -2110,6 +2117,7 @@ mod tests {
         // Removed inputs (history, owner-RPC reads) are rejected; live_nvmeof is required.
         for (index, key) in [
             "history_persistence",
+            "max_index_bytes",
             "owner_read_workers",
             "owner_read_resident_first",
             "owner_read_memory_allowance_bytes",
@@ -2128,7 +2136,7 @@ mod tests {
         no_live.as_object_mut().unwrap().remove("live_nvmeof");
         fs::write(&input, serde_json::to_vec(&no_live).unwrap()).unwrap();
         let rejected = root.join("rejected-no-live");
-        assert!(prepare_external_case_file(&input, &rejected).is_err());
+        refusal(&input, &rejected);
         assert!(!rejected.exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2156,7 +2164,6 @@ mod tests {
             "addresses": ["127.0.0.1:44000", "127.0.0.1:44001"],
             "transport": {"kind": "tcp"},
             "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
-            "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 0,
             "owner_wal_member_read": "async",
             "polling": "adaptive",
@@ -2238,7 +2245,7 @@ mod tests {
         for bytes in [0, 134217728, 268435457, 10871635968_u64] {
             config["owner_wal_file_bytes"] = serde_json::json!(bytes);
             fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert!(prepare_external_case_file(&input, &root.join("output")).is_err());
+            refusal(&input, &root.join("output"));
             assert!(!root.join("output").exists());
         }
         fs::remove_dir_all(root).unwrap();
@@ -2261,7 +2268,6 @@ mod tests {
                 "lease_ahead": true, "polled_writes": false
             },
             "max_admitted_batches": 1000000, "max_batches_per_partition": 16384,
-            "max_index_bytes": 536870912,
             "owner_transports": [{
                 "fabric": {"backend": "verbs", "source_address": "10.20.15.197"},
                 "kind": "ofi", "security": "trusted"
@@ -2372,7 +2378,6 @@ mod tests {
             "transport": {"kind": "tcp"},
             "owner_wal_geometry": "research",
             "max_batches_per_partition": 16384, "max_admitted_batches": 16384,
-            "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 1024_u64 * 1024 * 1024,
             "owner_wal_member_read": "async",
             "polling": "adaptive",
@@ -2388,15 +2393,15 @@ mod tests {
             512 * 1024 * 1024
         );
         write_input(&config);
-        assert!(prepare_external_case_file(&input, &root.join("default-large")).is_err());
+        refusal(&input, &root.join("default-large"));
         config["coordinator_read_memory_allowance_bytes"] =
             serde_json::json!(1024_u64 * 1024 * 1024);
         write_input(&config);
-        assert!(prepare_external_case_file(&input, &root.join("insufficient")).is_err());
+        refusal(&input, &root.join("insufficient"));
         config["coordinator_cache_bytes"] = serde_json::json!(usize::MAX);
         config["coordinator_read_memory_allowance_bytes"] = serde_json::json!(usize::MAX);
         write_input(&config);
-        assert!(prepare_external_case_file(&input, &root.join("overflow")).is_err());
+        refusal(&input, &root.join("overflow"));
         config["coordinator_cache_bytes"] = serde_json::json!(1024_u64 * 1024 * 1024);
         let allowance = 1024_u64 * 1024 * 1024 + 64 * 1024 * 1024;
         config["coordinator_read_memory_allowance_bytes"] = serde_json::json!(allowance);
@@ -2532,21 +2537,21 @@ mod tests {
             config["addresses"][1] = config["addresses"][0].clone();
             write_input(&config);
             let invalid = root.join("live-duplicate");
-            assert!(prepare_external_case_file(&input, &invalid).is_err());
+            refusal(&input, &invalid);
             assert!(!invalid.exists());
             config["addresses"] = serde_json::json!(["127.0.0.1:44000"]);
             config["live_nvmeof"]["addresses"] = serde_json::json!(["10.1.0.1"]);
             config["live_nvmeof"]["max_inflight_bytes"] = serde_json::json!(32 * 1024);
             write_input(&config);
             let undersized = root.join("live-undersized");
-            assert!(prepare_external_case_file(&input, &undersized).is_err());
+            refusal(&input, &undersized);
             assert!(!undersized.exists());
             let required =
                 (2 * (RESEARCH_BATCH_BYTES + 8) + 3 * 4095).max(RESEARCH_FRAGMENT_BYTES + 4095);
             config["live_nvmeof"]["max_inflight_bytes"] = serde_json::json!(required - 1);
             write_input(&config);
             let below_boundary = root.join("live-below-boundary");
-            assert!(prepare_external_case_file(&input, &below_boundary).is_err());
+            refusal(&input, &below_boundary);
             assert!(!below_boundary.exists());
             config["live_nvmeof"]["max_inflight_bytes"] = serde_json::json!(required);
             write_input(&config);
@@ -2582,7 +2587,6 @@ mod tests {
             "transport": {"kind":"tcp"},
             "max_batches_per_partition": 16384,
             "max_admitted_batches": 1_048_576,
-            "max_index_bytes": 512 * 1024 * 1024,
             "coordinator_cache_bytes": 0,
             "owner_wal_member_read": "async",
             "polling": "adaptive",

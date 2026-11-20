@@ -12,7 +12,7 @@ tidehunter/benches/admission_options/core.rs 2040
 tidehunter/src/distributed/nvmeof/live_target.rs 1502
 tidehunter/src/distributed/remote_db.rs 2702
 tidehunter/src/distributed/remote_db/concurrent/tests.rs 2280
-tidehunter/src/distributed/remote_db/leased_tests.rs 1756
+tidehunter/src/distributed/remote_db/leased_tests.rs 1755
 tidehunter/src/distributed/remote_db/live_bench_tests.rs 2056
 tidehunter/src/distributed/remote_db/pending_read.rs 2263
 tidehunter/src/distributed/remote_db/pipeline_tests.rs 2172

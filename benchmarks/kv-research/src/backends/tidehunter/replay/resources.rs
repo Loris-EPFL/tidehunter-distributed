@@ -267,7 +267,7 @@ mod tests {
             "transport":{"kind":"tcp-trusted"},
             "owner_wal_geometry":"native_default","replay_node_db_id":0,
             "batch_limits":{"max_operations":519,"max_encoded_bytes":500000},
-            "max_batches_per_partition":32768,"max_admitted_batches":1000000,"max_index_bytes":512*1024*1024,
+            "max_batches_per_partition":32768,"max_admitted_batches":1000000,
             "coordinator_cache_bytes":0,"owner_wal_member_read":"async","polling":"adaptive",
             "live_nvmeof":crate::backends::tidehunter::test_live_nvmeof(2)
         });

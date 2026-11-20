@@ -288,7 +288,6 @@ pub(super) fn leased_owner(
         coordinator: CoordinatorSpec {
             timeout_secs: 60,
             max_admitted_batches: 8192,
-            max_index_bytes: 256 * MIB,
             max_pending_batches: 64,
             max_pending_bytes: MAX_PENDING_BYTES,
             read_memory_allowance_bytes: 256 * MIB,

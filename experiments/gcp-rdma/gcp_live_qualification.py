@@ -716,7 +716,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
     if not own_is_owner:
         preparation = {'guest_root': str(root), 'addresses': [owner_control + ':9400'], 'transport': {'kind': 'tcp'},
             'owner_wal_geometry': 'research',
-            'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384, 'max_index_bytes': 128 * 1024**2,
+            'durability_tier': tier, 'max_batches_per_partition': 16384, 'max_admitted_batches': 16384,
             'coordinator_cache_bytes': 4 * 1024**2,
             'owner_wal_member_read': 'async', 'polling': 'adaptive',
             'live_nvmeof': {'transport': transport, 'addresses': [owner_fabric], 'service': 4420, 'port_id': 1000,
@@ -726,6 +726,7 @@ def _run(package, cfg, deadline, store, own, own_id, identity, api, info, zone, 
             preparation.update(owner_read_workers=2, owner_read_resident_first=False,
                                owner_read_memory_allowance_bytes=512 * 1024**2)
             preparation['history_persistence'] = 'wal_replay'
+            preparation['max_index_bytes'] = 128 * 1024**2  # required by Exact-era archive binaries
             preparation['live_nvmeof'].update(write_mode='leased', export_mode='per_owner',
                                               commissioning_service=4421, commissioning_port_id=1001)
         input_path = root / 'prepare.json'

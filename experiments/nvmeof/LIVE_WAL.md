@@ -305,7 +305,7 @@ The trust model is an isolated network with authorized, non-Byzantine privileged
 | `tidehunter/src/distributed/nvmeof/{live_namespace,live_connect,live_pool,live_io}.rs` | Verified block devices, controller ownership/pooling and bounded io_uring I/O. |
 | `tidehunter/src/distributed/tcp/{live_control,live_client,live_read,live_recovery}.rs` | Authenticated metadata, final-frame writes, member reads and payload recovery without payload RPC fallback. |
 | `tidehunter/src/distributed/tcp/{control,inventory}.rs` | Owner authority, persistence, target publication and higher-epoch recovery. |
-| `tidehunter/src/distributed/remote_db.rs` and `remote_db/{pending_read,concurrent,checkpoint_lifecycle,transports}.rs` | Live dispatch, queued checkpoint overlap, grant drainage, open/close/reopen and controller ownership. |
+| `tidehunter/src/distributed/remote_db.rs` and `remote_db/{pending_read,concurrent,transports}.rs` | Live dispatch, grant drainage, open/close/reopen and controller ownership. |
 | `tidehunter/src/distributed/sui.rs` | Existing Sui-facing operations, typed live evidence and separate final shutdown. |
 | `tidehunter/src/distributed/nvmeof/{live_metrics,live_prometheus}.rs` | Per-client counters, bounded observed-route evidence and pull-based Prometheus collection. |
 | `benchmarks/kv-research/src/backends/tidehunter/live_qualification.rs` | Real-file component qualification and actual-kernel operation/crash-recovery qualification. |

@@ -132,6 +132,11 @@ Standalone `sharded_wal_bench` uses the same structured `Transport` file:
 sharded_wal_bench --backend tcp --transport-config transport.json
 ```
 
+Note: the `sharded_wal_bench` example and its executable are removed from this
+tree. The archive tag `archive/multi-design-*` still builds them. This section
+stays as the record of earlier runs. Current builds select the transport
+through `kv-research`, as described below.
+
 Example benchmarks and `kv-research` have different selection surfaces:
 `kv-research` uses backend kind `tidehunter` and the
 `backend.options.transport` object in its run JSON.
@@ -299,6 +304,11 @@ executable is the existing
 benchmark workload runs in that mode. The new standalone `state-audit` uses the
 same adapter and the same engine sources. The existing strict
 `distributed_storage_local_audit` example is rebuilt from the same Sui sources.
+
+Note: the `sharded_wal_bench` executable is removed from this tree (see the
+note above). The `kv-research` executable now provides the same
+`--experimental-storage-node` mode. The paragraph above stays as the record of
+earlier builds.
 
 `source-manifest.json`, `sources.tar.gz`, the exact commands/log hashes,
 `build-manifest.json`, resolved lockfiles and executable hashes bind every

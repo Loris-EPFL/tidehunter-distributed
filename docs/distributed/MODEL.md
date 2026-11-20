@@ -28,6 +28,29 @@ source map, safety rules and local evidence §15
 (`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`,
 archived at tag `archive/multi-design-*`).
 
+## Implementation mapping updated 20 November 2026
+
+The coordinator index is now the native index with version-carrying positions
+([`ARCHITECTURE.md`](ARCHITECTURE.md) §4–5). The finite models below still check
+the batch and recovery protocol. Four terms map to the code as follows.
+
+- **Snapshot at a cut.** The code stores a control region (V4). The region names
+  one replay start per owner stream and one stored byte position per cell. It
+  never names a batch above the persisted version B durable cut.
+- **Recovery replay.** The code reads each owner stream and merges the streams in
+  batch-version order. A per-generation filter drops the unacknowledged tail of an
+  older generation. Replay has no length limit, as in native.
+- **Retained snapshot and protected reader.** The code keeps no retained view of
+  an older cut. Iterators are live. This is an accepted weakening. The
+  relocation model below remains an obligation model only.
+- **Relocation.** A relocation copy replaces an index entry with a
+  compare-and-swap on the exact old physical position. The owners must make the
+  copy durable first. A newer user mutation wins, because the compare fails.
+
+The member CRC-32 of the index position replaces the reference digests for value
+integrity on reads. It does not change the write-side validation that the model
+checks.
+
 ## Anchors and deliberate differences
 
 - Tidehunter's paper, §§3.1–3.4 and §4.4, separates whole-batch recovery, completed

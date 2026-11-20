@@ -300,8 +300,8 @@ kv-research --prepare-external-case input.json --output FRESH_DIR
 `input.json` specifies an absolute `guest_root`, one, two, four, five, or sixteen
 unique `addresses` as `IPv4:port`/`[IPv6]:port`, a structured engine `transport`,
 optional `owner_transports`, and the required `live_nvmeof` settings below.
-Set positive `max_batches_per_partition`, `max_admitted_batches` and
-`max_index_bytes`, a nonnegative `coordinator_cache_bytes`, an
+Set positive `max_batches_per_partition` and `max_admitted_batches`, a
+nonnegative `coordinator_cache_bytes`, an
 `owner_wal_member_read` policy (`async`, `mapped` or `positional`), and
 `polling` (`adaptive` or `busy`). The default synthetic keyshape has 16 mutexes
 × 64 cells. The helper writes `node-*/launch.yaml`, `remote.yaml`, `remote.json`,
@@ -361,6 +361,19 @@ target. The coordinator provisions database and effective target identities.
 Selected RDMA requires the actual Linux NVMe/RDMA initiator; there is no TCP payload fallback.
 Private loopback TCP commissioning is a target-control prerequisite, not the
 selected payload route.
+
+Address-keyed resolve (trust scope). `ResolveLiveRecords` carries member
+addresses only: partition, generation, offset and length. The owner checks that
+each address names a range inside a live file of its own partition, at least
+one frame header long, and pins that range. It does not check member
+boundaries. It does not check that the range holds the batch that the caller
+expects, and no batch digest travels with the request. The coordinator holds
+the expectation:
+it verifies the CRC-32 of the member payload that the index position carries. A
+caller that can authenticate to the owner control channel can already read any
+live range of that owner, so address keying adds no access. A retired range
+answers `NotFound`; the coordinator re-resolves once and then returns the typed
+error "value evicted during read".
 
 Run `kv-research --experimental-live-nvmeof-qualification INPUT.json --output FRESH_DIR`
 before admitting a physical campaign. `expected_route=local_file` is explicitly
@@ -512,9 +525,9 @@ unavailable for admission. These clocks overlap and include scheduling, kernel,
 fabric and target work where applicable; they are not device or wire latency
 or stage percentiles. See [live timing interpretation](../../experiments/nvmeof/LIVE_WAL.md#timing-interpretation).
 
-Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm through a snapshot **after the completion gate**, before profile finalization drains or sends control requests. Its legacy `measurement_boundary_cumulative_delta` scope name does not imply an exact measured-request window: background/checkpoint completions during gate observation can enter this delta. It is separate from sampled owner-prefix clocks and subtracts values already charged at arm time. Checkpoint phase sums/counts are charged when a checkpoint completes; they can include work begun before arm and exclude checkpoints still in flight at the end. Root adoption, live owner installation, worker cleanup and index preparation remain separate phase populations. These cumulative stage-clock deltas are not wall time or per-request durations; overlapping stages must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
+Distributed evidence also includes an optional `coordinator_interval` of whitelisted monotone coordinator counters, computed from a fresh snapshot immediately after profile arm through a snapshot **after the completion gate**, before profile finalization drains or sends control requests. Its legacy `measurement_boundary_cumulative_delta` scope name does not imply an exact measured-request window: background completions during gate observation can enter this delta. It is separate from sampled owner-prefix clocks and subtracts values already charged at arm time. These cumulative stage-clock deltas are not wall time or per-request durations; overlapping stages must not be added as disjoint fractions. Missing or decreased counters are reported as unavailable rather than zero-filled.
 
-The checkpoint phase subset additionally requires `coordinator_checkpoint_diagnostics_available=true`. A missing/false flag suppresses those Prometheus clocks, even if stale numeric fields exist; a zero phase count does not mean zero latency. Dynamic profile arming now completes older checkpoint work before enabling/resetting its bounded diagnostic ring, outside measurement. This does not add collection to unprofiled primary cases.
+The write-side checkpoint diagnostic ring is removed with the Exact index. The keys `write_checkpoint_diagnostics_available` and the 36 `write_checkpoint_diagnostic_*` keys no longer exist, and `coordinator_checkpoint_diagnostics_available` is no longer written. Analysis scripts skip those clocks when the flag is missing. A snapshot pass of the native index has its own native metrics.
 
 Connection/transport counters and owner append samples are not interchangeable
 populations. The local functional run recorded 1280 sampled append requests
@@ -730,23 +743,13 @@ Existing cases default to false and retain their original warm-up.
 
 ### Coordinator, acquisition and output decomposition
 
-The coordinator has an independent first-N API-resolution sampler. It includes
-point/bulk cache hits, negative index results, remote misses and errors, unlike
-the unchanged first-N *physical remote-flight* sampler. Its snapshot records
-index-lock wait, member-only index lookup, cache-lock wait and cache lookup,
-plus separate cut validation/capture, route, pin and batch-construction clocks.
-Bulk samples also record admitted batch wait, post-read cache-fill/accounting,
-and result materialization. These spans count only APIs that reach their end;
-preparation outcome counters do not imply that a later remote read succeeded.
-Older evidence without these three stages remains readable and does not emit
-invented zero-duration observations for them.
-Each has its own count, accumulated ns and maximum; bulk envelopes are not
-pooled with member lookups. Logical member outcomes
-and API resolution counts are distinct. `profile.coordinator_resolution_valid`
-requires a correctly armed, attempted and drained interval; missing remote
-flight evidence does not invalidate an otherwise valid cache-only resolution
-sample. Nonzero rearm resets after drain; disarm preserves the snapshot.
-The legacy combined resolve clock is not an index-only measurement.
+The coordinator resolution sampler is removed with the Exact index. The hybrid
+read path (`hybrid/read.rs`) reports only the physical remote-flight stages
+described above. The keys `profile.coordinator_resolution` and
+`profile.coordinator_resolution_valid` are no longer written. The analysis
+scripts that read them (`decomposition.py`, `focused_analysis.py`,
+`campaign_exporter.py`) treat a missing key as "unavailable". They still read
+the evidence of earlier runs.
 
 Batch cache lookup holds the cache for at most 32 consecutive request slots.
 Cache-lock-wait counts are actual acquisitions/windows; cache-lookup counts are
