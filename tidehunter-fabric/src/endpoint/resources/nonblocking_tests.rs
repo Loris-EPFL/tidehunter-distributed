@@ -39,9 +39,12 @@ unsafe extern "C" fn trywait(
     fids: *mut *mut ffi::fid,
     count: i32,
 ) -> i32 {
-    // SAFETY: The fixture installs this callback only on a fabric whose fid
-    // context points to the live Provider; calls are serialized.
-    let state = unsafe { &mut *(*fabric).fid.context.cast::<Provider>() };
+    // SAFETY: the fixture installs this callback only on a fabric whose
+    // context points to the live Provider; reading that field is in bounds.
+    let context = unsafe { (*fabric).fid.context };
+    // SAFETY: calls are serialized, so this callback has exclusive access to
+    // the Provider behind the context pointer.
+    let state = unsafe { &mut *context.cast::<Provider>() };
     assert_eq!(count, 1, "only the completion queue may be waited on");
     assert!(!fids.is_null());
     state.trywaits += 1;
@@ -52,9 +55,12 @@ unsafe extern "C" fn trywait(
 // heap addresses until Endpoint closes. Calls are serialized, with no Provider
 // reference live across an Endpoint call.
 unsafe extern "C" fn read_cq(cq: *mut ffi::fid_cq, buf: *mut c_void, count: usize) -> isize {
-    // SAFETY: cq is a live fixture handle whose context points to its Provider.
-    // Serialized dispatch gives this callback exclusive access to that state.
-    let state = unsafe { &mut *(*cq).fid.context.cast::<Provider>() };
+    // SAFETY: cq is a live fixture handle; reading its context pointer field
+    // is in bounds for this serialized callback.
+    let context = unsafe { (*cq).fid.context };
+    // SAFETY: serialized dispatch gives this callback exclusive access to the
+    // Provider behind the context pointer.
+    let state = unsafe { &mut *context.cast::<Provider>() };
     state.polls += 1;
     state.cq_capacity = count;
     if let Some(entry) = state.completion.take() {
@@ -71,9 +77,12 @@ unsafe extern "C" fn read_error(
     buf: *mut ffi::fi_cq_err_entry,
     _flags: u64,
 ) -> isize {
-    // SAFETY: cq is a live fixture handle whose context points to its Provider;
-    // serialized dispatch gives this callback exclusive access.
-    let state = unsafe { &mut *(*cq).fid.context.cast::<Provider>() };
+    // SAFETY: cq is a live fixture handle; reading its context pointer field
+    // is in bounds for this serialized callback.
+    let context = unsafe { (*cq).fid.context };
+    // SAFETY: serialized dispatch gives this callback exclusive access to the
+    // Provider behind the context pointer.
+    let state = unsafe { &mut *context.cast::<Provider>() };
     state.error_reads += 1;
     // SAFETY: poll supplies a writable, aligned error-entry local for this call.
     unsafe {
@@ -93,9 +102,12 @@ unsafe extern "C" fn send(
     _peer: ffi::fi_addr_t,
     context: *mut c_void,
 ) -> isize {
-    // SAFETY: ep is a live fixture handle whose context points to its Provider;
-    // serialized dispatch gives this callback exclusive access.
-    let state = unsafe { &mut *(*ep).fid.context.cast::<Provider>() };
+    // SAFETY: ep is a live fixture handle; reading its context pointer field
+    // is in bounds for this serialized callback.
+    let state_context = unsafe { (*ep).fid.context };
+    // SAFETY: serialized dispatch gives this callback exclusive access to the
+    // Provider behind the context pointer.
+    let state = unsafe { &mut *state_context.cast::<Provider>() };
     state.sends += 1;
     if state.send_result == 0 {
         state.sent = buf.cast();
@@ -119,9 +131,12 @@ unsafe extern "C" fn receive(
     _peer: ffi::fi_addr_t,
     context: *mut c_void,
 ) -> isize {
-    // SAFETY: ep is a live fixture handle whose context points to its Provider;
-    // serialized dispatch gives this callback exclusive access.
-    let state = unsafe { &mut *(*ep).fid.context.cast::<Provider>() };
+    // SAFETY: ep is a live fixture handle; reading its context pointer field
+    // is in bounds for this serialized callback.
+    let state_context = unsafe { (*ep).fid.context };
+    // SAFETY: serialized dispatch gives this callback exclusive access to the
+    // Provider behind the context pointer.
+    let state = unsafe { &mut *state_context.cast::<Provider>() };
     state.received = buf.cast();
     state.received_context = context;
     state.receives += 1;
@@ -129,9 +144,12 @@ unsafe extern "C" fn receive(
 }
 
 unsafe extern "C" fn close(fid: *mut ffi::fid) -> i32 {
-    // SAFETY: Each fixture handle has a live Provider context. Serialized close
-    // callbacks have exclusive state access before fixture storage is dropped.
-    let state = unsafe { &mut *(*fid).context.cast::<Provider>() };
+    // SAFETY: each fixture handle has a live Provider context; reading that
+    // field is in bounds for this serialized close callback.
+    let context = unsafe { (*fid).context };
+    // SAFETY: serialized close callbacks have exclusive access to the Provider
+    // behind the context pointer before fixture storage is dropped.
+    let state = unsafe { &mut *context.cast::<Provider>() };
     if state.closes == 0 && !state.sent.is_null() {
         // SAFETY: A successful nonempty send stored sent. Endpoint retains that
         // initialized TX slot through endpoint close; the fixture never writes it.
@@ -715,11 +733,10 @@ fn no_poll_eagain_releases_no_fence_and_never_retains_caller_slices() {
     input.fill(0);
     assert_eq!(fixture.state().polls, 0);
     assert_eq!(fixture.state().sends, 2);
-    // SAFETY: The successful post owns five bytes until completion/close.
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(fixture.state().sent, 5) },
-        b"owned"
-    );
+    // SAFETY: the successful post owns five initialized TX bytes until
+    // completion or close.
+    let sent = unsafe { std::slice::from_raw_parts(fixture.state().sent, 5) };
+    assert_eq!(sent, b"owned");
     drop(fixture.endpoint.take());
     assert_eq!(fixture.state().closed_byte, Some(b'o'));
 }
@@ -861,11 +878,10 @@ fn eagain_keeps_the_filled_slot_and_retries_without_copying_again() {
     assert_eq!(stats.send_size_le_4k, 1);
     assert_eq!(stats.send_post_bytes, 7);
     assert_eq!(fixture.endpoint().accepted_send_fence().unwrap(), 1);
-    // SAFETY: The successful post owns these seven initialized TX bytes.
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(fixture.state().sent, 7) },
-        b"payload"
-    );
+    // SAFETY: the successful post owns seven initialized TX bytes until
+    // completion or close.
+    let sent = unsafe { std::slice::from_raw_parts(fixture.state().sent, 7) };
+    assert_eq!(sent, b"payload");
 }
 
 #[test]
@@ -877,20 +893,18 @@ fn changed_bytes_after_eagain_are_copied_fresh_never_posted_stale() {
     fixture.state().send_result = 0;
     // Same length, different content, then different length: both need a copy.
     assert_eq!(fixture.endpoint().try_send(b"other").unwrap(), 5);
-    // SAFETY: The successful post owns these five initialized TX bytes.
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(fixture.state().sent, 5) },
-        b"other"
-    );
+    // SAFETY: the successful post owns five initialized TX bytes until
+    // completion or close.
+    let sent = unsafe { std::slice::from_raw_parts(fixture.state().sent, 5) };
+    assert_eq!(sent, b"other");
     fixture.state().send_result = -isize::try_from(ffi::FI_EAGAIN).unwrap();
     fixture.endpoint().try_send(b"abc").unwrap_err();
     fixture.state().send_result = 0;
     assert_eq!(fixture.endpoint().try_send(b"abcdef").unwrap(), 6);
-    // SAFETY: As above for the six posted bytes.
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(fixture.state().sent, 6) },
-        b"abcdef"
-    );
+    // SAFETY: the successful post owns six initialized TX bytes until
+    // completion or close.
+    let sent = unsafe { std::slice::from_raw_parts(fixture.state().sent, 6) };
+    assert_eq!(sent, b"abcdef");
     let stats = fixture.endpoint().progress_stats();
     assert_eq!(stats.send_copy_calls, 4);
     assert_eq!(stats.send_post_retries, 0);
@@ -982,12 +996,16 @@ fn configured_slot_count_sizes_every_per_slot_structure() {
                 None
             );
         }
-        // SAFETY: Both writes target in-bounds bytes of the last slot's buffers,
-        // which no provider references in this unit test.
-        unsafe {
-            resources.memory.tx(slots - 1).add(CHUNK - 1).write(7);
-            resources.memory.rx(slots - 1).add(CHUNK - 1).write(9);
-        }
+        // SAFETY: the last TX slot's CHUNK-byte buffer is live and no provider
+        // references it in this unit test; CHUNK - 1 is in bounds.
+        let tx_tail = unsafe { resources.memory.tx(slots - 1).add(CHUNK - 1) };
+        // SAFETY: tx_tail addresses the last byte of that writable buffer.
+        unsafe { tx_tail.write(7) };
+        // SAFETY: the last RX slot's CHUNK-byte buffer is live and no provider
+        // references it in this unit test; CHUNK - 1 is in bounds.
+        let rx_tail = unsafe { resources.memory.rx(slots - 1).add(CHUNK - 1) };
+        // SAFETY: rx_tail addresses the last byte of that writable buffer.
+        unsafe { rx_tail.write(9) };
         let past = resources.memory.tx_context(slots - 1);
         // One byte past a context is not a context.
         assert_eq!(
@@ -1037,11 +1055,10 @@ impl WaitPipe {
 
 impl Drop for WaitPipe {
     fn drop(&mut self) {
-        // SAFETY: Both descriptors were opened by `new` and are closed once.
-        unsafe {
-            libc::close(self.0[0]);
-            libc::close(self.0[1]);
-        }
+        // SAFETY: descriptor 0 was opened by `new` and is closed once here.
+        unsafe { libc::close(self.0[0]) };
+        // SAFETY: descriptor 1 was opened by `new` and is closed once here.
+        unsafe { libc::close(self.0[1]) };
     }
 }
 
