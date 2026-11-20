@@ -217,6 +217,15 @@ pub(super) fn run(
         }
         let mut driver = lane.driver.lock();
         let Some(mut cache) = sleeping_cache.take().or_else(|| driver.live_cache.take()) else {
+            // The worker owns the cache here, sleeping or installed in the
+            // driver; its absence is an invariant break, not an I/O failure.
+            super::super::record_first_failure(
+                &state.first_failure,
+                None,
+                None,
+                "live_read_cache_missing",
+                &"live lane cache missing while the worker still owns it",
+            );
             state.poison();
             break;
         };
@@ -340,6 +349,15 @@ pub(super) fn run(
     inbox.fail_waiting("live read lane stopped");
     let mut driver = lane.driver.lock();
     let Some(mut cache) = sleeping_cache.take().or_else(|| driver.live_cache.take()) else {
+        // Same invariant as the loop exit above: the worker still owns the
+        // cache, so a missing cache is a broken shutdown contract.
+        super::super::record_first_failure(
+            &state.first_failure,
+            None,
+            None,
+            "live_read_cache_missing",
+            &"live lane cache missing while the worker still owns it",
+        );
         state.poison();
         return;
     };
