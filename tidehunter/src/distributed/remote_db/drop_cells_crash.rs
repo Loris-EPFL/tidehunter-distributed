@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::cell::CellId;
+use crate::distributed::test_bounds::CHILD_RUN_CAP;
 
 const DROP_CHILD: &str =
     "distributed::remote_db::model_check_tests::drop_cells_crash::drop_cells_crash_child";
@@ -306,7 +307,8 @@ fn spawn(directory: &Path, stage: &str) -> Output {
         .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Whole test-binary child run; try_wait is the progress signal below.
+    let deadline = Instant::now() + CHILD_RUN_CAP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;

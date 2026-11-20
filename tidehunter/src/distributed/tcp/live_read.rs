@@ -1921,6 +1921,7 @@ impl Client {
 pub(crate) mod tests {
     use super::*;
     use crate::distributed::nvmeof::live_namespace::LiveNamespace;
+    use crate::distributed::test_bounds::PROGRESS_CAP;
     use crate::distributed::types::PhysicalValueAddress;
     use std::io::{Seek, SeekFrom, Write};
 
@@ -2274,7 +2275,11 @@ pub(crate) mod tests {
                 .read_inline_cached(&lane.client, &lane.a, deadline, None);
             (lane, result)
         });
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The pause handshake follows worker progress.
+        waiting.recv_timeout(PROGRESS_CAP).unwrap();
+        // The read's 20 ms deadline was taken before the worker entered the
+        // pause, so 30 ms after entry is strictly past it. A floor: machine
+        // load only lengthens the overdue window, never shortens it.
         std::thread::sleep(Duration::from_millis(30));
         release.send(()).unwrap();
         let (lane, result) = worker.join().unwrap();
@@ -2404,12 +2409,13 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(50));
             waker.wake().unwrap();
         });
-        let started = Instant::now();
+        // `Woken` (not `TimedOut` after the wait's own 10 s deadline) proves
+        // the wake ended the wait; no clock threshold is asserted because heavy
+        // load may delay the waker thread arbitrarily.
         assert_eq!(
             cache.wait(Duration::from_secs(10)).unwrap(),
             LiveReadWait::Woken
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
         sender.join().unwrap();
         // The wake was consumed: the next wait blocks again.
         assert_eq!(

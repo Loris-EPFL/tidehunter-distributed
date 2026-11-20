@@ -1,4 +1,5 @@
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -42,9 +43,18 @@ fn uncontended_acquisitions_record_no_wait_and_contention_records_wait() {
             assert!(released.load(Ordering::SeqCst));
         })
     };
+    // Progress wait: the waiter's blocked entry must be counted before the
+    // release; only a dead waiter exhausts the cap.
+    let blocked = Instant::now() + PROGRESS_CAP;
     while lock.stats().acquisitions < 4 {
+        assert!(
+            Instant::now() < blocked,
+            "waiter never reached the contended read"
+        );
         std::thread::yield_now();
     }
+    // The waiter registered its wait before this point, so 5 ms after it is a
+    // floor on the blocked period; load only lengthens the measured wait.
     std::thread::sleep(Duration::from_millis(5));
     released.store(true, Ordering::SeqCst);
     drop(writer);

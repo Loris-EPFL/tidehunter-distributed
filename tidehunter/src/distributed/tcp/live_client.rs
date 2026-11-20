@@ -2442,6 +2442,7 @@ pub(crate) mod leased_tests {
         live_target::LiveTargetManager,
     };
     use crate::distributed::tcp::{self, Client, NodeConfig, StorageNode, TlsFiles, Transport};
+    use crate::distributed::test_bounds::PROGRESS_CAP;
     use crate::distributed::write_timeline::WriteTimeline;
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -4176,7 +4177,8 @@ pub(crate) mod leased_tests {
             .log_for_test(1)
             .pause_live(LivePausePoint::FrameProbe);
         client.submit_leased_adoption().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Shared cap for the pause-entry and skip-marker progress loops below.
+        let deadline = Instant::now() + PROGRESS_CAP;
         loop {
             client.progress_session().unwrap();
             if entered.try_recv().is_ok() {

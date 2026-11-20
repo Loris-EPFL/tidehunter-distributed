@@ -1,12 +1,13 @@
 //! Behavioral tests of the shared frontier/syncer and of both tier contracts, plus a
 //! seeded crash model of the recovery invariant (checkpoints reference only synced
 //! positions). Timing assumptions exist only for negative checks ("has not happened after
-//! 100 ms"); every positive check waits on a channel or a frontier with a 5 s limit.
+//! 100 ms"); every positive check waits on a channel or a frontier up to `PROGRESS_CAP`.
 
 use super::frontier::{
     FlushTarget, Frontier, FrontierConfig, FrontierError, SyncPolicy, Syncer, flush_all,
 };
 use super::{DurabilityConfig, DurabilityTier, ReceiptDurability, native};
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,8 +15,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// Negative-settle floor: the sleeps with SETTLE prove a quiet syncer did NOT
+// sync. Under load the syncer may not run during the window at all, so the
+// check can pass vacuously; no negative check here can fail spuriously, so
+// machine load cannot turn a pass into a failure.
 const SETTLE: Duration = Duration::from_millis(100);
-const LIMIT: Duration = Duration::from_secs(5);
+// The progress polls below follow syncer thread progress.
+const LIMIT: Duration = PROGRESS_CAP;
 
 fn soon() -> Option<Instant> {
     Some(Instant::now() + LIMIT)
@@ -73,7 +79,7 @@ fn recording(frontier: &Arc<Frontier>) -> (Syncer, Arc<Mutex<Vec<u64>>>) {
 fn poll_until(mut condition: impl FnMut() -> bool) {
     let limit = Instant::now() + LIMIT;
     while !condition() {
-        assert!(Instant::now() < limit, "condition not reached in 5 s");
+        assert!(Instant::now() < limit, "condition not reached in {LIMIT:?}");
         thread::sleep(Duration::from_millis(1));
     }
 }

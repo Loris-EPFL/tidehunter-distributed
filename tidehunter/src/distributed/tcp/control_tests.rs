@@ -2,6 +2,7 @@ use super::super::tests::{batch, config, metrics};
 use super::*;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::storage::RetirementOutcome;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 
 // Mirror the production ownership-preserving admission API without boxing.
 #[allow(clippy::result_large_err)]
@@ -28,7 +29,8 @@ fn receive(
     completions: &mpsc::Receiver<reactor::WorkCompletion>,
     id: u64,
 ) -> reactor::WorkCompletion {
-    let completion = completions.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The completion follows owner control progress.
+    let completion = completions.recv_timeout(PROGRESS_CAP).unwrap();
     assert_eq!(completion.id, id);
     assert_eq!(completion.profile.control_queue_samples, 1);
     assert_eq!(completion.profile.control_execution_samples, 1);

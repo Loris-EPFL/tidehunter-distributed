@@ -1,5 +1,6 @@
 use super::super::NvmeofTransport;
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 
 fn local_resolver(dir: &std::path::Path) -> Arc<LiveNamespaceResolver> {
     let registry = LiveConnectionRegistry::open(&dir.join("resolver-registry")).unwrap();
@@ -309,7 +310,8 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
                 "nqn.2026-01.test:host",
                 [2; 16],
                 LiveNamespaceAccess::ReadWrite,
-                Instant::now() + Duration::from_secs(10),
+                // The waiter follows the delete's end.
+                Instant::now() + PROGRESS_CAP,
             );
             (result, deleted.load(Ordering::SeqCst))
         });
@@ -328,6 +330,7 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
         assert!(delete_had_ended);
         assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::InvalidData));
     });
-    pool.shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    // The delete (200 ms floor inside the callback) has already ended, so
+    // this bound only needs headroom for teardown under load.
+    pool.shutdown(Instant::now() + PROGRESS_CAP).unwrap();
 }

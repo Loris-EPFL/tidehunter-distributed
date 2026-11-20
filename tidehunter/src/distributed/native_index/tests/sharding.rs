@@ -3,10 +3,11 @@
 
 use super::*;
 use crate::distributed::native_publication::NativePendingSink;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use crate::index::pending_table::Transaction;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Keyspace 2 is `prefix`: variable-length keys routed by their first byte, so
 /// 256 distinct cells spread over the shards.
@@ -273,9 +274,18 @@ fn partially_applied_batch_is_invisible_at_the_watermark_until_publication() {
         let index = Arc::clone(&index);
         std::thread::spawn(move || index.writer().promote_committed().unwrap())
     };
+    // Progress wait: the publisher's blocked entry into the held shard is
+    // counted; only a dead publisher exhausts the cap.
+    let blocked = Instant::now() + PROGRESS_CAP;
     while index.shards[highest].stats().acquisitions == acquisitions {
+        assert!(
+            Instant::now() < blocked,
+            "publisher never reached the busy shard"
+        );
         std::thread::yield_now();
     }
+    // Floor after the observed block: the publisher is parked on the held
+    // shard, so load only lengthens the wait; it cannot finish early.
     std::thread::sleep(Duration::from_millis(20));
     assert!(!publisher.is_finished(), "apply waits for the busy shard");
 
@@ -726,9 +736,18 @@ fn public_scan_pins_its_cut_against_a_concurrent_checkpoint_floor() {
                 .unwrap()
         })
     };
+    // Progress wait: the scanner's blocked entry into the held shard is
+    // counted; only a dead scanner exhausts the cap.
+    let blocked = Instant::now() + PROGRESS_CAP;
     while index.shards[last].stats().acquisitions == acquisitions {
+        assert!(
+            Instant::now() < blocked,
+            "scan never reached the busy shard"
+        );
         std::thread::yield_now();
     }
+    // Floor after the observed block: the scan is parked inside its traversal
+    // on the held shard, so load only lengthens the wait.
     std::thread::sleep(Duration::from_millis(20));
     assert!(!scanner.is_finished(), "scan waits inside its traversal");
 

@@ -2,6 +2,7 @@
 use super::*;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::tcp::leased_tests::{Fixture, leased_latencies};
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) fn worker(fixture: &Fixture, client: Client) -> (ClientWorker, Arc<AtomicBool>) {
@@ -455,7 +456,8 @@ fn leased_worker_harvests_last_adoption_while_idle() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer());
     receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Progress wait on adoption counters.
+    let deadline = Instant::now() + PROGRESS_CAP;
     loop {
         let (_, _, pending) = worker.client.lock().leased_test_frontier();
         if fixture.metrics.snapshot().counts.adoption_async_exchanges == 1 && !pending {
@@ -478,7 +480,8 @@ fn leased_worker_failed_adoption_and_digest_mismatch_poison_while_idle() {
         client.leased_test_corrupt_adoption(bad_token);
         let (worker, failure) = worker(&fixture, client);
         receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Progress wait on worker exit.
+        let deadline = Instant::now() + PROGRESS_CAP;
         // Failure publication precedes channel teardown. Join only after the
         // actual worker exit, so append rejection does not race receiver drop.
         while !failure.load(Ordering::Acquire)
@@ -890,7 +893,8 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
             )
             .unwrap();
         let metrics = database.core.live_metrics.as_ref().unwrap().clone();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Progress wait on adoption counters.
+        let deadline = Instant::now() + PROGRESS_CAP;
         loop {
             if metrics.snapshot().counts.adoption_async_exchanges == 1
                 && !client.lock().leased_adoption_pending()
@@ -945,7 +949,7 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                     .core
                     .shutdown_with(|_| panic!("a failed close must not seal"))
             });
-            draining.recv_timeout(Duration::from_secs(5)).unwrap();
+            draining.recv_timeout(PROGRESS_CAP).unwrap();
             let mut guard = client
                 .try_lock_for(Duration::from_secs(1))
                 .expect("shutdown drain must release the client mutex");
@@ -1124,7 +1128,8 @@ fn leased_worker_closes_old_extent_and_preleases_while_appends_continue() {
     let fixture = Fixture::new(DurabilityTier::Native, 16384);
     let (worker, failure) = worker(&fixture, fixture.writer());
     receive(worker.enqueue(1, vec![fixture.batch(0)]).unwrap()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Progress wait on the prelease state.
+    let deadline = Instant::now() + PROGRESS_CAP;
     while !worker.client.lock().leased_test_ahead_state().1 {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(1));
@@ -1136,7 +1141,8 @@ fn leased_worker_closes_old_extent_and_preleases_while_appends_continue() {
     let (entered, resume) = log.pause_live(LivePausePoint::CloseSuffix);
     let before = fixture.metrics.snapshot().counts.adoption_sync_exchanges;
     receive(worker.enqueue(1, vec![fixture.batch(4)]).unwrap()).unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The pause handshake follows owner close progress.
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     // The old close holds no state lock or coordinator reply. New-extent data
     // reaches its CQE while that close is deliberately blocked.
     receive(worker.enqueue(1, vec![fixture.batch(5)]).unwrap()).unwrap();
@@ -1146,7 +1152,8 @@ fn leased_worker_closes_old_extent_and_preleases_while_appends_continue() {
     );
     assert!(worker.client.lock().leased_test_ahead_state().0);
     resume.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Progress wait on the close/prelease state.
+    let deadline = Instant::now() + PROGRESS_CAP;
     loop {
         let client = worker.client.lock();
         let (closing, next) = client.leased_test_ahead_state();
@@ -1174,7 +1181,7 @@ fn wal_replay_leased_checkpoint_does_not_settle_the_extent() {
             .unwrap()[0];
         let mut release_prelease = if pending_prelease {
             let (entered, release) = fixture.node.pause_inventory();
-            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            entered.recv_timeout(PROGRESS_CAP).unwrap();
             client.submit_leased_adoption().unwrap();
             assert!(client.leased_test_frontier().2);
             assert_eq!(fixture.metrics.snapshot().counts.extent_preleases, 0);
@@ -1199,10 +1206,7 @@ fn wal_replay_leased_checkpoint_does_not_settle_the_extent() {
                 release.send(()).unwrap();
             }
             let receipt = receive(append).unwrap()[0];
-            let proof = checkpoint
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap();
+            let proof = checkpoint.recv_timeout(PROGRESS_CAP).unwrap().unwrap();
             assert!(proof.durable_end >= through);
             through =
                 receipt.appended().address().offset + u64::from(receipt.appended().address().len);
@@ -1241,7 +1245,7 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
     worker
         .send(Command::CheckpointPosition(1, 1, through, reply))
         .unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     let overlapping = (|| -> Result<Vec<DurableBatch>, String> {
         let mut receipts = Vec::new();
         for n in 1..=8 {
@@ -1249,7 +1253,7 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
                 .enqueue(1, vec![fixture.batch(n)])
                 .map_err(|error| error.to_string())?;
             let result = append
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(PROGRESS_CAP)
                 .map_err(|error| error.to_string())?;
             receipts.push(result.map_err(|error| error.to_string())?[0]);
             if !matches!(checkpoint.try_recv(), Err(mpsc::TryRecvError::Empty)) {
@@ -1258,7 +1262,8 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
         }
         Ok(receipts)
     })();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Progress wait on the adoption profile counter.
+    let deadline = Instant::now() + PROGRESS_CAP;
     while fixture.metrics.snapshot().counts.adopt_profile_samples == before.adopt_profile_samples
         && Instant::now() < deadline
     {
@@ -1278,10 +1283,7 @@ fn wal_replay_leased_appends_continue_while_position_sync_is_pending() {
         pending.adoption_sync_exchanges,
         before.adoption_sync_exchanges
     );
-    let proof = checkpoint
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
+    let proof = checkpoint.recv_timeout(PROGRESS_CAP).unwrap().unwrap();
     assert!(proof.durable_end >= through);
     // The durability record covers the captured cut, not these later frames.
     assert!(

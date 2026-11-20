@@ -1,6 +1,7 @@
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 use crate::distributed::tcp::live_read::tests as local;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::io::{Seek, SeekFrom, Write};
 
 /// One resume message for a worker parked outside both lane mutexes. Capacity
@@ -460,12 +461,16 @@ fn live_inline_deadline_releases_credit_only_after_retirement() {
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
     let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
     let worker = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The pause handshake follows worker progress.
+    waiting.recv_timeout(PROGRESS_CAP).unwrap();
     let admitted_credit = *case.db.core.reads.state.retained.lock();
     assert_eq!(admitted_credit.0, 1);
     assert!(admitted_credit.1 > 0);
     assert_eq!(local::owner_local_pin_count(&case._fixture.nodes[node]), 1);
     assert!(case.db.core.reads.pause_live_for_retirement().is_err());
+    // The read's 50 ms I/O deadline was taken before the worker entered the
+    // pause, so 60 ms after entry is strictly past it. A floor: machine load
+    // only lengthens the overdue window.
     thread::sleep(Duration::from_millis(60));
     // The SQE is now overdue but still paused before any terminal harvest.
     assert_eq!(*case.db.core.reads.state.retained.lock(), admitted_credit);
@@ -491,7 +496,10 @@ fn live_inline_pause_before_submission_does_not_spend_deadline() {
     let case = Case::new();
     let _idle_lane = case.park_idle_lane();
     let before = case.snapshot();
-    let timeout = Duration::from_millis(50);
+    // The paused-time proof scales with the budget: three timeouts of paused
+    // time still exceed one timeout of live I/O, and a 1 s device budget
+    // keeps a healthy read safe under heavy machine load.
+    let timeout = Duration::from_secs(1);
     case.db.core.reads.set_limits_for_test(None, Some(timeout));
     let (entered, waiting) = mpsc::sync_channel(1);
     let (release, resume) = mpsc::sync_channel(1);
@@ -500,12 +508,16 @@ fn live_inline_pause_before_submission_does_not_spend_deadline() {
     let (node, epoch, reference) = (case.node, case.db.epoch(), case.reference);
     let pin = case.db.core.index.pin_cut(IndexReadCut::Latest).unwrap();
     let producer = thread::spawn(move || reads.read_inline(node, epoch, &reference, 0, Some(pin)));
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The pause handshake follows producer progress.
+    waiting.recv_timeout(PROGRESS_CAP).unwrap();
     {
         let registry = case.db.core.reads.state.flights.lock();
         let (flight, _) = registry.find(node, &reference).unwrap();
         assert_eq!(flight.io_deadline(), None, "not yet submitted");
     }
+    // Floor: the producer paused before submission, so three timeouts of
+    // paused time prove the pause did not spend the I/O deadline. Machine
+    // load only lengthens the paused window, strengthening the check.
     thread::sleep(3 * timeout);
     release.send(()).unwrap();
     let values = producer.join().unwrap().unwrap().unwrap();
@@ -570,10 +582,14 @@ fn live_inline_drain_in_progress_falls_back_without_taking_lane() {
     case.db.core.reads.sender.lock()[case.node]
         .send(ReadCommand::DrainLive(reply))
         .unwrap();
-    for _ in 0..1000 {
-        if case.db.core.reads.state.live_drains.load(Ordering::Acquire) != 0 {
-            break;
-        }
+    // Progress wait on the live-drain counter: the drain worker sets it once
+    // the in-flight drain is observed.
+    let drained = Instant::now() + PROGRESS_CAP;
+    while case.db.core.reads.state.live_drains.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < drained,
+            "DrainLive command never reached the lane worker"
+        );
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::distributed::storage::WalMemberReadPolicy;
 use crate::distributed::tcp::reactor::Envelope;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::sync::mpsc;
 
 pub(in crate::distributed::tcp) struct Running {
@@ -174,7 +175,8 @@ fn owner_session_deadlines_extend_fence() {
     );
     let mut client = server.client();
     client.timeout = Duration::from_secs(5);
-    let admission_deadline = Instant::now() + Duration::from_secs(2);
+    // These waits follow owner queue progress.
+    let admission_deadline = Instant::now() + PROGRESS_CAP;
     while server.node.control.pending_requests_for_test() != 0 {
         assert!(Instant::now() < admission_deadline);
         thread::yield_now();
@@ -196,9 +198,12 @@ fn owner_session_deadlines_extend_fence() {
         );
         thread::yield_now();
     }
+    // The hold must outlast the session I/O timeout. This sleep is a floor,
+    // not the measurement: machine load only lengthens the hold, so the
+    // deadline-extension evidence cannot get weaker under contention.
     thread::sleep(io_timeout + Duration::from_millis(100));
     drop(inventory);
-    let completion_deadline = Instant::now() + Duration::from_secs(2);
+    let completion_deadline = Instant::now() + PROGRESS_CAP;
     let response = loop {
         client.progress_session().unwrap();
         if let Some(response) = client.take_control() {
@@ -268,7 +273,7 @@ fn invalid_status_bounds_and_wrong_variants_name_the_failure() {
 
 fn observe_idle_readiness_wait(client: &mut Client) {
     client.connection_profile(true, true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + PROGRESS_CAP;
     loop {
         // Give the drained owner an idle interval; correctness is established
         // by readiness counters and successful replies, not a latency threshold.
