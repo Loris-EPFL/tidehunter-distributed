@@ -633,8 +633,8 @@ not replace `AGENTS.md` or the `kvstore-concurrency` skill.
 - **DEC-14** The toolchain is Rust 1.90, edition 2024. A toolchain or MSRV change needs
   owner approval.
 - **DEC-15** Record every benchmark result and its environment under the project
-  evidence directory `checkpoint-work/` (not tracked in this repository). A performance
-  claim without recorded evidence is not accepted.
+  evidence directory (not tracked in this repository). A performance claim
+  without recorded evidence is not accepted.
 - **DEC-16** Every PR gets one review by a reviewer agent before merge, in addition to
   one CI run per PR (no retry). The review is a text review grounded in `rustguides`
   and cites the rule ID of each finding. Fix each rule-numbered finding, or state the

@@ -30,9 +30,7 @@ AUTHORITY_INTERVAL_COUNTERS = {
     "write_authority_windows", "write_authority_batches"}
 COORDINATOR_INTERVAL_COUNTERS = {
     "write_storage_wait_ns", "write_publication_ns", "write_dispatch_ns", "write_preparation_admission_ns",
-    "write_checkpoint_ns", "write_checkpoint_count", "write_foreground_checkpoint_ns",
-    "write_foreground_checkpoint_count", "write_background_checkpoint_ns",
-    "write_concurrent_checkpoint_deferrals", "write_concurrent_checkpoint_wait_ns",
+    "write_checkpoint_ns", "write_checkpoint_count", "write_background_checkpoint_ns",
     "write_background_checkpoint_suffix_batches", "write_durable_receipt_publication_blocked_ns",
     "write_durable_receipt_publication_blocked_batches", "write_append_requests",
     "write_concurrent_admitted",

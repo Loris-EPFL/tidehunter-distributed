@@ -98,6 +98,11 @@ the caller thread when its lane is idle and its grant is healthy and free
 (`pending_read/live_inline.rs`). Scans are native live iterators over the
 index.
 
+A key length or shape that the store cannot hold returns `Ok(None)`, as native
+does: there is no read-side key-length rule, and the hybrid read path adds
+none. Empty keys stay legal on hashed and variable-length keyspaces. The
+parity row "zero-length and malformed-key reads" records the evidence.
+
 ## 5. Recovery
 
 Recovery is native recovery over a remote value WAL. The coordinator loads the
@@ -110,6 +115,14 @@ or below a stored position applies again with no change (idempotent by
 version). Replay has no length limit, as in native: the suffix is bounded only
 by the snapshot cadence (`snapshot_written_bytes`, 8 GiB in Sui).
 
+The stored region names one row per serving stream and one row per retained
+older generation (`hybrid/region.rs` `older_replay_from`). An older row is the
+stream end as soon as the stored cut epoch is above that generation. Before
+that, the row keeps its stored value and the counter
+`older_rows_without_end` increments. The cut crosses the start of the next
+generation only after the replay-dirty cells flush. That delay is the native
+stale-cell lag (7.5 GiB in Sui).
+
 Native-tier recovery is version B: `DurablePrefix` + `Extend`
 (`remote_db/durable_cut.rs`, `durable-cut.v1` record). The cut is an exact
 prefix of the coordinator version order; `extend` keeps the unbroken run of
@@ -119,13 +132,18 @@ Synchronous owners are per-batch durable and are never truncated. A stored
 region names only positions that are owner-synced or aborted. Owner recovery
 (`storage/wal_replay.rs`) validates everything inside the persisted root. It
 adopts complete valid frames beyond the root across skip markers. It stops at
-the first invalid frame, as native replay does. The recent-receipt window
-(`storage/history.rs`) serves retries only and is never persisted.
+the first invalid frame and discards the tail after it, as native WAL replay
+does (owner decision, 2026-11-20). The recent-receipt window
+(`storage/history.rs`) serves retries only and is never persisted. After a
+restart the window is empty, exactly as on a single node. A retry of an
+unknown version is then applied again as a new write (accepted, owner
+decision, 2026-11-20).
 
 | Owner event | Result | Operator action |
 |---|---|---|
 | A passed WAL file is not yet sealable | Not an error. The file waits for the next background seal kick. | None. |
 | The `fdatasync` of a passed file, or the directory sync, fails | The owner stream is poisoned (`StorageError::Io`). No seal is committed and the root is unchanged. A retry could certify bytes that the kernel dropped. | Restart the owner. The open re-reads the previous root. A clean `seal_ready_files` then seals the file. A sync that keeps failing means a failing device: replace it. |
+| The seal install fails, or a reopen finds that the sealed inventory no longer matches the surviving frames | The owner stream is poisoned (`StorageError::Io`). The next open reserves a new fencing generation. The files of the poisoned generation retire through the sealed-stream path (`storage/file_retirement.rs` `retire_sealed_stream_files`) after the recovery of the new generation covers them. | Restart the owner. Check the device before the new generation takes writes. |
 
 An owner seals a passed file only after an `fdatasync` of the file and a
 directory sync. It then installs the seal and `synced_end >= end` in one root
@@ -172,7 +190,7 @@ inferred from the epoch. A retired range answers `NotFound`.
 - **Owner inventory:** partition high-water, generation seals and file
   inventory pages (`tcp/inventory.rs`).
 - **Export revoke/drain and retirement:** a live file retires only when it has
-  no lease, it has no retained reference and the allocator is past it
+  no lease and no retained reference. The allocator must also be past the file
   (`storage/{file_seal,file_retirement,retired_files}.rs`).
 - **Provision and drop (L2):** `ProvisionDatabase`/`DropDatabase` over
   authenticated control; the coordinator writes a durable drop intent, owners
@@ -208,22 +226,22 @@ while the database is open.
   The open refuses even when some generations became eligible for trim after
   the last open, because the trim needs the new fenced generation.
 - The warning is the gauge `retained_stream_pressure` (75 % of the bound), with
-  `retained_streams`. At 75 % the open also queues a priority relocation, which
-  retires old generations while the database still opens.
+  `retained_streams`. At 75 % the open also queues a priority relocation. That
+  pass retires old generations while the database still opens.
 - Operator action: watch the gauge while the database still opens. If a
   database is found at the bound, the open stays refused until a separate
   offline fenced trim tool runs. That tool does not exist. It is built only if
   the gauge fires in a golden or qualification run. An online generation trim
-  is a possible later design: after a relocation pass, a command to the
-  durable-cut actor forgets one retired generation, and only while the
+  is a possible later design. After a relocation pass, a command to the
+  durable-cut actor forgets one retired generation. It runs only while the
   pressure gauge is set. It is not scheduled. It is not proven safe next to
   readers, grants and the relocation worker.
 
 ## 8. Capacity
 
 Relocation uses the native `WalBased` strategy (`RelocationStrategy` in
-`tidehunter/src/relocation/mod.rs`), which walks the WAL in order from the
-oldest position. It runs asynchronously on one background worker per database
+`tidehunter/src/relocation/mod.rs`). It walks the WAL in order from the oldest
+position. It runs asynchronously on one background worker per database
 (`sui/relocation.rs` `RemoteRelocator`, `Db::start_relocation` in `sui.rs`).
 A pass has six steps:
 
@@ -256,6 +274,76 @@ Gauges of the capacity path (exported by `sui.rs`, with `snapshot_latch_deferral
   latch (a relocation pass's frozen cut, or the short NONE latch of a
   checkpoint pin) was below the stored cut. The check fails closed. A later run
   retries the files.
+- `retirement_busy_replies`: retirement requests the owner answered `Busy`
+  because another lifecycle operation held the gate. The coordinator retries.
+- `deferred_retirements` (`FileMaintenanceStats` in `tcp/inventory.rs`):
+  retirement deferrals of the idle window. A file that became dead together
+  with the last rolled file waits for the next retirement request after a lease
+  adoption, or for the next open. The engine does not export this counter to
+  the Sui metrics (open owner item).
+
+These four counters mean "non-zero = defect or operator-visible state". The
+first two use the dynamic `stat` label of the `tidehunter_adapter` metric in
+the Sui adapter (`crates/typed-store/src/tidehunter_util.rs`, no registry
+change). The last two are engine counters in `RecoveryStats`; only the
+kv-research open record exports them.
+
+- `retirement_missing_rows`: a retirement proof found fewer index rows than
+  the files it covered. The retirement fails closed. Zero unless an invariant
+  broke.
+- `older_rows_without_end`: a region store carried an older-generation row
+  whose owner end was unknown. Non-zero shows an owner stream without a
+  reported end.
+- `old_generation_replayed_from_zero`: the loaded control region named no row
+  for a retained older generation, so the open replayed it from offset zero.
+  Zero in steady state. Non-zero is legitimate only for a generation that
+  opened and closed before any store, and is a defect otherwise.
+- `stale_region_rows_skipped`: the loaded control region named a generation
+  that this open does not retain (it was trimmed after the store). The open
+  skips the row and the next store drops it. Non-zero is an operator-visible
+  state after a trim.
+
+### Index cell size and the index WAL fragment
+
+- A hybrid index row is the key plus 48 bytes (the version-carrying position,
+  `hybrid/position.rs`). A native index row is the key plus 12 bytes (the
+  native WAL position).
+- For 32-byte keys, one entry is 80 bytes against 44. For 8-byte keys, one
+  entry is 56 bytes against 20.
+- One L1 cell blob is one index WAL frame, so its size must stay below one
+  index fragment. The fragment is the native `frag_size`. Sui sets it through
+  its `thdb_config` (`crates/typed-store/src/tidehunter_util.rs`); the native
+  `Config::default` uses 128 MiB (`tidehunter/src/config.rs`), and
+  `HybridIndexConfig::default` uses 1 GiB.
+- One fragment holds about 13.4 million entries at 32-byte keys, or 19.2
+  million at 8-byte keys. The native index holds about 24.4 million or 53.7
+  million. The hybrid cell thus holds about 55 % or 36 % of the native count.
+- Sui takes the cell count of a keyspace from `default_mutex_count()`
+  (`crates/typed-store/src/tidehunter_util.rs`; 1,024 release, 16 debug). A
+  keyspace has `cells_per_mutex * num_mutexes` cells
+  (`tidehunter/src/key_shape.rs`), and `default_cells_per_mutex()` is 1. One
+  keyspace declares twice that count
+  (`sui-core/src/authority/authority_store_tables.rs`,
+  `default_mutex_count() * 2`), so it has 2,048 cells (32 in debug). At 709
+  million rows, a cell of a 1,024-cell keyspace holds about 0.7 million
+  entries, about 55 MB, or about 5 % of a 1 GiB fragment. A 32 MiB debug
+  fragment holds about 419 thousand 32-byte-key entries per cell.
+- Sharding is opt-in exactly as in native, through `index_auto_shard_threshold`
+  (`TH_AUTOSHARD` in Sui, default false). A set threshold splits a cell into
+  shards until each shard holds at most the threshold. With no threshold, a
+  cell is not split, and the number of entries in one unsplit cell is then
+  bounded by the fragment, not by a shard threshold. Use the setting for a
+  keyspace with one cell, or with skewed keys.
+- Native asserts beyond the fragment cap: the flusher stops with
+  `Entry(n) is larger then frag_size(m)` (`wal/layout.rs`). No typed error is
+  promised.
+- The L0 blob is written whole (the native flusher non-promote branch, the
+  same code in the hybrid). Its size is bounded by `l0_max_entries` (default
+  `max_dirty_keys * 8`, so 8,192 rows) times the row size. With the 1 GiB
+  production fragment this is far below a fragment: 8,192 rows of key plus 48
+  bytes are under 1 MiB at 32-byte keys. A test with small fragments must set
+  `l0_max_entries` as well as the shard threshold.
+- The numbers for the exposed Sui keyspaces are not enumerated.
 
 ## 9. Concurrency contracts
 
@@ -298,6 +386,12 @@ Accepted weakenings against the Exact index (owner decision, 2026-11-20):
 - Kernel NVMe/TCP loopback CI job: leased recovery on a real loopback target
   (`CLOUD_AND_CI_TESTING.md`).
 - Real NVMe-oF/RDMA runs: CI kernel job and GCP only; no local sudo.
+- Dispatch-instant observation is not available after the hybrid: the worker's
+  position command, which carried that state, is gone, and `Command::Control`
+  runs behind `client.wait_leased_control`. Tests use outcome-level proof
+  instead. The parity row "dispatch-instant observation is not available after
+  the hybrid" records it, including that the proof is code-level until the
+  test runs on a compilable tree.
 
 ## 12. File map
 

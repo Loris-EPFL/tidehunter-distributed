@@ -309,10 +309,6 @@ write_dispatch_ns
 write_preparation_admission_ns
 write_checkpoint_ns
 write_checkpoint_count
-write_foreground_checkpoint_ns
-write_foreground_checkpoint_count
-write_concurrent_checkpoint_deferrals
-write_concurrent_checkpoint_wait_ns
 write_background_checkpoint_ns
 write_background_checkpoint_suffix_batches
 write_durable_receipt_publication_blocked_ns
@@ -330,13 +326,6 @@ optional interval evidence exports no coordinator values. The dashboard labels
 both populations explicitly. Do not add their overlapping stage totals,
 normalize full-window coordinator counters by prefix sample counts, infer
 per-operation percentiles, or turn the populations into latency fractions.
-
-`write_concurrent_checkpoint_deferrals` counts FIFO-head admissions retained at
-checkpoint or admission-capacity pressure. `write_concurrent_checkpoint_wait_ns`
-is their accumulated elapsed wait until admission or rejection. Pending-window,
-index and owner-reference capacity can contribute; this is not a pure checkpoint
-I/O timer. Published durable replies can progress while that head is deferred.
-The counters do not change the required owner persistence or publication rules.
 
 Normal runs remain unprofiled; diagnostic runs are a separate observation mode.
 The dashboard still cannot supply unmeasured TLS/fsync/coordination breakdowns,

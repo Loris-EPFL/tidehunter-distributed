@@ -3784,9 +3784,6 @@ def write_diagnostic_summary(row):
         valid_wait = boundary_eligible and type(wait) is int and wait >= 0
         clocks.append({"stage": "write_completion_wait", "scope": interval_scope,
                        "available": valid_wait, "sum_ns": wait, "count": None, "mean_ns": None})
-    observe("foreground_admission_pressure", coordinator, "write_foreground_checkpoint_ns",
-            "write_foreground_checkpoint_count", interval_scope,
-            boundary_eligible)
     return clocks
 
 

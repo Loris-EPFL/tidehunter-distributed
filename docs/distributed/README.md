@@ -21,3 +21,6 @@ Navigation only. Removed designs are archived at tag
   commands and durability limits.
 - [Sui checkpoint experiments](../../experiments/sui-checkpoint/README.md) —
   historical Sui replay campaigns and evidence rules.
+
+Dated notes under `docs/research/` are historical records. They may cite the
+evidence directory, and the living-document rule does not apply to them.

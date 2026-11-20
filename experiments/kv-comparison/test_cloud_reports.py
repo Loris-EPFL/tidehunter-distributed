@@ -1099,45 +1099,47 @@ class CloudReports(unittest.TestCase):
                         "write_profile_storage_persist_wal_file_ns": 900,
                         "write_profile_storage_file_persist_calls": 3},
                         "coordinator_interval": {"stages": {
-                            "write_foreground_checkpoint_ns": 800,
-                            "write_foreground_checkpoint_count": 4}}}}
+                            "write_storage_wait_ns": 800}}}}
         def summarize():
             return {item["stage"]: item for item in cloud.write_diagnostic_summary(
                 {"write_diagnostics": {"observed": evidence}})}
         clocks = summarize()
         self.assertEqual(clocks["client_exchange"]["mean_ns"], 500)
         self.assertEqual(clocks["storage_persist_wal_file"]["mean_ns"], 300)
-        self.assertEqual(clocks["foreground_admission_pressure"]["mean_ns"], 200)
+        # The interval clock keeps its own sum and never invents a call mean.
+        self.assertEqual(clocks["write_completion_wait"]["sum_ns"], 800)
+        self.assertIsNone(clocks["write_completion_wait"]["mean_ns"])
         # A connection finalization error does not invalidate the independent boundary.
         evidence["error"] = "connection profile capture failed"
         clocks = summarize()
         self.assertIsNone(clocks["client_exchange"]["mean_ns"])
-        self.assertEqual(clocks["foreground_admission_pressure"]["mean_ns"], 200)
+        self.assertTrue(clocks["write_completion_wait"]["available"])
 
     def test_write_summary_uses_pre_gate_boundary_without_relabeling_fallback(self):
         evidence = {"phase_attempted": True, "profile": {"coordinator_interval": {"stages": {
-            "write_foreground_checkpoint_ns": 900, "write_foreground_checkpoint_count": 3}}},
+            "write_storage_wait_ns": 900}}},
             "pre_completion_gate": {"available": True, "stages": {
-                "write_foreground_checkpoint_ns": 200, "write_foreground_checkpoint_count": 2}}}
+                "write_storage_wait_ns": 200}}}
         row = {"write_diagnostics": {"observed": evidence}}
         clock = cloud.write_diagnostic_summary(row)[0]
-        self.assertEqual(clock["mean_ns"], 100)
+        self.assertEqual(clock["sum_ns"], 200)
         self.assertEqual(clock["scope"], "coordinator_arm_through_pre_completion_gate")
         evidence["pre_completion_gate"] = {"available": False, "reason": "missing"}
         clock = cloud.write_diagnostic_summary(row)[0]
-        self.assertEqual(clock["mean_ns"], 300)
+        self.assertEqual(clock["sum_ns"], 900)
         self.assertEqual(clock["scope"], "coordinator_arm_through_post_gate")
 
-    def test_incomplete_measurement_does_not_publish_boundary_means(self):
+    def test_incomplete_measurement_does_not_publish_boundary_clocks(self):
         evidence = {"phase_attempted": True, "measurement_drained": False,
                     "pre_completion_gate": {"available": True, "stages": {
-                        "write_foreground_checkpoint_ns": 200,
-                        "write_foreground_checkpoint_count": 2}}}
+                        "write_storage_wait_ns": 200}}}
         clock = cloud.write_diagnostic_summary({"write_diagnostics": {"observed": evidence}})[0]
         self.assertFalse(clock["available"])
         self.assertIsNone(clock["mean_ns"])
         del evidence["measurement_drained"]
-        self.assertEqual(cloud.write_diagnostic_summary({"write_diagnostics": {"observed": evidence}})[0]["mean_ns"], 100)
+        clock = cloud.write_diagnostic_summary({"write_diagnostics": {"observed": evidence}})[0]
+        self.assertTrue(clock["available"])
+        self.assertEqual(clock["sum_ns"], 200)
 
     def test_write_completion_wait_has_no_invented_call_mean(self):
         row = {"write_diagnostics": {"observed": {

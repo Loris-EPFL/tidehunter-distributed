@@ -388,16 +388,9 @@ not independent physical failure domains.
 - All owned database containers, data volumes and `kv-research` processes were
   closed. The installed loopback-only monitoring stack remains available.
 
-Evidence is retained, but not committed as generated benchmark data:
-
-```text
-checkpoint-work/kv-comparison/local-complete-r2/
-checkpoint-work/kv-comparison/local-large-r2/
-checkpoint-work/kv-comparison/local-validation-final/comparison.json
-checkpoint-work/kv-comparison/local-validation-final/comparison.csv
-checkpoint-work/kv-comparison/local-validation-final/comparison.md
-checkpoint-work/kv-comparison/monitoring-final-proof.json
-```
+Evidence is retained, but not committed as generated benchmark data. The
+retained evidence covers the local comparison runs, their validation and the
+monitoring proof of that campaign.
 
 Validation found and fixed three concrete problems before accepting these
 artifacts: the initial FoundationDB cache exceeded its configured memory bound;

@@ -1074,33 +1074,33 @@ class CaseIdentityTests(unittest.TestCase):
         evidence["pre_completion_gate"] = {
             "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
             "clock_scope": "independent completion-charged counters",
-            "stages": {"write_foreground_checkpoint_ns": 2000000000,
-                       "write_foreground_checkpoint_count": 2}}
+            "stages": {"write_checkpoint_ns": 2000000000,
+                       "write_checkpoint_count": 2}}
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('scope="coordinator_arm_through_pre_completion_gate"', text)
-        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0', text)
+        self.assertIn('stage="write_checkpoint_ns"} 2.0', text)
         evidence["pre_completion_gate"] = {"available": False, "reason": "missing"}
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('scope="coordinator_arm_through_pre_completion_gate",diagnostic_backend=', text)
-        self.assertNotIn('stage="write_foreground_checkpoint_ns"', text)
+        self.assertNotIn('stage="write_checkpoint_ns"', text)
 
     def test_incomplete_measurement_does_not_export_boundary_counters(self):
         evidence = write_diagnostics()
         evidence["pre_completion_gate"] = {
             "available": True, "scope": "coordinator_arm_through_pre_completion_gate",
             "clock_scope": "independent clocks", "stages": {
-                "write_foreground_checkpoint_ns": 2000000000,
-                "write_foreground_checkpoint_count": 2}}
+                "write_checkpoint_ns": 2000000000,
+                "write_checkpoint_count": 2}}
         evidence["measurement_drained"] = False
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('scope="coordinator_arm_through_pre_completion_gate",diagnostic_backend="native"} 0', text)
-        self.assertNotIn('stage="write_foreground_checkpoint_ns"', text)
+        self.assertNotIn('stage="write_checkpoint_ns"', text)
         del evidence["measurement_drained"]
-        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0',
+        self.assertIn('stage="write_checkpoint_ns"} 2.0',
                       campaign.write_diagnostic_metrics(evidence, {}))
         evidence["error"] = "finalization failed"
         text = campaign.write_diagnostic_metrics(evidence, {})
-        self.assertIn('stage="write_foreground_checkpoint_ns"} 2.0', text)
+        self.assertIn('stage="write_checkpoint_ns"} 2.0', text)
 
     def test_checkpoint_control_metrics_require_explicit_availability(self):
         evidence = write_diagnostics()

@@ -537,7 +537,10 @@ Distributed evidence also includes an optional `coordinator_interval`. It holds 
 The native-index hybrid removes the write-side checkpoint diagnostic ring together with the Exact
 index. The keys `write_checkpoint_diagnostics_available`,
 `coordinator_checkpoint_diagnostics_available` and the
-`write_checkpoint_diagnostic_*` counters no longer exist. `campaign_exporter.py`
+`write_checkpoint_diagnostic_*` counters no longer exist. The Exact
+foreground-checkpoint pressure pair `write_foreground_checkpoint_ns` and
+`write_foreground_checkpoint_count` is gone with the same index: the hybrid has
+no foreground checkpoint phase to charge. `campaign_exporter.py`
 and `cloud_campaign.py` no longer admit those counter names in
 `coordinator_interval`. Evidence from the archive branch that carries them
 fails the exporter validation: analyze it with the tooling of that branch. A
