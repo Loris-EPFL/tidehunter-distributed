@@ -3550,7 +3550,7 @@ mod leased_tests;
 mod live_bench_tests;
 #[cfg(test)]
 mod position_tests;
-#[cfg(all(test, feature = "test_methods"))]
+#[cfg(test)]
 mod relocation_tests;
 
 #[cfg(test)]

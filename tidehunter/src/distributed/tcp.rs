@@ -76,10 +76,6 @@ mod tests;
 #[cfg(test)]
 mod transport_security_tests;
 
-#[cfg(all(test, feature = "experimental-fabric"))]
-pub(super) fn software_transport(security: FabricSecurity) -> Transport {
-    Transport::ofi(FabricBackend::SoftwareTcp, security)
-}
 use super::codec::{CompleteBatch, Mutation};
 use super::storage::StorageError;
 use super::storage::{DurableBatch, PartitionConfig, PartitionStats};

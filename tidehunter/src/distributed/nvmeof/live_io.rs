@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 mod buffers;
 
 // These tests drive a real io_uring; off Linux `LiveIo` cannot be constructed.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests;
 
 pub use buffers::LiveWriteBuffer;
@@ -961,21 +961,6 @@ impl LiveIo {
         let before = out.len();
         self.progress_with(|completion| out.push(completion))?;
         Ok(out.len() - before)
-    }
-
-    /// Scalar retirement without allocating a completion Vec.
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn progress_one(&mut self) -> Result<Option<LiveCompletion>, LiveIoError> {
-        let mut out = None;
-        let mut multiple = false;
-        self.progress_with(|completion| {
-            multiple |= out.is_some();
-            out = Some(completion);
-        })?;
-        if multiple {
-            return Err(LiveIoError::Invalid("multiple scalar completions"));
-        }
-        Ok(out)
     }
 
     fn progress_with(

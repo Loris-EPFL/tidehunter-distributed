@@ -8,6 +8,8 @@
 //!
 //! Ordinary files never qualify the Linux target; namespace drain is the CI
 //! kernel job's to prove.
+#![cfg(feature = "test_methods")]
+
 use super::pipeline_tests::{open_live_fixture_host, trusted_owner_host_config};
 use super::*;
 use crate::distributed::codec::BatchLimits;
