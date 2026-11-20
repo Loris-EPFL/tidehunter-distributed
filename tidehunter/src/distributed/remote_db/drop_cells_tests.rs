@@ -551,16 +551,28 @@ fn preflight_capacity_failure_aborts_without_effect_and_releases_the_barrier() {
     let db = open(&fixture);
     let ks = db.ks("cells");
     let key = |cell: u16| [&cell.to_be_bytes()[..], &[0; 6]].concat();
-    // Fill fresh cells until the masks of all of them no longer fit.
+    // Fill fresh cells until the masks of all of them no longer fit. The decision must
+    // rest on a settled total: a flush folds the transient per-cell charges into the
+    // resident total, which can free room, and deciding on an unsettled total made this
+    // test pass with the drop still admitted. The preflight (write_core/drop_cells.rs)
+    // adds the target masks to the resident total and to the index bytes already
+    // reserved for the slot, so a settled resident total that cannot hold the masks
+    // cannot be admitted either.
     let mut cells = 0u16;
     loop {
-        let charged = db.remote_for_test().index_stats().charged_metadata_bytes;
+        while budget.saturating_sub(db.remote_for_test().index_stats().charged_metadata_bytes)
+            >= drop_mask_charge(usize::from(cells)).unwrap()
+        {
+            db.insert(ks, key(cells), vec![1]).unwrap();
+            cells += 1;
+            assert!(cells < 4096, "the budget never filled");
+        }
+        let remote = db.remote_for_test();
+        remote.flush_index().unwrap();
+        let charged = remote.index_stats().charged_metadata_bytes;
         if budget.saturating_sub(charged) < drop_mask_charge(usize::from(cells)).unwrap() {
             break;
         }
-        db.insert(ks, key(cells), vec![1]).unwrap();
-        cells += 1;
-        assert!(cells < 4096, "the budget never filled");
     }
     let all = (
         CellId::Bytes(SmallVec::from_slice(&[0, 0])),
