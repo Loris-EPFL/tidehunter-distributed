@@ -97,7 +97,8 @@ Focused first-touch cases evict OS cache on all hosts after verification and
 before measurement, including buffered targets; repeat-read cases leave it
 intact. Neither setting proves per-call RAM or SSD service. Transport and target
 policy receipts, boundary counters and scoped device observations remain distinct.
-See the [current implementation and hardware qualification limits](../../docs/distributed/LINUX_NVME_OF_READ_BACKEND_2026-10-31.md#current-linux-page-cache-branch).
+See the archived implementation and hardware qualification limits (tag
+`archive/multi-design-*`, `docs/distributed/LINUX_NVME_OF_READ_BACKEND_2026-10-31.md`).
 
 The historical `standard-with-nvmeof` matrix is a sealed-read experiment.
 `standard-with-live-nvmeof` is a distinct combined plan that also schedules
@@ -1525,11 +1526,12 @@ Original historical repetitions and their hash-bound artifacts are not changed.
 
 ### Selective follow-up decisions
 
-Use existing matched repetitions before buying another run. The
-[retained variability assessment](../../docs/distributed/reports/2026-10-25-kv-comparison-ci-40226403293/variability-summary.json)
+Use existing matched repetitions before buying another run. The retained
+variability assessment (archived: tag `archive/multi-design-*`,
+`docs/distributed/reports/2026-10-25-kv-comparison-ci-40226403293/variability-summary.json`)
 analyzes the two completed histories separately, without pooling their changed
 CPU/memory or harness settings. Its
-[policy](../../docs/distributed/reports/2026-10-25-kv-comparison-ci-40226403293/variability-policy.json)
+policy (`variability-policy.json` in the same archived directory)
 declares these development-triage thresholds before any follow-up measurement:
 
 - API latency: a 10% relative effect and at least a 1 µs absolute effect.
@@ -1797,7 +1799,8 @@ its existing host samples and raw results remain the evidence for that run.
 
 ## Retained AWS report and offline figures, 25 October 2026
 
-[Research report](../../docs/distributed/reports/2026-10-25-kv-comparison/REPORT.md)
+The archived research report (tag `archive/multi-design-*`,
+`docs/distributed/reports/2026-10-25-kv-comparison/REPORT.md`)
 contains 13 comparison figures in PNG and vector PDF, the full numeric appendix,
 an untouched copy of the original CSV, and source/artifact explanations.
 The measured fleet is closed. This is synthetic KV evidence, not Sui replay,
@@ -1808,7 +1811,7 @@ With Matplotlib installed in the analysis environment (rendered with 3.11.2):
 ```bash
 python3 experiments/kv-comparison/plot_cloud_comparison.py \
   --input checkpoint-work/kv-comparison/cloud-ops/th-7dea3c080cb44d48/received/comparison.json \
-  --output docs/distributed/reports/2026-10-25-kv-comparison/figures
+  --output checkpoint-work/kv-comparison/figures-2026-10-25
 ```
 
 The command performs **offline postprocessing only**. It never launches EC2,

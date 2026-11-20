@@ -819,7 +819,8 @@ Primary references:
   and [file discovery semantics](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config).
 - [Tidehunter paper](../../../../papers/parsed/Tidehunter-2026-v2.md), §§3,6:
   native read tiers, asynchronous WAL persistence, and matched workload methodology.
-  [Fork invariants and local evidence boundary](../../../docs/distributed/ONE_SIDED_WAL_IMPLEMENTATION_2026-10-23.md).
+  Fork invariants and local evidence boundary are archived at tag
+  `archive/multi-design-*` (`docs/distributed/ONE_SIDED_WAL_IMPLEMENTATION_2026-10-23.md`).
   No WAL/cache mechanism is changed by this stack.
 - [Grafana datasource health and query HTTP APIs](https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/data_source/).
 

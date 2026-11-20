@@ -173,7 +173,8 @@ cache bounded by 1 MiB of canonical serialized bytes, without a separate row cap
 Native and remote Sui use the same policy; the producer's eight-entry digest/control
 window is separate. Hits retain storage failure fencing and same-key mutations
 invalidate delayed fills. The exact Sui and engine changes are mapped in
-[the local cache and checkpoint cutover](../../docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md).
+the archived local cache and checkpoint cutover (tag `archive/multi-design-*`,
+`docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md`).
 Typed-store `certified_checkpoints` histograms observe backend calls only, not
 sequence-cache hits. Fewer backend observations are not end-to-end sequence-lookup
 latency or an unchanged request population.
@@ -203,7 +204,8 @@ tenancy and cluster placement do not prove dedicated physical-host separation.
 Keep these results separate from the older campaigns below.
 
 The completed 13 October native/TCP/EFA matrix is recorded in
-[the measured results and closure report](../../docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md#20-completed-nativetcpefa-real-checkpoint-matrix-13-october-2026).
+the archived measured results and closure report §20
+(`docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md`, tag `archive/multi-design-*`).
 All four paired real-checkpoint runs passed full-state audits; both EFA cells
 proved hardware traffic on all six hosts. This is a private generated-transfer
 chain, not mainnet or a cold-NVMe capacity workload. All instances and temporary
@@ -213,7 +215,8 @@ a complete equal `experiment/audit.json` qualifies. No script in this directory
 calls AWS, launches instances, commits, pushes, or deletes old results.
 
 The **15 October local implementation and measurements** are in
-[the current source map, correctness rules and qualified results](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md#15-october-local-lifecycle-and-serving-path-implementation).
+the archived current source map, correctness rules and qualified results §15
+(`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`, tag `archive/multi-design-*`).
 They cover pooled immutable index containers, background checkpointing, pageable
 retry authority, pinned whole-file retirement, single-flight and actual Sui page
 prefetch. All five updated local native/TCP/software-fabric pairs passed state
@@ -745,8 +748,9 @@ Before paid allocation, CI must rebuild and complete a same-source real-checkpoi
 `fabric-tcp-native` local replay and full-state audit. This prerequisite is wired
 but is not a claim that a new Sui replay or hardware run occurred locally.
 
-See the [implemented native message contract](../../tidehunter-fabric/DESIGN.md#trusted-native-message-mode-21-october)
-and [one-sided WAL design](../../docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md).
+See the [implemented native message contract](../../tidehunter-fabric/DESIGN.md#trusted-native-message-mode-21-october);
+the one-sided WAL design is archived at tag `archive/multi-design-*`
+(`docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md`).
 
 New cell payloads bind `fabric_preflight_transport` in expected evidence. Their
 preflight runs `fi_info -p efa -f <fabric> -t FI_EP_RDM`; `efa-native` selects
@@ -865,7 +869,7 @@ exported before the exact-owned fleet termination attempt.
   pending/queued/byte peaks expose whether application writes actually overlap.
   These peaks are cumulative, and separately scraped counters are not atomic
   snapshots. The local implementation and remaining locks are documented in
-  [the concurrency cutover](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md).
+  the archived concurrency cutover (`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`, tag `archive/multi-design-*`).
 * `read_profile_transport_*` covers connection progress sweeps with sampled
   requests queued/active. It can include interleaved unprofiled work. Queue,
   submit and retire spans have separate sample counts because frames can cross

@@ -207,8 +207,9 @@ native modes add the explicit mode/version preface described below.
 Local send completion is not remote application receipt or persistence. The durable storage receipt
 remains the only write acknowledgement.
 
-See the [11 October implementation plan and local evidence](../docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md)
-and [9 October provenance](../docs/distributed/CHECKPOINT_ASYNC_READS_2026-10-09.md).
+See the archived 11 October implementation plan and local evidence and the
+9 October provenance (tag `archive/multi-design-*`,
+`docs/distributed/{CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md,CHECKPOINT_ASYNC_READS_2026-10-09.md}`).
 Software-provider and five-process TCP/software-fabric checks exercise ownership,
 recovery and failure paths. Real verbs hardware performance still requires
 approved hardware validation.
@@ -293,8 +294,9 @@ branch `perf/efa-native-messages-2026-10-21`.
 This follows [eRPC's ownership/bounded-buffer mechanisms](https://www.usenix.org/system/files/nsdi19-kalia.pdf),
 not its old small-object latency claims. The existing direct packet codec and
 provider progress are reused. There is no new C ABI, crate, storage format, global
-WAL, cache or automatic retry. The separate
-[one-sided resident WAL design](../docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md)
+WAL, cache or automatic retry. The separate one-sided resident WAL design
+(`docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md`)
+is archived at tag `archive/multi-design-*`; it
 maps TeRM/FaRM/HERD/FaSST mechanisms and the extra grant/MR/quiescence rules needed
 before bypassing the storage handler.
 

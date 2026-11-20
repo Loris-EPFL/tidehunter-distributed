@@ -228,7 +228,7 @@ sequenceDiagram
 
 **Commands on the writer.** A checkpoint first settles (a synchronous adoption through the written end; the extent stays open). A seal and every control closure first close the extent, which wastes the rest of the fragment. A clean shutdown closes a healthy open extent.
 
-**Not done.** No power-loss or kernel-crash qualification of the FUA acknowledgement exists for this mode. More than one frame in flight, polling queues and registered buffers are not implemented. Run 11 (11 November 2026) ran the campaign selection `leased_ab_compact` on the kernel target over RDMA: 72 of 72 cases, with the FUA and exchange gates satisfied in all 24 `leased` cases. Results: `docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md`, "Run 11 results". At 1 KiB the synchronous `leased` put is slower than the owner RPC put; at 64 KiB it is faster.
+**Not done.** No power-loss or kernel-crash qualification of the FUA acknowledgement exists for this mode. More than one frame in flight, polling queues and registered buffers are not implemented. Run 11 (11 November 2026) ran the campaign selection `leased_ab_compact` on the kernel target over RDMA: 72 of 72 cases, with the FUA and exchange gates satisfied in all 24 `leased` cases. Results: archived at tag `archive/multi-design-*` (`docs/distributed/FOCUSED_CAMPAIGN_2026-11-07.md`), "Run 11 results". At 1 KiB the synchronous `leased` put is slower than the owner RPC put; at 64 KiB it is faster.
 
 ## Reads and caches
 

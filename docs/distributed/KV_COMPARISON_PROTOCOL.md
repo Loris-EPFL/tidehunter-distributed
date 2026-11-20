@@ -1,14 +1,14 @@
 # Distributed KV comparison protocol
 
-This protocol separates comparative research from engine optimization. Local execution establishes API, lifecycle, accounting and artifact behavior. It does not establish independent-NVMe, EFA, scaling or high-availability performance. No AWS credentials or paid campaign are required by the local comparison workflow.
+This protocol separates comparative research from engine optimization. Local execution establishes API, lifecycle, accounting and artifact behavior. It does not establish independent-NVMe, verbs-hardware, scaling or high-availability performance. No cloud credentials or paid campaign are required by the local comparison workflow.
 
 ## Transport configuration and evidence
 
 The distributed transport is not a separate storage protocol: coordinator
 index, owner WAL, read grants, existing locks, and durable append receipts
 remain unchanged. The engine `Transport` defaults to TCP; an explicit OFI
-configuration selects one `FabricBackend` (`efa`, `efa-direct`, `verbs`, or
-`software-tcp`) and `FabricSecurity` (`mutual-tls` or `trusted`). Canonical
+configuration selects one `FabricBackend` (`verbs` or `software-tcp`) and
+`FabricSecurity` (`mutual-tls` or `trusted`). Canonical
 example:
 
 ```json
@@ -18,8 +18,7 @@ example:
 `domain` and `source_address` are optional host-local selectors. Supply each
 host's own selectors as needed; peers must select the same backend and
 security, while selectors need not be identical. Source-IP constraints depend
-on the provider: EFA/EFA-direct reject a source IP because `FI_ADDR_EFA` is
-opaque; verbs accepts IPv4 only because pinned RxM lists `FI_SOCKADDR` and
+on the provider: verbs accepts IPv4 only because pinned RxM lists `FI_SOCKADDR` and
 `FI_SOCKADDR_IN`, even where core verbs supports IPv6; software-tcp accepts
 IPv4/IPv6 when `fi_getinfo` returns a matching sockaddr. With no selector,
 each provider uses its default. Metadata reports a selected address only when
@@ -28,18 +27,14 @@ the selected OFI address, not echoed from config. Unsupported bindings,
 protocol mismatch, or unmet required device-read capability fail; transport
 never silently downgrades to TCP.
 
-EFA/EFA-direct and generic verbs are separate provider paths. IB, RoCE, and
-Falcon use verbs/RxM when supported by the selected host's provider, but are
-not interchangeable wire fabrics; EFA SRD is not verbs. A provider name or
+IB, RoCE and Falcon use verbs/RxM when supported by the selected host's
+provider. A provider name or
 requested setting is not hardware proof. Retain actual provider/setup metadata
-and capability provenance. For EFA/EFA-direct, native-read proof requires
-`FI_OPT_EFA_EMULATED_READ == false`. For verbs, it requires provider PCI
+and capability provenance. For verbs, native-read proof requires
 NIC/device metadata matched to canonical sysfs PCI BDF; software `rxe`,
-`rdma_rxe`, and `siw` devices are excluded. Verbs proof does not establish
-Falcon identity. Software OFI FI_READ validation proves only software
-correctness. Do not claim hardware qualification or performance without
-parent-reviewed hardware evidence. Transport does not alter storage locking
-or WAL/durability semantics.
+`rdma_rxe`, and `siw` devices are excluded. Do not claim hardware qualification
+or performance without parent-reviewed hardware evidence. Transport does not
+alter storage locking or WAL/durability semantics.
 
 Benchmark backend kind is unified as `tidehunter`; case identities such as
 `tidehunter_tcp`, `tidehunter_efa`, `tidehunter_efa_direct`, and
@@ -97,8 +92,7 @@ TCP. An unencrypted verbs cell against a TLS TCP cell mixes TLS cost with
 transport cost and must not be reported as a network effect.
 
 `fabric.slots` (optional, `1..=64`, default 4) sets the per-endpoint TX and RX
-slot count of the OFI message transport; EFA backends accept only the default.
-Record it with the run.
+slot count of the OFI message transport. Record it with the run.
 
 ## Research questions
 
@@ -259,7 +253,7 @@ records planning/reporting behavior and the preserved historical variability
 assessment. Missing observations remain missing; no follow-up runs are launched
 automatically.
 
-Count every data, coordinator, control-plane, transaction/log and load-generator role. Report allocated CPU/RAM as well as consumed resources and all relevant cache layers. Use a matched TCP deployment for a portable comparison; EFA and registered-memory controls are separate transport ablations, not capabilities attributed to competitors without an implemented path.
+Count every data, coordinator, control-plane, transaction/log and load-generator role. Report allocated CPU/RAM as well as consumed resources and all relevant cache layers. Use a matched TCP deployment for a portable comparison; verbs and registered-memory controls are separate transport ablations, not capabilities attributed to competitors without an implemented path.
 
 Report host-device byte amplification, occupied/live logical space, network traffic, CPU/operation and resource/cost denominators. Host write bytes do not establish physical NAND write amplification. Include all replicas and show replication separately from storage-engine amplification. Monetary inputs must be explicit estimates/rates, not presented as billing API evidence.
 
@@ -302,8 +296,7 @@ reading the database's WAL one-sided. Use the pinned
 not an unpatched or floating build.
 
 First qualify standalone Valkey TCP versus RDMA on matched compatible hardware.
-Its RDMA-CM/RC path is not established to work unchanged with
-[EFA's Libfabric RDM provider](https://ofiwg.github.io/libfabric/main/man/fi_efa.7.html).
+
 A ConnectX/RoCE/IB experiment is a different hardware/provider cohort; Tidehunter
 also needs a qualified path on that hardware before transport attribution is fair.
 Do not label standalone RDMA qualification as proven cluster-client, replication
@@ -345,7 +338,8 @@ Keep Sui replay separate from generic KV measurements. Existing certified privat
 - `.github/workflows/kv-comparison.yaml`: credential-free local adapter/instrumentation qualification, not paid cloud performance evidence.
 - `benchmarks/benchmark/src/`: existing native Tidehunter/RocksDB baseline and Prometheus exporter; preserve as the embedded reference.
 - `tidehunter/src/metrics.rs` and Sui typed-store adapter: existing engine/application telemetry. New benchmark-only profiling hooks do not change ordinary native algorithms, acknowledgment, locks or Sui behavior.
-- `experiments/aws-sharded-wal/` and `experiments/sui-checkpoint/`: preserved source-bound cloud/Sui campaigns. Their protected branch activation, exact-owned cleanup, budget ledger and deadline remain separate. The existing cloud harness's five-owner assumptions are not evidence of arbitrary-N support.
+- `experiments/gcp-rdma/`: current GCP benchmark campaign (protected `bench/gcp-rdma` activation, budget ledger, exact-owned cleanup and deadline).
+- `experiments/sui-checkpoint/`: archived Sui replay campaign record (only the README remains). The existing cloud harness's owner-count assumptions are not evidence of arbitrary-N support.
 
 ## Primary references and exact use
 

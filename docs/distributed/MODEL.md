@@ -2,8 +2,9 @@
 
 Date: 6 October 2026. **Executable design model; not a proof of the storage implementation.**
 
-This implements Gate 1 of the
-[architecture decision](distributed_tidehunter_architecture_decision_2026-10-06.md#11-work-order-and-acceptance-gates).
+This implements Gate 1 of the architecture decision
+(`docs/distributed/distributed_tidehunter_architecture_decision_2026-10-06.md#11-work-order-and-acceptance-gates`,
+archived at tag `archive/multi-design-*`).
 The model is independent of production Rust types and methods, so an implementation
 bug cannot automatically become its specification. It uses the standard library
 only and is compiled as test code in `distributed::model`.
@@ -11,19 +12,21 @@ only and is compiled as test code in `distributed::model`.
 ## Implementation boundary updated 15 October 2026
 
 The finite models below remain protocol checks, not a proof of the filesystem
-implementation. The RF1 implementation now has background cut capture/persist/
-adopt, bounded resident index/outcome windows backed by authenticated cold
-metadata, read-cut pins and explicit supported-history floors. A committed root
-can authorize deletion of wholly unreferenced files from sealed epochs. Old exact
-retry outcomes remain metadata authority even after payload retirement.
+implementation. This boundary paragraph is a historical record of the
+15 October RF1 implementation; it names removed designs (cold metadata
+history, per-epoch seals of that era). The current design is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §7–8.
 
 No global counter allocates physical disk addresses. Every stream retains its
 own WAL and independent physical offsets; complete logical batches retain one
 globally ordered publication version. Async replication is modeled below but is
-not made lossless or enabled by these RF1 lifecycle changes. Active-file GC,
-live-value relocation, dynamic inventory and replicated failover remain outside
-this implementation. See the
-[source map, safety rules and local evidence](CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md#15-october-local-lifecycle-and-serving-path-implementation).
+not made lossless or enabled. The model does not cover live-value relocation,
+range drop, generation trimming or inventory eviction: those are implemented
+outside the model (see [`ARCHITECTURE.md`](ARCHITECTURE.md) §7–8), and the model
+remains the contract for the batch/recovery protocol it checks. See the
+source map, safety rules and local evidence §15
+(`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`,
+archived at tag `archive/multi-design-*`).
 
 ## Anchors and deliberate differences
 
@@ -193,7 +196,9 @@ an exact state count that would prevent future model expansion.
 
 ### M2 refinement: complete persistence groups
 
-The separately documented [group model](GROUP_MODEL_2026-10-06.md) was run before
+The separately documented group model
+(`docs/distributed/GROUP_MODEL_2026-10-06.md`, archived at tag
+`archive/multi-design-*`) was run before
 implementing the group codec. It extends same-stream discovery from one pending
 batch to one pending **complete group** of whole batches. Both same-fragment and
 next-fragment cases explore 2,076 states and 3,889 transitions each. Seven unsafe
@@ -214,9 +219,9 @@ single-epoch storage backend. Its actual frame decoder, file ordering, filesyste
 sync errors, native WAL recovery, directory locks, request admission and read
 identity checks still need independent implementation tests.
 
-Before automatic failover or GC can be enabled, extend this model or another
+Before automatic failover can be enabled, extend this model or another
 independently reviewed specification for repeated epochs, multiple active recovery
-contenders, dynamic stream inventories, same-stream multi-record physical layouts,
+contenders, same-stream multi-record physical layouts,
 multi-frame large batches, durable retry expiry, finite leases/revocation failures,
 replica promotion and actual crash-atomic metadata writes. A native process lock is
 not cross-host fencing. An unavailable or permanently lost RF1 stream cannot be

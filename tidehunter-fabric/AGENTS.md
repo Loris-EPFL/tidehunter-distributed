@@ -1,7 +1,9 @@
 # Fabric correctness and hardware evidence
 
 Apply the root `AGENTS.md` as well as these transport-specific rules. Read
-`DESIGN.md`, `../docs/distributed/IMPLEMENTATION_PLAN_CHECKPOINT_AND_FABRIC_2026-10-18.md`
+`DESIGN.md`, `../docs/distributed/ARCHITECTURE.md`, the archived implementation
+plan (tag `archive/multi-design-*`,
+`docs/distributed/IMPLEMENTATION_PLAN_CHECKPOINT_AND_FABRIC_2026-10-18.md`)
 and `../docs/distributed/CLOUD_AND_CI_TESTING.md` before changing ownership or test
 classification. The implementation plan is a proposal, not completed behavior.
 
