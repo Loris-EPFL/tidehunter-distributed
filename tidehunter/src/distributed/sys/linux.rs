@@ -42,14 +42,20 @@ pub(crate) fn set_thread_affinity(cpu: usize) -> io::Result<()> {
             "CPU outside affinity mask",
         ));
     }
-    // SAFETY: cpu is inside cpu_set_t's bounds; the initialized mask lives for
-    // the whole syscall. pid 0 changes only the calling thread's affinity.
-    let result = unsafe {
-        let mut mask: libc::cpu_set_t = std::mem::zeroed();
+    // SAFETY: `zeroed` is valid for `cpu_set_t`, an all-zero bitset.
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `mask` is an initialized `cpu_set_t`; `CPU_ZERO` only clears it.
+    unsafe {
         libc::CPU_ZERO(&mut mask);
+    }
+    // SAFETY: cpu is inside cpu_set_t's bounds (checked above), so `CPU_SET`
+    // only flips one bit in the initialized mask.
+    unsafe {
         libc::CPU_SET(cpu, &mut mask);
-        libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask)
-    };
+    }
+    // SAFETY: the mask is initialized and lives for the whole syscall; pid 0
+    // changes only the calling thread's affinity.
+    let result = unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
