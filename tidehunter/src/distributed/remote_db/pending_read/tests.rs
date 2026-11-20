@@ -462,7 +462,7 @@ fn bounded_read_profiles_count_misses_not_hits_absences_or_backpressure() {
             value(key as u8 + 7)
         );
     }
-    assert_eq!(db.read_rpc_count(), 3);
+    assert_eq!(db.live_read_submission_count(), 3);
     assert_eq!(count("read_profile_selected"), 2);
     assert_eq!(count("read_profile_completed"), 2);
     assert_eq!(count("read_profile_errors"), 0);
@@ -549,11 +549,11 @@ fn external_read_pressure_does_not_poison_synchronous_conveniences() {
     let held = lane.lock();
     let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     let keys = vec![1u32.to_be_bytes().to_vec()];
-    let rpcs_before_rejection = db.read_rpc_count();
+    let rpcs_before_rejection = db.live_read_submission_count();
     assert!(RemoteDatabase::read_backpressured(
         &db.get_many(KeySpace(0), &keys).unwrap_err()
     ));
-    assert_eq!(db.read_rpc_count(), rpcs_before_rejection);
+    assert_eq!(db.live_read_submission_count(), rpcs_before_rejection);
     // A scan may join the occupied immutable reference. Let that real I/O
     // complete; the original unconsumed handle still owns the only physical
     // credit, so the scan's distinct next shard must report backpressure.
@@ -590,7 +590,7 @@ fn completion_is_not_visible_before_actor_releases_its_credit() {
 
     let observed = db.poll_get(&mut pending);
     let rejected = db.submit_get(KeySpace(0), &1u32.to_be_bytes());
-    let rpcs_after_rejection = db.read_rpc_count();
+    let rpcs_after_rejection = db.live_read_submission_count();
     release.send(()).unwrap();
 
     assert_eq!(observed.unwrap(), None);
@@ -995,10 +995,10 @@ fn cached_hit_and_same_shard_miss_progress_while_first_miss_is_blocked() {
     let held = lane.lock();
     let mut first = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     assert!(db.poll_get(&mut first).unwrap().is_none());
-    let rpcs_before_hit = db.read_rpc_count();
+    let rpcs_before_hit = db.live_read_submission_count();
     let mut hit = db.submit_get(KeySpace(0), &2u32.to_be_bytes()).unwrap();
     assert_eq!(db.poll_get(&mut hit).unwrap(), Some(value(9)));
-    assert_eq!(db.read_rpc_count(), rpcs_before_hit);
+    assert_eq!(db.live_read_submission_count(), rpcs_before_hit);
     let second = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
     assert_eq!(db.finish_get(second).unwrap(), value(8));
     assert!(db.poll_get(&mut first).unwrap().is_none());

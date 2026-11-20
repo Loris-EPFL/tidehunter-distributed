@@ -317,10 +317,10 @@ impl FixtureSpec {
                 commissioning_service_base: 4436 + base,
             },
             trusted_coordinator_id: Some(TRUSTED_COORDINATOR),
-            wal_member_read: Default::default(),
+            wal_member_read_policy: Default::default(),
             // Sparse owner files: actual blocks are monitored, never prewritten.
             wal_prewrite: false,
-            read_max_device_reads: 64,
+            max_device_reads_per_status: 64,
             durability: Default::default(),
         };
         config.validate()?;

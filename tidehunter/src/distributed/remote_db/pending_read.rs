@@ -712,7 +712,7 @@ struct State {
     wake_pending: Box<[AtomicBool]>,
     // Fixed flight signals, weak slots and exact-reference index are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
-    read_rpcs: AtomicU64,
+    live_read_submissions: AtomicU64,
     diagnostics: ReadDiagnostics,
     trace: Arc<ReadTrace>,
     coordinator_diagnostics: CoordinatorResolutionDiagnostics,
@@ -1535,7 +1535,7 @@ impl ReadService {
                 .map(|_| FlightSignal::new())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            read_rpcs: AtomicU64::new(0),
+            live_read_submissions: AtomicU64::new(0),
             diagnostics: ReadDiagnostics::default(),
             trace: Arc::new(ReadTrace::default()),
             coordinator_diagnostics: CoordinatorResolutionDiagnostics::default(),
@@ -2107,7 +2107,9 @@ impl ReadService {
             }
             // One remote value request handed to the live lane worker. Relaxed:
             // a diagnostic count; no data is published through it.
-            self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .live_read_submissions
+                .fetch_add(1, Ordering::Relaxed);
             Some(flight)
         } else {
             None
@@ -2271,8 +2273,12 @@ impl RemoteDatabase {
             state: self.core.reads.state.clone(),
         }
     }
-    pub fn read_rpc_count(&self) -> u64 {
-        self.core.reads.state.read_rpcs.load(Ordering::Relaxed)
+    pub fn live_read_submission_count(&self) -> u64 {
+        self.core
+            .reads
+            .state
+            .live_read_submissions
+            .load(Ordering::Relaxed)
     }
     pub fn submit_record(
         &mut self,
@@ -2831,7 +2837,7 @@ mod live_worker_tests {
             .unwrap();
         assert!(missing.into_iter().all(|result| matches!(result, Ok(None))));
         assert!(!db.reads.failed());
-        assert_eq!(db.read_rpc_count(), 0);
+        assert_eq!(db.live_read_submission_count(), 0);
         assert_eq!(*db.reads.state.retained.lock(), (0, 0));
         db.reads.sender.lock().clear();
         for worker in workers {

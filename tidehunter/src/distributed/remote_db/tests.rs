@@ -1093,7 +1093,7 @@ fn unusable_read_capacity_is_rejected_before_authority_mutation() {
         db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(),
         Some(vec![7; 32].into())
     );
-    assert_eq!(db.read_rpc_count(), 1);
+    assert_eq!(db.live_read_submission_count(), 1);
     db.shutdown().unwrap();
 }
 
@@ -1367,7 +1367,7 @@ fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     let (started, start_rx) = std::sync::mpsc::sync_channel(1);
     let (finished, finish_rx) = std::sync::mpsc::sync_channel(1);
     let reader = db.clone();
-    let scan_rpcs_before = db.remote_for_test().read_rpc_count();
+    let scan_rpcs_before = db.remote_for_test().live_read_submission_count();
     let scan = std::thread::spawn(move || {
         started.send(()).unwrap();
         let rows = reader.iterator(ks).collect::<Result<Vec<_>, _>>();
@@ -1375,12 +1375,12 @@ fn sui_grouped_scan_keeps_order_while_one_storage_lane_is_stalled() {
     });
     start_rx.recv().unwrap();
     let dispatch_deadline = Instant::now() + Duration::from_secs(5);
-    while db.remote_for_test().read_rpc_count() == scan_rpcs_before
+    while db.remote_for_test().live_read_submission_count() == scan_rpcs_before
         && Instant::now() < dispatch_deadline
     {
         std::thread::yield_now();
     }
-    assert!(db.remote_for_test().read_rpc_count() > scan_rpcs_before);
+    assert!(db.remote_for_test().live_read_submission_count() > scan_rpcs_before);
     let independent = first_page[..4]
         .iter()
         .find(|(_, reference)| reference.batch_address.partition != stalled_partition)

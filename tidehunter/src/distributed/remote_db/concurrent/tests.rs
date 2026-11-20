@@ -616,7 +616,7 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     let parked = db.reads.bench_park_live_lane(0);
     db.reads
         .bench_install_owner_local(&fixture.nodes[0], reference);
-    let rpcs = db.read_rpc_count();
+    let rpcs = db.live_read_submission_count();
     db.set_read_profile_limit(2);
     let monitor = db.read_profile_monitor();
     assert_eq!(get(&db, 0), Some(vec![5; 32]));
@@ -658,7 +658,7 @@ fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
     assert_eq!(resolution.route_preparation.count, 2);
     assert_eq!(resolution.pin_preparation.count, 2);
     assert_eq!(resolution.batch_preparation.count, 0);
-    assert_eq!(db.read_rpc_count() - rpcs, 2);
+    assert_eq!(db.live_read_submission_count() - rpcs, 2);
     db.shutdown().unwrap();
 }
 
@@ -1001,7 +1001,7 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
         .map(|key| key.to_be_bytes().to_vec())
         .collect();
     keys.push(Vec::new()); // malformed key must not discard other results
-    let before = db.remote_for_test().read_rpc_count();
+    let before = db.remote_for_test().live_read_submission_count();
     let values = db.multi_get(ks, &keys);
     for (slot, expected) in [1u8, 4, 2, 3, 1].into_iter().enumerate() {
         assert_eq!(
@@ -1011,11 +1011,14 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
     }
     assert!(values[5].as_ref().unwrap().is_none());
     assert!(values[6].is_err());
-    assert_eq!(db.remote_for_test().read_rpc_count() - before, 2);
+    assert_eq!(
+        db.remote_for_test().live_read_submission_count() - before,
+        2
+    );
     db.validate_cached_read().unwrap();
-    let before = db.remote_for_test().read_rpc_count();
+    let before = db.remote_for_test().live_read_submission_count();
     assert!(db.multi_get(ks, &keys)[6].is_err());
-    assert_eq!(db.remote_for_test().read_rpc_count(), before);
+    assert_eq!(db.remote_for_test().live_read_submission_count(), before);
     db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![9; 32])
         .unwrap();
     let retained = db.remote_for_test().get_many_cut(ks, &keys, cut).unwrap();
@@ -1145,7 +1148,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
         .index_reference(KeySpace(0), &7u32.to_be_bytes(), old_cut.clone())
         .unwrap()
         .unwrap();
-    let rpc_count = db.read_rpc_count();
+    let rpc_count = db.live_read_submission_count();
     assert_eq!(
         db.get_many_cut(KeySpace(0), &[7u32.to_be_bytes().to_vec()], old_cut.clone())
             .unwrap()[0]
@@ -1154,7 +1157,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
             .as_deref(),
         Some([1; 32].as_slice())
     );
-    assert_eq!(db.read_rpc_count(), rpc_count);
+    assert_eq!(db.live_read_submission_count(), rpc_count);
 
     db.write_batch(fixture.operation(1, 91), vec![put(7, 2)])
         .unwrap();
@@ -1174,7 +1177,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
     .unwrap();
     let deleted_cut = db.published_cut().unwrap();
     let keys = [7u32.to_be_bytes().to_vec()];
-    let before_reads = db.read_rpc_count();
+    let before_reads = db.live_read_submission_count();
     let old = db.get_many_cut(KeySpace(0), &keys, old_cut).unwrap();
     let updated = db.get_many_cut(KeySpace(0), &keys, updated_cut).unwrap();
     let deleted = db.get_many_cut(KeySpace(0), &keys, deleted_cut).unwrap();
@@ -1187,7 +1190,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
         Some([2; 32].as_slice())
     );
     assert!(deleted[0].as_ref().unwrap().is_none());
-    assert_eq!(db.read_rpc_count(), before_reads);
+    assert_eq!(db.live_read_submission_count(), before_reads);
     let cache = db.read_cache_stats();
     assert!(cache.inserts >= 3);
     assert!(cache.retained_bytes <= cache.budget_bytes);

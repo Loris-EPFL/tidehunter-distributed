@@ -60,8 +60,8 @@ impl Running {
             tls
         };
         let mut config = config(&temp.path().join("node"));
-        config.wal_member_read = policy;
-        config.read_max_device_reads = device_reads;
+        config.wal_member_read_policy = policy;
+        config.max_device_reads_per_status = device_reads;
         configure(&mut config);
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

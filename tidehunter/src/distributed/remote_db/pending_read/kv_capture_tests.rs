@@ -72,7 +72,7 @@ fn capture_child() {
     assert!(values.iter().all(Option::is_some));
     assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 8);
     assert!(
-        db.read_rpc_count() < 16,
+        db.live_read_submission_count() < 16,
         "the fixture must exercise grouped requests"
     );
     db.shutdown().unwrap();

@@ -766,7 +766,9 @@ message-read work. Coalesced consumers can share completed work, so logical
 rounds do not imply a minimum dispatch count. The counter is not a packet
 count and does not enumerate multiple internal messages for one group.
 Use per-lane `message_read_requests` and RMA posts/completions for those
-transport-operation populations.
+transport-operation populations. The JSON key `read_rpc_count` is kept for
+evidence-schema stability; the engine accessor behind it is
+`live_read_submission_count`.
 
 Sampled owner grant setup now distinguishes lookup/reuse, reservation/admission,
 envelope preparation, the actual `fi_mr_reg` call, and authority

@@ -134,9 +134,9 @@ pub(super) fn owner_host_config(root: PathBuf) -> OwnerHostConfig {
             commissioning_service_base: 5420,
         },
         trusted_coordinator_id: None,
-        wal_member_read: Default::default(),
+        wal_member_read_policy: Default::default(),
         wal_prewrite: false,
-        read_max_device_reads: 128,
+        max_device_reads_per_status: 128,
         durability: Default::default(),
     }
 }
@@ -145,7 +145,7 @@ pub(super) fn trusted_owner_host_config(root: PathBuf) -> OwnerHostConfig {
     let mut config = owner_host_config(root);
     config.max_databases = 1;
     config.trusted_coordinator_id = Some([1; 32]);
-    config.read_max_device_reads = 64;
+    config.max_device_reads_per_status = 64;
     config
 }
 
@@ -263,16 +263,16 @@ impl Fixture {
                 root: temp.path().join(format!("node-{index}")),
                 partition: config.partition_config(1, index as u32),
                 shape_yaml: shape.to_yaml().unwrap(),
-                wal_member_read: Default::default(),
+                wal_member_read_policy: Default::default(),
                 wal_prewrite: false,
-                read_max_device_reads: 128,
+                max_device_reads_per_status: 128,
                 live_target: None,
             };
             configure_node(&mut node_config);
             let mut host_config = owner_host_config(node_config.root);
-            host_config.wal_member_read = node_config.wal_member_read;
+            host_config.wal_member_read_policy = node_config.wal_member_read_policy;
             host_config.wal_prewrite = node_config.wal_prewrite;
-            host_config.read_max_device_reads = node_config.read_max_device_reads;
+            host_config.max_device_reads_per_status = node_config.max_device_reads_per_status;
             let host = open_live_fixture_host(host_config.clone()).unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             config.endpoints.push(RemoteEndpoint {

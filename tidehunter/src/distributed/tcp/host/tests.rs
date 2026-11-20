@@ -36,9 +36,9 @@ fn host_config(root: &Path, max_databases: usize) -> OwnerHostConfig {
         max_databases,
         live_target_pool: pool(),
         trusted_coordinator_id: Some(COORDINATOR),
-        wal_member_read: Default::default(),
+        wal_member_read_policy: Default::default(),
         wal_prewrite: false,
-        read_max_device_reads: 128,
+        max_device_reads_per_status: 128,
         durability: HostDurabilityDefaults::default(),
     }
 }

@@ -186,18 +186,18 @@ pub struct NodeConfig {
     pub partition: PartitionConfig,
     pub shape_yaml: String,
     /// Member read policy of owner WAL reads; with `Async`, also bounds each
-    /// live record resolution (see `read_max_device_reads`).
+    /// live record resolution (see `max_device_reads_per_status`).
     #[serde(default = "default_async_read_policy")]
-    pub wal_member_read: super::storage::WalMemberReadPolicy,
+    pub wal_member_read_policy: super::storage::WalMemberReadPolicy,
     /// Write and sync zeros across each external WAL file before it is usable,
     /// so live writes never convert unwritten extents. On by default and always
     /// serialized: an absent key means on, and opting out requires `false`.
     #[serde(default = "default_wal_prewrite")]
     pub wal_prewrite: bool,
-    /// With `wal_member_read: async`, caps `NodeStatus::max_reads` and the
-    /// references of one `ResolveLiveRecords` request.
+    /// With `wal_member_read_policy: async`, caps `NodeStatus::max_reads` and
+    /// the references of one `ResolveLiveRecords` request.
     #[serde(default = "default_device_reads")]
-    pub read_max_device_reads: usize,
+    pub max_device_reads_per_status: usize,
     /// Optional live target. Once enabled, its persisted configuration is
     /// required on every restart so outstanding namespaces can be revoked.
     #[serde(default)]
@@ -224,13 +224,15 @@ impl NodeConfig {
     }
 
     fn validate_reads(&self) -> Result<(), TcpError> {
-        validate_device_read_limit(self.read_max_device_reads)
+        validate_device_read_limit(self.max_device_reads_per_status)
     }
 }
 
 fn validate_device_read_limit(limit: usize) -> Result<(), TcpError> {
     if !(1..=4096).contains(&limit) {
-        return Err(TcpError::new("read_max_device_reads must be in 1..=4096"));
+        return Err(TcpError::new(
+            "max_device_reads_per_status must be in 1..=4096",
+        ));
     }
     Ok(())
 }
@@ -989,8 +991,8 @@ impl StorageNode {
         }
         config.validate_reads()?;
         let close_wake = WakeFd::for_progress("database close wake")?;
-        let wal_member_read = config.wal_member_read;
-        let read_max_device_reads = config.read_max_device_reads;
+        let wal_member_read_policy = config.wal_member_read_policy;
+        let max_device_reads_per_status = config.max_device_reads_per_status;
         let inventory = NodeInventory::open_with_mode(config, metrics, mode)?;
         let live_nvme_selected = inventory.live_target_configured;
         let lifecycle = inventory.lifecycle.clone();
@@ -1010,8 +1012,8 @@ impl StorageNode {
             persistence_failed,
             recoverable_live_failure: AtomicBool::new(false),
             poison_gate: Mutex::new(()),
-            wal_member_read,
-            read_max_device_reads,
+            wal_member_read_policy,
+            max_device_reads_per_status,
             transport: Arc::default(),
             live_control_gate: Mutex::new(()),
             #[cfg(test)]

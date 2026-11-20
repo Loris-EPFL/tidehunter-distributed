@@ -119,10 +119,10 @@ pub(super) fn config(root: &Path) -> NodeConfig {
             max_batches: 64,
             max_reference_metadata_bytes: 1024 * 1024,
         },
-        wal_member_read: Default::default(),
+        wal_member_read_policy: Default::default(),
         // Shared fixture keeps fallocated, unwritten WAL extents; prewrite tests opt in.
         wal_prewrite: false,
-        read_max_device_reads: default_device_reads(),
+        max_device_reads_per_status: default_device_reads(),
         live_target: None,
     }
 }
@@ -134,10 +134,10 @@ fn static_node_validation_opens_no_runtime_resources() {
     for fault in 0..5 {
         let mut invalid = config.clone();
         match fault {
-            0 => invalid.read_max_device_reads = 0,
+            0 => invalid.max_device_reads_per_status = 0,
             1 => invalid.partition.inventory.epoch = 2,
             2 => invalid.partition.inventory.segment_generation = 2,
-            3 => invalid.read_max_device_reads = 4097,
+            3 => invalid.max_device_reads_per_status = 4097,
             _ => invalid.shape_yaml = "invalid shape".into(),
         }
         assert!(invalid.validate().is_err());

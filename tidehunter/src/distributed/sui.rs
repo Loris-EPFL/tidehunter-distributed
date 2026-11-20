@@ -1866,7 +1866,11 @@ impl Db {
         match &self.backend {
             Backend::Remote(remote) => {
                 let db = &remote.db;
-                Some((db.read_cache_stats(), db.stats(), db.read_rpc_count()))
+                Some((
+                    db.read_cache_stats(),
+                    db.stats(),
+                    db.live_read_submission_count(),
+                ))
             }
             _ => None,
         }
@@ -1894,7 +1898,7 @@ impl Db {
             Backend::Remote(remote) => Some(Some((
                 remote.db.try_read_cache_stats()?,
                 remote.db.try_stats()?,
-                remote.db.read_rpc_count(),
+                remote.db.live_read_submission_count(),
             ))),
             Backend::Native(_) => Some(None),
         }

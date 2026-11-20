@@ -152,9 +152,9 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
                 commissioning_service_base: 4421,
             },
             trusted_coordinator_id: Some([1; 32]),
-            wal_member_read: Default::default(),
+            wal_member_read_policy: Default::default(),
             wal_prewrite: false,
-            read_max_device_reads: 64,
+            max_device_reads_per_status: 64,
             durability: Default::default(),
         };
         let configfs = base.join("configfs");

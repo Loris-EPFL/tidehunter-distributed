@@ -60,10 +60,10 @@ pub(super) struct ControlContext {
     pub(super) persistence_failed: Arc<AtomicBool>,
     pub(super) recoverable_live_failure: AtomicBool,
     pub(super) poison_gate: Mutex<()>,
-    pub(super) wal_member_read: super::super::storage::WalMemberReadPolicy,
+    pub(super) wal_member_read_policy: super::super::storage::WalMemberReadPolicy,
     /// With async member reads, caps `NodeStatus::max_reads` and each
     /// `ResolveLiveRecords` request (see `effective_max_reads`).
-    pub(super) read_max_device_reads: usize,
+    pub(super) max_device_reads_per_status: usize,
     /// Owner OFI transport counters, reported by `PartitionStats`. Sessions
     /// write their own cache-line shard (relaxed); a snapshot is not atomic.
     pub(super) transport: Arc<OwnerTransportCounters>,
@@ -1301,8 +1301,8 @@ impl ControlContext {
         self.inventory.lock().status()
     }
     pub(super) fn effective_max_reads(&self, limits: TcpLimits) -> usize {
-        if self.wal_member_read == super::super::storage::WalMemberReadPolicy::Async {
-            limits.max_reads.min(self.read_max_device_reads)
+        if self.wal_member_read_policy == super::super::storage::WalMemberReadPolicy::Async {
+            limits.max_reads.min(self.max_device_reads_per_status)
         } else {
             limits.max_reads
         }

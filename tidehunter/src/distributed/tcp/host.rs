@@ -90,11 +90,11 @@ pub struct OwnerHostConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_coordinator_id: Option<[u8; 32]>,
     #[serde(default = "super::default_async_read_policy")]
-    pub wal_member_read: crate::distributed::storage::WalMemberReadPolicy,
+    pub wal_member_read_policy: crate::distributed::storage::WalMemberReadPolicy,
     #[serde(default = "super::default_wal_prewrite")]
     pub wal_prewrite: bool,
     #[serde(default = "super::default_device_reads")]
-    pub read_max_device_reads: usize,
+    pub max_device_reads_per_status: usize,
     #[serde(default)]
     pub durability: HostDurabilityDefaults,
 }
@@ -109,7 +109,7 @@ impl OwnerHostConfig {
             ));
         }
         self.live_target_pool.validate(self.max_databases)?;
-        super::validate_device_read_limit(self.read_max_device_reads)
+        super::validate_device_read_limit(self.max_device_reads_per_status)
     }
 }
 
@@ -222,9 +222,9 @@ impl HostCore {
             root,
             partition: entry.spec.partition.clone(),
             shape_yaml: entry.spec.shape_yaml.clone(),
-            wal_member_read: self.config.wal_member_read,
+            wal_member_read_policy: self.config.wal_member_read_policy,
             wal_prewrite: self.config.wal_prewrite,
-            read_max_device_reads: self.config.read_max_device_reads,
+            max_device_reads_per_status: self.config.max_device_reads_per_status,
             live_target: Some(live_target),
         })
     }

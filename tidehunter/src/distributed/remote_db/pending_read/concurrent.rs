@@ -77,8 +77,11 @@ impl ConcurrentRemoteDatabase {
         }
         result
     }
-    pub fn read_rpc_count(&self) -> u64 {
-        self.reads.state.read_rpcs.load(Ordering::Relaxed)
+    pub fn live_read_submission_count(&self) -> u64 {
+        self.reads
+            .state
+            .live_read_submissions
+            .load(Ordering::Relaxed)
     }
 
     /// A scalar miss first tries caller-owned progress on an idle lane. Neither

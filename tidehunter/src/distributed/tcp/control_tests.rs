@@ -2456,11 +2456,11 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
     let temp = tempdir::TempDir::new("max-reads-invariance").unwrap();
     let mut document = serde_yaml::to_value(config(&temp.path().join("base"))).unwrap();
     let fields = document.as_mapping_mut().unwrap();
-    fields.remove("wal_member_read");
-    fields.remove("read_max_device_reads");
+    fields.remove("wal_member_read_policy");
+    fields.remove("max_device_reads_per_status");
     let defaults: NodeConfig = serde_yaml::from_value(document).unwrap();
-    assert_eq!(defaults.wal_member_read, WalMemberReadPolicy::Async);
-    assert_eq!(defaults.read_max_device_reads, 128);
+    assert_eq!(defaults.wal_member_read_policy, WalMemberReadPolicy::Async);
+    assert_eq!(defaults.max_device_reads_per_status, 128);
     let wire = TcpLimits::default();
     assert_eq!(wire.max_reads, 256);
     let narrow = TcpLimits {
@@ -2470,8 +2470,8 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
     for (name, policy, device_reads, limits, expected) in [
         (
             "default",
-            defaults.wal_member_read,
-            defaults.read_max_device_reads,
+            defaults.wal_member_read_policy,
+            defaults.max_device_reads_per_status,
             wire,
             128,
         ),
@@ -2488,8 +2488,8 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
     ] {
         let mut config = defaults.clone();
         config.root = temp.path().join(name);
-        config.wal_member_read = policy;
-        config.read_max_device_reads = device_reads;
+        config.wal_member_read_policy = policy;
+        config.max_device_reads_per_status = device_reads;
         let node = StorageNode::open(config.clone(), metrics()).unwrap();
         let Response::Status(StatusReply::Database(status)) = node
             .handle(

@@ -44,7 +44,7 @@ pub fn prepare_external_case(
     transport: Transport,
     owner_transports: &[Transport],
     read_lanes: Option<usize>,
-    wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
+    wal_member_read_policy: tidehunter::distributed::storage::WalMemberReadPolicy,
     polling: PollingPolicy,
     durability: DurabilityConfig,
     live_nvme: LiveClientConfig,
@@ -132,7 +132,7 @@ pub fn prepare_external_case(
                 node_root.join("storage"),
                 partition,
                 address.ip().to_string(),
-                wal_member_read,
+                wal_member_read_policy,
                 durability,
             )?,
             r1_events: None,
@@ -251,7 +251,7 @@ fn host_config(
     root: PathBuf,
     partition: u32,
     target_address: String,
-    wal_member_read: tidehunter::distributed::storage::WalMemberReadPolicy,
+    wal_member_read_policy: tidehunter::distributed::storage::WalMemberReadPolicy,
     durability: DurabilityConfig,
 ) -> Result<OwnerHostConfig> {
     // Colocated owners share nvmet port IDs and, on one address, services:
@@ -274,12 +274,12 @@ fn host_config(
         },
         // Required only by the trusted transports, ignored with mTLS.
         trusted_coordinator_id: Some([0x7d; 32]),
-        wal_member_read,
+        wal_member_read_policy,
         // Legacy harness behaviour, written explicitly because the owner
         // default is on. The cloud and local harnesses rebind each case's
         // owner_wal_prewrite before validating the launch.
         wal_prewrite: false,
-        read_max_device_reads: 128,
+        max_device_reads_per_status: 128,
         durability: HostDurabilityDefaults {
             max_unsynced_age_ms: durability.max_unsynced_age_ms,
             max_pending_completions: durability.max_pending_completions,

@@ -224,9 +224,12 @@ impl ReadService {
             trace.lane(lane.index, slot);
             trace.event("live_inline_admitted");
         }
-        // Relaxed: these counters only describe the chosen route. `read_rpcs`
-        // counts this inline live read as one remote value request.
-        self.state.read_rpcs.fetch_add(1, Ordering::Relaxed);
+        // Relaxed: these counters only describe the chosen route.
+        // `live_read_submissions` counts this inline live read as one remote
+        // value request.
+        self.state
+            .live_read_submissions
+            .fetch_add(1, Ordering::Relaxed);
         self.state
             .diagnostics
             .live_inline
