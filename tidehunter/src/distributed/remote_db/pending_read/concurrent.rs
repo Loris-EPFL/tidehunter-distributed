@@ -93,6 +93,10 @@ impl ConcurrentRemoteDatabase {
         self.get_inner(ks, key, None)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the miss variant always carries its owner route"
+    )]
     fn get_inner(
         &self,
         ks: KeySpace,
@@ -351,6 +355,10 @@ impl ConcurrentRemoteDatabase {
     /// reads of one resolved window.
     // Window, pin source and diagnostics belong to distinct concerns.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::expect_used,
+        reason = "an admitted member always receives its value before the batch completes"
+    )]
     fn fetch_references<K: AsRef<[u8]>>(
         &self,
         ks: KeySpace,
@@ -638,6 +646,10 @@ impl ConcurrentRemoteDatabase {
         Ok((resolution, node))
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the miss variant always carries its owner route"
+    )]
     fn prepare_concurrent_get(
         &self,
         ks: KeySpace,
@@ -736,6 +748,10 @@ impl ConcurrentRemoteDatabase {
     ///
     /// # Panics
     /// Panics only if an internal resolved-handle/completion invariant is broken.
+    #[allow(
+        clippy::expect_used,
+        reason = "the resolved state is only set with a detached completion"
+    )]
     pub fn finish_ready_get(&self, completed: CompletedGet) -> Result<Option<Bytes>, LocalDbError> {
         if !Arc::ptr_eq(&self.reads.state, &completed.pending.owner) {
             return Err(LocalDbError::new(
@@ -760,6 +776,10 @@ impl ConcurrentRemoteDatabase {
         result
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the count check above leaves exactly one member"
+    )]
     fn complete_concurrent_get(
         &self,
         reference: ValueRecordReference,
@@ -773,7 +793,7 @@ impl ConcurrentRemoteDatabase {
             self.poison(&error);
             return Err(error);
         }
-        let mutation = values.pop().unwrap();
+        let mutation = values.pop().expect("one verified member");
         let prepared = self.cache.prepare_verified(reference, &mutation);
         self.cache.insert_prepared(prepared);
         let result = RemoteDatabase::point_value(ks, key, mutation);

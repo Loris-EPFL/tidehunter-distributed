@@ -3,6 +3,10 @@
 use super::super::*;
 
 impl ClientWorker {
+    #[allow(
+        clippy::expect_used,
+        reason = "parked checkpoints, positions and queued controls are owned by this loop alone"
+    )]
     pub(in crate::distributed::remote_db) fn start(
         mut client: Client,
         queue_capacity: usize,
@@ -244,7 +248,7 @@ impl ClientWorker {
                                 client.prepare_leased_position()?;
                                 // A fixed-through proof tolerates later appends:
                                 // position persistence validates its captured offset.
-                                queued.push_front(parked_checkpoint.take().unwrap());
+                                queued.push_front(parked_checkpoint.take().expect("parked above"));
                             }
                             if parked_checkpoint.is_none()
                                 && matches!(queued.front(), Some(WorkerItem::Append(..)) | None)

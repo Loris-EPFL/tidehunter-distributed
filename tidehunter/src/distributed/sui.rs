@@ -1451,6 +1451,10 @@ impl Db {
     pub fn set_native_durable(&self, enabled: bool) {
         self.durable_native.store(enabled, Ordering::Relaxed);
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "callers name a keyspace declared at open; the expect names the contract"
+    )]
     pub fn ks(&self, name: &str) -> KeySpace {
         self.try_ks(name).expect("declared keyspace")
     }
@@ -2330,6 +2334,10 @@ impl RemoteIterator {
         Ok(references)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a scan iterator pins its cut for its whole lifetime"
+    )]
     fn fill_page(&mut self) -> Result<()> {
         let limit = match &self.db.backend {
             Backend::Remote(remote) => remote.db.scan_prefetch_pages(),

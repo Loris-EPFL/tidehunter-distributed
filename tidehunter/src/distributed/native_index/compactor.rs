@@ -315,10 +315,8 @@ fn newest_in_cut(
     overlay: &[ValueRecordReference],
     cut: &IndexReadCut,
 ) -> Option<ValueRecordReference> {
-    let reference = |n: usize| {
-        decode_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
-            .expect("validated immutable reference")
-    };
+    let reference =
+        |n: usize| validated_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES]);
     let count = base.len() / REFERENCE_BYTES;
     let base_end = lower_bound_by(count, |n| cut.contains(&reference(n)));
     let base = (base_end > 0).then(|| reference(base_end - 1));
@@ -370,6 +368,10 @@ fn head_bound(cell: &FrozenCell) -> usize {
 /// reference within the cut, above the newest mask, not covered by a mark
 /// (adopted, folded or added by a prune plan in this image). Keys borrow the
 /// immutable base block or the frozen overlay; nothing is copied.
+#[allow(
+    clippy::expect_used,
+    reason = "a row without base bytes comes from the overlay, so the key is present"
+)]
 fn collect_heads(cell: &FrozenCell, cut: &IndexReadCut, heads: &mut Vec<(Bytes, MutationVersion)>) {
     for (key, base, overlay) in Rows::new(cell) {
         let Some(newest) = newest_in_cut(base, overlay, cut) else {

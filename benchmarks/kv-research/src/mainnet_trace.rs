@@ -26,6 +26,10 @@ pub struct Table {
     pub control: bool,
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the static table list above is fixed at seventeen entries"
+)]
 pub fn tables() -> Vec<Table> {
     [
         ("certified_checkpoints", 1, 8, "sequence_prefix_48"),

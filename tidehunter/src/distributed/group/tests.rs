@@ -509,3 +509,25 @@ fn immutable_groups_can_be_decoded_concurrently() {
         }
     });
 }
+
+/// The header length check lives in `decode_owned`, the function that indexes
+/// the fixed header windows, so every entry point rejects short payloads.
+#[test]
+fn payloads_shorter_than_the_group_header_are_truncated() {
+    let (bl, gl) = limits();
+    for length in [0, 1, GROUP_HEADER_LEN - 1] {
+        let bytes = vec![0u8; length];
+        assert_eq!(
+            CompleteGroup::decode_slice(&shape(), &bytes, bl, gl).unwrap_err(),
+            GroupError::Truncated
+        );
+        assert_eq!(
+            CompleteGroup::decode(&shape(), Bytes::from(bytes.clone()), bl, gl).unwrap_err(),
+            GroupError::Truncated
+        );
+        assert_eq!(
+            CompleteGroup::decode_owned(&shape(), Bytes::from(bytes), bl, gl).unwrap_err(),
+            GroupError::Truncated
+        );
+    }
+}

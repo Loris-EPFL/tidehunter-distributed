@@ -223,6 +223,10 @@ impl RetentionState {
 
     /// `owner_charged` is read from the dropped view; it changes only under
     /// `cold`, and the last reference is gone, so no charge can race this.
+    #[allow(
+        clippy::expect_used,
+        reason = "every released view registered its pin first, so the entry is present"
+    )]
     pub(super) fn release_view(
         &self,
         key: Option<MutationVersion>,

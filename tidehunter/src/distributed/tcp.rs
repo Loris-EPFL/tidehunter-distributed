@@ -1556,6 +1556,10 @@ impl Client {
         Ok(client)
     }
     /// Authenticated status captured during connect; not a fresh health probe.
+    #[allow(
+        clippy::expect_used,
+        reason = "connect stores the authenticated status before the client is returned"
+    )]
     pub(crate) fn connected_status(&self) -> &NodeStatus {
         self.connected_status
             .as_ref()
@@ -1807,6 +1811,10 @@ impl Client {
             format_args!("expected {expected}, received {}", response.as_ref()),
         )
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "the named suite is TLS 1.3 by definition"
+    )]
     fn shape_sha256(yaml: &str) -> String {
         // This named TLS 1.3 suite always supplies SHA-256. Rustls/ring is
         // enabled by experimental-distributed, including no-test-utils clients.
@@ -2021,6 +2029,10 @@ impl TlsFiles {
         }
         Ok(trusted)
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "the hasher is configured for a 32-byte digest just above"
+    )]
     fn material(
         &self,
     ) -> Result<

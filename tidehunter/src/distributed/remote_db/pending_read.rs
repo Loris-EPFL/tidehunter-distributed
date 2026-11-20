@@ -103,6 +103,10 @@ impl FlightRegistry {
         (self.hasher.hash_one((node, reference)) as usize) % self.buckets.len()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the bucket chain only holds allocated entries, so every index resolves"
+    )]
     fn find(
         &self,
         node: usize,
@@ -110,7 +114,9 @@ impl FlightRegistry {
     ) -> Option<(Arc<ReadFlight>, usize)> {
         let mut index = self.buckets[self.bucket(node, reference)];
         while index != NO_INDEX {
-            let entry = self.entries[index].as_ref().unwrap();
+            let entry = self.entries[index]
+                .as_ref()
+                .expect("allocated flight entry");
             if entry.node == node
                 && entry.reference == *reference
                 && let Some(flight) = self.slots[entry.slot].upgrade()
@@ -122,21 +128,31 @@ impl FlightRegistry {
         None
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the bucket chain only holds allocated entries, so every index resolves"
+    )]
     fn clear_slot(&mut self, slot: usize) {
         let mut index = std::mem::replace(&mut self.slot_heads[slot], NO_INDEX);
         while index != NO_INDEX {
-            let entry = self.entries[index].take().unwrap();
+            let entry = self.entries[index].take().expect("allocated flight entry");
             let bucket = self.bucket(entry.node, &entry.reference);
             let mut current = self.buckets[bucket];
             let mut previous = NO_INDEX;
             while current != index {
                 previous = current;
-                current = self.entries[current].as_ref().unwrap().bucket_next;
+                current = self.entries[current]
+                    .as_ref()
+                    .expect("allocated flight entry")
+                    .bucket_next;
             }
             if previous == NO_INDEX {
                 self.buckets[bucket] = entry.bucket_next;
             } else {
-                self.entries[previous].as_mut().unwrap().bucket_next = entry.bucket_next;
+                self.entries[previous]
+                    .as_mut()
+                    .expect("allocated flight entry")
+                    .bucket_next = entry.bucket_next;
             }
             self.free.push(index);
             index = entry.slot_next;
@@ -158,6 +174,10 @@ impl FlightRegistry {
         self.free.len() >= count
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "flight index capacity is reserved per admitted request"
+    )]
     fn insert(&mut self, flight: &Arc<ReadFlight>) {
         let slot = flight.slot;
         self.clear_slot(slot);
@@ -289,6 +309,10 @@ impl ReadBatch {
         self.dispatch_traced(service, None, 0)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the loop bound proves the group deque is nonempty"
+    )]
     fn dispatch_traced(
         &mut self,
         service: &ReadService,
@@ -369,6 +393,10 @@ impl ReadBatch {
         Ok(())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "an admitted batch owns its signal, and the ready loop picked an existing request"
+    )]
     pub(super) fn finish_one(&mut self) -> Result<(), LocalDbError> {
         let (state, timeout) = {
             let request = &self
@@ -1493,6 +1521,10 @@ impl ReadService {
         + MIN_MEMBER_BYTES
         + 3 * 256;
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the client list is sized to endpoints times read lanes before this loop"
+    )]
     pub(super) fn from_clients(
         config: &RemoteDatabaseConfig,
         epoch: u64,
@@ -1592,7 +1624,7 @@ impl ReadService {
             let base = node * read_lanes;
             let mut lanes = Vec::with_capacity(read_lanes);
             for _ in 0..read_lanes {
-                let client = clients.next().unwrap();
+                let client = clients.next().expect("sized client list");
                 recovery_stats.add_connection(client.connect_profile());
                 let client = Arc::new(Mutex::new(client));
                 let index = base + lanes.len();
@@ -1875,6 +1907,10 @@ impl ReadService {
     }
     // Admission takes its context and optional precomputed member plans
     // explicitly; each belongs to a distinct concern.
+    #[allow(
+        clippy::expect_used,
+        reason = "a new request always reserves its flight slot and flight before planning"
+    )]
     fn submit_until_planned(
         &self,
         node: usize,
@@ -2027,7 +2063,10 @@ impl ReadService {
         };
         if let Some(trace) = &trace {
             if let Some(lane) = &lane {
-                trace.lane(lane.index, flight_slot.unwrap());
+                trace.lane(
+                    lane.index,
+                    flight_slot.expect("new request reserved its slot"),
+                );
                 trace.event("admitted");
             } else {
                 trace.event("coalesced_existing_flight");
@@ -2121,7 +2160,7 @@ impl ReadService {
             .into_iter()
             .map(|(existing, slot)| {
                 (
-                    existing.unwrap_or_else(|| flight.as_ref().unwrap().clone()),
+                    existing.unwrap_or_else(|| flight.as_ref().expect("planned flight").clone()),
                     slot,
                 )
             })
@@ -2184,6 +2223,10 @@ pub struct CompletedRecord {
 }
 
 impl PendingRecord {
+    #[allow(
+        clippy::expect_used,
+        reason = "an unfinished record owns its read, and the count check above leaves one member"
+    )]
     pub fn wait(self) -> CompletedRecord {
         let started = Instant::now();
         let result = match self.ready {
@@ -2350,6 +2393,10 @@ impl RemoteDatabase {
         Ok(mutation)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the resolved state is only set with a detached completion"
+    )]
     pub fn finish_ready_get(
         &mut self,
         completed: CompletedGet,
@@ -2387,6 +2434,10 @@ impl RemoteDatabase {
     ) -> Result<PendingGet, LocalDbError> {
         self.prepare_get(ks, key, cut, None, false)
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "inline and dispatch timers are armed on exactly the branch that reads them"
+    )]
     pub(super) fn prepare_get(
         &mut self,
         ks: KeySpace,
@@ -2512,7 +2563,7 @@ impl RemoteDatabase {
                     None
                 };
                 if let Some(values) = immediate {
-                    let elapsed = elapsed(inline_started.unwrap());
+                    let elapsed = elapsed(inline_started.expect("inline read"));
                     self.core
                         .value_read_ns
                         .fetch_add(elapsed, Ordering::Relaxed);
@@ -2529,7 +2580,7 @@ impl RemoteDatabase {
                         pin,
                     )?;
                     if let Some(profile) = profile {
-                        profile.dispatch_ns += elapsed(dispatch_started.unwrap());
+                        profile.dispatch_ns += elapsed(dispatch_started.expect("dispatched read"));
                     }
                     GetState::Pending {
                         read,
@@ -2596,6 +2647,10 @@ impl RemoteDatabase {
         }
         self.ensure_healthy()
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "the count check above leaves exactly one member"
+    )]
     fn complete_get(
         &mut self,
         reference: ValueRecordReference,
@@ -2609,7 +2664,7 @@ impl RemoteDatabase {
             self.poison(&error);
             return Err(error);
         }
-        let mutation = values.pop().unwrap();
+        let mutation = values.pop().expect("one verified member");
         if matches!(mutation, Mutation::Delete { .. }) {
             let error = LocalDbError::new("live index reference resolves to tombstone");
             self.poison(&error);
@@ -2675,6 +2730,10 @@ impl RemoteDatabase {
     pub fn finish_get(&mut self, pending: PendingGet) -> Result<Option<Bytes>, LocalDbError> {
         self.finish_get_profiled(pending, None)
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "wait_started is set whenever a profile samples this path"
+    )]
     pub(super) fn finish_get_profiled(
         &mut self,
         pending: PendingGet,
@@ -2697,7 +2756,7 @@ impl RemoteDatabase {
                     .fetch_add(elapsed(value_started), Ordering::Relaxed);
                 let values = result.inspect_err(|error| self.poison(error))?;
                 if let Some(profile) = profile {
-                    profile.wait_ns += elapsed(wait_started.unwrap());
+                    profile.wait_ns += elapsed(wait_started.expect("profiled wait"));
                 }
                 self.complete_get(reference, ks, &key, values)
             }

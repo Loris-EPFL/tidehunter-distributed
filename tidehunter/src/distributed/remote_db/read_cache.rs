@@ -849,6 +849,10 @@ impl CacheTable {
     }
 
     /// Admit one prepared entry, rechecking the current table state.
+    #[allow(
+        clippy::expect_used,
+        reason = "the candidate set only contains occupied slots"
+    )]
     fn insert_entry(&mut self, prepared: PreparedEntry) -> bool {
         let PreparedEntry {
             reference,
@@ -881,14 +885,14 @@ impl CacheTable {
                     .is_some_and(|entry| self.can_evict_entry(entry, protected))
             });
             let slot = replaceable.min_by_key(|&i| {
-                let entry = self.slots[i].as_ref().unwrap();
+                let entry = self.slots[i].as_ref().expect("occupied slot");
                 (u8::from(entry.protected), entry.benefit)
             });
             let Some(slot) = slot else {
                 bump(&self.counters.bypass_admission);
                 return false;
             };
-            if seen < 2 && self.slots[slot].as_ref().unwrap().benefit != 0 {
+            if seen < 2 && self.slots[slot].as_ref().expect("occupied slot").benefit != 0 {
                 bump(&self.counters.bypass_admission);
                 return false;
             }

@@ -50,6 +50,8 @@ mod capacity_observer;
 pub use capacity_observer::CapacityObserver;
 mod checkpoint_attribution;
 use checkpoint_attribution::CoordinatorIoCategory;
+mod checkpoint_inputs;
+use checkpoint_inputs::{position_has_owner_history, read_checkpoint};
 mod authority_lifecycle;
 pub(crate) use authority_lifecycle::drop_db;
 pub use authority_lifecycle::{AuthorityLifecycle, OwnerControlConfig};
@@ -2571,6 +2573,10 @@ fn checkpoint_metadata_fits(streams: usize, receipts: usize) -> bool {
 /// K-way merge of bounded pages. Never retain the database's value history in
 /// coordinator RAM merely to sort it; the index receives one batch at a time.
 #[allow(clippy::too_many_arguments)] // Keep independently owned recovery state explicit.
+#[allow(
+    clippy::expect_used,
+    reason = "the loop breaks unless the next page exists, and ready only holds nodes with a batch"
+)]
 fn replay_history(
     clients: &mut [Client],
     histories: &[Vec<u64>],
@@ -2622,7 +2628,7 @@ fn replay_history(
                     if !page.batches.is_empty() || page.next.is_none() {
                         break;
                     }
-                    cursor = page.next.unwrap();
+                    cursor = page.next.expect("checked above");
                 }
             }
             Ok(page)
@@ -2634,7 +2640,10 @@ fn replay_history(
             }
         }
         while let Some(Reverse((version, node))) = ready.pop() {
-            let (batch, durable) = pages[node].batches.pop_front().unwrap();
+            let (batch, durable) = pages[node]
+                .batches
+                .pop_front()
+                .expect("ready lists nodes with a batch");
             // A batch above the durable cut is not published: not indexed, not
             // a retry identity, not a version floor. It precedes the duplicate
             // check because a later epoch may hold its retried identity.
@@ -2723,25 +2732,6 @@ fn encode_checkpoint(image: &impl Serialize) -> Result<Vec<u8>, LocalDbError> {
         .with_fixint_encoding()
         .with_limit(MAX_CHECKPOINT_METADATA_BYTES)
         .serialize(image)
-        .map_err(LocalDbError::component)
-}
-
-fn read_checkpoint<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LocalDbError> {
-    let file = File::open(path).map_err(LocalDbError::component)?;
-    if file.metadata().map_err(LocalDbError::component)?.len() > MAX_CHECKPOINT_METADATA_BYTES {
-        return Err(LocalDbError::new(
-            "checkpoint receipt metadata exceeds bound",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_METADATA_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(LocalDbError::component)?;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_CHECKPOINT_METADATA_BYTES)
-        .reject_trailing_bytes()
-        .deserialize(&bytes)
         .map_err(LocalDbError::component)
 }
 
@@ -2841,14 +2831,13 @@ fn load_checkpoint(
         }
     };
     for position in std::mem::take(&mut image.positions) {
-        if !config.storage.partitions.contains(&position.partition)
-            || !histories[config
-                .endpoints
-                .iter()
-                .position(|endpoint| endpoint.partition == position.partition)
-                .unwrap()]
-            .contains(&position.epoch)
-            || position.epoch > commit.epoch
+        if !position_has_owner_history(
+            &config.storage.partitions,
+            &config.endpoints,
+            histories,
+            position.partition,
+            position.epoch,
+        ) || position.epoch > commit.epoch
             || position.replay_from % config.storage.fragment_bytes != 0
             || position.last_offset.is_some_and(|offset| {
                 offset < position.replay_from || offset >= position.durable_end
