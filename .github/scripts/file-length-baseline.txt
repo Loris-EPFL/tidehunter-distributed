@@ -1,0 +1,33 @@
+# File-length ratchet baseline (R6). Each line is "<path> <current lines>".
+# The file-length check fails if a listed file grows past its count or any
+# unlisted Rust file in the audited trees exceeds 1500 lines. Remove a line
+# when the file is split; never raise a count.
+tidehunter/src/distributed/codec.rs 1976
+tidehunter/src/distributed/native_index.rs 2695
+tidehunter/src/distributed/nvmeof/live_target.rs 1502
+tidehunter/src/distributed/remote_db/checkpoint_lifecycle.rs 2396
+tidehunter/src/distributed/remote_db/concurrent/tests.rs 2280
+tidehunter/src/distributed/remote_db/concurrent.rs 1657
+tidehunter/src/distributed/remote_db/leased_tests.rs 1789
+tidehunter/src/distributed/remote_db/live_bench_tests.rs 2058
+tidehunter/src/distributed/remote_db/pending_read/tests.rs 1578
+tidehunter/src/distributed/remote_db/pending_read.rs 3104
+tidehunter/src/distributed/remote_db/pipeline_tests.rs 2201
+tidehunter/src/distributed/remote_db/read_cache/trace_eval.rs 1776
+tidehunter/src/distributed/remote_db/read_cache.rs 2355
+tidehunter/src/distributed/remote_db/tests.rs 1812
+tidehunter/src/distributed/remote_db.rs 3589
+tidehunter/src/distributed/storage/tests.rs 2074
+tidehunter/src/distributed/storage.rs 4884
+tidehunter/src/distributed/sui.rs 2569
+tidehunter/src/distributed/tcp/control.rs 2381
+tidehunter/src/distributed/tcp/control_tests.rs 2542
+tidehunter/src/distributed/tcp/inventory.rs 1963
+tidehunter/src/distributed/tcp/live_client.rs 5506
+tidehunter/src/distributed/tcp/live_read.rs 3280
+tidehunter/src/distributed/tcp/reactor.rs 2318
+tidehunter/src/distributed/tcp.rs 2345
+benchmarks/kv-research/src/backends/tidehunter.rs 2942
+benchmarks/kv-research/src/mainnet_replay.rs 2440
+benchmarks/kv-research/src/runner.rs 7196
+tidehunter-fabric/src/endpoint/resources.rs 1978
