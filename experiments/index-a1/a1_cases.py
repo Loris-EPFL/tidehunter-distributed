@@ -15,8 +15,13 @@ canonical example spells it `max_bytes`, which the engine rejects.
 from __future__ import annotations
 
 import copy
+import os
 
-SIZES = (1_000_000, 5_000_000, 10_000_000)
+# Local calibration override (IndexA1Cal): the run controller and the analyzer
+# share this module, so an override keeps configs and the decision consistent.
+# Unset, the design values apply.
+SIZES = tuple(int(value) for value in os.environ.get(
+    "A1_SIZES", "1000000,5000000,10000000").split(","))
 TIERS = ("native", "synchronous")
 # Arm indices of the design's interleaving: [E4, E16, C, C-scaled].
 ARM_ORDER = ("e4", "e16", "c", "c-scaled")
@@ -24,11 +29,11 @@ ARM_ORDER = ("e4", "e16", "c", "c-scaled")
 # cannot reach: never run locally (design, "Cadence preflight is a hard gate").
 LOCAL_ARMS = ("e4", "e16", "c-scaled")
 DECISION_ARMS = ("e4", "e16")
-REPEATS = 5
+REPEATS = int(os.environ.get("A1_REPEATS", "5"))
 SEED = 20261119
 NAMESPACE = "a1a0a1a0a1a0a1a0a1a0a1a0a1a0a1a0"
 VALUE_SIZE = 1024
-TIMED_OPERATIONS = 10_000_000
+TIMED_OPERATIONS = int(os.environ.get("A1_TIMED_OPERATIONS", "10000000"))
 PILOT_OPERATIONS = 1_000_000
 PILOT_EXTENDED_OPERATIONS = 2_000_000
 CONFIRM_OPERATIONS = 1_000_000
