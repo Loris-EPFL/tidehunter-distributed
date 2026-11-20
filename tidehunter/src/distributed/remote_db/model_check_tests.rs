@@ -10,6 +10,7 @@
 //! trace.
 use super::pipeline_tests::{Fixture, open_live_fixture_host};
 use super::*;
+use crate::distributed::test_bounds::CHILD_RUN_CAP;
 use crate::failpoints::write_model;
 use crate::key_shape::KeyType;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -802,7 +803,8 @@ fn child(directory: &Path, stage: &str) -> Output {
         .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Whole test-binary child run; try_wait is the progress signal below.
+    let deadline = Instant::now() + CHILD_RUN_CAP;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;

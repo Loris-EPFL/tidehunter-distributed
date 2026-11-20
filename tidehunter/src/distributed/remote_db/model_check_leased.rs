@@ -3,6 +3,7 @@ use super::*;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
 use crate::distributed::tcp::{LeasedSync, LiveClientConfig};
+use crate::distributed::test_bounds::PROGRESS_CAP;
 
 const LEASED_BOUNDARIES: &[&str] = &[
     "write_submitted_to_kernel",
@@ -112,7 +113,8 @@ pub(super) fn flush_probe(
 }
 
 fn wait_flights(client: &Arc<Mutex<Client>>, count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Progress wait on the in-flight counter.
+    let deadline = Instant::now() + PROGRESS_CAP;
     while client.lock().leased_flights_in_flight() < count {
         assert!(
             Instant::now() < deadline,

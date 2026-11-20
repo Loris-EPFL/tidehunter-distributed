@@ -1,4 +1,5 @@
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 
 #[test]
 fn cpu_lists_parse_single_ranges_and_mixed_sets() {
@@ -434,7 +435,9 @@ fn missing_device_retries_but_other_failures_do_not() {
         &path,
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        // The creator thread makes the file appear 10 ms in; the retry loop
+        // follows that progress.
+        Instant::now() + PROGRESS_CAP,
         || Ok(()),
         || File::open(&path),
     )
@@ -722,7 +725,8 @@ fn deletion_confirmation_observes_delayed_disappearance() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_secs(2),
+        // The remover thread acts 10 ms in; this wait follows that progress.
+        Instant::now() + PROGRESS_CAP,
     )
     .unwrap();
     remover.join().unwrap();
