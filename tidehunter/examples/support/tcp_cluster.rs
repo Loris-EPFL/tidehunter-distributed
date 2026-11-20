@@ -86,7 +86,15 @@ pub fn prepare_external_case(
             addresses.len(),
         )?)
     };
-    let rebase = |root: &Path, path: &Path| root.join("tls").join(path.file_name().unwrap());
+    let rebase = |root: &Path, path: &Path| -> io::Result<PathBuf> {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS material path has no file name",
+            )
+        })?;
+        Ok(root.join("tls").join(name))
+    };
     let mut endpoints = Vec::new();
     for (i, ((&partition, &address), owner_transport)) in storage
         .partitions
@@ -103,19 +111,19 @@ pub fn prepare_external_case(
             // The prepared tree is also executable in place. Keep each owner's
             // complete identity with its launch file, never in a shared TLS bind.
             fs::create_dir(local_node.join("tls"))?;
-            fs::copy(&certs.ca, rebase(&local_node, &certs.ca))?;
+            fs::copy(&certs.ca, rebase(&local_node, &certs.ca)?)?;
             fs::rename(
                 &identity.certificate,
-                rebase(&local_node, &identity.certificate),
+                rebase(&local_node, &identity.certificate)?,
             )?;
             fs::rename(
                 &identity.private_key,
-                rebase(&local_node, &identity.private_key),
+                rebase(&local_node, &identity.private_key)?,
             )?;
             (
-                rebase(&node_root, &certs.ca),
-                rebase(&node_root, &identity.certificate),
-                rebase(&node_root, &identity.private_key),
+                rebase(&node_root, &certs.ca)?,
+                rebase(&node_root, &identity.certificate)?,
+                rebase(&node_root, &identity.private_key)?,
                 identity.server_name.clone(),
             )
         } else {
@@ -168,9 +176,9 @@ pub fn prepare_external_case(
     let client_tls = if let Some(certs) = certs.as_ref() {
         TlsFiles {
             transport,
-            ca: rebase(guest_root, &certs.ca),
-            cert: rebase(guest_root, &certs.authority.certificate),
-            key: rebase(guest_root, &certs.authority.private_key),
+            ca: rebase(guest_root, &certs.ca)?,
+            cert: rebase(guest_root, &certs.authority.certificate)?,
+            key: rebase(guest_root, &certs.authority.private_key)?,
             server_name: "unused-client-template".into(),
         }
     } else {
@@ -432,14 +440,16 @@ pub fn maybe_run_storage_node() -> Result<bool> {
     }
     // If a controller is killed, its children must not remain as orphan servers.
     #[cfg(target_os = "linux")]
-    unsafe {
-        // SAFETY: getppid takes no arguments; this prctl option accepts only an
-        // integer signal value and neither reads nor retains a user pointer.
-        let parent = libc::getppid();
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+    {
+        // SAFETY: getppid takes no arguments and has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        // SAFETY: this prctl option accepts only an integer signal value and
+        // neither reads nor retains a user pointer.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        if libc::getppid() != parent {
+        // SAFETY: getppid takes no arguments and has no preconditions.
+        if unsafe { libc::getppid() } != parent {
             return Err(io::Error::other("controller exited during node startup").into());
         }
     }

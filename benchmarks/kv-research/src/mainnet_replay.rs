@@ -2271,7 +2271,7 @@ async fn open_backend(
         )),
         "tidehunter_tcp" => {
             let backend = TidehunterReplayBackend::open(&config.backend.options, trace).await?;
-            let info = backend.info();
+            let info = backend.info()?;
             Ok((Arc::new(backend), info))
         }
         #[cfg(feature = "foundationdb")]

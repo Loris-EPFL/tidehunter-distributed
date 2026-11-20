@@ -156,16 +156,23 @@ impl TidehunterReplayBackend {
             {
                 let mutations = entries
                     .iter()
-                    .map(|r| Mutation::Put {
-                        keyspace: shape
-                            .iter_ks()
-                            .find(|ks| ks.name() == trace.tables[usize::from(r.table)].node_name)
-                            .expect("declared table")
-                            .id(),
-                        key: r.key.clone(),
-                        value: r.value.clone(),
+                    .map(|r| -> BackendResult<Mutation> {
+                        let node_name = &trace
+                            .tables
+                            .get(usize::from(r.table))
+                            .ok_or("replay table index out of range")?
+                            .node_name;
+                        Ok(Mutation::Put {
+                            keyspace: shape
+                                .iter_ks()
+                                .find(|ks| ks.name() == *node_name)
+                                .ok_or("replay table not declared in its database shape")?
+                                .id(),
+                            key: r.key.clone(),
+                            value: r.value.clone(),
+                        })
                     })
-                    .collect();
+                    .collect::<BackendResult<Vec<_>>>()?;
                 CompleteBatch::new(
                     &shape,
                     BatchId {
@@ -276,12 +283,10 @@ impl TidehunterReplayBackend {
             .collect::<BackendResult<_>>()?;
         Ok(Self { databases, tables })
     }
-    pub fn info(&self) -> BackendInfo {
-        let first = self
-            .databases
-            .first_key_value()
-            .expect("validated node DBs")
-            .1;
+    pub fn info(&self) -> BackendResult<BackendInfo> {
+        let Some(first) = self.databases.values().next() else {
+            return Err("distributed replay database set is empty".into());
+        };
         let mut info = first.info();
         if let Some(ack) =
             first.effective_configuration["live_write"]["acknowledgement_contract"].as_str()
@@ -302,7 +307,7 @@ impl TidehunterReplayBackend {
                 info.configuration["durability_tier"] = tier.clone();
             }
         }
-        info
+        Ok(info)
     }
 }
 impl ReplayBackend for TidehunterReplayBackend {
