@@ -172,10 +172,13 @@ generations + 1)` must not exceed it. The bound is a failure boundary, not a
 quota. Sizes: at 2 owners, 2047 retained generations per owner; at 16 owners,
 255.
 
-The open runs in this order: seed from the control region, check the bound,
-reserve the new generation, then trim what is eligible. The trim runs only at
-open, after the generation is reserved (`fencing_generations` `maintain`, one
-caller). No trim runs while the database is open.
+The open runs in this order: check the bound (`check_stream_bound`), reserve the
+new generation, run the fence sweep, seed the stream positions from the owner
+reports (`seed_positions`), then trim what is eligible. The bound check runs
+before the fence sweep. It counts the retained generations of the manifest, not
+the seeded positions. The trim runs only at open, after the generation is
+reserved (`fencing_generations` `maintain`, one caller). No trim runs while the
+database is open.
 
 - An open at bound−1 reserves its generation and trims what is eligible.
 - A coordinator that finds the database at the bound refuses the open with a
