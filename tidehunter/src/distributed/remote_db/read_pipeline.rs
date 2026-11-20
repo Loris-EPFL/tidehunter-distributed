@@ -47,6 +47,10 @@ impl ScanPage {
     /// A normal page has bounded payload and metadata. An individually legal
     /// larger record is returned alone and cannot overlap another page. This
     /// preserves legal large values without making lookahead memory unbounded.
+    #[allow(
+        clippy::expect_used,
+        reason = "`peek` just returned this row, so `next` returns it"
+    )]
     fn next(
         cursor: &mut NativeIndexScan,
         index: &crate::distributed::native_index::NativeIndex,

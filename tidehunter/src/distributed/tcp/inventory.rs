@@ -776,6 +776,10 @@ impl NodeInventory {
     /// writer, and `healthy` stays false until the new epoch is installed.
     /// `drain_log` joins the control owner's workers of the old live log after
     /// target revocation and before the log is scanned.
+    #[allow(
+        clippy::expect_used,
+        reason = "an open manifest always retains its newest epoch entry"
+    )]
     pub(super) fn fence<H: InventoryAccess>(
         inventory: &mut H,
         slot: &mut LifecycleSlot,
@@ -907,7 +911,12 @@ impl NodeInventory {
                     Ok::<_, TcpError>(log)
                 })?;
                 inventory.logs.insert(old.epoch, log);
-                inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
+                inventory
+                    .manifest
+                    .epochs
+                    .last_mut()
+                    .expect("newest epoch")
+                    .state = EpochState::Sealed;
                 Self::persist_manifest(inventory)?;
                 inventory.healthy = true;
             } else {
@@ -952,7 +961,12 @@ impl NodeInventory {
             );
             Ok::<_, TcpError>(log)
         })?;
-        inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Active;
+        inventory
+            .manifest
+            .epochs
+            .last_mut()
+            .expect("newest epoch")
+            .state = EpochState::Active;
         Self::persist_manifest(inventory)?;
         let inventory = &mut **inventory;
         inventory.logs.insert(epoch, log);
@@ -1417,6 +1431,10 @@ impl NodeInventory {
 
     /// Seal `epoch`. Same gate contract as `fence`: revocation, drain, the
     /// log seal and the manifest install all run with the inventory released.
+    #[allow(
+        clippy::expect_used,
+        reason = "an open manifest always retains its newest epoch entry"
+    )]
     pub(super) fn seal_epoch<H: InventoryAccess>(
         inventory: &mut H,
         slot: &mut LifecycleSlot,
@@ -1449,7 +1467,12 @@ impl NodeInventory {
                 .map_err(TcpError::component)?;
         }
         drop(log);
-        inventory.manifest.epochs.last_mut().unwrap().state = EpochState::Sealed;
+        inventory
+            .manifest
+            .epochs
+            .last_mut()
+            .expect("open manifest retains its newest epoch")
+            .state = EpochState::Sealed;
         Self::persist_manifest(inventory)?;
         inventory.healthy = true;
         Ok(())

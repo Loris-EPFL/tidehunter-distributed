@@ -495,6 +495,10 @@ impl CellScan {
         }
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the order match above proves which head is present"
+    )]
     fn next(
         &mut self,
         index: &NativeIndex,
@@ -1016,12 +1020,11 @@ impl NativeIndex {
                     })
                     || cell.base.as_ref().is_some_and(|block| {
                         (0..block.count).any(|n| {
-                            block.entry(n).1.chunks_exact(REFERENCE_BYTES).any(|bytes| {
-                                references(
-                                    &decode_reference(bytes)
-                                        .expect("validated immutable reference"),
-                                )
-                            })
+                            block
+                                .entry(n)
+                                .1
+                                .chunks_exact(REFERENCE_BYTES)
+                                .any(|bytes| references(&validated_reference(bytes)))
                         })
                     })
             })
@@ -1272,6 +1275,10 @@ impl CellIndex {
         let base = self.base.as_ref().and_then(|block| block.get(key, cut));
         newest(overlay, base)
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "the equal-key arm matched both heads, so merging yields one"
+    )]
     fn next_overlay(
         &self,
         previous: Option<&[u8]>,
@@ -1438,6 +1445,10 @@ impl SortedBlock {
     /// only the rows, and the bytes after the last row: the cell's prune-mark
     /// trailer, empty for a cell without marks. The caller validates the
     /// trailer.
+    #[allow(
+        clippy::expect_used,
+        reason = "chunks_exact(4) yields four-byte windows, so the conversion cannot fail"
+    )]
     fn validated(
         bytes: Bytes,
         mapped: bool,
@@ -1458,7 +1469,11 @@ impl SortedBlock {
         let mut retained_bytes = 0;
         let mut retained_versions = 0;
         for offset in offsets.chunks_exact(4) {
-            let offset = u32::from_be_bytes(offset.try_into().unwrap()) as usize;
+            let offset = u32::from_be_bytes(
+                offset
+                    .try_into()
+                    .expect("chunks_exact(4) yields four bytes"),
+            ) as usize;
             if offset != expected {
                 return Err(NativeIndexError::Invalid("noncanonical block offset"));
             }
@@ -1517,11 +1532,17 @@ impl SortedBlock {
 
     /// Length of the rows of an already validated cell payload: the end of
     /// its last row. The payload may continue with a prune-mark trailer.
+    #[allow(
+        clippy::expect_used,
+        reason = "`field` reads a four-byte window that `get` just proved present"
+    )]
     fn rows_len(payload: &[u8]) -> Result<usize, NativeIndexError> {
         let field = |at: usize| -> Result<usize, NativeIndexError> {
             payload
                 .get(at..at + 4)
-                .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
+                .map(|bytes| {
+                    u32::from_be_bytes(bytes.try_into().expect("four-byte window")) as usize
+                })
                 .ok_or(NativeIndexError::Invalid("truncated cell payload"))
         };
         let count = field(0)?;
@@ -1537,15 +1558,28 @@ impl SortedBlock {
         }
         Ok(end)
     }
+    #[allow(
+        clippy::expect_used,
+        reason = "entries only exist for payloads accepted by `validated`, so every window is in range"
+    )]
     fn entry(&self, index: usize) -> (&[u8], &[u8]) {
-        let offset =
-            u32::from_be_bytes(self.bytes[4 + index * 4..8 + index * 4].try_into().unwrap())
-                as usize;
-        let len = u32::from_be_bytes(self.bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let offset = u32::from_be_bytes(
+            self.bytes[4 + index * 4..8 + index * 4]
+                .try_into()
+                .expect("validated block offset window"),
+        ) as usize;
+        let len = u32::from_be_bytes(
+            self.bytes[offset..offset + 4]
+                .try_into()
+                .expect("validated row window"),
+        ) as usize;
         let key = &self.bytes[offset + 4..offset + 4 + len];
         let count_at = offset + 4 + len;
-        let count =
-            u32::from_be_bytes(self.bytes[count_at..count_at + 4].try_into().unwrap()) as usize;
+        let count = u32::from_be_bytes(
+            self.bytes[count_at..count_at + 4]
+                .try_into()
+                .expect("validated version-count window"),
+        ) as usize;
         (
             key,
             &self.bytes[count_at + 4..count_at + 4 + count * REFERENCE_BYTES],
@@ -1554,15 +1588,13 @@ impl SortedBlock {
     fn selected(&self, index: usize, cut: &IndexReadCut) -> Option<ValueRecordReference> {
         let (_, values) = self.entry(index);
         let count = lower_bound_by(values.len() / REFERENCE_BYTES, |n| {
-            cut.within_upper(
-                &decode_reference(&values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
-                    .expect("validated immutable reference"),
-            )
+            cut.within_upper(&validated_reference(
+                &values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES],
+            ))
         });
         (0..count).rev().find_map(|n| {
             let reference =
-                decode_reference(&values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
-                    .expect("validated immutable reference");
+                validated_reference(&values[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES]);
             cut.contains(&reference).then_some(reference)
         })
     }
@@ -1652,14 +1684,14 @@ fn installed_entry_values(bytes: &[u8], index: usize) -> Option<&[u8]> {
 fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexError> {
     let mut c = Cursor::new(bytes);
     let id = BatchId {
-        database: c.take(16)?.try_into().unwrap(),
-        operation: c.take(16)?.try_into().unwrap(),
+        database: c.take_array::<16>()?,
+        operation: c.take_array::<16>()?,
     };
     let version = BatchVersion {
         epoch: c.u64()?,
         sequence: c.u64()?,
     };
-    let digest = PayloadDigest(c.take(32)?.try_into().unwrap());
+    let digest = PayloadDigest(c.take_array::<32>()?);
     let address = PhysicalValueAddress {
         partition: c.u32()?,
         segment_generation: c.u64()?,
@@ -1700,6 +1732,16 @@ fn decode_reference(bytes: &[u8]) -> Result<ValueRecordReference, NativeIndexErr
         batch_address: address,
         descriptor,
     })
+}
+/// Decode a reference from bytes that index-image validation already accepted.
+/// The image loader validates every stored reference once at open, so this
+/// decode cannot fail; the expect only names a broken validation contract.
+#[allow(
+    clippy::expect_used,
+    reason = "index-image validation accepted these bytes at open, so the decode cannot fail"
+)]
+fn validated_reference(bytes: &[u8]) -> ValueRecordReference {
+    decode_reference(bytes).expect("validated immutable reference")
 }
 fn encode_cut(cut: &IndexReadCut, output: &mut Vec<u8>) {
     match cut {
@@ -1765,17 +1807,24 @@ impl<'a> Cursor<'a> {
         self.position = end;
         Ok(bytes)
     }
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], NativeIndexError> {
+        // `take` returns exactly `N` bytes or errors; the conversion only
+        // narrows the type and cannot fail.
+        self.take(N)?
+            .try_into()
+            .map_err(|_| NativeIndexError::Invalid("fixed-width read"))
+    }
     fn u8(&mut self) -> Result<u8, NativeIndexError> {
         Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16, NativeIndexError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(self.take_array::<2>()?))
     }
     fn u32(&mut self) -> Result<u32, NativeIndexError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.take_array::<4>()?))
     }
     fn u64(&mut self) -> Result<u64, NativeIndexError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.take_array::<8>()?))
     }
 }
 

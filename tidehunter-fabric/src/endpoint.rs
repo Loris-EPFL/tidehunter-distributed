@@ -233,6 +233,10 @@ impl Endpoint {
     /// # Panics
     /// Panics if the internal resource-ownership invariant is broken.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "a live endpoint retains its resources until Drop"
+    )]
     pub fn open_profile(&self) -> OpenProfile {
         self.resources
             .as_deref()
@@ -244,6 +248,10 @@ impl Endpoint {
     /// Panics if the internal ownership invariant is broken: successful open
     /// retains the provider metadata until this endpoint is dropped.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "a live endpoint retains its resources until Drop"
+    )]
     pub fn provider_info(&self) -> &ProviderInfo {
         self.resources
             .as_deref()
@@ -453,6 +461,10 @@ impl Endpoint {
     /// Panics if the internal ownership invariant is broken. A live endpoint
     /// always retains its resources until `Drop`.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "a live endpoint retains its resources until Drop"
+    )]
     pub fn sends_pending(&self) -> bool {
         self.resources
             .as_deref()
@@ -485,6 +497,10 @@ impl Endpoint {
     /// # Panics
     /// Panics if the internal resource-ownership invariant is broken.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "a live endpoint retains its resources until Drop"
+    )]
     pub fn progress_stats(&self) -> ProgressStats {
         self.resources
             .as_deref()
@@ -700,6 +716,10 @@ impl Endpoint {
         Ok(())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a live endpoint retains its resources until Drop"
+    )]
     fn inner(&mut self) -> &mut Resources {
         self.resources
             .as_deref_mut()

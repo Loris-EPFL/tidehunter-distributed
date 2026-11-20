@@ -34,6 +34,10 @@ enum IndexCell {
     Prefix([u8; 18]),
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the shifted product stays below the cell count bound checked here"
+)]
 fn index_cell(table: &Table, key: &[u8]) -> IndexCell {
     let prefix_bits: usize = match table.key_shape.as_str() {
         "sequence_prefix_48" => 48,

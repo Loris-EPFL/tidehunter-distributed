@@ -232,6 +232,10 @@ impl PreparedIndexImage {
 
     // Test hook: after container creation but before appending any cell data,
     // without serving-index ownership. The root is created only after data sync.
+    #[allow(
+        clippy::expect_used,
+        reason = "`reusable` only accepts cells whose durable base has a file, so the option is present"
+    )]
     pub(super) fn persist_with_hook(
         mut self,
         path: &Path,
@@ -785,7 +789,7 @@ pub(super) fn open(
         }
         let offset = cursor.u64()?;
         let length = cursor.u64()?;
-        let digest: [u8; 32] = cursor.take(32)?.try_into().unwrap();
+        let digest: [u8; 32] = cursor.take_array::<32>()?;
         let cell_floor = decode_cut(&mut cursor)?;
         if cell_floor == IndexReadCut::Latest
             || retention::position(&cell_floor) > retention::position(&floor)
@@ -907,6 +911,10 @@ impl<'a> Rows<'a> {
 
 impl<'a> Iterator for Rows<'a> {
     type Item = (&'a [u8], &'a [u8], &'a [ValueRecordReference]);
+    #[allow(
+        clippy::expect_used,
+        reason = "the equal-key arm matched an overlay row that `next` must return"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         let base = self
             .base
@@ -934,7 +942,7 @@ impl<'a> Iterator for Rows<'a> {
                     .map(|(key, values)| (key.as_ref(), &[][..], values.as_slice())),
                 Ordering::Equal => {
                     self.position += 1;
-                    let (_, values) = self.overlay.next().unwrap();
+                    let (_, values) = self.overlay.next().expect("equal keys have an overlay row");
                     Some((key, versions, values))
                 }
             },
@@ -957,10 +965,7 @@ impl<'a> Versions<'a> {
             a: None,
             b: None,
         };
-        result.a = result
-            .base
-            .next()
-            .map(|bytes| decode_reference(bytes).expect("validated immutable reference"));
+        result.a = result.base.next().map(validated_reference);
         result.b = result.overlay.next().copied();
         result
     }
@@ -985,10 +990,7 @@ impl Iterator for Versions<'_> {
             .a
             .is_some_and(|a| a.mutation_version() == result.mutation_version())
         {
-            self.a = self
-                .base
-                .next()
-                .map(|bytes| decode_reference(bytes).expect("validated immutable reference"));
+            self.a = self.base.next().map(validated_reference);
         }
         if self
             .b
@@ -1017,10 +1019,7 @@ fn retained<'a>(
     // floor hides every version at or below it from every valid cut: those
     // versions, the anchor included, are omitted (the mask is absorbed).
     let count = base.len() / REFERENCE_BYTES;
-    let reference = |n| {
-        decode_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES])
-            .expect("validated immutable reference")
-    };
+    let reference = |n| validated_reference(&base[n * REFERENCE_BYTES..(n + 1) * REFERENCE_BYTES]);
     let at_floor = lower_bound_by(count, |n| floor.contains(&reference(n)));
     let base_anchor = (at_floor > 0).then(|| reference(at_floor - 1));
     let overlay_anchor = matching_prefix(overlay, |value| floor.contains(value))

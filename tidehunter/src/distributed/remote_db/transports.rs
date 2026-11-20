@@ -139,10 +139,14 @@ impl ReadSetup {
         Ok(Self(Some(thread)))
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "`finish` consumes the setup once, so the thread is still owned"
+    )]
     pub(super) fn finish(mut self) -> Result<Connections, LocalDbError> {
         self.0
             .take()
-            .unwrap()
+            .expect("setup thread owned until finish")
             .join()
             .map_err(|_| LocalDbError::new("read transport setup panicked"))?
     }

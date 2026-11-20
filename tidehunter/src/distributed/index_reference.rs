@@ -54,6 +54,10 @@ impl LogicalValueId {
 
     /// Decode only after the enclosing index container has validated database,
     /// integrity and version metadata. Decoding alone proves no authority.
+    #[allow(
+        clippy::unwrap_used,
+        reason = "the exact length check above fixes every conversion window"
+    )]
     pub fn decode(format_version: u16, bytes: &[u8]) -> Result<Self, ReferenceCodecError> {
         if format_version != LOGICAL_VALUE_ID_FORMAT_VERSION {
             return Err(ReferenceCodecError::UnsupportedFormat(format_version));

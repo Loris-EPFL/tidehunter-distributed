@@ -425,8 +425,8 @@ impl CompleteBatch {
             return Err(CodecError::InvalidFormat);
         }
         let id = BatchId {
-            database: cursor.take(16)?.try_into().expect("checked 16-byte slice"),
-            operation: cursor.take(16)?.try_into().expect("checked 16-byte slice"),
+            database: cursor.take_array::<16>()?,
+            operation: cursor.take_array::<16>()?,
         };
         let version = BatchVersion {
             epoch: cursor.u64()?,
@@ -439,7 +439,7 @@ impl CompleteBatch {
         if count > (encoded.len() - HEADER_LEN) / MIN_MEMBER_LEN {
             return Err(CodecError::Truncated);
         }
-        let digest = PayloadDigest(cursor.take(32)?.try_into().expect("checked 32-byte slice"));
+        let digest = PayloadDigest(cursor.take_array::<32>()?);
         if digest != record_digest(&encoded) {
             return Err(CodecError::DigestMismatch);
         }
@@ -842,6 +842,10 @@ impl PayloadHasher {
         self.0.update(bytes.as_ref());
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "blake2b_simd is configured for a 32-byte digest, so the conversion cannot fail"
+    )]
     fn finalize(self) -> [u8; 32] {
         self.0
             .finalize()
@@ -1058,23 +1062,22 @@ impl<'a> Cursor<'a> {
         self.position = end;
         Ok(result)
     }
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
+        // `take` returns exactly `N` bytes or errors; the conversion only
+        // narrows the type and cannot fail.
+        self.take(N)?.try_into().map_err(|_| CodecError::Truncated)
+    }
     fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16, CodecError> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.try_into().expect("checked slice"),
-        ))
+        Ok(u16::from_be_bytes(self.take_array::<2>()?))
     }
     fn u32(&mut self) -> Result<u32, CodecError> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?.try_into().expect("checked slice"),
-        ))
+        Ok(u32::from_be_bytes(self.take_array::<4>()?))
     }
     fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(
-            self.take(8)?.try_into().expect("checked slice"),
-        ))
+        Ok(u64::from_be_bytes(self.take_array::<8>()?))
     }
 }
 

@@ -435,6 +435,10 @@ impl PartitionLog {
         )?)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the branch above installs the file before this reference"
+    )]
     fn replay_file<'a>(
         &self,
         cached: &'a mut Option<(u64, File)>,
@@ -805,6 +809,10 @@ impl PartitionLog {
 }
 
 impl PartitionLog {
+    #[allow(
+        clippy::expect_used,
+        reason = "the header read above opened this file, so it is present"
+    )]
     pub(super) fn recover_wal_replay(
         path: PathBuf,
         registration: Registration,

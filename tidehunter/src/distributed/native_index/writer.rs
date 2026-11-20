@@ -219,6 +219,10 @@ impl IndexWriter<'_> {
     /// Touched cells are applied grouped by shard in ascending shard index, one
     /// shard lock at a time, so a publication blocks only the shards it touches
     /// and only while it applies that shard's cells.
+    #[allow(
+        clippy::expect_used,
+        reason = "the touched set lists only cells present in their shard"
+    )]
     pub fn promote_committed(&mut self) -> Result<usize, NativeIndexError> {
         let index = self.index;
         let state = &mut *self.state;
@@ -482,6 +486,10 @@ impl IndexWriter<'_> {
     }
 
     /// Non-serving wrapper. Serving owners use bounded capture steps.
+    #[allow(
+        clippy::expect_used,
+        reason = "a capture over every cell ends only by exhausting the directory, which returns the image"
+    )]
     pub(crate) fn prepare_compacted_image(
         &mut self,
         cut: IndexReadCut,
@@ -603,6 +611,10 @@ impl IndexWriter<'_> {
     /// histories. It returns the image on the step that freezes the last cell
     /// born before `begin`. Persistence filters the immutable cut later. Each
     /// cell is frozen under its own shard lock; no two are held together.
+    #[allow(
+        clippy::expect_used,
+        reason = "capture steps run only between begin and finish, so the capture state is present"
+    )]
     pub(crate) fn capture_step(&mut self, max_cells: usize) -> Option<PreparedIndexImage> {
         assert!(max_cells != 0, "capture step must make progress");
         let index = self.index;
@@ -679,6 +691,10 @@ impl IndexWriter<'_> {
 
     /// Restore abandoned generations before another barrier. No history is
     /// discarded; this is also safe when a prepared image was dropped.
+    #[allow(
+        clippy::expect_used,
+        reason = "directory steps list only cells present in their shard"
+    )]
     pub(crate) fn cleanup_failed_capture_step(
         &mut self,
         max_cells: usize,
@@ -744,6 +760,10 @@ impl IndexWriter<'_> {
     /// preserves every existing pin. The owner must not release checkpoint
     /// credits or authorize cleanup before `true`. Cells the installation
     /// leaves empty become reap candidates for [`Self::reap_step`].
+    #[allow(
+        clippy::expect_used,
+        reason = "installation cells are captured and never reaped before their own installation"
+    )]
     pub(crate) fn install_image_step(&mut self, max_cells: usize) -> bool {
         assert!(max_cells != 0, "installation step must make progress");
         let index = self.index;

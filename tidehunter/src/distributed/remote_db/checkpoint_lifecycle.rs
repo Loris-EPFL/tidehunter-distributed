@@ -1331,6 +1331,10 @@ struct CheckpointPersistence {
     hooks: super::write_core::core::CheckpointTestHooks,
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the is_some_and guard above proves the previous position exists"
+)]
 fn persist_checkpoint(
     capture: CapturingCheckpoint,
     prepared: PreparedIndexImage,
@@ -1442,7 +1446,7 @@ fn persist_checkpoint(
             if previous.is_some_and(|position| {
                 position.complete || position.last_offset.is_some_and(|last| last >= offset)
             }) {
-                output.push(previous.unwrap().clone());
+                output.push(previous.expect("guard above").clone());
                 continue;
             }
             let through = offset

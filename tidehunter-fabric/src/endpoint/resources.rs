@@ -1,5 +1,6 @@
 //! Native resources and raw ownership of memory accessed by the provider.
 
+mod ffi_abi;
 #[cfg(test)]
 mod nonblocking_tests;
 
@@ -7,6 +8,7 @@ use super::{
     CHUNK, OpenProfile, ProgressStats, ProviderGeometry, ProviderInfo, ProviderParameter, SLOTS,
 };
 use crate::{FabricBackend, FabricConfig, MAX_SLOTS};
+use ffi_abi::abi;
 use ofi_libfabric_sys::bindgen as ffi;
 use std::{
     cell::UnsafeCell,
@@ -287,7 +289,7 @@ impl Info {
             } else {
                 ffi::FI_MR_LOCAL
             };
-            (*(*hints.0).domain_attr).mr_mode = i32::try_from(requested_mr_modes).unwrap();
+            (*(*hints.0).domain_attr).mr_mode = abi(requested_mr_modes);
             (*(*hints.0).tx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
             (*(*hints.0).rx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
             (*(*hints.0).fabric_attr).prov_name = libc::strdup(provider.as_ptr());
@@ -569,7 +571,7 @@ impl Resources {
         let hints = Info::hints(&provider, &domain)?;
         let source_v4 = config.source_address.and_then(|address| match address {
             std::net::IpAddr::V4(address) => Some(libc::sockaddr_in {
-                sin_family: libc::sa_family_t::try_from(libc::AF_INET).unwrap(),
+                sin_family: abi(libc::AF_INET),
                 sin_port: 0,
                 sin_addr: libc::in_addr {
                     s_addr: u32::from_ne_bytes(address.octets()),
@@ -581,7 +583,7 @@ impl Resources {
         let source_v6 = config.source_address.and_then(|address| match address {
             std::net::IpAddr::V4(_) => None,
             std::net::IpAddr::V6(address) => Some(libc::sockaddr_in6 {
-                sin6_family: libc::sa_family_t::try_from(libc::AF_INET6).unwrap(),
+                sin6_family: abi(libc::AF_INET6),
                 sin6_port: 0,
                 sin6_flowinfo: 0,
                 sin6_addr: libc::in6_addr {
@@ -701,7 +703,7 @@ impl Resources {
                 )
                 || (*selected.tx_attr).size < slots
                 || (*selected.rx_attr).size < slots
-                || mr_mode & !i32::try_from(supported_mr_modes).unwrap() != 0
+                || mr_mode & !abi::<_, i32>(supported_mr_modes) != 0
             {
                 return Err(invalid("unsupported fabric provider capabilities"));
             }
@@ -732,7 +734,7 @@ impl Resources {
             self.open_profile.domain_ns = elapsed_ns(stage);
             self.open_endpoint(info.0, wait_request)?;
             let stage = Instant::now();
-            if mr_mode & i32::try_from(ffi::FI_MR_LOCAL).unwrap() != 0 {
+            if mr_mode & abi::<_, i32>(ffi::FI_MR_LOCAL) != 0 {
                 check(
                     "register transmit buffer",
                     ffi::fi_mr_reg(
@@ -854,7 +856,7 @@ impl Resources {
             };
             let refused = [ffi::FI_ENOSYS, ffi::FI_EOPNOTSUPP, ffi::FI_EINVAL]
                 .into_iter()
-                .any(|refusal| code == -i32::try_from(refusal).unwrap());
+                .any(|refusal| code == -abi::<_, i32>(refusal));
             if wait_request != WaitRequest::None && refused {
                 // Keep the polling behavior: a provider without a wait object is
                 // reported in evidence, never papered over with a different one.
@@ -873,7 +875,7 @@ impl Resources {
                         let mut fd: libc::c_int = -1;
                         let status = ffi::fi_control(
                             &raw mut (*self.cq).fid,
-                            i32::try_from(ffi::FI_GETWAIT).unwrap(),
+                            abi(ffi::FI_GETWAIT),
                             (&raw mut fd).cast(),
                         );
                         if status == 0 && fd >= 0 {
@@ -1213,7 +1215,7 @@ impl Resources {
             stats.send_post_calls = stats.send_post_calls.saturating_add(1);
             if code == 0 {
                 stats.send_post_bytes = stats.send_post_bytes.saturating_add(len as u64);
-            } else if code == -isize::try_from(ffi::FI_EAGAIN).unwrap() {
+            } else if code == -abi::<_, isize>(ffi::FI_EAGAIN) {
                 stats.send_post_would_block = stats.send_post_would_block.saturating_add(1);
             } else {
                 stats.send_post_errors = stats.send_post_errors.saturating_add(1);
@@ -1221,7 +1223,7 @@ impl Resources {
         }
         if code == 0 {
             self.record_send_bucket(len);
-        } else if code == -isize::try_from(ffi::FI_EAGAIN).unwrap() {
+        } else if code == -abi::<_, isize>(ffi::FI_EAGAIN) {
             self.progress_stats.send_post_eagain =
                 self.progress_stats.send_post_eagain.saturating_add(1);
         }
@@ -1302,7 +1304,7 @@ impl Resources {
             stats.receive_post_calls = stats.receive_post_calls.saturating_add(1);
             if code == 0 {
                 stats.receive_post_bytes = stats.receive_post_bytes.saturating_add(CHUNK as u64);
-            } else if code == -isize::try_from(ffi::FI_EAGAIN).unwrap() {
+            } else if code == -abi::<_, isize>(ffi::FI_EAGAIN) {
                 stats.receive_post_would_block = stats.receive_post_would_block.saturating_add(1);
             } else {
                 stats.receive_post_errors = stats.receive_post_errors.saturating_add(1);
@@ -1440,17 +1442,17 @@ impl Resources {
             self.open_profile.first_progress_ns = elapsed_ns(start);
             self.initial_progress_recorded = true;
         }
-        if count == -isize::try_from(ffi::FI_EAGAIN).unwrap()
+        if count == -abi::<_, isize>(ffi::FI_EAGAIN)
             || count == 0
             || WAIT
-                && (count == -isize::try_from(ffi::FI_ETIMEDOUT).unwrap()
-                    || count == -isize::try_from(libc::EINTR).unwrap())
+                && (count == -abi::<_, isize>(ffi::FI_ETIMEDOUT)
+                    || count == -abi::<_, isize>(libc::EINTR))
         {
             self.progress_stats.cq_empty_polls =
                 self.progress_stats.cq_empty_polls.saturating_add(1);
             return Ok(false);
         }
-        if count == -isize::try_from(ffi::FI_EAVAIL).unwrap() {
+        if count == -abi::<_, isize>(ffi::FI_EAVAIL) {
             let mut failure = ffi::fi_cq_err_entry::default();
             let began = self.time_progress.then(Instant::now);
             // SAFETY: EAVAIL requires reading the error queue. The zeroed entry
@@ -1653,7 +1655,7 @@ fn check(stage: &str, code: i32) -> io::Result<()> {
 fn posted(stage: &str, code: isize) -> io::Result<bool> {
     if code == 0 {
         Ok(true)
-    } else if code == -isize::try_from(ffi::FI_EAGAIN).unwrap() {
+    } else if code == -abi::<_, isize>(ffi::FI_EAGAIN) {
         Ok(false)
     } else {
         Err(error(
