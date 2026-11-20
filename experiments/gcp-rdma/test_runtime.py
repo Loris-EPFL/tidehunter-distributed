@@ -62,14 +62,16 @@ class TraceAndReplayPolicyTests(unittest.TestCase):
     def test_image_preparation_pins_trace_buffer_for_next_boot(self):
         import gcp_image_prepare as image
         with patch.object(image, 'require_kernel_btf') as require, \
-             patch.object(image, 'run', side_effect=['', 'args="quiet trace_buf_size=4K"\n']) as run:
+             patch.object(image, 'run', side_effect=['', '', 'args="quiet trace_buf_size=4K"\n']) as run:
             self.assertEqual(image.prepare_trace_boot('1-test'), 'trace_buf_size=4K')
         require.assert_called_once_with()
-        self.assertEqual(run.call_args_list[0].args[0],
-                         ['grubby', '--update-kernel=/boot/vmlinuz-1-test', '--args=trace_buf_size=4K'])
-        self.assertEqual(run.call_args_list[1].args[0], ['grubby', '--info=/boot/vmlinuz-1-test'])
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ['grubby', '--update-kernel=/boot/vmlinuz-1-test', '--remove-args=trace_buf_size'],
+            ['grubby', '--update-kernel=/boot/vmlinuz-1-test', '--args=trace_buf_size=4K'],
+            ['grubby', '--info=/boot/vmlinuz-1-test'],
+        ])
         with patch.object(image, 'require_kernel_btf'), \
-             patch.object(image, 'run', side_effect=['', 'args="quiet trace_buf_size=8K"\n']), \
+             patch.object(image, 'run', side_effect=['', '', 'args="quiet trace_buf_size=4K trace_buf_size=8K"\n']), \
              self.assertRaisesRegex(ValueError, 'TRACE_BOOT_BUFFER_INVALID'):
             image.prepare_trace_boot('1-test')
 
@@ -84,6 +86,12 @@ class TraceAndReplayPolicyTests(unittest.TestCase):
             with patch.object(cold_device_trace, 'qualify_trace_ring') as ring, \
                  patch.object(image, 'require_kernel_btf', side_effect=lambda: require(missing)), \
                  self.assertRaisesRegex(image.KernelBtfMissing, 'KERNEL_BTF_MISSING.*vmlinux'):
+                runtime.qualify_physical_trace(spec)
+            ring.assert_not_called()
+            missing.touch()
+            with patch.object(cold_device_trace, 'qualify_trace_ring') as ring, \
+                 patch.object(image, 'require_kernel_btf', side_effect=lambda: require(missing)), \
+                 self.assertRaisesRegex(image.KernelBtfMissing, 'KERNEL_BTF_MISSING.*nonempty'):
                 runtime.qualify_physical_trace(spec)
             ring.assert_not_called()
             missing.write_bytes(b'present')

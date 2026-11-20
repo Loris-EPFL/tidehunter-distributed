@@ -28,14 +28,22 @@ class KernelBtfMissing(RuntimeError):
 
 
 def require_kernel_btf(path=Path('/sys/kernel/btf/vmlinux')):
-    if not path.is_file() or not os.access(path, os.R_OK):
-        raise KernelBtfMissing(f'KERNEL_BTF_MISSING: {path} must be readable')
+    try:
+        if not path.is_file():
+            raise OSError('not a regular BTF file')
+        with path.open('rb') as btf:
+            if not btf.read(1):
+                raise OSError('empty BTF file')
+    except OSError as exc:
+        raise KernelBtfMissing(f'KERNEL_BTF_MISSING: {path} must be readable and nonempty') from exc
 
 
 def prepare_trace_boot(kernel_release):
     """Set the initial per-CPU trace buffer on the pinned kernel, for the next boot."""
     require_kernel_btf()
     kernel = '/boot/vmlinuz-' + kernel_release
+    # Remove every previous setting from this entry before installing the reviewed size.
+    run(['grubby', '--update-kernel=' + kernel, '--remove-args=trace_buf_size'], timeout=30)
     run(['grubby', '--update-kernel=' + kernel, '--args=' + TRACE_BOOT_ARG], timeout=30)
     info = run(['grubby', '--info=' + kernel], timeout=30)
     args = [word for line in info.splitlines() if line.startswith('args=')
