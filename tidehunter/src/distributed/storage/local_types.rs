@@ -47,7 +47,7 @@ pub struct LocalDbError {
     /// Set only by [`LocalDbError::copies_not_durable`]: a typed marker, so a
     /// caller never classifies the deferral by its kind or message prefix.
     copies_not_durable: bool,
-    /// Set only by [`LocalDbError::exact_era_manifest`]: a typed marker, so a
+    /// Set only by [`LocalDbError::mark_exact_era_manifest`]: a typed marker, so a
     /// caller never classifies the refused manifest by its message prefix.
     exact_era_manifest: bool,
 }
@@ -137,7 +137,7 @@ impl LocalDbError {
         }
     }
 
-    /// True for [`Self::exact_era_manifest`].
+    /// True for [`Self::mark_exact_era_manifest`].
     pub(crate) fn is_exact_era_manifest(&self) -> bool {
         self.exact_era_manifest
     }
