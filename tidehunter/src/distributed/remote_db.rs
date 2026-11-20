@@ -105,6 +105,8 @@ pub use read_cache::{
     ReadCacheStats,
 };
 use read_cache::{ReadCache, ReadCachePolicy};
+mod snapshots;
+pub use snapshots::{RemoteReadProfile, ShutdownStats};
 
 pub const BACKEND_ID: &str = "tidehunter-tcp-rf1";
 const MANIFEST: &str = "tcp-database-authority-v1";
@@ -1016,27 +1018,6 @@ pub struct WriteProfileSnapshot {
     /// Committed at admission; pre-admission failures are not counted.
     pub checkpoint_admission_stalls: u64,
     pub profile: super::tcp::ConnectionProfile,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ShutdownStats {
-    pub drain_ns: u64,
-    pub checkpoint_ns: u64,
-    pub seal_ns: u64,
-    pub join_ns: u64,
-}
-
-/// Diagnostic clocks only. Stages are nested and must not be summed with
-/// dispatch/wait into a purported non-overlapping latency breakdown.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RemoteReadProfile {
-    pub index_ns: u64,
-    pub dispatch_ns: u64,
-    pub wait_ns: u64,
-    /// Caller-owned scalar live read, with no read-actor queue/return handoff.
-    pub inline_read_ns: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
 }
 
 /// A held read view (native `DbCheckpoint`): the publication cut at the time of

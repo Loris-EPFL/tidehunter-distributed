@@ -66,4 +66,48 @@ impl LiveTargetManager {
         }
         result
     }
+
+    /// Release a marker before unlink only for a lookahead file covered by a
+    /// durable generation trim intent. The caller proves the sealed boundary
+    /// and holds the lifecycle gate. A missing marker is a repeated release.
+    pub(crate) fn release_trim_lookahead(
+        &mut self,
+        path: &Path,
+        crash_before_sync: bool,
+    ) -> io::Result<()> {
+        if self.poisoned {
+            return Err(invalid("target manager is quarantined"));
+        }
+        if self
+            .state
+            .exports
+            .iter()
+            .any(|export| export.file.path == path)
+        {
+            return Err(invalid("WAL namespace is still registered"));
+        }
+        if let Some(identity) = self.sealed_file(path)? {
+            if self.state.exports.iter().any(|export| {
+                export.file.path == path
+                    || (export.file.device, export.file.inode) == (identity.device, identity.inode)
+            }) {
+                return Err(invalid("WAL namespace is still registered"));
+            }
+            drop(self.file(&identity)?);
+            let result = fs::remove_file(self.marker_path(path)?).and_then(|()| {
+                if crash_before_sync {
+                    return Err(io::Error::other(
+                        "injected crash before marker directory sync",
+                    ));
+                }
+                self.sealed_directory.sync_all()
+            });
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result
+        } else {
+            self.sealed_directory.sync_all()
+        }
+    }
 }
