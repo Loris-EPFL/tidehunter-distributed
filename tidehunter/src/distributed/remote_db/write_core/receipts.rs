@@ -105,6 +105,7 @@ impl ReceiptIndex {
         self.shards.iter().map(|shard| shard.lock().len()).sum()
     }
 
+    #[cfg(test)]
     fn clear(&self) {
         for shard in &self.shards {
             shard.lock().clear();
@@ -118,6 +119,7 @@ impl ReceiptIndex {
             .sum()
     }
 
+    #[cfg(test)]
     fn shard_count(&self) -> usize {
         self.shards.len()
     }
@@ -141,14 +143,17 @@ impl ReceiptWindow {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn len(&self) -> usize {
         self.order.len()
     }
 
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
 
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn iter(&self) -> impl Iterator<Item = &RecentReceipt> {
         self.order.iter()
     }
@@ -157,6 +162,7 @@ impl ReceiptWindow {
     ///
     /// Read on the write hot path, so it touches one index shard and never the
     /// publisher lock.
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn get(
         &self,
         operation: &[u8; 16],
@@ -192,6 +198,7 @@ impl ReceiptWindow {
     /// Install the window a persisted snapshot carried. Entries keep their
     /// order; anything beyond the cap is dropped from the oldest end, exactly
     /// as a head of publication would have done.
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn replace(
         &mut self,
         order: impl IntoIterator<Item = RecentReceipt>,
@@ -218,6 +225,7 @@ impl ReceiptWindow {
     /// twice that many slots plus one round-up step per shard. Both containers
     /// therefore fit in twice the element count of each, plus one slot per index
     /// shard.
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn resident_bound() -> usize {
         let cap = WAL_REPLAY_WINDOW_BATCHES;
         let shards = shard_count(crate::parallelism::available());

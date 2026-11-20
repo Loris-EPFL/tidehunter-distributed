@@ -977,11 +977,8 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "qualification requires enabled coordinator cache",
     )?;
     check(
-        remote.endpoints.len() == 1
-            && remote.storage.partitions.len() == 1
-            && remote.replay_limits.max_batches >= 8
-            && remote.replay_limits.max_encoded_bytes >= 4 * (input.value_bytes + 4096),
-        "two-host qualification requires one owner and a replay window above the child batch",
+        remote.endpoints.len() == 1 && remote.storage.partitions.len() == 1,
+        "two-host qualification requires one owner",
     )?;
     let partitions = &remote.storage.partitions;
     fs::create_dir(output)?;

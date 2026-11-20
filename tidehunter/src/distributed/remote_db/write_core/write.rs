@@ -601,32 +601,10 @@ impl WriteCore {
                 self.write_timeline
                     .event(sample, WriteTimelineStage::AdmissionWaitStarted);
             }
-            debug_assert!(
-                grant.identities == 0 && grant.index_bytes == 0,
-                "a hybrid write grant carries no checkpoint-bound dimension",
-            );
             let block_started = self.write_timeline.block_started();
-            let credit = self.admission.reserve_grant(
-                grant,
-                block,
-                || self.ensure_writable(),
-                // The only dimensions that can block a grant on a checkpoint are
-                // `identities` and `index_bytes`. This site builds the grant from
-                // `WriteGrant::default()` and never sets either, so both stay zero
-                // (asserted above) and this callback cannot be reached from here.
-                // The parameter itself belongs to `concurrent.rs`; S11 removes it
-                // with the rest of the dead surface. It returns a typed error
-                // rather than `Ok`: if a later change gives the grant either
-                // dimension, a parked caller would otherwise wait for a snapshot
-                // trigger nothing issues, and a hang with no error is the worst
-                // failure on this path.
-                |_| {
-                    Err(LocalDbError::new(
-                        "checkpoint-bound admission is unreachable: identities and index bytes \
-                         are not part of a hybrid write grant",
-                    ))
-                },
-            )?;
+            let credit = self
+                .admission
+                .reserve_grant(grant, block, || self.ensure_writable())?;
             self.write_timeline.block_finished(
                 WriteBlockStage::AdmissionCredit,
                 block_started,
@@ -1047,7 +1025,6 @@ impl WriteCore {
                     owner: plan.owner,
                     operation: plan.operation,
                     records: plan.validated.mutations().len(),
-                    encoded_bytes: plan.validated.encoded_len(),
                 },
                 copy_error(error),
             )?;

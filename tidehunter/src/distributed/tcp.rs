@@ -1412,7 +1412,6 @@ pub struct Client {
     live_write_local_fixture: bool,
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
-    live_unreleased_tokens: Vec<(u64, [u8; 16])>,
     progress_wait: Option<progress_wait::ClientProgressWait>,
 }
 impl Client {
@@ -1540,7 +1539,6 @@ impl Client {
             live_write_local_fixture: false,
             live_counters: None,
             live_metrics: None,
-            live_unreleased_tokens: Vec::new(),
             progress_wait: progress.map(progress_wait::ClientProgressWait::new),
         };
         let began = Instant::now();

@@ -199,7 +199,6 @@ pub fn prepare_external_case(
         max_index_bytes,
         max_pending_batches: 128,
         max_pending_bytes: 64 * 1024 * 1024,
-        replay_limits: Default::default(),
         owner_append_occupancy: RemoteDatabaseConfig::DEFAULT_OWNER_APPEND_OCCUPANCY,
         live_nvme,
         pipelined_writes: true,

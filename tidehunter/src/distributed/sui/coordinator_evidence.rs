@@ -1,7 +1,6 @@
 //! Coordinator evidence through the Sui adapter: the engine's recovery record
-//! and the process-wide coordinator file counters. The Exact checkpoint ring,
-//! suffix tracker and attribution totals no longer exist: the native index
-//! snapshots on its own cadence and reports through its own metrics.
+//! and the process-wide coordinator file counters. The native index snapshots
+//! on its own cadence and reports through its own metrics.
 
 use super::super::remote_db::{FileIo, RecoveryStats, coordinator_io_snapshot};
 use super::{Backend, Db};
@@ -39,13 +38,6 @@ pub(super) fn visit_coordinator_io(set: &mut impl FnMut(&'static str, u64)) {
             );)+
         };
     }
-    categories!(
-        manifest_stage,
-        manifest_adopt,
-        manifest_cleanup,
-        cleanup_names,
-        open,
-        durable_cut,
-    );
+    categories!(manifest_adopt, open, durable_cut);
     set("coordinator_io_allocation_errors", io.allocation_errors);
 }

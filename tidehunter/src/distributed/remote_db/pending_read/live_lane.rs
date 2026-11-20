@@ -49,6 +49,7 @@ struct LaneInbox<'a> {
     /// `max_requests`: each request holds a global flight credit.
     waiting: VecDeque<Request>,
     flying: HashMap<LiveReadToken, Request>,
+    #[cfg(test)]
     drains: Vec<mpsc::SyncSender<Result<(), String>>>,
     evictions: Vec<Arc<RetirementEviction>>,
     done: Vec<LiveReadDone>,
@@ -68,6 +69,7 @@ impl LaneInbox<'_> {
                     self.waiting.push_back(request);
                 }
             }
+            #[cfg(test)]
             LiveLaneCommand::Drain(reply) => self.drains.push(reply),
             LiveLaneCommand::EvictRetirement(request) => self.evictions.push(request),
         }
@@ -170,6 +172,7 @@ pub(super) fn run(
         depth,
         waiting: VecDeque::new(),
         flying: HashMap::new(),
+        #[cfg(test)]
         drains: Vec::new(),
         evictions: Vec::new(),
         done: Vec::new(),
@@ -233,21 +236,24 @@ pub(super) fn run(
             break;
         };
         inbox.drain_channel(max_requests);
-        if !inbox.drains.is_empty() {
-            let mut client = lane.client.lock();
-            let result = cache
-                .drain(&mut client, epoch, &mut inbox.done)
-                .and_then(|()| cache.close(&mut client, epoch))
-                .map_err(|error| error.to_string());
-            drop(client);
-            if result.is_err() {
-                state.poison();
-            }
-            inbox.deliver();
-            for reply in inbox.drains.drain(..) {
-                // Release: CQ retirement and grant close precede drain completion.
-                state.live_drains.fetch_sub(1, Ordering::Release);
-                let _ = reply.send(result.clone());
+        #[cfg(test)]
+        {
+            if !inbox.drains.is_empty() {
+                let mut client = lane.client.lock();
+                let result = cache
+                    .drain(&mut client, epoch, &mut inbox.done)
+                    .and_then(|()| cache.close(&mut client, epoch))
+                    .map_err(|error| error.to_string());
+                drop(client);
+                if result.is_err() {
+                    state.poison();
+                }
+                inbox.deliver();
+                for reply in inbox.drains.drain(..) {
+                    // Release: CQ retirement and grant close precede drain completion.
+                    state.live_drains.fetch_sub(1, Ordering::Release);
+                    let _ = reply.send(result.clone());
+                }
             }
         }
         if !inbox.evictions.is_empty() {

@@ -2155,33 +2155,6 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
 }
 
 #[test]
-fn checkpoint_diagnostic_cursor_survives_profile_rearming() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.arm_write_profile(1).unwrap();
-    db.write_batch(fixture.operation(0, 301), vec![put(301, 1)])
-        .unwrap();
-    db.flush_index().unwrap();
-    let first = db.checkpoint_diagnostics_since(0);
-    assert!(!first.records.is_empty());
-    let cursor = first.next_cursor;
-    db.arm_write_profile(0).unwrap();
-    let disabled = db.checkpoint_diagnostics_since(0);
-    assert!(disabled.records.is_empty());
-    assert_eq!(disabled.next_cursor, cursor);
-    db.arm_write_profile(1).unwrap();
-    assert!(db.checkpoint_diagnostics_since(0).records.is_empty());
-    db.write_batch(fixture.operation(1, 302), vec![put(302, 2)])
-        .unwrap();
-    db.flush_index().unwrap();
-    let second = db.checkpoint_diagnostics_since(cursor);
-    assert!(!second.records.is_empty());
-    assert!(second.records.iter().all(|record| record.cursor >= cursor));
-    assert!(second.next_cursor > cursor);
-    db.shutdown().unwrap();
-}
-
-#[test]
 fn write_profile_limit_stops_dispatch_after_one_selected_append() {
     let mut fixture = Fixture::new();
     fixture.config.write_profile_limit = 1;

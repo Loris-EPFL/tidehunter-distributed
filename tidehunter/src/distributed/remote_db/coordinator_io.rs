@@ -53,22 +53,20 @@ impl FileIo {
     }
 }
 
-/// Coordinator files by category: the authority manifest and its cleanup, the
-/// durable-cut record. The index WAL and control region are the native
-/// stack's own files and are not counted here.
+/// Coordinator files by category: the authority manifest (callback-start
+/// adoption and open), the durable-cut record. The index WAL and control
+/// region are the native stack's own files and are not counted here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CoordinatorIoCategory {
-    ManifestStage,
+    /// Callback-start adoption: one manifest replacement.
     ManifestAdopt,
-    ManifestCleanup,
-    CleanupNames,
-    /// Authority manifest writes and cleanup during open.
+    /// Authority manifest writes during open.
     Open,
     /// `durable-cut.v1` record writes.
     DurableCut,
 }
 
-const CATEGORIES: usize = 6;
+const CATEGORIES: usize = 3;
 
 struct IoCounters {
     bytes: AtomicU64,
@@ -172,23 +170,10 @@ pub(super) fn record_installed(
     io
 }
 
-/// One directory sync after unlinking staged names.
-pub(super) fn record_unlink_sync(category: CoordinatorIoCategory) -> FileIo {
-    let io = FileIo {
-        dir_syncs: 1,
-        ..FileIo::default()
-    };
-    record_coordinator_io(category, io);
-    io
-}
-
 /// Cumulative coordinator file work of this process, by category.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorIoSnapshot {
-    pub manifest_stage: FileIo,
     pub manifest_adopt: FileIo,
-    pub manifest_cleanup: FileIo,
-    pub cleanup_names: FileIo,
     pub open: FileIo,
     pub durable_cut: FileIo,
     pub allocation_accounting: bool,
@@ -200,14 +185,7 @@ pub struct CoordinatorIoSnapshot {
 impl CoordinatorIoSnapshot {
     pub fn total(&self) -> FileIo {
         let mut total = FileIo::default();
-        for io in [
-            self.manifest_stage,
-            self.manifest_adopt,
-            self.manifest_cleanup,
-            self.cleanup_names,
-            self.open,
-            self.durable_cut,
-        ] {
+        for io in [self.manifest_adopt, self.open, self.durable_cut] {
             total.add(io);
         }
         total
@@ -217,10 +195,7 @@ impl CoordinatorIoSnapshot {
 pub fn coordinator_io_snapshot() -> CoordinatorIoSnapshot {
     let load = |category: CoordinatorIoCategory| COORDINATOR_IO[category as usize].load();
     CoordinatorIoSnapshot {
-        manifest_stage: load(CoordinatorIoCategory::ManifestStage),
         manifest_adopt: load(CoordinatorIoCategory::ManifestAdopt),
-        manifest_cleanup: load(CoordinatorIoCategory::ManifestCleanup),
-        cleanup_names: load(CoordinatorIoCategory::CleanupNames),
         open: load(CoordinatorIoCategory::Open),
         durable_cut: load(CoordinatorIoCategory::DurableCut),
         allocation_accounting: ALLOCATION_ACCOUNTING.load(Ordering::Relaxed),

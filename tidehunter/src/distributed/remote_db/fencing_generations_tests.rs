@@ -381,7 +381,12 @@ fn coordinator_crash_cuts_before_and_during_reservation_and_fencing() {
         assert!(harness.open_with(OpenInterruption::AfterServed).is_err());
         let manifest = harness.manifest();
         assert_eq!(ids(&manifest), vec![1, 2, 3]);
-        assert!(is_served(&manifest, 3));
+        assert!(
+            manifest
+                .generations
+                .iter()
+                .any(|entry| { entry.generation == 3 && entry.state == GenerationState::Served })
+        );
         assert_recovered(&harness);
     }
 }

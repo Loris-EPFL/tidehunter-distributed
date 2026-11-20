@@ -1,6 +1,7 @@
 //! Real TCP control and local-file io_uring tests for the leased owner worker.
 use super::*;
 use crate::distributed::durability::DurabilityTier;
+use crate::distributed::hybrid::loader::{AllocationView, allocation_capacity};
 use crate::distributed::tcp::leased_tests::{Fixture, leased_latencies};
 use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,14 +78,10 @@ fn worker_with_completion(
             .unwrap(),
         },
         route,
-        Arc::new(crate::distributed::hybrid::loader::AllocationView::new(1)),
+        Arc::new(AllocationView::new(1)),
         0,
         fixture.config.partition.inventory.epoch,
-        crate::distributed::hybrid::loader::allocation_capacity(
-            64 * 1024 * 1024,
-            4096,
-            max_pending,
-        ),
+        allocation_capacity(64 * 1024 * 1024, 4096, max_pending),
     )
     .unwrap();
     worker.test_completion = Some(sink);
@@ -839,10 +836,6 @@ fn leased_database_shutdown_detaches_failed_skip_without_waking_idle_worker() {
                 config.max_admitted_batches = 16;
                 config.max_pending_batches = 16;
                 config.max_pending_bytes = 4 * 1024 * 1024;
-                config.replay_limits = ReplayLimits {
-                    max_batches: 4096,
-                    max_encoded_bytes: 16 * 1024 * 1024,
-                };
                 config.owner_append_occupancy = 1;
                 config.read_cache_bytes = 0;
                 config.read_memory_allowance_bytes = 64 * 1024 * 1024;

@@ -1919,18 +1919,6 @@ async fn export_read_diagnostics<B: KvBackend>(
                 "no remote read requests selected; measurement observed {hits} coordinator cache hits and {rpcs} remote read RPCs"
             )));
         }
-        let resolution_valid = armed
-            && measurement_attempted
-            && measurement_drained
-            && runtime_enabled
-            && object
-                .get("runtime_limit")
-                .and_then(serde_json::Value::as_u64)
-                == Some(config.diagnostics.read_profile_limit as u64);
-        object.insert(
-            "coordinator_resolution_valid".to_owned(),
-            resolution_valid.into(),
-        );
         object.insert("read_evidence".to_owned(), read_evidence.clone());
     }
     let field = |name: &str| profile.as_ref().and_then(|value| value.get(name));

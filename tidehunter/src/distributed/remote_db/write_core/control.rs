@@ -1,13 +1,12 @@
 use super::super::{
-    AuthorityWriteStats, CheckpointDiagnosticSummary, LocalDbError, LocalDbStats, PipelineStats,
-    WriteProfileSnapshot, elapsed, failure_context, receive,
+    AuthorityWriteStats, LocalDbError, LocalDbStats, PipelineStats, WriteProfileSnapshot, elapsed,
+    failure_context, receive,
 };
 use super::completion::DrainStop;
 use super::core::WriteCore;
 use crate::distributed::hybrid::StoredSnapshot;
 use crate::distributed::hybrid::region::OlderStream;
 use crate::distributed::types::BatchVersion;
-use std::collections::VecDeque;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
@@ -253,24 +252,6 @@ impl WriteCore {
             return Err(LocalDbError::new("write profile limit exceeds 65536"));
         }
         self.drain()?;
-        {
-            let mut publisher = self.publisher.lock();
-            // Armed index diagnostics are gone with the Exact lifecycle: a profile
-            // window owns the ring and its counters.
-            if limit == 0 {
-                publisher.checkpoint_diagnostics = None;
-            } else if let Some(records) = &mut publisher.checkpoint_diagnostics {
-                records.clear();
-            } else {
-                publisher.checkpoint_diagnostics = Some(VecDeque::with_capacity(128));
-            }
-            publisher.checkpoint_diagnostic_summary = CheckpointDiagnosticSummary {
-                available: limit != 0,
-                ..CheckpointDiagnosticSummary::default()
-            };
-            publisher.dropped_checkpoint_diagnostics = 0;
-            publisher.last_checkpoint_diagnostic = None;
-        }
         *self.write_profile.lock() = WriteProfileSnapshot {
             limit_per_connection: limit,
             expected_connections: self.clients.len(),

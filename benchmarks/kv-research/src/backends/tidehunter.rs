@@ -528,7 +528,7 @@ pub fn prepare_external_case_file(input: &Path, output: &Path) -> BackendResult<
 }
 // Checkpoint phase sums are charged on completion, including work begun before
 // the measurement boundary. They are not per-request latency or network clocks.
-const COORDINATOR_INTERVAL_COUNTERS: [&str; 26] = [
+const COORDINATOR_INTERVAL_COUNTERS: [&str; 18] = [
     "write_storage_wait_ns",
     "write_publication_ns",
     "write_dispatch_ns",
@@ -547,14 +547,6 @@ const COORDINATOR_INTERVAL_COUNTERS: [&str; 26] = [
     "write_concurrent_admitted",
     "write_out_of_prefix_published_batches",
     "write_dependency_wait_batches",
-    "write_checkpoint_diagnostic_root_adoption_ns",
-    "write_checkpoint_diagnostic_root_adoption_count",
-    "write_checkpoint_diagnostic_owner_adoption_ns",
-    "write_checkpoint_diagnostic_owner_adoption_count",
-    "write_checkpoint_diagnostic_obsolete_cleanup_ns",
-    "write_checkpoint_diagnostic_obsolete_cleanup_count",
-    "write_checkpoint_diagnostic_index_prepare_ns",
-    "write_checkpoint_diagnostic_index_prepare_count",
 ];
 
 fn coordinator_counter_snapshot(db: &sui::Db) -> BTreeMap<&'static str, u64> {
@@ -1368,46 +1360,6 @@ impl KvBackend for TidehunterBackend {
                 .or_default()
                 .insert(name.to_owned(), value);
         });
-        let resolution = db.coordinator_resolution_snapshot().map(|snapshot| {
-            macro_rules! stage {
-                ($name:ident) => {{
-                    let value = &snapshot.$name;
-                    serde_json::json!({
-                        "available": value.count > 0,
-                        "sum_ns": (value.count > 0).then_some(value.sum_ns),
-                        "count": value.count,
-                        "max_ns": (value.count > 0).then_some(value.max_ns),
-                        "unavailable_reason": if value.count > 0 { None } else { Some("no observations for this stage") }
-                    })
-                }};
-            }
-            serde_json::json!({
-                "selection_policy": "independent first N point and bulk API resolution attempts; not the remote-flight prefix; errors count preparation failures, later stages count only completed spans",
-                "selected": snapshot.selected,
-                "point": snapshot.point,
-                "bulk": snapshot.bulk,
-                "errors": snapshot.errors,
-                "logical_members": snapshot.logical_members,
-                "cache_hits": snapshot.cache_hits,
-                "index_misses": snapshot.index_misses,
-                "remote_misses": snapshot.remote_misses,
-                "member_errors": snapshot.member_errors,
-                "stages": {
-                    "index_lock_wait": stage!(index_lock_wait),
-                    "index_lookup": stage!(index_lookup),
-                    "cache_lock_wait": stage!(cache_lock_wait),
-                    "cache_lookup": stage!(cache_lookup),
-                    "cut_validation": stage!(cut_validation),
-                    "cut_capture": stage!(cut_capture),
-                    "route_preparation": stage!(route_preparation),
-                    "pin_preparation": stage!(pin_preparation),
-                    "batch_preparation": stage!(batch_preparation),
-                    "batch_wait": stage!(batch_wait),
-                    "postread_cache_fill": stage!(postread_cache_fill),
-                    "result_materialization": stage!(result_materialization)
-                }
-            })
-        });
         let caller_trace = db.read_trace_snapshot();
         // Disable before any later qualification, even when evidence is incomplete.
         db.set_read_profile_limit(0);
@@ -1619,7 +1571,6 @@ impl KvBackend for TidehunterBackend {
             "coverage": {"selected_remote_requests": selected, "completed_remote_requests": completed, "nvme_completed": nvme_completed, "profiled_owner_responses": owner_responses, "reason": coverage_reason},
             "stages": stages,
             "owners": owners,
-            "coordinator_resolution": resolution,
             "counters": counters,
             "clock_scope": "local monotonic elapsed clocks in coordinator, transport and owner; grouped_inline_completed classifies grouped caller admission origin, not executing thread, because progress can be handed to the actor; inline_ns includes elapsed time until completion, not CPU time; actor queue/service are elapsed spans, not CPU time; nvme_flight runs from flight admission to terminal completion and verification, including queueing, not pure network or device time; async starts during SQE preparation before kernel acceptance and ends at CQE observation, including submission retry and progress, not physical device latency; transport CQ call is local provider-call wall time, not wire latency",
             "overlap_semantics": "API-resolution and remote-flight prefixes are independently selected; stage scopes overlap and may be nested; sums and percentiles are not additive; host timestamps are not subtracted; global and partition snapshots are sequential rather than globally atomic",
@@ -1715,9 +1666,7 @@ impl KvBackend for TidehunterBackend {
         let finalization = db.finish_write_profile().map_err(native_error);
         let mut counters = BTreeMap::new();
         db.visit_timing_metrics(|name, value| {
-            if name.starts_with("write_profile_")
-                || name == "write_checkpoint_diagnostics_available"
-            {
+            if name.starts_with("write_profile_") {
                 counters.insert(name.to_owned(), value);
             }
         });
@@ -1742,9 +1691,6 @@ impl KvBackend for TidehunterBackend {
             .get("write_profile_capture_errors")
             .copied()
             .unwrap_or(0);
-        let checkpoint_diagnostics_available = counters
-            .remove("write_checkpoint_diagnostics_available")
-            .map(|value| value == 1);
         let mut errors = Vec::new();
         if let Err(error) = finalization {
             errors.push(error.to_string());
@@ -1779,7 +1725,6 @@ impl KvBackend for TidehunterBackend {
             "expected_connections": expected_connections,
             "captured_connections": captured_connections,
             "max_profiled_requests": profile_limit.saturating_mul(expected_connections),
-            "coordinator_checkpoint_diagnostics_available": checkpoint_diagnostics_available,
             "stages": counters,
             "clock_scope": "append/checkpoint-control connection, client, transport and owner storage clocks have independent populations; per-request multiplexed send/receive clocks are unavailable",
             "overlap_semantics": "client/transport/server clocks overlap and nested components are not additive; storage append and persistence occur on owner workers; no idle interval or coordinator elapsed fraction is inferred",

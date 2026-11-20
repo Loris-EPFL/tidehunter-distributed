@@ -13,13 +13,10 @@ use super::super::native_publication::member_positions;
 use super::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-mod hard_wait;
 mod reads;
-pub use hard_wait::{HardWaitSnapshot, WaitReasonTotals};
 
 #[derive(Default)]
 struct CheckpointBudget {
-    identities: usize,
     partition_batches: Vec<usize>,
     partition_records: Vec<usize>,
 }
@@ -29,17 +26,12 @@ struct WriteBudget {
     requests: usize,
     bytes: usize,
     slots: usize,
-    index_bytes: usize,
     peak_requests: usize,
     peak_bytes: usize,
     closed: bool,
     waiters: VecDeque<Arc<AdmissionWaiter>>,
     live_waiters: usize,
     checkpoint: CheckpointBudget,
-    hard_wait: hard_wait::HardWaitTracker,
-    /// Test-only lower identity bound, applied inside the grant predicate.
-    #[cfg(test)]
-    identity_limit: Option<usize>,
 }
 /// One FIFO grant covers the complete invocation window. Partitions are
 /// ascending and unique; each entry is (endpoint index, batches, records).
@@ -48,8 +40,6 @@ pub(in crate::distributed::remote_db) struct WriteGrant {
     pub requests: usize,
     pub bytes: usize,
     pub slots: usize,
-    pub identities: usize,
-    pub index_bytes: usize,
     pub partitions: SmallVec<[(usize, usize, usize); 4]>,
 }
 
@@ -91,8 +81,6 @@ pub(in crate::distributed::remote_db) struct AdmissionCharges {
     pub requests: usize,
     pub bytes: usize,
     pub slots: usize,
-    pub index_bytes: usize,
-    pub identities: usize,
     pub partition_batches: usize,
     pub partition_records: usize,
 }
@@ -104,8 +92,6 @@ pub(super) struct Admission {
     drained: parking_lot::Condvar,
     max_requests: usize,
     max_bytes: usize,
-    max_identities: usize,
-    max_index_bytes: usize,
     partition_batches: usize,
     reference_bytes: usize,
     timeout: Duration,
@@ -162,8 +148,6 @@ struct WaitingReservation<'a> {
     admission: &'a Admission,
     waiter: Arc<AdmissionWaiter>,
     claimed: bool,
-    /// Blocking reasons, ended under the budget mutex at claim or drop.
-    wait: hard_wait::WaiterWait,
 }
 
 impl Drop for WaitingReservation<'_> {
@@ -172,9 +156,6 @@ impl Drop for WaitingReservation<'_> {
             return;
         }
         let mut budget = self.admission.budget.lock();
-        budget
-            .hard_wait
-            .set(&mut self.wait, 0, diagnostics_clock_ns());
         if let Some(position) = budget
             .waiters
             .iter()
@@ -200,36 +181,9 @@ fn wake_granted(granted: SmallVec<[Arc<AdmissionWaiter>; 4]>) {
 
 impl Admission {
     pub(super) fn for_open(database: &super::write_core::core::OpenState) -> Arc<Self> {
-        // This is the exact fixed-width checkpoint_metadata_fits inequality,
-        // solved once at open rather than recomputed on every FIFO grant. The
-        // streams are the actual retained (owner, generation) pairs; open-time
-        // trims only shrink them, and no generation is added while serving.
-        let streams: usize = database
-            .publisher
-            .retained_epochs
-            .iter()
-            .map(Vec::len)
-            .sum();
-        let metadata_identities = MAX_CHECKPOINT_METADATA_BYTES
-            .checked_sub(1024 * 1024)
-            .map(|bytes| bytes / 128)
-            .and_then(|entries| entries.checked_sub(u64::try_from(streams).ok()?))
-            .and_then(|entries| usize::try_from(entries).ok())
-            .unwrap_or(0);
-        let max_identities = if metadata_identities >= WAL_REPLAY_WINDOW_BATCHES {
-            database.config.max_admitted_batches
-        } else {
-            database
-                .config
-                .max_admitted_batches
-                .min(metadata_identities)
-        };
         Arc::new(Self {
             budget: Mutex::new(WriteBudget {
                 checkpoint: CheckpointBudget {
-                    // A hybrid write carries no identity charge (S7): the retry
-                    // window is the receipt window, bounded by itself.
-                    identities: 0,
                     partition_batches: vec![0; database.clients.len()],
                     partition_records: vec![0; database.clients.len()],
                 },
@@ -238,8 +192,6 @@ impl Admission {
             drained: parking_lot::Condvar::new(),
             max_requests: database.config.max_pending_batches,
             max_bytes: database.config.max_pending_bytes,
-            max_identities,
-            max_index_bytes: database.config.max_index_bytes,
             partition_batches: database.config.storage.max_batches_per_partition.min(1024),
             reference_bytes: database.config.storage.max_reference_metadata_bytes,
             timeout: database.config.timeout,
@@ -272,8 +224,6 @@ impl Admission {
             requests: budget.requests,
             bytes: budget.bytes,
             slots: budget.slots,
-            index_bytes: budget.index_bytes,
-            identities: budget.checkpoint.identities,
             partition_batches: budget.checkpoint.partition_batches.iter().sum(),
             partition_records: budget.checkpoint.partition_records.iter().sum(),
         }
@@ -299,22 +249,12 @@ impl Admission {
         }
     }
 
-    pub(super) fn hard_wait_snapshot(&self) -> HardWaitSnapshot {
-        let now = diagnostics_clock_ns();
-        self.budget.lock().hard_wait.snapshot(now)
-    }
-
     /// Return every batch/record/slot dimension in one transaction, after all
-    /// publisher, slot, identity and dependency guards have been dropped.
-    /// `_replay` is the old replay-tail dimension: no grant charges it any more
-    /// (the hybrid has no replay limit), so it is ignored. The parameter keeps
-    /// the three-argument call sites of the write path unchanged; the cleanup
-    /// that removes it lands with the Exact deletion.
+    /// publisher, slot and dependency guards have been dropped.
     pub(super) fn release_publication(
         &self,
         slots: usize,
         partitions: &[(usize, usize)],
-        _replay: (usize, usize),
     ) -> Result<(), LocalDbError> {
         let mut budget = self.budget.lock();
         if slots > budget.slots
@@ -358,11 +298,6 @@ impl Admission {
         Ok(())
     }
 
-    pub(super) fn regrant(&self) {
-        let granted = self.grant_waiters(&mut self.budget.lock());
-        wake_granted(granted);
-    }
-
     fn fits(&self, budget: &WriteBudget, grant: &WriteGrant) -> bool {
         budget
             .requests
@@ -376,7 +311,6 @@ impl Admission {
                 .slots
                 .checked_add(grant.slots)
                 .is_some_and(|n| n <= self.max_requests)
-            && self.checkpoint_fits(budget, grant)
             && grant
                 .partitions
                 .iter()
@@ -407,93 +341,11 @@ impl Admission {
                 })
     }
 
-    fn checkpoint_fits(&self, budget: &WriteBudget, grant: &WriteGrant) -> bool {
-        self.checkpoint_pressure_for(budget, grant).is_none()
-    }
-
-    /// The first checkpoint-bound dimension that blocks this grant, if any.
-    /// Only checkpoint apply releases these, so a blocked caller requests one.
-    fn checkpoint_pressure_for(
-        &self,
-        budget: &WriteBudget,
-        grant: &WriteGrant,
-    ) -> Option<CheckpointPressure> {
-        // A hybrid write carries no replay-tail charge (WAL replay has no hard
-        // bound), so only the identity and index dimensions can name a reason.
-        let reason = self.checkpoint_block(budget, grant, false).0?;
-        Some(CheckpointPressure {
-            reason,
-            batches: 0,
-            encoded_bytes: 0,
-            max_batches: usize::MAX,
-            max_encoded_bytes: usize::MAX,
-            incoming_encoded_bytes: None,
-        })
-    }
-
-    /// The first blocking checkpoint dimension, in priority order, and the
-    /// wait bits of the dimensions evaluated. `all` evaluates every dimension
-    /// (waiting path); otherwise evaluation stops at the first block.
-    fn checkpoint_block(
-        &self,
-        budget: &WriteBudget,
-        grant: &WriteGrant,
-        all: bool,
-    ) -> (Option<&'static str>, u8) {
-        let tail = &budget.checkpoint;
-        #[cfg(test)]
-        let max_identities = budget
-            .identity_limit
-            .map_or(self.max_identities, |limit| limit.min(self.max_identities));
-        #[cfg(not(test))]
-        let max_identities = self.max_identities;
-        // WAL replay deliberately has no hard tail bound.
-        let identity = tail
-            .identities
-            .checked_add(grant.identities)
-            .is_none_or(|n| n > max_identities);
-        if identity && !all {
-            return (Some("identity"), hard_wait::WAIT_IDENTITY);
-        }
-        let index = budget
-            .index_bytes
-            .checked_add(grant.index_bytes)
-            .is_none_or(|n| n > self.max_index_bytes);
-        let first = if identity {
-            Some("identity")
-        } else {
-            index.then_some("index")
-        };
-        let bits = (if identity {
-            hard_wait::WAIT_IDENTITY
-        } else {
-            0
-        }) | (if index { hard_wait::WAIT_INDEX } else { 0 });
-        (first, bits)
-    }
-
-    /// Wait bits of a queued grant: its checkpoint dimensions, or `other`.
-    fn wait_bits(&self, budget: &WriteBudget, grant: &WriteGrant) -> u8 {
-        match self.checkpoint_block(budget, grant, true).1 {
-            0 => hard_wait::WAIT_OTHER,
-            bits => bits,
-        }
-    }
-
-    /// Lower the identity (checkpoint receipt metadata) bound for a test,
-    /// under the budget mutex so every later grant predicate observes it.
-    #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn limit_identities_for_test(&self, limit: usize) {
-        self.budget.lock().identity_limit = Some(limit);
-    }
-
     fn charge_grant(budget: &mut WriteBudget, grant: &WriteGrant) {
         // The complete predicate was checked under this same budget mutex.
         budget.requests += grant.requests;
         budget.bytes += grant.bytes;
         budget.slots += grant.slots;
-        budget.index_bytes += grant.index_bytes;
-        budget.checkpoint.identities += grant.identities;
         for &(partition, batches, records) in &grant.partitions {
             budget.checkpoint.partition_batches[partition] += batches;
             budget.checkpoint.partition_records[partition] += records;
@@ -504,8 +356,6 @@ impl Admission {
 
     fn resources_owned(budget: &WriteBudget, grant: &WriteGrant) -> bool {
         grant.slots <= budget.slots
-            && grant.index_bytes <= budget.index_bytes
-            && grant.identities <= budget.checkpoint.identities
             && grant
                 .partitions
                 .iter()
@@ -525,8 +375,6 @@ impl Admission {
 
     fn uncharge_resources(budget: &mut WriteBudget, grant: &WriteGrant) {
         budget.slots -= grant.slots;
-        budget.index_bytes -= grant.index_bytes;
-        budget.checkpoint.identities -= grant.identities;
         for &(partition, batches, records) in &grant.partitions {
             budget.checkpoint.partition_batches[partition] -= batches;
             budget.checkpoint.partition_records[partition] -= records;
@@ -594,17 +442,11 @@ impl Admission {
         budget.live_waiters += 1;
         budget.waiters.push_back(waiter.clone());
         debug_assert!(budget.waiters.len() <= budget.live_waiters);
-        let mut reservation = WaitingReservation {
+        WaitingReservation {
             admission: self,
             waiter,
             claimed: false,
-            wait: hard_wait::WaiterWait::default(),
-        };
-        let bits = self.wait_bits(budget, &reservation.waiter.grant);
-        budget
-            .hard_wait
-            .set(&mut reservation.wait, bits, diagnostics_clock_ns());
-        reservation
+        }
     }
 
     #[cfg(test)]
@@ -618,7 +460,7 @@ impl Admission {
         bytes: usize,
         healthy: impl Fn() -> Result<(), LocalDbError>,
     ) -> Result<WriteCredit, LocalDbError> {
-        self.reserve_grant(WriteGrant::request(bytes), true, healthy, |_| Ok(()))
+        self.reserve_grant(WriteGrant::request(bytes), true, healthy)
     }
 
     pub(in crate::distributed::remote_db) fn reserve_grant(
@@ -626,7 +468,6 @@ impl Admission {
         grant: WriteGrant,
         block: bool,
         healthy: impl Fn() -> Result<(), LocalDbError>,
-        checkpoint: impl Fn(CheckpointPressure) -> Result<(), LocalDbError>,
     ) -> Result<WriteCredit, LocalDbError> {
         if grant.bytes > self.max_bytes {
             return Err(LocalDbError::new("write exceeds admission byte budget"));
@@ -634,8 +475,6 @@ impl Admission {
         if grant.requests == 0
             || grant.requests > self.max_requests
             || grant.slots > self.max_requests
-            || grant.identities > self.max_identities
-            || grant.index_bytes > self.max_index_bytes
         {
             return Err(LocalDbError::new("write exceeds admission window capacity"));
         }
@@ -681,9 +520,6 @@ impl Admission {
                 WAITER_GRANTED => {
                     healthy()?;
                     let mut budget = self.budget.lock();
-                    budget
-                        .hard_wait
-                        .set(&mut waiting.wait, 0, diagnostics_clock_ns());
                     if budget.closed {
                         return Err(self.closed_error());
                     }
@@ -703,19 +539,6 @@ impl Admission {
                     // would cancel a queued grant before it can be claimed.
                     if Instant::now() >= deadline {
                         return Err(LocalDbError::new("write admission deadline expired"));
-                    }
-                    let pressure = {
-                        let mut budget = self.budget.lock();
-                        let bits = self.wait_bits(&budget, &waiting.waiter.grant);
-                        budget
-                            .hard_wait
-                            .set(&mut waiting.wait, bits, diagnostics_clock_ns());
-                        self.checkpoint_pressure_for(&budget, &waiting.waiter.grant)
-                    };
-                    if let Some(pressure) = pressure {
-                        // No Admission/identity/key/owner/publication lock
-                        // survives into checkpoint request or the capacity park.
-                        checkpoint(pressure)?;
                     }
                     thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
                 }
@@ -774,17 +597,6 @@ impl Admission {
             waiter.thread.unpark();
         }
     }
-
-    /// A finished checkpoint may release too little for the FIFO head, which
-    /// then stays parked with no publication or grant left to wake it. Unpark
-    /// only the head (FIFO: later waiters cannot be granted before it); it
-    /// rechecks its pressure and requests the next checkpoint with no lock held.
-    pub(super) fn wake_checkpoint_waiter(&self) {
-        let head = self.budget.lock().waiters.front().cloned();
-        if let Some(waiter) = head {
-            waiter.thread.unpark();
-        }
-    }
 }
 
 /// Setup evidence from one owner-monitor connection.
@@ -819,7 +631,6 @@ pub struct ConcurrentRemoteDatabase {
     pub(super) shape: KeyShape,
     pub(super) config: RemoteDatabaseConfig,
     pub(super) epoch: u64,
-    pub(super) partition_indexes: HashMap<u32, usize>,
     pub(super) read_resolve_ns: AtomicU64,
     pub(super) value_read_ns: AtomicU64,
     io_clients: Vec<(u32, ControlHandle)>,
@@ -1065,7 +876,6 @@ impl ConcurrentRemoteDatabase {
             shape: core.shape.clone(),
             config: core.config.clone(),
             epoch: core.epoch,
-            partition_indexes: core.partition_indexes.clone(),
             read_resolve_ns: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),
             io_clients: core
@@ -1296,18 +1106,6 @@ impl ConcurrentRemoteDatabase {
         Ok((members, version))
     }
 
-    /// One native snapshot pass: native `rebuild_control_region`. Flushes the
-    /// cells that are stale by value-byte distance, stores one region when the
-    /// flush frontier advanced and is a no-op otherwise (`stored == false`).
-    ///
-    /// # Errors
-    /// Returns an observed authority failure, an owner drain failure or an
-    /// index/control-region persistence error.
-    pub(crate) fn snapshot_index(&self) -> Result<StoredSnapshot, LocalDbError> {
-        self.ensure_healthy()?;
-        self.write_core().snapshot_table()
-    }
-
     /// Snapshot passes that were a no-op only because a reader latch held the
     /// flush frontier below the stored head. Diagnostic, exported as the
     /// `snapshot_latch_deferrals` gauge.
@@ -1366,7 +1164,8 @@ impl ConcurrentRemoteDatabase {
     /// when the head did not move. Takes no write gate; later writes proceed.
     ///
     /// # Errors
-    /// As [`Self::snapshot_index`].
+    /// Returns an observed authority failure, an owner drain failure or an
+    /// index/control-region persistence error.
     pub(crate) fn force_rebuild_index(&self) -> Result<StoredSnapshot, LocalDbError> {
         self.ensure_healthy()?;
         let frontier = self.table.last_processed();
@@ -1398,19 +1197,12 @@ impl ConcurrentRemoteDatabase {
     /// Visit one local-only snapshot of write owner, checkpoint, and cache metrics.
     /// This performs no diagnostic RPC and does not enable sampled profiling.
     pub fn visit_write_metrics(&self, visit: impl FnOnce(WriteMetricsSnapshot)) {
-        let checkpoint_diagnostics = self
-            .database
-            .core
-            .publisher
-            .lock()
-            .checkpoint_diagnostic_summary;
         let write_profile = *self.write_profile.lock();
         visit(WriteMetricsSnapshot {
             authority: self.database.core.authority_write_stats(),
             pipeline: self.pipeline_stats(),
             read_cache: self.cache.stats(),
             write_profile,
-            checkpoint_diagnostics,
         });
     }
     /// Bounded metrics snapshot; lock contention makes the whole snapshot unavailable.
@@ -1418,12 +1210,6 @@ impl ConcurrentRemoteDatabase {
         // Copy each domain separately; metrics must not introduce a reverse
         // stats/Admission→publisher lock order.
         let stored = *self.database.core.stats.try_lock()?;
-        let diagnostics = self
-            .database
-            .core
-            .publisher
-            .try_lock()?
-            .checkpoint_diagnostic_summary;
         let (requests, bytes) = {
             let budget = self.admission.budget.try_lock()?;
             (budget.peak_requests, budget.peak_bytes)
@@ -1450,7 +1236,6 @@ impl ConcurrentRemoteDatabase {
             pipeline,
             read_cache: self.cache.stats(),
             write_profile: profile,
-            checkpoint_diagnostics: diagnostics,
         };
         visit(snapshot);
         Some(())

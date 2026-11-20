@@ -2,11 +2,10 @@
 //! batches. Checkpoint persistence owns no foreground or publication lock.
 
 use super::super::{
-    AuthorityManifest, AuthorityWriteStats, CheckpointDiagnostic, CheckpointDiagnosticSummary,
-    ControlHandle, LocalDbError, LocalDbStats, MutationVersion, ReadCache, ReadService,
-    RecentReceipt, RecoveryStats, RemoteDatabaseConfig, ShutdownStats, StaticInventory,
-    StreamPosition, WriteProfileSnapshot, WriteTimeline, concurrent, failure_context,
-    record_first_failure,
+    AuthorityManifest, AuthorityWriteStats, ControlHandle, LocalDbError, LocalDbStats,
+    MutationVersion, ReadCache, ReadService, RecentReceipt, RecoveryStats, RemoteDatabaseConfig,
+    ShutdownStats, StaticInventory, StreamPosition, WriteProfileSnapshot, WriteTimeline,
+    concurrent, failure_context, record_first_failure,
 };
 use super::dependencies::DependencyRegistry;
 use super::inflight::InFlight;
@@ -15,7 +14,7 @@ use super::sequencer::{Resolution, Sequencer};
 use crate::distributed::hybrid::table::HybridTable;
 use crate::key_shape::KeyShape;
 use parking_lot::{Condvar, Mutex};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::RandomState};
+use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
@@ -25,29 +24,20 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-/// Only D9 publisher-owned fields cross this boundary. Returning disjoint field
-/// references permits capture to update stream cuts and the retry window
-/// without cloning maps or exposing the legacy authority's clients/admission.
+/// The publisher-owned fields that the authority's open, relocation, trim and
+/// retirement code reads and updates under the publisher lock. Returning
+/// disjoint field references avoids cloning maps or exposing the clients and
+/// admission of the authority.
 pub(in crate::distributed::remote_db) struct PublisherCheckpoint<'a> {
-    pub stream_last: &'a mut BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: &'a mut BTreeMap<(u32, u64), StreamPosition>,
-    pub committed_complete: &'a mut BTreeSet<(u32, u64)>,
-    pub committed_streams: &'a mut BTreeSet<(u32, u64)>,
     /// Adopted R1 callback starts, keyed by `(partition, fencing_generation)`.
     pub callback_starts: &'a mut BTreeMap<(u32, u64), u64>,
-    pub recent: &'a mut ReceiptWindow,
     pub latest: &'a mut Option<MutationVersion>,
     pub live_latest: &'a mut Option<MutationVersion>,
-    pub snapshot_generation: &'a mut u64,
     pub manifest: &'a mut AuthorityManifest,
     pub retained_epochs: &'a mut Vec<Vec<u64>>,
     pub checkpoint_tail_batches: &'a mut usize,
     pub checkpoint_tail_bytes: &'a mut usize,
-    pub checkpoint_diagnostics: &'a mut Option<VecDeque<CheckpointDiagnostic>>,
-    pub checkpoint_diagnostic_summary: &'a mut CheckpointDiagnosticSummary,
-    pub next_checkpoint_diagnostic: &'a mut u64,
-    pub dropped_checkpoint_diagnostics: &'a mut u64,
-    pub last_checkpoint_diagnostic: &'a mut Option<CheckpointDiagnostic>,
 }
 
 pub(in crate::distributed::remote_db) struct PublisherState {
@@ -55,27 +45,15 @@ pub(in crate::distributed::remote_db) struct PublisherState {
     /// oldest first. Filled at publication and replaced by a persisted window at
     /// open.
     pub recent: ReceiptWindow,
-    pub stream_last: BTreeMap<(u32, u64), (u64, u32)>,
     pub positions: BTreeMap<(u32, u64), StreamPosition>,
-    pub committed_complete: BTreeSet<(u32, u64)>,
-    /// Every stream the committed root names in its positions, complete or
-    /// not. A generation trim adopts a replacement root only when the root
-    /// names the trimmed stream or the stream produced it (L1).
-    pub committed_streams: BTreeSet<(u32, u64)>,
-    /// Adopted R1 callback starts; changed only by an Exact installation.
+    /// Adopted R1 callback starts; they only rise.
     pub callback_starts: BTreeMap<(u32, u64), u64>,
     pub latest: Option<MutationVersion>,
     pub live_latest: Option<MutationVersion>,
-    pub snapshot_generation: u64,
     pub manifest: AuthorityManifest,
     pub retained_epochs: Vec<Vec<u64>>,
     pub checkpoint_tail_batches: usize,
     pub checkpoint_tail_bytes: usize,
-    pub checkpoint_diagnostics: Option<VecDeque<CheckpointDiagnostic>>,
-    pub checkpoint_diagnostic_summary: CheckpointDiagnosticSummary,
-    pub next_checkpoint_diagnostic: u64,
-    pub dropped_checkpoint_diagnostics: u64,
-    pub last_checkpoint_diagnostic: Option<CheckpointDiagnostic>,
     /// Exclusive contiguous publication frontier, including an empty epoch 0.
     pub published_next: u64,
     pub upper: Option<MutationVersion>,
@@ -105,24 +83,14 @@ impl PublisherState {
         &mut self,
     ) -> PublisherCheckpoint<'_> {
         PublisherCheckpoint {
-            stream_last: &mut self.stream_last,
             positions: &mut self.positions,
-            committed_complete: &mut self.committed_complete,
-            committed_streams: &mut self.committed_streams,
             callback_starts: &mut self.callback_starts,
-            recent: &mut self.recent,
             latest: &mut self.latest,
             live_latest: &mut self.live_latest,
-            snapshot_generation: &mut self.snapshot_generation,
             manifest: &mut self.manifest,
             retained_epochs: &mut self.retained_epochs,
             checkpoint_tail_batches: &mut self.checkpoint_tail_batches,
             checkpoint_tail_bytes: &mut self.checkpoint_tail_bytes,
-            checkpoint_diagnostics: &mut self.checkpoint_diagnostics,
-            checkpoint_diagnostic_summary: &mut self.checkpoint_diagnostic_summary,
-            next_checkpoint_diagnostic: &mut self.next_checkpoint_diagnostic,
-            dropped_checkpoint_diagnostics: &mut self.dropped_checkpoint_diagnostics,
-            last_checkpoint_diagnostic: &mut self.last_checkpoint_diagnostic,
         }
     }
 }
@@ -240,9 +208,6 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub first_failure: Arc<OnceLock<super::super::FirstFailure>>,
     pub stopped: AtomicBool,
     pub closing: AtomicBool,
-    /// The one named index force in flight (`force_rebuild_index`); claimed
-    /// by compare-exchange, released when its ticket drops.
-    pub force_in_flight: Arc<AtomicBool>,
     pub clients: Vec<super::super::ClientWorker>,
     /// Set when this epoch is tracked under durable-prefix recovery. Open
     /// attaches it after offline fencing-generation maintenance, before the
@@ -306,7 +271,6 @@ impl WriteCore {
             closing: AtomicBool::new(false),
             owner_controls,
             clients: open.clients,
-            force_in_flight: Arc::new(AtomicBool::new(false)),
             durable_cut: OnceLock::new(),
             live_pool: open.live_pool,
             live_metrics: open.live_metrics,
@@ -457,6 +421,7 @@ impl WriteCore {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn next_sequence(&self) -> u64 {
         self.sequencer.next()
     }

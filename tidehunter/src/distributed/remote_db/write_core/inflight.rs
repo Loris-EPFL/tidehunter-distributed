@@ -20,6 +20,7 @@ use crate::distributed::types::BatchVersion;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, hash_map::RandomState};
 use std::hash::BuildHasher;
+#[cfg(test)]
 use std::ops::DerefMut;
 
 /// The generation that currently owns an operation id.
@@ -57,6 +58,7 @@ impl InFlight {
         self.shard(operation).lock().get(&operation).copied()
     }
 
+    #[cfg(test)]
     pub(super) fn with_operation<T>(
         &self,
         operation: [u8; 16],
@@ -102,6 +104,7 @@ impl InFlight {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.shards.iter().map(|shard| shard.lock().len()).sum()
     }
@@ -127,10 +130,12 @@ impl InFlight {
     }
 
     /// Bytes per resident slot, as charged by [`Self::resident_bytes`].
+    #[cfg(test)]
     pub(super) const fn entry_bytes() -> usize {
         std::mem::size_of::<([u8; 16], InFlightEntry)>()
     }
 
+    #[cfg(test)]
     pub(super) fn shard_count(&self) -> usize {
         self.shards.len()
     }

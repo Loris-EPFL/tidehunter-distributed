@@ -25,7 +25,6 @@ impl ConcurrentRemoteDatabase {
             .diagnostics
             .remaining
             .store(limit, Ordering::Relaxed);
-        self.reads.state.coordinator_diagnostics.arm(limit);
         self.reads.state.trace.arm(limit);
     }
 

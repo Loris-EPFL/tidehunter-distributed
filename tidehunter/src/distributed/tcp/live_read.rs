@@ -1715,60 +1715,7 @@ impl Client {
     pub(crate) fn read_lane_pin_counters(&self) -> Option<Arc<LiveNvmeCounters>> {
         self.live_counters.clone()
     }
-
-    /// Read one member frame by index position (the raw `[length][crc][entry]`
-    /// bytes). Integrity and decoding are the value reader's: the lane only
-    /// transfers the exact range the position names.
-    pub(crate) fn read_record(
-        &mut self,
-        epoch: u64,
-        position: &VersionPosition,
-    ) -> Result<Bytes, TcpError> {
-        self.read_records(epoch, std::slice::from_ref(position))?
-            .pop()
-            .ok_or_else(|| TcpError::new("empty record response"))
-    }
-    /// Direct live reads with a fresh published-index cache. The read-service
-    /// lanes retain their own bounded, trusted-index grants across requests.
-    pub(crate) fn read_records(
-        &mut self,
-        epoch: u64,
-        positions: &[VersionPosition],
-    ) -> Result<Vec<Bytes>, TcpError> {
-        if self.live_config.is_none() {
-            return Err(TcpError::new("reads require live NVMe-oF configuration"));
-        }
-        if !self.live_unreleased_tokens.is_empty() {
-            return Err(TcpError::new("live read has quarantined owner grants"));
-        }
-        let mut cache = LiveReadCache::default();
-        let result = self.live_read_records(
-            &mut cache,
-            epoch,
-            positions,
-            Instant::now() + self.timeout,
-            None,
-        );
-        let cleanup = cache.close(self, epoch);
-        self.live_unreleased_tokens.extend(
-            cache
-                .take_unreleased()
-                .into_iter()
-                .map(|token| (epoch, token)),
-        );
-        // Live I/O and validation clocks come from live_nvmeof_stats.
-        match (result, cleanup) {
-            (Ok(values), Ok(())) => Ok(values),
-            (Err(error), Ok(())) => Err(error),
-            (result, Err(cleanup)) => {
-                self.broken = true;
-                Err(TcpError::new(format!(
-                    "live read result {:?}; owner grant cleanup remains quarantined: {cleanup}",
-                    result.err(),
-                )))
-            }
-        }
-    }
+    #[cfg(test)]
     /// Blocking read of `positions` through `cache`. For callers that own a
     /// lane exclusively and keep one request at a time; lane workers use the
     /// multi-flight calls of [`LiveReadCache`] instead.

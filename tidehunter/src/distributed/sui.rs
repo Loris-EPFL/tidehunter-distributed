@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+mod coordinator_evidence;
 mod drop_cells;
-mod index_checkpoint;
 mod iter;
 pub(crate) mod kv_capture;
 mod relocation;
@@ -877,16 +877,6 @@ impl Db {
             remote.profile.visit_partitions(&mut set);
         }
     }
-    /// Snapshot the separate bounded coordinator-resolution sample, including
-    /// cache hits and negative lookups that create no remote flight.
-    pub fn coordinator_resolution_snapshot(
-        &self,
-    ) -> Option<super::remote_db::CoordinatorResolutionSnapshot> {
-        match &self.backend {
-            Backend::Remote(remote) => Some(remote.profile.coordinator_resolution_snapshot()),
-            Backend::Native(_) => None,
-        }
-    }
     /// Drain admitted remote writes and finalize finite per-connection profile
     /// samples before a local metrics snapshot is collected.
     pub fn finish_write_profile(&self) -> Result<()> {
@@ -955,7 +945,6 @@ impl Db {
         set("read_profile_transport_cq_available", 0);
         set("scalar_read_ns_available", 0);
         set("read_index_ns_available", 0);
-        set("write_checkpoint_diagnostics_available", 0);
         if let Backend::Remote(remote) = &self.backend {
             let read_timing_available = u64::from(remote.db.read_profile_enabled());
             set("scalar_read_ns_available", read_timing_available);
@@ -1001,58 +990,7 @@ impl Db {
             set("value_cache_misses", reader.cache_misses());
             set("value_decode_failures", reader.decode_failure_count());
             remote.db.visit_write_metrics(|snapshot| {
-                let checkpoint = snapshot.checkpoint_diagnostics;
-                set(
-                    "write_checkpoint_diagnostics_available",
-                    u64::from(checkpoint.available),
-                );
-                macro_rules! checkpoint_fields {
-                    ($($field:ident),+ $(,)?) => {
-                        $(set(
-                            concat!("write_checkpoint_diagnostic_", stringify!($field)),
-                            checkpoint.$field,
-                        );)+
-                    };
-                }
-                checkpoint_fields!(
-                    records,
-                    dropped_records,
-                    pressure_wait_ns,
-                    pressure_wait_count,
-                    drain_ns,
-                    drain_count,
-                    existing_capture_wait_ns,
-                    existing_capture_wait_count,
-                    new_capture_wait_ns,
-                    new_capture_wait_count,
-                    staging_manifest_ns,
-                    staging_manifest_count,
-                    node_prefix_wait_ns,
-                    node_prefix_wait_count,
-                    index_prepare_ns,
-                    index_prepare_count,
-                    index_persist_ns,
-                    index_persist_count,
-                    metadata_install_ns,
-                    metadata_install_count,
-                    root_adoption_ns,
-                    root_adoption_count,
-                    owner_adoption_ns,
-                    owner_adoption_count,
-                    obsolete_cleanup_ns,
-                    obsolete_cleanup_count,
-                    tail_pressure_count,
-                    known_identity_pressure_count,
-                    partition_window_pressure_count,
-                    index_reservation_pressure_count,
-                    already_available_count,
-                    after_drain_relief_count,
-                    after_existing_capture_relief_count,
-                    after_new_capture_relief_count,
-                    capacity_error_count,
-                    progress_error_count,
-                );
-                index_checkpoint::visit_coordinator_io(&mut set);
+                coordinator_evidence::visit_coordinator_io(&mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);
@@ -1222,7 +1160,6 @@ impl Db {
         set("read_profile_transport_cq_available", 0);
         set("scalar_read_ns_available", 0);
         set("read_index_ns_available", 0);
-        set("write_checkpoint_diagnostics_available", 0);
         if let Backend::Remote(remote) = &self.backend {
             let read_timing_available = u64::from(remote.db.read_profile_enabled());
             set("scalar_read_ns_available", read_timing_available);
@@ -1242,58 +1179,7 @@ impl Db {
                 remote.db.snapshot_latch_deferrals(),
             );
             remote.db.try_visit_write_metrics(|snapshot| {
-                let checkpoint = snapshot.checkpoint_diagnostics;
-                set(
-                    "write_checkpoint_diagnostics_available",
-                    u64::from(checkpoint.available),
-                );
-                macro_rules! checkpoint_fields {
-                    ($($field:ident),+ $(,)?) => {
-                        $(set(
-                            concat!("write_checkpoint_diagnostic_", stringify!($field)),
-                            checkpoint.$field,
-                        );)+
-                    };
-                }
-                checkpoint_fields!(
-                    records,
-                    dropped_records,
-                    pressure_wait_ns,
-                    pressure_wait_count,
-                    drain_ns,
-                    drain_count,
-                    existing_capture_wait_ns,
-                    existing_capture_wait_count,
-                    new_capture_wait_ns,
-                    new_capture_wait_count,
-                    staging_manifest_ns,
-                    staging_manifest_count,
-                    node_prefix_wait_ns,
-                    node_prefix_wait_count,
-                    index_prepare_ns,
-                    index_prepare_count,
-                    index_persist_ns,
-                    index_persist_count,
-                    metadata_install_ns,
-                    metadata_install_count,
-                    root_adoption_ns,
-                    root_adoption_count,
-                    owner_adoption_ns,
-                    owner_adoption_count,
-                    obsolete_cleanup_ns,
-                    obsolete_cleanup_count,
-                    tail_pressure_count,
-                    known_identity_pressure_count,
-                    partition_window_pressure_count,
-                    index_reservation_pressure_count,
-                    already_available_count,
-                    after_drain_relief_count,
-                    after_existing_capture_relief_count,
-                    after_new_capture_relief_count,
-                    capacity_error_count,
-                    progress_error_count,
-                );
-                index_checkpoint::visit_coordinator_io(&mut set);
+                coordinator_evidence::visit_coordinator_io(&mut set);
                 let authority = snapshot.authority;
                 set("write_authority_prepare_ns", authority.authority_prepare_ns);
                 set("write_authority_admit_ns", authority.authority_admit_ns);

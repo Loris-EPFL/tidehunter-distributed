@@ -31,13 +31,12 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-/// One published extent: the member frame of one batch in this stream's value
-/// WAL. `end` is exclusive.
+/// One published extent: the start of the member frame of one batch in this
+/// stream's value WAL. The queue's tail carries the end.
 #[derive(Clone, Copy, Debug)]
 struct Extent {
     version: BatchVersion,
     offset: u64,
-    end: u64,
 }
 
 /// One owner worker's offset-ordered allocation queue.
@@ -102,11 +101,7 @@ impl ExtentQueue {
     pub(super) fn reserve(&mut self, version: BatchVersion, offset: u64, end: u64) {
         if self.pending.len() < self.capacity.get() {
             let was_empty = self.pending.is_empty();
-            self.pending.push_back(Extent {
-                version,
-                offset,
-                end,
-            });
+            self.pending.push_back(Extent { version, offset });
             if was_empty {
                 // Publish the start before the end: a reader that sees the new
                 // tail must also see this store. Unconditional on the floor: the

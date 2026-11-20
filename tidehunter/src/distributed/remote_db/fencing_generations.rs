@@ -32,7 +32,17 @@ use crate::distributed::tcp::{
 };
 
 /// L2 requires a provisioned identity and owner lifecycle metadata.
-pub(super) const AUTHORITY_FORMAT: u32 = 9;
+///
+/// Format 10 is the native-index hybrid (I9). A format-9 manifest comes from
+/// the Exact era and carries a checkpoint this engine cannot read: the open
+/// refuses it before any fence. An older binary refuses a format-10 manifest
+/// by its own ceiling. Raising the constant is the only gate: a database must
+/// never open with its Exact checkpoint ignored.
+pub(super) const AUTHORITY_FORMAT: u32 = 10;
+
+/// The last authority manifest format of the Exact-index engine. Its manifest
+/// names a checkpoint that this engine ignores, so it is refused by name.
+const EXACT_ERA_FORMAT: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,11 +70,19 @@ struct FormatProbe {
 }
 
 /// Read the authority manifest; another format fails with its number before
-/// any current field is interpreted, and the store is never rewritten.
+/// any current field is interpreted, and the store is never rewritten. The
+/// Exact-era format is named as a removed mode: its checkpoint is not an index
+/// this engine can read.
 pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, LocalDbError> {
     let probe: FormatProbe = read_metadata(path).map_err(LocalDbError::component)?;
     probe.mode.reject_legacy_mode(probe.format)?;
     if probe.format != AUTHORITY_FORMAT {
+        if probe.format == EXACT_ERA_FORMAT {
+            return Err(legacy_mode_error(&format!(
+                "exact_index (authority manifest format {})",
+                probe.format
+            )));
+        }
         return Err(LocalDbError::new(format!(
             "unsupported distributed authority manifest format {} (expected {AUTHORITY_FORMAT})",
             probe.format
@@ -155,13 +173,6 @@ pub(super) fn mark_served(
             "authority reservation changed before activation",
         )),
     }
-}
-
-pub(super) fn is_served(manifest: &AuthorityManifest, generation: u64) -> bool {
-    manifest
-        .generations
-        .iter()
-        .any(|entry| entry.generation == generation && entry.state == GenerationState::Served)
 }
 
 /// Retained generations below `current`, ascending, with `true` for an aborted

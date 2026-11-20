@@ -77,7 +77,6 @@ pub(super) struct AbortedAllocation {
     /// The operation id whose in-flight ownership this abort releases.
     pub(super) operation: [u8; 16],
     pub(super) records: usize,
-    pub(super) encoded_bytes: usize,
 }
 
 impl WriteCore {
@@ -509,11 +508,9 @@ impl WriteCore {
         let mut slots = 0usize;
         let mut partitions = SmallVec::<[(usize, usize); 4]>::new();
         partitions.resize(self.partition_indexes.len(), (0, 0));
-        let mut aborted_replay = (0, 0);
         if let Some((allocation, _)) = &aborted {
             partitions[allocation.owner].0 += 1;
             partitions[allocation.owner].1 += allocation.records;
-            aborted_replay = (1, allocation.encoded_bytes);
             slots += self.finalize_slot(allocation.sequence);
         }
         let published_count = published.len() as u64;
@@ -530,8 +527,7 @@ impl WriteCore {
             partitions[partition].1 += entry.batch.mutations().len();
             slots += self.finalize_published(entry)?;
         }
-        self.admission
-            .release_publication(slots, &partitions, aborted_replay)?;
+        self.admission.release_publication(slots, &partitions)?;
         result
     }
 

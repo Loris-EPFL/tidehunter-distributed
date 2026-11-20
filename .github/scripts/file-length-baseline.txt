@@ -4,28 +4,27 @@
 # a listed file is within the cap or gone. Change a line only in the change
 # that splits or shrinks the file.
 
-benchmarks/kv-research/src/backends/tidehunter.rs 2808
+benchmarks/kv-research/src/backends/tidehunter.rs 2757
 benchmarks/kv-research/src/mainnet_replay.rs 2355
-benchmarks/kv-research/src/runner.rs 7069
+benchmarks/kv-research/src/runner.rs 7057
 tidehunter-fabric/src/endpoint/resources.rs 1965
 tidehunter/benches/admission_options/core.rs 2040
 tidehunter/src/distributed/nvmeof/live_target.rs 1502
-tidehunter/src/distributed/remote_db.rs 3023
-tidehunter/src/distributed/remote_db/concurrent.rs 1617
+tidehunter/src/distributed/remote_db.rs 2702
 tidehunter/src/distributed/remote_db/concurrent/tests.rs 2280
-tidehunter/src/distributed/remote_db/leased_tests.rs 1763
+tidehunter/src/distributed/remote_db/leased_tests.rs 1756
 tidehunter/src/distributed/remote_db/live_bench_tests.rs 2056
 tidehunter/src/distributed/remote_db/pending_read.rs 2263
-tidehunter/src/distributed/remote_db/pipeline_tests.rs 2199
+tidehunter/src/distributed/remote_db/pipeline_tests.rs 2172
 tidehunter/src/distributed/remote_db/read_cache.rs 2049
 tidehunter/src/distributed/remote_db/tests.rs 1812
 tidehunter/src/distributed/storage.rs 4799
 tidehunter/src/distributed/storage/tests.rs 2074
-tidehunter/src/distributed/sui.rs 2134
-tidehunter/src/distributed/tcp.rs 2303
+tidehunter/src/distributed/sui.rs 2059
+tidehunter/src/distributed/tcp.rs 2301
 tidehunter/src/distributed/tcp/control.rs 2308
 tidehunter/src/distributed/tcp/control_tests.rs 2542
 tidehunter/src/distributed/tcp/inventory.rs 1959
 tidehunter/src/distributed/tcp/live_client.rs 5456
-tidehunter/src/distributed/tcp/live_read.rs 3274
+tidehunter/src/distributed/tcp/live_read.rs 3220
 tidehunter/src/distributed/tcp/reactor.rs 2303

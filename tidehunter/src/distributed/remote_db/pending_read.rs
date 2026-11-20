@@ -35,10 +35,6 @@ struct MemberPlan {
 struct PlannedMembers<'a> {
     members: &'a [MemberPlan],
 }
-/// One member's plan, kept across admission retries.
-struct CachedPlan {
-    member: [MemberPlan; 1],
-}
 use read_trace::ReadTrace;
 pub use read_trace::ReadTraceSnapshot;
 pub(crate) use read_trace::{ReadTraceCallGuard, ReadTraceChild};
@@ -296,6 +292,7 @@ impl ReadBatch {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn has_unsubmitted(&self) -> bool {
         !self.groups.is_empty()
     }
@@ -562,18 +559,6 @@ pub struct ReadProfileMonitor {
     state: Arc<State>,
 }
 impl ReadProfileMonitor {
-    pub(super) fn select_resolution(
-        &self,
-        bulk: bool,
-        members: usize,
-    ) -> Option<ResolutionSample<'_>> {
-        self.state.coordinator_diagnostics.select(bulk, members)
-    }
-    /// Cumulative independent first-N API-resolution samples. Drain callers before
-    /// taking a boundary snapshot; stage counts determine availability.
-    pub fn coordinator_resolution_snapshot(&self) -> CoordinatorResolutionSnapshot {
-        self.state.coordinator_diagnostics.snapshot()
-    }
     pub fn visit(&self, set: &mut impl FnMut(&'static str, u64)) {
         self.state.diagnostics.visit(set);
         set(
@@ -747,7 +732,6 @@ struct State {
     live_read_submissions: AtomicU64,
     diagnostics: ReadDiagnostics,
     trace: Arc<ReadTrace>,
-    coordinator_diagnostics: CoordinatorResolutionDiagnostics,
     owner_diagnostics: Box<[(u32, ReadDiagnostics)]>,
     flights: Mutex<FlightRegistry>,
     coalesced_members: AtomicU64,
@@ -807,7 +791,9 @@ impl Drop for Credit {
         self.state.admission_changed.notify_all();
     }
 }
+#[cfg(test)]
 pub(super) struct AdmissionPause(Arc<State>);
+#[cfg(test)]
 impl Drop for AdmissionPause {
     fn drop(&mut self) {
         let _retained = self.0.retained.lock();
@@ -857,12 +843,14 @@ enum ReadCommand {
     /// Test barrier: the actor clears `wake_pending[node]` when it takes this.
     #[cfg(test)]
     Wake,
+    #[cfg(test)]
     DrainLive(mpsc::SyncSender<Result<(), String>>),
     EvictRetirement(Arc<RetirementEviction>),
 }
 
 enum LiveLaneCommand {
     Request(Request),
+    #[cfg(test)]
     Drain(mpsc::SyncSender<Result<(), String>>),
     EvictRetirement(Arc<RetirementEviction>),
 }
@@ -1118,6 +1106,8 @@ fn drive_live_reads(
                 request.complete_nvme(Err(LocalDbError::new("live read worker stopped")));
                 None
             }
+            // `offer` sends only `Request`. The test-only `Drain` and the
+            // actor's own `EvictRetirement` never pass through it.
             Err(_) => None,
         }
     }
@@ -1249,6 +1239,7 @@ fn drive_live_reads(
             }
             #[cfg(test)]
             ReadCommand::Wake => state.wake_pending[node].store(false, Ordering::Release),
+            #[cfg(test)]
             ReadCommand::DrainLive(reply) => {
                 for lane in &inboxes {
                     // Release: publish the drain before the worker can receive it.
@@ -1367,14 +1358,6 @@ impl ReadService {
             self.test_timeout_ns.store(nanos, Ordering::Relaxed);
         }
     }
-    pub(super) fn resolution_monitor(&self) -> Option<ReadProfileMonitor> {
-        self.state
-            .coordinator_diagnostics
-            .enabled()
-            .then(|| ReadProfileMonitor {
-                state: self.state.clone(),
-            })
-    }
 }
 struct BatchSubscription {
     signal: Arc<BatchSignal>,
@@ -1383,7 +1366,6 @@ struct BatchSubscription {
 pub(crate) struct ReadRequest {
     parts: SmallVec<[(Arc<ReadFlight>, usize); 1]>,
     credit: Arc<Credit>,
-    admitted: Instant,
     /// Longest wait between health and deadline rechecks.
     timeout: Duration,
     trace: Option<ReadTraceChild>,
@@ -1523,25 +1505,6 @@ impl ReadService {
         LocalDbError::new(BACKPRESSURE)
     }
 
-    /// Plan of one member kept across admission retries of a blocking caller;
-    /// released credit never recomputes it.
-    fn cached_plan<'a>(
-        &self,
-        cached: &'a mut Option<CachedPlan>,
-        position: &VersionPosition,
-    ) -> Result<PlannedMembers<'a>, LocalDbError> {
-        let plan = match cached.take() {
-            Some(plan) => plan,
-            None => CachedPlan {
-                member: [self.plan_member(position)?],
-            },
-        };
-        let plan = cached.insert(plan);
-        Ok(PlannedMembers {
-            members: &plan.member,
-        })
-    }
-
     const FLIGHT_SLOT_BYTES: usize = std::mem::size_of::<Weak<ReadFlight>>()
         + std::mem::size_of::<ReadFlight>()
         + std::mem::size_of::<FlightCompletion>()
@@ -1604,7 +1567,6 @@ impl ReadService {
             live_read_submissions: AtomicU64::new(0),
             diagnostics: ReadDiagnostics::default(),
             trace: Arc::new(ReadTrace::default()),
-            coordinator_diagnostics: CoordinatorResolutionDiagnostics::default(),
             owner_diagnostics: config
                 .endpoints
                 .iter()
@@ -1700,6 +1662,7 @@ impl ReadService {
         }
         Ok(service)
     }
+    #[cfg(test)]
     fn pause_idle_nvmeof(&self, allow_failed: bool) -> Result<AdmissionPause, LocalDbError> {
         let retained = self.state.retained.lock();
         if (!allow_failed && self.failed()) || self.state.stopped.load(Ordering::Acquire) {
@@ -1756,6 +1719,7 @@ impl ReadService {
     /// Pause new admissions and retire every lane's cached live file grants.
     /// Outstanding callers receive an explicit retryable error instead of
     /// relinquishing their read/cut pins on their behalf.
+    #[cfg(test)]
     pub(super) fn pause_live_for_retirement(&self) -> Result<AdmissionPause, LocalDbError> {
         let pause = self.pause_idle_nvmeof(false)?;
         let lanes = self.lanes.read().iter().map(Vec::len).sum::<usize>();
@@ -1998,7 +1962,6 @@ impl ReadService {
         context: ReadContext,
         planned: Option<PlannedMembers<'_>>,
     ) -> Result<ReadRequest, LocalDbError> {
-        let admitted = Instant::now();
         let timeout = self.timeout();
         let ReadContext { trace } = context;
         if let Some(trace) = &trace {
@@ -2246,7 +2209,6 @@ impl ReadService {
         Ok(ReadRequest {
             parts,
             credit,
-            admitted,
             timeout,
             trace,
             subscription: None,

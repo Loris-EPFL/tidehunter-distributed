@@ -32,9 +32,7 @@ use super::storage::{LocalDbError, LocalDbStats, LocalInventoryConfig};
 use super::tcp::checkpoint::CheckpointPositionProof;
 use super::tcp::{Client, OwnerGenerationState, TlsFiles};
 use super::types::{BatchId, BatchVersion, MutationVersion};
-use super::write_timeline::{
-    CheckpointPressure, WriteTimeline, WriteTimelineSample, WriteTimelineStage, WriteWait,
-};
+use super::write_timeline::{WriteTimeline, WriteTimelineSample, WriteTimelineStage, WriteWait};
 use crate::key_shape::{KeyShape, KeySpace};
 use crate::lock::DbLock;
 use crate::metrics::Metrics;
@@ -43,7 +41,6 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -58,7 +55,6 @@ mod authority_lifecycle;
 pub(crate) use authority_lifecycle::drop_db;
 pub use authority_lifecycle::{AuthorityLifecycle, OwnerControlConfig};
 mod concurrent;
-mod coordinator_profile;
 mod dead_wal_files;
 mod r1_events;
 mod relocation;
@@ -66,13 +62,10 @@ pub use concurrent::ConcurrentRemoteDatabase;
 #[cfg(feature = "experimental-fabric")]
 pub use concurrent::FabricProviderEvidence;
 pub use concurrent::LiveFinalShutdownEvidence;
-use coordinator_profile::{CoordinatorResolutionDiagnostics, ResolutionSample};
-pub use coordinator_profile::{CoordinatorResolutionSnapshot, CoordinatorResolutionStage};
 pub(crate) use relocation::RelocationReport;
 #[cfg(feature = "test_methods")]
 pub(crate) use relocation::{CallbackDecision, RelocationGate};
 mod durable_cut;
-pub use concurrent::{HardWaitSnapshot, WaitReasonTotals};
 pub use coordinator_io::{
     CoordinatorIoSnapshot, FileIo, coordinator_io_snapshot, diagnostics_clock_ns,
     set_coordinator_allocation_accounting,
@@ -86,9 +79,7 @@ use fencing_generations::GenerationState;
 pub(crate) mod pending_read;
 pub(crate) use pending_read::ReadTraceChild;
 pub use pending_read::ReadTraceSnapshot;
-mod replay_limits;
 mod write_core;
-pub use replay_limits::ReplayLimits;
 use write_core::completion::{AppendCompletion, GroupCompletion, WorkerAccounting};
 use write_core::owner_queue::OwnerQueue;
 use write_core::owner_sender::{OrderedCommand, OwnerSender};
@@ -110,7 +101,6 @@ pub use snapshots::{RemoteReadProfile, ShutdownStats};
 
 pub const BACKEND_ID: &str = "tidehunter-tcp-rf1";
 const MANIFEST: &str = "tcp-database-authority-v1";
-const MAX_CHECKPOINT_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
@@ -137,9 +127,6 @@ pub struct RemoteDatabaseConfig {
     pub max_index_bytes: usize,
     pub max_pending_batches: usize,
     pub max_pending_bytes: usize,
-    /// Background checkpoint trigger.
-    #[serde(default)]
-    pub replay_limits: ReplayLimits,
     /// Queued and active append commands per owner; one transport slot is reserved for control.
     #[serde(default = "default_owner_append_occupancy")]
     pub owner_append_occupancy: usize,
@@ -398,7 +385,6 @@ impl RemoteDatabaseConfig {
                 }
             }
         }
-        self.replay_limits.validate().map_err(LocalDbError::new)?;
         validate_owner_occupancy(self.owner_append_occupancy).map_err(LocalDbError::new)?;
         if self
             .live_nvme
@@ -453,21 +439,6 @@ impl RemoteDatabaseConfig {
                 .validate()
                 .map_err(LocalDbError::component)?;
         }
-        if !checkpoint_metadata_fits(self.endpoints.len(), 0) {
-            return Err(LocalDbError::new(
-                "checkpoint epoch inventory exceeds metadata budget",
-            ));
-        }
-        if !checkpoint_metadata_fits(
-            self.endpoints.len(),
-            self.replay_limits
-                .max_batches
-                .min(self.max_admitted_batches),
-        ) {
-            return Err(LocalDbError::new(
-                "replay suffix exceeds checkpoint metadata capacity",
-            ));
-        }
         self.recovery_page_limit()?;
         Ok(())
     }
@@ -519,8 +490,6 @@ struct AuthorityManifest {
     mode: AuthorityMode,
     endpoints: Vec<RemoteEndpoint>,
     shape_yaml: String,
-    #[serde(default = "ReplayLimits::legacy")]
-    replay_limits: ReplayLimits,
     /// The data-plane mode and initiator identity survive authority reopen.
     #[serde(default)]
     live_nvme_identity: Option<(String, [u8; 16])>,
@@ -532,21 +501,10 @@ struct AuthorityManifest {
     generations: Vec<AuthorityGeneration>,
     /// Excluded generation whose owner trims are not all acknowledged yet.
     trim_pending: Option<u64>,
-    /// In-memory only: the trim the next checkpoint adopts with its root.
-    #[serde(skip)]
-    adopt_trim: Option<u64>,
     /// Adopted relocation callback starts, ascending by `(partition,
     /// generation)`; they only rise (`callback_starts`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     callback_starts: Vec<CallbackStart>,
-    #[serde(default)]
-    checkpoint: Option<CheckpointCommit>,
-    /// Ownership is reserved durably before any checkpoint output is created.
-    #[serde(default)]
-    checkpoint_staging: Option<CheckpointFiles>,
-    /// Previous committed files, removable only after the new root is durable.
-    #[serde(default)]
-    checkpoint_obsolete: Option<CheckpointCommit>,
     lifecycle: Option<AuthorityLifecycle>,
     owner_control: Option<OwnerControlConfig>,
 }
@@ -631,57 +589,14 @@ fn new_authority_manifest(config: &RemoteDatabaseConfig, shape_yaml: &str) -> Au
         },
         endpoints: config.endpoints.clone(),
         shape_yaml: shape_yaml.to_owned(),
-        replay_limits: config.replay_limits,
         live_nvme_identity: Some((config.live_nvme.host_nqn.clone(), config.live_nvme.host_id)),
         live_nvme_owner_identities: config.live_nvme.owner_identities.clone(),
         next_generation: 1,
         generations: Vec::new(),
         trim_pending: None,
-        adopt_trim: None,
         callback_starts: Vec::new(),
-        checkpoint: None,
-        checkpoint_staging: None,
-        checkpoint_obsolete: None,
         lifecycle: None,
         owner_control: None,
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckpointFiles {
-    epoch: u64,
-    generation: u64,
-    index_files: Vec<String>,
-}
-impl CheckpointFiles {
-    fn names(&self) -> Vec<String> {
-        let mut names = vec![
-            format!("index-{}-{}.snapshot", self.epoch, self.generation),
-            format!("checkpoint-{}-{}.metadata", self.epoch, self.generation),
-            format!(
-                ".checkpoint-{}-{}.metadata.pending",
-                self.epoch, self.generation
-            ),
-        ];
-        names.extend(self.index_files.iter().cloned());
-        names
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckpointCommit {
-    epoch: u64,
-    generation: u64,
-    metadata_bytes: u64,
-    metadata_digest: [u8; 32],
-    index_files: Vec<String>,
-}
-impl CheckpointCommit {
-    fn metadata_name(&self) -> String {
-        format!("checkpoint-{}-{}.metadata", self.epoch, self.generation)
-    }
-    fn index_name(&self) -> String {
-        format!("index-{}-{}.snapshot", self.epoch, self.generation)
     }
 }
 
@@ -704,7 +619,7 @@ struct RecentReceipt {
 
 /// R1 durable callback cursor of one stream: the next relocation scan of
 /// `(partition, fencing_generation)` starts at file-aligned offset `from`.
-/// Monotone across adopted Exact roots; never an owner replay cursor.
+/// Monotone across adopted cursors; never an owner replay cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CallbackStart {
     partition: u32,
@@ -895,107 +810,12 @@ pub struct AuthorityWriteStats {
     pub admission_exclusive_lock_max_ns: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct CheckpointDiagnostic {
-    pub cursor: u64,
-    pub epoch: u64,
-    pub generation: Option<u64>,
-    pub checkpoint_generation: Option<u64>,
-    pub trigger: Option<CheckpointTrigger>,
-    pub requested_cut: Option<MutationVersion>,
-    pub captured_cut: Option<MutationVersion>,
-    pub captured_batches: Option<usize>,
-    pub captured_bytes: Option<usize>,
-    pub reserved_index_bytes_before: usize,
-    pub reserved_index_bytes_after: usize,
-    pub pressure_wait_ns: Option<u64>,
-    pub drain_ns: Option<u64>,
-    pub existing_capture_wait_ns: Option<u64>,
-    pub new_capture_wait_ns: Option<u64>,
-    pub staging_manifest_ns: Option<u64>,
-    pub node_prefix_wait_ns: Option<u64>,
-    pub index_prepare_ns: Option<u64>,
-    pub index_persist_ns: Option<u64>,
-    pub metadata_install_ns: Option<u64>,
-    pub root_adoption_ns: Option<u64>,
-    pub owner_adoption_ns: Option<u64>,
-    pub obsolete_cleanup_ns: Option<u64>,
-    pub outcome: Option<CheckpointProgressOutcome>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum CheckpointTrigger {
-    Tail,
-    KnownIdentities,
-    PartitionWindow,
-    IndexReservation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum CheckpointProgressOutcome {
-    AlreadyAvailable,
-    AfterDrain,
-    AfterExistingCapture,
-    AfterNewCapture,
-    CapacityError,
-    ProgressError,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CheckpointDiagnosticsSnapshot {
-    pub next_cursor: u64,
-    pub dropped_records: u64,
-    pub records: Vec<CheckpointDiagnostic>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CheckpointDiagnosticSummary {
-    pub available: bool,
-    pub records: u64,
-    pub dropped_records: u64,
-    pub pressure_wait_ns: u64,
-    pub pressure_wait_count: u64,
-    pub drain_ns: u64,
-    pub drain_count: u64,
-    pub existing_capture_wait_ns: u64,
-    pub existing_capture_wait_count: u64,
-    pub new_capture_wait_ns: u64,
-    pub new_capture_wait_count: u64,
-    pub staging_manifest_ns: u64,
-    pub staging_manifest_count: u64,
-    pub node_prefix_wait_ns: u64,
-    pub node_prefix_wait_count: u64,
-    pub index_prepare_ns: u64,
-    pub index_prepare_count: u64,
-    pub index_persist_ns: u64,
-    pub index_persist_count: u64,
-    pub metadata_install_ns: u64,
-    pub metadata_install_count: u64,
-    pub root_adoption_ns: u64,
-    pub root_adoption_count: u64,
-    pub owner_adoption_ns: u64,
-    pub owner_adoption_count: u64,
-    pub obsolete_cleanup_ns: u64,
-    pub obsolete_cleanup_count: u64,
-    pub tail_pressure_count: u64,
-    pub known_identity_pressure_count: u64,
-    pub partition_window_pressure_count: u64,
-    pub index_reservation_pressure_count: u64,
-    pub already_available_count: u64,
-    pub after_drain_relief_count: u64,
-    pub after_existing_capture_relief_count: u64,
-    pub after_new_capture_relief_count: u64,
-    pub capacity_error_count: u64,
-    pub progress_error_count: u64,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteMetricsSnapshot {
     pub authority: AuthorityWriteStats,
     pub pipeline: PipelineStats,
     pub read_cache: ReadCacheStats,
     pub write_profile: WriteProfileSnapshot,
-    pub checkpoint_diagnostics: CheckpointDiagnosticSummary,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1245,10 +1065,6 @@ impl RemoteDatabase {
             ));
         }
         fencing_generations::validate(&manifest)?;
-        manifest
-            .replay_limits
-            .validate()
-            .map_err(LocalDbError::new)?;
         // Use the configured identity for comparisons, and the provisioned
         // per-database identity for actual namespace grants and connections.
         authority_lifecycle::apply_effective_initiators(&mut config);
@@ -1536,13 +1352,6 @@ impl RemoteDatabase {
         let (cut_record, recovered_cut) = cut_plan.finish(epoch, tracked, &owner_fences);
         recovery_stats.recovered_cut = recovered_cut;
         recovery_stats.tail_replay_ns = elapsed(replay_started);
-        // Resolve only durably named cleanup intents before allowing more work.
-        cleanup_checkpoint_artifacts(
-            &path,
-            &mut manifest,
-            false,
-            (CoordinatorIoCategory::Open, CoordinatorIoCategory::Open),
-        )?;
         let mut workers = Vec::new();
         let write_profile = Arc::new(Mutex::new(WriteProfileSnapshot {
             limit_per_connection: config.write_profile_limit,
@@ -1641,11 +1450,9 @@ impl RemoteDatabase {
             return Err(LocalDbError::new("injected interruption after cut record"));
         }
         fencing_generations::mark_served(&mut manifest, epoch)?;
-        // Old suffixes validated against their original durable bound. Only a
-        // fully recovered, not-yet-serving epoch may activate a larger bound.
-        // Before serving, gate DropCells and the Exact callback-start wrapper.
+        // Before serving, gate DropCells and the hybrid index: a binary of an
+        // older format refuses this authority.
         manifest.format = fencing_generations::AUTHORITY_FORMAT;
-        manifest.replay_limits = config.replay_limits;
         persist_manifest(&path, &manifest, CoordinatorIoCategory::Open)?;
         #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::AfterServed)) {
@@ -1657,8 +1464,6 @@ impl RemoteDatabase {
             .enumerate()
             .map(|(i, e)| (e.partition, i))
             .collect();
-        let checkpoint_diagnostics =
-            (config.write_profile_limit != 0).then(|| VecDeque::with_capacity(128));
         let reads = Arc::new(reads);
         let read_cache = Arc::new(ReadCache::new(config.read_cache_bytes));
         let reader = Arc::new(ValueReader::new(
@@ -1745,10 +1550,7 @@ impl RemoteDatabase {
                 // Out-of-window retries are re-applied, as native has no operation
                 // ids; the window fills at publication (owner-accepted weakening).
                 recent: write_core::receipts::ReceiptWindow::new(),
-                stream_last: BTreeMap::new(),
                 positions,
-                committed_complete: Default::default(),
-                committed_streams: Default::default(),
                 callback_starts,
                 published_next: 0,
                 upper: None,
@@ -1756,7 +1558,6 @@ impl RemoteDatabase {
                 range_barrier: None,
                 latest: None,
                 live_latest: None,
-                snapshot_generation: 0,
                 manifest,
                 retained_epochs: histories
                     .into_iter()
@@ -1767,14 +1568,6 @@ impl RemoteDatabase {
                     .collect(),
                 checkpoint_tail_batches: recovery_stats.tail_batches as usize,
                 checkpoint_tail_bytes: recovery_stats.tail_bytes as usize,
-                checkpoint_diagnostic_summary: CheckpointDiagnosticSummary {
-                    available: checkpoint_diagnostics.is_some(),
-                    ..CheckpointDiagnosticSummary::default()
-                },
-                checkpoint_diagnostics,
-                next_checkpoint_diagnostic: 0,
-                dropped_checkpoint_diagnostics: 0,
-                last_checkpoint_diagnostic: None,
             },
             concurrent_failure,
             first_failure,
@@ -2140,31 +1933,6 @@ impl RemoteDatabase {
     pub fn authority_write_stats(&self) -> AuthorityWriteStats {
         self.core.authority_write_stats()
     }
-    pub fn checkpoint_diagnostic_summary(&self) -> CheckpointDiagnosticSummary {
-        self.core.publisher.lock().checkpoint_diagnostic_summary
-    }
-
-    /// Cursor for bounded checkpoint diagnostics. A zero-profile database has
-    /// no diagnostic ring and returns an empty snapshot.
-    pub fn checkpoint_diagnostic_cursor(&self) -> u64 {
-        self.core.publisher.lock().next_checkpoint_diagnostic
-    }
-
-    pub fn checkpoint_diagnostics_since(&self, cursor: u64) -> CheckpointDiagnosticsSnapshot {
-        let publisher = self.core.publisher.lock();
-        CheckpointDiagnosticsSnapshot {
-            next_cursor: publisher.next_checkpoint_diagnostic,
-            dropped_records: publisher.dropped_checkpoint_diagnostics,
-            records: publisher
-                .checkpoint_diagnostics
-                .as_ref()
-                .into_iter()
-                .flat_map(|records| records.iter())
-                .filter(|record| record.cursor >= cursor)
-                .copied()
-                .collect(),
-        }
-    }
     /// Arm fresh bounded append and checkpoint profiles after warm-up.
     /// Finish any pre-existing checkpoint before resetting the phase counters.
     pub fn arm_write_profile(&self, limit: usize) -> Result<(), LocalDbError> {
@@ -2327,121 +2095,6 @@ impl Drop for RemoteDatabase {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
-}
-
-fn checkpoint_metadata_fits(streams: usize, receipts: usize) -> bool {
-    // Fixed-width bincode: a receipt is 104 bytes; a stream including its
-    // vector header is 84. Charge 128 for each and reserve 1 MiB for schema
-    // and fixed fields (the authority's existing CRC metadata limit). Streams
-    // are the actual retained (owner, generation) pairs, not a lifetime quota.
-    streams
-        .checked_add(receipts)
-        .and_then(|entries| entries.checked_mul(128))
-        .and_then(|bytes| bytes.checked_add(1024 * 1024))
-        .is_some_and(|bytes| bytes as u64 <= MAX_CHECKPOINT_METADATA_BYTES)
-}
-
-/// Returns the unlink directory sync and the cleanup manifest write, counted
-/// under `categories` (names, manifest); both are empty when nothing is staged.
-fn cleanup_checkpoint_artifacts(
-    path: &Path,
-    manifest: &mut AuthorityManifest,
-    _interrupt_after_unlink: bool,
-    categories: (CoordinatorIoCategory, CoordinatorIoCategory),
-) -> Result<(FileIo, FileIo), LocalDbError> {
-    let current = manifest
-        .checkpoint
-        .as_ref()
-        .map(|commit| (commit.epoch, commit.generation));
-    let staged = manifest.checkpoint_staging.as_ref();
-    let obsolete = manifest
-        .checkpoint_obsolete
-        .as_ref()
-        .map(|commit| CheckpointFiles {
-            epoch: commit.epoch,
-            generation: commit.generation,
-            index_files: commit.index_files.clone(),
-        });
-    if staged.is_none() && obsolete.is_none() {
-        return Ok((FileIo::default(), FileIo::default()));
-    }
-    // The CRC-protected ledger names only generations reserved by this authority.
-    // Validate every intent before deleting anything, especially the live root.
-    for (files, retiring) in [(staged, false), (obsolete.as_ref(), true)] {
-        if let Some(files) = files {
-            let identity = (files.epoch, files.generation);
-            // A retiring commit is strictly older than the current root; its
-            // producer may already be trimmed. A staged one must be served.
-            if files.generation == 0
-                || (!retiring && !fencing_generations::is_served(manifest, files.epoch))
-                || if retiring {
-                    current.is_none_or(|current| identity >= current)
-                } else {
-                    current.is_some_and(|current| identity <= current)
-                }
-            {
-                return Err(LocalDbError::new(
-                    "checkpoint cleanup intent conflicts with committed authority",
-                ));
-            }
-            for name in files.names() {
-                if manifest
-                    .checkpoint
-                    .as_ref()
-                    .is_some_and(|current| current.index_files.binary_search(&name).is_ok())
-                {
-                    continue;
-                }
-                if Path::new(&name).components().count() != 1 {
-                    return Err(LocalDbError::new(
-                        "checkpoint cleanup filename is not relative",
-                    ));
-                }
-                match fs::symlink_metadata(path.join(name)) {
-                    Ok(metadata) if metadata.file_type().is_file() => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(LocalDbError::component(error)),
-                    Ok(_) => {
-                        return Err(LocalDbError::new(
-                            "checkpoint cleanup target is not a regular file",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for files in [staged, obsolete.as_ref()].into_iter().flatten() {
-        for name in files.names() {
-            if manifest
-                .checkpoint
-                .as_ref()
-                .is_some_and(|current| current.index_files.binary_search(&name).is_ok())
-            {
-                continue;
-            }
-            match fs::remove_file(path.join(name)) {
-                Ok(()) => {}
-                // An interrupted earlier cleanup may already have unlinked it.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(LocalDbError::component(error)),
-            }
-        }
-    }
-    #[cfg(test)]
-    if _interrupt_after_unlink {
-        return Err(LocalDbError::new(
-            "injected interruption after checkpoint artifact unlink",
-        ));
-    }
-    // Unlink never modifies mapped immutable bytes. Linux keeps existing inode
-    // mappings alive until their last owner drops; names are never reused.
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(LocalDbError::component)?;
-    let names = coordinator_io::record_unlink_sync(categories.0);
-    manifest.checkpoint_staging = None;
-    manifest.checkpoint_obsolete = None;
-    Ok((names, persist_manifest(path, manifest, categories.1)?))
 }
 
 fn persist_manifest(
@@ -3015,6 +2668,8 @@ mod pipeline_tests;
 mod drop_cells_tests;
 #[cfg(test)]
 mod durable_cut_tests;
+#[cfg(test)]
+mod format_gate_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

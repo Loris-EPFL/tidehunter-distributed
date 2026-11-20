@@ -90,7 +90,6 @@ pub struct CheckpointTimelineEvent {
     /// Checkpoint generation, absent for connection-level control events.
     pub generation: Option<u64>,
     pub prefix: Option<usize>,
-    pub pressure: Option<CheckpointPressure>,
 }
 
 /// JSON-only control diagnostics. This type is not part of the owner wire format.
@@ -111,16 +110,6 @@ pub struct ControlTimelineEvent {
     pub envelope_id: u64,
     pub target: ControlTimelineTarget,
     pub success: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CheckpointPressure {
-    pub reason: &'static str,
-    pub batches: usize,
-    pub encoded_bytes: usize,
-    pub max_batches: usize,
-    pub max_encoded_bytes: usize,
-    pub incoming_encoded_bytes: Option<usize>,
 }
 
 /// Already-queued same-epoch append commands ahead of the first control barrier.
@@ -648,34 +637,7 @@ impl WriteTimeline {
                     epoch,
                     generation,
                     prefix,
-                    pressure: None,
                     elapsed_ns: s.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                });
-            }
-        }
-    }
-    pub fn checkpoint_pressure(
-        &self,
-        epoch: u64,
-        generation: Option<u64>,
-        pressure: CheckpointPressure,
-    ) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut() {
-            if s.export.checkpoint_events.len() >= s.export.limit.saturating_mul(64) {
-                s.export.dropped_checkpoint_events += 1;
-            } else {
-                s.export.checkpoint_events.push(CheckpointTimelineEvent {
-                    stage: "admission_pressure",
-                    elapsed_ns: s.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    owner: None,
-                    epoch,
-                    generation,
-                    prefix: None,
-                    pressure: Some(pressure),
                 });
             }
         }
