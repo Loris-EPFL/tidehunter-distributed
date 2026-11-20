@@ -353,6 +353,28 @@ mod tests {
             call.groups[0].events[1].io_token
         );
     }
+    /// A group whose creation meets a held lock is shed and counted exactly
+    /// once, so a caller that sees fewer groups than it submitted can account
+    /// for every missing group with `contention_drops`.
+    #[test]
+    fn contended_group_creation_is_shed_and_counted_once() {
+        let trace = Arc::new(ReadTrace::default());
+        trace.arm(1);
+        let call = trace.begin(1, 3).unwrap();
+        let first = call.child(0, vec![0, 2]).unwrap();
+        let held = trace.inner.lock();
+        assert!(call.child(1, vec![1]).is_none());
+        drop(held);
+        first.event("delivered");
+        call.finish(true);
+        let snapshot = trace.snapshot();
+        let call = &snapshot.calls[0];
+        assert_eq!(call.status, "complete");
+        assert_eq!(call.groups.len(), 1);
+        assert_eq!(call.groups[0].members, [0, 2]);
+        assert_eq!(call.dropped_children, 0);
+        assert_eq!(snapshot.contention_drops, 1);
+    }
     #[test]
     fn byte_budget_drops_calls_and_children() {
         let trace = Arc::new(ReadTrace::default());

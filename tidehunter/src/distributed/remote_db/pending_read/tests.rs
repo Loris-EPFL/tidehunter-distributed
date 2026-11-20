@@ -2,6 +2,8 @@
 use super::*;
 use crate::distributed::remote_db::pipeline_tests::Fixture;
 
+mod trace_tests;
+
 pub(super) fn put(key: u32, value: u8) -> Mutation {
     Mutation::Put {
         keyspace: KeySpace(0),
@@ -348,64 +350,6 @@ fn sampled_owner_profiles_are_attributed_to_configured_partitions() {
 }
 
 #[test]
-fn traced_bulk_call_preserves_owner_and_member_identity() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 0), vec![put(0, 7)])
-        .unwrap();
-    original
-        .write_batch(fixture.operation(1, 1), vec![put(1, 8)])
-        .unwrap();
-    let original = reopen_cold(&fixture, original);
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    db.set_read_profile_limit(1);
-    let trace = db.begin_read_trace(123, 3).unwrap();
-    // Tracing is best effort: an event that meets a held trace lock is shed
-    // and counted in `contention_drops` (read_trace.rs `update`). Measure the
-    // sheds of this call alone.
-    let sheds_before = db.read_trace_snapshot().contention_drops;
-    let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes(), 0u32.to_be_bytes()];
-    let values = db
-        .traced_get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest, Some(&trace), 0)
-        .unwrap();
-    assert!(values.iter().all(|value| value.as_ref().unwrap().is_some()));
-    trace.finish(true);
-    let snapshot = db.read_trace_snapshot();
-    let sheds = snapshot.contention_drops - sheds_before;
-    assert_eq!(snapshot.calls.len(), 1);
-    let call = &snapshot.calls[0];
-    assert_eq!(
-        (call.caller_id, call.members, call.status),
-        (123, 3, "complete")
-    );
-    assert!(call.groups.iter().any(|group| group.members == [0, 2]));
-    assert!(call.groups.iter().any(|group| group.members == [1]));
-    assert_ne!(call.groups[0].owner, call.groups[1].owner);
-    // Every group's delivery event is recorded unless a counted shed took it;
-    // without sheds, every group has it.
-    let missing = call
-        .groups
-        .iter()
-        .filter(|group| {
-            !group
-                .events
-                .iter()
-                .any(|event| event.name == "request_result_delivered")
-        })
-        .count() as u64;
-    assert!(
-        missing <= sheds,
-        "{missing} groups lack request_result_delivered with {sheds} counted sheds"
-    );
-    if sheds == 0 {
-        assert_eq!(missing, 0);
-    }
-    db.shutdown().unwrap();
-}
-
-#[test]
 fn bounded_read_profiles_count_misses_not_hits_absences_or_backpressure() {
     let mut fixture = Fixture::new();
     fixture.config.max_pending_reads = 1;
@@ -718,101 +662,6 @@ fn sui_bulk_accepts_borrowed_keys_with_duplicates() {
     assert_eq!(results[1].as_ref().unwrap(), &None);
     assert_eq!(results[2].as_ref().unwrap(), &value(7));
     db.wait_for_background_threads_to_finish().unwrap();
-}
-
-#[test]
-fn cancelled_batch_keeps_accepted_flight_until_completion() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_lanes = Some(1);
-    fixture.config.read_cache_bytes = 0;
-    let mut db = fixture.open();
-    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
-        .unwrap();
-    let reference = db
-        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
-        .unwrap()
-        .unwrap();
-    let node = db.core.partition_indexes[&reference.batch_address.partition];
-    let lane = db.core.reads.lane_client(node, 0);
-    let held = lane.lock();
-    let mut groups = vec![Vec::new(); db.core.partition_indexes.len()];
-    groups[node].extend([(0, reference), (1, reference)]);
-    let mut batch = ReadBatch::new(&db.core.reads, vec![None; 2], groups).unwrap();
-    db.core.reads.state.trace.arm(2);
-    let trace = db.core.reads.state.trace.begin(91, 2).unwrap();
-    batch
-        .dispatch_traced(&db.core.reads, Some(&trace), 0)
-        .unwrap();
-    let slot = batch.reads[0].1.parts[0].0.slot;
-    drop(batch);
-    drop(trace);
-    assert_eq!(db.core.reads.state.retained.lock().0, 1);
-    drop(held);
-    assert!(
-        db.core.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5))
-    );
-    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
-    let snapshot = db.core.reads.state.trace.snapshot();
-    let call = &snapshot.calls[0];
-    assert_eq!(
-        (call.caller_id, call.status),
-        (91, "cancelled_or_incomplete")
-    );
-    assert!(
-        call.groups[0]
-            .events
-            .iter()
-            .any(|event| event.name == "flight_completed")
-    );
-    assert_eq!(call.groups[0].members, [0, 1]);
-    assert_eq!(db.get(KeySpace(0), &0u32.to_be_bytes()).unwrap(), value(7));
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn traced_fenced_read_records_failure_and_retires_transport() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_lanes = Some(1);
-    fixture.config.read_cache_bytes = 0;
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 0), vec![put(0, 7)])
-        .unwrap();
-    let reference = db
-        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
-        .unwrap()
-        .unwrap();
-    let node = db.core.partition_indexes[&reference.batch_address.partition];
-    let lane = db.core.reads.lane_client(node, 0);
-    let held = lane.lock();
-    db.core.reads.state.trace.arm(1);
-    let trace = db.core.reads.state.trace.begin(92, 1).unwrap();
-    let mut groups = vec![Vec::new(); db.core.partition_indexes.len()];
-    groups[node].push((0, reference));
-    let mut batch = ReadBatch::new(&db.core.reads, vec![None], groups).unwrap();
-    batch
-        .dispatch_traced(&db.core.reads, Some(&trace), 0)
-        .unwrap();
-    let slot = batch.reads[0].1.parts[0].0.slot;
-    fixture.fence_owner(node, db.epoch() + 1);
-    drop(held);
-    assert!(
-        db.core.reads.state.flight_ready[slot].wait_until(Instant::now() + Duration::from_secs(5))
-    );
-    assert!(batch.finish_one().is_err());
-    drop(batch);
-    trace.finish(false);
-    db.core.reads.stop();
-    assert_eq!(*db.core.reads.state.retained.lock(), (0, 0));
-    let snapshot = db.core.reads.state.trace.snapshot();
-    let call = &snapshot.calls[0];
-    assert_eq!((call.caller_id, call.status), (92, "error"));
-    assert!(
-        call.groups[0]
-            .events
-            .iter()
-            .any(|event| event.name == "flight_error")
-    );
-    assert!(db.shutdown().is_err());
 }
 
 #[test]
