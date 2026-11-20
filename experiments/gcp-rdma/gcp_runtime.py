@@ -26,14 +26,31 @@ MACHINE_RAM_MIB = {'z4m-highmem-16': 122_000_000_000 // 2**20,
                    'z4m-highmem-32': 244_000_000_000 // 2**20,
                    'h4d-highmem-192-lssd': 1523712}
 REPLAY_HOST_RESERVE_MIB = 8 * 1024  # Kernel, services, and host page cache.
-REPLAY_CLIENT_TARGET_MIB = 32 * 1024  # P13's 16 GiB client peaks were cap-censored.
+REPLAY_OBSERVED_PEAK_MIB = 16 * 1024  # P13 peaked at its cap; the uncapped peak is unknown.
+REPLAY_CLIENT_TARGET_MIB = 32 * 1024
 
 
-def replay_client_memory_mib(machine_type):
-    ram = MACHINE_RAM_MIB.get(machine_type, 0)
-    if ram <= REPLAY_HOST_RESERVE_MIB:
-        raise RuntimeSafetyError(f'REPLAY_HOST_MEMORY_UNAVAILABLE: {machine_type}')
-    return min(REPLAY_CLIENT_TARGET_MIB, ram - REPLAY_HOST_RESERVE_MIB)
+def replay_client_memory_mib(machine_type, requested=None):
+    available = MACHINE_RAM_MIB.get(machine_type, 0) - REPLAY_HOST_RESERVE_MIB
+    cap = min(REPLAY_CLIENT_TARGET_MIB, available) if requested is None else requested
+    if type(cap) is not int or not REPLAY_OBSERVED_PEAK_MIB < cap <= available:
+        raise RuntimeSafetyError(
+            f'REPLAY_HOST_MEMORY_UNAVAILABLE: {machine_type} replay cap must exceed the '
+            f'{REPLAY_OBSERVED_PEAK_MIB} MiB observed peak and fit the '
+            f'{available} MiB available after host reserve')
+    return cap
+
+
+def admit_replay_memory(policy, jobs, source, machine_type):
+    import replay_memory
+
+    if (not isinstance(policy, dict) or not policy or set(policy) - {'cap_mib', 'workloads'}
+            or ('cap_mib' in policy and type(policy['cap_mib']) is not int)):
+        raise ValueError('replay_memory requires cap_mib and/or a workloads map')
+    if not any(job.get('case_kind') == 'mainnet_replay' for job in jobs):
+        raise ValueError('replay_memory requires a selected mainnet replay workload')
+    cap = replay_client_memory_mib(machine_type, policy.get('cap_mib'))
+    return cap, replay_memory.admit(policy.get('workloads', {}), jobs, source, cap * 1024**2)
 
 
 def qualify_physical_trace(spec):

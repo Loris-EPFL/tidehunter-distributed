@@ -19,6 +19,7 @@ import ack_contract
 import analyze
 from cloud_layout import OWNER_HOST_COUNTS, LOGICAL_OWNER_COUNTS
 import local
+import replay_memory
 import resource_accounting
 import q0_campaign
 from q0_campaign import SELECTION as Q0_SELECTION
@@ -3274,6 +3275,22 @@ def summarize_case(directory, *, local_mode=False):
     admit_durability_tier(job, runtime_options(normalized), result / "manifest.json")
     if job.get("case_kind") == "mainnet_replay":
         admit_replay_summary(normalized, json.loads((result / "summary.json").read_text()))
+        if receipt["status"] == "completed" and not local_mode:
+            if receipt.get("replay_memory") is None:
+                value["status"] = "memory_unqualified"
+            else:
+                binding = receipt["cgroup_memory_evidence"]
+                if binding["path"] != "cgroup-memory.json":
+                    raise ValueError("invalid replay cgroup memory artifact path")
+                artifact = replay_memory.read_artifact(directory / binding["path"], binding["sha256"])
+                admission = artifact["admission"]
+                workload = replay_memory.workload_sha256(job, config["workload"]["manifest_sha256"])
+                memory = replay_memory.assess(artifact, admission)
+                if memory != receipt["replay_memory"] or admission["workload_sha256"] != workload:
+                    raise ValueError("replay memory qualification differs from receipt or workload")
+                value["replay_memory"] = memory
+                if memory["status"] != "qualified":
+                    value["status"] = memory["status"]
     if job["backend"] in NVME_BACKENDS and job.get("nvmeof_route") == "live":
         manifest_path = result / "manifest.json"
         backend_info = json.loads(manifest_path.read_text()).get("backend_info", {}) if manifest_path.is_file() else {}
@@ -3835,6 +3852,12 @@ def report(root):
                     raise ValueError("focused receipt job differs from planned job")
                 if q0_seals is not None and row.get("case_binary") != q0_seals[job["binary_role"]]:
                     raise ValueError("Q0 case receipt binary differs from the fleet matrix")
+                if (memory := row.get("replay_memory")) is not None:
+                    policy = planned["spec"].get("replay_memory", {})
+                    reviewed = policy.get("workloads", {}).get(memory["workload_sha256"], {})
+                    if (memory["qualified_peak_bytes"] != reviewed.get("qualified_peak_bytes")
+                            or ("cap_mib" in policy and memory["cap_bytes"] != policy["cap_mib"] * 1024**2)):
+                        raise ValueError("replay memory receipt differs from the planned admission")
                 results.append(row)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 receipt = json.loads((directory / "receipt.json").read_text())
@@ -3880,6 +3903,7 @@ def report(root):
         "interpretation": ["Common RF1 API experiment, not equivalent HA/transaction/security guarantees.",
             "API-call latency for get_many is the complete ordered group, not latency per key.",
             "OS-cache eviction does not evict engine caches; qualified device intervals, when available, are retained separately.",
+            "Censored, exploratory and memory-unqualified replay rows are not parity evidence.",
             "Live SPDK target direct-file I/O bypasses the target OS page cache; device and controller caches may remain.",
             "TideHunter native owner acknowledgement is a page-cache write with background fsync; compare only to a matching page-cache acknowledgement contract.",
             "Valkey GET is memory-resident even after OS-cache eviction; AOF is write acknowledgment, not a value-WAL-backed read. Synced uses appendfsync always; periodic_sync uses everysec; os_buffered uses no. Neither relaxed mode proves a per-case page-cache write; Valkey page_cache is unsupported.",

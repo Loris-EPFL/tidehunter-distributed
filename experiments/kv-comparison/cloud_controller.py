@@ -52,6 +52,7 @@ import cloud_campaign
 import floors
 import cloud_layout
 import ack_contract as contracts
+import replay_memory
 import local
 import physical_storage
 import rdma_diagnostics
@@ -893,6 +894,21 @@ def dump(path, value):
     guarded(path, path.parent)
     guarded(path.with_suffix(path.suffix + ".tmp"), path.parent)
     local.dump(path, value)
+
+
+def finalize_replay_memory(directory, receipt, admission, drain_proved):
+    try:
+        binding = receipt["cgroup_memory_evidence"]
+        path = directory / binding["path"]
+        artifact = replay_memory.read_artifact(path, binding["sha256"])
+        artifact["measurement_completed"] = drain_proved
+        result = replay_memory.assess(artifact, admission)
+        dump_compact(path, artifact)
+        binding["sha256"] = digest(path)
+        receipt["replay_memory"] = result
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise InfrastructureError(f"CGROUP_MEMORY_INCOMPLETE: {exc}") from exc
+
 
 def dump_compact(path, value):
     path = Path(path).absolute()
@@ -3256,6 +3272,15 @@ class Controller:
     def __init__(self, config, clients, *, clock=time.monotonic, local_mode=None):
         self.local_mode = local_mode
         self.config = validate_config(config) if local_mode is None else local_mode.validate_config(config)
+        self.replay_memory_cap_mib = None
+        self.replay_memory_peaks = {}
+        if local_mode is None and "replay_memory" in config["spec"]:
+            platform = platform_module(config)
+            if platform is None:
+                raise SafetyError("replay_memory qualification requires GCP")
+            self.replay_memory_cap_mib, self.replay_memory_peaks = platform.admit_replay_memory(
+                config["spec"]["replay_memory"], controller_matrix(config["spec"]),
+                config["repository_root"], config["fleet"]["instance_type"])
         self.clients = clients
         self.clock = clock
         deadline = timestamp(config["deadline_utc"])
@@ -4950,6 +4975,7 @@ class Controller:
         cgroup_memory_active = False
         replay_platform = (platform_module(self.config) if self.local_mode is None
                            and job.get("case_kind") == "mainnet_replay" else None)
+        memory_budget = None
         native_wal_start = None
         nvme_trace_attempted = False
         nvme_trace_stopped = False
@@ -5007,8 +5033,11 @@ class Controller:
                 timeout=60, export=True)
             measurements = [row for row in evidence if not row.get("inactive")]
             artifact = {"client": measurements[0], "owners": measurements[1:]}
+            if memory_budget is not None:
+                artifact["admission"] = memory_budget
+                artifact["measurement_completed"] = False
             path = directory / "cgroup-memory.json"
-            dump(path, artifact)
+            dump_compact(path, artifact)
             receipt["cgroup_memory_evidence"] = {"path": path.name, "sha256": digest(path)}
             cgroup_memory_active = False
             return [row for row in measurements if row.get("available") is not True]
@@ -5154,7 +5183,11 @@ class Controller:
             except (RuntimeError, ValueError, KeyError) as exc:
                 raise SafetyError("typed configuration admission failed: " + str(exc)) from exc
             if replay_platform:
-                budget["memory_mib"] = replay_platform.replay_client_memory_mib(self.config["fleet"]["instance_type"])
+                budget["memory_mib"] = self.replay_memory_cap_mib or replay_platform.replay_client_memory_mib(
+                    self.config["fleet"]["instance_type"])
+                workload = replay_memory.workload_sha256(job, config["workload"]["manifest_sha256"])
+                memory_budget = {"workload_sha256": workload, "cap_bytes": budget["memory_mib"] * 1024**2,
+                                 "qualified_peak_bytes": self.replay_memory_peaks.get(workload)}
             dump(directory / "client-budget.json", budget)
             if live_case:
                 live_observation_attempted = True
@@ -5251,6 +5284,11 @@ class Controller:
                         {"action": "thread_cpu_start", "case_id": job["case_id"]},
                         case=job["case_id"], owner_count=0 if job["backend"] == "native" else owner_count, timeout=60)
                 if replay_platform:
+                    limit = process_before.get("cgroup", {}).get("memory.max", "").strip()
+                    if limit != str(memory_budget["cap_bytes"]):
+                        raise InfrastructureError(
+                            f"CGROUP_MEMORY_UNAVAILABLE: client memory.max={limit!r} "
+                            f"does not match admitted cap {memory_budget['cap_bytes']}")
                     cgroup_memory_active = True
                     samplers = self.all_hosts({"action": "cgroup_memory_start", "case_id": job["case_id"]},
                         case=job["case_id"], owner_count=0 if backend == "native" else owner_count, timeout=60)
@@ -5544,6 +5582,8 @@ class Controller:
                 path = directory / "block_trace_evidence.json"
                 dump(path, evidence)
                 receipt["block_trace_evidence"] = {"path": path.name, "sha256": digest(path)}
+            if memory_budget is not None:
+                finalize_replay_memory(directory, receipt, memory_budget, drain_proved)
             receipt["status"] = "completed"
         except Exception as exc:
             primary = None

@@ -159,14 +159,21 @@ def memory_snapshot(cgroup):
     observed_monotonic_ns = time.monotonic_ns()
     events = {}
     for line in (cgroup / 'memory.events').read_text().splitlines():
-        name, value = line.split()
-        events[name] = int(value)
+        name, raw = line.split()
+        value = int(raw)
+        if name in events or value < 0:
+            raise ValueError(f'invalid {cgroup / "memory.events"} counter: {name}')
+        events[name] = value
+    if not {'max', 'high', 'oom'} <= events.keys():
+        raise ValueError(f'{cgroup / "memory.events"} lacks required pressure counters')
     current = int((cgroup / 'memory.current').read_text())
     limit = (cgroup / 'memory.max').read_text().strip()
     try:
         peak = int((cgroup / 'memory.peak').read_text())
     except FileNotFoundError:
         peak = None  # Older cgroup-v2 kernels may not expose memory.peak.
+    if current < 0 or (peak is not None and peak < 0):
+        raise ValueError(f'invalid memory byte count for {cgroup}')
     return {'observed_unix_ns': observed_unix_ns, 'observed_monotonic_ns': observed_monotonic_ns,
             'memory.events': events, 'memory.current': current,
             'memory.max': limit if limit == 'max' else int(limit), 'memory.peak': peak}

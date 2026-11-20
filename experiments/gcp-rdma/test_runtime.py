@@ -98,8 +98,16 @@ class TraceAndReplayPolicyTests(unittest.TestCase):
         self.assertEqual(runtime.replay_client_memory_mib('z4m-highmem-32'), 32 * 1024)
         with patch.dict(runtime.MACHINE_RAM_MIB, {'small-vm': 28 * 1024}):
             self.assertEqual(runtime.replay_client_memory_mib('small-vm'), 20 * 1024)
+        with patch.dict(runtime.MACHINE_RAM_MIB, {'no-headroom': 24 * 1024}):
+            with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'must exceed'):
+                runtime.replay_client_memory_mib('no-headroom')
         with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'REPLAY_HOST_MEMORY_UNAVAILABLE'):
             runtime.replay_client_memory_mib('unknown')
+        job = {'case_kind': 'mainnet_replay'}
+        self.assertEqual(runtime.admit_replay_memory({'cap_mib': 48 * 1024}, [job], None,
+                                                     'z4m-highmem-16'), (48 * 1024, {}))
+        with self.assertRaisesRegex(runtime.RuntimeSafetyError, 'after host reserve'):
+            runtime.admit_replay_memory({'cap_mib': 128 * 1024}, [job], None, 'z4m-highmem-16')
 
 
 class SelectedBackendRuntimeTests(unittest.TestCase):

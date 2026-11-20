@@ -384,6 +384,11 @@ def _reviewed_jobs(spec):
     if not isinstance(spec, dict) or spec.get("selection") not in (
             "nvmeof_p13_write_engine", REDRAIN_AB_SELECTION):
         spec = reviewed_window_spec(spec)
+    # The sealed package separately admits this evidence and cap, not a matrix edit.
+    if isinstance(spec, dict) and 'replay_memory' in spec:
+        if not isinstance(spec['replay_memory'], dict) or not spec['replay_memory']:
+            raise ValueError('invalid replay_memory policy')
+        spec = {key: value for key, value in spec.items() if key != 'replay_memory'}
     if isinstance(spec, dict) and 'machine_type' in spec:
         if spec['machine_type'] not in MACHINE_RATE_NANODOLLARS:
             raise ValueError('unreviewed machine type')
@@ -498,6 +503,9 @@ def _admit_package(package_dir, revision, spec):
             or any(receipt.get(field) != verified[field] for field in fields)
             or receipt.get('nvmet_fix') != verified.get('nvmet_fix')):
         raise ValueError('package receipt does not bind the source, binary and ABI')
+    if 'replay_memory' in spec:
+        gcp_runtime.admit_replay_memory(spec['replay_memory'], _reviewed_jobs(spec), root / 'source',
+                                        spec.get('machine_type', 'z4m-highmem-16'))
     archive = root / 'bundle.tar.gz'
     if archive.stat().st_size > 512 * 1024 * 1024 or campaign.file_sha256(archive) != receipt.get('sha256'):
         raise ValueError('runtime archive checksum or size mismatch')

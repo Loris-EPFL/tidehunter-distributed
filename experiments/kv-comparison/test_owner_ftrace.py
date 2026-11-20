@@ -87,7 +87,7 @@ class OwnerFtraceTests(unittest.TestCase):
             cgroup.mkdir()
             (cgroup / 'memory.current').write_text('120\n')
             (cgroup / 'memory.max').write_text('200\n')
-            (cgroup / 'memory.events').write_text('max 0\noom 0\n')
+            (cgroup / 'memory.events').write_text('max 0\nhigh 0\noom 0\n')
             (cgroup / 'memory.peak').write_text('125\n')
             elapsed = 0.0
 
@@ -96,7 +96,7 @@ class OwnerFtraceTests(unittest.TestCase):
                 elapsed += interval
                 if elapsed >= 1:
                     (cgroup / 'memory.current').write_text('150\n')
-                    (cgroup / 'memory.events').write_text('max 3\noom 0\n')
+                    (cgroup / 'memory.events').write_text('max 3\nhigh 0\noom 0\n')
                     (cgroup / 'memory.peak').write_text('199\n')
                 if elapsed >= 1.5:
                     (root / 'cgroup-memory.stop').touch()
@@ -126,6 +126,16 @@ class OwnerFtraceTests(unittest.TestCase):
             self.assertEqual(data['samples'], [])
             self.assertIsNone(data['sampled_peak_bytes'])
             self.assertIn('memory.events', data['reason'])
+
+    def test_cgroup_memory_does_not_start_with_incomplete_pressure_counters(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / 'memory.events').write_text('max 0\noom 0\n')
+            owner_ftrace.sample_memory(root, root, duration_seconds=1)
+            self.assertFalse((root / 'cgroup-memory.ready').exists())
+            data = json.loads((root / 'cgroup-memory.json').read_text())
+            self.assertFalse(data['available'])
+            self.assertIn('lacks required pressure counters', data['reason'])
 
     def test_missing_events_and_failed_start_remove_instance(self):
         with tempfile.TemporaryDirectory() as root:
