@@ -42,12 +42,11 @@ struct Memory {
 /// All-zero bytes must be a valid `T`.
 unsafe fn zeroed_array<T>(len: usize) -> NonNull<T> {
     let mut array = Box::<[T]>::new_uninit_slice(len);
-    // SAFETY: the allocation holds exactly `len` elements and zero is valid by
-    // this function's contract.
-    let array = unsafe {
-        array.as_mut_ptr().write_bytes(0, len);
-        array.assume_init()
-    };
+    // SAFETY: the allocation holds exactly `len` elements and all-zero bytes
+    // are a valid `T` by this function's contract.
+    unsafe { array.as_mut_ptr().write_bytes(0, len) };
+    // SAFETY: every one of the `len` elements is now initialized.
+    let array = unsafe { array.assume_init() };
     // SAFETY: Box::into_raw never returns null.
     unsafe { NonNull::new_unchecked(Box::into_raw(array).cast()) }
 }
@@ -66,15 +65,20 @@ unsafe fn release_array<T>(ptr: NonNull<T>, len: usize) {
 impl Memory {
     fn new(slots: usize) -> Self {
         debug_assert!((1..=MAX_SLOTS).contains(&slots));
-        // SAFETY: byte arrays and fi_context2 (raw-pointer fields) are valid all-zero.
-        unsafe {
-            Self {
-                slots,
-                tx: zeroed_array(slots),
-                rx: zeroed_array(slots),
-                tx_context: zeroed_array(slots),
-                rx_context: zeroed_array(slots),
-            }
+        // SAFETY: the TX byte arrays are valid all-zero.
+        let tx = unsafe { zeroed_array(slots) };
+        // SAFETY: the RX byte arrays are valid all-zero.
+        let rx = unsafe { zeroed_array(slots) };
+        // SAFETY: fi_context2 holds raw pointers, valid all-zero.
+        let tx_context = unsafe { zeroed_array(slots) };
+        // SAFETY: fi_context2 holds raw pointers, valid all-zero.
+        let rx_context = unsafe { zeroed_array(slots) };
+        Self {
+            slots,
+            tx,
+            rx,
+            tx_context,
+            rx_context,
         }
     }
 
@@ -138,15 +142,19 @@ impl Default for Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        // SAFETY: Each pointer and self.slots are the original zeroed_array pair,
-        // released once. Endpoint drops registered memory only after all handles
-        // close; failed close retains Resources and these allocations.
-        unsafe {
-            release_array(self.tx, self.slots);
-            release_array(self.rx, self.slots);
-            release_array(self.tx_context, self.slots);
-            release_array(self.rx_context, self.slots);
-        }
+        // SAFETY: `self.tx` with `self.slots` is the original zeroed_array
+        // pair; drop runs only after all handles close, so no provider access
+        // to the memory remains.
+        unsafe { release_array(self.tx, self.slots) };
+        // SAFETY: `self.rx` with `self.slots` is the original zeroed_array
+        // pair; no provider access remains at teardown.
+        unsafe { release_array(self.rx, self.slots) };
+        // SAFETY: `self.tx_context` with `self.slots` is the original
+        // zeroed_array pair; no provider access remains at teardown.
+        unsafe { release_array(self.tx_context, self.slots) };
+        // SAFETY: `self.rx_context` with `self.slots` is the original
+        // zeroed_array pair; no provider access remains at teardown.
+        unsafe { release_array(self.rx_context, self.slots) };
     }
 }
 
@@ -275,32 +283,59 @@ impl Info {
         if hints.0.is_null() {
             return Err(error("allocate fabric hints", ffi::FI_ENOMEM));
         }
-        // SAFETY: fi_allocinfo initializes all nested attribute allocations.
-        // strdup gives ownership of matching C-allocator strings to fi_freeinfo.
-        unsafe {
-            (*(*hints.0).ep_attr).type_ = ffi::fi_ep_type_FI_EP_RDM;
-            (*hints.0).caps = u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV;
-            (*hints.0).mode = ffi::FI_CONTEXT;
-            (*(*hints.0).domain_attr).threading = ffi::fi_threading_FI_THREAD_DOMAIN;
-            (*(*hints.0).domain_attr).__bindgen_anon_1.data_progress =
-                ffi::fi_progress_FI_PROGRESS_MANUAL;
-            let requested_mr_modes = if provider.to_bytes() == b"verbs;ofi_rxm" {
-                ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
-            } else {
-                ffi::FI_MR_LOCAL
-            };
-            (*(*hints.0).domain_attr).mr_mode = abi(requested_mr_modes);
-            (*(*hints.0).tx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
-            (*(*hints.0).rx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS);
-            (*(*hints.0).fabric_attr).prov_name = libc::strdup(provider.as_ptr());
-            if (*(*hints.0).fabric_attr).prov_name.is_null() {
-                return Err(error("allocate provider name", ffi::FI_ENOMEM));
-            }
-            if !domain.to_bytes().is_empty() {
-                (*(*hints.0).domain_attr).name = libc::strdup(domain.as_ptr());
-                if (*(*hints.0).domain_attr).name.is_null() {
-                    return Err(error("allocate domain name", ffi::FI_ENOMEM));
-                }
+        // SAFETY: fi_allocinfo returned a non-null, initialized fi_info that
+        // hints owns; reading its ep_attr pointer field is in bounds.
+        let ep_attr = unsafe { (*hints.0).ep_attr };
+        // SAFETY: ep_attr points at the endpoint attribute fi_allocinfo
+        // created and keeps live with this fi_info.
+        unsafe { (*ep_attr).type_ = ffi::fi_ep_type_FI_EP_RDM };
+        // SAFETY: same owned, initialized fi_info; the caps field is a u64.
+        unsafe { (*hints.0).caps = u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV };
+        // SAFETY: same owned, initialized fi_info; the mode field is a u64.
+        unsafe { (*hints.0).mode = ffi::FI_CONTEXT };
+        // SAFETY: same owned fi_info; reading the domain_attr pointer field.
+        let domain_attr = unsafe { (*hints.0).domain_attr };
+        // SAFETY: domain_attr points at the domain attribute fi_allocinfo
+        // created and keeps live with this fi_info; nothing else references it.
+        let domain_attr = unsafe { &mut *domain_attr };
+        domain_attr.threading = ffi::fi_threading_FI_THREAD_DOMAIN;
+        // fi_allocinfo initialized this union as fi_progress; a union field
+        // write is a safe operation and every integer value is a valid one.
+        domain_attr.__bindgen_anon_1.data_progress = ffi::fi_progress_FI_PROGRESS_MANUAL;
+        let requested_mr_modes = if provider.to_bytes() == b"verbs;ofi_rxm" {
+            ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
+        } else {
+            ffi::FI_MR_LOCAL
+        };
+        // The same exclusive domain attribute reference; mr_mode is an i32 field.
+        domain_attr.mr_mode = abi(requested_mr_modes);
+        // SAFETY: same owned fi_info; reading the tx_attr pointer field.
+        let tx_attr = unsafe { (*hints.0).tx_attr };
+        // SAFETY: tx_attr points at the TX attribute fi_allocinfo created.
+        unsafe { (*tx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS) };
+        // SAFETY: same owned fi_info; reading the rx_attr pointer field.
+        let rx_attr = unsafe { (*hints.0).rx_attr };
+        // SAFETY: rx_attr points at the RX attribute fi_allocinfo created.
+        unsafe { (*rx_attr).msg_order = u64::from(ffi::FI_ORDER_SAS) };
+        // SAFETY: same owned fi_info; reading the fabric_attr pointer field.
+        let fabric_attr = unsafe { (*hints.0).fabric_attr };
+        // SAFETY: `provider` is a live NUL-terminated C string; strdup copies
+        // it and hands the C-allocator result to fi_freeinfo with these hints.
+        let prov_name = unsafe { libc::strdup(provider.as_ptr()) };
+        // SAFETY: fabric_attr points at the fabric attribute fi_allocinfo
+        // created; storing the strdup result transfers ownership to Info.
+        unsafe { (*fabric_attr).prov_name = prov_name };
+        if prov_name.is_null() {
+            return Err(error("allocate provider name", ffi::FI_ENOMEM));
+        }
+        if !domain.to_bytes().is_empty() {
+            // SAFETY: `domain` is a live NUL-terminated C string; strdup hands
+            // the C-allocator result to fi_freeinfo with these hints.
+            let name = unsafe { libc::strdup(domain.as_ptr()) };
+            // Storing the strdup result transfers its ownership to Info.
+            domain_attr.name = name;
+            if name.is_null() {
+                return Err(error("allocate domain name", ffi::FI_ENOMEM));
             }
         }
         Ok(hints)
@@ -325,56 +360,67 @@ fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
     }
 }
 fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
-    // SAFETY: Callers keep the fi_getinfo result and its source allocation live.
+    // Callers keep the fi_getinfo result and its source allocation live.
     // Format, length and null checks bound each read; read_unaligned does not
     // require the provider's sockaddr pointer to have Rust alignment.
-    unsafe {
-        match info.addr_format {
-            ffi::FI_SOCKADDR_IN
-                if info.src_addrlen >= mem::size_of::<libc::sockaddr_in>()
-                    && !info.src_addr.is_null() =>
-            {
-                let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>());
+    match info.addr_format {
+        ffi::FI_SOCKADDR_IN
+            if info.src_addrlen >= mem::size_of::<libc::sockaddr_in>()
+                && !info.src_addr.is_null() =>
+        {
+            // SAFETY: the guard bounds src_addrlen by sockaddr_in and src_addr
+            // is non-null; read_unaligned needs no Rust alignment.
+            let address = unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>()) };
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                address.sin_addr.s_addr.to_ne_bytes(),
+            )))
+        }
+        ffi::FI_SOCKADDR_IN6
+            if info.src_addrlen >= mem::size_of::<libc::sockaddr_in6>()
+                && !info.src_addr.is_null() =>
+        {
+            // SAFETY: the guard bounds src_addrlen by sockaddr_in6 and
+            // src_addr is non-null; read_unaligned needs no Rust alignment.
+            let address =
+                unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>()) };
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                address.sin6_addr.s6_addr,
+            )))
+        }
+        ffi::FI_SOCKADDR
+            if info.src_addrlen >= mem::size_of::<libc::sockaddr>() && !info.src_addr.is_null() =>
+        {
+            // SAFETY: the guard bounds src_addrlen by sockaddr and src_addr
+            // is non-null; read_unaligned needs no Rust alignment.
+            let family =
+                unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr>()) }.sa_family;
+            if i32::from(family) == libc::AF_INET {
+                if info.src_addrlen < mem::size_of::<libc::sockaddr_in>() {
+                    return None;
+                }
+                // SAFETY: the family check and src_addrlen bound this
+                // sockaddr_in read; read_unaligned needs no Rust alignment.
+                let address =
+                    unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>()) };
                 Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
                     address.sin_addr.s_addr.to_ne_bytes(),
                 )))
-            }
-            ffi::FI_SOCKADDR_IN6
-                if info.src_addrlen >= mem::size_of::<libc::sockaddr_in6>()
-                    && !info.src_addr.is_null() =>
-            {
-                let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>());
+            } else if i32::from(family) == libc::AF_INET6 {
+                if info.src_addrlen < mem::size_of::<libc::sockaddr_in6>() {
+                    return None;
+                }
+                // SAFETY: the family check and src_addrlen bound this
+                // sockaddr_in6 read; read_unaligned needs no Rust alignment.
+                let address =
+                    unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>()) };
                 Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
                     address.sin6_addr.s6_addr,
                 )))
+            } else {
+                None
             }
-            ffi::FI_SOCKADDR
-                if info.src_addrlen >= mem::size_of::<libc::sockaddr>()
-                    && !info.src_addr.is_null() =>
-            {
-                let family = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr>()).sa_family;
-                if i32::from(family) == libc::AF_INET {
-                    if info.src_addrlen < mem::size_of::<libc::sockaddr_in>() {
-                        return None;
-                    }
-                    let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>());
-                    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-                        address.sin_addr.s_addr.to_ne_bytes(),
-                    )))
-                } else if i32::from(family) == libc::AF_INET6 {
-                    if info.src_addrlen < mem::size_of::<libc::sockaddr_in6>() {
-                        return None;
-                    }
-                    let address = ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>());
-                    Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                        address.sin6_addr.s6_addr,
-                    )))
-                } else {
-                    None
-                }
-            }
-            _ => None,
         }
+        _ => None,
     }
 }
 
@@ -498,16 +544,17 @@ unsafe fn capture_geometry(
     slots: usize,
     cq_wait: &str,
 ) -> ProviderGeometry {
-    // SAFETY: by this function's contract all attribute pointers are valid.
-    let (fabric, domain, ep, tx, rx) = unsafe {
-        (
-            &*selected.fabric_attr,
-            &*selected.domain_attr,
-            &*selected.ep_attr,
-            &*selected.tx_attr,
-            &*selected.rx_attr,
-        )
-    };
+    // SAFETY: by this function's contract the fabric attribute pointer is
+    // valid and initialized; the reference stays within this call.
+    let fabric = unsafe { &*selected.fabric_attr };
+    // SAFETY: same contract; the domain attribute pointer is valid.
+    let domain = unsafe { &*selected.domain_attr };
+    // SAFETY: same contract; the endpoint attribute pointer is valid.
+    let ep = unsafe { &*selected.ep_attr };
+    // SAFETY: same contract; the TX attribute pointer is valid.
+    let tx = unsafe { &*selected.tx_attr };
+    // SAFETY: same contract; the RX attribute pointer is valid.
+    let rx = unsafe { &*selected.rx_attr };
     let rxm = optional_c_string(fabric.prov_name).is_some_and(|name| name.contains("ofi_rxm"));
     ProviderGeometry {
         // SAFETY: fi_version has no arguments and no preconditions.
@@ -614,19 +661,25 @@ impl Resources {
             if owned_address.is_null() {
                 return Err(error("allocate source address hint", ffi::FI_ENOMEM));
             }
-            // SAFETY: address points to the selected live sockaddr struct;
-            // owned_address is a distinct, non-null allocation of address_size.
-            // hints owns its initialized fi_info and any prior C-allocated address.
-            // Replace that address once, transferring the new allocation to Info.
-            unsafe {
-                ptr::copy_nonoverlapping(address, owned_address.cast(), address_size);
-                if !(*hints.0).src_addr.is_null() {
-                    libc::free((*hints.0).src_addr);
-                }
-                (*hints.0).addr_format = address_format;
-                (*hints.0).src_addr = owned_address;
-                (*hints.0).src_addrlen = address_size;
+            // SAFETY: `address` points to the selected live sockaddr struct and
+            // `owned_address` is a distinct, non-null allocation of the same
+            // address_size, so the copy stays in bounds and cannot overlap.
+            unsafe { ptr::copy_nonoverlapping(address, owned_address.cast(), address_size) };
+            // SAFETY: hints owns its initialized fi_info; reading the prior
+            // C-allocated source address is in bounds.
+            let prior = unsafe { (*hints.0).src_addr };
+            if !prior.is_null() {
+                // SAFETY: the prior address came from libfabric's C allocator
+                // (fi_getinfo or this hint path) and is freed exactly once here.
+                unsafe { libc::free(prior) };
             }
+            // SAFETY: same owned, initialized fi_info; addr_format is a u32.
+            unsafe { (*hints.0).addr_format = address_format };
+            // SAFETY: same owned fi_info; storing the new allocation transfers
+            // its ownership to Info, released by fi_freeinfo.
+            unsafe { (*hints.0).src_addr = owned_address };
+            // SAFETY: same owned fi_info; src_addrlen is a size_t field.
+            unsafe { (*hints.0).src_addrlen = address_size };
             Ok(())
         };
         apply_source_hint(&hints)?;
@@ -640,184 +693,243 @@ impl Resources {
         if info.0.is_null() {
             return Err(invalid("fabric returned no provider info"));
         }
-        // SAFETY: info owns the non-null fi_getinfo result throughout this block.
-        // Required attribute pointers are checked before use; optional NIC fields
-        // and strings are checked before dereference. Union reads use the reported
-        // discriminant, or the equivalent fi_progress fields. Native handles are
-        // used only after successful creation and saved for ordered teardown.
-        // Registered buffers and contexts stay allocated until close succeeds;
-        // output pointers address live locals or exclusively borrowed fields.
-        unsafe {
-            let selected = &*info.0;
-            if selected.fabric_attr.is_null()
-                || selected.domain_attr.is_null()
-                || selected.ep_attr.is_null()
-                || selected.tx_attr.is_null()
-                || selected.rx_attr.is_null()
-            {
-                return Err(invalid("incomplete fabric provider capabilities"));
-            }
-            if config
-                .source_address
-                .is_some_and(|source| !source_address_matches(selected, source))
+        // info owns the non-null fi_getinfo result throughout this section.
+        // Required attribute pointers are checked before use; optional NIC
+        // fields and strings are checked before dereference. Native handles
+        // are used only after successful creation and saved for ordered
+        // teardown. Registered buffers and contexts stay allocated until close
+        // succeeds; output pointers address live locals or owned fields.
+        // SAFETY: the non-null fi_getinfo result info owns was initialized by
+        // libfabric; this shared reference keeps it live for every read below.
+        let selected = unsafe { &*info.0 };
+        if selected.fabric_attr.is_null()
+            || selected.domain_attr.is_null()
+            || selected.ep_attr.is_null()
+            || selected.tx_attr.is_null()
+            || selected.rx_attr.is_null()
+        {
+            return Err(invalid("incomplete fabric provider capabilities"));
+        }
+        // SAFETY: the guard above checked fabric_attr non-null; fi_getinfo
+        // initialized it and info keeps it allocated.
+        let fabric_attr = unsafe { &*selected.fabric_attr };
+        // SAFETY: the guard above checked domain_attr non-null; fi_getinfo
+        // initialized it and info keeps it allocated.
+        let domain_attr = unsafe { &*selected.domain_attr };
+        // SAFETY: the guard above checked ep_attr non-null; fi_getinfo
+        // initialized it and info keeps it allocated.
+        let ep_attr = unsafe { &*selected.ep_attr };
+        // SAFETY: the guard above checked tx_attr non-null; fi_getinfo
+        // initialized it and info keeps it allocated.
+        let tx_attr = unsafe { &*selected.tx_attr };
+        // SAFETY: the guard above checked rx_attr non-null; fi_getinfo
+        // initialized it and info keeps it allocated.
+        let rx_attr = unsafe { &*selected.rx_attr };
+        if config
+            .source_address
+            .is_some_and(|source| !source_address_matches(selected, source))
+        {
+            return Err(invalid(
+                "provider did not return the explicitly requested source address",
+            ));
+        }
+        if let Some(expected_domain) = config.domain.as_deref() {
+            let selected_domain = domain_attr.name;
+            if selected_domain.is_null()
+                // SAFETY: the is_null check guards this read of the
+                // libfabric-owned, NUL-terminated domain name.
+                || unsafe { CStr::from_ptr(selected_domain) }.to_bytes()
+                    != expected_domain.as_bytes()
             {
                 return Err(invalid(
-                    "provider did not return the explicitly requested source address",
+                    "provider did not return the explicitly requested domain",
                 ));
             }
-            if let Some(expected_domain) = config.domain.as_deref() {
-                let selected_domain = (*selected.domain_attr).name;
-                if selected_domain.is_null()
-                    || CStr::from_ptr(selected_domain).to_bytes() != expected_domain.as_bytes()
-                {
-                    return Err(invalid(
-                        "provider did not return the explicitly requested domain",
-                    ));
-                }
+        }
+        let provider_name = fabric_attr.prov_name;
+        let fabric_name = fabric_attr.name;
+        let mr_mode = domain_attr.mr_mode;
+        let supported_mr_modes = if provider.as_bytes() == b"verbs;ofi_rxm" {
+            ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
+        } else {
+            ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR
+        };
+        // SAFETY: the is_null check guards this read of the
+        // libfabric-owned, NUL-terminated provider name.
+        let valid_identity = !provider_name.is_null()
+            && unsafe { CStr::from_ptr(provider_name) } == provider.as_c_str();
+        let valid_normal = ep_attr.max_msg_size >= CHUNK
+            && selected.caps & (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
+                == (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
+            && tx_attr.msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
+            && rx_attr.msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
+            && selected.mode & !ffi::FI_CONTEXT == 0;
+        if !valid_identity
+            || !valid_normal
+            || ep_attr.type_ != ffi::fi_ep_type_FI_EP_RDM
+            || selected.caps & u64::from(ffi::FI_MSG) == 0
+            || tx_attr.iov_limit == 0
+            || rx_attr.iov_limit == 0
+            || !matches!(
+                domain_attr.threading,
+                ffi::fi_threading_FI_THREAD_SAFE | ffi::fi_threading_FI_THREAD_DOMAIN
+            )
+            || tx_attr.size < slots
+            || rx_attr.size < slots
+            || mr_mode & !abi::<_, i32>(supported_mr_modes) != 0
+        {
+            return Err(invalid("unsupported fabric provider capabilities"));
+        }
+        self.open_profile.selected_tx = tx_attr.size;
+        self.open_profile.selected_rx = rx_attr.size;
+        self.open_profile.provider_version = fabric_attr.prov_version;
+        if !selected.nic.is_null() {
+            // SAFETY: the NIC null check guards this read of its link_attr
+            // pointer field.
+            let link_attr = unsafe { (*selected.nic).link_attr };
+            if !link_attr.is_null() {
+                // SAFETY: link_attr is the non-null link attribute libfabric
+                // initialized with the NIC it came from.
+                self.open_profile.mtu = unsafe { (*link_attr).mtu };
             }
-            let provider_name = (*selected.fabric_attr).prov_name;
-            let fabric_name = (*selected.fabric_attr).name;
-            let mr_mode = (*selected.domain_attr).mr_mode;
-            let supported_mr_modes = if provider.as_bytes() == b"verbs;ofi_rxm" {
-                ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
-            } else {
-                ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR
-            };
-            let valid_identity =
-                !provider_name.is_null() && CStr::from_ptr(provider_name) == provider.as_c_str();
-            let valid_normal = (*selected.ep_attr).max_msg_size >= CHUNK
-                && selected.caps & (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
-                    == (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
-                && (*selected.tx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
-                && (*selected.rx_attr).msg_order & u64::from(ffi::FI_ORDER_SAS) != 0
-                && selected.mode & !ffi::FI_CONTEXT == 0;
-            if !valid_identity
-                || !valid_normal
-                || (*selected.ep_attr).type_ != ffi::fi_ep_type_FI_EP_RDM
-                || selected.caps & u64::from(ffi::FI_MSG) == 0
-                || (*selected.tx_attr).iov_limit == 0
-                || (*selected.rx_attr).iov_limit == 0
-                || !matches!(
-                    (*selected.domain_attr).threading,
-                    ffi::fi_threading_FI_THREAD_SAFE | ffi::fi_threading_FI_THREAD_DOMAIN
+        }
+        self.addr_format = selected.addr_format;
+        if !matches!(
+            self.addr_format,
+            ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
+        ) {
+            return Err(invalid("unsupported fabric address format"));
+        }
+        let stage = Instant::now();
+        // SAFETY: the validated attribute pointers address allocations info
+        // owns and keeps live; the output slot stays live for this
+        // synchronous call.
+        check("open fabric", unsafe {
+            ffi::fi_fabric(selected.fabric_attr, &raw mut self.fabric, ptr::null_mut())
+        })?;
+        self.open_profile.fabric_ns = elapsed_ns(stage);
+        let stage = Instant::now();
+        // SAFETY: the fabric handle was just created and the fi_info
+        // allocation is live; the output slot stays live for this synchronous
+        // call.
+        check("open fabric domain", unsafe {
+            ffi::fi_domain(self.fabric, info.0, &raw mut self.domain, ptr::null_mut())
+        })?;
+        self.open_profile.domain_ns = elapsed_ns(stage);
+        self.open_endpoint(info.0, wait_request)?;
+        let stage = Instant::now();
+        if mr_mode & abi::<_, i32>(ffi::FI_MR_LOCAL) != 0 {
+            // SAFETY: the live domain owns the registration; slot 0 addresses
+            // `CHUNK * slots` contiguous TX bytes and the output slot stays
+            // live for this synchronous call.
+            check("register transmit buffer", unsafe {
+                ffi::fi_mr_reg(
+                    self.domain,
+                    self.memory.tx(0).cast(),
+                    CHUNK * slots,
+                    u64::from(ffi::FI_SEND),
+                    0,
+                    1,
+                    0,
+                    &raw mut self.tx_mr,
+                    ptr::null_mut(),
                 )
-                || (*selected.tx_attr).size < slots
-                || (*selected.rx_attr).size < slots
-                || mr_mode & !abi::<_, i32>(supported_mr_modes) != 0
-            {
-                return Err(invalid("unsupported fabric provider capabilities"));
-            }
-            self.open_profile.selected_tx = (*selected.tx_attr).size;
-            self.open_profile.selected_rx = (*selected.rx_attr).size;
-            self.open_profile.provider_version = (*selected.fabric_attr).prov_version;
-            if !selected.nic.is_null() && !(*selected.nic).link_attr.is_null() {
-                self.open_profile.mtu = (*(*selected.nic).link_attr).mtu;
-            }
-            self.addr_format = selected.addr_format;
-            if !matches!(
-                self.addr_format,
-                ffi::FI_SOCKADDR | ffi::FI_SOCKADDR_IN | ffi::FI_SOCKADDR_IN6
-            ) {
-                return Err(invalid("unsupported fabric address format"));
-            }
-            let stage = Instant::now();
-            check(
-                "open fabric",
-                ffi::fi_fabric(selected.fabric_attr, &raw mut self.fabric, ptr::null_mut()),
-            )?;
-            self.open_profile.fabric_ns = elapsed_ns(stage);
-            let stage = Instant::now();
-            check(
-                "open fabric domain",
-                ffi::fi_domain(self.fabric, info.0, &raw mut self.domain, ptr::null_mut()),
-            )?;
-            self.open_profile.domain_ns = elapsed_ns(stage);
-            self.open_endpoint(info.0, wait_request)?;
-            let stage = Instant::now();
-            if mr_mode & abi::<_, i32>(ffi::FI_MR_LOCAL) != 0 {
-                check(
-                    "register transmit buffer",
-                    ffi::fi_mr_reg(
-                        self.domain,
-                        self.memory.tx(0).cast(),
-                        CHUNK * slots,
-                        u64::from(ffi::FI_SEND),
-                        0,
-                        1,
-                        0,
-                        &raw mut self.tx_mr,
-                        ptr::null_mut(),
-                    ),
-                )?;
-                check(
-                    "register receive buffer",
-                    ffi::fi_mr_reg(
-                        self.domain,
-                        self.memory.rx(0).cast(),
-                        CHUNK * slots,
-                        u64::from(ffi::FI_RECV),
-                        0,
-                        2,
-                        0,
-                        &raw mut self.rx_mr,
-                        ptr::null_mut(),
-                    ),
-                )?;
-            }
-            self.open_profile.register_ns = elapsed_ns(stage);
-            let stage = Instant::now();
-            let mut address = AlignedAddress::default();
-            let mut len = ADDRESS;
-            check(
-                "read fabric address",
-                ffi::fi_getname(
-                    &raw mut (*self.ep).fid,
-                    address.bytes.as_mut_ptr().cast(),
-                    &raw mut len,
-                ),
-            )?;
-            if len == 0 || len > ADDRESS {
-                return Err(invalid("invalid fabric address length"));
-            }
-            // Validate our own address before trusting its length for peers.
-            AlignedAddress::new(self.addr_format, len, &address.bytes[..len])?;
-            self.address = address.bytes[..len].to_vec();
-            self.open_profile.address_ns = elapsed_ns(stage);
-            let (device, driver, bus_address) =
-                if !selected.nic.is_null() && !(*selected.nic).device_attr.is_null() {
-                    let attributes = &*(*selected.nic).device_attr;
-                    let bus_address = if !(*selected.nic).bus_attr.is_null()
-                        && (*(*selected.nic).bus_attr).bus_type == ffi::fi_bus_type_FI_BUS_PCI
-                    {
-                        let pci = (*(*selected.nic).bus_attr).attr.pci;
+            })?;
+            // SAFETY: same live domain; slot 0 addresses `CHUNK * slots`
+            // contiguous RX bytes and the output slot stays live for this
+            // synchronous call.
+            check("register receive buffer", unsafe {
+                ffi::fi_mr_reg(
+                    self.domain,
+                    self.memory.rx(0).cast(),
+                    CHUNK * slots,
+                    u64::from(ffi::FI_RECV),
+                    0,
+                    2,
+                    0,
+                    &raw mut self.rx_mr,
+                    ptr::null_mut(),
+                )
+            })?;
+        }
+        self.open_profile.register_ns = elapsed_ns(stage);
+        let stage = Instant::now();
+        let mut address = AlignedAddress::default();
+        let mut len = ADDRESS;
+        // SAFETY: the endpoint handle is open; taking its fid address writes
+        // nothing and creates no reference.
+        let endpoint_fid = unsafe { &raw mut (*self.ep).fid };
+        // SAFETY: the caller-owned address buffer and length stay live for
+        // this synchronous call; fi_getname retains neither.
+        check("read fabric address", unsafe {
+            ffi::fi_getname(
+                endpoint_fid,
+                address.bytes.as_mut_ptr().cast(),
+                &raw mut len,
+            )
+        })?;
+        if len == 0 || len > ADDRESS {
+            return Err(invalid("invalid fabric address length"));
+        }
+        // Validate our own address before trusting its length for peers.
+        AlignedAddress::new(self.addr_format, len, &address.bytes[..len])?;
+        self.address = address.bytes[..len].to_vec();
+        self.open_profile.address_ns = elapsed_ns(stage);
+        let (device, driver, bus_address) = if selected.nic.is_null() {
+            (None, None, None)
+        } else {
+            // SAFETY: the NIC null check above guards this read of its
+            // device_attr pointer field.
+            let device_attr = unsafe { (*selected.nic).device_attr };
+            if device_attr.is_null() {
+                (None, None, None)
+            } else {
+                // SAFETY: device_attr is the non-null device attribute
+                // libfabric initialized with this NIC.
+                let attributes = unsafe { &*device_attr };
+                // SAFETY: the NIC is non-null; reading its bus_attr pointer.
+                let bus_attr = unsafe { (*selected.nic).bus_attr };
+                let bus_address = if bus_attr.is_null() {
+                    None
+                } else {
+                    // SAFETY: bus_attr is non-null and initialized.
+                    let is_pci = unsafe { (*bus_attr).bus_type } == ffi::fi_bus_type_FI_BUS_PCI;
+                    if is_pci {
+                        // SAFETY: bus_attr is non-null and initialized; this
+                        // reference is the only access to the bus attribute.
+                        let bus = unsafe { &*bus_attr };
+                        // SAFETY: the bus_type check above selected this PCI
+                        // union member.
+                        let pci = unsafe { bus.attr.pci };
                         Some(format!(
                             "{:04x}:{:02x}:{:02x}.{}",
                             pci.domain_id, pci.bus_id, pci.device_id, pci.function_id
                         ))
                     } else {
                         None
-                    };
-                    (
-                        optional_c_string(attributes.name),
-                        optional_c_string(attributes.driver),
-                        bus_address,
-                    )
-                } else {
-                    (None, None, None)
+                    }
                 };
-            self.provider_info = Some(ProviderInfo {
-                backend: config.backend,
-                provider: optional_c_string(provider_name).unwrap_or_default(),
-                fabric: optional_c_string(fabric_name),
-                domain: optional_c_string((*selected.domain_attr).name),
-                source_address: selected_source_address(selected),
-                device,
-                driver,
-                bus_address,
-                capability_evidence: "libfabric fi_getinfo provider/domain selection".to_owned(),
-                geometry: capture_geometry(selected, api, slots, &self.cq_wait_note),
-            });
-        }
+                (
+                    optional_c_string(attributes.name),
+                    optional_c_string(attributes.driver),
+                    bus_address,
+                )
+            }
+        };
+        self.provider_info = Some(ProviderInfo {
+            backend: config.backend,
+            provider: optional_c_string(provider_name).unwrap_or_default(),
+            fabric: optional_c_string(fabric_name),
+            domain: optional_c_string(domain_attr.name),
+            source_address: selected_source_address(selected),
+            device,
+            driver,
+            bus_address,
+            capability_evidence: "libfabric fi_getinfo provider/domain selection".to_owned(),
+            // SAFETY: `selected` is the validated fi_getinfo result kept live
+            // by info; capture_geometry's contract holds for it.
+            geometry: unsafe { capture_geometry(selected, api, slots, &self.cq_wait_note) },
+        });
         Ok(())
     }
 
@@ -841,83 +953,99 @@ impl Resources {
             count: 1,
             ..ffi::fi_av_attr::default()
         };
-        // SAFETY: The caller supplies a live domain and fi_getinfo allocation.
-        // CQ/AV attributes and output pointers stay live for each synchronous call.
-        // Each handle is used only after successful creation and saved before the
-        // next fallible step; teardown closes the endpoint before its bindings.
-        unsafe {
-            let stage = Instant::now();
-            let mut code =
-                ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
-            self.cq_wait_note = match wait_request {
-                WaitRequest::None => "none: not requested".to_owned(),
-                WaitRequest::Software => "unspec: bounded fi_cq_sread".to_owned(),
-                WaitRequest::Fd => "fd: FI_WAIT_FD with fi_trywait and poll".to_owned(),
+        // The caller supplies a live domain and fi_getinfo allocation. CQ/AV
+        // attributes and output pointers stay live for each synchronous call.
+        // Each handle is used only after successful creation and saved before
+        // the next fallible step; teardown closes the endpoint before its
+        // bindings.
+        let stage = Instant::now();
+        // SAFETY: the live domain and initialized cq attributes address
+        // storage that stays live for this synchronous call.
+        let mut code =
+            unsafe { ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut()) };
+        self.cq_wait_note = match wait_request {
+            WaitRequest::None => "none: not requested".to_owned(),
+            WaitRequest::Software => "unspec: bounded fi_cq_sread".to_owned(),
+            WaitRequest::Fd => "fd: FI_WAIT_FD with fi_trywait and poll".to_owned(),
+        };
+        let refused = [ffi::FI_ENOSYS, ffi::FI_EOPNOTSUPP, ffi::FI_EINVAL]
+            .into_iter()
+            .any(|refusal| code == -abi::<_, i32>(refusal));
+        if wait_request != WaitRequest::None && refused {
+            // Keep the polling behavior: a provider without a wait object is
+            // reported in evidence, never papered over with a different one.
+            self.cq_wait_note = format!(
+                "none: provider rejected the CQ wait object ({}); busy polling retained",
+                error("open completion queue wait", code.unsigned_abs())
+            );
+            cq.wait_obj = ffi::fi_wait_obj_FI_WAIT_NONE;
+            self.cq = ptr::null_mut();
+            // SAFETY: same live domain; the reset attributes and the output
+            // slot stay live for this synchronous retry call.
+            code = unsafe {
+                ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut())
             };
-            let refused = [ffi::FI_ENOSYS, ffi::FI_EOPNOTSUPP, ffi::FI_EINVAL]
-                .into_iter()
-                .any(|refusal| code == -abi::<_, i32>(refusal));
-            if wait_request != WaitRequest::None && refused {
-                // Keep the polling behavior: a provider without a wait object is
-                // reported in evidence, never papered over with a different one.
-                self.cq_wait_note = format!(
-                    "none: provider rejected the CQ wait object ({}); busy polling retained",
-                    error("open completion queue wait", code.unsigned_abs())
-                );
-                cq.wait_obj = ffi::fi_wait_obj_FI_WAIT_NONE;
-                self.cq = ptr::null_mut();
-                code = ffi::fi_cq_open(self.domain, &raw mut cq, &raw mut self.cq, ptr::null_mut());
-            } else if code == 0 {
-                match wait_request {
-                    WaitRequest::None => {}
-                    WaitRequest::Software => self.cq_wait_mode = CqWaitMode::SoftwareBounded,
-                    WaitRequest::Fd => {
-                        let mut fd: libc::c_int = -1;
-                        let status = ffi::fi_control(
-                            &raw mut (*self.cq).fid,
-                            abi(ffi::FI_GETWAIT),
-                            (&raw mut fd).cast(),
+        } else if code == 0 {
+            match wait_request {
+                WaitRequest::None => {}
+                WaitRequest::Software => self.cq_wait_mode = CqWaitMode::SoftwareBounded,
+                WaitRequest::Fd => {
+                    let mut fd: libc::c_int = -1;
+                    // SAFETY: the CQ handle was just opened; taking its fid
+                    // address writes nothing and creates no reference.
+                    let wait_cq_fid = unsafe { &raw mut (*self.cq).fid };
+                    // SAFETY: wait_cq_fid addresses one initialized fid for
+                    // this synchronous call and fd is a live output local.
+                    let status = unsafe {
+                        ffi::fi_control(wait_cq_fid, abi(ffi::FI_GETWAIT), (&raw mut fd).cast())
+                    };
+                    if status == 0 && fd >= 0 {
+                        self.cq_wait_mode = CqWaitMode::FdTryWait(fd);
+                    } else {
+                        self.cq_wait_note = format!(
+                            "none: FI_GETWAIT returned no fd (status {status}); busy polling retained"
                         );
-                        if status == 0 && fd >= 0 {
-                            self.cq_wait_mode = CqWaitMode::FdTryWait(fd);
-                        } else {
-                            self.cq_wait_note = format!(
-                                "none: FI_GETWAIT returned no fd (status {status}); busy polling retained"
-                            );
-                        }
                     }
                 }
             }
-            check("open completion queue", code)?;
-            self.open_profile.cq_ns = elapsed_ns(stage);
-            let stage = Instant::now();
-            check(
-                "open address vector",
-                ffi::fi_av_open(self.domain, &raw mut av, &raw mut self.av, ptr::null_mut()),
-            )?;
-            self.open_profile.av_ns = elapsed_ns(stage);
-            let stage = Instant::now();
-            check(
-                "open endpoint",
-                ffi::fi_endpoint(self.domain, info, &raw mut self.ep, ptr::null_mut()),
-            )?;
-            self.open_profile.endpoint_ns = elapsed_ns(stage);
-            let stage = Instant::now();
-            check(
-                "bind completion queue",
-                ffi::fi_ep_bind(
-                    self.ep,
-                    &raw mut (*self.cq).fid,
-                    u64::from(ffi::FI_TRANSMIT | ffi::FI_RECV),
-                ),
-            )?;
-            check(
-                "bind address vector",
-                ffi::fi_ep_bind(self.ep, &raw mut (*self.av).fid, 0),
-            )?;
-            check("enable endpoint", ffi::fi_enable(self.ep))?;
-            self.open_profile.bind_enable_ns = elapsed_ns(stage);
         }
+        check("open completion queue", code)?;
+        self.open_profile.cq_ns = elapsed_ns(stage);
+        let stage = Instant::now();
+        // SAFETY: the live domain and initialized av attributes address
+        // storage that stays live for this synchronous call.
+        check("open address vector", unsafe {
+            ffi::fi_av_open(self.domain, &raw mut av, &raw mut self.av, ptr::null_mut())
+        })?;
+        self.open_profile.av_ns = elapsed_ns(stage);
+        let stage = Instant::now();
+        // SAFETY: the live domain and the caller-owned fi_getinfo allocation
+        // stay live for this synchronous call.
+        check("open endpoint", unsafe {
+            ffi::fi_endpoint(self.domain, info, &raw mut self.ep, ptr::null_mut())
+        })?;
+        self.open_profile.endpoint_ns = elapsed_ns(stage);
+        let stage = Instant::now();
+        // SAFETY: the CQ handle is open; taking its fid address writes
+        // nothing and creates no reference.
+        let cq_fid = unsafe { &raw mut (*self.cq).fid };
+        // SAFETY: the endpoint and CQ handles are open and stay live for this
+        // synchronous binding call.
+        check("bind completion queue", unsafe {
+            ffi::fi_ep_bind(self.ep, cq_fid, u64::from(ffi::FI_TRANSMIT | ffi::FI_RECV))
+        })?;
+        // SAFETY: the AV handle is open; taking its fid address writes nothing
+        // and creates no reference.
+        let av_fid = unsafe { &raw mut (*self.av).fid };
+        // SAFETY: the endpoint and AV handles are open and stay live for this
+        // synchronous binding call.
+        check("bind address vector", unsafe {
+            ffi::fi_ep_bind(self.ep, av_fid, 0)
+        })?;
+        // SAFETY: the endpoint handle is open and stays live for this
+        // synchronous call.
+        check("enable endpoint", unsafe { ffi::fi_enable(self.ep) })?;
+        self.open_profile.bind_enable_ns = elapsed_ns(stage);
         Ok(())
     }
 
@@ -1013,13 +1141,14 @@ impl Resources {
         if !self.wait_quiescent() {
             return Ok(None);
         }
-        // SAFETY: `fabric` and `cq` are the live handles this Resources owns and
-        // this &mut self is the only user (FI_THREAD_DOMAIN); `fids` points to one
-        // initialized element for the call's duration.
-        let code = unsafe {
-            let mut fid = &raw mut (*self.cq).fid;
-            ffi::fi_trywait(self.fabric, &raw mut fid, 1)
-        };
+        // SAFETY: `cq` is the live handle this Resources owns and this &mut
+        // self is its only user (FI_THREAD_DOMAIN); taking the fid address
+        // writes nothing and creates no reference.
+        let mut fid = unsafe { &raw mut (*self.cq).fid };
+        // SAFETY: `fabric` is the live handle this Resources owns; `fid`
+        // points to one initialized element for the duration of this
+        // synchronous call.
+        let code = unsafe { ffi::fi_trywait(self.fabric, &raw mut fid, 1) };
         match code {
             0 => Ok(Some(fd)),
             code if code < 0 && code.unsigned_abs() == ffi::FI_EAGAIN => Ok(None),
@@ -1046,12 +1175,14 @@ impl Resources {
         let mut offset = 0;
         for source in bytes {
             let len = source.len().min(CHUNK - offset);
-            // SAFETY: source supplies len readable bytes and cannot alias the
-            // private TX allocation. This free slot has CHUNK writable bytes;
-            // offset + len <= CHUNK, with no pending provider operation.
-            unsafe {
-                ptr::copy_nonoverlapping(source.as_ptr(), self.memory.tx(slot).add(offset), len);
-            }
+            // SAFETY: the loop breaks once offset reaches CHUNK, so offset < CHUNK
+            // and the add stays inside this free slot's live CHUNK-byte buffer.
+            let destination = unsafe { self.memory.tx(slot).add(offset) };
+            // SAFETY: len = min(source.len(), CHUNK - offset), so offset + len <=
+            // CHUNK: source supplies len readable bytes and cannot alias the
+            // private TX allocation, destination holds len writable bytes, and no
+            // provider operation is pending on this slot.
+            unsafe { ptr::copy_nonoverlapping(source.as_ptr(), destination, len) };
             offset += len;
             if offset == CHUNK {
                 break;
@@ -1149,16 +1280,16 @@ impl Resources {
         }
         let len = bytes.len().min(self.rx_len[slot] - self.rx_offset);
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: A terminal completion set this slot's length <= CHUNK and
-        // cleared pending. The bounded range is initialized and cannot overlap
-        // the caller's writable output. Repost waits until all bytes are copied.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                self.memory.rx(slot).add(self.rx_offset),
-                bytes.as_mut_ptr(),
-                len,
-            );
-        }
+        // SAFETY: A terminal completion set rx_len[slot] <= CHUNK and cleared
+        // pending; rx_offset < rx_len[slot] (the subtraction above would
+        // underflow otherwise), so the add stays inside the slot's live
+        // CHUNK-byte buffer.
+        let source = unsafe { self.memory.rx(slot).add(self.rx_offset) };
+        // SAFETY: len = min(bytes.len(), rx_len[slot] - rx_offset), so the range
+        // ends within the received, initialized bytes of the slot and cannot
+        // overlap the caller's writable output. Repost waits until all bytes
+        // are copied.
+        unsafe { ptr::copy_nonoverlapping(source, bytes.as_mut_ptr(), len) };
         if let Some(began) = began {
             self.progress_stats.receive_copy_ns = self
                 .progress_stats
@@ -1189,17 +1320,19 @@ impl Resources {
             .checked_add(1)
             .ok_or_else(|| invalid("fabric send fence exhausted"))?;
         let began = self.time_progress.then(Instant::now);
+        let desc = if self.tx_mr.is_null() {
+            ptr::null_mut()
+        } else {
+            // SAFETY: `tx_mr`, when non-null, is the live registration this
+            // Resources owns; no provider operation releases it before close.
+            unsafe { ffi::fi_mr_desc(self.tx_mr) }
+        };
         // SAFETY: Callers first copy at most CHUNK bytes into this free slot.
         // Buffer, registration and context outlive completion or successful
         // endpoint close; no other operation uses this slot. A failed post,
         // including EAGAIN, accepts no operation and retains no buffer ownership
         // (fi_msg(3), RETURN VALUE); only a successful post marks it immutable.
         let code = unsafe {
-            let desc = if self.tx_mr.is_null() {
-                ptr::null_mut()
-            } else {
-                ffi::fi_mr_desc(self.tx_mr)
-            };
             ffi::fi_send(
                 self.ep,
                 self.memory.tx(slot).cast(),
@@ -1280,15 +1413,17 @@ impl Resources {
     fn post_receive(&mut self, slot: usize) -> io::Result<bool> {
         let peer = self.peer.ok_or_else(|| invalid("missing fabric peer"))?;
         let began = self.time_progress.then(Instant::now);
+        let desc = if self.rx_mr.is_null() {
+            ptr::null_mut()
+        } else {
+            // SAFETY: `rx_mr`, when non-null, is the live registration this
+            // Resources owns; no provider operation releases it before close.
+            unsafe { ffi::fi_mr_desc(self.rx_mr) }
+        };
         // SAFETY: try_post_receive selects an in-bounds free slot with no unread
         // bytes or Rust borrows. The endpoint, peer and optional MR are live;
         // allocation and context stay fixed until completion or successful close.
         let code = unsafe {
-            let desc = if self.rx_mr.is_null() {
-                ptr::null_mut()
-            } else {
-                ffi::fi_mr_desc(self.rx_mr)
-            };
             ffi::fi_recv(
                 self.ep,
                 self.memory.rx(slot).cast(),
@@ -1341,13 +1476,14 @@ impl Resources {
     /// `fi_trywait` (EAGAIN: provider has work to progress) polls normally
     /// instead. Returns `(progress, parked)`.
     fn park_on_wait_fd(&mut self, fd: libc::c_int) -> io::Result<(bool, bool)> {
-        // SAFETY: `fabric` and `cq` are the live handles this Resources owns and
-        // this &mut self is the only user (FI_THREAD_DOMAIN); `fids` points to one
-        // initialized element for the call's duration.
-        let code = unsafe {
-            let mut fid = &raw mut (*self.cq).fid;
-            ffi::fi_trywait(self.fabric, &raw mut fid, 1)
-        };
+        // SAFETY: `cq` is the live handle this Resources owns and this &mut
+        // self is its only user (FI_THREAD_DOMAIN); taking the fid address
+        // writes nothing and creates no reference.
+        let mut fid = unsafe { &raw mut (*self.cq).fid };
+        // SAFETY: `fabric` is the live handle this Resources owns; `fid`
+        // points to one initialized element for the duration of this
+        // synchronous call.
+        let code = unsafe { ffi::fi_trywait(self.fabric, &raw mut fid, 1) };
         if code != 0 {
             return self.poll().map(|progress| (progress, false));
         }
@@ -1414,11 +1550,11 @@ impl Resources {
         let capacity = 2 * self.slots();
         let initial_progress = (!self.initial_progress_recorded).then(Instant::now);
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: Our CQ uses MSG format and may initialize at most `capacity <=
-        // entries.len()` entries; no Rust references to this storage cross the
-        // synchronous call.
-        let count = unsafe {
-            if WAIT {
+        let count = if WAIT {
+            // SAFETY: Our CQ uses MSG format and may initialize at most
+            // `capacity <= entries.len()` entries; no Rust references to this
+            // storage cross the synchronous call.
+            unsafe {
                 ffi::fi_cq_sread(
                     self.cq,
                     entries.as_mut_ptr().cast(),
@@ -1426,9 +1562,11 @@ impl Resources {
                     ptr::null(),
                     timeout_ms,
                 )
-            } else {
-                ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), capacity)
             }
+        } else {
+            // SAFETY: Same live CQ and entry bounds as the sread arm;
+            // fi_cq_read is the non-blocking form of the same call.
+            unsafe { ffi::fi_cq_read(self.cq, entries.as_mut_ptr().cast(), capacity) }
         };
         if let Some(began) = began {
             self.progress_stats.cq_call_ns = self
@@ -1485,14 +1623,21 @@ impl Resources {
         for entry in &entries[..count] {
             let began = self.time_progress.then(Instant::now);
             let entry = entry.as_ptr();
-            // SAFETY: Positive count validates this array slot; fi_cq specifies
-            // op_context for every returned completion, including sends.
-            let context = unsafe { ptr::addr_of!((*entry).op_context).read() };
+            // SAFETY: Positive count validates this array slot; taking the
+            // field address reads and writes nothing.
+            let op_context = unsafe { ptr::addr_of!((*entry).op_context) };
+            // SAFETY: fi_cq specifies op_context for every returned completion,
+            // including sends.
+            let context = unsafe { op_context.read() };
             let result = self.complete(context, || {
                 // SAFETY: complete calls this only for an owned receive CQE,
-                // for which fi_cq guarantees len. Never read send-only padding
-                // or fields which the provider need not initialize.
-                unsafe { ptr::addr_of!((*entry).len).read() }
+                // for which the array slot is validated; taking the field
+                // address reads and writes nothing.
+                let len_field = unsafe { ptr::addr_of!((*entry).len) };
+                // SAFETY: fi_cq guarantees len for an owned receive CQE. Never
+                // read send-only padding or fields which the provider need not
+                // initialize.
+                unsafe { len_field.read() }
             });
             if let Some(began) = began {
                 self.progress_stats.cq_dispatch_ns = self
@@ -1553,10 +1698,14 @@ impl Resources {
         macro_rules! close {
             ($field:ident) => {
                 if !self.$field.is_null() {
+                    // SAFETY: The non-null handle is owned here; taking the
+                    // address of the fid its generated C struct begins with
+                    // writes nothing and creates no reference.
+                    let fid = unsafe { &raw mut (*self.$field).fid };
                     // SAFETY: Each handle is owned here; its generated C struct
                     // begins with fid. Stop on failure, retaining every live
                     // handle and allocation because the provider may use them.
-                    let code = unsafe { ffi::fi_close(&raw mut (*self.$field).fid) };
+                    let code = unsafe { ffi::fi_close(fid) };
                     if code != 0 {
                         // Do not format or allocate before the owner quarantines
                         // this allocation; even panic paths must retain memory.
@@ -1630,9 +1779,10 @@ pub(super) fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync
 }
 
 pub(super) fn error(stage: &str, code: u32) -> io::Error {
-    // SAFETY: fi_strerror returns a static terminated string for any error code.
-    let detail =
-        unsafe { CStr::from_ptr(ffi::fi_strerror(i32::try_from(code).unwrap_or(i32::MAX))) };
+    // SAFETY: fi_strerror places no precondition on the error number it receives.
+    let text = unsafe { ffi::fi_strerror(i32::try_from(code).unwrap_or(i32::MAX)) };
+    // SAFETY: fi_strerror returns a static NUL-terminated string for any code.
+    let detail = unsafe { CStr::from_ptr(text) };
     let kind = if code == ffi::FI_ETIMEDOUT {
         io::ErrorKind::TimedOut
     } else {
@@ -1674,7 +1824,11 @@ mod tests {
         for provider in [c"verbs;ofi_rxm", c"tcp;ofi_rxm"] {
             let hints = Info::hints(provider, c"").unwrap();
             // SAFETY: Info owns the live, fully initialized hint allocation.
-            let (tx, rx) = unsafe { (&*(*hints.0).tx_attr, &*(*hints.0).rx_attr) };
+            let info = unsafe { &*hints.0 };
+            // SAFETY: fi_allocinfo initialized tx_attr; hints keeps it live here.
+            let tx = unsafe { &*info.tx_attr };
+            // SAFETY: fi_allocinfo initialized rx_attr; hints keeps it live here.
+            let rx = unsafe { &*info.rx_attr };
             assert_eq!(tx.size, 0);
             assert_eq!(rx.size, 0);
             assert_eq!(tx.msg_order, u64::from(ffi::FI_ORDER_SAS));
