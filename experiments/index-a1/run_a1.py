@@ -47,6 +47,8 @@ import a1_metrics  # noqa: E402
 
 GIB = 1024**3
 FREE_RESERVE = 25 * GIB
+# Host-level stop (Main's disk guard): never start a stage below this.
+HOST_FREE_FLOOR = 100 * GIB
 OWNER_CEILING = 80 * GIB
 COORDINATOR_CEILING = 16 * GIB
 OUTPUT_CEILING = 4 * GIB
@@ -213,6 +215,8 @@ class Stage:
         ):
             if value > ceiling and self.breach is None:
                 self.breach = label
+        if free < HOST_FREE_FLOOR and self.breach is None:
+            self.breach = "host free space below the 100 GiB guard"
         if free < FREE_RESERVE and self.breach is None:
             self.breach = "host free space below 25 GiB"
         if available < MEM_AVAILABLE_FLOOR and self.breach is None:
@@ -320,6 +324,8 @@ class Controller:
         wait_for_quiet_host()
         need = stage_need(name, config, data)
         free = free_bytes(self.workspace)
+        if free < HOST_FREE_FLOOR:
+            raise SystemExit(f"{case} {name}: host free {free / GIB:.1f} GiB below the 100 GiB guard")
         if free - FREE_RESERVE < need:
             raise SystemExit(f"{case} {name}: host free {free / GIB:.1f} GiB leaves less than the stage worst case {need / GIB:.1f} GiB above the 25 GiB reserve")
         record = Stage(self, case_dir, name, argv, data).run(output)
@@ -546,8 +552,16 @@ def main_blocks(arguments) -> int:
     controller.prepare()
     state = controller.state()
     cells = a1_cases.local_cells(frozenset(map(tuple, state["c_scaled_ready"])))
+    # Local calibration: a quiet window ends at A1_STOP_EPOCH. Stop between
+    # cases, never inside one, so no case is lost to an interrupted stage.
+    stop_epoch = int(os.environ.get("A1_STOP_EPOCH", "0"))
     for repeat in range(a1_cases.REPEATS):
         for size, tier, arm in a1_cases.block_order(repeat, cells):
+            if stop_epoch and time.time() >= stop_epoch:
+                print(f"window deadline reached before repeat {repeat} {size} {tier} {arm}")
+                state["stopped_at"] = now()
+                controller.save(state)
+                return 0
             case = a1_cases.case_name(size, arm, tier, repeat)
             if case in state["cases"]:
                 continue

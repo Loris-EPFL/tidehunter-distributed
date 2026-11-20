@@ -104,6 +104,11 @@ def metric_fit(cases: dict[tuple[int, int], dict], field: str, target: int, boun
     reduced = [fit(medians(repeat), target) for repeat in range(a1_cases.REPEATS)]
     fits = [full, *reduced]
     reasons = []
+    # Two distinct sizes fit any two points exactly: the 0.20 residual screen
+    # and the drop-one-repeat flip can never fire, so a verdict would rest on
+    # unscreened noise. Refuse to qualify such a metric.
+    if len(set(a1_cases.SIZES)) < 3:
+        reasons.append("fewer than three sizes: a two-point log-log fit is exact")
     if not all(item["qualified_input"] for item in fits):
         reasons.append("nonpositive or missing fit input")
     else:

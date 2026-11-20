@@ -47,7 +47,7 @@ class Configs(unittest.TestCase):
         self.assertEqual(config["execution"]["mode"], "open_loop")
         self.assertEqual(config["execution"]["offered_ops_per_second"], 12345)
         self.assertEqual(config["workload"]["put_key_policy"], "overwrite")
-        self.assertEqual(config["phases"]["measurement_operations"], 10_000_000)
+        self.assertEqual(config["phases"]["measurement_operations"], a1_cases.TIMED_OPERATIONS)
         pilot = a1_cases.config(WORKSPACE, "p", 1_000_000, "e4", "native", "overwrite", operations=1_000_000)
         self.assertEqual(pilot["execution"]["mode"], "closed_loop")
         self.assertNotIn("offered_ops_per_second", pilot["execution"])
@@ -73,7 +73,8 @@ class Configs(unittest.TestCase):
 
     def test_worst_case_budget(self):
         budget = a1_cases.case_budget(10_000_000)
-        self.assertEqual(budget["owner_worst_bytes"], 20_000_000 * 4096)
+        self.assertEqual(budget["owner_worst_bytes"],
+                         (10_000_000 + a1_cases.TIMED_OPERATIONS) * 4096)
         self.assertTrue(budget["fits_owner_ceiling"])
 
 
@@ -139,6 +140,12 @@ def setting(ratio_of, cold_of, **overrides) -> dict:
 
 
 class Decision(unittest.TestCase):
+    def require_three_sizes(self):
+        # Pass/fail paths need a screened fit; a two-point fit is exact and the
+        # analyzer refuses to qualify it (fewer than three sizes).
+        if len(set(a1_cases.SIZES)) < 3:
+            self.skipTest("decision pass/fail paths need three sizes")
+
     def test_power_law_fit_is_exact_for_a_power_law(self):
         fit = analyze_a1.fit({size: 0.01 * (size / 1e6) ** 0.5 for size in a1_cases.SIZES}, 709_000_000)
         self.assertAlmostEqual(fit["slope"], 0.5)
@@ -147,6 +154,7 @@ class Decision(unittest.TestCase):
         self.assertFalse(analyze_a1.fit({1: 0.0, 2: 1.0, 3: 1.0}, 10)["qualified_input"])
 
     def test_flat_small_metrics_pass_and_select_lower_bytes(self):
+        self.require_three_sizes()
         good = setting(lambda size, repeat: 0.05, lambda size, repeat: 2.0 + 0.01 * repeat)
         cheaper = setting(lambda size, repeat: 0.05, lambda size, repeat: 2.0, per_put=50.0)
         settings = {"e4": analyze_a1.evaluate_setting("e4", good), "e16": analyze_a1.evaluate_setting("e16", cheaper)}
@@ -156,6 +164,7 @@ class Decision(unittest.TestCase):
         self.assertEqual(decision["selected_setting"], "e16")
 
     def test_growing_ratio_fails_and_both_failing_is_insufficient(self):
+        self.require_three_sizes()
         growing = setting(lambda size, repeat: 0.1 * (size / 1e6), lambda size, repeat: 1.0)
         result = analyze_a1.evaluate_setting("e4", growing)
         self.assertEqual(result["status"], "fail")
@@ -167,7 +176,12 @@ class Decision(unittest.TestCase):
         noisy = setting(lambda size, repeat: 0.05 * (2.0 if size == 5_000_000 else 1.0), lambda size, repeat: 1.0)
         result = analyze_a1.evaluate_setting("e4", noisy)
         self.assertEqual(result["status"], "unqualified")
-        self.assertIn("absolute log residual above 0.2", result["tiers"]["native"]["fits"]["ratio"]["unqualified_reasons"])
+        if len(set(a1_cases.SIZES)) >= 3:
+            self.assertIn("absolute log residual above 0.2", result["tiers"]["native"]["fits"]["ratio"]["unqualified_reasons"])
+        else:
+            # A two-point fit is exact; the size-count guard is the screen.
+            self.assertIn("fewer than three sizes: a two-point log-log fit is exact",
+                          result["tiers"]["native"]["fits"]["ratio"]["unqualified_reasons"])
         missing = setting(lambda size, repeat: 0.05, lambda size, repeat: 1.0)
         del missing["native"][(1_000_000, 4)]
         self.assertEqual(analyze_a1.evaluate_setting("e4", missing)["status"], "unqualified")
@@ -243,6 +257,8 @@ class V6Gate(unittest.TestCase):
         self.assertNotIn("pass", json.dumps(report["decision"]["setting_status"]))
 
     def test_matching_pass_receipt_allows_the_measured_decision(self):
+        if len(set(a1_cases.SIZES)) < 3:
+            self.skipTest("the measured pass path needs three sizes")
         report = self.run_analysis(self.receipt())
         self.assertTrue(report["decision"]["v6_gate"]["passed"])
         self.assertEqual(report["decision"]["verdict"], "Exact sufficient (projected)")
