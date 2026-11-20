@@ -459,7 +459,7 @@ async fn perpetual_only_replay_uses_exact_database_population() {
         ),
         (1014, 232, 1308, 6)
     );
-    assert_eq!(backend.info().topology["node_databases"], 1);
+    assert_eq!(backend.info().unwrap().topology["node_databases"], 1);
     drop(backend);
     drop(owners);
     std::fs::remove_dir_all(root).unwrap();
@@ -487,7 +487,7 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
     }))
     .unwrap();
     let output = root.join("result");
-    let info = backend.info();
+    let info = backend.info().unwrap();
     crate::mainnet_replay::run_prepared(
         config,
         &output,
@@ -568,7 +568,7 @@ async fn real_local_file_live_replay_writes_r0_json() {
     }))
     .unwrap();
     let output = root.join("result");
-    let info = backend.info();
+    let info = backend.info().unwrap();
     crate::mainnet_replay::run_prepared(
         config,
         &output,
