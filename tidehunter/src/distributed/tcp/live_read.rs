@@ -2381,10 +2381,8 @@ pub(crate) mod tests {
             tv_nsec: 0,
         };
         // SAFETY: `now` is a valid timespec and the clock id is a constant.
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
-            0
-        );
+        let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+        assert_eq!(read, 0);
         Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
     }
 
