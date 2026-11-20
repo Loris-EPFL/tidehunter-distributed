@@ -119,7 +119,7 @@ fn receipt_binds_dataset_shape_geometry_tier_and_path() {
     let mut options = super::super::parse_options(&config.backend.options).unwrap();
     let fixture = options.index_fixture.take().unwrap();
     let replay_limits = validate_route(&options).unwrap();
-    let paths = CasePaths::new(&options);
+    let paths = CasePaths::new(&options, fixture.owner_root.as_deref());
     let dataset = DatasetIdentity::from_config(&config).unwrap();
     assert_eq!(
         dataset.namespace().unwrap().to_vec(),
@@ -172,4 +172,77 @@ fn receipt_binds_dataset_shape_geometry_tier_and_path() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn default_owner_root_is_unchanged_and_absent_from_serialized_options() {
+    let config = run_config("build");
+    let mut options = super::super::parse_options(&config.backend.options).unwrap();
+    let fixture = options.index_fixture.take().unwrap();
+    assert_eq!(fixture.owner_root, None);
+    let paths = CasePaths::new(&options, fixture.owner_root.as_deref());
+    assert_eq!(
+        paths.fixture,
+        PathBuf::from("/cases/n1000000-e4-native-r0/db/fixture")
+    );
+    // Receipts and effective configurations keep their shape without the option.
+    assert!(
+        serde_json::to_value(&fixture)
+            .unwrap()
+            .get("owner_root")
+            .is_none()
+    );
+}
+
+#[test]
+fn owner_root_option_moves_only_the_owner_tree_and_binds_the_case() {
+    let mut document = options_json("build");
+    document["index_fixture"]["owner_root"] = json!("/dev/shm/a1/owner");
+    let mut options = super::super::parse_options(&document).unwrap();
+    let fixture = options.index_fixture.take().unwrap();
+    fixture.validate().unwrap();
+    let paths = CasePaths::new(&options, fixture.owner_root.as_deref());
+    assert_eq!(paths.fixture, PathBuf::from("/dev/shm/a1/owner"));
+    assert_eq!(
+        paths.coordinator,
+        PathBuf::from("/cases/n1000000-e4-native-r0/db/coordinator")
+    );
+    assert_eq!(
+        paths.evidence,
+        PathBuf::from("/cases/n1000000-e4-native-r0/db/evidence")
+    );
+    // The owner root is part of the case identity a receipt binds.
+    let mut default_root = fixture.clone();
+    default_root.owner_root = None;
+    assert!(!fixture.same_case(&default_root));
+    // A relative owner root is refused.
+    let mut relative = document["index_fixture"].clone();
+    relative["owner_root"] = json!("relative/owner");
+    assert!(
+        serde_json::from_value::<IndexFixtureOptions>(relative)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+fn cold_reopen_refuses_an_external_owner_root() {
+    let mut document = options_json("overwrite");
+    let mut options = super::super::parse_options(&document).unwrap();
+    options
+        .index_fixture
+        .take()
+        .unwrap()
+        .require_case_owner_root()
+        .unwrap();
+    document["index_fixture"]["owner_root"] = json!("/dev/shm/a1/owner");
+    let mut options = super::super::parse_options(&document).unwrap();
+    let error = options
+        .index_fixture
+        .take()
+        .unwrap()
+        .require_case_owner_root()
+        .unwrap_err();
+    assert!(error.to_string().contains("owner_root"));
 }

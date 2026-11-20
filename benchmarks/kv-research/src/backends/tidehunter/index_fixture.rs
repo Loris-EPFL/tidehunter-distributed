@@ -84,6 +84,11 @@ pub(super) struct IndexFixtureOptions {
     wal_file_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     per_cell: Option<PerCellThresholds>,
+    /// Absolute owner root outside the case path (the A0 V6 gate puts the
+    /// owner tree on tmpfs so only coordinator files reach the measured
+    /// device). `None` keeps `<path>/fixture`. Part of the case identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_root: Option<PathBuf>,
 }
 
 /// Fixture geometry rule: admitted batches 1..=1M, positive index bytes, 4 KiB
@@ -113,6 +118,13 @@ impl IndexFixtureOptions {
         ) {
             return Err("index_fixture geometry: admitted batches 1..=1000000, positive index bytes, 4 KiB fragments of at least 2 MiB + 4 KiB dividing the WAL file".into());
         }
+        if self
+            .owner_root
+            .as_ref()
+            .is_some_and(|root| !root.is_absolute())
+        {
+            return Err("index_fixture.owner_root must be an absolute path".into());
+        }
         match (self.arm, &self.per_cell) {
             (IndexArm::Exact, None) | (IndexArm::PerCell, Some(_)) => Ok(()),
             _ => Err(
@@ -120,6 +132,15 @@ impl IndexFixtureOptions {
                     .into(),
             ),
         }
+    }
+
+    /// Cold reopen evicts and residency-checks the case tree only, so an
+    /// owner tree outside it (tmpfs cannot be evicted) would escape both.
+    fn require_case_owner_root(&self) -> BackendResult<()> {
+        if self.owner_root.is_some() {
+            return Err("cold reopen does not support index_fixture.owner_root: eviction and the residency check walk the case tree only".into());
+        }
+        Ok(())
     }
 
     /// Everything but the stage must equal the build receipt.
@@ -130,6 +151,7 @@ impl IndexFixtureOptions {
             && self.fragment_bytes == other.fragment_bytes
             && self.wal_file_bytes == other.wal_file_bytes
             && self.per_cell == other.per_cell
+            && self.owner_root == other.owner_root
     }
 
     fn geometry(&self, replay_limits: ReplayLimits) -> BenchmarkGeometry {
@@ -220,11 +242,13 @@ struct CasePaths {
 }
 
 impl CasePaths {
-    fn new(options: &Options) -> Self {
+    /// `owner_root` is the fixture option; `None` keeps the owner tree under
+    /// the case path.
+    fn new(options: &Options, owner_root: Option<&Path>) -> Self {
         Self {
             root: options.path.clone(),
             coordinator: options.path.join("coordinator"),
-            fixture: options.path.join("fixture"),
+            fixture: owner_root.map_or_else(|| options.path.join("fixture"), Path::to_path_buf),
             evidence: options
                 .evidence
                 .clone()
@@ -418,7 +442,7 @@ pub(super) fn open(config: &RunConfig) -> BackendResult<TidehunterBackend> {
     let dataset = DatasetIdentity::from_config(config)?;
     let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
     let shape_yaml = serde_yaml::to_string(&shape)?;
-    let paths = CasePaths::new(&options);
+    let paths = CasePaths::new(&options, fixture.owner_root.as_deref());
     let tier = options.durability_tier;
     let (spec, label, kind) = match fixture.stage {
         IndexFixtureStage::Build => {

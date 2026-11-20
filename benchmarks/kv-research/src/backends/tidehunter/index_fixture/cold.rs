@@ -189,8 +189,9 @@ pub fn cold_reopen(config_path: &Path, output: &Path) -> BackendResult<()> {
         .index_fixture
         .take()
         .ok_or("index_fixture is missing")?;
+    fixture.require_case_owner_root()?;
     let replay_limits = validate_route(&options)?;
-    let paths = CasePaths::new(&options);
+    let paths = CasePaths::new(&options, None);
     let dataset = DatasetIdentity::from_config(&config)?;
     let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
     let shape_yaml = serde_yaml::to_string(&shape)?;
