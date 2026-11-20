@@ -41,6 +41,9 @@ pub(in crate::distributed::remote_db) struct ReceiptWindow {
     index: std::sync::Arc<ReceiptIndex>,
 }
 
+/// One shard of the receipt probe: operation id to its recent receipt.
+type ReceiptShard = Mutex<HashMap<[u8; 16], RecentReceipt>>;
+
 /// Sharded operation → receipt probe. Written only under the publisher lock, so
 /// each shard has a single logical writer; read without the publisher lock by
 /// every write admission.
@@ -51,7 +54,7 @@ pub(in crate::distributed::remote_db) struct ReceiptWindow {
 /// the allocation order `in-flight shards → key shards → owner order → slot`.
 /// A future edit that calls out under a shard would create the cycle.
 pub(in crate::distributed::remote_db) struct ReceiptIndex {
-    shards: Box<[Mutex<HashMap<[u8; 16], RecentReceipt>>]>,
+    shards: Box<[ReceiptShard]>,
     hash: RandomState,
 }
 

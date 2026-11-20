@@ -33,17 +33,29 @@ impl NodeInventory {
             ));
         }
         let log = inventory.retirement_log(authority_epoch, epoch)?;
-        let files: Vec<u64> = proofs.iter().map(|proof| proof.file_start).collect();
+        let Some(reservation) = inventory
+            .released(|| log.reserve_sealed_retirement(proofs))
+            .map_err(TcpError::component)?
+        else {
+            inventory.file_maintenance.busy_retirements += 1;
+            return Ok(RetirementOutcome::Busy);
+        };
+        if !Arc::ptr_eq(&inventory.retirement_log(authority_epoch, epoch)?, &log) {
+            return Err(TcpError::new("retirement authority changed"));
+        }
+        let files = reservation.files().to_vec();
         let mut target = {
-            if !inventory.live_pins.is_empty() {
-                return Err(TcpError::new(
-                    "live NVMe-oF pins must drain before retirement",
-                ));
-            }
+            // A pin on a victim file defers the request: a cached read-lane
+            // connection or an in-flight read is transient, and the next pass
+            // asks again (the same `Busy` the serving path answers). Pins on
+            // other files never block it (`victims_pinned`). The coordinator
+            // disconnects its own idle pool controllers of the victims before
+            // it asks (`Client::evict_retirement_files`).
             if inventory.victims_pinned(epoch, &files) {
-                return Err(TcpError::new(
-                    "live connection pins must drain before retirement",
-                ));
+                #[cfg(test)]
+                inventory.record_victim_pins(&log, epoch, &files);
+                inventory.file_maintenance.busy_retirements += 1;
+                return Ok(RetirementOutcome::Busy);
             }
             let target = live_target(inventory, slot)?;
             if let Some(target) = target {
@@ -56,37 +68,47 @@ impl NodeInventory {
                 None
             }
         };
+        #[cfg(test)]
+        if log.take_sealed_before_root_failure() {
+            return Err(TcpError::new("injected failure after revoke before root"));
+        }
         // Counted on submission, before any root install or unlink, so a
         // partially failed retirement still shows that unlinks were attempted.
         inventory.value_wal_unlinks = inventory
             .value_wal_unlinks
             .saturating_add(u64::try_from(files.len()).unwrap_or(u64::MAX));
         let emit = inventory.r1_events.is_some();
-        let (outcome, done, tombstones, cleared) =
-            inventory.released(|| -> Result<_, TcpError> {
-                let outcome = log
-                    .retire_sealed_stream_files(proofs)
-                    .map_err(TcpError::component)?;
-                if outcome == RetirementOutcome::Busy {
-                    return Ok((outcome, Vec::new(), Vec::new(), None));
+        let result = inventory.released(|| -> Result<_, TcpError> {
+            let outcome = log
+                .finish_sealed_retirement(reservation)
+                .map_err(TcpError::component)?;
+            if outcome == RetirementOutcome::Busy {
+                return Ok((outcome, Vec::new(), Vec::new(), None));
+            }
+            let done = log.pending_file_retirements();
+            let mut tombstones = Vec::new();
+            if let Some(target) = target.as_mut() {
+                if emit {
+                    tombstones.reserve_exact(done.len());
                 }
-                let done = log.pending_file_retirements();
-                let mut tombstones = Vec::new();
-                if let Some(target) = target.as_mut() {
+                finish_tombstones(target, &log, &done, |removed| {
                     if emit {
-                        tombstones.reserve_exact(done.len());
+                        tombstones.push(removed);
                     }
-                    finish_tombstones(target, &log, &done, |removed| {
-                        if emit {
-                            tombstones.push(removed);
-                        }
-                    })?;
-                }
-                let cleared = log
-                    .clear_retirement_cleanup(&done)
-                    .map_err(TcpError::component)?;
-                Ok((outcome, done, tombstones, cleared))
-            })?;
+                })?;
+            }
+            let cleared = log
+                .clear_retirement_cleanup(&done)
+                .map_err(TcpError::component)?;
+            Ok((outcome, done, tombstones, cleared))
+        });
+        let (outcome, done, tombstones, cleared) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                inventory.healthy = false;
+                return Err(error);
+            }
+        };
         // Older sealed stream: only the cleanup completions are published
         // (its decision and unlink steps are not part of the R1 contract).
         if let Some(events) = inventory.r1_events.as_mut() {
@@ -138,6 +160,20 @@ impl NodeInventory {
             if guard.victims_pinned(authority_epoch, &files)
                 || !guard.successor_published(&log, authority_epoch)?
             {
+                #[cfg(test)]
+                {
+                    guard.record_victim_pins(&log, authority_epoch, &files);
+                    if !guard.victims_pinned(authority_epoch, &files) {
+                        for &file in &files {
+                            log.record_busy(
+                                file,
+                                crate::distributed::storage::BusyCause::Other(
+                                    "successor not published",
+                                ),
+                            );
+                        }
+                    }
+                }
                 guard.file_maintenance.busy_retirements += 1;
                 return Ok(RetirementOutcome::Busy);
             }
@@ -216,6 +252,15 @@ impl NodeInventory {
             .finish_file_retirement_outcomes()
             .map_err(TcpError::component)?;
         if outcomes.is_empty() {
+            // Pending entries with no outcome: the pass was deferred (see
+            // `FileMaintenanceStats::deferred_retirements`), never lost.
+            if !log.pending_file_retirements().is_empty() {
+                let mut guard = inventory.lock();
+                guard.file_maintenance.deferred_retirements = guard
+                    .file_maintenance
+                    .deferred_retirements
+                    .saturating_add(1);
+            }
             return Ok(());
         }
         let generation = log.config().inventory.epoch;
@@ -255,6 +300,26 @@ impl NodeInventory {
         guard.file_maintenance.retired_files =
             guard.file_maintenance.retired_files.saturating_add(count);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_victim_pins(&self, log: &PartitionLog, epoch: u64, files: &[u64]) {
+        use crate::distributed::storage::BusyCause;
+        let bytes = self.config.partition.wal_file_bytes;
+        for (_, leases) in self.live_pins.values() {
+            for lease in leases {
+                let file = lease.segment.file_index * bytes;
+                if lease.segment.epoch == epoch && files.contains(&file) {
+                    log.record_busy(file, BusyCause::RecordPin);
+                }
+            }
+        }
+        for (_, (source, index)) in self.live_export_pins.values() {
+            let file = index * bytes;
+            if *source == epoch && files.contains(&file) {
+                log.record_busy(file, BusyCause::ExportPin);
+            }
+        }
     }
 
     /// Any record lease or connection pin on a victim defers the request.

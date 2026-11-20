@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "experimental-distributed")]
+use std::sync::atomic::AtomicUsize;
 
 /// Open WAL files keyed by `WalFileId`. The map may be sparse — the index WAL
 /// is GC'd by file id, so middle file ids can be missing after a snapshot
@@ -17,11 +19,29 @@ use std::sync::Arc;
 pub(crate) struct WalFiles {
     pub(crate) base_path: PathBuf,
     pub(crate) files: BTreeMap<WalFileId, Arc<File>>,
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) read_pins: Option<BTreeMap<WalFileId, Arc<AtomicUsize>>>,
 }
 
 impl WalFiles {
-    pub(crate) fn new(base_path: &Path, layout: &WalLayout) -> io::Result<Arc<ArcSwap<Self>>> {
+    pub(crate) fn new(
+        base_path: &Path,
+        layout: &WalLayout,
+        #[cfg(feature = "experimental-distributed")] pin_reads: bool,
+    ) -> io::Result<Arc<ArcSwap<Self>>> {
         let wal_files = Self::load(base_path, layout)?;
+        #[cfg(feature = "experimental-distributed")]
+        let mut wal_files = wal_files;
+        #[cfg(feature = "experimental-distributed")]
+        if pin_reads {
+            wal_files.read_pins = Some(
+                wal_files
+                    .files
+                    .keys()
+                    .map(|&id| (id, Arc::new(AtomicUsize::new(0))))
+                    .collect(),
+            );
+        }
         Ok(Arc::new(ArcSwap::from(Arc::new(wal_files))))
     }
 
@@ -48,6 +68,8 @@ impl WalFiles {
         }
         Ok(Self {
             base_path: base_path.to_path_buf(),
+            #[cfg(feature = "experimental-distributed")]
+            read_pins: None,
             files,
         })
     }
@@ -81,8 +103,15 @@ impl WalFiles {
             crate::file_reader::set_direct_options(&mut options, layout.direct_io);
             files.insert(id, Arc::new(options.open(entry.path())?));
         }
+        let read_pins = Some(
+            files
+                .keys()
+                .map(|&id| (id, Arc::new(AtomicUsize::new(0))))
+                .collect(),
+        );
         Ok(Self {
             base_path: base_path.to_path_buf(),
+            read_pins,
             files,
         })
     }
@@ -124,8 +153,14 @@ impl WalFiles {
         to_remove: &[WalFileId],
     ) -> (Self, Vec<(WalFileId, Arc<File>)>) {
         let mut files = self.files.clone();
+        #[cfg(feature = "experimental-distributed")]
+        let mut read_pins = self.read_pins.clone();
         let mut removed = Vec::with_capacity(to_remove.len());
         for id in to_remove {
+            #[cfg(feature = "experimental-distributed")]
+            if let Some(pins) = &mut read_pins {
+                pins.remove(id);
+            }
             if let Some(file) = files.remove(id) {
                 removed.push((*id, file));
             }
@@ -133,6 +168,8 @@ impl WalFiles {
         (
             Self {
                 base_path: self.base_path.clone(),
+                #[cfg(feature = "experimental-distributed")]
+                read_pins,
                 files,
             },
             removed,
@@ -148,8 +185,16 @@ impl WalFiles {
             files.insert(id, file).is_none(),
             "wal file {id:?} already in registry",
         );
+        #[cfg(feature = "experimental-distributed")]
+        let mut read_pins = self.read_pins.clone();
+        #[cfg(feature = "experimental-distributed")]
+        if let Some(pins) = &mut read_pins {
+            pins.insert(id, Arc::new(AtomicUsize::new(0)));
+        }
         Self {
             base_path: self.base_path.clone(),
+            #[cfg(feature = "experimental-distributed")]
+            read_pins,
             files,
         }
     }

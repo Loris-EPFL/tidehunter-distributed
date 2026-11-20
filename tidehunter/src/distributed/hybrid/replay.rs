@@ -195,8 +195,6 @@ pub(crate) struct ReplayOutcome {
 /// added.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplayReport {
-    /// The cut the index reflects after replay.
-    pub(crate) cut: BatchVersion,
     /// Batches the index received.
     pub(crate) tail_batches: u64,
     /// Sum of `CompleteBatch::encoded().len()` over the indexed batches: the
@@ -209,8 +207,8 @@ pub(crate) struct ReplayReport {
     pub(crate) discarded: u64,
     /// Dead-generation fronts skipped.
     pub(crate) skipped_dead: u64,
-    /// Relocated copies skipped (never indexed; their versions still advance
-    /// `cut`).
+    /// Relocated copies skipped (never indexed; they consumed an allocator
+    /// version and are not part of the tail).
     pub(crate) relocated_skipped: u64,
 }
 
@@ -318,6 +316,12 @@ impl BatchCursor {
             }));
         }
         let index = self.next_member;
+        // Every member was yielded: the batch is exhausted. (Asking past the
+        // last member is the normal end of a batch, not a malformed page; the
+        // descriptor count was validated against the mutation count at `new`.)
+        if index >= self.descriptors.len() {
+            return Ok(None);
+        }
         let descriptor = self
             .descriptors
             .get(index)
@@ -638,7 +642,6 @@ pub(crate) fn replay_into(
     fronts: &[StreamFront],
     live_streams: &[(u32, u64)],
 ) -> Result<ReplayReport, LocalDbError> {
-    let start = table.stored_cut();
     let page_limit = transport.page_limit;
     let fragment_bytes = transport.fragment_bytes;
     let source = HybridReplaySource::new(
@@ -665,7 +668,6 @@ pub(crate) fn replay_into(
     // build the report, and the caller folds every field into `RecoveryStats`;
     // nothing is printed, because stdout is not an operator channel.
     Ok(ReplayReport {
-        cut: outcome.applied.unwrap_or(start),
         tail_batches: outcome
             .merged
             .saturating_sub(outcome.discarded)

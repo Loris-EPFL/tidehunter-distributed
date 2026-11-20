@@ -50,6 +50,7 @@ struct LaneInbox<'a> {
     waiting: VecDeque<Request>,
     flying: HashMap<LiveReadToken, Request>,
     drains: Vec<mpsc::SyncSender<Result<(), String>>>,
+    evictions: Vec<Arc<RetirementEviction>>,
     done: Vec<LiveReadDone>,
     disconnected: bool,
 }
@@ -68,6 +69,7 @@ impl LaneInbox<'_> {
                 }
             }
             LiveLaneCommand::Drain(reply) => self.drains.push(reply),
+            LiveLaneCommand::EvictRetirement(request) => self.evictions.push(request),
         }
     }
     /// Take what is already queued without waiting; at most one channel's worth.
@@ -169,6 +171,7 @@ pub(super) fn run(
         waiting: VecDeque::new(),
         flying: HashMap::new(),
         drains: Vec::new(),
+        evictions: Vec::new(),
         done: Vec::new(),
         disconnected: false,
     };
@@ -245,6 +248,15 @@ pub(super) fn run(
                 // Release: CQ retirement and grant close precede drain completion.
                 state.live_drains.fetch_sub(1, Ordering::Release);
                 let _ = reply.send(result.clone());
+            }
+        }
+        if !inbox.evictions.is_empty() {
+            let mut client = lane.client.lock();
+            for request in inbox.evictions.drain(..) {
+                let released = cache
+                    .evict_retirement_files(&mut client, epoch, request.generation, &request.files)
+                    .is_ok();
+                let _ = request.reply.try_send(released);
             }
         }
         let mut client = lane.client.lock();

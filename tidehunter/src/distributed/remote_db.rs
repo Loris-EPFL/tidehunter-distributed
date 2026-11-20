@@ -13,6 +13,8 @@
 
 use super::codec::{CompleteBatch, Mutation};
 use super::durability::{DurabilityTier, DurableCutConfig};
+pub use super::hybrid::HybridIndexConfig;
+use super::hybrid::StoredSnapshot;
 use super::hybrid::loader::CutLatch;
 use super::hybrid::loader::{CutSources, allocation_capacity};
 use super::hybrid::position::VersionPosition;
@@ -20,7 +22,6 @@ use super::hybrid::read::ValueReader;
 use super::hybrid::region::StreamFront;
 use super::hybrid::replay::{ReplayTransport, replay_into};
 use super::hybrid::table::HybridTable;
-use super::hybrid::{HybridIndexConfig, StoredSnapshot};
 use super::native_publication::NativePublicationRouting;
 use super::reference_directory::ReferenceDirectory;
 use super::storage::{
@@ -50,7 +51,7 @@ use std::time::{Duration, Instant};
 
 mod callback_starts;
 mod stream_positions;
-use stream_positions::{OwnerTail, seed_positions};
+use stream_positions::{OwnerTail, check_stream_bound, seed_positions};
 mod coordinator_io;
 use coordinator_io::CoordinatorIoCategory;
 mod authority_lifecycle;
@@ -182,22 +183,14 @@ pub struct RemoteDatabaseConfig {
     /// The durable cut of Native-tier recovery. Absent means the default lags.
     #[serde(default, skip_serializing_if = "DurableCutConfig::is_default")]
     pub durable_cut: DurableCutConfig,
-    /// Native `relocation_max_reclaim_pct` (0..=100), carried from the
-    /// caller's native config: it caps only the per-owner physical reclaim
-    /// span of an R1 pass, never the callback scan. Zero keeps native's
-    /// one-file minimum. Absent means native's default.
-    #[serde(default = "default_relocation_max_reclaim_pct")]
-    pub relocation_max_reclaim_pct: u8,
     /// The native index configuration of the coordinator's `LargeTable`,
-    /// `IndexFlusher` and control region: Sui's resolved native values reach the
-    /// engine only through this field (`HybridIndexConfig::from_native`). Absent
-    /// means Sui's production defaults; an unknown key fails at parse.
+    /// `IndexFlusher`, control region and relocation policy (including native
+    /// `relocation_max_reclaim_pct`, the one source of that value): Sui's
+    /// resolved native values reach the engine only through this field, built by
+    /// [`RemoteDatabaseConfig::with_native_index`]. Absent means Sui's production
+    /// defaults; an unknown key fails at parse.
     #[serde(default)]
     pub index: HybridIndexConfig,
-}
-
-fn default_relocation_max_reclaim_pct() -> u8 {
-    crate::config::Config::default().relocation_max_reclaim_pct
 }
 
 fn default_max_pending_reads() -> usize {
@@ -235,6 +228,15 @@ fn default_owner_append_occupancy() -> usize {
 }
 
 impl RemoteDatabaseConfig {
+    /// Takes the index rows of the native [`crate::config::Config`] the caller
+    /// resolved for a native database (Sui's `thdb_config`), so a remote
+    /// database indexes with exactly the values a native one would.
+    #[must_use]
+    pub fn with_native_index(mut self, native: &crate::config::Config) -> Self {
+        self.index = HybridIndexConfig::from_native(native);
+        self
+    }
+
     pub const MAX_OWNER_APPEND_OCCUPANCY: usize = super::tcp::APPEND_COMMAND_WINDOW;
     pub const DEFAULT_OWNER_APPEND_OCCUPANCY: usize = DEFAULT_OWNER_APPEND_OCCUPANCY;
     /// Each lane retains a connection to every owner. Owners must budget for
@@ -337,11 +339,7 @@ impl RemoteDatabaseConfig {
     /// # Errors
     /// Rejects unsupported live mode, incompatible limits or invalid inventories.
     pub fn validate(&self) -> Result<(), LocalDbError> {
-        if self.relocation_max_reclaim_pct > 100 {
-            return Err(LocalDbError::new(
-                "relocation_max_reclaim_pct must be in 0..=100",
-            ));
-        }
+        self.index.validate()?;
         self.durable_cut.validate().map_err(LocalDbError::new)?;
         {
             let live = &self.live_nvme;
@@ -716,9 +714,17 @@ struct CallbackStart {
 pub struct RecoveryStats {
     pub checkpoint_loaded: bool,
     pub checkpoint_load_ns: u64,
-    pub proof_validation_ns: u64,
+    /// Retained older generations the loaded control region did not name, so
+    /// the open replayed them from offset 0. Zero in steady state: every store
+    /// names every retained generation (`hybrid::region::older_replay_from`).
+    /// Non-zero is legitimate only for a generation that opened and closed
+    /// before any store, and is a defect otherwise.
+    pub old_generation_replayed_from_zero: u64,
+    /// Rows of the loaded control region that name a generation this open does
+    /// not retain (trimmed after the store). The open skips them; the next
+    /// store drops them.
+    pub stale_region_rows_skipped: u64,
     pub tail_replay_ns: u64,
-    pub checkpoint_commit_ns: u64,
     pub connection_setup_ns: u64,
     pub fencing_ns: u64,
     pub tail_batches: u64,
@@ -1073,7 +1079,7 @@ impl RemoteDatabase {
     /// One native snapshot pass (the cadence thread's call).
     pub(crate) fn snapshot_index(&self) -> Result<StoredSnapshot, LocalDbError> {
         self.ensure_healthy()?;
-        self.core.table.snapshot()
+        self.core.snapshot_table()
     }
 
     /// A failed snapshot pass is fail-stop, as native's `expect` on its pass
@@ -1223,6 +1229,11 @@ impl RemoteDatabase {
         }
         config.validate()?;
         config.validate_read_lane_pinning(config.effective_read_lanes())?;
+        // Reported once per open and never an error: native batch compression has
+        // no meaning on the leased route, which carries whole owner frames.
+        if let Some(report) = config.index.unsupported_report(&path.display().to_string()) {
+            eprintln!("{report}");
+        }
         let shape_yaml = shape.to_yaml().map_err(LocalDbError::component)?;
         // Preserve callback closures; YAML describes the shape, not its policy.
         let shape = shape.clone();
@@ -1319,6 +1330,13 @@ impl RemoteDatabase {
             fencing_generations::check_owner_status(status.partition.partition, status, &manifest)?;
             recovery_stats.add_connection(client.connect_profile());
         }
+        // The one place the stream bound is enforced before anything is
+        // persisted: a reservation that would take `owners x (retained + 1)
+        // past the control-region bound is refused here, with the manifest
+        // untouched and no owner fenced. Trimming first is not possible: an
+        // owner trim is fenced by the reserved generation itself. The soft
+        // pressure signal after open is what keeps databases from getting here.
+        check_stream_bound(config.endpoints.len(), manifest.generations.len())?;
         // One durable replacement folds a previous reservation into Aborted,
         // appends Reserved(g) and advances the never-reused counter before ANY
         // owner may activate g. A failed partial fence is aborted by the next open.
@@ -1456,6 +1474,8 @@ impl RemoteDatabase {
             &partitions,
         )?);
         table.validate_partitions(&partitions)?;
+        recovery_stats.checkpoint_loaded = table.region_loaded();
+        recovery_stats.checkpoint_load_ns = table.region_load_ns();
         // No checkpoint covers any batch for Version B: the durable-cut record is
         // the only claim about what the owners synced, which is the stricter
         // reading of a region cut that is exclusive.
@@ -1477,22 +1497,31 @@ impl RemoteDatabase {
         for (node, partition) in partitions.iter().enumerate() {
             for generation in histories[node].iter().copied() {
                 live_streams.push((*partition, generation));
-                fronts.push(
-                    table
-                        .opened_fronts()
-                        .iter()
-                        .find(|front| {
-                            front.partition == *partition && front.generation == generation
-                        })
-                        .copied()
-                        .unwrap_or(StreamFront {
-                            partition: *partition,
-                            generation,
-                            replay_from: 0,
-                        }),
-                );
+                let front =
+                    match table.opened_fronts().iter().find(|front| {
+                        front.partition == *partition && front.generation == generation
+                    }) {
+                        Some(front) => *front,
+                        None => {
+                            recovery_stats.old_generation_replayed_from_zero += 1;
+                            StreamFront {
+                                partition: *partition,
+                                generation,
+                                replay_from: 0,
+                            }
+                        }
+                    };
+                fronts.push(front);
             }
         }
+        recovery_stats.stale_region_rows_skipped = u64::try_from(
+            table
+                .opened_fronts()
+                .iter()
+                .filter(|front| !live_streams.contains(&(front.partition, front.generation)))
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
         let replay_started = Instant::now();
         let page_limit = config
             .recovery_page_limit()?
@@ -2112,8 +2141,10 @@ impl RemoteDatabase {
 
     /// One native snapshot pass: flushes the cells that are stale by value-byte
     /// distance and stores one control region when the flush frontier advanced.
-    pub fn flush_index(&self) -> Result<StoredSnapshot, LocalDbError> {
-        self.core.flush_index()
+    /// The pass outcome ([`StoredSnapshot`]) is crate-internal; callers outside
+    /// the crate only need to know the pass succeeded.
+    pub fn flush_index(&self) -> Result<(), LocalDbError> {
+        self.core.flush_index().map(|_| ())
     }
     pub fn pipeline_stats(&self) -> PipelineStats {
         self.core.pipeline_stats()

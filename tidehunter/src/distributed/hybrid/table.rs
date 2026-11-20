@@ -1,5 +1,8 @@
 //! The hybrid table: the coordinator's native index over remote value positions.
 //!
+//! Convention (A13): cuts are exclusive (`below(cut)` is `version < cut`),
+//! starts are inclusive and ends are exclusive.
+//!
 //! Native `Db` owns one `LargeTable`, its `IndexFlusher` threads and the local
 //! value WAL that gives every position a meaning. The hybrid keeps the first
 //! two unchanged and replaces the third with the remote value WAL: a
@@ -39,7 +42,8 @@ use super::config::HybridIndexConfig;
 use super::loader::{AllocationView, CutLatch, CutSources, HybridLoader, next_stored_target};
 use super::position::VersionPosition;
 use super::region::{
-    HybridRegionStore, MAX_REGION_STREAMS, StreamFront, max_flushed_at, max_region_cells,
+    HybridRegionStore, MAX_REGION_STREAMS, OlderStream, StreamFront, max_flushed_at,
+    max_region_cells,
 };
 use super::snapshot::{self, StoredSnapshot};
 use crate::background_health::BackgroundHealth;
@@ -67,8 +71,10 @@ use minibytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 
 /// The value a `put` is indexed with.
@@ -108,7 +114,6 @@ impl Deref for HybridTable {
 
 /// The table state; also the flusher threads' host.
 pub(crate) struct TableInner {
-    dir: PathBuf,
     shape: Arc<KeyShape>,
     config: HybridIndexConfig,
     metrics: Arc<Metrics>,
@@ -119,6 +124,28 @@ pub(crate) struct TableInner {
     region: Mutex<HybridRegionStore>,
     /// The per-stream replay table the region loaded at open named.
     opened_fronts: Vec<StreamFront>,
+    /// Whether the open found a stored control region (native: a snapshot to
+    /// load), and how long reading and validating it took. Recovery
+    /// diagnostics only (`RecoveryStats::checkpoint_loaded/_load_ns`).
+    region_loaded: bool,
+    region_load_ns: u64,
+    /// Single-flight of the snapshot pass. Every caller (the cadence thread,
+    /// `flush`, a relocation pass, the named force rebuild, the shutdown
+    /// snapshot) runs `rebuild_control_region`, which reads the stored cut, picks
+    /// its head and later stores; two interleaved passes would race a stale head
+    /// against the other's store (the store refuses a regression, which would
+    /// fail the database). The pass takes this lock first and holds it to the
+    /// end, so a concurrent caller waits and then runs its own pass on the
+    /// fresh stored cut. Lock order: `pass` -> cut latch -> `region`. Cold path.
+    pass: Mutex<()>,
+    /// Test hook: park a pass after it chose its head, to prove single-flight.
+    #[cfg(test)]
+    pass_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     cuts: CutSources,
     allocation: Arc<AllocationView>,
     health: Arc<BackgroundHealth>,
@@ -130,6 +157,11 @@ pub(crate) struct TableInner {
     /// flush frontier below the stored head (S5c2). Diagnostic; a relaxed
     /// counter is enough, nothing orders against it.
     latch_deferrals: AtomicU64,
+    /// Older-generation rows written without a known durable end (carried, not
+    /// advanced). The coordinator seeds a position for every retained
+    /// generation, so a non-zero value is a broken invariant that stays
+    /// visible instead of silently dropping the row. Relaxed: diagnostic only.
+    older_rows_without_end: AtomicU64,
     /// See [`HybridTable::set_after_pin_sample`].
     #[cfg(test)]
     after_pin_sample: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -171,11 +203,14 @@ impl HybridTable {
             health.clone(),
         )
         .map_err(|error| LocalDbError::new(format!("open index WAL: {error}")))?;
+        let region_load_started = std::time::Instant::now();
         let (region_store, region) =
             HybridRegionStore::open(dir.join(CONTROL_REGION_FILE), &shape)?;
         if let Some(region) = &region {
             region.validate_bounds(MAX_REGION_STREAMS, max_region_cells(&shape))?;
         }
+        let region_load_ns =
+            u64::try_from(region_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let empty;
         let snapshot = match &region {
             Some(region) => region.region.snapshot(),
@@ -230,7 +265,6 @@ impl HybridTable {
             allocation.publish_partition(stream, *partition);
         }
         let inner = Arc::new(TableInner {
-            dir: dir.to_path_buf(),
             shape,
             config: config.clone(),
             metrics: metrics.clone(),
@@ -239,11 +273,17 @@ impl HybridTable {
             table,
             region: Mutex::new(region_store),
             opened_fronts,
+            region_loaded: region.is_some(),
+            region_load_ns,
+            pass: Mutex::new(()),
+            #[cfg(test)]
+            pass_pause: Mutex::new(None),
             cuts,
             allocation,
             health,
             streams: OnceLock::new(),
             latch_deferrals: AtomicU64::new(0),
+            older_rows_without_end: AtomicU64::new(0),
             #[cfg(test)]
             after_pin_sample: Mutex::new(None),
             #[cfg(test)]
@@ -272,10 +312,21 @@ impl HybridTable {
         Self::open_with_partitions(dir, shape, config, cuts, metrics, &[])
     }
 
-    /// One native snapshot pass (the cadence thread's call).
-    pub(crate) fn snapshot(&self) -> Result<StoredSnapshot, LocalDbError> {
+    /// One native snapshot pass (the cadence thread's call). `older` names every
+    /// retained older generation; the stored region keeps a row for each.
+    pub(crate) fn snapshot_with(
+        &self,
+        older: &[OlderStream],
+    ) -> Result<StoredSnapshot, LocalDbError> {
         self.check_background_health()?;
-        snapshot::rebuild_control_region(self, false, None)
+        snapshot::rebuild_control_region(self, false, None, older)
+    }
+
+    /// [`Self::snapshot_with`] for an index-only table, which has no older
+    /// generation.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Result<StoredSnapshot, LocalDbError> {
+        self.snapshot_with(&[])
     }
 
     /// A snapshot that must cover the relocation pass's scan cut `q` (A22/A23).
@@ -287,9 +338,10 @@ impl HybridTable {
     /// where the cut stays and the blob content changes. The flush clamp is
     /// `last_processed_at_capture`; a `q` above it cannot be covered (promotion
     /// would pass a held cut), so the caller defers.
-    pub(crate) fn snapshot_for_relocation(
+    pub(crate) fn snapshot_for_relocation_with(
         &self,
         q: BatchVersion,
+        older: &[OlderStream],
     ) -> Result<StoredSnapshot, LocalDbError> {
         self.check_background_health()?;
         let promotion_cut = self.last_processed();
@@ -301,7 +353,16 @@ impl HybridTable {
                 promotion_cut,
             });
         }
-        snapshot::rebuild_control_region(self, true, Some(promotion_cut))
+        snapshot::rebuild_control_region(self, true, Some(promotion_cut), older)
+    }
+
+    /// [`Self::snapshot_for_relocation_with`] for an index-only table.
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_relocation(
+        &self,
+        q: BatchVersion,
+    ) -> Result<StoredSnapshot, LocalDbError> {
+        self.snapshot_for_relocation_with(q, &[])
     }
 }
 
@@ -336,14 +397,44 @@ impl TableInner {
         debug_assert!(attached, "owner lanes attached twice");
     }
 
+    /// The single-flight lock of the snapshot pass.
+    pub(crate) fn pass_lock(&self) -> &Mutex<()> {
+        &self.pass
+    }
+
+    /// Test hook: park the next pass after it chose its head. Returns
+    /// (entered, resume).
+    #[cfg(test)]
+    pub(crate) fn pause_next_pass(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.pass_pause.lock() = Some((entered, released));
+        (started, resume)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_pass_pause(&self) {
+        let pause = self.pass_pause.lock().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.recv_timeout(std::time::Duration::from_secs(120));
+        }
+    }
+
     /// The cut the stored region names.
     pub(crate) fn stored_cut(&self) -> BatchVersion {
         self.region.lock().last_position()
     }
 
     /// The cut the next store may name: `max(previous, min(durable, applied,
-    /// lowest held latch))` (A9). Never moves back, so a checkpoint held below
-    /// the stored head only makes the store a no-op.
+    /// lowest held latch))` (A9), where `previous` is `self.stored_cut()`, the
+    /// cut the stored control region names. Never moves back, so a checkpoint
+    /// held below the region cut only makes the store a no-op.
     pub(crate) fn stored_target(&self) -> BatchVersion {
         next_stored_target(
             self.stored_cut(),
@@ -483,6 +574,16 @@ impl TableInner {
         &self.opened_fronts
     }
 
+    /// A stored control region was loaded at open.
+    pub(crate) fn region_loaded(&self) -> bool {
+        self.region_loaded
+    }
+
+    /// Time to read and validate the control region at open, in nanoseconds.
+    pub(crate) fn region_load_ns(&self) -> u64 {
+        self.region_load_ns
+    }
+
     /// The per-stream allocation view shared with the owner workers.
     pub(crate) fn allocation(&self) -> &Arc<AllocationView> {
         &self.allocation
@@ -492,11 +593,9 @@ impl TableInner {
         &self.cuts
     }
 
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// The replay table the next store writes (I3/I4).
+    /// The serving generation's rows of the replay table the next store writes
+    /// (I3/I4); the snapshot pass adds one row per retained older generation
+    /// (`snapshot::region_rows`).
     ///
     /// Each stream's front is the minimum of its oldest unapplied offset, its
     /// published tail and its dropped floor, so every allocated extent is
@@ -568,6 +667,10 @@ impl TableInner {
     /// Index level only: the caller resolves the position through the value path
     /// and advances past an entry its owner no longer holds, exactly as native
     /// `Db::next_entry` does after a failed record read.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors native `LargeTable::next_entry`, which takes the same list plus the loader"
+    )]
     pub(crate) fn next_entry(
         &self,
         ks: KeySpace,
@@ -618,13 +721,36 @@ impl TableInner {
         self.table.next_cell(context, cell, reverse)
     }
 
-    /// The as-of view of one cell at the relocation scan cut `q`, with the latch
-    /// that keeps it valid (A22/A23).
+    /// The view of one cell at the relocation scan cut `q`, with the latch that
+    /// keeps it valid (A22/A23).
     ///
-    /// The latch goes in first: from then on no flush promotes past `q`, so the
-    /// overlay filter (`retain_processed(q)`) and the on-disk levels describe the
-    /// same prefix. Dropping the latch releases the clamp; a pass holds it for the
-    /// cell it is copying and no longer.
+    /// **Guarantee: the view shows every entry at or above `q`, not the prefix
+    /// `q`.** An earlier flush may already have promoted entries newer than `q`
+    /// into a flat or on-disk level before the latch landed (the flush frontier
+    /// can be above `q` until this pin), and a later overwrite of a key never
+    /// removes its older version while a latch is held. What the latch fixes is
+    /// the lower side: from the pin on no flush promotes past `q`, so the overlay
+    /// filter (`retain_processed(q)`) and the on-disk levels describe the same
+    /// prefix for every version below `q`. A pass therefore re-points an entry
+    /// only by a `same_physical` compare-and-set against the position it read
+    /// (`relocation_apply`), never by "version below `q`", so an entry above `q`
+    /// that the view happens to contain is re-pointed only when it is still the
+    /// physical entry the pass copied, and a newer overwrite is left alone.
+    ///
+    /// Dropping the latch releases the clamp; a pass holds it for the cell it is
+    /// copying and no longer. `relocation_apply` needs the latch held until its
+    /// compare-and-set has run (the re-pointed entries are lifted into the
+    /// overlay below the flush frontier, the same hazard a request-time frontier
+    /// has), so the durable-copy wait of `flush_relocated` also runs under it.
+    ///
+    /// **Bound on the latch hold.** That wait (`WriteCore::await_copies_durable`)
+    /// is at most `8 * durable_cut.lag_ms + config.timeout`, capped at 120 s
+    /// (`COPY_DURABLE_LAG_MULTIPLE`, `COPY_DURABLE_WAIT_CAP`), per chunk; on
+    /// expiry the pass ends with the typed `copies_not_durable` deferral and the
+    /// latch drops with it. While it is held `last_processed` cannot pass `q`,
+    /// so no snapshot store moves the stored cut beyond `q`: a stalled owner
+    /// delays index promotion and the retirement witness that follows the
+    /// stored cut by at most that bound per chunk.
     pub(crate) fn relocation_view(
         &self,
         ks: KeySpace,
@@ -730,6 +856,17 @@ impl TableInner {
     /// Total of [`Self::record_snapshot_latch_deferral`].
     pub(crate) fn snapshot_latch_deferrals(&self) -> u64 {
         self.latch_deferrals.load(Ordering::Relaxed)
+    }
+
+    /// Counts an older-generation row written without a known durable end.
+    pub(crate) fn record_older_row_without_end(&self) {
+        // Relaxed: a diagnostic counter; no other memory is published by it.
+        self.older_rows_without_end.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total of [`Self::record_older_row_without_end`].
+    pub(crate) fn older_rows_without_end(&self) -> u64 {
+        self.older_rows_without_end.load(Ordering::Relaxed)
     }
 
     /// Inserts one published batch's members and charges its bytes.

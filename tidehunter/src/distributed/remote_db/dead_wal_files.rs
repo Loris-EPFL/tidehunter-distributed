@@ -28,7 +28,10 @@
 //! In-flight reads need no extra file guard here: a read holds the checkpoint
 //! latch of its cut (I6), which clamps `Loader::last_processed`, which clamps
 //! the durable flush target and so the control-region frontier. Retirement
-//! therefore never passes a cut a read can still use.
+//! therefore never passes a cut a read can still use. `take_snapshot` adds the
+//! explicit cap (no stream retires while a latch is below the stored cut: a
+//! stale relocation latch or the transient NONE latch of `pin_checkpoint`) and
+//! counts it as `retirement_latch_caps`.
 //!
 //! Nothing here is fatal for the authority: a failed or refused request made
 //! no coordinator state change, and the next pass re-pages the owner.
@@ -42,6 +45,7 @@ use super::{Client, LocalDbError};
 use crate::distributed::storage::{RetireProof, RetirementWitness, WalInode};
 use crate::distributed::tcp::checkpoint::RetirementResult;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 /// Owner inventory pages per pass and owner; a stream has far fewer files.
 const MAX_PAGES_PER_STREAM: usize = 1 << 16;
@@ -114,6 +118,13 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
                 endpoint.partition
             ))
         })?;
+        // The retirement request first disconnects the coordinator's own idle
+        // read controllers of the victim files (`evict_retirement_files`). A
+        // session without the pool skips that step and the owner then finds
+        // the lanes' cached connection pins on the victims.
+        if let Some(pool) = &core.live_pool {
+            client.set_live_pool(pool.clone());
+        }
         let Some(generations) = snapshot.retained.get(node) else {
             continue;
         };
@@ -128,6 +139,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
                 retire_serving_stream(
                     core,
                     &mut client,
+                    node,
                     endpoint.partition,
                     watermark,
                     stream_end,
@@ -137,6 +149,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
                 retire_sealed_stream(
                     core,
                     &mut client,
+                    node,
                     endpoint.partition,
                     generation,
                     watermark,
@@ -184,12 +197,54 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
         (starts, durable_end, retained)
     };
     // Per stream, never one global term: independent owner offset spaces.
+    //
+    // Read order matters: `starts` above came first, the stored rows come now.
+    // A store between the two reads can only add rows (the retained set changes
+    // at open only), so the subset check below cannot trip on that race.
     let mut fronts: BTreeMap<(u32, u64), u64> = BTreeMap::new();
     for front in &core.table.stored_fronts() {
         fronts.insert((front.partition, front.generation), front.replay_from);
     }
+    // The retirement witness never passes the lowest held latch. A latch below
+    // the stored control-region cut holds a view whose older versions of
+    // overwritten keys are still in the index overlay and name bytes the
+    // relocation pass did not copy (it copies the newest entry at its scan
+    // cut), so no stream retires while one is held. `held < stored_cut()`
+    // compares two exclusive cuts (`BatchVersion`: below(cut) = version < cut).
+    //
+    // Which latches can be below the stored cut:
+    // - Checkpoint, iterator and snapshot latches are pinned at a cut at or
+    //   above the stored one (`pin_checkpoint` pins the publication cut,
+    //   table.rs `pin_checkpoint`; the snapshot pass pins its head), and
+    //   `stored_target` is `max(previous, min(durable, applied, lowest held))`
+    //   (table.rs `stored_target`), so a held latch only stops the stored cut
+    //   from advancing: by induction they are never below it.
+    // - A relocation latch pins the cut `q` that the pass froze ONCE
+    //   (`freeze_relocation_scan`, relocation.rs) and re-pins per cell
+    //   (`relocation_view` -> `pin_cut(q)`). Between two cells no latch at `q`
+    //   exists, so the cadence store may pass `q`; a stale-`q` latch can then
+    //   be below the stored cut. This is harmless today only because the one
+    //   caller (`relocation.rs`, under `core.retirement`) runs on the
+    //   relocation worker after that pass's per-cell latches are dropped. A
+    //   second caller on another thread would meet a stale-`q` latch and be
+    //   capped: fail closed, counted, retried by the next pass.
+    // - The transient NONE latch of `pin_checkpoint` (cut `{0,0}`: "no cut is
+    //   known yet") is always below it; the check refuses retirement for
+    //   exactly that window.
+    //
+    // The latch is read before the stored cut and the stored cut never moves
+    // back, so a store between the two reads can only add refusals.
+    let held_below_stored = core
+        .table
+        .cuts()
+        .lowest_held()
+        .is_some_and(|held| held < core.table.stored_cut());
+    if held_below_stored {
+        // Relaxed: a diagnostic count; nothing is ordered against it.
+        core.retirement_latch_caps.fetch_add(1, Ordering::Relaxed);
+    }
     let mut watermark = BTreeMap::new();
-    for (&key, &callback_from) in &starts {
+    for (&key, &callback_from) in starts.iter().filter(|_| !held_below_stored) {
         // A stream the durable control region never covered has no replay
         // floor yet: no byte of it can be proven dead.
         let Some(&replay_from) = fronts.get(&key) else {
@@ -212,16 +267,42 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
             (stats.enabled && stats.epoch == core.epoch).then_some(stats.persisted_next)
         }
     };
-    // A stream with an adopted start but no control-region front (or the
-    // reverse) would never retire and nobody would notice; the two come from
-    // one snapshot, so they must name the same streams.
-    debug_assert_eq!(
-        starts.keys().collect::<Vec<_>>(),
-        fronts
+    // A start without a control-region row is legitimate until THIS process
+    // stores a region: a generation that wrote and closed before any store has
+    // a start seeded at open and no row, even when an older region was loaded
+    // (the first snapshot is cadence-driven, 8 GiB of values); and the serving
+    // generation can publish before its first store. The loop above skips such
+    // a stream (no byte can be proven dead without a replay floor).
+    //
+    // From the first store of this process on, every start stream has a row:
+    // the store names the serving generation and one row per retained older
+    // generation of the manifest (`HybridTable::snapshot_with`). The serving
+    // generation is new at every open, so a loaded region can never name it:
+    // its row is the proof that a store happened since this open. A start
+    // without a row after that is a broken invariant. Release builds keep the
+    // skip above (nothing retires without a floor) and count it.
+    let stored_by_this_process = fronts
+        .keys()
+        .any(|&(_, generation)| generation == core.epoch);
+    if stored_by_this_process {
+        let missing: Vec<(u32, u64)> = starts
             .keys()
-            .filter(|key| starts.contains_key(key))
-            .collect::<Vec<_>>()
-    );
+            .filter(|key| !fronts.contains_key(key))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            // Relaxed: a diagnostic count; nothing is ordered against it.
+            core.retirement_missing_rows.fetch_add(
+                u64::try_from(missing.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        debug_assert!(
+            missing.is_empty(),
+            "every seeded start stream (serving or retained older) must have a row in the \
+             region this process stored; missing (partition, generation): {missing:?}"
+        );
+    }
     Snapshot {
         watermark,
         durable_end,
@@ -235,6 +316,7 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
 fn retire_serving_stream(
     core: &WriteCore,
     client: &mut Client,
+    node: usize,
     partition: u32,
     watermark: StreamWatermark,
     durable_end: u64,
@@ -242,24 +324,22 @@ fn retire_serving_stream(
 ) -> Result<(), LocalDbError> {
     // An owner whose allocator, lease or root moved during paging yields no
     // trustworthy proof: defer it to the next pass.
-    let Some((header, rows)) = page_serving_stream(client, core.epoch)? else {
+    let Some(rows) = page_serving_stream(client, core.epoch)? else {
         return Ok(());
     };
     let file_bytes = core.config.partition_config(1, partition).wal_file_bytes;
-    let proofs = victims(
-        core,
-        partition,
-        &rows,
-        watermark,
-        durable_end,
-        persisted_cut_next,
-    )?;
+    let proofs = victims(core, &rows, watermark, durable_end, persisted_cut_next)?;
     let witness = RetirementWitness {
         replay_from: watermark.replay_from,
         callback_from: watermark.callback_from,
         persisted_cut_next,
     };
     for chunk in proofs.chunks(MAX_PROOFS_PER_REQUEST) {
+        let files: Vec<u64> = chunk.iter().map(|proof| proof.file_start).collect();
+        if !core.reads.evict_retirement_grants(node, core.epoch, &files) {
+            core.retirement_busy_replies.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         let claim = core
             .r1_events
             .claimed(core, partition, file_bytes, chunk, &witness);
@@ -277,6 +357,8 @@ fn retire_serving_stream(
         }
         // `Busy`: no durable decision; retry on the next pass, never in a loop.
         if outcome == RetirementResult::Busy {
+            // Relaxed: a diagnostic count; nothing is ordered against it.
+            core.retirement_busy_replies.fetch_add(1, Ordering::Relaxed);
             break;
         }
     }
@@ -288,6 +370,7 @@ fn retire_serving_stream(
 fn retire_sealed_stream(
     core: &WriteCore,
     client: &mut Client,
+    node: usize,
     partition: u32,
     generation: u64,
     watermark: StreamWatermark,
@@ -312,20 +395,15 @@ fn retire_sealed_stream(
         // only dead when its *end* is at or below the watermark, exactly like
         // the serving stream: a mid-file target leaves live bytes above it.
         let size = core.config.partition_config(1, partition).wal_file_bytes;
-        let full = watermark.end >= stream_end;
         let dead: Vec<u64> = files
             .into_iter()
-            .filter(|&start| {
-                if full {
-                    start < watermark.end
-                } else {
-                    start
-                        .checked_add(size)
-                        .is_some_and(|end| end <= watermark.end)
-                }
-            })
+            .filter(|&start| sealed_file_is_dead(start, size, watermark.end, stream_end))
             .collect();
         if dead.is_empty() {
+            return Ok(());
+        }
+        if !core.reads.evict_retirement_grants(node, generation, &dead) {
+            core.retirement_busy_replies.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if client
@@ -337,8 +415,26 @@ fn retire_sealed_stream(
             })?
             == RetirementResult::Busy
         {
+            // Relaxed: a diagnostic count; nothing is ordered against it.
+            core.retirement_busy_replies.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+    }
+}
+
+/// Whether the file starting at `start` of a sealed stream ending at
+/// `stream_end` is dead under a watermark ending at `watermark_end`. Full
+/// coverage (`watermark_end >= stream_end`) kills every file that starts below
+/// the watermark, including the last one whose tail past the stream end is the
+/// seal scan's zero or skip suffix; otherwise the file's own end must be at or
+/// below the watermark.
+fn sealed_file_is_dead(start: u64, size: u64, watermark_end: u64, stream_end: u64) -> bool {
+    if watermark_end >= stream_end {
+        start < watermark_end
+    } else {
+        start
+            .checked_add(size)
+            .is_some_and(|end| end <= watermark_end)
     }
 }
 
@@ -347,7 +443,7 @@ fn retire_sealed_stream(
 fn page_serving_stream(
     client: &mut Client,
     authority: u64,
-) -> Result<Option<(FileInventoryReply, Vec<WalFileObservation>)>, LocalDbError> {
+) -> Result<Option<Vec<WalFileObservation>>, LocalDbError> {
     let mut after = None;
     let mut rows = Vec::new();
     let mut header: Option<FileInventoryReply> = None;
@@ -371,8 +467,7 @@ fn page_serving_stream(
         rows.append(&mut reply.rows);
         header = Some(reply);
         if !full {
-            let header = header.ok_or_else(|| LocalDbError::new("inventory page missing"))?;
-            return Ok(Some((header, rows)));
+            return Ok(Some(rows));
         }
     }
     Err(LocalDbError::new(
@@ -383,7 +478,6 @@ fn page_serving_stream(
 /// Proofs for the durably sealed files of one owner at or below the watermark.
 fn victims(
     core: &WriteCore,
-    partition: u32,
     rows: &[WalFileObservation],
     watermark: StreamWatermark,
     processed_end: u64,
@@ -403,7 +497,7 @@ fn victims(
                 hi: processed_end,
             }],
             size,
-            core.config.relocation_max_reclaim_pct,
+            core.config.index.relocation_max_reclaim_pct,
         )
         .get(&core.epoch)
         .copied()
@@ -432,7 +526,7 @@ fn victims(
         {
             continue;
         }
-        if !budget_end.is_some_and(|end| file_end <= end) {
+        if budget_end.is_none_or(|end| file_end > end) {
             continue;
         }
         proofs.push(RetireProof {

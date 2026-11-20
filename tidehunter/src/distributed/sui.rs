@@ -717,6 +717,20 @@ impl Db {
         let profile = db.read_profile_monitor();
         let relocator =
             relocation::RemoteRelocator::start_worker(Arc::clone(&db)).map_err(error)?;
+        // The retained-generation table is at or above 75 % of its bound: ask
+        // relocation for a pass now instead of waiting for Sui's cadence, so old
+        // generations retire (and the next open can trim them) long before the
+        // hard bound refuses an open. Coalesces with a queued pass. `start` fails
+        // only for a worker that already ended (a filter panic in an earlier
+        // pass, impossible before the first pass of a fresh worker) or one that
+        // is shutting down; the relocator is then unusable and every later
+        // `start_relocation` would fail the same way, so failing the open is
+        // exact, not a refused hint.
+        if db.stream_pressure().is_soft() {
+            relocator.start().map_err(|cause| {
+                error(format!("priority relocation request at open: {cause:?}"))
+            })?;
+        }
         Ok(Self::new(
             Backend::Remote(Remote {
                 relocator,
@@ -960,6 +974,32 @@ impl Db {
                 "snapshot_latch_deferrals",
                 remote.db.snapshot_latch_deferrals(),
             );
+            // Pressure of the retained-generation table (owner streams against
+            // the control-region bound): 1 from 75 % of the bound, where the
+            // open already asked relocation to retire old generations.
+            let pressure = remote.db.stream_pressure();
+            set("retained_streams", pressure.streams as u64);
+            set("retained_stream_pressure", u64::from(pressure.is_soft()));
+            set(
+                "relocation_copy_deferrals",
+                remote.db.relocation_copy_deferrals(),
+            );
+            set("retirement_latch_caps", remote.db.retirement_latch_caps());
+            set(
+                "retirement_missing_rows",
+                remote.db.retirement_missing_rows(),
+            );
+            set(
+                "retirement_busy_replies",
+                remote.db.retirement_busy_replies(),
+            );
+            set("older_rows_without_end", remote.db.older_rows_without_end());
+            // The value reader's cache and integrity counters: a CRC or key-binding
+            // failure of a fetched member is a decode failure, counted here.
+            let reader = remote.db.value_reader();
+            set("value_cache_hits", reader.cache_hits());
+            set("value_cache_misses", reader.cache_misses());
+            set("value_decode_failures", reader.decode_failure_count());
             remote.db.visit_write_metrics(|snapshot| {
                 let checkpoint = snapshot.checkpoint_diagnostics;
                 set(
@@ -2037,6 +2077,12 @@ impl Checkpoint {
         }
     }
 }
+// One iterator lives per scan on the caller's stack; boxing the native variant
+// would add an allocation to every iterator creation on the read path.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the native iterator costs an allocation per scan creation"
+)]
 pub enum DbIterator {
     /// The native iterator over either backend: a native database, or the
     /// coordinator index of a remote one (see `iter`).
@@ -2085,100 +2131,4 @@ impl Iterator for DbIterator {
 }
 
 #[cfg(test)]
-mod timing_tests {
-    use super::*;
-
-    #[test]
-    fn acquisition_span_completes_before_guard_is_released() {
-        let stage = Stage::default();
-        let mutex = parking_lot::Mutex::new(());
-        let guard = stage.measure(|| mutex.lock());
-        assert_eq!(stage.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(stage.errors.load(Ordering::Relaxed), 0);
-        assert!(mutex.try_lock().is_none());
-        drop(guard);
-        assert_eq!(stage.calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn failed_and_unwinding_stage_spans_are_not_lost() {
-        let stage = Stage::default();
-        assert_eq!(stage.run(|| Err::<(), _>("rejected")), Err("rejected"));
-        assert_eq!(stage.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(stage.errors.load(Ordering::Relaxed), 1);
-        let unwind = std::panic::catch_unwind(|| stage.measure(|| panic!("failed operation")));
-        assert!(unwind.is_err());
-        assert_eq!(stage.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(stage.errors.load(Ordering::Relaxed), 2);
-        stage.run(|| Ok::<_, ()>(())).unwrap();
-        assert_eq!(stage.calls.load(Ordering::Relaxed), 3);
-        assert_eq!(stage.errors.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn native_profile_selection_is_bounded_across_callers_and_clean_at_zero() {
-        let profile = NativeWriteProfile::default();
-        assert!(!profile.select());
-        assert_eq!(profile.barrier.calls.load(Ordering::Relaxed), 0);
-        profile.remaining.store(7, Ordering::Relaxed);
-        let selected = AtomicU64::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..16 {
-                let (profile, selected) = (&profile, &selected);
-                scope.spawn(move || {
-                    if profile.select() {
-                        selected.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
-        });
-        assert_eq!(selected.load(Ordering::Relaxed), 7);
-        assert_eq!(profile.remaining.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn native_foreground_profile_excludes_maintenance_and_stops_at_limit() {
-        let temp = tempdir::TempDir::new("sui-native-profile").unwrap();
-        let shape = KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1));
-        let mut config = Config::small();
-        config.snapshot_written_bytes = u64::MAX;
-        let db = Db::open_native(
-            temp.path(),
-            shape,
-            Arc::new(config),
-            Metrics::new_in_enabled(&prometheus::Registry::new(), false),
-        )
-        .unwrap();
-        db.set_native_durable(true);
-        let ks = db.ks("root");
-        db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![1]).unwrap();
-        assert_eq!(
-            db.native_write_profile
-                .barrier
-                .calls
-                .load(Ordering::Relaxed),
-            0
-        );
-        db.set_native_write_profile_limit(2);
-        db.native_barrier(false).unwrap();
-        assert_eq!(db.native_write_profile.remaining.load(Ordering::Relaxed), 2);
-        for key in 1u32..4 {
-            db.insert(ks, key.to_be_bytes().to_vec(), vec![key as u8])
-                .unwrap();
-        }
-        let mut counters = std::collections::BTreeMap::new();
-        db.visit_timing_metrics(|name, value| {
-            counters.insert(name, value);
-        });
-        assert_eq!(counters["native_profile_limit"], 2);
-        assert_eq!(counters["native_profile_available"], 1);
-        assert_eq!(counters["native_profile_barrier_calls"], 2);
-        assert_eq!(counters["native_profile_barrier_errors"], 0);
-        assert!(counters["native_profile_file_calls"] >= 2);
-        assert_eq!(
-            counters["native_profile_file_calls"],
-            counters["native_profile_file_successes"]
-        );
-        db.wait_for_background_threads_to_finish().unwrap();
-    }
-}
+mod timing_tests;

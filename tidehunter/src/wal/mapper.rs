@@ -335,6 +335,7 @@ impl WalMapper {
                 files: Arc::new(ArcSwap::from_pointee(WalFiles {
                     base_path: PathBuf::new(),
                     files: BTreeMap::new(),
+                    read_pins: None,
                 })),
             },
             receiver,

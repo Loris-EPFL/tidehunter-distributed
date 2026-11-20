@@ -7,21 +7,47 @@
 //! the owner refuses any new grant inside a sealed file. A seal never proves
 //! that the file is unreachable.
 //!
-//! It also does not prove durability, and must not: native has no such
-//! precondition either (its `Wal::gc` reclaims on
-//! `min(relocation start, control-region position)` alone). A retired file's
-//! durability is the coordinator's Version B term of the retirement witness
-//! (the synchronous tier has no B cut because every write was already forced).
-//! A crash can therefore leave a durable seal over a tail the owner never
-//! synced, which loses nothing that the tier had acknowledged: at the native
-//! tier that tail was only in the page cache, exactly as it would be without
-//! this file's retirement.
+//! The seal also proves durability, because the owner root needs it: the
+//! file's bytes and name are synced (`fdatasync` of the scanned inode plus a
+//! directory sync, with no lock held) BEFORE the one root install that records
+//! the seal and `synced_end >= seal.end`. A root that names a seal over bytes
+//! that are still only in the page cache is the state `validate_root_sets`
+//! refuses after a crash (`seal.end > synced_end`). The sync runs once per
+//! sealed file on the background seal kick; no write and no checkpoint waits
+//! for it.
+//!
+//! Failure rule: only a failed `fdatasync` or directory sync poisons the
+//! stream, as `StorageError::Unknown(WalError::Io(cause))` (the convention of
+//! every other fatal owner sync failure, so the control layer also poisons its
+//! readers). After a failed `fsync` the kernel may mark the dirty pages clean,
+//! so a retried sync could succeed over bytes that never reached the disk and
+//! the root would certify them. No seal is committed and the root is
+//! unchanged. The poisoned generation is never re-sealed: the next open of the
+//! owner root starts a new serving generation, and the old one is recovered as
+//! an immutable sealed stream, whose files (sealed or not) retire through the
+//! sealed-stream path (`retire_sealed_stream_files`) under the coordinator's
+//! watermark. A file that is not yet sealable (busy, still open, not yet
+//! passed) is not an error and retries on the next kick.
 //!
 //! Steps: capture under `state` (no I/O) -> whole-file scan with no lock ->
-//! `persistence` -> recheck under `state` -> root install with `state`
-//! released -> publish. Seals are installed in ascending file order.
+//! file and directory sync with no lock -> `persistence` -> recheck under
+//! `state` -> one root install (seal + `synced_end`) with `state` released ->
+//! publish. Seals are installed in ascending file order.
 use super::file_retirement::CommitStep;
+#[cfg(test)]
+use super::file_retirement::CrashCut;
 use super::*;
+
+/// Test-only one-shot pause shared by the `PartitionLog` hooks: the paused path
+/// sends on the first half when it arrives and resumes when the test sends on
+/// the second.
+#[cfg(test)]
+pub(super) type TestPause = Mutex<
+    Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+>;
 
 /// Files sealed per maintenance kick; bounds one kick's scan and root work.
 const SEALS_PER_KICK: usize = 4;
@@ -43,7 +69,8 @@ struct SealSequences {
 impl PartitionLog {
     /// Seal up to `SEALS_PER_KICK` passed files in ascending order. Returns
     /// how many were sealed; zero when the next file is not ready. Never waits
-    /// for a grant, adoption or position proof, and adds no write-path sync.
+    /// for a grant, adoption or position proof; the only sync it performs is
+    /// the one `fdatasync` plus directory sync of each file it seals.
     pub(crate) fn seal_ready_files(&self) -> Result<usize, StorageError> {
         let mut sealed = 0;
         while sealed < SEALS_PER_KICK {
@@ -51,6 +78,7 @@ impl PartitionLog {
                 break;
             };
             let sequences = self.validate_file_seal(&candidate)?;
+            self.sync_sealed_file(&candidate)?;
             if !self.install_file_seal(&candidate, sequences)? {
                 break;
             }
@@ -96,8 +124,16 @@ impl PartitionLog {
     /// The stream serves, is healthy, the allocator passed the file and no
     /// extent or reservation owns it. Coverage by the durable index is the
     /// coordinator's control-region frontier (the retirement witness, I8), the
-    /// same term native `Wal::gc` uses; an owner-local position root is no
-    /// longer a precondition, exactly as native has none.
+    /// same term native `Wal::gc` uses. The seal itself needs no owner position
+    /// proof beforehand: `seal_ready_files` syncs the immutable file and
+    /// installs the seal together with `synced_end >= end`.
+    ///
+    /// Poison rule: every not-yet-sealable state returns `false` here and is
+    /// retried on a later kick. Only a failed file or directory sync
+    /// (`sync_sealed_file`) poisons the stream, and a poisoned stream is
+    /// refused by this function (`state.poison.is_none()`), so after a sync
+    /// failure no seal is attempted on this generation: the next owner open is
+    /// a new generation and the old files retire as a sealed stream.
     fn seal_allowed(state: &State, root: &WalRoot, start: u64, size: u64) -> bool {
         let index = start / size;
         let owned = |segment: &crate::distributed::nvmeof::live_storage::LiveWalSegment| {
@@ -254,6 +290,10 @@ impl PartitionLog {
             .generation
             .checked_add(1)
             .ok_or(StorageError::Capacity)?;
+        // The file was synced above and every earlier file is sealed (synced by
+        // its own seal) or retired, so everything below `end` is durable: the
+        // root records that with the seal, in one install.
+        root.synced_end = root.synced_end.max(candidate.end);
         root.sealed_files.push(FileSeal {
             start: candidate.start,
             end: candidate.end,
@@ -264,6 +304,61 @@ impl PartitionLog {
         });
         self.commit_root(root, CommitStep::Seal)?;
         Ok(true)
+    }
+
+    /// Makes the scanned file's bytes and name durable before any root may name
+    /// its seal. No lock is held, so no put, lease or grant waits on it.
+    ///
+    /// A failed sync poisons the stream and returns the cause as
+    /// `StorageError::Unknown(WalError::Io(..))` (module doc, failure rule);
+    /// the seal is not installed and the root is unchanged.
+    fn sync_sealed_file(&self, candidate: &SealCandidate) -> Result<(), StorageError> {
+        #[cfg(test)]
+        {
+            self.crash_at(CrashCut::SealBeforeSync)?;
+            let pause = self.before_seal_sync.lock().take();
+            if let Some((entered, resume)) = pause {
+                let _ = entered.send(());
+                // Bounded so a failing test cannot hang its scope join.
+                let _ = resume.recv_timeout(std::time::Duration::from_secs(120));
+            }
+        }
+        #[cfg(test)]
+        let injected = self.crash_at(CrashCut::SealSyncFails).is_err();
+        #[cfg(not(test))]
+        let injected = false;
+        let synced = if injected {
+            Err(io::Error::other("injected seal fdatasync failure"))
+        } else {
+            candidate
+                .file
+                .sync_data()
+                .and_then(|()| self.wal.persist_namespace())
+        };
+        if let Err(error) = synced {
+            // No retry may certify these bytes (module doc, failure rule).
+            self.state.lock().poison = Some(WriterPoison::Fatal);
+            return Err(StorageError::Unknown(WalError::Io(error)));
+        }
+        #[cfg(test)]
+        self.crash_at(CrashCut::SealAfterSync)?;
+        Ok(())
+    }
+
+    /// Park the next seal before its file sync, with no lock held: a lease and
+    /// an append must proceed while a seal is mid-sync. Returns (entered,
+    /// resume).
+    #[cfg(test)]
+    pub(crate) fn pause_before_seal_sync(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        *self.before_seal_sync.lock() = Some((entered, released));
+        (started, resume)
     }
 
     /// File that the next live grant allocates in (allocator position file).

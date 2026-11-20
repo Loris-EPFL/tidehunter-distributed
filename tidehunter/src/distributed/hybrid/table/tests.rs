@@ -17,6 +17,7 @@ use crate::key_shape::{KeyShape, KeySpace, KeySpaceConfig, KeyType};
 use crate::large_table::Loader;
 use crate::metrics::Metrics;
 use crate::wal::position::IndexPosition;
+use minibytes::Bytes;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -162,6 +163,56 @@ fn a_later_write_to_the_same_key_wins_by_version() {
         fixture.get(1, version(3)).map(|found| found.address.offset),
         Some(100),
     );
+}
+
+/// A relocation update prepared before an overwrite or another re-point must
+/// not replace the new head. The last-chunk drop must not remove it either.
+#[test]
+fn relocation_compare_and_set_preserves_a_newer_head() {
+    for overwrite in [false, true] {
+        let fixture = Fixture::new("hybrid-relocation-stale");
+        let ks = fixture.ks();
+        let key = [1; 4];
+        let cell = fixture.table.shape().ks(ks).cell_id(&key);
+        let reduced =
+            Bytes::copy_from_slice(fixture.table.shape().ks(ks).reduce_key(&key).as_ref());
+        fixture.publish(RecordKind::Put, 1, 2, 100);
+        fixture.table.advance_applied(version(3));
+        let old = fixture.get(1, version(3)).expect("original position");
+        let first_copy = old.moved_to(position(2, 200).address);
+        let stale_copy = old.moved_to(position(2, 900).address);
+        if overwrite {
+            fixture.publish(RecordKind::Put, 1, 4, 900);
+            fixture.table.advance_applied(version(5));
+        } else {
+            fixture
+                .table
+                .relocation_apply(
+                    ks,
+                    &cell,
+                    Some(&[(reduced.clone(), old, first_copy)]),
+                    &[(0, 1, 500)],
+                    false,
+                )
+                .expect("first re-point");
+        }
+        let current = fixture.get(1, version(6)).expect("new head");
+        fixture
+            .table
+            .relocation_apply(
+                ks,
+                &cell,
+                Some(&[(reduced, old, stale_copy)]),
+                &[(0, 1, 500)],
+                true,
+            )
+            .expect("stale re-point");
+        let after = fixture.get(1, version(6)).expect("head survives");
+        assert!(
+            after.same_physical(&current),
+            "overwrite={overwrite}: {after:?} != {current:?}"
+        );
+    }
 }
 
 #[test]

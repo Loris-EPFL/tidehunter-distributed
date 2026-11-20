@@ -29,6 +29,57 @@ pub(super) struct OwnerTail {
     pub complete: bool,
 }
 
+/// Streams of `owners` owners with `retained` older generations: one per owner
+/// for each retained generation plus the serving one (what the control region
+/// stores). The one bound arithmetic of the table.
+fn stream_count(owners: usize, retained: usize) -> usize {
+    owners.saturating_mul(retained.saturating_add(1))
+}
+
+/// The generation reservation's bound check, run before anything is persisted.
+///
+/// # Errors
+/// `owners × (retained + 1)` exceeds [`MAX_REGION_STREAMS`]. The message is the
+/// operator-facing one: there is no in-band recovery at the bound, because a
+/// refused open runs no relocation and so cannot retire old generations (trim
+/// itself needs the fenced new generation, `fencing_generations::maintain`).
+pub(super) fn check_stream_bound(owners: usize, retained: usize) -> Result<(), LocalDbError> {
+    let streams = stream_count(owners, retained);
+    if streams > MAX_REGION_STREAMS {
+        return Err(LocalDbError::new(format!(
+            "refusing this open: {owners} owners x ({retained} retained fencing generations + 1 \
+             serving) = {streams} owner streams exceeds the control-region stream bound of \
+             {MAX_REGION_STREAMS}. No generation was reserved and the database on disk is \
+             unchanged and valid. There is no in-band recovery: a refused open runs no \
+             relocation, so old generations cannot be retired from here. Act on the \
+             `retained_stream_pressure` gauge (it fires at {SOFT_PRESSURE_PERCENT}% of the bound, \
+             while the database still opens and its relocation retires old generations); at the \
+             bound, escalate for the offline fenced trim tool (not built)."
+        )));
+    }
+    Ok(())
+}
+
+/// Share of the stream bound at which the open and the metrics report pressure.
+pub(crate) const SOFT_PRESSURE_PERCENT: usize = 75;
+
+/// How full the stream table is, against [`MAX_REGION_STREAMS`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamPressure {
+    pub(crate) streams: usize,
+}
+
+impl StreamPressure {
+    pub(crate) fn new(streams: usize) -> Self {
+        Self { streams }
+    }
+
+    /// At or above [`SOFT_PRESSURE_PERCENT`] of the bound, and not before.
+    pub(crate) fn is_soft(self) -> bool {
+        self.streams.saturating_mul(100) >= MAX_REGION_STREAMS.saturating_mul(SOFT_PRESSURE_PERCENT)
+    }
+}
+
 /// The stream positions an open starts with: one entry per owner partition and
 /// retained older generation.
 ///
@@ -55,13 +106,9 @@ pub(super) fn seed_positions(
     retained: &[(u64, bool)],
     tails: &[OwnerTail],
 ) -> Result<BTreeMap<(u32, u64), StreamPosition>, LocalDbError> {
-    // One stream per owner for each retained generation plus the serving one,
-    // which is what the control region stores.
-    if partitions
-        .len()
-        .saturating_mul(retained.len().saturating_add(1))
-        > MAX_REGION_STREAMS
-    {
+    // The reservation already refused an over-bound table (`check_stream_bound`),
+    // and trim only shrinks `retained`; this is the invariant, not a user error.
+    if stream_count(partitions.len(), retained.len()) > MAX_REGION_STREAMS {
         return Err(LocalDbError::new(format!(
             "{} owners with {} retained generations exceed the {MAX_REGION_STREAMS}-stream bound",
             partitions.len(),

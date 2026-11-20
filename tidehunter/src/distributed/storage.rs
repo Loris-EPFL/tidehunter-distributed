@@ -204,6 +204,46 @@ struct SealedEnd {
     physical_end: u64,
 }
 
+/// Read the durable sealed end used by generation trim after the log is closed.
+pub(crate) fn trim_sealed_end(path: &Path, generation: u64) -> Result<Option<u64>, StorageError> {
+    let seal_path = path.join(SEAL);
+    match fs::symlink_metadata(&seal_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(StorageError::Invalid("invalid sealed WAL metadata")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let seal: SealedEnd = read_metadata(&seal_path)?;
+    if seal.format != 5 || seal.epoch != generation || seal.generation != generation {
+        return Err(StorageError::Invalid("sealed WAL identity mismatch"));
+    }
+    Ok(Some(seal.physical_end))
+}
+
+/// Persist the zero end for a never-activated generation before trim intent.
+pub(crate) fn install_empty_trim_seal(path: &Path, generation: u64) -> Result<(), StorageError> {
+    if let Some(end) = trim_sealed_end(path, generation)? {
+        return if end == 0 {
+            // A prior rename may have succeeded before its directory sync failed.
+            File::open(path)?.sync_all()?;
+            Ok(())
+        } else {
+            Err(StorageError::Invalid(
+                "abandoned generation has nonzero sealed end",
+            ))
+        };
+    }
+    let seal = SealedEnd {
+        format: 5,
+        epoch: generation,
+        generation,
+        frame_count: 0,
+        physical_end: 0,
+    };
+    install_metadata(path, SEAL, &encode_metadata(&seal)?)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LiveFrontier {
     database: [u8; 16],
@@ -391,6 +431,12 @@ pub(crate) enum LivePausePoint {
     ColdReadAfterSync,
     ColdReadBeforePin,
     ColdReadAfterPin,
+    ReadPinBeforeIncrement,
+    ProgressBeforePersist,
+    SyncerBeforePersist,
+    RetirementBeforePersistence,
+    AppendedPersistenceLocked,
+    RetirementPersistenceLocked,
 }
 
 #[cfg(test)]
@@ -893,9 +939,63 @@ fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BusyCause {
+    RecordPin,
+    ExportPin,
+    PendingCapacity,
+    Other(&'static str),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BusyEvent {
+    pub epoch: u64,
+    pub file: u64,
+    pub cause: BusyCause,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BusyEvents {
+    events: std::collections::VecDeque<BusyEvent>,
+    dropped: u64,
+}
+
+#[cfg(test)]
+impl BusyEvents {
+    fn record(&mut self, event: BusyEvent) {
+        if self.events.len() == 64 {
+            self.events.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn busy_events_drop_oldest() {
+    let mut ring = BusyEvents::default();
+    for file in 0..66 {
+        ring.record(BusyEvent {
+            epoch: 7,
+            file,
+            cause: BusyCause::RecordPin,
+        });
+    }
+    assert_eq!(ring.events.len(), 64);
+    assert_eq!(ring.dropped, 2);
+    assert_eq!(ring.events.front().unwrap().file, 2);
+    assert_eq!(ring.events.back().unwrap().file, 65);
+}
+
 /// A local storage node component; caller threads serialize appends per partition.
 /// Different instances/partitions may append concurrently.
 pub struct PartitionLog {
+    #[cfg(test)]
+    busy_events: Mutex<BusyEvents>,
     state: Mutex<State>,
     references: Arc<ReferenceDirectory>,
     durable_frontier: AtomicU64,
@@ -936,21 +1036,22 @@ pub struct PartitionLog {
     // Test-only pause after the retirement detach, before the unlinks (no
     // lock held): writes must proceed while a retirement is mid-flight.
     #[cfg(test)]
-    before_unlink: Mutex<
-        Option<(
-            std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    before_unlink: file_seal::TestPause,
+    // Test-only pause before a seal's file sync (no lock held).
     #[cfg(test)]
-    before_persist: Mutex<
-        Option<(
-            std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    before_seal_sync: file_seal::TestPause,
+    #[cfg(test)]
+    before_persist: file_seal::TestPause,
     #[cfg(test)]
     fail_persist: AtomicBool,
+    #[cfg(test)]
+    fail_live_progress: AtomicBool,
+    #[cfg(test)]
+    failed_live_progress: AtomicBool,
+    #[cfg(test)]
+    syncer_persist_hold_reached: AtomicBool,
+    #[cfg(test)]
+    fail_sealed_before_root: AtomicBool,
     #[cfg(test)]
     fail_appended_persist: AtomicBool,
     #[cfg(test)]
@@ -976,6 +1077,27 @@ pub struct PartitionLog {
 }
 
 impl PartitionLog {
+    #[cfg(test)]
+    pub(crate) fn record_busy(&self, file: u64, cause: BusyCause) {
+        self.busy_events.lock().record(BusyEvent {
+            epoch: self.config().inventory.epoch,
+            file,
+            cause,
+        });
+    }
+
+    /// Drain this log's bounded ring and reset its drop count. Events are
+    /// recorded only where retirement returns `Busy`; a pin walk records the
+    /// first blocker. The idle cleanup deferral is not a `Busy` and not recorded.
+    #[cfg(test)]
+    pub(crate) fn take_busy_events(&self) -> (Vec<BusyEvent>, u64) {
+        let mut events = self.busy_events.lock();
+        (
+            events.events.drain(..).collect(),
+            std::mem::take(&mut events.dropped),
+        )
+    }
+
     /// Check the durable live-stream selection without opening any WAL file.
     pub fn is_live_path(path: &Path) -> Result<bool, StorageError> {
         let marker = path.join(LIVE_REGISTRATION);
@@ -1043,17 +1165,15 @@ impl PartitionLog {
         .sync_all()?;
         let lock = DbLock::acquire(&path, Duration::ZERO)?;
         let (references, reference_writer) = ReferenceDirectory::open(&registration.config)?;
-        let wal = if prewrite {
-            Wal::open_external_prewrite(&path, registration.config.layout(), metrics)?
-        } else {
-            Wal::open(&path, registration.config.layout(), metrics)?
-        };
+        let wal = Wal::open_owner(&path, registration.config.layout(), metrics, prewrite)?;
         wal.persist_registered_files()?;
         install_metadata(&path, REGISTRATION, &metadata)?;
         let wal_root = WalRoot::new(&registration.config);
         wal_root.install(&path)?;
         let writer = wal.writer_after(None).map_err(StorageError::Wal)?;
         Ok(Self {
+            #[cfg(test)]
+            busy_events: Mutex::new(BusyEvents::default()),
             state: Mutex::new(State {
                 open_live_extent: None,
                 next_live_extent: None,
@@ -1101,9 +1221,19 @@ impl PartitionLog {
             #[cfg(test)]
             before_unlink: Mutex::new(None),
             #[cfg(test)]
+            before_seal_sync: Mutex::new(None),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_live_progress: AtomicBool::new(false),
+            #[cfg(test)]
+            failed_live_progress: AtomicBool::new(false),
+            #[cfg(test)]
+            syncer_persist_hold_reached: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_sealed_before_root: AtomicBool::new(false),
             #[cfg(test)]
             fail_appended_persist: AtomicBool::new(false),
             #[cfg(test)]
@@ -2498,18 +2628,28 @@ impl PartitionLog {
 
     #[cfg(test)]
     fn pause_live_at(&self, point: LivePausePoint) {
-        let hook = {
-            let mut slot = self.live_pause.lock();
-            if slot.as_ref().is_some_and(|hook| hook.0 == point) {
-                slot.take()
-            } else {
-                None
-            }
-        };
-        if let Some((_, entered, resume)) = hook {
-            let _ = entered.send(());
-            let _ = resume.recv();
+        if let Some(hook) = self.take_live_pause(point) {
+            Self::run_live_pause(hook);
         }
+    }
+
+    /// Take the armed hook of `point`, if any. The caller runs it, so it can
+    /// record that the armed point engaged before it blocks.
+    #[cfg(test)]
+    fn take_live_pause(&self, point: LivePausePoint) -> Option<LivePauseHook> {
+        let mut slot = self.live_pause.lock();
+        if slot.as_ref().is_some_and(|hook| hook.0 == point) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn run_live_pause(hook: LivePauseHook) {
+        let (_, entered, resume) = hook;
+        let _ = entered.send(());
+        let _ = resume.recv();
     }
 
     fn decode_live_frame(&self, frame: &[u8]) -> Result<CompleteGroup, StorageError> {
@@ -2999,6 +3139,19 @@ impl PartitionLog {
     /// appended end, as on a recovered handle. Returns false when the stream is not
     /// live: its reports follow every sync, so the syncer serves the nudge.
     pub fn persist_live_progress(&self) -> Result<bool, StorageError> {
+        // Test hooks sit before the idle early return, so a nudge that finds
+        // everything already persisted still reaches them. They run with no
+        // lock held and only on a live stream, like the returns below.
+        #[cfg(test)]
+        if self.state.lock().live {
+            self.pause_live_at(LivePausePoint::ProgressBeforePersist);
+            if self.fail_live_progress.swap(false, Ordering::AcqRel) {
+                self.failed_live_progress.store(true, Ordering::Release);
+                return Err(StorageError::Io(io::Error::other(
+                    "injected live progress failure",
+                )));
+            }
+        }
         {
             let state = self.state.lock();
             if !state.live {
@@ -3053,6 +3206,20 @@ impl PartitionLog {
         let mut profile = StorageWriteProfile::default();
         let adopted = self.self_adopt_live_extent();
         let result = adopted.and_then(|()| {
+            // Hold point of the adoption-triggered persist: the copies are
+            // adopted, nothing is persisted yet. No lock is held. A failure of
+            // the persist below is armed with `fail_next_appended_persist`
+            // (its consumed flag proves it fired), which fails the frontier
+            // for good, as a real sync failure does. `stopping` is read after
+            // this point, so a stop that starts while parked still selects the
+            // barrier policy. The flag is set only when the armed hook is
+            // actually taken, so it proves this pass engaged the hold.
+            #[cfg(test)]
+            if let Some(hook) = self.take_live_pause(LivePausePoint::SyncerBeforePersist) {
+                self.syncer_persist_hold_reached
+                    .store(true, Ordering::Release);
+                Self::run_live_pause(hook);
+            }
             // The final drain at syncer shutdown (fence, retire, owner stop)
             // is an explicit barrier: it leaves the root covering the prefix.
             let stopping = self
@@ -3194,9 +3361,13 @@ impl PartitionLog {
 
         timing.stage(Some(WriteStage::PersistSerializationLock));
         let _persistence = self.persistence.lock();
+        #[cfg(test)]
+        if matches!(scope, PersistScope::Appended) {
+            self.pause_live_at(LivePausePoint::AppendedPersistenceLocked);
+        }
         timing.stage(Some(WriteStage::PersistStateLock));
         let mut live_frontier = None;
-        let (start, end, namespace_synced_file, captured) = {
+        let (start, end, namespace_synced_file, captured, wal_root) = {
             let mut state = self.state.lock();
             timing.stage(Some(WriteStage::PersistValidation));
             let Some(requested_end) = pending_with_root(&state, scope, root)? else {
@@ -3257,6 +3428,9 @@ impl PartitionLog {
                 state.namespace_synced_file,
                 // The version of the last batch below `end`, read under the same lock.
                 state.progress.capture(),
+                // The retirement record at capture time: a file it names was
+                // durable when it retired and is unlinked, so it is not synced.
+                state.wal_root.clone(),
             )
         };
         timing.stage(None);
@@ -3280,13 +3454,42 @@ impl PartitionLog {
         let result = (|| -> io::Result<()> {
             // A root catch-up after a deferred root has no new data to sync.
             for file_id in (first_file..=last_file).filter(|_| start < end) {
+                let offset = file_id
+                    .checked_mul(self.config().wal_file_bytes)
+                    .ok_or_else(|| io::Error::other("WAL file offset overflow"))?;
+                // Skip a file the WAL root names as retired, as
+                // `persist_wal_through` does.
+                // (a) `state.durable_end` (the `start` of this loop) is assigned
+                // only in this function, in the graceful seal (after
+                // `persist_appended`) and in recovery (`wal_replay.rs`).
+                // `persist_wal_through` and the file-seal install move only the
+                // root's `synced_end`. So a sealed file of the RUNNING
+                // generation can retire while `durable_end` is still below it.
+                // (b) A retired file was durable when it retired: its exact
+                // seal is installed after `sync_sealed_file`, with
+                // `synced_end >= seal.end`. Skipping its sync is correct, and
+                // its path is gone, so a sync would fail and poison the log.
+                // (c) `persist_namespace_witnesses` after this loop still
+                // writes witness metadata for EVERY file from
+                // `previous_namespace + 1` to `last_file` (from 0 when there is
+                // none), retired files included. That is harmless: it is
+                // metadata only and never opens the WAL file, and recovery
+                // explains a retired file by `retired.skip_end`. The cost is
+                // one create, fsync and directory sync per retired file at the
+                // first persist.
+                // (d) Lock order: `persistence`, then `state`. Retirement holds
+                // `persistence` across root, unlink and directory sync, so the
+                // retired set captured here cannot change during the loop.
+                if wal_root
+                    .as_deref()
+                    .is_some_and(|root| root.retired.contains(offset))
+                {
+                    continue;
+                }
                 timing.record(|profile| {
                     profile.file_persist_calls = profile.file_persist_calls.saturating_add(1);
                 });
                 timing.stage(Some(WriteStage::PersistFile));
-                let offset = file_id
-                    .checked_mul(self.config().wal_file_bytes)
-                    .ok_or_else(|| io::Error::other("WAL file offset overflow"))?;
                 #[cfg(test)]
                 crate::failpoints::write_model::boundary("file_sync_before");
                 self.wal.persist_frame_file(WalPosition::new(offset, 1))?;
@@ -3915,16 +4118,42 @@ impl PartitionLog {
                 "WAL pathname no longer names pinned inode",
             ));
         }
-        self.live_read_pins
+        let file_pin = self
+            .wal
+            .read_pin_counter(global_offset, &metadata)?
+            .ok_or_else(|| {
+                StorageError::Io(io::Error::new(io::ErrorKind::NotFound, "WAL file retired"))
+            })?;
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::ReadPinBeforeIncrement);
+        // Admission excludes closure until the lease owns this count.
+        file_pin
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                (pins < Wal::READ_PIN_CLOSED - 1).then(|| pins + 1)
+            })
+            .map_err(|pins| {
+                if pins & Wal::READ_PIN_CLOSED != 0 {
+                    StorageError::Io(io::Error::new(io::ErrorKind::NotFound, "WAL file retired"))
+                } else {
+                    StorageError::Capacity
+                }
+            })?;
+        if self
+            .live_read_pins
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
                 pins.checked_add(1)
             })
-            .map_err(|_| StorageError::Capacity)?;
+            .is_err()
+        {
+            file_pin.fetch_sub(1, Ordering::Release);
+            return Err(StorageError::Capacity);
+        }
         Ok(LiveRecordLease {
             segment,
             offset,
             len,
             _plan: plan,
+            _file_pin: file_pin,
         })
     }
 
@@ -4119,6 +4348,47 @@ impl PartitionLog {
         self.fail_persist.store(true, Ordering::Release);
     }
 
+    /// Fail the next live-progress nudge on a live stream, including an idle
+    /// one that production would answer without persisting. Arm it only in a
+    /// quiesced fixture: a background nudge can consume it first.
+    #[cfg(test)]
+    pub(crate) fn fail_next_live_progress(&self) {
+        self.failed_live_progress.store(false, Ordering::Release);
+        self.fail_live_progress.store(true, Ordering::Release);
+    }
+
+    /// Whether the injected progress failure fired. It proves the nudge
+    /// reached the hook, not that an appended persist was attempted.
+    #[cfg(test)]
+    pub(crate) fn live_progress_failure_consumed(&self) -> bool {
+        self.failed_live_progress.load(Ordering::Acquire)
+    }
+
+    /// Whether the syncer reached its hold point (after the self-adoption of
+    /// the live extent, before the appended persist) since the last take.
+    /// It proves the setup happened, not that the persist ran or failed.
+    #[cfg(test)]
+    pub(crate) fn syncer_persist_hold_reached(&self) -> bool {
+        self.syncer_persist_hold_reached.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_syncer_persist_hold_reached(&self) -> bool {
+        self.syncer_persist_hold_reached
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Fail a sealed retirement after target revoke and before root install.
+    #[cfg(test)]
+    pub(crate) fn fail_next_sealed_before_root(&self) {
+        self.fail_sealed_before_root.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_sealed_before_root_failure(&self) -> bool {
+        self.fail_sealed_before_root.swap(false, Ordering::AcqRel)
+    }
+
     /// Fail one appended persist after its serialization lock is held.
     #[cfg(test)]
     pub(crate) fn fail_next_appended_persist(&self) {
@@ -4130,6 +4400,17 @@ impl PartitionLog {
     #[cfg(test)]
     pub(crate) fn appended_persist_failure_consumed(&self) -> bool {
         self.failed_appended_persist.load(Ordering::Acquire)
+    }
+
+    /// Fail the next `persist_wal_through` at `phase`: 4 before the data sync,
+    /// 5 after the data and namespace syncs before the root install, 6 after
+    /// the root install (`wal_replay.rs` `fail_position_at`). Unlike
+    /// `fail_next_persist`, a phase names where in the persist it fails, so a
+    /// persist that runs earlier does not consume it by accident (arm it
+    /// right before the persist under test).
+    #[cfg(test)]
+    pub(crate) fn fail_next_position_persist(&self, phase: u8) {
+        self.fail_wal_root.store(phase, Ordering::Release);
     }
     #[cfg(test)]
     pub(crate) fn fail_next_namespace_persist(&self) {

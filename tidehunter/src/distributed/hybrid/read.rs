@@ -160,6 +160,7 @@ impl ValueReader {
     /// `indexed_key` is the index's own (already reduced) key, not the caller's
     /// full key: for `Hash` and `Reduction` keyspaces the member's full key is
     /// reduced and compared with it, so a full key here rejects every member.
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         ks: KeySpace,

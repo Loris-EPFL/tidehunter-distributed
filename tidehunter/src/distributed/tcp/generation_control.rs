@@ -229,8 +229,18 @@ impl Client {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerTrimCrash {
+    /// A zero-end seal for an abandoned generation was installed.
+    AfterEmptySeal,
     /// Ledger without the generation and with `trim_pending` is installed.
     AfterLedger,
+    /// The lookahead marker was removed but its directory was not synced.
+    AfterLookaheadMarkerUnlink,
+    /// Lookahead marker release and marker directory sync completed.
+    AfterLookaheadMarker,
+    /// The lookahead WAL was unlinked but its parent was not synced.
+    AfterLookaheadFileUnlink,
+    /// Lookahead WAL unlink and its parent directory sync completed.
+    AfterLookaheadUnlink,
     /// The generation directory is deleted and the root synced.
     AfterUnlink,
 }

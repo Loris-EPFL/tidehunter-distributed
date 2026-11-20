@@ -196,6 +196,7 @@ impl VersionPosition {
     }
 
     /// The same logical write re-pointed at a relocated member copy.
+    #[cfg(test)]
     pub(crate) const fn moved_to(self, address: PhysicalValueAddress) -> Self {
         Self {
             batch: self.batch,
@@ -457,40 +458,21 @@ impl IndexPosition for VersionPosition {
         first.batch.min(bound())
     }
 
+    /// On-disk row: byte-identical to a clean flat row (kind 0). The index table
+    /// decoder hands a tombstone-free blob straight to its flat buffer
+    /// (`IndexTable::deserialize_fixed_size`), so the two layouts must agree
+    /// byte for byte.
+    /// A tombstone is the invalid sentinel, written verbatim (including
+    /// `len = u32::MAX`), exactly as native writes its own sentinel; its row is
+    /// still a kind-0 flat row, and the decoder routes it through the slow path.
     fn write_blob<B: BufMut>(&self, buf: &mut B) {
-        // On-disk row: no kind word. A tombstone is the invalid sentinel,
-        // written verbatim (including `len = u32::MAX`), exactly as native
-        // writes its own sentinel.
-        buf.put_u64(self.batch.epoch);
-        buf.put_u64(self.batch.sequence);
-        buf.put_u32(self.operation_index);
-        buf.put_u32(self.payload_crc);
-        buf.put_u32(self.address.partition);
-        buf.put_u64(self.address.segment_generation);
-        buf.put_u64(self.address.offset);
-        buf.put_u32(self.address.len);
+        self.write_flat(0, buf);
     }
 
     fn read_blob<B: Buf>(buf: &mut B) -> Self {
-        let epoch = buf.get_u64();
-        let sequence = buf.get_u64();
-        let operation_index = buf.get_u32();
-        let payload_crc = buf.get_u32();
-        let partition = buf.get_u32();
-        let segment_generation = buf.get_u64();
-        let offset = buf.get_u64();
-        let len = buf.get_u32();
-        Self {
-            batch: BatchVersion { epoch, sequence },
-            operation_index,
-            payload_crc,
-            address: PhysicalValueAddress {
-                partition,
-                segment_generation,
-                offset,
-                len,
-            },
-        }
+        let (position, kind) = Self::read_flat(buf);
+        debug_assert_eq!(kind, 0, "an on-disk row carries no entry kind");
+        position
     }
 }
 

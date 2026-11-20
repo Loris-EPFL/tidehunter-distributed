@@ -407,18 +407,21 @@ impl Wal {
             background_health,
             #[cfg(feature = "experimental-distributed")]
             false,
+            #[cfg(feature = "experimental-distributed")]
+            false,
         )
     }
 
     /// Only newly created owner streams use this entry point. Recovery opens
     /// retained WALs instead: it must never zero acknowledged historical bytes.
     #[cfg(feature = "experimental-distributed")]
-    pub(crate) fn open_external_prewrite(
+    pub(crate) fn open_owner(
         base_path: &Path,
         layout: WalLayout,
         metrics: Arc<Metrics>,
+        prewrite: bool,
     ) -> io::Result<Arc<Self>> {
-        Self::open_inner(base_path, layout, metrics, Arc::default(), true)
+        Self::open_inner(base_path, layout, metrics, Arc::default(), prewrite, true)
     }
 
     fn open_inner(
@@ -427,9 +430,15 @@ impl Wal {
         metrics: Arc<Metrics>,
         background_health: Arc<BackgroundHealth>,
         #[cfg(feature = "experimental-distributed")] prewrite: bool,
+        #[cfg(feature = "experimental-distributed")] pin_reads: bool,
     ) -> io::Result<Arc<Self>> {
         layout.assert_layout();
-        let files = WalFiles::new(base_path, &layout)?;
+        let files = WalFiles::new(
+            base_path,
+            &layout,
+            #[cfg(feature = "experimental-distributed")]
+            pin_reads,
+        )?;
         #[cfg(feature = "experimental-distributed")]
         let external_preparation = {
             let preparation = Arc::new(external::ExternalPreparation::new(prewrite));
@@ -658,8 +667,83 @@ impl Wal {
         Ok(file.map(|file| WalMemberReadPlan {
             file,
             offset: self.layout.offset_in_wal_file(position.offset()),
-            len: len as usize,
+            len,
         }))
+    }
+    /// The high bit closes a file to new leases; remaining bits count leases.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) const READ_PIN_CLOSED: usize = 1 << (usize::BITS - 1);
+
+    /// Returns the pin counter for the registered inode containing `offset`.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn read_pin_counter(
+        &self,
+        offset: u64,
+        expected: &std::fs::Metadata,
+    ) -> io::Result<Option<Arc<std::sync::atomic::AtomicUsize>>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let files = self.files.load();
+        let id = self.layout.locate_file(offset);
+        let Some(file) = files.get_checked(id) else {
+            return Ok(None);
+        };
+        let actual = file.metadata()?;
+        if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            return Ok(None);
+        }
+        Ok(files
+            .read_pins
+            .as_ref()
+            .and_then(|pins| pins.get(&id))
+            .cloned())
+    }
+
+    /// Snapshot victim counters before taking the read-admission write lock.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn file_read_pin_counters(
+        &self,
+        offsets: impl Iterator<Item = u64>,
+    ) -> Vec<(
+        position::WalFileId,
+        Option<Arc<std::sync::atomic::AtomicUsize>>,
+    )> {
+        let files = self.files.load();
+        offsets
+            .map(|offset| {
+                let id = self.layout.locate_file(offset);
+                (
+                    id,
+                    files
+                        .read_pins
+                        .as_ref()
+                        .and_then(|pins| pins.get(&id))
+                        .cloned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Validate that the counter snapshot still names the current file map.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn file_read_pin_counters_current(
+        &self,
+        counters: &[(
+            position::WalFileId,
+            Option<Arc<std::sync::atomic::AtomicUsize>>,
+        )],
+    ) -> bool {
+        let files = self.files.load();
+        counters.iter().all(|(id, expected)| {
+            match (
+                files.read_pins.as_ref().and_then(|pins| pins.get(id)),
+                expected,
+            ) {
+                (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
+                (None, None) => true,
+                _ => false,
+            }
+        })
     }
 
     /// The offset of `position` inside its WAL file, from the layout that owns the

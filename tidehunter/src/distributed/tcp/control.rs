@@ -708,6 +708,16 @@ impl StorageNode {
         self.inventory.lock().active(epoch).unwrap()
     }
 
+    /// Inspect a sealed generation without requiring an active authority.
+    /// Drop the returned handle before testing generation trimming.
+    #[cfg(test)]
+    pub(crate) fn sealed_log_for_test(
+        &self,
+        epoch: u64,
+    ) -> Arc<super::super::storage::PartitionLog> {
+        self.inventory.lock().sealed_log_for_test(epoch)
+    }
+
     /// Test hook: the log of `epoch` with its stream frontier and syncer
     /// attached, as the first lease (formerly the first append) does.
     #[cfg(test)]
@@ -2343,10 +2353,11 @@ impl ControlContext {
             Request::CheckTrimGeneration(check) => {
                 let _gate = self.live_control_gate.lock();
                 let _lifecycle = self.lifecycle.lock();
-                let (result, _) = self
-                    .inventory
-                    .lock()
-                    .trim_readiness(check.authority_generation, check.generation)?;
+                let (result, _) = NodeInventory::trim_readiness(
+                    &mut self.inventory.lock(),
+                    check.authority_generation,
+                    check.generation,
+                )?;
                 Ok(Response::CheckTrimGeneration(
                     super::generation_control::CheckTrimReply {
                         generation: check.generation,

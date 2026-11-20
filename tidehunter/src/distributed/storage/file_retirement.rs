@@ -14,9 +14,36 @@
 //! ([`RetirementWitness`]); the owner rechecks it against its own durable root
 //! and its exact file seals. No index root and no reference walk take part.
 //!
-//! Lock order: `persistence` -> `state`, as for every root writer. `state` is
-//! dropped across root, unlink and directory syncs on the active stream; the
-//! older sealed-stream path keeps its original holds (no writer exists).
+//! Deferral (bounded): the mapper refuses to detach a file while the writer's
+//! open fragment map still covers it (`WouldBlock`, `wal/mapper.rs`
+//! `detach_retired_files`; the whole batch waits, nothing is detached). A
+//! sealed file that ends exactly at the allocator is in that state: its last
+//! fragment map is finalized (`MapFinalized`, `wal/tracker.rs`) when the next
+//! fragment gets its first allocation, i.e. at the next lease. The pass then
+//! returns no outcomes with `cleanup_pending` still set, counted in
+//! `FileMaintenanceStats::deferred_retirements`, and the next pass (any later
+//! retirement request, or the repeat of recovery at open) unlinks every
+//! pending file. The only wait is therefore the idle case: with no further
+//! allocation (a quiet database can stay that way for hours), the last rolled
+//! file and every file retired in the same pass stay on disk, durably retired
+//! and never reused, until a retirement request after the next lease adoption
+//! (adoption only finalizes the map; nothing retries on adoption itself) or
+//! reopen. The leak is
+//! bounded by the files of one pass (at most 256 per request,
+//! `retire_active_files`) and by `MAX_PENDING_RETIREMENTS`, which blocks new
+//! authorizations (`Busy`) before it can grow. `deferred_retirements` lives
+//! in the engine's inventory stats (`FileMaintenanceStats`, read through
+//! `StorageNode::file_maintenance_stats`) and shows the stuck state; it is
+//! not exported to the Sui metrics (an open owner item, no new Sui surface
+//! here). A
+//! partial detach (skip only the writable file) would shrink the window to
+//! one file; it needs a change in the native `wal/mapper.rs` and is not made.
+//!
+//! Lock order: `persistence` -> `state` or `read_admission`. Reservation and
+//! rollback hold `persistence` before taking the admission write guard. The
+//! lease paths do not wait for persistence while holding admission. The
+//! admission write guard is never held across target I/O, root install or
+//! unlink. A sealed rollback clears only newly closed, not-yet-retired counters.
 use super::*;
 
 /// Local inode identity of one WAL file; bound to the logical `WalFileKey`.
@@ -91,6 +118,35 @@ pub(crate) struct Cleared {
     pub(crate) removed: Vec<PendingRetirement>,
 }
 
+/// Serializes a sealed retirement while its target bindings are revoked.
+/// Drop reopens only newly reserved files unless root installation began.
+pub(crate) struct SealedRetirement<'a> {
+    log: &'a PartitionLog,
+    _persistence: parking_lot::MutexGuard<'a, ()>,
+    current: Arc<WalRoot>,
+    entries: Vec<PendingRetirement>,
+    files: Vec<u64>,
+    rollback: Vec<Arc<std::sync::atomic::AtomicUsize>>,
+    root_started: bool,
+}
+
+impl SealedRetirement<'_> {
+    pub(crate) fn files(&self) -> &[u64] {
+        &self.files
+    }
+}
+
+impl Drop for SealedRetirement<'_> {
+    fn drop(&mut self) {
+        if !self.root_started {
+            let _admission = self.log.read_admission.write();
+            for pins in &self.rollback {
+                pins.fetch_and(!Wal::READ_PIN_CLOSED, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// Test-only crash cuts between the persisted steps. Root install cuts reuse
 /// `fail_wal_root` phases 1-3 (before temp write, after temp sync, after
 /// rename before directory sync).
@@ -110,12 +166,40 @@ pub(crate) enum CrashCut {
     AfterFirstUnlink = 5,
     /// Directory synced, pending entries not yet cleared.
     AfterDirectorySync = 6,
+    /// Seal scan done; nothing synced, no root written.
+    SealBeforeSync = 7,
+    /// Sealed file and directory synced; no root written.
+    SealAfterSync = 8,
+    /// The seal's file sync fails (an I/O error): the stream must poison.
+    SealSyncFails = 9,
 }
 
 impl PartitionLog {
     #[cfg(test)]
     pub(crate) fn arm_crash_cut(&self, cut: CrashCut) {
         self.r1_crash.store(cut as u8, Ordering::Release);
+    }
+
+    /// Wait until the WAL maintenance threads have handled every allocation
+    /// made so far: a tracker round trip (every earlier allocation processed,
+    /// its `MapFinalized` sent) followed by a mapper round trip (an empty
+    /// detach request is refused with `InvalidInput`, but only after the
+    /// mapper dequeued it behind every earlier message). Afterwards a retire
+    /// pass sees the final map state, with no sleeps. Call with no unresolved
+    /// extent: the latch waits for every allocated position to be processed,
+    /// and the writer is borrowed under `state`.
+    #[cfg(test)]
+    pub(crate) fn quiesce_wal_maps(&self) {
+        let state = self.state.lock();
+        let Some(writer) = state.writer.as_ref() else {
+            return;
+        };
+        let latch = writer.latch();
+        writer.release_latch(latch);
+        let refused = writer
+            .external_file_preparer()
+            .detach_retired_files(Vec::new());
+        assert!(refused.is_err(), "an empty detach request is refused");
     }
 
     /// Park the next serving-stream retirement after its detach and before
@@ -223,6 +307,12 @@ impl PartitionLog {
         let observed = self.observe_proofs(proofs)?;
         let current = self.active_retirement_root()?;
         let entries = retirement_entries(&current, proofs, &observed, witness)?;
+        #[cfg(test)]
+        if pending_outcome(&current, &entries) == RetirementOutcome::Busy {
+            for entry in &entries {
+                self.record_busy(entry.start, BusyCause::PendingCapacity);
+            }
+        }
         Ok(pending_outcome(&current, &entries))
     }
 
@@ -253,10 +343,20 @@ impl PartitionLog {
         check_proof_order(proofs, size)?;
         // Path observations are I/O: take them before any lock.
         let observed = self.observe_proofs(proofs)?;
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::RetirementBeforePersistence);
         let _persistence = self.persistence.lock();
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::RetirementPersistenceLocked);
         let current = self.active_retirement_root()?;
         let entries = retirement_entries(&current, proofs, &observed, witness)?;
         let outcome = pending_outcome(&current, &entries);
+        #[cfg(test)]
+        if outcome == RetirementOutcome::Busy {
+            for entry in &entries {
+                self.record_busy(entry.start, BusyCause::PendingCapacity);
+            }
+        }
         if entries.is_empty() || outcome == RetirementOutcome::Busy {
             return Ok(Authorized {
                 outcome,
@@ -321,6 +421,31 @@ impl PartitionLog {
         };
         if pending.is_empty() {
             return Ok(Vec::new());
+        }
+        // Pending entries already belong to a durable retirement root. Close
+        // all their counters together before the mapper can detach them.
+        // The bounded victim walk holds admission only for atomic operations;
+        // mapper IPC, unlink and sync run after the guard is released.
+        let counters = self
+            .wal
+            .file_read_pin_counters(pending.iter().map(|entry| entry.start));
+        {
+            let admission = self.read_admission.write();
+            if !*admission {
+                return Err(StorageError::Poisoned);
+            }
+            if !self.wal.file_read_pin_counters_current(&counters)
+                || counters
+                    .iter()
+                    .filter_map(|(_, pins)| pins.as_ref())
+                    .any(|pins| pins.load(Ordering::Acquire) & !Wal::READ_PIN_CLOSED != 0)
+            {
+                return Ok(Vec::new());
+            }
+            for pins in counters.iter().filter_map(|(_, pins)| pins.as_ref()) {
+                // Admission excludes increments; release publishes closure.
+                pins.fetch_or(Wal::READ_PIN_CLOSED, Ordering::Release);
+            }
         }
         #[cfg(test)]
         self.crash_at(CrashCut::BeforeDetach)?;
@@ -448,14 +573,13 @@ impl PartitionLog {
         Ok(Some(cleared))
     }
 
-    /// Older sealed stream: the original path, now with inode-bound pending
-    /// entries and interval retirement. No writer exists; `state` and read
-    /// admission stay held across the root, unlink and directory sync, as
-    /// before. Leaves `cleanup_pending` for the caller's target cleanup.
-    pub(crate) fn retire_sealed_stream_files(
+    /// Reserve all sealed victims before any target binding is revoked.
+    /// The persistence guard serializes reservations and root updates; the
+    /// admission guard covers only the bounded counter walk.
+    pub(crate) fn reserve_sealed_retirement(
         &self,
         proofs: &[RetireProof],
-    ) -> Result<RetirementOutcome, StorageError> {
+    ) -> Result<Option<SealedRetirement<'_>>, StorageError> {
         let size = self.config().wal_file_bytes;
         check_proof_order(proofs, size)?;
         if proofs.iter().any(|proof| proof.seal_generation.is_some()) {
@@ -463,20 +587,26 @@ impl PartitionLog {
                 "older sealed stream files carry no file seal",
             ));
         }
-        let _persistence = self.persistence.lock();
-        let mut state = self.state.lock();
-        if !state.sealed || state.writer.is_some() || state.poison.is_some() {
-            return Err(StorageError::Invalid(
-                "retirement requires healthy sealed storage",
-            ));
-        }
-        let current = state
-            .wal_root
-            .clone()
-            .ok_or(StorageError::Invalid("request requires WAL replay history"))?;
-        if proofs.is_empty() {
-            return Ok(RetirementOutcome::Completed);
-        }
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::RetirementBeforePersistence);
+        let persistence = self.persistence.lock();
+        #[cfg(test)]
+        self.pause_live_at(LivePausePoint::RetirementPersistenceLocked);
+        let current = {
+            let state = self.state.lock();
+            if state.poison.is_some() {
+                return Err(StorageError::Poisoned);
+            }
+            if !state.sealed || state.writer.is_some() {
+                return Err(StorageError::Invalid(
+                    "retirement requires healthy sealed storage",
+                ));
+            }
+            state
+                .wal_root
+                .clone()
+                .ok_or(StorageError::Invalid("request requires WAL replay history"))?
+        };
         let inventory_end = highest_wal_end(&self.path, self.config())?.max(current.retired.end());
         let mut entries = Vec::with_capacity(proofs.len());
         for proof in proofs {
@@ -504,23 +634,95 @@ impl PartitionLog {
             });
         }
         if current.cleanup_pending.len() + entries.len() > retired_files::MAX_PENDING_RETIREMENTS {
-            return Ok(RetirementOutcome::Busy);
+            #[cfg(test)]
+            for entry in &entries {
+                self.record_busy(entry.start, BusyCause::PendingCapacity);
+            }
+            return Ok(None);
         }
-        let mut admission = self.read_admission.write();
-        if self.live_read_pins.load(Ordering::Acquire) != 0 {
-            return Err(StorageError::Invalid(
-                "live namespace or read pin prevents retirement",
-            ));
+        let mut files: Vec<u64> = proofs.iter().map(|proof| proof.file_start).collect();
+        files.extend(current.cleanup_pending.iter().map(|entry| entry.start));
+        files.sort_unstable();
+        files.dedup();
+        let counters = self.wal.file_read_pin_counters(files.iter().copied());
+        let mut reservation = SealedRetirement {
+            log: self,
+            _persistence: persistence,
+            current,
+            entries,
+            rollback: Vec::with_capacity(counters.len()),
+            files,
+            root_started: false,
+        };
+        {
+            let admission = self.read_admission.write();
+            if !*admission {
+                return Err(StorageError::Poisoned);
+            }
+            let current = self.wal.file_read_pin_counters_current(&counters);
+            #[cfg(test)]
+            if !current {
+                for &file in &reservation.files {
+                    self.record_busy(file, BusyCause::Other("pin counters changed"));
+                }
+            }
+            if !current
+                || counters
+                    .iter()
+                    .zip(&reservation.files)
+                    .any(|((_, pins), &start)| {
+                        pins.as_ref().is_some_and(|pins| {
+                            let value = pins.load(Ordering::Acquire);
+                            let pinned = value & !Wal::READ_PIN_CLOSED != 0;
+                            let closed = value & Wal::READ_PIN_CLOSED != 0
+                                && !reservation.current.retired.contains(start);
+                            #[cfg(test)]
+                            if pinned {
+                                self.record_busy(start, BusyCause::RecordPin);
+                            } else if closed {
+                                self.record_busy(start, BusyCause::Other("counter closed"));
+                            }
+                            pinned || closed
+                        })
+                    })
+            {
+                return Ok(None);
+            }
+            for ((_, pins), &start) in counters.iter().zip(&reservation.files) {
+                if let Some(pins) = pins {
+                    let previous = pins.fetch_or(Wal::READ_PIN_CLOSED, Ordering::Release);
+                    if previous & Wal::READ_PIN_CLOSED == 0
+                        && !reservation.current.retired.contains(start)
+                    {
+                        reservation.rollback.push(Arc::clone(pins));
+                    }
+                }
+            }
         }
-        // An interrupted retirement keeps read admission closed until reopen.
-        *admission = false;
-        let pending = if entries.is_empty() {
-            current.cleanup_pending.clone()
+        Ok(Some(reservation))
+    }
+
+    /// Commit a reserved sealed retirement, then unlink its pending files.
+    pub(crate) fn finish_sealed_retirement(
+        &self,
+        mut reservation: SealedRetirement<'_>,
+    ) -> Result<RetirementOutcome, StorageError> {
+        let size = self.config().wal_file_bytes;
+        let pending = if reservation.entries.is_empty() {
+            reservation.root_started = true;
+            reservation.current.cleanup_pending.clone()
         } else {
-            let root = retirement_root(&current, &entries, size)?;
-            self.install_wal_root(&root)?;
+            let root = retirement_root(&reservation.current, &reservation.entries, size)?;
+            // A failed install may have renamed the root. Keep files closed and
+            // fail the owner until recovery resolves that ambiguous boundary.
+            reservation.root_started = true;
+            if let Err(error) = self.install_wal_root(&root) {
+                self.state.lock().poison = Some(WriterPoison::Fatal);
+                *self.read_admission.write() = false;
+                return Err(error);
+            }
             let pending = root.cleanup_pending.clone();
-            state.wal_root = Some(Arc::new(root));
+            self.state.lock().wal_root = Some(Arc::new(root));
             pending
         };
         #[cfg(test)]
@@ -539,8 +741,20 @@ impl PartitionLog {
         if present.is_empty() && !pending.is_empty() {
             File::open(&self.path)?.sync_all()?;
         }
-        *admission = true;
         Ok(RetirementOutcome::Completed)
+    }
+
+    pub(crate) fn retire_sealed_stream_files(
+        &self,
+        proofs: &[RetireProof],
+    ) -> Result<RetirementOutcome, StorageError> {
+        if proofs.is_empty() {
+            return Ok(RetirementOutcome::Completed);
+        }
+        let Some(reservation) = self.reserve_sealed_retirement(proofs)? else {
+            return Ok(RetirementOutcome::Busy);
+        };
+        self.finish_sealed_retirement(reservation)
     }
 
     fn check_active_retirement_state(state: &State) -> Result<(), StorageError> {

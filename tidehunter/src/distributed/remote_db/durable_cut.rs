@@ -756,18 +756,6 @@ impl DurableCut {
         self.shared.published.fetch_max(next, Ordering::Release);
     }
 
-    /// Version B's consistent prefix as the index loader's durable term (plan
-    /// I2): every batch of the tracked epoch below the returned cut is synced on
-    /// its owner or aborted, and no batch at or above it may be named by a
-    /// durable index artifact. Monotone; `{epoch, 0}` before the first
-    /// evaluation, which `BatchVersion` reserves as "none".
-    pub(super) fn cut(&self) -> BatchVersion {
-        BatchVersion {
-            epoch: self.shared.epoch,
-            sequence: self.shared.consistent.load(Ordering::Acquire),
-        }
-    }
-
     /// Explicit flush: every batch below `next` is synced or aborted. Returns
     /// after the record covers `next`.
     pub(super) fn certify(&self, next: u64) -> Result<(), LocalDbError> {

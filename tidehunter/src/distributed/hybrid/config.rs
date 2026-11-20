@@ -100,8 +100,8 @@ impl Default for HybridIndexConfig {
 
 impl HybridIndexConfig {
     /// The exact native `Config::default()` index rows, not Sui's production
-    /// values ([`Default`]). Used where a test or tool wants the native
-    /// single-node geometry.
+    /// values ([`Default`]). Tests use it for the native single-node geometry.
+    #[cfg(test)]
     pub(crate) fn native_default() -> Self {
         Self::from_native(&Config::default())
     }
@@ -139,6 +139,9 @@ impl HybridIndexConfig {
                  cells can never be flushed"
                     .to_owned(),
             );
+        }
+        if self.relocation_max_reclaim_pct > 100 {
+            return invalid("index relocation_max_reclaim_pct must be in 0..=100".to_owned());
         }
         if let Some(threshold) = self.index_auto_shard_threshold {
             // Same ceiling as native `Config::validate`: one serialized index
@@ -191,8 +194,11 @@ impl HybridIndexConfig {
         }
     }
 
-    /// Captures the index rows of the native configuration Sui resolved.
-    pub(crate) fn from_native(config: &Config) -> Self {
+    /// Captures the index rows of the native configuration Sui resolved. This is
+    /// the one constructor the Sui adapter calls: it reads
+    /// `tidehunter_util::thdb_config`'s result and hands it to
+    /// `RemoteDatabaseConfig::index`, so no native value is re-derived.
+    pub fn from_native(config: &Config) -> Self {
         Self {
             frag_size: config.frag_size,
             max_maps: config.max_maps,

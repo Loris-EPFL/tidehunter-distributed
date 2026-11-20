@@ -1,5 +1,8 @@
 //! The snapshot pass and the thread that paces it.
 //!
+//! Convention (A13): cuts are exclusive (`below(cut)` is `version < cut`),
+//! starts are inclusive and ends are exclusive.
+//!
 //! This is native `Db::rebuild_control_region_from` (`db.rs:1627-1730`) and its
 //! periodic driver (`db.rs:505-555`) over the hybrid index. The pass is the same
 //! sequence with two substitutions, and nothing else:
@@ -36,7 +39,8 @@
 //! `snapshot_written_bytes` or hour, never on a put or a get.
 
 use super::region::{
-    HybridControlRegion, MAX_REGION_STREAMS, max_region_cells, snapshot_due, stale_threshold,
+    HybridControlRegion, MAX_REGION_STREAMS, OlderStream, StreamFront, max_region_cells,
+    older_replay_from, snapshot_due, stale_threshold,
 };
 use super::table::HybridTable;
 use crate::control::RelocateFiles;
@@ -45,7 +49,7 @@ use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::BatchVersion;
 use crate::metrics::TimerExt;
 use crate::wal::position::WalFileId;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Weak;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -156,9 +160,11 @@ pub(crate) struct StoredSnapshot {
 /// The snapshot's frontier fell below the stored region cut during a forced
 /// store. Storing at the stored cut would name a region whose dirty cells are
 /// older than its cut, so the pass fails with this typed cause instead of a
-/// message built at the call site. Reachable only through a reader latch pinned
-/// below the stored head (the checkpoint pin race); `stored_target()` and the
-/// pass's own pin cannot produce it.
+/// message built at the call site. A defensive fail-closed invariant: the
+/// forced pass flushes every dirty cell before the snapshot, so it is not
+/// expected to fire when the promotion cut is at or above `stored`. A cadence
+/// pass in the same state stores nothing and
+/// counts a deferral (`snapshot_latch_deferrals`).
 #[derive(Debug)]
 struct CutBelowStored {
     cut: BatchVersion,
@@ -179,11 +185,20 @@ impl std::fmt::Display for CutBelowStored {
 impl std::error::Error for CutBelowStored {}
 
 /// One native snapshot pass over the hybrid index.
+///
+/// `older` lists every retained older generation of every owner (see
+/// [`OlderStream`]); the stored region names each of them, so a generation
+/// that is no longer serving keeps the replay floor retirement and trim need.
 pub(crate) fn rebuild_control_region(
     table: &HybridTable,
     force_store: bool,
     promotion_cut: Option<BatchVersion>,
+    older: &[OlderStream],
 ) -> Result<StoredSnapshot, LocalDbError> {
+    // One pass at a time (see `TableInner::pass`): the stored cut and the head
+    // below are read under it, so no other pass can store between this pass
+    // choosing its head and storing it.
+    let _single_flight = table.pass_lock().lock();
     let stored = table.stored_cut();
     // The head this pass stores at. It is `min(durable, applied, lowest held
     // latch)` raised to the stored head, so it never moves back and never
@@ -191,6 +206,8 @@ pub(crate) fn rebuild_control_region(
     // two cuts from being compared: every cell frontier the snapshot captures is
     // at or below the pin, whatever `last_processed()` reports before or after.
     let head = table.stored_target();
+    #[cfg(test)]
+    table.run_pass_pause();
     // The frontier the flush actually covers: the relocation clamp on a forced
     // pass, the head otherwise.
     let flush_frontier = promotion_cut.unwrap_or(head);
@@ -312,31 +329,53 @@ pub(crate) fn rebuild_control_region(
     // the unlink: both passes above always run, so a stalled cut still
     // force-flushes, relocates and collects garbage exactly as native does.
     //
-    // `cut < stored` is not reachable through `stored_target()` (monotone) or
-    // through the pin above. The one path is native `ks_snapshot`, which assigns
-    // a clean cell the loader's `last_processed()` unconditionally, so a reader
-    // latch below `stored` lowers `replay_from`. A latch can land there only
-    // through the checkpoint pin race (sampled at `current()`, pinned after
-    // `stored_target()` advanced past it), which the iterator/checkpoint slice
-    // closes by pinning above the stored head.
+    // `cut < stored` cannot come from `stored_target()` (monotone) or from the
+    // pin above, and a reader latch below `stored` no longer lowers a CLEAN
+    // cell: native `ks_snapshot` assigns the loader's `last_processed()` only
+    // when it is not below the cell's own frontier (`large_table.rs`,
+    // `loader_last_processed >= entry.last_processed`). What remains reachable
+    // in a cadence pass is a DIRTY cell whose own frontier is below `stored`
+    // (a re-pointed cell keeps its older frontier until its flush); the pass
+    // then stores nothing and the table counts the deferral.
     //
-    // The two modes answer it differently on purpose. A forced store must store
-    // something, and storing at `stored` would name a region whose dirty cells
-    // are older than its cut, so it fails with a typed invariant error: a latch
-    // landing below `stored` during a relocation pass is a failed pass, never a
-    // deferral. The cadence pass stores nothing in this case, which leaves the
-    // previous region and its fronts valid and byte-identical; an error there
-    // would fail-stop the database over a reader race that lost no data, so it
-    // is the same safe no-op as an unmoved cut.
+    // The two modes answer it differently on purpose. A cadence pass stores
+    // nothing: the previous region and its fronts stay valid and
+    // byte-identical, the same safe no-op as an unmoved cut, and an error
+    // would fail-stop the database over a frontier that lost no data. A forced
+    // store must store something and storing at `stored` would name a region
+    // whose dirty cells are older than its cut, so it keeps the check as a
+    // fail-closed invariant. What backs it (checked): (i) a forced pass flushes
+    // with threshold `value_bytes()` (pass 1 above) and a cell's `flushed_at`
+    // never exceeds the counter (seeded at open, `table.rs` `seed_cell_bytes`),
+    // so the cadence filter skips no dirty cell; (ii) a flush completion
+    // stores `max(old, request cut)` (`large_table.rs` `commit_flushed_cut`,
+    // `position.rs` `committed_cut`), so a flushed cell's frontier is at or
+    // above the flush frontier; (iii) `mark_dirty` (`large_table.rs`) anchors
+    // only an Empty cell, at `min(first batch, applied)`, so an insert into a
+    // non-Empty cell during pass 1 lowers no frontier; (iv) a failed flush is a
+    // fatal background-health error and the pass returns before the region
+    // store, never a silent skip. The remaining clause, flush frontier at or
+    // above `stored`, is not a theorem: the flush frontier is the loader's
+    // `last_processed()` at capture, below `stored` only while a latch below
+    // `stored` is held. The latch analysis closes it: the checkpoint and
+    // snapshot pins are never below `stored`, the NONE window defers through
+    // `q > promotion_cut`, and relocation latches are dropped before
+    // `snapshot_for_relocation`. The error is defensive and not expected to
+    // fire when the promotion cut is at or above `stored`.
     if cut < stored && force_store {
         return Err(LocalDbError::component(CutBelowStored { cut, stored }));
     }
     if !force_store && cut <= stored {
         if cut < stored {
-            // A reader latch pinned below the stored head lowered the cut. The
-            // pass stores nothing, so the no-op is safe, but it must not be
-            // silent: a latch stuck below the head holds every later snapshot
-            // back the same way. The table counts each deferral
+            // A dirty cell whose own frontier is below the stored head lowered
+            // the cut (a reader latch no longer lowers a clean cell: pinned by
+            // `a_latch_below_the_stored_cut_does_not_lower_a_clean_cell`; the
+            // dirty case by
+            // `two_deferrals_under_a_dirty_cell_below_stored_are_counted`,
+            // both in `snapshot_tests`).
+            // The pass stores nothing, so the no-op is safe, but it must not
+            // be silent: such a cell holds every later snapshot back the same
+            // way until it is flushed. The table counts each deferral
             // (`snapshot_latch_deferrals`) so that shows up in its metrics.
             table.record_snapshot_latch_deferral();
         }
@@ -381,11 +420,17 @@ pub(crate) fn rebuild_control_region(
     // cut is monotone (`cut >= stored` above), which is what the head assertion
     // of the next store compares against; a forced store keeps the cut exactly
     // as it was and only re-covers it with the new per-cell bases.
+    // The rows: the serving generation's allocation fronts, plus one row per
+    // retained older generation taken from `older` (the manifest's retained
+    // set), never from the previous region, so a trimmed generation drops out
+    // at the next store. The cut is this store's own, computed above and
+    // already drained to, so the rows and the cut are one claim.
+    let streams = region_rows(table, &region, cut, older);
     let next_region = HybridControlRegion::new(
         snapshot.data,
         cut,
         table.shape(),
-        table.stream_fronts(),
+        streams,
         table.cell_bytes(),
     );
     // Fail closed: a region over the stream or cell bound is never written
@@ -400,6 +445,39 @@ pub(crate) fn rebuild_control_region(
         forced: forced_same_cut,
         promotion_cut: stored_promotion,
     })
+}
+
+/// The replay table a store at `cut` writes: the serving rows, then one row per
+/// older stream (`older_replay_from`). An older stream whose end the
+/// coordinator does not know is carried, counted, and never dropped.
+fn region_rows(
+    table: &HybridTable,
+    stored: &super::region::HybridRegionStore,
+    cut: BatchVersion,
+    older: &[OlderStream],
+) -> Vec<StreamFront> {
+    let mut rows = table.stream_fronts();
+    let previous: BTreeMap<(u32, u64), u64> = stored
+        .stream_fronts()
+        .iter()
+        .map(|front| ((front.partition, front.generation), front.replay_from))
+        .collect();
+    for stream in older {
+        let carried = previous
+            .get(&(stream.partition, stream.generation))
+            .copied()
+            .unwrap_or(0);
+        let (replay_from, end_unknown) = older_replay_from(carried, cut, stream);
+        if end_unknown {
+            table.record_older_row_without_end();
+        }
+        rows.push(StreamFront {
+            partition: stream.partition,
+            generation: stream.generation,
+            replay_from,
+        });
+    }
+    rows
 }
 
 /// A durable step of the pass. A pass that fails at one has performed every

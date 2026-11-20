@@ -57,15 +57,15 @@
 //!
 //! Every live entry pays value bytes, the existing nonempty byte-owner header,
 //! and `size_of::<Entry>() + ENTRY_ALLOCATOR_BYTES`. The 8-byte Entry allowance
-//! models a 216-byte Box in a 224-byte glibc chunk on this build.
+//! models allocator overhead; its exact size depends on the allocator.
 //! This is an accounting model, not an RSS bound: allocator rounding of byte
 //! owners, instrumentation, shard locks and caller-held clones remain outside it.
 //! Per-slot fixed bytes are one optional Box handle, one u64 tag and one history
 //! item (32 bytes here). For shard budget b, allocate
 //! `4 * floor(b / (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE) / 4)` slots.
-//! The minimum realistic charge uses a 64-byte value. Fixed arrays use at most
-//! 7.70% of b. No payload floor is reserved per slot. Disabled tiny caches
-//! allocate no slot arrays. CLOCK uses at most 64 steps.
+//! The minimum charge includes a conservative record-size estimate. Fixed
+//! arrays use at most 8% of b. No payload floor is reserved per slot.
+//! Disabled tiny caches allocate no slot arrays. CLOCK uses at most 64 steps.
 //!
 //! Sources:
 //! <https://github.com/facebook/rocksdb/blob/main/cache/cache_key.h>
@@ -87,7 +87,7 @@ use crate::distributed::shard_lock::{ShardLockStats, ShardMutex, StableHasher};
 use crate::distributed::types::MutationVersion;
 use minibytes::Bytes;
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -95,14 +95,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 const WAYS: usize = 4;
 // Bound insertion latency independently of configured capacity.
 const MAX_EVICTION_STEPS: usize = 64;
-// One 216-byte Entry uses a 224-byte glibc chunk on this build. This is an
-// effective accounting allowance, not a portable allocator or RSS guarantee.
+// Account for Entry allocator overhead without claiming a portable chunk size.
+// This is a model, not an allocator or RSS guarantee.
 const ENTRY_ALLOCATOR_BYTES: usize = 8;
 const ENTRY_BYTES: usize = size_of::<Entry>() + ENTRY_ALLOCATOR_BYTES;
 const FIXED_SLOT_BYTES: usize =
     size_of::<Option<Box<Entry>>>() + size_of::<u64>() + size_of::<AccessHistory>();
-// Size the fixed arrays for a 32-byte key and a 64-byte value. Smaller records
-// can reach the slot ceiling; larger records reach the byte ceiling first.
+// This conservative sizing estimate includes 32 bytes and an extra byte-owner
+// header, although entries retain only value bytes.
 const COMPUTED_MIN_ENTRY_CHARGE: usize = ENTRY_BYTES + 32 + 64 + 2 * BYTE_OWNER_BYTES;
 // The fixed slot arrays are metadata held outside the byte budget: they may
 // not exceed 8 % of (metadata + charged bytes) even for the smallest record, so
@@ -538,9 +538,7 @@ impl CacheTable {
     // into the tag. This is not an identity check: full equality remains
     // mandatory, even when folded tags collide.
     fn fingerprint(&self, key: &CacheKey) -> u64 {
-        let mut hasher = self.hash.build_hasher();
-        key.identity.hash(&mut hasher);
-        hasher.finish()
+        self.hash.hash_one(key.identity)
             ^ key.identity.batch.epoch.rotate_left(3)
             ^ key.identity.batch.sequence.rotate_left(7)
             ^ u64::from(key.identity.operation_index).rotate_left(11)
@@ -966,6 +964,7 @@ impl ReadCache {
     }
 
     /// False when the budget holds no table slot. A disabled cache takes no lock.
+    #[cfg(test)]
     pub(super) fn is_enabled(&self) -> bool {
         self.enabled
     }

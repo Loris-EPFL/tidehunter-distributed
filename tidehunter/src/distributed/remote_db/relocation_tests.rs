@@ -219,8 +219,6 @@ impl Fixture {
                 queue_geometry: Default::default(),
             },
             durable_cut: Default::default(),
-            // Sui's native value (`typed-store/src/tidehunter_util.rs`).
-            relocation_max_reclaim_pct: 100,
             index: Default::default(),
         };
         let mut node_roots = Vec::new();

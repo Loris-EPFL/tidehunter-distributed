@@ -1,6 +1,9 @@
 //! R1 relocation pass: native `WalBased` relocation semantics on leased owner
 //! WALs (paper §2.3 principle 3 and §4.4: relocation never blocks writes).
 //!
+//! Convention (A13): cuts are exclusive (`below(cut)` is `version < cut`),
+//! starts are inclusive and ends are exclusive.
+//!
 //! One pass:
 //! 1. Freeze the scan cut `Q` = `Loader::last_processed()` (`min` of the
 //!    Version B durable cut, the contiguous index-applied cut and any held
@@ -13,8 +16,8 @@
 //!    through the ordinary position read and passed to the filter once,
 //!    including puts the index no longer holds. The first `Stop` ends all
 //!    callbacks, later members of its batch included. `Keep` members below the
-//!    owner's span budget are remembered by `(keyspace, version, member)`,
-//!    never by value.
+//!    owner's span budget are remembered by keyspace and physical member
+//!    address, never by value.
 //! 3. Per stream: terminal = the `Stop` batch, the first batch after `Stop`
 //!    (other streams), the first batch above `Q`, or the clean tail at the
 //!    durable end. The target is the native rule
@@ -48,8 +51,9 @@ use crate::cell::CellId;
 use crate::distributed::hybrid::StoredSnapshot;
 use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::storage::RelocationBatch;
+use crate::distributed::types::PhysicalValueAddress;
 use crate::wal::position::IndexCut;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Batches requested per owner page; one page per stream is the merge state.
@@ -100,6 +104,8 @@ pub(crate) struct StreamReport {
     /// Oldest unretired position at or after the callback start.
     pub lo: u64,
     pub processed_upper: u64,
+    /// The stream's durable end (the scan's required end).
+    pub stream_end: u64,
     pub terminal_position: u64,
     pub rounded_target: u64,
 }
@@ -189,9 +195,10 @@ struct Cursor {
     upper: Option<u64>,
 }
 
-/// A scanned `Keep` member below the owner's span budget: the identity of the
-/// index position that must be copied and re-pointed.
-type KeptKey = (u8, BatchVersion, u32);
+/// A scanned `Keep` member, identified by its immutable physical address.
+/// A relocated index entry retains its original logical version, but a scan
+/// sees the copy batch's version, so logical identity cannot match both.
+type KeptKey = (u8, PhysicalValueAddress);
 
 /// One value copy for the serving generation: full key, value and the logical
 /// version the copy re-points.
@@ -237,8 +244,12 @@ impl ConcurrentRemoteDatabase {
     pub(crate) fn background_relocation_pass(&self, cancel: &AtomicBool) {
         if let Err(error) = self.relocation_pass(false, cancel) {
             // A pass whose copies did not become durable in time applied
-            // nothing; it is retried, never a database failure.
+            // nothing; it is retried, never a database failure. Counted, so a
+            // persistently failing owner sync is visible.
             if error.is_copies_not_durable() {
+                self.write_core()
+                    .copy_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
             // Relaxed: the flag only selects the outcome; no data is handed off.
@@ -260,7 +271,7 @@ impl ConcurrentRemoteDatabase {
         let core = self.write_core();
         let (cut, streams) = self.freeze_relocation_scan()?;
         let file = core.config.storage.wal_file_bytes;
-        let pct = core.config.relocation_max_reclaim_pct;
+        let pct = core.config.index.relocation_max_reclaim_pct;
         let empty = |streams: Vec<StreamReport>| RelocationReport {
             gate: RelocationGate::NoWork,
             streams,
@@ -296,7 +307,7 @@ impl ConcurrentRemoteDatabase {
         let mut callbacks = Vec::new();
         // `Keep` members below the span budget, by position identity. Memory
         // is bounded by the reclaim span, not by the retained data set.
-        let mut kept: BTreeSet<KeptKey> = BTreeSet::new();
+        let mut kept: HashSet<KeptKey> = HashSet::new();
         let mut kept_seen = vec![false; self.shape.num_ks()];
         let mut stop: Option<(usize, BatchVersion, u64)> = None;
         // Per-owner budget ends: fixed before the scan, exactly the native
@@ -379,11 +390,7 @@ impl ConcurrentRemoteDatabase {
                             .and_then(|ends| ends.get(&cursors[index].scan.generation))
                             .is_some_and(|&end| batch.address.offset < end);
                         if reachable {
-                            kept.insert((
-                                keyspace.0,
-                                put.position.batch,
-                                put.position.operation_index,
-                            ));
+                            kept.insert((keyspace.0, put.position.address));
                         }
                     }
                     CallbackDecision::Remove => {}
@@ -447,7 +454,7 @@ impl ConcurrentRemoteDatabase {
         // count, so a pass that copied nothing still counts as mutating when it
         // had a target to drop against: deferring costs one pass and changes no
         // state, while adopting early can lose data.
-        let first = core.table.snapshot()?;
+        let first = core.snapshot_table()?;
         // A real store needs its target to advance, but relocation re-points
         // *old* versions: on an idle database or under a held latch the normal
         // store is a no-op forever and nothing would ever be reclaimed. The
@@ -466,7 +473,7 @@ impl ConcurrentRemoteDatabase {
         } = if first.stored && first.cut >= q {
             first
         } else {
-            core.table.snapshot_for_relocation(q)?
+            core.snapshot_table_for_relocation(q)?
         };
         // A forced store keeps the previous target and is bounded by its flush
         // frontier instead: it returns `stored = true` only when
@@ -531,7 +538,7 @@ impl ConcurrentRemoteDatabase {
         &self,
         q: BatchVersion,
         targets: &[(u32, u64, u64)],
-        kept: &BTreeSet<KeptKey>,
+        kept: &HashSet<KeptKey>,
         kept_seen: &[bool],
         cancel: &AtomicBool,
     ) -> Result<(u64, u64, BTreeSet<(u32, u64)>), LocalDbError> {
@@ -605,7 +612,7 @@ impl ConcurrentRemoteDatabase {
         cell: &CellId,
         q: BatchVersion,
         targets: &[(u32, u64, u64)],
-        kept: &BTreeSet<KeptKey>,
+        kept: &HashSet<KeptKey>,
         filtered: bool,
         limit: usize,
         cancel: &AtomicBool,
@@ -626,7 +633,7 @@ impl ConcurrentRemoteDatabase {
             if !below_target(&position, targets) {
                 continue;
             }
-            if filtered && !kept.contains(&(keyspace.0, position.batch, position.operation_index)) {
+            if filtered && !kept.contains(&(keyspace.0, position.address)) {
                 continue;
             }
             // A survivor whose bytes do not verify against the indexed CRC is
@@ -734,6 +741,19 @@ impl ConcurrentRemoteDatabase {
         // only in the owner's page cache until this returns. On error nothing is
         // applied: the copies stay unreferenced and the next pass retries.
         self.write_core().await_copies_durable(last_version)?;
+        #[cfg(test)]
+        {
+            let pause = self
+                .write_core()
+                .test_hooks
+                .lock()
+                .relocation_copy_pause
+                .take();
+            if let Some((entered, resume)) = pause {
+                let _ = entered.try_send((keyspace, expected.first().map(|(key, _)| key.clone())));
+                let _ = resume.recv();
+            }
+        }
         if members.len() != chunk.len() || expected.len() != chunk.len() {
             return Err(LocalDbError::new(
                 "relocation copy returned a different member count",
@@ -792,9 +812,12 @@ impl ConcurrentRemoteDatabase {
         let mut publisher = core.publisher.lock();
         let published_next = publisher.published_next;
         let state = publisher.checkpoint_state();
-        // A cut at or above the published floor names a batch that may still
-        // be published under us; the publisher state is the authority.
-        if q != BatchVersion::NONE && q.epoch == core.epoch && q.sequence >= published_next {
+        // Cuts are exclusive (`below(cut) = version < cut`) and `published_next`
+        // is the next sequence to publish, so `q == published_next` names only
+        // published batches: it is the normal idle state (everything published
+        // and processed). A cut ABOVE the published floor names a batch that may
+        // still be published under us; the publisher state is the authority.
+        if q != BatchVersion::NONE && q.epoch == core.epoch && q.sequence > published_next {
             return Err(LocalDbError::new(
                 "relocation stable cut exceeds published floor",
             ));
@@ -812,15 +835,23 @@ impl ConcurrentRemoteDatabase {
                 if !position.complete {
                     continue;
                 }
+                // A sealed stream whose adopted start reached its end has no
+                // byte left to scan. The clean-tail target is rounded up to
+                // the end of the last file, so the start can lie above the
+                // end; the owner refuses a page whose start is above its end.
+                let from = state
+                    .callback_starts
+                    .get(&(partition, generation))
+                    .copied()
+                    .unwrap_or(0);
+                if generation < core.epoch && from >= position.durable_end {
+                    continue;
+                }
                 streams.push(StreamScan {
                     node,
                     partition,
                     generation,
-                    from: state
-                        .callback_starts
-                        .get(&(partition, generation))
-                        .copied()
-                        .unwrap_or(0),
+                    from,
                     required_end: position.durable_end,
                 });
             }
@@ -969,6 +1000,7 @@ fn stream_reports(
                 fencing_generation: cursor.scan.generation,
                 lo,
                 processed_upper,
+                stream_end: cursor.scan.required_end,
                 terminal_position,
                 rounded_target: 0,
             }
@@ -997,16 +1029,26 @@ fn stream_reports(
                 .copied()
                 .ok_or_else(|| LocalDbError::new("relocation budget lost a stream"))?;
             let target = stream.terminal_position.min(budget_end);
-            // A sealed stream can never append, so only its clean tail (the
-            // exact stream end) may stay unrounded: rounding that down would
-            // leave its last partial file unreclaimable forever. Any other
-            // target, a mid-file Stop or a percentage budget included, rounds
-            // down as native does; otherwise the file would be retired with
-            // live bytes above the target that no copy covers.
-            let clean_tail =
-                stream.fencing_generation < serving && target == stream.processed_upper;
+            // A sealed stream can never append, so its clean tail (the exact
+            // stream end) is rounded UP to the end of its last file: a
+            // callback start is a file-aligned offset (the manifest and the
+            // merge refuse any other), and a start below the stream end could
+            // never satisfy trim eligibility (`callback_start >= durable_end`)
+            // or the full-coverage retirement of the last partial file. The
+            // bytes between the stream end and the file end hold no frame,
+            // so no copy is skipped. Any other target, a mid-file Stop or a
+            // percentage budget included, rounds down as native does;
+            // otherwise the file would be retired with live bytes above the
+            // target that no copy covers.
+            // The clean tail is exactly the stream end: the scan ended there
+            // without a Stop and without a budget cut.
+            let clean_tail = stream.fencing_generation < serving
+                && target == stream.processed_upper
+                && target == stream.stream_end;
             stream.rounded_target = if clean_tail {
                 target
+                    .checked_next_multiple_of(file)
+                    .ok_or_else(|| LocalDbError::new("relocation clean-tail target overflow"))?
             } else {
                 target - target % file
             };

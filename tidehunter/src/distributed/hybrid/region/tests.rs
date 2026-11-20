@@ -2,8 +2,7 @@
 
 use super::{
     HybridControlRegion, HybridRegionStore, MAX_CONTROL_REGION_BYTES, MAX_REGION_STREAMS,
-    StreamFront, is_stale, max_flushed_at, max_region_cells, owner_counter_backwards, snapshot_due,
-    stale_threshold, stored_snapshot_offsets,
+    StreamFront, max_flushed_at, max_region_cells, snapshot_due, stale_threshold,
 };
 use crate::cell::CellId;
 use crate::container::LargeTableContainer;
@@ -173,25 +172,6 @@ fn after_rename_hook_runs_before_the_directory_sync() {
 }
 
 #[test]
-fn stored_offsets_sum_saturating() {
-    assert_eq!(stored_snapshot_offsets(&streams()), 3_072);
-    assert_eq!(stored_snapshot_offsets(&[]), 0);
-    let huge = vec![
-        StreamFront {
-            partition: 0,
-            generation: 1,
-            replay_from: u64::MAX,
-        },
-        StreamFront {
-            partition: 1,
-            generation: 1,
-            replay_from: 5,
-        },
-    ];
-    assert_eq!(stored_snapshot_offsets(&huge), u64::MAX);
-}
-
-#[test]
 fn root_trigger_is_strictly_greater_than_the_threshold() {
     assert!(!snapshot_due(100, 20, 80), "exactly at the threshold");
     assert!(snapshot_due(101, 20, 80));
@@ -205,9 +185,6 @@ fn root_trigger_is_strictly_greater_than_the_threshold() {
 fn stale_threshold_matches_native_arithmetic() {
     let threshold = stale_threshold(1_000, 300);
     assert_eq!(threshold, 700);
-    assert!(is_stale(700, threshold), "inclusive, as native");
-    assert!(!is_stale(701, threshold));
-    assert!(is_stale(0, threshold), "a never-flushed cell is stale");
     assert_eq!(stale_threshold(100, 300), 0, "saturating");
 }
 
@@ -215,15 +192,6 @@ fn stale_threshold_matches_native_arithmetic() {
 fn max_flushed_at_seeds_the_cadence_floor() {
     assert_eq!(max_flushed_at(&cell_bytes()), 8_192);
     assert_eq!(max_flushed_at(&BTreeMap::new()), 0);
-}
-
-#[test]
-fn backwards_owner_counter_has_the_exact_diagnostic() {
-    let error = owner_counter_backwards(3, 500, 400);
-    assert_eq!(
-        error.to_string(),
-        "owner byte counter went backwards: stream 3, flushed_at 500, sum 400",
-    );
 }
 
 #[test]

@@ -246,7 +246,6 @@ impl Fixture {
                 queue_geometry: Default::default(),
             },
             durable_cut: Default::default(),
-            relocation_max_reclaim_pct: 100,
             index: Default::default(),
         };
         let host_config = trusted_owner_host_config(root.path().join("owner"));

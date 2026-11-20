@@ -220,6 +220,20 @@ impl PartitionLog {
             .is_some_and(|root| root.retired.contains(offset)))
     }
 
+    /// The durable retirement root must cover every file below the sealed end.
+    pub(crate) fn trim_retired_prefix(&self, end: u64) -> bool {
+        if end == 0 {
+            return true;
+        }
+        let last_start = (end - 1) / self.config().wal_file_bytes * self.config().wal_file_bytes;
+        self.state
+            .lock()
+            .wal_root
+            .as_ref()
+            .and_then(|root| root.retired.skip_end(0))
+            .is_some_and(|retired_end| retired_end > last_start)
+    }
+
     /// Sync the fixed acknowledged cut without blocking leases on the file barrier.
     /// Lifecycle callers keep the log alive and exclude seal/fence/retirement.
     /// The position root is separate from the adopted-receipt sync frontier:
@@ -436,9 +450,10 @@ impl PartitionLog {
             .collect();
         match self.retire_proved_files(&proofs, None)? {
             RetirementOutcome::Completed => Ok(()),
-            RetirementOutcome::Busy => Err(StorageError::Invalid(
-                "retirement cleanup set is full; retry after cleanup",
-            )),
+            RetirementOutcome::Busy => Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "WAL retirement is busy",
+            ))),
         }
     }
 
@@ -955,6 +970,8 @@ impl PartitionLog {
             })
             .collect();
         let mut log = Self {
+            #[cfg(test)]
+            busy_events: Mutex::new(BusyEvents::default()),
             state: Mutex::new(State {
                 open_live_extent: None,
                 next_live_extent: None,
@@ -1003,9 +1020,23 @@ impl PartitionLog {
             #[cfg(test)]
             before_unlink: Mutex::new(None),
             #[cfg(test)]
+            before_seal_sync: Mutex::new(None),
+            #[cfg(test)]
             before_persist: Mutex::new(None),
             #[cfg(test)]
             fail_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_live_progress: AtomicBool::new(false),
+            #[cfg(test)]
+            failed_live_progress: AtomicBool::new(false),
+            #[cfg(test)]
+            syncer_persist_hold_reached: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_sealed_before_root: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_appended_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            failed_appended_persist: AtomicBool::new(false),
             #[cfg(test)]
             fail_namespace_persist: AtomicBool::new(false),
             #[cfg(test)]
@@ -1245,24 +1276,61 @@ impl PartitionLog {
                 "sealed inventory no longer matches surviving frames",
             ));
         }
+        // Recovered end floor, only for a stream without a SEAL record (the
+        // first recovery of an owner-crashed stream) whose floored end
+        // `strict_end` lies in a retired file (the file holding
+        // `strict_end - 1`; `strict_end > physical_end >= 0`, so it cannot
+        // underflow). The scan cannot see frames in a retired file, so it ends
+        // at `scan_from`, below `replay_from`, and the coordinator's
+        // `require_end` check would refuse the generation for good ("sealed
+        // WAL ends below the required position"). Every byte below
+        // `strict_end` is certified: a retired file always carried a durable
+        // seal; `validate_root_sets` refuses `seal.end > synced_end`
+        // (`retired_files.rs`), the seal install sets `synced_end >= seal.end`
+        // after the file's own sync (`file_seal.rs`), and `synced_end` only
+        // grows (`persist_wal_through`, `max`); `strict_end` also holds the
+        // LIVE_FRONTIER end of a live stream. Neither floor comes from
+        // `scan_end` (the last present file, lowered by retirement). The
+        // floored end is what the SEAL records, so a later open reads it back
+        // exactly: the file holding it is retired, which makes `physical_end`
+        // the recorded end above. Testing the scanned end's file instead would
+        // skip the floor when `scan_from` sits at a file start behind a live
+        // hole, and a floored end in a live file would fail the SEAL
+        // comparison on the second open; a floor whose file is not retired is
+        // therefore not taken (the scanned end stays: exact, and what a
+        // graceful seal records). `RetiredFiles::end` is deliberately NOT a
+        // floor: the sealed-stream retirement path retires the last file with
+        // `start + size` above the true end, and a raised end would be
+        // reported as the durable end (`remote_db.rs` generation_unused:
+        // `replay_from >= durable_end`), keeping such generations
+        // non-trimmable after an owner restart.
+        let floor_file =
+            strict_end.saturating_sub(1) / expected.wal_file_bytes * expected.wal_file_bytes;
+        let frontier_end =
+            if recorded.is_none() && strict_end > physical_end && root.retired.contains(floor_file)
+            {
+                strict_end
+            } else {
+                physical_end
+            };
         let end = SealedEnd {
             format: 5,
             epoch: expected.inventory.epoch,
             generation: expected.inventory.segment_generation,
             frame_count: log.receipt_count(),
-            physical_end,
+            physical_end: frontier_end,
         };
         install_metadata(&log.path, SEAL, &encode_metadata(&end)?)?;
         {
             let mut state = log.state.lock();
-            state.appended_end = physical_end;
-            state.durable_end = physical_end;
-            state.progress = ProgressTail::recovered(physical_end);
+            state.appended_end = frontier_end;
+            state.durable_end = frontier_end;
+            state.progress = ProgressTail::recovered(frontier_end);
             {
-                state.live_root_end = physical_end;
+                state.live_root_end = frontier_end;
             }
         }
-        log.durable_frontier.store(physical_end, Ordering::Release);
+        log.durable_frontier.store(frontier_end, Ordering::Release);
         log.recovery_hole = recovery_hole;
         Ok(log)
     }

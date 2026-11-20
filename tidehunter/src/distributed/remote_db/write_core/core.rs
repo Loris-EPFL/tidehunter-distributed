@@ -178,6 +178,11 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub force_timeout: Option<std::time::Duration>,
     /// Replaces the configuration-derived bound of `await_copies_durable`.
     pub copy_durable_timeout: Option<std::time::Duration>,
+    /// Sends the keyspace and first reduced key, then parks before re-point.
+    pub relocation_copy_pause: Option<(
+        mpsc::SyncSender<(crate::key_shape::KeySpace, Option<minibytes::Bytes>)>,
+        mpsc::Receiver<()>,
+    )>,
     /// Parks the shutdown snapshot: sends on the first, waits on the second.
     pub checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     /// Fails the shutdown snapshot before it stores anything.
@@ -209,6 +214,26 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub(crate) r1_events: super::super::r1_events::R1EventSlot,
     pub stats: Mutex<CoreStats>,
     pub read_resolve_ns: AtomicU64,
+    /// Relocation passes that applied nothing because the durable cut did not
+    /// cover their copies in time. Diagnostic only (a persistent value means an
+    /// owner cannot sync): relaxed, nothing is ordered against it.
+    pub(crate) copy_deferrals: AtomicU64,
+    /// Retirement passes that refused every stream because a reader latch sat
+    /// below the stored cut (`dead_wal_files::take_snapshot`). Diagnostic only:
+    /// relaxed, nothing is ordered against it.
+    pub(crate) retirement_latch_caps: AtomicU64,
+    /// Seeded start streams that a retirement pass found with no row in the
+    /// region this process stored (`dead_wal_files::take_snapshot`), summed
+    /// over passes. Every store names every retained generation, so a
+    /// non-zero value is a broken invariant: the stream is skipped (nothing
+    /// retires without a replay floor) and the state stays visible.
+    /// Diagnostic only: relaxed, nothing is ordered against it.
+    pub(crate) retirement_missing_rows: AtomicU64,
+    /// Retirement requests an owner or the controller pool answered `Busy`
+    /// (a pin on a victim file): one count per reply, summed over passes.
+    /// Non-zero for long means a reader holds old files and a generation stays
+    /// untrimmed. Diagnostic only: relaxed, nothing is ordered against it.
+    pub(crate) retirement_busy_replies: AtomicU64,
     pub value_read_ns: AtomicU64,
     pub admission: Arc<concurrent::Admission>,
     pub concurrent_failure: Arc<AtomicBool>,
@@ -270,6 +295,10 @@ impl WriteCore {
             stats: Mutex::new(open.stats),
             admission,
             read_resolve_ns: AtomicU64::new(0),
+            copy_deferrals: AtomicU64::new(0),
+            retirement_latch_caps: AtomicU64::new(0),
+            retirement_missing_rows: AtomicU64::new(0),
+            retirement_busy_replies: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),
             concurrent_failure: open.concurrent_failure,
             first_failure: open.first_failure,

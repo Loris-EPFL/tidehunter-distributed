@@ -2,17 +2,21 @@
 //!
 //! The ledger keeps a monotone `highest_fenced_generation` that is never
 //! derived from the retained entries, so trimming old entries can never let a
-//! stale fence reactivate a generation. Trim of one generation is three durable
-//! steps under the lifecycle gate:
+//! stale fence reactivate a generation. The authenticated coordinator commits
+//! its trim intent only after `generation_unused` proves its durable replay
+//! and relocation watermarks cover the stream. The owner trusts that decision;
+//! it does not treat the recovered end as a grant high-water.
 //!
-//! 1. install the ledger without the generation and with `trim_pending`;
-//! 2. delete the exact generation directory (live WAL files first, each with
-//!    its sealed target marker), then sync the owner root;
-//! 3. install the ledger with `trim_pending` cleared.
+//! Under the live-control and lifecycle gates, the owner validates the durable
+//! SEAL against the recovered end, requires retirement and absence below it,
+//! checks pins, and fences reader snapshots. For an abandoned generation it
+//! first installs a durable zero-end SEAL.
 //!
-//! A restart between 1 and 3 finds `trim_pending`, which is the only
-//! unregistered generation directory open accepts, and resumes step 2 before
-//! any log is recovered or reader authority published.
+//! The owner then installs `trim_pending`, releases each lookahead marker and
+//! syncs the marker directory before unlinking its WAL and syncing the WAL
+//! directory, removes the generation directory and syncs the owner root, and
+//! clears `trim_pending`. A restart with the intent repeats deletion before
+//! publishing readers. Recovery refuses to extend an existing SEAL.
 
 #[cfg(test)]
 use super::super::generation_control::OwnerTrimCrash;
@@ -95,7 +99,13 @@ pub(super) fn resume_trim(
     let Some(generation) = manifest.trim_pending else {
         return Ok(());
     };
-    delete_generation(root, generation, target)?;
+    delete_generation(
+        root,
+        generation,
+        manifest.partition.wal_file_bytes,
+        target,
+        TrimCrashCuts::default(),
+    )?;
     manifest.trim_pending = None;
     persist(root, manifest)
 }
@@ -114,6 +124,9 @@ fn present_wal_files(path: &Path) -> Result<Vec<u64>, TcpError> {
         else {
             continue;
         };
+        if !entry.file_type()?.is_file() {
+            return Err(TcpError::new("trim WAL path is not a regular file"));
+        }
         files.push(id);
     }
     files.sort_unstable();
@@ -124,22 +137,37 @@ fn wal_name(directory: &Path, id: u64) -> PathBuf {
     directory.join(format!("wal_{id:016x}"))
 }
 
-/// Delete exactly `epoch_path(root, generation)` and sync the owner root.
-/// Repeatable: an absent directory only repeats the root sync.
-///
-/// Live WAL files are removed in descending file order, each followed by the
-/// release of its sealed target marker (`retire_deleted_file` syncs the WAL
-/// directory before it removes the marker). A crash between the unlink and the
-/// marker release therefore leaves the files below the removed one present, and
-/// the resume probes the marker of the next file above the highest present one
-/// (file 0 when none is present). Trim deletes only empty streams as a unit or
-/// streams whose files were all retired, so the remaining files are contiguous.
-fn delete_generation(root: &Path, generation: u64, target: TrimTarget<'_>) -> Result<(), TcpError> {
+#[derive(Default)]
+struct TrimCrashCuts {
+    before_marker_sync: bool,
+    after_marker: bool,
+    after_unlink: bool,
+    after_file_sync: bool,
+}
+
+/// Delete the intended generation and sync the owner root. The seal remains
+/// until all WAL files are gone. An interrupted final directory removal may
+/// lose the seal only after marker cleanup and WAL deletion have completed.
+fn delete_generation(
+    root: &Path,
+    generation: u64,
+    file_bytes: u64,
+    target: TrimTarget<'_>,
+    cuts: TrimCrashCuts,
+) -> Result<(), TcpError> {
     let path = epoch_path(root, generation);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
+            let present = present_wal_files(&path)?;
+            let first_ahead = if present.is_empty() {
+                None
+            } else {
+                let end = crate::distributed::storage::trim_sealed_end(&path, generation)
+                    .map_err(TcpError::component)?
+                    .ok_or_else(|| TcpError::new("trim WAL files have no sealed end"))?;
+                Some(end.div_ceil(file_bytes))
+            };
             if let Some(target) = target {
-                let present = present_wal_files(&path)?;
                 let probe = present.last().map_or(Some(0), |last| last.checked_add(1));
                 if let Some(identity) = probe
                     .map(|id| target.sealed_file(&wal_name(&path, id)))
@@ -153,13 +181,43 @@ fn delete_generation(root: &Path, generation: u64, target: TrimTarget<'_>) -> Re
                 }
                 for &id in present.iter().rev() {
                     let file = wal_name(&path, id);
-                    let identity = target.sealed_file(&file).map_err(TcpError::component)?;
-                    fs::remove_file(&file)?;
-                    if let Some(identity) = identity {
+                    if first_ahead.is_some_and(|first| id >= first) {
                         target
-                            .retire_deleted_file(&identity)
+                            .release_trim_lookahead(&file, cuts.before_marker_sync)
                             .map_err(TcpError::component)?;
+                        if cuts.after_marker {
+                            return Err(TcpError::new(
+                                "injected owner crash after lookahead marker",
+                            ));
+                        }
+                        fs::remove_file(&file)?;
+                        if cuts.after_unlink {
+                            return Err(TcpError::new(
+                                "injected owner crash before WAL directory sync",
+                            ));
+                        }
+                        File::open(&path)?.sync_all()?;
+                        if cuts.after_file_sync {
+                            return Err(TcpError::new(
+                                "injected owner crash after lookahead unlink",
+                            ));
+                        }
+                    } else {
+                        let identity = target.sealed_file(&file).map_err(TcpError::component)?;
+                        fs::remove_file(&file)?;
+                        if let Some(identity) = identity {
+                            target
+                                .retire_deleted_file(&identity)
+                                .map_err(TcpError::component)?;
+                        } else {
+                            File::open(&path)?.sync_all()?;
+                        }
                     }
+                }
+            } else {
+                for &id in present.iter().rev() {
+                    fs::remove_file(wal_name(&path, id))?;
+                    File::open(&path)?.sync_all()?;
                 }
             }
             fs::remove_dir_all(&path)?;
@@ -279,60 +337,106 @@ impl NodeInventory {
 
     /// Readiness of `generation` for trim under the current fence
     /// `authority_generation`, with the reason when it is `Blocked`.
-    pub(in crate::distributed::tcp) fn trim_readiness(
-        &self,
+    pub(in crate::distributed::tcp) fn trim_readiness<H: InventoryAccess>(
+        inventory: &mut H,
         authority_generation: u64,
         generation: u64,
     ) -> Result<(TrimReadiness, &'static str), TcpError> {
-        self.active(authority_generation)?;
+        inventory.active(authority_generation)?;
         if generation == 0 || generation >= authority_generation {
             return Ok((TrimReadiness::Blocked, "live-or-future"));
         }
-        let Ok(index) = self
-            .manifest
-            .epochs
-            .binary_search_by_key(&generation, |e| e.epoch)
-        else {
-            if self.manifest.trim_pending == Some(generation) {
-                return Ok((TrimReadiness::Blocked, "cleanup"));
-            }
-            return match fs::symlink_metadata(epoch_path(&self.config.root, generation)) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    Ok((TrimReadiness::Absent, ""))
-                }
-                Err(error) => Err(error.into()),
-                Ok(_) => Ok((TrimReadiness::Blocked, "cleanup")),
-            };
-        };
-        if let Some(reason) = self.trim_blocker(generation) {
+        if let Some(reason) = inventory.trim_blocker(generation) {
             return Ok((TrimReadiness::Blocked, reason));
         }
-        match self.manifest.epochs[index].state {
-            EpochState::Preparing | EpochState::Active => {
-                Ok((TrimReadiness::Blocked, "live-or-future"))
-            }
-            // Never activated: no group can have been accepted.
-            EpochState::Abandoned => Ok((TrimReadiness::EmptySealed, "")),
-            EpochState::Sealed => {
-                let Some(log) = self.logs.get(&generation) else {
-                    return Ok((TrimReadiness::Blocked, "cleanup"));
-                };
-                // A sealed recovery that found no valid frame and no hole: the
-                // stream never accepted a group.
-                if log.appended_frontier() == 0 && !log.recovery_found_hole() {
-                    return Ok((TrimReadiness::EmptySealed, ""));
-                }
-                // Retired: no unretired file in the WAL root and no WAL file
-                // left on disk (every retirement unlink completed).
-                let unretired = log.wal_file_page(None, 1).map_err(TcpError::component)?;
-                let present = present_wal_files(&epoch_path(&self.config.root, generation))?;
-                if unretired.is_empty() && present.is_empty() {
-                    Ok((TrimReadiness::Retired, ""))
-                } else {
-                    Ok((TrimReadiness::Blocked, "durability proof"))
-                }
-            }
+        let state = inventory
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == generation)
+            .map(|entry| entry.state);
+        if inventory.manifest.trim_pending == Some(generation) {
+            return Ok((TrimReadiness::Blocked, "cleanup"));
         }
+        if matches!(state, Some(EpochState::Preparing | EpochState::Active)) {
+            return Ok((TrimReadiness::Blocked, "live-or-future"));
+        }
+        let frontier = if state == Some(EpochState::Sealed) {
+            let Some(log) = inventory.logs.get(&generation) else {
+                return Ok((TrimReadiness::Blocked, "cleanup"));
+            };
+            if log.recovery_found_hole() {
+                return Ok((TrimReadiness::Blocked, "durability proof"));
+            }
+            let end = log.appended_frontier();
+            Some((end, log.trim_retired_prefix(end)))
+        } else {
+            None
+        };
+        let path = epoch_path(&inventory.config.root, generation);
+        let file_bytes = inventory.config.partition.wal_file_bytes;
+        // The lifecycle gate excludes changes while the inventory is released.
+        let result = inventory.released(|| -> Result<_, TcpError> {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(if state.is_none() {
+                        (TrimReadiness::Absent, "")
+                    } else if state == Some(EpochState::Abandoned) {
+                        (TrimReadiness::EmptySealed, "")
+                    } else {
+                        (TrimReadiness::Blocked, "cleanup")
+                    });
+                }
+                Err(error) => return Err(error.into()),
+                Ok(metadata) if !metadata.file_type().is_dir() => {
+                    return Err(TcpError::new("generation path is not a directory"));
+                }
+                Ok(_) if state.is_none() => return Ok((TrimReadiness::Blocked, "cleanup")),
+                Ok(_) => {}
+            }
+            let ids = present_wal_files(&path)?;
+            if let Some((end, retired)) = frontier {
+                let Some(seal) = crate::distributed::storage::trim_sealed_end(&path, generation)
+                    .map_err(TcpError::component)?
+                else {
+                    return Ok((TrimReadiness::Blocked, "missing sealed end"));
+                };
+                if seal != end {
+                    return Ok((TrimReadiness::Blocked, "sealed end mismatch"));
+                }
+                if !retired {
+                    return Ok((TrimReadiness::Blocked, "durability proof"));
+                }
+                if ids.iter().any(|id| *id < end.div_ceil(file_bytes)) {
+                    return Ok((TrimReadiness::Blocked, "durability proof"));
+                }
+            }
+            Ok(if frontier.map_or(0, |(end, _)| end) == 0 {
+                (TrimReadiness::EmptySealed, "")
+            } else {
+                (TrimReadiness::Retired, "")
+            })
+        })?;
+        inventory.active(authority_generation)?;
+        let current = inventory
+            .manifest
+            .epochs
+            .iter()
+            .find(|entry| entry.epoch == generation)
+            .map(|entry| entry.state);
+        if current != state
+            || inventory.manifest.trim_pending == Some(generation)
+            || inventory.trim_blocker(generation).is_some()
+            || frontier.is_some_and(|(end, _)| {
+                inventory
+                    .logs
+                    .get(&generation)
+                    .is_none_or(|log| log.appended_frontier() != end)
+            })
+        {
+            return Ok((TrimReadiness::Blocked, "changed during readiness check"));
+        }
+        Ok(result)
     }
 
     /// Fenced trim of `generation`. The caller holds the lifecycle gate
@@ -365,7 +469,7 @@ impl NodeInventory {
             Err(_) if inventory.manifest.trim_pending == Some(generation) => {}
             // Already trimmed: success only with the same absent-state checks.
             Err(_) => {
-                return match inventory.trim_readiness(authority_generation, generation)? {
+                return match Self::trim_readiness(inventory, authority_generation, generation)? {
                     (TrimReadiness::Absent, _) => Ok(()),
                     (_, reason) => Err(refuse(reason)),
                 };
@@ -374,62 +478,129 @@ impl NodeInventory {
                 if inventory.manifest.trim_pending.is_some() {
                     return Err(refuse("cleanup"));
                 }
-                match inventory.trim_readiness(authority_generation, generation)? {
+                match Self::trim_readiness(inventory, authority_generation, generation)? {
                     (TrimReadiness::EmptySealed | TrimReadiness::Retired, _) => {}
                     (_, reason) => return Err(refuse(reason)),
                 }
-                // R1 recovery can leave exact tombstones for already absent
-                // files at arbitrary offsets. Finish them before detaching the
-                // log or dropping its durable cleanup record.
-                if let Some(target) = target.as_deref_mut()
-                    && let Some(log) = inventory.logs.get(&generation).cloned()
-                {
-                    let pending = log.pending_file_retirements();
-                    inventory.released(|| {
-                        super::retirement::finish_tombstones(target, &log, &pending, |_| {})
-                    })?;
-                }
-                // Detach the log: readers first, then this inventory's handle.
+                // Lock order is inventory then readers. Removing the reader
+                // entry prevents new snapshots; the sole-Arc check catches
+                // snapshots and leases obtained before that removal.
                 inventory.readers.write().logs.remove(&generation);
-                if let Some(log) = inventory.logs.remove(&generation) {
-                    if Arc::strong_count(&log) != 1 {
+                #[cfg(test)]
+                if let Some((entered, resume)) = inventory.trim_detach_pause.take() {
+                    let _ = entered.send(());
+                    let _ = resume.recv();
+                }
+                let detached = inventory.logs.remove(&generation);
+                if detached
+                    .as_ref()
+                    .is_some_and(|log| Arc::strong_count(log) != 1)
+                {
+                    if let Some(log) = detached {
                         inventory
                             .readers
                             .write()
                             .logs
                             .insert(generation, log.clone());
                         inventory.logs.insert(generation, log);
-                        return Err(refuse("reader/actor/log handle pending"));
                     }
-                    drop(log);
+                    return Err(TcpError::with_kind(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "owner {partition} cannot trim fencing generation {generation}: reader/actor/log handle pending"
+                        ),
+                    ));
                 }
-                // Idle history exports of this generation have no pin (checked
-                // above); revoke them before the namespace backing disappears.
-                if let Some(target) = target.as_deref_mut() {
-                    let keys: Vec<_> = inventory
-                        .live_bindings
-                        .keys()
-                        .copied()
-                        .filter(|key| key.0 == generation)
-                        .collect();
-                    let claimed: Vec<_> = keys
-                        .iter()
-                        .filter_map(|key| inventory.live_bindings.remove_entry(key))
-                        .collect();
-                    let result = inventory
-                        .released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
-                    if let Err(error) = result {
-                        inventory.live_bindings.extend(claimed);
-                        inventory.healthy = false;
+                let preparation = (|| -> Result<(Manifest, Vec<u8>), TcpError> {
+                    if inventory.manifest.epochs[index].state == EpochState::Abandoned {
+                        let root = inventory.config.root.clone();
+                        let path = epoch_path(&root, generation);
+                        inventory.released(|| {
+                            match fs::symlink_metadata(&path) {
+                                Ok(metadata) if metadata.file_type().is_dir() => {}
+                                Ok(_) => {
+                                    return Err(TcpError::new(
+                                        "generation path is not a directory",
+                                    ));
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                    fs::create_dir(&path)?;
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
+                            File::open(&root)?.sync_all()?;
+                            crate::distributed::storage::install_empty_trim_seal(&path, generation)
+                                .map_err(TcpError::component)
+                        })?;
+                        #[cfg(test)]
+                        if inventory.take_trim_crash(OwnerTrimCrash::AfterEmptySeal) {
+                            return Err(TcpError::new("injected owner crash after empty seal"));
+                        }
+                    }
+                    if let Some(target) = target.as_deref_mut()
+                        && let Some(log) = detached.as_ref()
+                    {
+                        let pending = log.pending_file_retirements();
+                        inventory.released(|| {
+                            super::retirement::finish_tombstones(target, log, &pending, |_| {})
+                        })?;
+                    }
+                    if let Some(target) = target.as_deref_mut() {
+                        let keys: Vec<_> = inventory
+                            .live_bindings
+                            .keys()
+                            .copied()
+                            .filter(|key| key.0 == generation)
+                            .collect();
+                        let claimed: Vec<_> = keys
+                            .iter()
+                            .filter_map(|key| inventory.live_bindings.remove_entry(key))
+                            .collect();
+                        let result = inventory.released(|| {
+                            revoke_bindings(target, claimed.iter().map(|(_, binding)| binding))
+                        });
+                        if let Err(error) = result {
+                            inventory.live_bindings.extend(claimed);
+                            inventory.healthy = false;
+                            return Err(error);
+                        }
+                        inventory
+                            .idle_history_exports
+                            .retain(|key| key.0 != generation);
+                    }
+                    let mut manifest = inventory.manifest.clone();
+                    manifest.epochs.remove(index);
+                    manifest.trim_pending = Some(generation);
+                    let bytes = encode_metadata(&manifest).map_err(TcpError::component)?;
+                    inventory.bump_revision()?;
+                    Ok((manifest, bytes))
+                })();
+                let (manifest, bytes) = match preparation {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if let Some(log) = detached {
+                            inventory
+                                .readers
+                                .write()
+                                .logs
+                                .insert(generation, log.clone());
+                            inventory.logs.insert(generation, log);
+                        }
                         return Err(error);
                     }
-                    inventory
-                        .idle_history_exports
-                        .retain(|key| key.0 != generation);
+                };
+                drop(detached);
+                inventory.manifest = manifest;
+                let root = inventory.config.root.clone();
+                if let Err(error) = inventory
+                    .released(|| install_metadata(&root, MANIFEST, &bytes))
+                    .map_err(TcpError::component)
+                {
+                    // The rename may already be durable. Never restore access.
+                    inventory.healthy = false;
+                    inventory.readers.write().invalidate();
+                    return Err(error);
                 }
-                inventory.manifest.epochs.remove(index);
-                inventory.manifest.trim_pending = Some(generation);
-                Self::persist_manifest(inventory)?;
             }
         }
         #[cfg(test)]
@@ -438,7 +609,23 @@ impl NodeInventory {
             return Err(TcpError::new("injected owner crash after trim ledger"));
         }
         let root = inventory.config.root.clone();
-        inventory.released(|| delete_generation(&root, generation, target))?;
+        let file_bytes = inventory.config.partition.wal_file_bytes;
+        #[cfg(test)]
+        let cuts = TrimCrashCuts {
+            before_marker_sync: inventory
+                .take_trim_crash(OwnerTrimCrash::AfterLookaheadMarkerUnlink),
+            after_marker: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadMarker),
+            after_unlink: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadFileUnlink),
+            after_file_sync: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadUnlink),
+        };
+        #[cfg(not(test))]
+        let cuts = TrimCrashCuts::default();
+        let result =
+            inventory.released(|| delete_generation(&root, generation, file_bytes, target, cuts));
+        if result.is_err() {
+            inventory.healthy = false;
+        }
+        result?;
         #[cfg(test)]
         if inventory.take_trim_crash(OwnerTrimCrash::AfterUnlink) {
             inventory.healthy = false;
@@ -446,6 +633,20 @@ impl NodeInventory {
         }
         inventory.manifest.trim_pending = None;
         Self::persist_manifest(inventory)
+    }
+
+    /// Pause after reader detachment, while the inventory lock is held.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn pause_trim_after_detach(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, observed) = std::sync::mpsc::sync_channel(0);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+        self.trim_detach_pause = Some((entered, resume_rx));
+        (observed, resume)
     }
 
     #[cfg(test)]

@@ -1,5 +1,8 @@
 //! Cut fronts, allocation tracking and the hybrid [`Loader`] implementation.
 //!
+//! Convention (A13): cuts are exclusive (`below(cut)` is `version < cut`),
+//! starts are inclusive and ends are exclusive.
+//!
 //! Native Tidehunter derives its index frontier from local `WalGuard`s: every
 //! position below `WalTracker::last_processed` is in the index. A remote
 //! append never touches the coordinator's value WAL, so the hybrid tracks the
@@ -43,7 +46,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// A cut cell with lock-free reads.
 ///
@@ -420,11 +423,13 @@ pub(crate) fn compose_last_processed(
 
 /// The monotone stored target (Amendment 9).
 ///
-/// The stored target is `max(previous_stored_target, min(durable, applied,
-/// lowest held latch))`: a held checkpoint taken below the target, or a
-/// replayed durable cut that is still behind, must never lower what the last
-/// snapshot already persisted. An unchanged target makes the store a no-op
-/// (the previous region and `replay_from` are kept).
+/// The stored target is `max(previous, min(durable, applied, lowest held
+/// latch))`, where `previous` is the cut the stored control region names
+/// (`HybridTable::stored_cut`), not the head of the live index: a held
+/// checkpoint taken below the region cut, or a replayed durable cut that is
+/// still behind, must never lower what the last snapshot already persisted. An
+/// unchanged target makes the store a no-op (the previous region and
+/// `replay_from` are kept).
 pub(crate) fn next_stored_target(
     previous: BatchVersion,
     durable: BatchVersion,
@@ -462,15 +467,6 @@ impl HybridLoader {
         }
     }
 
-    /// The cut a snapshot may persist: `min(durable, applied, held latch)`.
-    ///
-    /// This is the promotion/cleaning clamp and may decrease when a latch is
-    /// taken. It is never the stored region cut; `HybridTable::stored_target`
-    /// owns that monotone value.
-    pub(crate) fn flush_target(&self) -> BatchVersion {
-        self.last_processed()
-    }
-
     /// Release check: every batch below `cut` is owner synced.
     ///
     /// Version B establishes the durable cut before publication acknowledges
@@ -498,10 +494,6 @@ impl HybridLoader {
 
     pub(crate) fn index_writer(&self) -> &Arc<WalWriter> {
         &self.index_writer
-    }
-
-    pub(crate) fn value_bytes(&self) -> u64 {
-        self.cuts.bytes()
     }
 }
 
@@ -531,7 +523,7 @@ impl Loader for HybridLoader {
         ks: &KeySpaceDesc,
         position: WalPosition,
     ) -> Result<IndexTable<VersionPosition>, LocalDbError> {
-        let (_, frame) = self
+        let (read_type, frame) = self
             .index_wal
             .read(position)
             .map_err(|error| index_wal_error("read", error))?;
@@ -541,7 +533,25 @@ impl Loader for HybridLoader {
                 position.offset()
             ))
         })?;
-        Ok(ks.index_format().deserialize_index(ks, frame))
+        // The frame still carries the `[WAL_ENTRY_INDEX][keyspace]` prefix:
+        // decode it exactly as native `Db::read_entry` does, so the index
+        // deserializer sees only the blob (`index_reader` skips the same prefix).
+        let frame_len = frame.len() as u64;
+        match WalEntry::from_bytes(frame) {
+            WalEntry::Index(id, blob) if id == ks.id() => {
+                // Same per-keyspace read counters native `Db::report_read` bumps
+                // for an index entry, so hybrid index loads are not invisible.
+                let context = self.contexts.ks_context(id);
+                context.inc_read(WalEntryKind::Index, read_type);
+                context.inc_read_bytes(WalEntryKind::Index, read_type, frame_len);
+                Ok(ks.index_format().deserialize_index(ks, blob))
+            }
+            _ => Err(LocalDbError::new(format!(
+                "index WAL offset {} does not hold an index entry of keyspace {}",
+                position.offset(),
+                ks.name()
+            ))),
+        }
     }
 
     fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, LocalDbError> {

@@ -1305,7 +1305,7 @@ impl ConcurrentRemoteDatabase {
     /// index/control-region persistence error.
     pub(crate) fn snapshot_index(&self) -> Result<StoredSnapshot, LocalDbError> {
         self.ensure_healthy()?;
-        self.table.snapshot()
+        self.write_core().snapshot_table()
     }
 
     /// Snapshot passes that were a no-op only because a reader latch held the
@@ -1313,6 +1313,52 @@ impl ConcurrentRemoteDatabase {
     /// `snapshot_latch_deferrals` gauge.
     pub(crate) fn snapshot_latch_deferrals(&self) -> u64 {
         self.table.snapshot_latch_deferrals()
+    }
+
+    /// How full the owner-stream table is against its control-region bound;
+    /// exported as the `retained_streams` / `retained_stream_pressure` gauges
+    /// and read once after open to request a priority relocation pass.
+    pub(crate) fn stream_pressure(&self) -> super::stream_positions::StreamPressure {
+        self.write_core().stream_pressure()
+    }
+
+    /// Relocation passes deferred because their copies were not durable in
+    /// time; exported as the `relocation_copy_deferrals` gauge.
+    pub(crate) fn relocation_copy_deferrals(&self) -> u64 {
+        self.write_core().copy_deferrals.load(Ordering::Relaxed)
+    }
+
+    /// Retirement passes that refused every stream because a reader latch was
+    /// below the stored cut; exported as the `retirement_latch_caps` gauge.
+    pub(crate) fn retirement_latch_caps(&self) -> u64 {
+        self.write_core()
+            .retirement_latch_caps
+            .load(Ordering::Relaxed)
+    }
+
+    /// Seeded start streams a retirement pass found with no row in the region
+    /// this process stored (summed over passes); exported as the
+    /// `retirement_missing_rows` gauge. Zero unless an invariant broke.
+    pub(crate) fn retirement_missing_rows(&self) -> u64 {
+        self.write_core()
+            .retirement_missing_rows
+            .load(Ordering::Relaxed)
+    }
+
+    /// Retirement requests answered `Busy` because a reader pins a victim
+    /// file (one count per reply, whether the controller pool or an owner
+    /// answered); exported as the `retirement_busy_replies` gauge. Non-zero for
+    /// long means a reader holds old files.
+    pub(crate) fn retirement_busy_replies(&self) -> u64 {
+        self.write_core()
+            .retirement_busy_replies
+            .load(Ordering::Relaxed)
+    }
+
+    /// Older-generation rows stored without a known durable end; exported as
+    /// the `older_rows_without_end` gauge. Zero unless an invariant broke.
+    pub(crate) fn older_rows_without_end(&self) -> u64 {
+        self.table.older_rows_without_end()
     }
 
     /// Named index rebuild: native `force_rebuild_control_region`. Force-flushes
@@ -1324,7 +1370,7 @@ impl ConcurrentRemoteDatabase {
     pub(crate) fn force_rebuild_index(&self) -> Result<StoredSnapshot, LocalDbError> {
         self.ensure_healthy()?;
         let frontier = self.table.last_processed();
-        self.table.snapshot_for_relocation(frontier)
+        self.write_core().snapshot_table_for_relocation(frontier)
     }
 
     pub fn read_cache_stats(&self) -> ReadCacheStats {

@@ -102,7 +102,6 @@ pub(super) fn coordinator_config(
         write_profile_limit: 0,
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
-        relocation_max_reclaim_pct: 100,
         index: Default::default(),
     }
 }

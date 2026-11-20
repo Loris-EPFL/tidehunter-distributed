@@ -5,6 +5,7 @@ use super::super::{
 use super::completion::DrainStop;
 use super::core::WriteCore;
 use crate::distributed::hybrid::StoredSnapshot;
+use crate::distributed::hybrid::region::OlderStream;
 use crate::distributed::types::BatchVersion;
 use std::collections::VecDeque;
 use std::sync::{Arc, atomic::Ordering};
@@ -41,11 +42,68 @@ impl WriteCore {
     ) -> Result<StoredSnapshot, LocalDbError> {
         let next = self.sequencer.next();
         self.wait_published_before(next)?;
-        let result = self.table.snapshot();
+        let result = self.snapshot_table();
         if let Err(error) = &result {
             self.fail(LocalDbError::new(error.message()));
         }
         result
+    }
+
+    /// One cadence snapshot pass over the index, with the retained older
+    /// generations named so the stored region keeps a row for each.
+    pub(in crate::distributed::remote_db) fn snapshot_table(
+        &self,
+    ) -> Result<StoredSnapshot, LocalDbError> {
+        self.table.snapshot_with(&self.older_streams())
+    }
+
+    /// A snapshot that covers a relocation scan cut; see
+    /// `HybridTable::snapshot_for_relocation_with`.
+    pub(in crate::distributed::remote_db) fn snapshot_table_for_relocation(
+        &self,
+        q: BatchVersion,
+    ) -> Result<StoredSnapshot, LocalDbError> {
+        self.table
+            .snapshot_for_relocation_with(q, &self.older_streams())
+    }
+
+    /// Every retained older `(owner partition, fencing generation)` stream: the
+    /// manifest's retained set below the serving generation, each with the
+    /// publisher position's `durable_end`.
+    ///
+    /// Read cold under the publisher lock, the way `take_snapshot` reads it, and
+    /// released before the pass starts (no lock is held across the store). The
+    /// retained set changes only at open (`fencing_generations::maintain`), and
+    /// an older stream is sealed, so the set and its ends cannot change between
+    /// this read and the store that uses it.
+    fn older_streams(&self) -> Vec<OlderStream> {
+        let mut publisher = self.publisher.lock();
+        let state = publisher.checkpoint_state();
+        let retained =
+            super::super::fencing_generations::retained_below(state.manifest, self.epoch);
+        let mut streams = Vec::with_capacity(self.config.endpoints.len() * retained.len());
+        for endpoint in &self.config.endpoints {
+            for &(generation, _aborted) in &retained {
+                streams.push(OlderStream {
+                    partition: endpoint.partition,
+                    generation,
+                    durable_end: state
+                        .positions
+                        .get(&(endpoint.partition, generation))
+                        .map(|position| position.durable_end),
+                });
+            }
+        }
+        streams
+    }
+
+    /// The owner-stream table's fill against the control-region bound.
+    pub(in crate::distributed::remote_db) fn stream_pressure(
+        &self,
+    ) -> super::super::stream_positions::StreamPressure {
+        super::super::stream_positions::StreamPressure::new(
+            self.publisher.lock().checkpoint_state().positions.len(),
+        )
     }
 
     pub(in crate::distributed::remote_db) fn flush_durable(&self) -> Result<(), LocalDbError> {
@@ -341,7 +399,7 @@ impl WriteCore {
             result = if interrupted {
                 Err(LocalDbError::new("injected shutdown snapshot interruption"))
             } else {
-                self.table.snapshot().map(|_| ())
+                self.snapshot_table().map(|_| ())
             };
         }
         self.stats.lock().shutdown.checkpoint_ns = elapsed(started);

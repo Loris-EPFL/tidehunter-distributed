@@ -26,6 +26,7 @@ use crate::distributed::storage::AppendedBatch;
 use crate::distributed::types::{BatchId, BatchVersion, PayloadDigest};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// WAL files per permanent export subsystem: one subsystem per owner covers
 /// 1024 files of an epoch, one namespace each.
@@ -183,10 +184,14 @@ pub struct LiveRecordLease {
     pub offset: u64,
     pub len: u32,
     pub(crate) _plan: crate::distributed::storage::RecordReadPlan,
+    pub(crate) _file_pin: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for LiveRecordLease {
     fn drop(&mut self) {
+        // Release publishes the end of this lease to the retirement check.
+        self._file_pin
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
         self._plan._log.release_live_read_pin();
     }
 }

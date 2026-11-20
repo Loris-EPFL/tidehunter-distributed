@@ -334,6 +334,34 @@ fn blob_round_trip_is_verbatim_for_the_tombstone() {
     assert_eq!(decoded.address, VersionPosition::INVALID.address);
 }
 
+/// `IndexTable::deserialize_fixed_size` hands a tombstone-free on-disk blob
+/// straight to its flat buffer, so a blob row must be byte-identical to the
+/// kind-0 flat row of the same position. Negative control: the former blob
+/// layout (epoch word first) differs from the flat row in its first 4 bytes and
+/// every loaded version came back shifted.
+#[test]
+fn the_blob_row_is_byte_identical_to_a_clean_flat_row() {
+    let max_operation = (1u32 << 30) - 1;
+    for original in [
+        position(7, 8, 9),
+        position(1, 4, 0),
+        position(u64::MAX - 1, u64::MAX - 1, max_operation),
+        VersionPosition::INVALID,
+    ] {
+        let mut blob = BytesMut::with_capacity(48);
+        original.write_blob(&mut blob);
+        let mut flat = BytesMut::with_capacity(48);
+        original.write_flat(0, &mut flat);
+        assert_eq!(blob, flat, "{original:?}");
+
+        let from_blob = VersionPosition::read_blob(&mut blob.freeze());
+        let (from_flat, kind) = VersionPosition::read_flat(&mut flat.freeze());
+        assert_eq!(kind, 0);
+        assert!(from_blob.same_physical(&original), "{from_blob:?}");
+        assert!(from_flat.same_physical(&original), "{from_flat:?}");
+    }
+}
+
 #[test]
 fn precedes_is_strict_logical_order() {
     assert!(position(1, 1, 0).precedes(position(1, 1, 1)));

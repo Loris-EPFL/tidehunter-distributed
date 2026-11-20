@@ -29,6 +29,11 @@ pub struct FileMaintenanceStats {
     pub retired_files: u64,
     /// Retirement requests that made no durable decision.
     pub busy_retirements: u64,
+    /// Finish passes that unlinked nothing although cleanups were pending:
+    /// a victim was still the writer's open fragment map (`WouldBlock` from
+    /// the mapper). The next pass repeats the work once the next fragment's
+    /// first allocation finalizes that map.
+    pub deferred_retirements: u64,
     /// Grants answered from an already published binding: no lifecycle gate.
     pub ready_binding_grants: u64,
     /// Grants that took the lifecycle gate although their binding was
@@ -81,7 +86,7 @@ struct Epoch {
 /// Owner fencing ledger (format `generations::FORMAT`). Retained entries can
 /// be trimmed; `highest_fenced_generation` never decreases and is the only
 /// source of the stale-fence check.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Manifest {
     format: u32,
     partition: PartitionConfig,
@@ -304,6 +309,11 @@ pub struct NodeInventory {
     revision: u64,
     #[cfg(test)]
     trim_crash: Option<super::generation_control::OwnerTrimCrash>,
+    #[cfg(test)]
+    trim_detach_pause: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     /// Value WAL files passed to a successful retirement unlink step by this
     /// process. Read by the R0 inventory page; R0 asserts it does not move.
     value_wal_unlinks: u64,
@@ -661,6 +671,8 @@ impl NodeInventory {
             revision: 0,
             #[cfg(test)]
             trim_crash: None,
+            #[cfg(test)]
+            trim_detach_pause: None,
             value_wal_unlinks: 0,
             file_maintenance: FileMaintenanceStats::default(),
             r1_events: None,
@@ -985,6 +997,17 @@ impl NodeInventory {
             .released(|| install_metadata(&root, MANIFEST, &bytes))
             .map_err(TcpError::component)
     }
+    #[cfg(test)]
+    pub(super) fn sealed_log_for_test(&self, epoch: u64) -> Arc<PartitionLog> {
+        assert!(
+            self.manifest
+                .epochs
+                .iter()
+                .any(|entry| { entry.epoch == epoch && entry.state == EpochState::Sealed })
+        );
+        Arc::clone(self.logs.get(&epoch).expect("sealed stream missing"))
+    }
+
     pub(super) fn active(&self, epoch: u64) -> Result<Arc<PartitionLog>, TcpError> {
         self.ensure_healthy()?;
         if !self

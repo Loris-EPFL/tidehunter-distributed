@@ -858,11 +858,20 @@ enum ReadCommand {
     #[cfg(test)]
     Wake,
     DrainLive(mpsc::SyncSender<Result<(), String>>),
+    EvictRetirement(Arc<RetirementEviction>),
 }
 
 enum LiveLaneCommand {
     Request(Request),
     Drain(mpsc::SyncSender<Result<(), String>>),
+    EvictRetirement(Arc<RetirementEviction>),
+}
+
+/// One bounded retirement request shared by the lanes of an owner.
+struct RetirementEviction {
+    generation: u64,
+    files: Vec<u64>,
+    reply: mpsc::SyncSender<bool>,
 }
 
 impl Request {
@@ -1252,6 +1261,23 @@ fn drive_live_reads(
                         // Release: this lane did not accept the published drain.
                         state.live_drains.fetch_sub(1, Ordering::Release);
                         let _ = reply.send(Err("live read lane drain admission failed".into()));
+                    }
+                }
+            }
+            ReadCommand::EvictRetirement(request) => {
+                for lane in &inboxes {
+                    if lane
+                        .sender
+                        .try_send(LiveLaneCommand::EvictRetirement(Arc::clone(&request)))
+                        .is_err()
+                    {
+                        let _ = request.reply.try_send(false);
+                        continue;
+                    }
+                    if let Some(waker) = lane.waker.get()
+                        && waker.wake().is_err()
+                    {
+                        let _ = request.reply.try_send(false);
                     }
                 }
             }
@@ -1690,6 +1716,41 @@ impl ReadService {
         let pause = AdmissionPause(self.state.clone());
         drop(retained);
         Ok(pause)
+    }
+
+    /// Ask one owner's bounded lane actors to release idle victim grants.
+    /// Full, closed, failed or timed-out lanes defer this retirement pass.
+    pub(super) fn evict_retirement_grants(
+        &self,
+        node: usize,
+        generation: u64,
+        files: &[u64],
+    ) -> bool {
+        let lanes = self.lanes.read().get(node).map_or(0, Vec::len);
+        let sender = self.sender.lock().get(node).cloned();
+        let Some(sender) = sender.filter(|_| lanes != 0) else {
+            return false;
+        };
+        let (reply, responses) = mpsc::sync_channel(lanes);
+        let request = Arc::new(RetirementEviction {
+            generation,
+            files: files.to_vec(),
+            reply,
+        });
+        if sender
+            .try_send(ReadCommand::EvictRetirement(request))
+            .is_err()
+        {
+            return false;
+        }
+        let deadline = Instant::now() + self.timeout();
+        for _ in 0..lanes {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !matches!(responses.recv_timeout(remaining), Ok(true)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Pause new admissions and retire every lane's cached live file grants.

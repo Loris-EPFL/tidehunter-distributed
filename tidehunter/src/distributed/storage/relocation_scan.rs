@@ -31,7 +31,9 @@ use minibytes::Bytes;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelocationPut {
     pub keyspace: u8,
-    pub position: VersionPosition,
+    /// Crate-internal: `VersionPosition` is not a public type; the page is
+    /// only produced and consumed inside the crate and by serde.
+    pub(crate) position: VersionPosition,
     pub reduced_key: Bytes,
 }
 

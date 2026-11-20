@@ -27,7 +27,6 @@
 use crate::cell::CellId;
 use crate::container::LargeTableContainer;
 use crate::control::ControlRegion;
-use crate::db::CONTROL_REGION_FILE;
 use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::BatchVersion;
 use crate::key_shape::{KeyShape, KeyType};
@@ -55,11 +54,19 @@ const MAX_CONTROL_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// A stream is one `(owner partition, fencing generation)` pair the database
 /// still references. There is no static cap on the owner count and the retained
 /// generations are bounded only by what is still referenced, so this fixed
-/// number is the failure boundary, not a derived quota: 4,096 is, for example,
-/// 16 owners with 256 retained generations each (each retained generation
-/// holds at least one unretired file on its owner). Past it an open refuses the
-/// database, a store refuses the region and a publication fails closed; nothing
-/// is ever truncated, because dropping a stream would drop its replay start.
+/// number is the failure boundary, not a derived quota. The open's invariant is
+/// `owners × (retained generations + 1) <= 4096`, enforced at the generation
+/// reservation before anything is persisted: 2,047 retained generations per
+/// owner at 2 owners (the retired `max_epochs` limit was 1,024 per database),
+/// 255 at 16 owners (the one regression against that limit; it applies only if
+/// that many generations stay referenced, and each holds at least one unretired
+/// file). Size at the bound: a stored `StreamFront` is 4 + 8 + 8 = 20 B, so the
+/// region part is about 80 KiB, and the in-memory position and callback-start
+/// maps are about 48 B + 24 B per stream, 0.3 MiB: trivial against the 8 GiB
+/// snapshot window. A store refuses a region over the bound and a publication
+/// fails closed; nothing is ever truncated, because dropping a stream would drop
+/// its replay start. At 75 % the open reports pressure (gauge and a priority
+/// relocation request) long before the hard bound.
 pub(crate) const MAX_REGION_STREAMS: usize = 4096;
 
 /// One owner stream's replay start, persisted with the snapshot.
@@ -72,6 +79,55 @@ pub(crate) struct StreamFront {
     pub(crate) partition: u32,
     pub(crate) generation: u64,
     pub(crate) replay_from: u64,
+}
+
+/// A retained older fencing generation of one owner, as the coordinator knows
+/// it when it builds the rows of a region store.
+///
+/// Older generations are sealed: nothing is appended to them any more, so the
+/// owner's `durable_end` is final for the process that holds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OlderStream {
+    pub(crate) partition: u32,
+    pub(crate) generation: u64,
+    /// The publisher position's `durable_end` (the quantity trim eligibility
+    /// compares a row against), or `None` when the coordinator holds no
+    /// position for the stream.
+    pub(crate) durable_end: Option<u64>,
+}
+
+/// The row an older stream gets in a region stored at `cut`, and whether the
+/// row had to be carried because its end is unknown.
+///
+/// Epoch and fencing generation are one counter, so every version of
+/// generation `k` is below `{k + 1, 0}`. A store whose `cut.epoch > k` has every
+/// batch of `k` in the stored blobs (native `replay_from`: nothing below the
+/// cut is replayed), so the stream needs no replay: its row is the owner's
+/// `durable_end`. Below that cut the row only carries `previous` (the row
+/// already stored, else 0): replay starts no later than the last store said.
+/// The row never moves back. An unknown end carries `previous` and reports
+/// itself, so a stream is never dropped from the region and never advanced
+/// without proof.
+pub(crate) fn older_replay_from(
+    previous: u64,
+    cut: BatchVersion,
+    stream: &OlderStream,
+) -> (u64, bool) {
+    match stream.durable_end {
+        Some(end) if cut.epoch > stream.generation => {
+            // An older stream was replayed at open from its stored row, and the
+            // replay refuses a start above the owner's end, so `max` equals
+            // `end` in every reachable state. The assert documents it.
+            debug_assert!(
+                previous <= end,
+                "older row {previous} of generation {} is above its durable end {end}",
+                stream.generation
+            );
+            (previous.max(end), false)
+        }
+        Some(_) => (previous, false),
+        None => (previous, true),
+    }
 }
 
 /// Native control-region payload plus the hybrid-only fields.
@@ -106,6 +162,7 @@ impl HybridControlRegion {
     /// Verifies the stored snapshot against the canonical shape with the
     /// native verifier (same rules as a native V3 open; a mismatch is a
     /// configuration/disk disagreement and fails loudly, as native does).
+    #[cfg(test)]
     pub(crate) fn verify_shape(&self, key_shape: &KeyShape) {
         self.region.verify_shape(key_shape);
     }
@@ -191,11 +248,6 @@ impl HybridRegionStore {
             #[cfg(test)]
             after_rename_hook: None,
         }
-    }
-
-    /// The control-region path inside a coordinator database directory.
-    pub(crate) fn at(dir: &Path) -> Self {
-        Self::new(dir.join(CONTROL_REGION_FILE))
     }
 
     /// Reads an existing region and prepares it for open: the native shape
@@ -384,6 +436,7 @@ impl HybridRegionStore {
         &self.streams
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -406,18 +459,6 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(raw)
 }
 
-/// `Σ` of the per-stream offsets persisted with the last snapshot.
-///
-/// This is the stored term of the byte-cadence root trigger. The persisted
-/// offset is `replay_from`, which is at or below the snapshot tail (I4), so
-/// `current - stored` can only overestimate the bytes since the snapshot and
-/// can only make a snapshot fire earlier, never later.
-pub(crate) fn stored_snapshot_offsets(streams: &[StreamFront]) -> u64 {
-    streams
-        .iter()
-        .fold(0u64, |sum, stream| sum.saturating_add(stream.replay_from))
-}
-
 /// Native root trigger: `written > snapshot_written_bytes` (strictly greater),
 /// expressed over the value-byte counter and the stored offsets.
 pub(crate) fn snapshot_due(current: u64, stored: u64, snapshot_written_bytes: u64) -> bool {
@@ -429,32 +470,10 @@ pub(crate) fn stale_threshold(current: u64, snapshot_unload_threshold: u64) -> u
     current.saturating_sub(snapshot_unload_threshold)
 }
 
-/// Native unload predicate: a cell flushes when
-/// `flushed_at <= current - snapshot_unload_threshold` (inclusive).
-pub(crate) fn is_stale(flushed_at: u64, threshold: u64) -> bool {
-    flushed_at <= threshold
-}
-
 /// Highest per-cell byte position, used to seed `current` on open so a cell
 /// whose `flushed_at` is above the replayed tails can never wrap.
 pub(crate) fn max_flushed_at(cell_bytes: &BTreeMap<(u8, CellId), u64>) -> u64 {
     cell_bytes.values().copied().max().unwrap_or(0)
-}
-
-/// Diagnostic for an owner byte counter that moved backwards.
-///
-/// A backwards per-stream tail means the owner restarted in a new generation
-/// or lost data. The cadence must not wrap; the caller keeps the previous
-/// counter and reports this error. The counter is advisory, so the message is
-/// the observable contract, not a retry.
-pub(crate) fn owner_counter_backwards(partition: u32, flushed_at: u64, sum: u64) -> LocalDbError {
-    LocalDbError::with_kind(
-        std::io::ErrorKind::InvalidData,
-        format!(
-            "owner byte counter went backwards: stream {partition}, \
-             flushed_at {flushed_at}, sum {sum}"
-        ),
-    )
 }
 
 #[cfg(test)]

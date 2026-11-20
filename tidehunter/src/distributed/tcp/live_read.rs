@@ -500,7 +500,7 @@ fn member_range(grant: &Grant, position: &VersionPosition) -> Result<(u64, usize
     let bytes = grant.scope.file_bytes();
     let offset = position.address.offset % bytes;
     let len = position.address.len as usize;
-    if len < CrcFrame::CRC_HEADER_LENGTH as usize
+    if len < CrcFrame::CRC_HEADER_LENGTH
         || !grant.scope.covers(position)
         || offset.checked_add(len as u64).is_none_or(|end| end > bytes)
     {
@@ -767,6 +767,47 @@ impl LiveReadCache {
             drop(grant);
             if let Some(token) = token {
                 self.unreleased.push(token);
+            }
+        }
+        self.release_pending(client, epoch)
+    }
+
+    /// Retire idle grants covering the requested files. In-flight grants keep
+    /// their pins and the owner can defer the retirement with `Busy`.
+    pub(crate) fn evict_retirement_files(
+        &mut self,
+        client: &mut Client,
+        epoch: u64,
+        generation: u64,
+        files: &[u64],
+    ) -> Result<(), TcpError> {
+        let mut index = 0;
+        while index < self.grants.len() {
+            let grant = &self.grants[index];
+            let matches = match &grant.scope {
+                GrantScope::File(location) => {
+                    location.segment.generation == generation
+                        && files.iter().any(|&start| {
+                            start / location.segment.bytes == location.segment.file_index
+                        })
+                }
+                GrantScope::Subsystem {
+                    generation: source,
+                    subsystem,
+                    files_per_subsystem,
+                    file_bytes,
+                    ..
+                } => {
+                    *source == generation
+                        && files
+                            .iter()
+                            .any(|&start| start / file_bytes / files_per_subsystem == *subsystem)
+                }
+            };
+            if matches && grant.outstanding() == 0 {
+                self.retire(client, epoch, index)?;
+            } else {
+                index += 1;
             }
         }
         self.release_pending(client, epoch)

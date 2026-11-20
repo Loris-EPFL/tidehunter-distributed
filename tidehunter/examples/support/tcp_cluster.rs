@@ -213,7 +213,6 @@ pub fn prepare_external_case(
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
         durable_cut: Default::default(),
-        relocation_max_reclaim_pct: 100,
         index: Default::default(),
     };
     fs::write(

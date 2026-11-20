@@ -139,7 +139,6 @@ impl Fixture {
             write_profile_limit: 0,
             live_nvme: live_config(tier),
             durable_cut: Default::default(),
-            relocation_max_reclaim_pct: 100,
             index: Default::default(),
         };
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")

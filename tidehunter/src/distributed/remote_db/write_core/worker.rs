@@ -23,10 +23,7 @@ fn record_lease_reservations(
     accounting: &WorkerAccounting,
 ) {
     client.take_lease_reservations(|version, address| {
-        let end = address
-            .offset
-            .checked_add(u64::from(address.len))
-            .unwrap_or(u64::MAX);
+        let end = address.offset.saturating_add(u64::from(address.len));
         queue.reserve(version, address.offset, end);
     });
     accounting.record_allocation_cap_hits(queue.cap_hits());

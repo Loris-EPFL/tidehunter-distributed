@@ -335,8 +335,8 @@ fn coordinator_eligible(core: &WriteCore, record: Option<&CutRecord>, generation
     let mut publisher = core.publisher.lock();
     let state = publisher.checkpoint_state();
     generation_unused(
-        &state.positions,
-        &state.callback_starts,
+        state.positions,
+        state.callback_starts,
         &fronts,
         generation,
         &partitions,

@@ -83,6 +83,8 @@ fn recovery_json(stats: &RecoveryStats) -> Value {
         "tail_batches": stats.tail_batches,
         "tail_bytes": stats.tail_bytes,
         "tail_replay_ns": stats.tail_replay_ns,
+        "old_generation_replayed_from_zero": stats.old_generation_replayed_from_zero,
+        "stale_region_rows_skipped": stats.stale_region_rows_skipped,
         "connection_setup_ns": stats.connection_setup_ns,
         "fencing_ns": stats.fencing_ns,
         "tls_config_ns": stats.tls_config_ns,

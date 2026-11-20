@@ -44,6 +44,9 @@ pub struct LocalDbError {
     message: String,
     kind: io::ErrorKind,
     pub uncertain_version: Option<BatchVersion>,
+    /// Set only by [`LocalDbError::copies_not_durable`]: a typed marker, so a
+    /// caller never classifies the deferral by its kind or message prefix.
+    copies_not_durable: bool,
 }
 
 impl LocalDbError {
@@ -56,6 +59,7 @@ impl LocalDbError {
             message: message.into(),
             kind,
             uncertain_version: None,
+            copies_not_durable: false,
         }
     }
     pub(crate) fn kind(&self) -> io::ErrorKind {
@@ -86,6 +90,7 @@ impl LocalDbError {
     }
 
     /// True for [`Self::evicted_during_read`].
+    #[cfg(test)]
     pub(crate) fn is_evicted_during_read(&self) -> bool {
         self.message.starts_with("value evicted during read:")
     }
@@ -94,22 +99,26 @@ impl LocalDbError {
     /// copies in time, so the pass applied nothing. Not a failure of the
     /// database: the copies stay unreferenced and the next pass retries.
     pub(crate) fn copies_not_durable(next: u64, cause: impl fmt::Display) -> Self {
-        Self::with_kind(
-            io::ErrorKind::TimedOut,
-            format!("relocation copies not durable through sequence {next}: {cause}"),
-        )
+        Self {
+            copies_not_durable: true,
+            ..Self::with_kind(
+                io::ErrorKind::TimedOut,
+                format!("relocation copies not durable through sequence {next}: {cause}"),
+            )
+        }
     }
 
     /// True for [`Self::copies_not_durable`].
     pub(crate) fn is_copies_not_durable(&self) -> bool {
-        self.kind == io::ErrorKind::TimedOut
-            && self.message.starts_with("relocation copies not durable")
+        self.copies_not_durable
     }
+
     pub(crate) fn unknown(version: BatchVersion, error: impl fmt::Display) -> Self {
         Self {
             message: format!("outcome requires recovery for {version:?}: {error}"),
             kind: io::ErrorKind::Other,
             uncertain_version: Some(version),
+            copies_not_durable: false,
         }
     }
 }
