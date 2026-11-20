@@ -23,10 +23,6 @@ pub(crate) enum RetirementResult {
 }
 
 impl Client {
-    pub(crate) fn position_deadline(&self) -> Instant {
-        Instant::now() + self.timeout
-    }
-
     pub fn checkpoint_position(
         &mut self,
         authority_epoch: u64,
@@ -39,32 +35,6 @@ impl Client {
             through,
         })?;
         self.validate_checkpoint_position_response(response, epoch, through)
-    }
-
-    pub(crate) fn submit_checkpoint_position(
-        &mut self,
-        authority_epoch: u64,
-        epoch: u64,
-        through: u64,
-        deadline: Instant,
-    ) -> Result<bool, TcpError> {
-        self.submit_position(
-            &Request::CheckpointPosition {
-                authority_epoch,
-                epoch,
-                through,
-            },
-            deadline,
-        )
-    }
-
-    pub(crate) fn take_checkpoint_position(
-        &mut self,
-        epoch: u64,
-        through: u64,
-    ) -> Option<Result<CheckpointPositionProof, TcpError>> {
-        self.take_position()
-            .map(|response| self.validate_checkpoint_position_response(response?, epoch, through))
     }
 
     fn validate_checkpoint_position_response(

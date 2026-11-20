@@ -207,25 +207,6 @@ fn live_group_limit_and_stale_generation_are_explicit() {
 }
 
 #[test]
-fn checkpoint_events_are_bounded_and_keep_generation() {
-    let timeline = WriteTimeline::default();
-    timeline.checkpoint_generation("disabled", None, 1, None, Some(9));
-    timeline.arm(1, 1).unwrap();
-    for _ in 0..65 {
-        timeline.checkpoint_generation("capture_start", None, 1, None, Some(9));
-    }
-    let export = timeline.finish().unwrap();
-    assert_eq!(export.checkpoint_events.len(), 64);
-    assert_eq!(export.dropped_checkpoint_events, 1);
-    assert!(
-        export
-            .checkpoint_events
-            .iter()
-            .all(|event| event.generation == Some(9))
-    );
-}
-
-#[test]
 fn control_events_are_bounded_and_keep_request_identity() {
     let timeline = WriteTimeline::default();
     let target = ControlTimelineTarget {

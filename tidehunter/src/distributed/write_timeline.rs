@@ -196,7 +196,12 @@ pub struct WriteTimelineExport {
     pub incomplete_calls: u64,
     pub deadline_exceeded: bool,
     pub owner_storage_durations_available: bool,
+    /// Always empty: S11f removed the position-proof path that was the only
+    /// producer. The field and `dropped_checkpoint_events` stay in the export
+    /// shape for the analyzer (`experiments/kv-comparison/analyze.py`), which
+    /// reads them with a default.
     pub checkpoint_events: Vec<CheckpointTimelineEvent>,
+    /// Always 0 for the same reason as [`Self::checkpoint_events`].
     pub dropped_checkpoint_events: u64,
     pub control_events: Vec<ControlTimelineEvent>,
     pub dropped_control_events: u64,
@@ -605,43 +610,6 @@ impl WriteTimeline {
         }
     }
 
-    pub fn checkpoint(
-        &self,
-        stage: &'static str,
-        owner: Option<u32>,
-        epoch: u64,
-        prefix: Option<usize>,
-    ) {
-        self.checkpoint_generation(stage, owner, epoch, prefix, None);
-    }
-
-    pub fn checkpoint_generation(
-        &self,
-        stage: &'static str,
-        owner: Option<u32>,
-        epoch: u64,
-        prefix: Option<usize>,
-        generation: Option<u64>,
-    ) {
-        if !self.enabled() {
-            return;
-        }
-        let mut guard = self.session.lock();
-        if let Some(s) = guard.as_mut() {
-            if s.export.checkpoint_events.len() >= s.export.limit.saturating_mul(64) {
-                s.export.dropped_checkpoint_events += 1;
-            } else {
-                s.export.checkpoint_events.push(CheckpointTimelineEvent {
-                    stage,
-                    owner,
-                    epoch,
-                    generation,
-                    prefix,
-                    elapsed_ns: s.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                });
-            }
-        }
-    }
     pub fn batch(&self, operation: [u8; 16], version: BatchVersion) {
         if !self.enabled.load(Ordering::Acquire) {
             return;

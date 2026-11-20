@@ -29,7 +29,6 @@ use super::storage::{
     encode_metadata, install_metadata, read_metadata,
 };
 use super::storage::{LocalDbError, LocalDbStats, LocalInventoryConfig};
-use super::tcp::checkpoint::CheckpointPositionProof;
 use super::tcp::{Client, OwnerGenerationState, TlsFiles};
 use super::types::{BatchId, BatchVersion, MutationVersion};
 use super::write_timeline::{WriteTimeline, WriteTimelineSample, WriteTimelineStage, WriteWait};
@@ -2269,7 +2268,6 @@ impl StreamControls {
 
 enum Command {
     QueueReady,
-    CheckpointPosition(u64, u64, u64, Reply<CheckpointPositionProof>),
     Stats(Reply<PartitionStats>),
     Seal(u64, Reply<()>),
     ArmProfile(usize, Reply<()>),
@@ -2647,8 +2645,6 @@ mod dead_wal_files_tests;
 mod leased_tests;
 #[cfg(test)]
 mod live_bench_tests;
-#[cfg(test)]
-mod position_tests;
 #[cfg(test)]
 mod relocation_tests;
 

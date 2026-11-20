@@ -141,11 +141,18 @@ fn correlated_position_proof_keeps_data_deadline_under_stall() {
     client.timeout = Duration::from_secs(5);
     client.fence_to(1).unwrap();
     let inventory = server.node.inventory.lock();
-    let deadline = client.position_deadline();
+    let deadline = Instant::now() + client.timeout;
     assert!(deadline <= Instant::now() + Duration::from_secs(5));
     assert!(
         client
-            .submit_checkpoint_position(1, 1, 0, deadline)
+            .submit_position(
+                &Request::CheckpointPosition {
+                    authority_epoch: 1,
+                    epoch: 1,
+                    through: 0,
+                },
+                deadline,
+            )
             .unwrap()
     );
     client

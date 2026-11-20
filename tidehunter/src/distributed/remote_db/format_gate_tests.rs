@@ -32,6 +32,7 @@ fn install(bytes: &[u8]) -> (tempdir::TempDir, PathBuf) {
 fn pre_generation_manifest_format_4_is_rejected_unchanged() {
     let (_temp, path) = install(MANIFEST_4);
     let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+    assert!(!error.is_exact_era_manifest());
     assert_eq!(
         error.to_string(),
         format!(
@@ -70,6 +71,7 @@ fn exact_era_format_9_manifest_with_a_checkpoint_is_refused_by_name_and_unchange
         "the fixture must carry a committed checkpoint"
     );
     let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+    assert!(error.is_exact_era_manifest());
     let message = error.to_string();
     assert!(
         message.starts_with("unsupported legacy distributed mode exact_index"),
@@ -87,9 +89,9 @@ fn exact_era_formats_6_7_and_8_are_refused_by_name_and_unchanged() {
     for format in 6..=8u32 {
         let bytes = with_format(format);
         let (_temp, path) = install(&bytes);
-        let message = fencing_generations::read_authority_manifest(&path)
-            .unwrap_err()
-            .to_string();
+        let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+        assert!(error.is_exact_era_manifest());
+        let message = error.to_string();
         assert!(
             message.starts_with("unsupported legacy distributed mode exact_index"),
             "{message}"
@@ -106,9 +108,9 @@ fn exact_era_formats_6_7_and_8_are_refused_by_name_and_unchanged() {
 fn format_5_is_per_cell_and_formats_below_5_and_above_10_stay_generic() {
     let bytes = with_format(5);
     let (_temp, path) = install(&bytes);
-    let message = fencing_generations::read_authority_manifest(&path)
-        .unwrap_err()
-        .to_string();
+    let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+    assert!(!error.is_exact_era_manifest(), "format 5 is per_cell");
+    let message = error.to_string();
     assert!(
         message.starts_with("unsupported legacy distributed mode per_cell"),
         "{message}"
@@ -117,9 +119,9 @@ fn format_5_is_per_cell_and_formats_below_5_and_above_10_stay_generic() {
     for format in [3u32, 11, 12] {
         let bytes = with_format(format);
         let (_temp, path) = install(&bytes);
-        let message = fencing_generations::read_authority_manifest(&path)
-            .unwrap_err()
-            .to_string();
+        let error = fencing_generations::read_authority_manifest(&path).unwrap_err();
+        assert!(!error.is_exact_era_manifest());
+        let message = error.to_string();
         assert_eq!(
             message,
             format!(
@@ -149,7 +151,9 @@ fn exact_era_manifest_with_a_committed_checkpoint_is_refused_and_format_10_reope
     assert_eq!(current["format"].as_u64(), Some(10));
     fs::write(root.join(MANIFEST), MANIFEST_9).unwrap();
     let before = fs::read(root.join(MANIFEST)).unwrap();
-    let message = reopen_result(&fixture).err().unwrap().to_string();
+    let error = reopen_result(&fixture).err().unwrap();
+    assert!(error.is_exact_era_manifest());
+    let message = error.to_string();
     assert!(
         message.starts_with("unsupported legacy distributed mode exact_index"),
         "{message}"
@@ -161,7 +165,9 @@ fn exact_era_manifest_with_a_committed_checkpoint_is_refused_and_format_10_reope
         .unwrap()
         .insert("format".into(), 11u32.into());
     install_metadata(&root, MANIFEST, &encode_metadata(&newer).unwrap()).unwrap();
-    let message = reopen_result(&fixture).err().unwrap().to_string();
+    let error = reopen_result(&fixture).err().unwrap();
+    assert!(!error.is_exact_era_manifest());
+    let message = error.to_string();
     assert!(
         message.starts_with("unsupported distributed authority manifest format 11"),
         "{message}"

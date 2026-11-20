@@ -47,6 +47,9 @@ pub struct LocalDbError {
     /// Set only by [`LocalDbError::copies_not_durable`]: a typed marker, so a
     /// caller never classifies the deferral by its kind or message prefix.
     copies_not_durable: bool,
+    /// Set only by [`LocalDbError::exact_era_manifest`]: a typed marker, so a
+    /// caller never classifies the refused manifest by its message prefix.
+    exact_era_manifest: bool,
 }
 
 impl LocalDbError {
@@ -60,6 +63,7 @@ impl LocalDbError {
             kind,
             uncertain_version: None,
             copies_not_durable: false,
+            exact_era_manifest: false,
         }
     }
     pub(crate) fn kind(&self) -> io::ErrorKind {
@@ -119,7 +123,23 @@ impl LocalDbError {
             kind: io::ErrorKind::Other,
             uncertain_version: Some(version),
             copies_not_durable: false,
+            exact_era_manifest: false,
         }
+    }
+
+    /// Mark a legacy-mode refusal as the Exact-index era (`archive/multi-design`).
+    /// The caller builds the message, so the refusal sentence keeps one source
+    /// (`legacy_mode_error`).
+    pub(crate) fn mark_exact_era_manifest(self) -> Self {
+        Self {
+            exact_era_manifest: true,
+            ..self
+        }
+    }
+
+    /// True for [`Self::exact_era_manifest`].
+    pub(crate) fn is_exact_era_manifest(&self) -> bool {
+        self.exact_era_manifest
     }
 }
 

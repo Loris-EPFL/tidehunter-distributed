@@ -40,7 +40,46 @@ fn error(e: impl std::fmt::Display) -> DbError {
 }
 /// Keep the typed class (busy, missing, invalid) of a remote open failure.
 fn remote_error(e: super::storage::LocalDbError) -> DbError {
-    DbError::Io(std::io::Error::new(e.kind(), e.to_string()))
+    // A manifest of the archived Exact-index engine is caller input that this
+    // engine refuses; the database stays on `archive/multi-design`.
+    let kind = if e.is_exact_era_manifest() {
+        std::io::ErrorKind::InvalidInput
+    } else {
+        e.kind()
+    };
+    DbError::Io(std::io::Error::new(kind, e.to_string()))
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::remote_error;
+    use crate::distributed::storage::LocalDbError;
+
+    /// The Exact-era marker reaches the adapter as caller input, not as an
+    /// undifferentiated I/O failure, and the mapping is specific: an error
+    /// without the marker keeps its own kind. This covers the adapter half
+    /// only; format_gate_tests covers the engine open that produces it.
+    #[test]
+    fn exact_era_manifest_maps_to_invalid_input_and_others_keep_their_kind() {
+        let marked = remote_error(
+            LocalDbError::new("unsupported legacy distributed mode exact_index")
+                .mark_exact_era_manifest(),
+        );
+        match marked {
+            super::DbError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput)
+            }
+            other => panic!("expected an IO error, got {other:?}"),
+        }
+        let unmarked = remote_error(LocalDbError::with_kind(
+            std::io::ErrorKind::TimedOut,
+            "busy",
+        ));
+        match unmarked {
+            super::DbError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected an IO error, got {other:?}"),
+        }
+    }
 }
 
 /// Cumulative completed spans, including failed calls and unwinding. Nanoseconds

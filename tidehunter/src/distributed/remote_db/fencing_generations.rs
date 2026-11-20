@@ -86,7 +86,8 @@ pub(super) fn read_authority_manifest(path: &Path) -> Result<AuthorityManifest, 
             return Err(legacy_mode_error(&format!(
                 "exact_index (authority manifest format {})",
                 probe.format
-            )));
+            ))
+            .mark_exact_era_manifest());
         }
         return Err(LocalDbError::new(format!(
             "unsupported distributed authority manifest format {} (expected {AUTHORITY_FORMAT})",

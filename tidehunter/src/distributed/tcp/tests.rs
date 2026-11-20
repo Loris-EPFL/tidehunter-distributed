@@ -8,6 +8,8 @@ use std::process::Command;
 
 #[path = "reactor_tests.rs"]
 pub(in crate::distributed::tcp) mod multiplexed;
+#[path = "position_tests.rs"]
+mod position_tests;
 #[path = "wal_replay_tests.rs"]
 mod wal_replay;
 

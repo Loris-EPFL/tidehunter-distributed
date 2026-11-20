@@ -48,7 +48,7 @@ tidehunter/src/distributed/storage.rs 0 1
 tidehunter/src/distributed/sui.rs 1 1
 tidehunter/src/distributed/tcp/control.rs 0 1
 tidehunter/src/distributed/tcp/inventory.rs 1 8
-tidehunter/src/distributed/tcp/live_client.rs 3 60
+tidehunter/src/distributed/tcp/live_client.rs 3 59
 tidehunter/src/distributed/tcp/live_read.rs 1 29
 tidehunter/src/distributed/tcp/live_recovery.rs 1 1
 tidehunter/src/distributed/tcp/probe.rs 0 1

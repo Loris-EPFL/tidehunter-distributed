@@ -84,7 +84,14 @@ fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(
             client
-                .submit_checkpoint_position(1, 1, through, deadline)
+                .submit_position(
+                    &Request::CheckpointPosition {
+                        authority_epoch: 1,
+                        epoch: 1,
+                        through,
+                    },
+                    deadline,
+                )
                 .unwrap()
         );
         loop {
@@ -138,8 +145,15 @@ fn session_and_node_use_the_same_stream_class_for_every_wal_request() {
         assert!(proof_pending);
         loop {
             client.progress_session().unwrap();
-            if let Some(proof) = client.take_checkpoint_position(1, through) {
-                proof.unwrap();
+            if let Some(proof) = client.take_position() {
+                let proof = proof.unwrap();
+                assert!(
+                    matches!(
+                        proof,
+                        Response::CheckpointPosition { durable_end, .. } if durable_end >= through
+                    ),
+                    "the position reply must cover the requested cut"
+                );
                 break;
             }
             assert!(Instant::now() < deadline);
@@ -186,7 +200,14 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
         drop(log); // Fence must not see a test-owned outstanding storage handle.
         let deadline = Instant::now() + Duration::from_secs(5);
         client
-            .submit_checkpoint_position(authority, 1, through, deadline)
+            .submit_position(
+                &Request::CheckpointPosition {
+                    authority_epoch: authority,
+                    epoch: 1,
+                    through,
+                },
+                deadline,
+            )
             .unwrap();
         loop {
             client.progress_session().unwrap();
@@ -248,8 +269,15 @@ fn seal_fence_and_retirement_wait_for_active_position_proofs() {
         while !proof_done || !control_done {
             client.progress_session().unwrap();
             other.progress_session().unwrap();
-            if !proof_done && let Some(proof) = client.take_checkpoint_position(1, through) {
-                proof.unwrap();
+            if !proof_done && let Some(proof) = client.take_position() {
+                let proof = proof.unwrap();
+                assert!(
+                    matches!(
+                        proof,
+                        Response::CheckpointPosition { durable_end, .. } if durable_end >= through
+                    ),
+                    "the position reply must cover the requested cut"
+                );
                 proof_done = true;
             }
             let control = if scenario < 3 {
@@ -283,7 +311,14 @@ fn position_and_control_admission_keep_the_existing_session_bound() {
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(
             !client
-                .submit_checkpoint_position(1, 1, 0, deadline)
+                .submit_position(
+                    &Request::CheckpointPosition {
+                        authority_epoch: 1,
+                        epoch: 1,
+                        through: 0,
+                    },
+                    deadline,
+                )
                 .unwrap()
         );
         assert!(!client.submit_control(&Request::Stats, deadline).unwrap());

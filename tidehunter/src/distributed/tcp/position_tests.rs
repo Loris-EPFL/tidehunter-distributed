@@ -1,10 +1,9 @@
 //! Position proofs share the wire session, not lease progress or its file barrier.
-use super::leased_tests::worker;
 use super::*;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::storage::LivePausePoint;
 use crate::distributed::tcp::leased_tests::Fixture;
-use std::sync::atomic::Ordering;
+use crate::distributed::write_timeline::WriteTimeline;
 
 fn ready(fixture: &Fixture) -> (Client, DurableBatch) {
     let mut client = fixture.writer();
@@ -22,33 +21,57 @@ fn through(receipt: DurableBatch) -> u64 {
     address.offset + u64::from(address.len)
 }
 
+fn submit(
+    client: &mut Client,
+    authority_epoch: u64,
+    epoch: u64,
+    through: u64,
+    deadline: Instant,
+) -> Result<bool, TcpError> {
+    client.submit_position(
+        &Request::CheckpointPosition {
+            authority_epoch,
+            epoch,
+            through,
+        },
+        deadline,
+    )
+}
+
 #[test]
 fn paused_position_allows_adoption_prelease_and_two_extent_switches() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         let fixture = Fixture::new(tier, 16384);
-        let (client, first) = ready(&fixture);
+        let (mut client, first) = ready(&fixture);
         let log = fixture.node.log_for_test(1);
         let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
-        let (worker, failure) = worker(&fixture, client);
-        let (reply, proof) = mpsc::sync_channel(1);
-        worker
-            .send(Command::CheckpointPosition(1, 1, through(first), reply))
-            .unwrap();
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(submit(&mut client, 1, 1, through(first), deadline).unwrap());
+        loop {
+            client.progress_session().unwrap();
+            if entered.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         let overlapping = (|| -> Result<Vec<DurableBatch>, String> {
             let mut receipts = vec![first];
             for n in 1..=10 {
-                let pending = worker
-                    .enqueue(1, vec![fixture.batch(n)])
-                    .map_err(|e| e.to_string())?;
-                let result = pending
-                    .recv_timeout(Duration::from_secs(5))
-                    .map_err(|e| e.to_string())?;
-                receipts.push(result.map_err(|e| e.to_string())?[0]);
+                receipts.extend(
+                    client
+                        .submit_and_drain_leased_group(
+                            1,
+                            vec![fixture.batch(n)],
+                            &WriteTimeline::default(),
+                            2,
+                        )
+                        .map_err(|error| error.to_string())?,
+                );
             }
             Ok(receipts)
         })();
-        let pending = matches!(proof.try_recv(), Err(mpsc::TryRecvError::Empty));
+        let pending = client.checkpoint_position_pending();
         let counts = fixture.metrics.snapshot().counts;
         release.send(()).unwrap();
         let receipts = overlapping.expect("position data sync must not own lease progress");
@@ -56,15 +79,19 @@ fn paused_position_allows_adoption_prelease_and_two_extent_switches() {
         assert!(counts.extent_switch_samples >= 2);
         assert!(counts.extent_preleases >= 2);
         assert!(counts.adoption_async_samples > 1);
-        assert!(
-            proof
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .durable_end
-                >= through(first)
-        );
-        receive(worker.seal(1).unwrap()).unwrap();
+        let proof = loop {
+            client.progress_session().unwrap();
+            if let Some(proof) = client.take_position() {
+                break proof.unwrap();
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        };
+        let Response::CheckpointPosition { durable_end, .. } = proof else {
+            panic!("the position slot returns a CheckpointPosition reply");
+        };
+        assert!(durable_end >= through(first));
+        client.seal(1).unwrap();
         for (n, receipt) in receipts.into_iter().enumerate() {
             let batch = fixture.batch(n as u64);
             let reference = batch
@@ -72,8 +99,6 @@ fn paused_position_allows_adoption_prelease_and_two_extent_switches() {
                 .unwrap();
             assert_eq!(log.read_record(&reference).unwrap(), batch.mutations()[0]);
         }
-        drop(worker);
-        assert!(!failure.load(Ordering::Acquire));
     }
 }
 
@@ -89,17 +114,8 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
             .unwrap()[0];
         let log = fixture.node.log_for_test(1);
         let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
-        assert!(
-            client
-                .submit_checkpoint_position(
-                    1,
-                    1,
-                    through(first),
-                    Instant::now() + Duration::from_secs(5)
-                )
-                .unwrap()
-        );
         let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(submit(&mut client, 1, 1, through(first), deadline).unwrap());
         loop {
             client.progress_session().unwrap();
             if entered.try_recv().is_ok() {
@@ -109,30 +125,29 @@ fn independent_position_slots_merge_roots_in_reverse_completion_order() {
             thread::yield_now();
         }
         // Capacity is exactly one position, independently of the ordinary control.
-        assert!(
-            !client
-                .submit_checkpoint_position(1, 1, through(second), deadline)
-                .unwrap()
-        );
+        assert!(!submit(&mut client, 1, 1, through(second), deadline).unwrap());
         let newer = other.checkpoint_position(1, 1, through(second));
         release.send(()).unwrap();
         let newer = newer.unwrap();
         let older = loop {
             client.progress_session().unwrap();
-            if let Some(result) = client.take_checkpoint_position(1, through(first)) {
-                break result.unwrap();
+            if let Some(proof) = client.take_position() {
+                break proof.unwrap();
             }
             assert!(Instant::now() < deadline);
             thread::yield_now();
         };
-        assert_eq!(older.durable_end, newer.durable_end);
-        assert!(older.durable_end >= through(second));
+        let Response::CheckpointPosition { durable_end, .. } = older else {
+            panic!("the position slot returns a CheckpointPosition reply");
+        };
+        assert_eq!(durable_end, newer.durable_end);
+        assert!(durable_end >= through(second));
         client.close_leased_extent(&mut Vec::new(), None).unwrap();
     }
 }
 
 #[test]
-fn position_deadline_poison_clears_both_slots() {
+fn position_deadline_poison_clears_the_slot() {
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         let fixture = Fixture::new(tier, 128 * 1024);
         let (mut client, first) = ready(&fixture);
@@ -142,11 +157,7 @@ fn position_deadline_poison_clears_both_slots() {
         let log = fixture.node.log_for_test(1);
         let (entered, release) = log.pause_live(LivePausePoint::PositionBeforeData);
         let deadline = Instant::now() + Duration::from_secs(5);
-        assert!(
-            client
-                .submit_checkpoint_position(1, 1, through(first), deadline)
-                .unwrap()
-        );
+        assert!(submit(&mut client, 1, 1, through(first), deadline).unwrap());
         loop {
             client.progress_session().unwrap();
             if entered.try_recv().is_ok() {
@@ -162,66 +173,14 @@ fn position_deadline_poison_clears_both_slots() {
         release.send(()).unwrap();
         assert!(matches!(failed, Err(error) if error.to_string().contains("deadline expired")));
         assert!(!client.checkpoint_control_pending());
-        assert!(client.take_checkpoint_position(1, through(first)).is_none());
+        assert!(client.take_position().is_none());
         assert!(
-            client
-                .submit_checkpoint_position(1, 1, through(first), deadline)
+            submit(&mut client, 1, 1, through(first), deadline)
                 .unwrap_err()
                 .to_string()
                 .contains("requires replacement")
         );
     }
-}
-
-#[test]
-fn shutdown_drains_an_inflight_position_and_lease_controls() {
-    let fixture = Fixture::new(DurabilityTier::Native, 16384);
-    let (client, first) = ready(&fixture);
-    let (entered, release) = fixture
-        .node
-        .log_for_test(1)
-        .pause_live(LivePausePoint::PositionBeforeData);
-    let (worker, failure) = worker(&fixture, client);
-    let (reply, proof) = mpsc::sync_channel(1);
-    worker
-        .send(Command::CheckpointPosition(1, 1, through(first), reply))
-        .unwrap();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (closed, done) = mpsc::sync_channel(1);
-    let shutdown = thread::spawn(move || {
-        drop(worker);
-        closed.send(()).unwrap();
-    });
-    let was_pending = matches!(
-        done.recv_timeout(Duration::from_millis(20)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    );
-    release.send(()).unwrap();
-    assert!(was_pending);
-    assert!(proof.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
-    done.recv_timeout(Duration::from_secs(5)).unwrap();
-    shutdown.join().unwrap();
-    assert!(!failure.load(Ordering::Acquire));
-}
-
-#[test]
-fn failed_position_proof_poison_is_published_before_more_commands() {
-    let fixture = Fixture::new(DurabilityTier::Native, 16384);
-    let (client, _) = ready(&fixture);
-    let (worker, failure) = worker(&fixture, client);
-    let (reply, proof) = mpsc::sync_channel(1);
-    worker
-        .send(Command::CheckpointPosition(1, 1, u64::MAX, reply))
-        .unwrap();
-    assert!(proof.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !failure.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    let _ = worker.stats();
-    drop(worker);
-    assert!(failure.load(Ordering::Acquire));
 }
 
 #[test]
@@ -241,9 +200,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     let receipt_before = log.synced_frontier();
     let (entered, release) = log.pause_live(LivePausePoint::PositionRootLocked);
     let deadline = Instant::now() + Duration::from_secs(5);
-    client
-        .submit_checkpoint_position(1, 1, through(first), deadline)
-        .unwrap();
+    submit(&mut client, 1, 1, through(first), deadline).unwrap();
     loop {
         client.progress_session().unwrap();
         if entered.try_recv().is_ok() {
@@ -265,7 +222,7 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     };
     let root_during = log.position_root_for_test();
     let receipt_during = log.synced_frontier();
-    let proof_pending = client.take_checkpoint_position(1, through(first)).is_none();
+    let proof_pending = client.take_position().is_none();
     let pending = client.leased_adoption_pending();
     // Release the hook before asserting, including on a broken fast path.
     release.send(()).unwrap();
@@ -281,8 +238,11 @@ fn prepared_prelease_completes_during_serialized_root_install() {
     assert!(client.leased_test_ahead_state().1);
     loop {
         client.progress_session().unwrap();
-        if let Some(proof) = client.take_checkpoint_position(1, through(first)) {
-            assert_eq!(proof.unwrap().durable_end, through(first));
+        if let Some(proof) = client.take_position() {
+            let Response::CheckpointPosition { durable_end, .. } = proof.unwrap() else {
+                panic!("the position slot returns a CheckpointPosition reply");
+            };
+            assert_eq!(durable_end, through(first));
             break;
         }
         assert!(Instant::now() < deadline);

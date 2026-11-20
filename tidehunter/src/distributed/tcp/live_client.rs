@@ -432,43 +432,6 @@ fn record_write_io(
 }
 
 impl super::Client {
-    /// Direct writes can proceed without the lease control slot while runway fits.
-    /// Use the next frame's exact aligned size, or the maximum when not known.
-    pub(crate) fn leased_append_needs_control(&self, frame_len: Option<usize>) -> bool {
-        let Some(current) = &self.live_leased.current else {
-            return true;
-        };
-        if current.prefixes.len() >= 1024 {
-            return true;
-        }
-        let frame = frame_len.unwrap_or_else(|| {
-            self.expected
-                .group_limits
-                .max_encoded_bytes
-                .saturating_add(8 + 4095)
-                & !4095
-        });
-        frame as u64 > current.lease.extent.end - current.cursor
-            && (!self.lease_ahead()
-                || self.live_leased.closing.is_some()
-                || self.live_leased.next.is_none())
-    }
-
-    /// Request the largest lease runway before submitting an independent proof.
-    /// The fixed, CQE-complete cut does not depend on adoption or a future grant.
-    pub(crate) fn prepare_leased_position(&mut self) -> Result<(), super::TcpError> {
-        self.ensure_leased_healthy()?;
-        if self.lease_ahead()
-            && self.live_leased.current.is_some()
-            && (self.live_leased.closing.is_some() || self.live_leased.next.is_none())
-        {
-            self.submit_leased_adoption()?;
-        }
-        Ok(())
-    }
-}
-
-impl super::Client {
     pub(crate) fn set_live_pool(
         &mut self,
         pool: std::sync::Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>,
@@ -4999,58 +4962,6 @@ pub(crate) mod leased_tests {
                     .unwrap();
                 assert_eq!(owner_read(&fixture, &reference), batch.mutations());
             }
-        }
-    }
-
-    #[test]
-    fn leased_window_checkpoint_position_does_not_cover_a_completion_hole() {
-        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-            let fixture = Fixture::new(tier, 32768);
-            let mut client = fixture.writer_without_ahead();
-            let timeline = WriteTimeline::default();
-            client.leased_test_hold_completions(&[1]);
-            for sequence in 0..2 {
-                assert!(matches!(
-                    client
-                        .submit_leased_group(1, vec![fixture.batch(sequence)], &timeline, 2, true)
-                        .unwrap(),
-                    LeasedSubmit::Submitted(_)
-                ));
-            }
-            let mut released = Vec::new();
-            progress_until(&mut client, &mut released, &timeline, |client| {
-                client.live_leased.flights[1].completed
-            });
-            assert!(released.is_empty());
-            client.prepare_leased_position().unwrap();
-            let written_end = client.live_leased.current.as_ref().unwrap().written_end;
-            assert_eq!(written_end, 0);
-            assert!(
-                client
-                    .submit_checkpoint_position(
-                        1,
-                        1,
-                        written_end,
-                        Instant::now() + Duration::from_secs(5)
-                    )
-                    .unwrap()
-            );
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let proof = loop {
-                assert!(Instant::now() < deadline);
-                client.progress_session().unwrap();
-                if let Some(proof) = client.take_checkpoint_position(1, written_end) {
-                    break proof.unwrap();
-                }
-                thread::yield_now();
-            };
-            assert!(proof.durable_end >= written_end);
-            assert_eq!(
-                client.live_leased.current.as_ref().unwrap().written_end,
-                written_end
-            );
-            client.leased_test_release_held();
-            client.drain_leased_flights(&mut released, None).unwrap();
         }
     }
 }

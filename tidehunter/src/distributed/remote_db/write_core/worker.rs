@@ -32,7 +32,7 @@ fn record_lease_reservations(
 impl ClientWorker {
     #[allow(
         clippy::expect_used,
-        reason = "parked checkpoints, positions and queued controls are owned by this loop alone"
+        reason = "the queued control front just matched is owned by this loop alone"
     )]
     #[allow(
         clippy::too_many_arguments,
@@ -100,19 +100,9 @@ impl ClientWorker {
                 // The configured limit arms the profile before the first frame;
                 // ArmProfile replaces that attempt.
                 let mut profile_attempted = false;
-                let mut checkpoint_samples = 0usize;
-                let mut checkpoint_stalls = 0u64;
-                let mut checkpoint_started: Option<Instant> = None;
-                let mut checkpoint_admission_deadline: Option<Instant> = None;
-                let mut checkpoint_append_completions = 0u64;
                 let mut queued = VecDeque::new();
                 let mut controls: VecDeque<OrderedCommand> =
                     VecDeque::with_capacity(queue_capacity);
-                // One fixed-cut position proof may wait outside the append FIFO.
-                // Later non-append commands never pass it. Earlier covered appends
-                // have already run; passing appends have later WAL positions.
-                let mut parked_checkpoint: Option<WorkerItem> = None;
-                let mut position: Option<(u64, u64, Reply<CheckpointPositionProof>)> = None;
                 let mut disconnected = false;
                 let mut leased_replies: VecDeque<(u64, LeasedMembers)> =
                     VecDeque::with_capacity(leased_write_window);
@@ -133,7 +123,6 @@ impl ClientWorker {
                             return false;
                         }
                         let result = match command {
-                            WorkerItem::Control(Command::CheckpointPosition(..)) => Ok(()),
                             WorkerItem::Control(Command::Seal(..))
                             | WorkerItem::Control(Command::Control(_)) => {
                                 client.close_leased_extent(released, Some(&write_timeline))
@@ -287,24 +276,7 @@ impl ClientWorker {
                                 client.progress_session()?;
                                 client.harvest_leased_adoption()?;
                             }
-                            if parked_checkpoint.is_none()
-                                && position.is_none()
-                                && matches!(
-                                    queued.front(),
-                                    Some(WorkerItem::Control(Command::CheckpointPosition(..)))
-                                )
-                            {
-                                parked_checkpoint = queued.pop_front();
-                            }
-                            if parked_checkpoint.is_some() {
-                                client.prepare_leased_position()?;
-                                // A fixed-through proof tolerates later appends:
-                                // position persistence validates its captured offset.
-                                queued.push_front(parked_checkpoint.take().expect("parked above"));
-                            }
-                            if parked_checkpoint.is_none()
-                                && matches!(queued.front(), Some(WorkerItem::Append(..)) | None)
-                            {
+                            if matches!(queued.front(), Some(WorkerItem::Append(..)) | None) {
                                 client.submit_leased_adoption()?;
                             }
                             Ok::<(), crate::distributed::tcp::TcpError>(())
@@ -326,16 +298,9 @@ impl ClientWorker {
                             failure.store(true, std::sync::atomic::Ordering::Release);
                             break;
                         }
-                        if position.is_none()
-                            && client.leased_adoption_pending()
+                        if client.leased_adoption_pending()
                             && client.leased_flights_in_flight() == 0
-                            && !matches!(
-                                queued.front(),
-                                Some(
-                                    WorkerItem::Append(..)
-                                        | WorkerItem::Control(Command::CheckpointPosition(..))
-                                )
-                            )
+                            && !matches!(queued.front(), Some(WorkerItem::Append(..)))
                         {
                             // The control slot progresses only on this thread. Do
                             // not park forever on the command channel or spin on
@@ -379,7 +344,6 @@ impl ClientWorker {
 
                     if !disconnected
                         && queued.is_empty()
-                        && parked_checkpoint.is_none()
                         && !client.has_pending_io()
                         && client.leased_flights_in_flight() == 0
                         && deferred.is_none()
@@ -422,9 +386,7 @@ impl ClientWorker {
                                     write_profile.lock().sampled_requests += 1;
                                 }
                                 leased_replies.push_back((id, members));
-                                if position.is_none() {
-                                    continue;
-                                }
+                                continue;
                             }
                             Ok(crate::distributed::tcp::LeasedSubmit::Deferred(batches)) => {
                                 deferred = Some((epoch, batches, members));
@@ -448,10 +410,6 @@ impl ClientWorker {
                         && (deferred.is_some()
                             || !matches!(queued.front(), Some(WorkerItem::Append(..)))
                             || client.leased_flights_in_flight() >= client.leased_write_window())
-                        && !matches!(
-                            queued.front(),
-                            Some(WorkerItem::Control(Command::CheckpointPosition(..)))
-                        )
                     {
                         if !worker_queue.park() && !queue_credit_blocked {
                             continue;
@@ -473,9 +431,7 @@ impl ClientWorker {
                             failure.store(true, std::sync::atomic::Ordering::Release);
                             break;
                         }
-                        if position.is_none() {
-                            continue;
-                        }
+                        continue;
                     }
                     // Merge ready same-epoch appends without crossing a control
                     // barrier. Leased frames use the configured completion window.
@@ -488,11 +444,7 @@ impl ClientWorker {
                         && let Some(WorkerItem::Append(batches, _)) = queued.front()
                     {
                         let epoch = batches[0].version().epoch;
-                        if write_profile_limit > 0
-                            && !profile_attempted
-                            && position.is_none()
-                            && parked_checkpoint.is_none()
-                        {
+                        if write_profile_limit > 0 && !profile_attempted {
                             profile_attempted = true;
                             if let Err(error) = settle_leased_for_control(
                                 &mut client,
@@ -582,16 +534,6 @@ impl ClientWorker {
                             }
                             match budget.extend(count, payload, batches) {
                                 Some((next_count, next_payload)) => {
-                                    let frame = (next_payload + 8 + 4095) & !4095;
-                                    // Harvest a pending prelease in the worker before
-                                    // a boundary write consumes it. This gives the
-                                    // parked proof its first free control turn.
-                                    if (position.is_some() || parked_checkpoint.is_some())
-                                        && client.leased_append_needs_control(Some(frame))
-                                        && client.leased_adoption_pending()
-                                    {
-                                        break;
-                                    }
                                     count = next_count;
                                     payload = next_payload;
                                     take += 1;
@@ -599,12 +541,7 @@ impl ClientWorker {
                                 // The first group is sent alone even if it exceeds the
                                 // budget, so the owner reports the real limit error.
                                 None if take == 0 => {
-                                    if (position.is_none() && parked_checkpoint.is_none())
-                                        || !client.leased_append_needs_control(None)
-                                        || !client.leased_adoption_pending()
-                                    {
-                                        take = 1;
-                                    }
+                                    take = 1;
                                     break;
                                 }
                                 None => {
@@ -680,200 +617,51 @@ impl ClientWorker {
                                     break;
                                 }
                             }
-                            if position.is_none() {
-                                continue;
-                            }
+                            continue;
                         }
                     }
 
                     let mut progressed = false;
-                    if parked_checkpoint.is_none()
-                        && position.is_none()
-                        && let Some(WorkerItem::Control(Command::CheckpointPosition(
-                            authority,
-                            epoch,
-                            through,
-                            _,
-                        ))) = queued.front()
+                    if client.has_pending_io()
+                        && let Err(error) = client.progress_session()
                     {
-                        if let Some(command) = queued.front()
-                            && !prepare_leased_command(
-                                &mut client,
-                                command,
-                                &mut released,
-                                &mut leased_replies,
-                            )
-                        {
-                            break;
-                        }
-                        let deadline = *checkpoint_admission_deadline
-                            .get_or_insert_with(|| client.position_deadline());
-                        match client
-                            .submit_checkpoint_position(*authority, *epoch, *through, deadline)
-                        {
-                            Ok(true) => {
-                                let Some(WorkerItem::Control(Command::CheckpointPosition(
-                                    _,
-                                    epoch,
-                                    through,
-                                    reply,
-                                ))) = queued.pop_front()
-                                else {
-                                    unreachable!()
-                                };
-                                write_timeline.checkpoint(
-                                    "control_submit",
-                                    Some(partition),
-                                    epoch,
-                                    None,
-                                );
-                                checkpoint_admission_deadline = None;
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_samples += 1;
-                                    checkpoint_started = Some(Instant::now());
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_requests += 1;
-                                    profile.checkpoint_admission_stalls = profile
-                                        .checkpoint_admission_stalls
-                                        .saturating_add(checkpoint_stalls);
+                        record_first_failure(
+                            &first_failure,
+                            Some(partition),
+                            None,
+                            "transport_progress",
+                            &error,
+                        );
+                        failure.store(true, std::sync::atomic::Ordering::Release);
+                        let message = error.to_string();
+                        for command in queued.drain(..) {
+                            match command {
+                                WorkerItem::Append(batches, reply) => {
+                                    let first = batches[0].version();
+                                    let _ = reply.send(Err(LocalDbError::unknown(first, &message)));
                                 }
-                                checkpoint_stalls = 0;
-                                position = Some((epoch, through, reply));
-                                progressed = true;
-                            }
-                            Ok(false) => {
-                                if checkpoint_samples < write_profile_limit {
-                                    checkpoint_stalls = checkpoint_stalls.saturating_add(1);
+                                WorkerItem::Control(Command::Stats(reply)) => {
+                                    let _ = reply.send(Err(LocalDbError::new(&message)));
                                 }
-                            }
-                            Err(error) => {
-                                let Some(WorkerItem::Control(Command::CheckpointPosition(
-                                    _,
-                                    _,
-                                    _,
-                                    reply,
-                                ))) = queued.pop_front()
-                                else {
-                                    unreachable!()
-                                };
-                                checkpoint_admission_deadline = None;
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "checkpoint_position_submit",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                let _ = reply.send(Err(LocalDbError::component(error)));
-                                progressed = true;
+                                WorkerItem::Control(Command::ArmProfile(_, reply))
+                                | WorkerItem::Control(Command::OwnerTimelineArm(_, reply))
+                                | WorkerItem::Control(Command::Seal(_, reply))
+                                | WorkerItem::Control(Command::FinishProfile(reply)) => {
+                                    let _ = reply.send(Err(LocalDbError::new(&message)));
+                                }
+                                WorkerItem::Control(Command::Control(_)) => {}
+                                WorkerItem::Control(Command::QueueReady) => {}
+                                // The ack sender is dropped: the snapshot
+                                // sees a disconnect and treats the drain as
+                                // unperformed instead of covering a failed
+                                // queue.
+                                WorkerItem::Control(Command::DrainTo(..)) => {}
                             }
                         }
+                        break;
                     }
-                    if client.has_pending_io() {
-                        match client.progress_session() {
-                            Ok(()) => {
-                                if let Some((epoch, through, _)) = position.as_ref()
-                                    && let Some(result) =
-                                        client.take_checkpoint_position(*epoch, *through)
-                                {
-                                    write_timeline.checkpoint(
-                                        "control_retire",
-                                        Some(partition),
-                                        *epoch,
-                                        None,
-                                    );
-                                    if let Some(started) = checkpoint_started.take() {
-                                        let mut profile = write_profile.lock();
-                                        profile.checkpoint_completed += 1;
-                                        profile.checkpoint_wait_ns = profile
-                                            .checkpoint_wait_ns
-                                            .saturating_add(elapsed(started));
-                                        profile.checkpoint_append_completions = profile
-                                            .checkpoint_append_completions
-                                            .saturating_add(checkpoint_append_completions);
-                                        checkpoint_append_completions = 0;
-                                    }
-                                    let (_, _, reply) = position.take().expect("position exists");
-                                    let result = result.map_err(LocalDbError::component);
-                                    if let Err(error) = &result {
-                                        record_first_failure(
-                                            &first_failure,
-                                            Some(partition),
-                                            None,
-                                            "checkpoint_position_completion",
-                                            error,
-                                        );
-                                        failure.store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                    let _ = reply.send(result);
-                                    progressed = true;
-                                }
-                            }
-                            Err(error) => {
-                                record_first_failure(
-                                    &first_failure,
-                                    Some(partition),
-                                    None,
-                                    "transport_progress",
-                                    &error,
-                                );
-                                failure.store(true, std::sync::atomic::Ordering::Release);
-                                if let Some(started) = checkpoint_started.take() {
-                                    let mut profile = write_profile.lock();
-                                    profile.checkpoint_completed += 1;
-                                    profile.checkpoint_wait_ns =
-                                        profile.checkpoint_wait_ns.saturating_add(elapsed(started));
-                                    profile.checkpoint_append_completions = profile
-                                        .checkpoint_append_completions
-                                        .saturating_add(checkpoint_append_completions);
-                                }
-                                if let Some((_, _, reply)) = position.take() {
-                                    let _ = reply.send(Err(LocalDbError::new(error.to_string())));
-                                }
-                                let message = error.to_string();
-                                for command in queued.drain(..) {
-                                    match command {
-                                        WorkerItem::Append(batches, reply) => {
-                                            let first = batches[0].version();
-                                            let _ = reply
-                                                .send(Err(LocalDbError::unknown(first, &message)));
-                                        }
-                                        WorkerItem::Control(Command::Stats(reply)) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        WorkerItem::Control(Command::CheckpointPosition(
-                                            _,
-                                            _,
-                                            _,
-                                            reply,
-                                        )) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        WorkerItem::Control(Command::ArmProfile(_, reply))
-                                        | WorkerItem::Control(Command::OwnerTimelineArm(
-                                            _,
-                                            reply,
-                                        ))
-                                        | WorkerItem::Control(Command::Seal(_, reply))
-                                        | WorkerItem::Control(Command::FinishProfile(reply)) => {
-                                            let _ = reply.send(Err(LocalDbError::new(&message)));
-                                        }
-                                        WorkerItem::Control(Command::Control(_)) => {}
-                                        WorkerItem::Control(Command::QueueReady) => {}
-                                        // The ack sender is dropped: the snapshot
-                                        // sees a disconnect and treats the drain as
-                                        // unperformed instead of covering a failed
-                                        // queue.
-                                        WorkerItem::Control(Command::DrainTo(..)) => {}
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    // Acquire observes checkpoint submission/completion failure in
-                    // this pass before profile control, queued commands or close.
+                    // Acquire observes an authority failure in this pass before
+                    // profile control, queued commands or close.
                     if client.live_nvme_configured()
                         && failure.load(std::sync::atomic::Ordering::Acquire)
                     {
@@ -881,11 +669,7 @@ impl ClientWorker {
                         break;
                     }
 
-                    if profile_enabled
-                        && profile_requests >= write_profile_limit
-                        && position.is_none()
-                        && parked_checkpoint.is_none()
-                    {
+                    if profile_enabled && profile_requests >= write_profile_limit {
                         // The capture is a control exchange: settle the sampled
                         // frames and their adoption first, as for FinishProfile.
                         if let Err(error) = settle_leased_for_control(
@@ -913,120 +697,102 @@ impl ClientWorker {
                         progressed = true;
                     }
 
-                    if position.is_none() && parked_checkpoint.is_none() {
-                        match queued.front() {
-                            Some(WorkerItem::Control(Command::Stats(_)))
-                            | Some(WorkerItem::Control(Command::OwnerTimelineArm(_, _)))
-                            | Some(WorkerItem::Control(Command::Seal(_, _)))
-                            | Some(WorkerItem::Control(Command::ArmProfile(_, _)))
-                            | Some(WorkerItem::Control(Command::FinishProfile(_)))
-                            | Some(WorkerItem::Control(Command::DrainTo(..)))
-                            | Some(WorkerItem::Control(Command::Control(_))) => {
-                                if let Some(command) = queued.front()
-                                    && !prepare_leased_command(
-                                        &mut client,
-                                        command,
-                                        &mut released,
-                                        &mut leased_replies,
-                                    )
-                                {
-                                    break;
-                                }
-                                match queued.pop_front().expect("front control exists") {
-                                    WorkerItem::Control(Command::Control(operation)) => {
-                                        operation(&mut client)
-                                    }
-                                    WorkerItem::Control(Command::DrainTo(target, ack)) => {
-                                        // Cold path, at most once per real snapshot
-                                        // store. Reserve everything the writer has
-                                        // allocated first, then treat the
-                                        // snapshot's stored cut as authoritative:
-                                        // every extent below it is covered by the
-                                        // region and must not be replayed.
-                                        record_lease_reservations(
-                                            &mut client,
-                                            &mut allocations,
-                                            &worker_accounting,
-                                        );
-                                        allocations.drain_to(target);
-                                        let _ = ack.send(Ok(()));
-                                    }
-                                    WorkerItem::Control(Command::Stats(reply)) => {
-                                        let _ = reply
-                                            .send(client.stats().map_err(LocalDbError::component));
-                                    }
-                                    WorkerItem::Control(Command::OwnerTimelineArm(
-                                        limit,
-                                        reply,
-                                    )) => {
-                                        let _ = reply.send(
-                                            client
-                                                .owner_timeline_arm(limit)
-                                                .map_err(LocalDbError::component),
-                                        );
-                                    }
-                                    WorkerItem::Control(Command::Seal(epoch, reply)) => {
-                                        let _ = reply.send(
-                                            client.seal(epoch).map_err(LocalDbError::component),
-                                        );
-                                    }
-                                    WorkerItem::Control(Command::ArmProfile(limit, reply)) => {
-                                        write_profile_limit = limit;
-                                        profile_requests = 0;
-                                        profile_attempted = limit != 0;
-                                        checkpoint_samples = 0;
-                                        checkpoint_stalls = 0;
-                                        let enabled = limit != 0;
-                                        let result = client
-                                            .connection_profile(enabled, true)
-                                            .map(|_| profile_enabled = enabled)
-                                            .map_err(LocalDbError::component);
-                                        if result.is_err() {
-                                            record_write_profile_error(&write_profile, true);
-                                            profile_enabled = false;
-                                        }
-                                        let _ = reply.send(result);
-                                    }
-                                    WorkerItem::Control(Command::FinishProfile(reply)) => {
-                                        checkpoint_samples = write_profile_limit;
-                                        let result = if profile_enabled {
-                                            match client.connection_profile(false, false) {
-                                                Ok(profile) => {
-                                                    capture_write_profile(&write_profile, profile);
-                                                    profile_enabled = false;
-                                                    Ok(())
-                                                }
-                                                Err(error) => {
-                                                    record_write_profile_error(
-                                                        &write_profile,
-                                                        false,
-                                                    );
-                                                    profile_enabled = false;
-                                                    Err(LocalDbError::component(error))
-                                                }
-                                            }
-                                        } else {
-                                            Ok(())
-                                        };
-                                        let _ = reply.send(result);
-                                    }
-                                    WorkerItem::Control(Command::QueueReady) => {}
-                                    WorkerItem::Append(..)
-                                    | WorkerItem::Control(Command::CheckpointPosition(..)) => {
-                                        unreachable!()
-                                    }
-                                }
-                                progressed = true;
+                    match queued.front() {
+                        Some(WorkerItem::Control(Command::Stats(_)))
+                        | Some(WorkerItem::Control(Command::OwnerTimelineArm(_, _)))
+                        | Some(WorkerItem::Control(Command::Seal(_, _)))
+                        | Some(WorkerItem::Control(Command::ArmProfile(_, _)))
+                        | Some(WorkerItem::Control(Command::FinishProfile(_)))
+                        | Some(WorkerItem::Control(Command::DrainTo(..)))
+                        | Some(WorkerItem::Control(Command::Control(_))) => {
+                            if let Some(command) = queued.front()
+                                && !prepare_leased_command(
+                                    &mut client,
+                                    command,
+                                    &mut released,
+                                    &mut leased_replies,
+                                )
+                            {
+                                break;
                             }
-                            _ => {}
+                            match queued.pop_front().expect("front control exists") {
+                                WorkerItem::Control(Command::Control(operation)) => {
+                                    operation(&mut client)
+                                }
+                                WorkerItem::Control(Command::DrainTo(target, ack)) => {
+                                    // Cold path, at most once per real snapshot
+                                    // store. Reserve everything the writer has
+                                    // allocated first, then treat the
+                                    // snapshot's stored cut as authoritative:
+                                    // every extent below it is covered by the
+                                    // region and must not be replayed.
+                                    record_lease_reservations(
+                                        &mut client,
+                                        &mut allocations,
+                                        &worker_accounting,
+                                    );
+                                    allocations.drain_to(target);
+                                    let _ = ack.send(Ok(()));
+                                }
+                                WorkerItem::Control(Command::Stats(reply)) => {
+                                    let _ =
+                                        reply.send(client.stats().map_err(LocalDbError::component));
+                                }
+                                WorkerItem::Control(Command::OwnerTimelineArm(limit, reply)) => {
+                                    let _ = reply.send(
+                                        client
+                                            .owner_timeline_arm(limit)
+                                            .map_err(LocalDbError::component),
+                                    );
+                                }
+                                WorkerItem::Control(Command::Seal(epoch, reply)) => {
+                                    let _ = reply
+                                        .send(client.seal(epoch).map_err(LocalDbError::component));
+                                }
+                                WorkerItem::Control(Command::ArmProfile(limit, reply)) => {
+                                    write_profile_limit = limit;
+                                    profile_requests = 0;
+                                    profile_attempted = limit != 0;
+                                    let enabled = limit != 0;
+                                    let result = client
+                                        .connection_profile(enabled, true)
+                                        .map(|_| profile_enabled = enabled)
+                                        .map_err(LocalDbError::component);
+                                    if result.is_err() {
+                                        record_write_profile_error(&write_profile, true);
+                                        profile_enabled = false;
+                                    }
+                                    let _ = reply.send(result);
+                                }
+                                WorkerItem::Control(Command::FinishProfile(reply)) => {
+                                    let result = if profile_enabled {
+                                        match client.connection_profile(false, false) {
+                                            Ok(profile) => {
+                                                capture_write_profile(&write_profile, profile);
+                                                profile_enabled = false;
+                                                Ok(())
+                                            }
+                                            Err(error) => {
+                                                record_write_profile_error(&write_profile, false);
+                                                profile_enabled = false;
+                                                Err(LocalDbError::component(error))
+                                            }
+                                        }
+                                    } else {
+                                        Ok(())
+                                    };
+                                    let _ = reply.send(result);
+                                }
+                                WorkerItem::Control(Command::QueueReady) => {}
+                                WorkerItem::Append(..) => {
+                                    unreachable!()
+                                }
+                            }
+                            progressed = true;
                         }
+                        _ => {}
                     }
-                    if disconnected
-                        && queued.is_empty()
-                        && controls.is_empty()
-                        && position.is_none()
-                        && parked_checkpoint.is_none()
-                    {
+                    if disconnected && queued.is_empty() && controls.is_empty() {
                         if client.live_nvme_configured()
                             && let Err(error) =
                                 client.close_leased_extent(&mut released, Some(&write_timeline))
@@ -1047,23 +813,6 @@ impl ClientWorker {
                     drop(client);
                     if !progressed {
                         thread::yield_now();
-                    }
-                }
-                if let Some((_, _, reply)) = position.take() {
-                    let message =
-                        failure_context(&first_failure, "TCP worker stopped during position proof");
-                    let _ = reply.send(Err(LocalDbError::new(message)));
-                }
-                if let Some(command) = parked_checkpoint.take() {
-                    let message = failure_context(
-                        &first_failure,
-                        "TCP worker stopped before proof submission",
-                    );
-                    match command {
-                        WorkerItem::Control(Command::CheckpointPosition(_, _, _, reply)) => {
-                            let _ = reply.send(Err(LocalDbError::new(message)));
-                        }
-                        _ => unreachable!("only fixed-cut proofs may be parked"),
                     }
                 }
                 {
