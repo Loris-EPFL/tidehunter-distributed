@@ -1,0 +1,947 @@
+use super::*;
+
+#[test]
+fn cpu_lists_parse_single_ranges_and_mixed_sets() {
+    assert_eq!(parse_cpu_list("7\n").unwrap(), vec![7]);
+    assert_eq!(parse_cpu_list("0-3").unwrap(), vec![0, 1, 2, 3]);
+    assert_eq!(
+        parse_cpu_list("0-3,8,10-11\n").unwrap(),
+        vec![0, 1, 2, 3, 8, 10, 11]
+    );
+    for invalid in ["", "\n", "3-1", "a", "0,", "1-2-3"] {
+        assert!(parse_cpu_list(invalid).is_err(), "{invalid:?}");
+    }
+    assert!(parse_cpu_list(&format!("0-{}", usize::MAX)).is_err());
+    assert!(parse_cpu_list(&sys::affinity_cpu_limit().to_string()).is_err());
+}
+
+#[test]
+fn queue_cpus_reads_sysfs_in_numeric_queue_order_and_names_errors() {
+    let temp = tempdir::TempDir::new("queue-cpus").unwrap();
+    let root = temp.path();
+    let mq = root.join("nvme0n1/mq");
+    for (queue, cpus) in [("10", "8"), ("2", "0-3,8"), ("0", "4-5")] {
+        let path = mq.join(queue);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("cpu_list"), cpus).unwrap();
+    }
+    assert_eq!(
+        queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap(),
+        vec![vec![4, 5], vec![0, 1, 2, 3, 8], vec![8]]
+    );
+    let path = mq.join("2/cpu_list");
+    std::fs::write(&path, "").unwrap();
+    let error = queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains(path.to_str().unwrap()));
+    std::fs::remove_file(&path).unwrap();
+    let error = queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(error.to_string().contains(path.to_str().unwrap()));
+}
+
+#[test]
+fn queue_cpus_follows_native_multipath_head_in_sorted_path_order() {
+    let temp = tempdir::TempDir::new("queue-cpus-multipath").unwrap();
+    let root = temp.path();
+    let paths = root.join("nvme0n1/multipath");
+    std::fs::create_dir_all(&paths).unwrap();
+    for (name, cpus) in [("nvme0c2n1", "8-9"), ("nvme0c1n1", "2-3")] {
+        let disk = root.join(name);
+        std::fs::create_dir_all(disk.join("mq/0")).unwrap();
+        std::fs::write(disk.join("mq/0/cpu_list"), cpus).unwrap();
+        std::os::unix::fs::symlink(&disk, paths.join(name)).unwrap();
+    }
+    assert_eq!(
+        queue_cpus_at(root, Path::new("/dev/nvme0n1")).unwrap(),
+        vec![vec![2, 3]]
+    );
+}
+
+#[test]
+fn live_queue_geometry_defaults_to_four_128_entry_queues() {
+    assert_eq!(
+        LiveQueueGeometry::default(),
+        LiveQueueGeometry {
+            io_queues: 4,
+            queue_size: 128,
+            poll_queues: 0
+        }
+    );
+}
+
+#[test]
+fn live_queue_geometry_validates_all_bounds() {
+    assert!(LiveQueueGeometry::default().validate().is_ok());
+    for io_queues in [1, 16] {
+        for queue_size in [16, 128] {
+            for poll_queues in [0, 4] {
+                assert!(
+                    LiveQueueGeometry {
+                        io_queues,
+                        queue_size,
+                        poll_queues
+                    }
+                    .validate()
+                    .is_ok()
+                );
+            }
+        }
+    }
+    for geometry in [
+        LiveQueueGeometry {
+            io_queues: 0,
+            ..Default::default()
+        },
+        LiveQueueGeometry {
+            io_queues: 17,
+            ..Default::default()
+        },
+        LiveQueueGeometry {
+            queue_size: 15,
+            ..Default::default()
+        },
+        LiveQueueGeometry {
+            queue_size: 129,
+            ..Default::default()
+        },
+        LiveQueueGeometry {
+            poll_queues: 5,
+            ..Default::default()
+        },
+    ] {
+        assert!(geometry.validate().is_err());
+    }
+    assert!(
+        serde_json::from_value::<LiveQueueGeometry>(serde_json::json!({
+            "io_queues": 1, "queue_size": 32, "poll_queues": 0, "unknown": 0
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn old_connect_target_defaults_geometry_and_pins_connect_options() {
+    let mut target: LiveConnectTarget = serde_json::from_value(serde_json::json!({
+        "nqn": "nqn.2026-01.test:wal", "uuid": vec![1; 16], "nsid": 1,
+        "bytes": 4096, "block_size": 4096, "address": "127.0.0.1",
+        "service": 4420, "transport": "tcp"
+    }))
+    .unwrap();
+    assert_eq!(target.geometry, LiveQueueGeometry::default());
+    let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,duplicate_connect,ctrl_loss_tmo=0,nr_io_queues=4,queue_size=128";
+    assert_eq!(
+        connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+        expected
+    );
+    target.geometry = LiveQueueGeometry {
+        io_queues: 1,
+        queue_size: 32,
+        poll_queues: 1,
+    };
+    assert_eq!(
+        connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+        expected.replace(
+            "nr_io_queues=4,queue_size=128",
+            "nr_io_queues=1,queue_size=32,nr_poll_queues=1"
+        )
+    );
+    let other = connect_options(&target, "nqn.2026-01.test:other-owner", [3; 16]);
+    assert!(other.contains(
+        "hostnqn=nqn.2026-01.test:other-owner,hostid=03030303-0303-0303-0303-030303030303"
+    ));
+    assert!(!other.contains("hostnqn=nqn.2026-01.test:host,"));
+}
+
+#[test]
+fn vanished_accepts_only_missing_or_torn_down_devices() {
+    assert!(vanished(&io::Error::from(io::ErrorKind::NotFound)));
+    assert!(vanished(&io::Error::from_raw_os_error(libc::ENOENT)));
+    assert!(vanished(&io::Error::from_raw_os_error(libc::ENODEV)));
+    assert!(!vanished(&io::Error::from(io::ErrorKind::PermissionDenied)));
+    assert!(!vanished(&io::Error::from_raw_os_error(libc::EIO)));
+    assert!(!vanished(&io::Error::from_raw_os_error(libc::ENXIO)));
+}
+
+#[test]
+fn namespace_attribute_disappearance_skips_but_other_errors_fail() {
+    let temp = tempdir::TempDir::new("namespace-attribute").unwrap();
+    let path = temp.path().join("nsid");
+    assert_eq!(scan_attribute(&path).unwrap(), None);
+    std::fs::write(&path, "1\n").unwrap();
+    assert_eq!(scan_attribute(&path).unwrap().as_deref(), Some("1"));
+    assert!(scan_attribute(temp.path()).is_err());
+}
+
+#[test]
+fn queue_geometry_admission_requires_exact_readable_kernel_attributes() {
+    let temp = tempdir::TempDir::new("controller-queues").unwrap();
+    let path = temp.path();
+    std::fs::write(path.join("queue_count"), "5\n").unwrap();
+    std::fs::write(path.join("sqsize"), "127\n").unwrap();
+    verify_queue_geometry(path, LiveQueueGeometry::default()).unwrap();
+    for (geometry, count, size) in [
+        (
+            LiveQueueGeometry {
+                io_queues: 1,
+                queue_size: 32,
+                poll_queues: 0,
+            },
+            "2",
+            "31",
+        ),
+        (
+            LiveQueueGeometry {
+                poll_queues: 1,
+                ..Default::default()
+            },
+            "6",
+            "127",
+        ),
+    ] {
+        std::fs::write(path.join("queue_count"), count).unwrap();
+        std::fs::write(path.join("sqsize"), size).unwrap();
+        verify_queue_geometry(path, geometry).unwrap();
+    }
+
+    std::fs::write(path.join("queue_count"), "17\n").unwrap();
+    assert_eq!(
+        verify_queue_geometry(path, LiveQueueGeometry::default())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    std::fs::write(path.join("queue_count"), "5\n").unwrap();
+    std::fs::write(path.join("sqsize"), "31\n").unwrap();
+    assert_eq!(
+        verify_queue_geometry(path, LiveQueueGeometry::default())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    std::fs::write(path.join("sqsize"), "not-a-number\n").unwrap();
+    assert_eq!(
+        verify_queue_geometry(path, LiveQueueGeometry::default())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    std::fs::remove_file(path.join("sqsize")).unwrap();
+    assert_eq!(
+        verify_queue_geometry(path, LiveQueueGeometry::default())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn registry_excludes_duplicate_intents_and_holds_lock() {
+    let temp = tempdir::TempDir::new("live-connect").unwrap();
+    let path = temp.path().join("registry");
+    let registry = LiveConnectionRegistry::open(&path).unwrap();
+    assert!(LiveConnectionRegistry::open(&path).is_err());
+    let intent = Intent {
+        target: LiveConnectTarget {
+            nqn: "nqn.2026-01.test:wal".into(),
+            uuid: [1; 16],
+            nsid: 1,
+            bytes: 4096,
+            block_size: 4096,
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            geometry: Default::default(),
+        },
+        host_nqn: "nqn.2026-01.test:host".into(),
+        host_id: [2; 16],
+    };
+    std::fs::write(path.join("interrupted.tmp"), b"{\"target\":").unwrap();
+    assert!(
+        !registry
+            .has_intent(&intent.target.nqn, &intent.host_nqn)
+            .unwrap()
+    );
+    let journal = registry.reserve(&intent).unwrap();
+    assert!(
+        registry
+            .has_intent(&intent.target.nqn, &intent.host_nqn)
+            .unwrap()
+    );
+    assert!(registry.reserve(&intent).is_err());
+    let restored: Intent = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(restored.host_nqn, intent.host_nqn);
+    assert_eq!(restored.target.uuid, intent.target.uuid);
+    registry.remove_intent(&journal).unwrap();
+    assert!(
+        !registry
+            .has_intent(&intent.target.nqn, &intent.host_nqn)
+            .unwrap()
+    );
+    drop(registry);
+    let registry = LiveConnectionRegistry::open(&path).unwrap();
+    assert!(registry.reserve(&intent).is_ok());
+}
+
+#[test]
+fn retirement_does_not_touch_missing_or_replaced_original() {
+    let temp = tempdir::TempDir::new("controller-retire").unwrap();
+    let path = temp.path().join("controller");
+    let original = File::create(&path).unwrap();
+    let metadata = original.metadata().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let mut state = DeletionState::NotStarted;
+    retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_secs(1),
+        || panic!("removed controller must not be verified"),
+        || panic!("removed controller must not be deleted"),
+    )
+    .unwrap();
+    assert_eq!(state, DeletionState::Gone);
+    let replacement = File::create(&path).unwrap();
+    assert_ne!(replacement.metadata().unwrap().ino(), metadata.ino());
+    state = DeletionState::NotStarted;
+    retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_secs(1),
+        || panic!("replacement must not be verified"),
+        || panic!("replacement must not be deleted"),
+    )
+    .unwrap();
+    assert_eq!(state, DeletionState::Gone);
+    assert!(path.exists());
+}
+
+#[test]
+fn retirement_missing_attribute_remains_uncertain_until_original_disappears() {
+    for errno in [libc::ENOENT, libc::ENODEV] {
+        let temp = tempdir::TempDir::new("controller-uncertain").unwrap();
+        let path = temp.path().join("controller");
+        let original = File::create(&path).unwrap();
+        let metadata = original.metadata().unwrap();
+        let mut state = DeletionState::NotStarted;
+        let result = retire_controller(
+            &mut state,
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            Instant::now() + Duration::from_millis(100),
+            || Err(io::Error::from_raw_os_error(errno)),
+            || panic!("missing verification attribute must not issue delete"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(state, DeletionState::Uncertain);
+        std::fs::remove_file(&path).unwrap();
+        retire_controller(
+            &mut state,
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            Instant::now() + Duration::from_secs(1),
+            || panic!("uncertain retry must not verify again"),
+            || panic!("uncertain retry must not issue delete"),
+        )
+        .unwrap();
+        assert_eq!(state, DeletionState::Gone);
+    }
+}
+
+#[test]
+fn retirement_missing_delete_attribute_observes_without_reissue() {
+    for errno in [libc::ENOENT, libc::ENODEV] {
+        let temp = tempdir::TempDir::new("controller-delete-missing").unwrap();
+        let path = temp.path().join("controller");
+        let original = File::create(&path).unwrap();
+        let metadata = original.metadata().unwrap();
+        let mut state = DeletionState::NotStarted;
+        let result = retire_controller(
+            &mut state,
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            Instant::now() + Duration::from_millis(100),
+            || Ok(()),
+            || Err(io::Error::from_raw_os_error(errno)),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(state, DeletionState::Uncertain);
+        std::fs::remove_file(&path).unwrap();
+        retire_controller(
+            &mut state,
+            &path,
+            metadata.dev(),
+            metadata.ino(),
+            Instant::now() + Duration::from_secs(1),
+            || panic!("uncertain retry must not verify again"),
+            || panic!("uncertain retry must not issue delete"),
+        )
+        .unwrap();
+        assert_eq!(state, DeletionState::Gone);
+    }
+}
+
+#[test]
+fn retirement_store_io_error_retains_uncertainty_without_retry() {
+    let temp = tempdir::TempDir::new("controller-store-error").unwrap();
+    let path = temp.path().join("controller");
+    let original = File::create(&path).unwrap();
+    let metadata = original.metadata().unwrap();
+    let mut state = DeletionState::NotStarted;
+    let error = retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_secs(1),
+        || Ok(()),
+        || Err(io::Error::from_raw_os_error(libc::EIO)),
+    )
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert_eq!(state, DeletionState::Uncertain);
+    let error = retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_millis(100),
+        || panic!("uncertain retry must not verify again"),
+        || panic!("uncertain retry must not issue delete"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(state, DeletionState::Uncertain);
+}
+
+#[test]
+fn missing_device_retries_but_other_failures_do_not() {
+    let temp = tempdir::TempDir::new("device-readiness").unwrap();
+    let path = temp.path().join("device");
+    let created_path = path.clone();
+    let creator = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        File::create(created_path).unwrap();
+    });
+    let file = wait_for_device(
+        "open test device",
+        &path,
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || Ok(()),
+        || File::open(&path),
+    )
+    .unwrap();
+    drop(file);
+    creator.join().unwrap();
+    let mut calls = 0;
+    wait_for_device(
+        "open test device",
+        &path,
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || Ok(()),
+        || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::ENODEV))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 2);
+    let mut calls = 0;
+    let error = wait_for_device::<()>(
+        "open test device",
+        &path,
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || Ok(()),
+        || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
+    assert!(error.to_string().contains("open test device"));
+    assert!(error.to_string().contains(path.to_str().unwrap()));
+}
+
+#[test]
+fn namespace_enxio_retries_reverify_the_controller_before_each_open() {
+    let temp = tempdir::TempDir::new("namespace-enxio").unwrap();
+    let path = temp.path().join("nvme5n1");
+    File::create(&path).unwrap();
+    let mut verifies = 0;
+    let mut opens = 0;
+    let file = wait_for_device(
+        "open namespace device",
+        &path,
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || {
+            verifies += 1;
+            Ok(())
+        },
+        || {
+            opens += 1;
+            if opens <= 2 {
+                Err(io::Error::from_raw_os_error(libc::ENXIO))
+            } else {
+                File::open(&path)
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        file.metadata().unwrap().ino(),
+        path.metadata().unwrap().ino()
+    );
+    assert_eq!(opens, 3);
+    assert_eq!(verifies, 3);
+}
+
+#[test]
+fn namespace_enxio_deadline_names_the_device_and_owned_controller() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(40);
+    let mut opens = 0;
+    let mut verifies = 0;
+    let error = wait_for_device::<()>(
+        "open namespace device",
+        Path::new("/dev/nvme5n1"),
+        "nvme5",
+        DeviceNode::Namespace,
+        deadline,
+        || {
+            verifies += 1;
+            Ok(())
+        },
+        || {
+            opens += 1;
+            Err(io::Error::from_raw_os_error(libc::ENXIO))
+        },
+    )
+    .unwrap_err();
+    assert!(Instant::now() >= deadline);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(opens > 0);
+    assert_eq!(verifies, opens);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(message.contains("/dev/nvme5n1"));
+    assert!(message.contains("controller nvme5"));
+    assert!(message.contains("ENXIO persisted"));
+}
+
+#[test]
+fn namespace_retry_rejects_reused_controller_identity_before_foreign_open() {
+    let temp = tempdir::TempDir::new("namespace-reused-controller").unwrap();
+    let controller = temp.path().join("nvme5");
+    std::fs::create_dir(&controller).unwrap();
+    for (name, value) in [
+        ("subsysnqn", "nqn.2026-01.test:owned"),
+        ("hostnqn", "nqn.2026-01.test:host"),
+        ("hostid", "02020202-0202-0202-0202-020202020202"),
+    ] {
+        std::fs::write(controller.join(name), value).unwrap();
+    }
+    let directory = File::open(&controller).unwrap();
+    let original = directory.metadata().unwrap();
+    let mut opens = 0;
+    let mut verifies = 0;
+    let error = wait_for_device::<()>(
+        "open namespace device",
+        Path::new("/dev/nvme5n1"),
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || {
+            verifies += 1;
+            let current = controller.metadata()?;
+            if current.dev() != original.dev()
+                || current.ino() != original.ino()
+                || controller_attribute(&controller, &directory, "subsysnqn")?.as_deref()
+                    != Some("nqn.2026-01.test:owned")
+                || controller_attribute(&controller, &directory, "hostnqn")?.as_deref()
+                    != Some("nqn.2026-01.test:host")
+                || controller_attribute(&controller, &directory, "hostid")?.as_deref()
+                    != Some("02020202-0202-0202-0202-020202020202")
+            {
+                return Err(invalid("controller identity changed"));
+            }
+            Ok(())
+        },
+        || {
+            opens += 1;
+            assert_eq!(opens, 1, "must never open a foreign controller's device");
+            std::fs::rename(&controller, temp.path().join("old-controller"))?;
+            std::fs::create_dir(&controller)?;
+            Err(io::Error::from_raw_os_error(libc::ENXIO))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(opens, 1);
+    assert_eq!(verifies, 2);
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("controller identity changed"));
+}
+
+#[test]
+fn namespace_open_io_and_permission_errors_and_admin_enxio_do_not_retry() {
+    for (node, errno) in [
+        (DeviceNode::Namespace, libc::EIO),
+        (DeviceNode::Namespace, libc::EACCES),
+        (DeviceNode::Controller, libc::ENXIO),
+    ] {
+        let mut opens = 0;
+        let error = wait_for_device::<()>(
+            "open test device",
+            Path::new("/dev/nvme5n1"),
+            "nvme5",
+            node,
+            Instant::now() + Duration::from_secs(2),
+            || Ok(()),
+            || {
+                opens += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(opens, 1);
+        assert_eq!(error.kind(), io::Error::from_raw_os_error(errno).kind());
+    }
+}
+
+#[test]
+fn namespace_identity_enxio_is_not_a_retryable_device_open_error() {
+    let mut verifies = 0;
+    let error = wait_for_device::<()>(
+        "open namespace device",
+        Path::new("/dev/nvme5n1"),
+        "nvme5",
+        DeviceNode::Namespace,
+        Instant::now() + Duration::from_secs(2),
+        || {
+            verifies += 1;
+            Err(io::Error::from_raw_os_error(libc::ENXIO))
+        },
+        || panic!("identity check failed: device must not open"),
+    )
+    .unwrap_err();
+    assert_eq!(verifies, 1);
+    assert_eq!(
+        error.kind(),
+        io::Error::from_raw_os_error(libc::ENXIO).kind()
+    );
+}
+
+#[test]
+fn failed_connect_cleanup_preserves_the_primary_readiness_diagnostic() {
+    let primary = "open namespace device /dev/nvme5n1 (controller nvme5): ENXIO persisted";
+    let error = connect_error_after_cleanup(
+        io::Error::new(io::ErrorKind::TimedOut, primary),
+        Err(io::Error::from_raw_os_error(libc::EACCES)),
+    );
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(message.starts_with(primary));
+    assert!(message.contains("; controller cleanup failed: "));
+    assert!(message.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()));
+    // Successful cleanup preserves even the original OS error representation.
+    let error = connect_error_after_cleanup(io::Error::from_raw_os_error(libc::EIO), Ok(()));
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+}
+
+#[test]
+fn disappeared_controller_is_distinct_from_missing_live_attribute() {
+    let temp = tempdir::TempDir::new("controller-attribute").unwrap();
+    let path = temp.path().join("controller");
+    std::fs::create_dir(&path).unwrap();
+    let directory = File::open(&path).unwrap();
+    assert!(controller_attribute(&path, &directory, "hostid").is_err());
+    std::fs::remove_dir(&path).unwrap();
+    assert!(
+        controller_attribute(&path, &directory, "hostid")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn deletion_confirmation_waits_and_never_touches_replacement() {
+    let temp = tempdir::TempDir::new("controller-confirmation").unwrap();
+    let path = temp.path().join("controller");
+    let original = File::create(&path).unwrap();
+    let metadata = original.metadata().unwrap();
+    assert!(!original_removed(&path, metadata.dev(), metadata.ino()).unwrap());
+    let error = wait_for_original_removal(&path, metadata.dev(), metadata.ino(), Instant::now())
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    std::fs::remove_file(&path).unwrap();
+    assert!(original_removed(&path, metadata.dev(), metadata.ino()).unwrap());
+    let replacement = File::create(&path).unwrap();
+    assert_ne!(replacement.metadata().unwrap().ino(), metadata.ino());
+    assert!(original_removed(&path, metadata.dev(), metadata.ino()).unwrap());
+    wait_for_original_removal(
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(path.exists());
+}
+
+#[test]
+fn deletion_confirmation_observes_delayed_disappearance() {
+    let temp = tempdir::TempDir::new("controller-delayed").unwrap();
+    let path = temp.path().join("controller");
+    let original = File::create(&path).unwrap();
+    let metadata = original.metadata().unwrap();
+    let removed_path = path.clone();
+    let remover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::remove_file(removed_path).unwrap();
+    });
+    wait_for_original_removal(
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    remover.join().unwrap();
+}
+
+#[test]
+fn namespace_visibility_rejects_hidden_and_invalid_paths() {
+    assert!(namespace_name("nvme3n1"));
+    assert!(namespace_name("nvme3c2n1"));
+    assert!(!namespace_name("nvme3n1p1"));
+    assert!(!namespace_name("nvme3"));
+    let temp = tempdir::TempDir::new("namespace-hidden").unwrap();
+    let hidden = temp.path().join("hidden");
+    std::fs::write(&hidden, "1\n").unwrap();
+    assert!(!namespace_visible(temp.path()).unwrap());
+    std::fs::write(&hidden, "0\n").unwrap();
+    assert!(namespace_visible(temp.path()).unwrap());
+    std::fs::write(&hidden, "unexpected\n").unwrap();
+    assert!(namespace_visible(temp.path()).is_err());
+}
+
+#[test]
+fn fabrics_options_reject_delimiters() {
+    assert!(valid_nqn("nqn.2026-01.test:host"));
+    assert!(!valid_nqn("nqn.2026-01.test:host,duplicate_connect"));
+    assert!(!valid_nqn("nqn.2026-01.test:host=other"));
+}
+
+fn would_block(file: &File) -> bool {
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+        && matches!(
+            file.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        )
+}
+
+fn unlocked(path: &Path) -> bool {
+    File::open(path).unwrap().try_lock().is_ok()
+}
+
+/// Fake sysfs and /dev for controller `nvme9`: a plain disk `nvme9n1`, a
+/// multipath head `nvme9n2` linking to it, a hidden path disk, a disk of
+/// `nvme8`, a node `nvme9n3` now naming another device, and a visible disk
+/// `nvme9n4` whose node vanished. Returns `(block, dev, ctrl)`.
+fn fake_controller_disks(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let (block, dev) = (root.join("block"), root.join("dev"));
+    for dir in ["ctrl/nvme9", "ctrl/nvme8", "subsys", "block", "dev"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let ctrl = std::fs::canonicalize(root.join("ctrl/nvme9")).unwrap();
+    std::os::unix::fs::symlink(&ctrl, root.join("subsys/nvme9")).unwrap();
+    for (name, parent, hidden, number, node) in [
+        ("nvme9n1", "ctrl/nvme9", "0", "0:0", true),
+        ("nvme9n2", "subsys", "0", "0:0", true),
+        ("nvme9c9n1", "ctrl/nvme9", "1", "0:0", true),
+        ("nvme8n1", "ctrl/nvme8", "0", "0:0", true),
+        ("nvme9n3", "ctrl/nvme9", "0", "7:3", true),
+        ("nvme9n4", "ctrl/nvme9", "0", "0:0", false),
+    ] {
+        let disk = block.join(name);
+        std::fs::create_dir(&disk).unwrap();
+        std::os::unix::fs::symlink(root.join(parent), disk.join("device")).unwrap();
+        std::fs::write(disk.join("hidden"), hidden).unwrap();
+        // Regular files stand in for nodes: their device number is 0:0.
+        std::fs::write(disk.join("dev"), number).unwrap();
+        if node {
+            File::create(dev.join(name)).unwrap();
+        }
+    }
+    (block, dev, ctrl)
+}
+
+#[test]
+fn reconcile_teardown_locks_every_visible_disk_without_resolve_history() {
+    let temp = tempdir::TempDir::new("teardown-disks").unwrap();
+    let (block, dev, ctrl) = fake_controller_disks(temp.path());
+    let mut names: Vec<String> = owned_visible_disks(&block, &ctrl, "nvme9")
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["nvme9n1", "nvme9n2", "nvme9n3", "nvme9n4"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let locks = lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline).unwrap();
+    assert_eq!(locks.len(), 2);
+    // udevd's close-after-write reread takes LOCK_EX|LOCK_NB and its
+    // workers LOCK_SH|LOCK_NB: both must skip the controller's disks.
+    assert!(would_block(&File::open(dev.join("nvme9n1")).unwrap()));
+    assert!(would_block(&File::open(dev.join("nvme9n2")).unwrap()));
+    for other in ["nvme9c9n1", "nvme8n1", "nvme9n3"] {
+        assert!(unlocked(&dev.join(other)), "{other} must not be locked");
+    }
+    drop(locks);
+    assert!(unlocked(&dev.join("nvme9n1")));
+}
+
+#[test]
+fn disk_lock_is_taken_only_at_teardown_and_released_after_deletion() {
+    let temp = tempdir::TempDir::new("teardown-order").unwrap();
+    let (block, dev, ctrl) = fake_controller_disks(temp.path());
+    let disk = dev.join("nvme9n1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // Normal use: namespace I/O opens and closes the disk read-write, and
+    // udev may process it; nothing holds the lock.
+    drop(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&disk)
+            .unwrap(),
+    );
+    let udev = File::open(&disk).unwrap();
+    udev.try_lock().unwrap();
+    udev.unlock().unwrap();
+    let mut locks = Vec::new();
+    let error = retire_locked(
+        &mut locks,
+        true,
+        || lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline),
+        || {
+            assert!(would_block(&udev), "delete issued without the lock");
+            Err(io::Error::other("deletion uncertain"))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "deletion uncertain");
+    assert!(would_block(&udev), "unconfirmed deletion released the lock");
+    // A later attempt after the store keeps the same locks until confirmation.
+    retire_locked(
+        &mut locks,
+        false,
+        || panic!("teardown relocked after the delete was issued"),
+        || {
+            assert!(would_block(&udev));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(locks.is_empty());
+    udev.try_lock().unwrap();
+}
+
+#[test]
+fn teardown_lock_timeout_issues_no_delete() {
+    let temp = tempdir::TempDir::new("teardown-timeout").unwrap();
+    let (block, dev, ctrl) = fake_controller_disks(temp.path());
+    let probe = File::open(dev.join("nvme9n1")).unwrap();
+    probe.lock_shared().unwrap();
+    let mut locks = Vec::new();
+    let mut deleted = false;
+    let error = retire_locked(
+        &mut locks,
+        true,
+        || {
+            lock_controller_disks(
+                &block,
+                &dev,
+                &ctrl,
+                "nvme9",
+                Instant::now() + Duration::from_millis(50),
+            )
+        },
+        || {
+            deleted = true;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(!deleted, "delete issued without the lock");
+    assert!(locks.is_empty());
+    // Locks already taken in the failed attempt are released.
+    assert!(unlocked(&dev.join("nvme9n2")));
+}
+
+#[test]
+fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
+    let temp = tempdir::TempDir::new("disk-lock-wait").unwrap();
+    let disk = temp.path().join("nvme9n1");
+    File::create(&disk).unwrap();
+    let probe = File::open(&disk).unwrap();
+    probe.lock_shared().unwrap();
+    let error = lock_disk(
+        File::open(&disk).unwrap(),
+        &disk,
+        "nvme9",
+        Instant::now() + Duration::from_millis(50),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{} (controller nvme9)", disk.display()))
+    );
+    let waiter = {
+        let disk = disk.clone();
+        std::thread::spawn(move || {
+            lock_disk(
+                File::open(&disk).unwrap(),
+                &disk,
+                "nvme9",
+                Instant::now() + Duration::from_secs(10),
+            )
+        })
+    };
+    // Ending the probe lets the waiter in; the timed-out helper also wakes,
+    // and must drop its late lock instead of keeping it.
+    drop(probe);
+    let held = waiter.join().unwrap().unwrap();
+    assert!(would_block(&File::open(&disk).unwrap()));
+    drop(held);
+    // The late helper may still take the lock briefly; it must let it go.
+    lock_disk(
+        File::open(&disk).unwrap(),
+        &disk,
+        "nvme9",
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+}
