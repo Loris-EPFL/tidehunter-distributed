@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use super::*;
 use std::fs::OpenOptions;
 
@@ -911,4 +913,20 @@ fn terminal_write_result_override_is_one_shot_and_keeps_unknown_outcomes() {
     assert_eq!(io.stats().short_write_bytes, 2048);
     assert_eq!(io.stats().completed_write_ops, 1);
     assert_eq!(io.stats().completions, 3);
+}
+
+impl LiveIo {
+    /// Scalar retirement without allocating a completion Vec.
+    fn progress_one(&mut self) -> Result<Option<LiveCompletion>, LiveIoError> {
+        let mut out = None;
+        let mut multiple = false;
+        self.progress_with(|completion| {
+            multiple |= out.is_some();
+            out = Some(completion);
+        })?;
+        if multiple {
+            return Err(LiveIoError::Invalid("multiple scalar completions"));
+        }
+        Ok(out)
+    }
 }

@@ -11,6 +11,11 @@ pub(in crate::distributed::tcp) mod multiplexed;
 #[path = "wal_replay_tests.rs"]
 mod wal_replay;
 
+#[cfg(feature = "experimental-fabric")]
+pub(super) fn software_transport(security: FabricSecurity) -> Transport {
+    Transport::ofi(FabricBackend::SoftwareTcp, security)
+}
+
 #[test]
 fn default_owner_limits_admit_an_automatic_coordinator_and_its_reopen() {
     use crate::distributed::remote_db::RemoteDatabaseConfig;

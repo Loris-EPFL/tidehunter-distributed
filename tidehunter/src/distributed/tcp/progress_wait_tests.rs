@@ -5,6 +5,8 @@
 use super::progress_wait::{
     HookEvent, SPIN_LIMIT, ScriptStep, WAIT_UNAVAILABLE, WaitHook, WaitSet, WakeFd, Woke,
 };
+#[cfg(feature = "experimental-fabric")]
+use super::tests::software_transport;
 use super::tests::{batch, certificates, config, metrics};
 use super::*;
 use std::sync::mpsc;
