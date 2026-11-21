@@ -539,12 +539,28 @@ class KernelPortsContractTests(unittest.TestCase):
         routes, _, _, scan = self.geometry_fixture()
         record = {"sample_errors": [], "sample_errors_truncated": False}
         rows = scan(record["sample_errors"])
-        targets._admit_kernel_geometry(record, routes, rows)
+        targets._admit_kernel_geometry(record, routes,
+                                       {"rows": tuple(rows), "errors": (), "truncated": False})
         self.assertEqual({row["controller"] for row in record["queue_samples"]}, {"nvme0", "nvme3"})
         with self.assertRaisesRegex(targets.TargetError, "missing identities"):
-            targets._admit_kernel_geometry(record, routes, [row for row in rows if row["controller"] != "nvme3"])
+            targets._admit_kernel_geometry(
+                record, routes,
+                {"rows": tuple(row for row in rows if row["controller"] != "nvme3"),
+                 "errors": (), "truncated": False})
         self.assertEqual([row[0] for row in record["missing_queue_identities"]], ["nvme3"])
         self.assertEqual(record["sample_errors"], [])
+
+    def test_admission_uses_only_the_latest_snapshot(self):
+        routes, _, _, scan = self.geometry_fixture()
+        rows = scan([])
+        earlier = {"path": "/sys/class/nvme/nvme2/hostnqn", "errno": errno.ENODEV,
+                   "disappeared": True, "identity": {"controller": "nvme2"}}
+        record = {"sample_errors": [earlier], "sample_errors_truncated": False}
+        targets._admit_kernel_geometry(record, routes,
+                                       {"rows": tuple(rows), "errors": (), "truncated": False})
+        self.assertEqual({row["controller"] for row in record["queue_samples"]}, {"nvme0", "nvme3"})
+        self.assertEqual(record["missing_queue_identities"], [])
+        self.assertEqual(record["invalid_queue_samples"], [])
 
     def test_geometry_records_errno_path_and_identity_without_tolerating_errors(self):
         routes, expected, unrelated, scan = self.geometry_fixture()
@@ -575,7 +591,10 @@ class KernelPortsContractTests(unittest.TestCase):
                 self.assertEqual(error["identity"]["controller"], directory.name)
                 self.assertEqual(error["disappeared"], code == errno.ENODEV)
                 with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
-                    targets._admit_kernel_geometry(record, routes, earlier)
+                    targets._admit_kernel_geometry(
+                        record, routes,
+                        {"rows": tuple(earlier), "errors": tuple(record["sample_errors"]),
+                         "truncated": False})
                 self.assertEqual(record["missing_queue_identities"], [])
                 self.assertEqual(record["invalid_queue_samples"], [])
 

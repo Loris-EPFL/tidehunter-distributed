@@ -567,16 +567,17 @@ def _queue_identity(row):
     return row["controller"], row["subsysnqn"], row["hostnqn"], row["hostid"]
 
 
-def _admit_kernel_geometry(record, routes, samples):
+def _admit_kernel_geometry(record, routes, snapshot):
+    """Admit one complete sampler pass: rows and errors come from the same pass."""
     expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
                  r["namespace_identity"]["nqn"], r["host_nqn"],
                  str(uuid.UUID(bytes=bytes(r["host_id"])))) for r in routes}
-    matched = [r for r in samples if _queue_identity(r) in expected]
+    matched = [r for r in snapshot["rows"] if _queue_identity(r) in expected]
     missing = sorted(expected - {_queue_identity(r) for r in matched})
     invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
     record.update(queue_samples=matched, missing_queue_identities=missing, invalid_queue_samples=invalid)
-    hard_errors = len(record["sample_errors"])
-    truncated = record["sample_errors_truncated"]
+    hard_errors = len(snapshot["errors"])
+    truncated = snapshot["truncated"]
     if not expected or missing or invalid or hard_errors or truncated:
         raise TargetError(f"live 1x32 controller geometry not proven; missing identities: {missing!r}; "
                           f"wrong geometry: {len(invalid)}; sampling errors: {hard_errors}; truncated: {truncated}")
@@ -775,7 +776,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         client = None
         sampler = None
         stop = threading.Event()
-        samples = {}
+        snapshot = {"rows": (), "errors": (), "truncated": False}
         record.update(sample_errors=[], sample_errors_truncated=False)
         launch = remote = reprovisioned_database = None
 
@@ -795,6 +796,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             return value
 
         def sample():
+            nonlocal snapshot
             while not stop.wait(.02):
                 errors = []
                 try:
@@ -804,15 +806,16 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     rows = []
                     errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
                                    "disappeared": False, "identity": {}})
-                for row in rows:
-                    key = (row["controller"], row["device"], row["inode"])
-                    if len(samples) < 4096:
-                        samples[key] = row
+                seen = sorted({_queue_identity(row) for row in rows})
+                for error in errors:
+                    error["observed_identities"] = seen
+                # Publish one complete pass atomically. Admission reads the
+                # latest pass once, so its rows and errors agree.
+                snapshot = {"rows": tuple(rows), "errors": tuple(errors), "truncated": False}
                 if errors:
-                    seen = sorted({_queue_identity(row) for row in rows})
                     kept = record["sample_errors"]
                     available = 20 - len(kept)
-                    kept.extend(dict(error, observed_identities=seen) for error in errors[:available])
+                    kept.extend(errors[:available])
                     record["sample_errors_truncated"] |= len(errors) > available
 
         def diagnose(name, capture):
@@ -959,7 +962,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             reuse, routes = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
             reprovisioned_database = reuse["database"]
             record["target_reuse"] = {key: reuse[key] for key in ("dropped_database", "database")}
-            _admit_kernel_geometry(record, routes, samples.values())
+            _admit_kernel_geometry(record, routes, snapshot)
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
