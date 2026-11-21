@@ -550,53 +550,62 @@ class KernelPortsContractTests(unittest.TestCase):
         self.assertEqual([row[0] for row in record["missing_queue_identities"]], ["nvme3"])
         self.assertEqual(record["sample_errors"], [])
 
-    def test_admission_uses_only_the_latest_snapshot(self):
+    def scan_with_error(self, directory, code, scan):
+        read = Path.read_text
+        failed = directory / "sqsize"
+        moved = self.root / "disconnected"
+
+        def during_teardown(path, *args, **kwargs):
+            if path == failed:
+                if code == errno.ENODEV:
+                    directory.rename(moved)
+                raise OSError(code, "test", str(path))
+            return read(path, *args, **kwargs)
+
+        record = {"sample_errors": [], "sample_errors_truncated": False}
+        try:
+            with patch.object(Path, "read_text", during_teardown):
+                scan(record["sample_errors"])
+        finally:
+            if moved.exists():
+                moved.rename(directory)
+        error, = record["sample_errors"]
+        self.assertEqual(error["path"], str(failed))
+        self.assertEqual(error["errno"], code)
+        self.assertEqual(error["identity"]["controller"], directory.name)
+        self.assertEqual(error["disappeared"], code == errno.ENODEV)
+        return error
+
+    def test_resolved_disappeared_error_does_not_fail_admission(self):
         routes, _, _, scan = self.geometry_fixture()
         rows = scan([])
-        earlier = {"path": "/sys/class/nvme/nvme2/hostnqn", "errno": errno.ENODEV,
-                   "disappeared": True, "identity": {"controller": "nvme2"}}
-        record = {"sample_errors": [earlier], "sample_errors_truncated": False}
-        targets._admit_kernel_geometry(record, routes,
-                                       {"rows": tuple(rows), "errors": (), "truncated": False})
-        self.assertEqual({row["controller"] for row in record["queue_samples"]}, {"nvme0", "nvme3"})
-        self.assertEqual(record["missing_queue_identities"], [])
-        self.assertEqual(record["invalid_queue_samples"], [])
+        error = {"path": "/sys/class/nvme/nvme0/hostnqn", "errno": errno.ENODEV,
+                 "disappeared": True,
+                 "identity": {"controller": "nvme0",
+                              "subsysnqn": routes[0]["namespace_identity"]["nqn"]}}
+        targets._admit_kernel_geometry(
+            {"sample_errors": [error], "sample_errors_truncated": False}, routes,
+            {"rows": tuple(rows), "errors": (error,), "truncated": False})
+        self.assertEqual({row["controller"] for row in rows}, {"nvme0", "nvme1", "nvme3"})
 
-    def test_geometry_records_errno_path_and_identity_without_tolerating_errors(self):
+    def test_disappeared_controller_error_is_resolved_by_the_set(self):
         routes, expected, unrelated, scan = self.geometry_fixture()
         earlier = scan([])
-        read = Path.read_text
-        for directory, code in ((unrelated, errno.ENODEV), (expected, errno.ENODEV), (unrelated, errno.EIO)):
-            with self.subTest(controller=directory.name, errno=code):
-                failed = directory / "sqsize"
-                moved = self.root / "disconnected"
+        for directory in (unrelated, expected):
+            with self.subTest(controller=directory.name):
+                error = self.scan_with_error(directory, errno.ENODEV, scan)
+                targets._admit_kernel_geometry(
+                    {"sample_errors": [error], "sample_errors_truncated": False}, routes,
+                    {"rows": tuple(earlier), "errors": (error,), "truncated": False})
 
-                def during_teardown(path, *args, **kwargs):
-                    if path == failed:
-                        if code == errno.ENODEV:
-                            directory.rename(moved)
-                        raise OSError(code, "test", str(path))
-                    return read(path, *args, **kwargs)
-
-                record = {"sample_errors": [], "sample_errors_truncated": False}
-                try:
-                    with patch.object(Path, "read_text", during_teardown):
-                        scan(record["sample_errors"])
-                finally:
-                    if moved.exists():
-                        moved.rename(directory)
-                error, = record["sample_errors"]
-                self.assertEqual(error["path"], str(failed))
-                self.assertEqual(error["errno"], code)
-                self.assertEqual(error["identity"]["controller"], directory.name)
-                self.assertEqual(error["disappeared"], code == errno.ENODEV)
-                with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
-                    targets._admit_kernel_geometry(
-                        record, routes,
-                        {"rows": tuple(earlier), "errors": tuple(record["sample_errors"]),
-                         "truncated": False})
-                self.assertEqual(record["missing_queue_identities"], [])
-                self.assertEqual(record["invalid_queue_samples"], [])
+    def test_io_error_is_not_tolerated(self):
+        routes, _, unrelated, scan = self.geometry_fixture()
+        earlier = scan([])
+        error = self.scan_with_error(unrelated, errno.EIO, scan)
+        with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
+            targets._admit_kernel_geometry(
+                {"sample_errors": [error], "sample_errors_truncated": False}, routes,
+                {"rows": tuple(earlier), "errors": (error,), "truncated": False})
 
 
 if __name__ == '__main__':

@@ -567,16 +567,30 @@ def _queue_identity(row):
     return row["controller"], row["subsysnqn"], row["hostnqn"], row["hostid"]
 
 
+def _resolved_sample_error(error, rows):
+    """A disappeared controller that is in the admitted set is a transient."""
+    identity = error.get("identity") or {}
+    controller = identity.get("controller")
+    if not error.get("disappeared") or not controller:
+        return False
+    for row in rows:
+        if row["controller"] == controller and (
+                not identity.get("subsysnqn") or row["subsysnqn"] == identity["subsysnqn"]):
+            return True
+    return False
+
+
 def _admit_kernel_geometry(record, routes, snapshot):
-    """Admit one complete sampler pass: rows and errors come from the same pass."""
+    """Admit the accumulated controller set and its unresolved sampling errors."""
     expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
                  r["namespace_identity"]["nqn"], r["host_nqn"],
                  str(uuid.UUID(bytes=bytes(r["host_id"])))) for r in routes}
-    matched = [r for r in snapshot["rows"] if _queue_identity(r) in expected]
+    rows = snapshot["rows"]
+    matched = [r for r in rows if _queue_identity(r) in expected]
     missing = sorted(expected - {_queue_identity(r) for r in matched})
     invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
     record.update(queue_samples=matched, missing_queue_identities=missing, invalid_queue_samples=invalid)
-    hard_errors = len(snapshot["errors"])
+    hard_errors = sum(not _resolved_sample_error(error, rows) for error in snapshot["errors"])
     truncated = snapshot["truncated"]
     if not expected or missing or invalid or hard_errors or truncated:
         raise TargetError(f"live 1x32 controller geometry not proven; missing identities: {missing!r}; "
@@ -776,7 +790,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
         client = None
         sampler = None
         stop = threading.Event()
-        snapshot = {"rows": (), "errors": (), "truncated": False}
+        samples = {}
         record.update(sample_errors=[], sample_errors_truncated=False)
         launch = remote = reprovisioned_database = None
 
@@ -796,7 +810,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             return value
 
         def sample():
-            nonlocal snapshot
             while not stop.wait(.02):
                 errors = []
                 try:
@@ -806,16 +819,15 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     rows = []
                     errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
                                    "disappeared": False, "identity": {}})
-                seen = sorted({_queue_identity(row) for row in rows})
-                for error in errors:
-                    error["observed_identities"] = seen
-                # Publish one complete pass atomically. Admission reads the
-                # latest pass once, so its rows and errors agree.
-                snapshot = {"rows": tuple(rows), "errors": tuple(errors), "truncated": False}
+                for row in rows:
+                    key = (row["controller"], row["device"], row["inode"])
+                    if len(samples) < 4096:
+                        samples[key] = row
                 if errors:
+                    seen = sorted({_queue_identity(row) for row in rows})
                     kept = record["sample_errors"]
                     available = 20 - len(kept)
-                    kept.extend(errors[:available])
+                    kept.extend(dict(error, observed_identities=seen) for error in errors[:available])
                     record["sample_errors_truncated"] |= len(errors) > available
 
         def diagnose(name, capture):
@@ -962,7 +974,10 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             reuse, routes = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
             reprovisioned_database = reuse["database"]
             record["target_reuse"] = {key: reuse[key] for key in ("dropped_database", "database")}
-            _admit_kernel_geometry(record, routes, snapshot)
+            _admit_kernel_geometry(record, routes, {
+                "rows": tuple(samples.values()),
+                "errors": tuple(record["sample_errors"]),
+                "truncated": record["sample_errors_truncated"]})
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
