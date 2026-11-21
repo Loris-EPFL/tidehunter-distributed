@@ -1,0 +1,60 @@
+# Test-layout ratchet baseline (owner rule). Each line is
+# "<path> <inline #[cfg(test)] module bodies> <#[test] functions>". The owner
+# rule is that tests live outside production files, so every count must reach
+# zero: the baseline may only shrink, and an entry is removed when its file has
+# no inline tests left. The check fails if a listed file grows past its counts,
+# an unlisted file has inline tests, or an entry is stale. TST-3 in
+# docs/RUST_GUIDELINES.md states the rule.
+benchmarks/kv-research/src/backend.rs 1 2
+benchmarks/kv-research/src/backends/cassandra/replay.rs 0 1
+benchmarks/kv-research/src/backends/native/group_barrier.rs 1 7
+benchmarks/kv-research/src/backends/replay.rs 1 2
+benchmarks/kv-research/src/backends/tidehunter.rs 1 18
+benchmarks/kv-research/src/backends/tidehunter/live_qualification.rs 1 4
+benchmarks/kv-research/src/backends/tidehunter/live_write_profile.rs 1 8
+benchmarks/kv-research/src/backends/tidehunter/replay/resources.rs 1 1
+benchmarks/kv-research/src/backends/tikv/replay.rs 1 3
+benchmarks/kv-research/src/backends/valkey_rdma/replay.rs 1 1
+benchmarks/kv-research/src/config.rs 1 21
+benchmarks/kv-research/src/main.rs 1 1
+benchmarks/kv-research/src/report.rs 1 4
+benchmarks/kv-research/src/runner.rs 1 24
+benchmarks/kv-research/src/workload.rs 1 11
+tidehunter-fabric/src/endpoint.rs 1 3
+tidehunter-fabric/src/endpoint/resources.rs 1 5
+tidehunter/src/distributed/codec.rs 1 18
+tidehunter/src/distributed/group_model.rs 0 2
+tidehunter/src/distributed/model.rs 0 5
+tidehunter/src/distributed/native_index.rs 1 8
+tidehunter/src/distributed/native_publication.rs 1 6
+tidehunter/src/distributed/nvmeof/live_metrics.rs 1 1
+tidehunter/src/distributed/nvmeof/live_storage.rs 1 1
+tidehunter/src/distributed/owner_events.rs 1 5
+tidehunter/src/distributed/remote_db/checkpoint_lifecycle.rs 3 11
+tidehunter/src/distributed/remote_db/dead_wal_files_tests/r1_events.rs 0 2
+tidehunter/src/distributed/remote_db/drop_cells_crash.rs 0 3
+tidehunter/src/distributed/remote_db/model_check_concurrent.rs 0 6
+tidehunter/src/distributed/remote_db/model_check_leased.rs 0 2
+tidehunter/src/distributed/remote_db/pending_read.rs 1 6
+tidehunter/src/distributed/remote_db/pending_read/live_lane.rs 1 1
+tidehunter/src/distributed/remote_db/pending_read/read_trace.rs 1 4
+tidehunter/src/distributed/remote_db/read_cache.rs 1 28
+tidehunter/src/distributed/remote_db/read_cache/trace_eval.rs 0 18
+tidehunter/src/distributed/remote_db/replay_limits.rs 1 2
+tidehunter/src/distributed/remote_db/write_core/completion.rs 1 1
+tidehunter/src/distributed/remote_db/write_core/core.rs 1 4
+tidehunter/src/distributed/remote_db/write_core/dependencies.rs 1 1
+tidehunter/src/distributed/remote_db/write_core/identity.rs 1 1
+tidehunter/src/distributed/remote_db/write_core/owner_queue.rs 1 3
+tidehunter/src/distributed/remote_db/write_core/owner_sender.rs 1 4
+tidehunter/src/distributed/remote_db/write_core/publisher.rs 1 1
+tidehunter/src/distributed/remote_db/write_core/transport_budget.rs 1 2
+tidehunter/src/distributed/storage.rs 0 1
+tidehunter/src/distributed/sui.rs 1 4
+tidehunter/src/distributed/tcp/control.rs 0 1
+tidehunter/src/distributed/tcp/inventory.rs 1 8
+tidehunter/src/distributed/tcp/live_client.rs 3 60
+tidehunter/src/distributed/tcp/live_read.rs 1 29
+tidehunter/src/distributed/tcp/live_recovery.rs 1 1
+tidehunter/src/distributed/tcp/probe.rs 0 1
+tidehunter/src/distributed/write_timeline.rs 1 1

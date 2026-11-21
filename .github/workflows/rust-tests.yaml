@@ -395,6 +395,15 @@ jobs:
       - name: Run selected profile
         run: python3 .github/scripts/checks.py "${{ matrix.profile }}"
 
+      - name: Enforce file length and test layout
+        if: matrix.profile == 'format'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/checks.py file-length
+          python3 -B .github/scripts/checks.py test-layout
+          python3 -B -m unittest discover -s .github/scripts -p 'test_checks.py' -v
+
       - name: Prepare Darwin standard library for boundary check
         if: matrix.profile == 'lint'
         run: rustup target add --toolchain 1.90 x86_64-apple-darwin

@@ -317,7 +317,7 @@ exists, and a source link.
   [AGENTS.md, Task Quality](../AGENTS.md)
 - **TST-2** A crash-consistency change tests every crash boundary it adds or moves.
   [AGENTS.md, Correctness](../AGENTS.md)
-- **TST-3** Keep test bodies out of production files: end the file with only `#[cfg(test)] mod tests;` and put the tests in `foo/tests.rs`, or in `foo_tests.rs` declared with `#[path = "foo_tests.rs"]`. No inline `mod tests { ... }` body and no `#[test]` function in a production file.
+- **TST-3** Keep test bodies out of production files: end the file with only `#[cfg(test)] mod tests;` and put the tests in `foo/tests.rs`, or in `foo_tests.rs` declared with `#[path = "foo_tests.rs"]`. No inline `mod tests { ... }` body and no `#[test]` function in a production file. Enforced by `.github/scripts/checks.py test-layout` against a baseline that may only shrink.
   [Book 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html), [Effective Rust, Item 30](https://effective-rust.com/testing.html)
 - **TST-4** Test code may use `unwrap` and `expect`; set `allow-unwrap-in-tests` and `allow-expect-in-tests` in `clippy.toml`.
   [Clippy lint configuration](https://doc.rust-lang.org/clippy/lint_configuration.html#allow-unwrap-in-tests)

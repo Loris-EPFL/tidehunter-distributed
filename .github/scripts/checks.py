@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from resident_config import software_fabric_environment
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness",
-            "file-length", "all")
+            "file-length", "test-layout", "all")
 SOFTWARE_STREAM_TESTS = (
     "software_provider_preserves_stream_bytes_across_reused_buffers",
     "software_provider_timeout_poison_and_teardown_preserve_buffer_lifetimes",
@@ -139,12 +139,149 @@ def check_file_length():
             + "\n  ".join(over))
 
 
+TEST_LAYOUT_ROOTS = FILE_LENGTH_ROOTS
+TEST_LAYOUT_BASELINE = ROOT / ".github/scripts/test-layout-baseline.txt"
+TEST_LAYOUT_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*test\s*\]")
+MODULE_DECLARATION = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*([{;])")
+
+
+def without_comments_and_strings(source):
+    """Remove comments and literals so attributes inside them are not counted."""
+    out = []
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = length if newline < 0 else newline
+        elif source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+        elif char == '"':
+            index += 1
+            while index < length and source[index] != '"':
+                index += 2 if source[index] == "\\" else 1
+            index += 1
+        elif char == "r" and index + 1 < length and source[index + 1] in '#"':
+            hashes = 0
+            cursor = index + 1
+            while cursor < length and source[cursor] == "#":
+                hashes += 1
+                cursor += 1
+            if cursor < length and source[cursor] == '"':
+                end = source.find('"' + "#" * hashes, cursor + 1)
+                index = length if end < 0 else end + 1 + hashes
+            else:
+                out.append(char)
+                index += 1
+        elif char == "'":
+            # Skip a character literal; a lifetime has no closing quote.
+            cursor = index + 1
+            escaped = cursor < length and source[cursor] == "\\"
+            cursor += 2 if escaped else 1
+            if cursor < length and source[cursor] == "'":
+                index = cursor + 1
+            else:
+                out.append(char)
+                index += 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def count_inline_tests(source):
+    """Return (inline #[cfg(test)] module bodies, #[test] functions) in one file."""
+    stripped = without_comments_and_strings(source)
+    modules = 0
+    for attribute in TEST_LAYOUT_ATTRIBUTE.finditer(stripped):
+        tail = stripped[attribute.end():].lstrip()
+        while tail.startswith("#"):
+            opening = re.match(r"#\s*\[", tail)
+            if opening is None:
+                break
+            depth = 0
+            cursor = opening.end() - 1
+            while cursor < len(tail):
+                if tail[cursor] == "[":
+                    depth += 1
+                elif tail[cursor] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                cursor += 1
+            tail = tail[cursor + 1:].lstrip()
+        declaration = MODULE_DECLARATION.match(tail)
+        if declaration is not None and declaration.group(1) == "{":
+            modules += 1
+    return modules, len(TEST_ATTRIBUTE.findall(stripped))
+
+
+def layout_counts(root):
+    """Count inline tests per production file; separate test files are skipped."""
+    counts = {}
+    for relative_root in TEST_LAYOUT_ROOTS:
+        for path in sorted((root / relative_root).rglob("*.rs")):
+            relative = path.relative_to(root)
+            if (relative.name == "tests.rs" or relative.name.endswith("_tests.rs")
+                    or "tests" in relative.parts):
+                continue
+            counts[str(relative)] = count_inline_tests(path.read_text(errors="replace"))
+    return counts
+
+
+def check_test_layout(root=ROOT, baseline_path=TEST_LAYOUT_BASELINE):
+    """Ratchet: inline test modules and #[test] functions only shrink."""
+    baseline = {}
+    for line in baseline_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, modules, tests = line.rsplit(maxsplit=2)
+        baseline[path] = (int(modules), int(tests))
+    counts = layout_counts(root)
+    problems = []
+    for relative, (modules, tests) in sorted(counts.items()):
+        recorded = baseline.get(relative)
+        if recorded is None:
+            if modules or tests:
+                problems.append(
+                    f"{relative}: {modules} inline test modules and {tests} tests "
+                    "(not in baseline; move them to a sibling test file)")
+        elif modules > recorded[0] or tests > recorded[1]:
+            problems.append(
+                f"{relative}: {modules} modules and {tests} tests "
+                f"(grew past baseline {recorded[0]}/{recorded[1]})")
+    debt = []
+    for relative in sorted(baseline):
+        modules, tests = counts.get(relative, (0, 0))
+        if not modules and not tests:
+            problems.append(f"{relative}: stale baseline entry (no inline tests left); remove it")
+        else:
+            debt.append(f"{relative}: {modules} modules, {tests} tests")
+    print("test-layout debt (inline tests in production files):", flush=True)
+    for line in debt:
+        print(f"  {line}", flush=True)
+    print(f"  total: {len(debt)} files, "
+          f"{sum(counts.get(path, (0, 0))[0] for path in baseline)} modules, "
+          f"{sum(counts.get(path, (0, 0))[1] for path in baseline)} tests", flush=True)
+    if problems:
+        raise RuntimeError(
+            "test-layout ratchet failed; move tests to sibling files, never raise the baseline:\n  "
+            + "\n  ".join(problems))
+
+
 def check(profile, env):
     print(f"\n=== {profile}: correctness only; no hardware/performance claim ===", flush=True)
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
     elif profile == "file-length":
         check_file_length()
+    elif profile == "test-layout":
+        check_test_layout()
     elif profile == "lint":
         for features in ((), ("--features", "experimental-distributed,test-utils")):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
