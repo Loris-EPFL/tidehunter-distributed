@@ -68,6 +68,11 @@ exists, and a source link.
 - **CLN-10** Use `Box<dyn Trait>` only at a boundary, never per message or per request.
   Lint: `clippy::borrowed_box`.
   [Perf Book, inlining](https://nnethercote.github.io/perf-book/inlining.html)
+- **CLN-11** Use `dst.clone_from(&src)` instead of `dst = src.clone()` when `dst` already owns a buffer that can be reused.
+  Lint: `clippy::assigning_clones`.
+  [Perf Book, heap allocations](https://nnethercote.github.io/perf-book/heap-allocations.html)
+- **CLN-12** Use `Arc::make_mut` or `Rc::make_mut` for clone-on-write of shared state; it clones only when the reference count is above one.
+  [Perf Book, standard library types](https://nnethercote.github.io/perf-book/standard-library-types.html)
 
 ## Error handling and Result/Option
 
@@ -101,6 +106,9 @@ exists, and a source link.
 - **ERR-12** Use `let ... else` for the early-return shape instead of a nested `match`.
   Lint: `clippy::manual_let_else`.
   [Book 6.1](https://doc.rust-lang.org/book/ch06-01-defining-an-enum.html)
+- **ERR-13** Build an expensive error value lazily: use `ok_or_else` and `map_or_else`, not `ok_or` or `map_or` with a function call.
+  Lint: `clippy::or_fun_call`.
+  [Perf Book, standard library types](https://nnethercote.github.io/perf-book/standard-library-types.html)
 
 ## Types, newtypes, and enums
 
@@ -126,6 +134,8 @@ exists, and a source link.
   [C-COMMON-TRAITS](https://rust-lang.github.io/api-guidelines/interoperability.html#c-common-traits)
 - **TYP-10** Mark a public enum `#[non_exhaustive]` when a new variant must not break downstream matches.
   [non_exhaustive attribute](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute)
+- **TYP-11** Put `#[repr(transparent)]` on a newtype whose inner layout must stay the same, for example a newtype that crosses an FFI or on-disk layout boundary.
+  [Effective Rust, Item 6](https://effective-rust.com/newtype.html)
 
 ## Traits and generics
 
@@ -199,6 +209,8 @@ exists, and a source link.
   [Perf Book, iterators](https://nnethercote.github.io/perf-book/iterators.html)
 - **ITR-9** Give every loop a fixed upper bound, or document and assert its non-termination contract.
   [AGENTS.md, Correctness](../AGENTS.md)
+- **ITR-10** Give a custom `Iterator` that is collected on a hot path an accurate `size_hint` (and `ExactSizeIterator::len` when exact), so `collect` allocates once.
+  [Perf Book, iterators](https://nnethercote.github.io/perf-book/iterators.html)
 
 ## Threads and standard concurrency
 
@@ -277,6 +289,9 @@ exists, and a source link.
   [Miri](https://github.com/rust-lang/miri)
 - **UNS-9** Do not remove a bounds check with `get_unchecked` unless a benchmark shows the check is hot.
   [Perf Book, bounds checks](https://nnethercote.github.io/perf-book/bounds-checks.html)
+- **UNS-10** Do not use `transmute` or a raw-pointer dereference to extend a lifetime; bound the lifetime at the function boundary instead.
+  Lint: `clippy::transmute_ptr_to_ref`.
+  [Rustonomicon, unbounded lifetimes](https://doc.rust-lang.org/nomicon/unbounded-lifetimes.html)
 
 ## Documentation
 
@@ -302,8 +317,8 @@ exists, and a source link.
   [AGENTS.md, Task Quality](../AGENTS.md)
 - **TST-2** A crash-consistency change tests every crash boundary it adds or moves.
   [AGENTS.md, Correctness](../AGENTS.md)
-- **TST-3** Move an inline `#[cfg(test)] mod tests` longer than 30 lines to a sibling `tests.rs` with `#[cfg(test)] mod tests;`.
-  [Book 11.1](https://doc.rust-lang.org/book/ch11-01-writing-tests.html)
+- **TST-3** Keep test bodies out of production files: end the file with only `#[cfg(test)] mod tests;` and put the tests in `foo/tests.rs`, or in `foo_tests.rs` declared with `#[path = "foo_tests.rs"]`. No inline `mod tests { ... }` body and no `#[test]` function in a production file.
+  [Book 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html), [Effective Rust, Item 30](https://effective-rust.com/testing.html)
 - **TST-4** Test code may use `unwrap` and `expect`; set `allow-unwrap-in-tests` and `allow-expect-in-tests` in `clippy.toml`.
   [Clippy lint configuration](https://doc.rust-lang.org/clippy/lint_configuration.html#allow-unwrap-in-tests)
 - **TST-5** A test name states the behavior and the condition it exercises.
@@ -337,6 +352,8 @@ exists, and a source link.
   [AGENTS.md, Tooling](../AGENTS.md)
 - **PRF-9** When a micro-optimization is claimed but the benchmark is flat, inspect the machine code before keeping it.
   [Perf Book, machine code](https://nnethercote.github.io/perf-book/machine-code.html)
+- **PRF-10** Move a rarely taken branch into a separate function marked `#[cold]` so the compiler favors the hot path; measure the effect.
+  [Perf Book, inlining](https://nnethercote.github.io/perf-book/inlining.html)
 
 ## Rules from The Rust Programming Language, chapter by chapter
 
@@ -409,7 +426,7 @@ the topic rule is kept. Lint names marked "not enabled" exist but are not on the
   [Ch 10.1](https://doc.rust-lang.org/book/ch10-01-syntax.html)
 ### Ch 11 Automated Tests
 
-- **BK11-1** Unit tests live in `#[cfg(test)] mod tests`; tests of the public API live in `tests/` with helpers in `tests/common/mod.rs`.
+- **BK11-1** Unit tests live in a sibling test module (`foo/tests.rs` or `foo_tests.rs`, declared with `#[cfg(test)] mod tests;`), never in an inline body; tests of the public API live in `tests/` with helpers in `tests/common/mod.rs`.
   [Ch 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html)
 - **BK11-2** Tests run in parallel; give each a unique temp path, and use `--test-threads=1` only for tests that share global state.
   [Ch 11.2](https://doc.rust-lang.org/book/ch11-02-running-tests.html)
@@ -441,6 +458,8 @@ the topic rule is kept. Lint names marked "not enabled" exist but are not on the
 - **BK14-3** Split crates inside one workspace (one `Cargo.lock`, one `target/`) and declare each inter-crate dependency explicitly; helper `cargo-*` tools are separate binaries, never runtime dependencies.
   [Ch 14.3](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html),
   [Ch 14.4](https://doc.rust-lang.org/book/ch14-04-installing-binaries.html)
+- **BK14-4** Make Cargo features additive: enabling a feature must only add items, never remove or change behavior, and no feature may exclude another.
+  [Effective Rust, Item 26](https://effective-rust.com/features.html)
 ### Ch 15 Smart Pointers
 
 - **BK15-1** Use `Box<T>` to move a large value cheaply or to build a recursive type, not as a default wrapper.
