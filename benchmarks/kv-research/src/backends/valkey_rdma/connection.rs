@@ -36,12 +36,13 @@ unsafe extern "C" {
     pub(super) fn kv_reply_integer(r: *const c_void) -> i64;
     pub(super) fn kv_reply_count(r: *const c_void) -> usize;
     pub(super) fn kv_reply_element(r: *const c_void, i: usize) -> *const c_void;
-    pub(super) fn kv_reply_string() -> c_int;
-    pub(super) fn kv_reply_array() -> c_int;
-    pub(super) fn kv_reply_integer_type() -> c_int;
-    pub(super) fn kv_reply_nil() -> c_int;
-    pub(super) fn kv_reply_status() -> c_int;
-    pub(super) fn kv_reply_error() -> c_int;
+    // Constants of the shim: no argument, no state, no precondition.
+    pub(super) safe fn kv_reply_string() -> c_int;
+    pub(super) safe fn kv_reply_array() -> c_int;
+    pub(super) safe fn kv_reply_integer_type() -> c_int;
+    pub(super) safe fn kv_reply_nil() -> c_int;
+    pub(super) safe fn kv_reply_status() -> c_int;
+    pub(super) safe fn kv_reply_error() -> c_int;
 }
 pub(super) struct Connection {
     pub(super) ptr: NonNull<c_void>,
@@ -74,50 +75,68 @@ pub(super) enum Response {
     Array(Vec<Response>),
 }
 pub(super) type SlotGroup = (Vec<Vec<u8>>, Vec<usize>);
-// The caller retains the root Reply for the whole traversal. Child pointers and
-// string buffers are borrowed from that reply and never escape this function.
+/// Decodes one libvalkey reply tree into owned data.
+///
+/// # Safety
+/// `p` must be null or a live libvalkey reply, and the caller must retain the
+/// root reply for the whole call. Child pointers and string buffers are
+/// borrowed from that reply and never escape this function.
 unsafe fn decode(p: *const c_void) -> BackendResult<Response> {
     if p.is_null() {
         return Err(invalid("null libvalkey reply element"));
     }
-    // SAFETY: p is a live root or child valkeyReply from that retained reply;
-    // libvalkey guarantees each non-null string buffer has its reported length.
-    unsafe {
-        let t = kv_reply_type(p);
-        if t == kv_reply_nil() {
-            return Ok(Response::Nil);
-        }
-        if t == kv_reply_integer_type() {
-            return Ok(Response::Integer(kv_reply_integer(p)));
-        }
-        if t == kv_reply_array() {
-            let count = kv_reply_count(p);
-            let mut v = Vec::with_capacity(count);
-            for i in 0..count {
-                v.push(decode(kv_reply_element(p, i))?);
-            }
-            return Ok(Response::Array(v));
-        }
-        if t == kv_reply_string() || t == kv_reply_status() || t == kv_reply_error() {
-            let len = kv_reply_len(p);
-            let data = kv_reply_data(p);
-            let bytes = if len == 0 {
-                Vec::new()
-            } else if data.is_null() {
-                return Err(invalid("null libvalkey reply data"));
-            } else {
-                std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec()
-            };
-            if t == kv_reply_error() {
-                return Err(invalid(format!(
-                    "Valkey error (no redirect or mutation retry): {}",
-                    String::from_utf8_lossy(&bytes)
-                )));
-            }
-            return Ok(Response::Bytes(bytes));
-        }
-        Err(invalid("unexpected libvalkey reply type"))
+    // SAFETY: p is non-null and a live reply by the function contract; the
+    // shim only reads the type field.
+    let t = unsafe { kv_reply_type(p) };
+    if t == kv_reply_nil() {
+        return Ok(Response::Nil);
     }
+    if t == kv_reply_integer_type() {
+        // SAFETY: p is a live integer reply by the type check; the shim only
+        // reads the integer field.
+        return Ok(Response::Integer(unsafe { kv_reply_integer(p) }));
+    }
+    if t == kv_reply_array() {
+        // SAFETY: p is a live array reply by the type check; the shim only
+        // reads the element count.
+        let count = unsafe { kv_reply_count(p) };
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: p is a live array reply and the shim returns null for
+            // an index at or past the element count.
+            let child = unsafe { kv_reply_element(p, i) };
+            // SAFETY: child is null, which decode rejects, or a live child of
+            // the root reply the caller retains.
+            v.push(unsafe { decode(child) }?);
+        }
+        return Ok(Response::Array(v));
+    }
+    if t == kv_reply_string() || t == kv_reply_status() || t == kv_reply_error() {
+        // SAFETY: p is a live string, status or error reply by the type
+        // check; the shim only reads the length field.
+        let len = unsafe { kv_reply_len(p) };
+        // SAFETY: same reply; the shim only reads the string pointer field.
+        let data = unsafe { kv_reply_data(p) };
+        let bytes = if len == 0 {
+            Vec::new()
+        } else if data.is_null() {
+            return Err(invalid("null libvalkey reply data"));
+        } else {
+            // SAFETY: data is non-null and libvalkey guarantees its buffer
+            // holds len bytes while the root reply is retained. len is the
+            // size of one libvalkey allocation, so len <= isize::MAX. u8 needs
+            // no alignment and to_vec copies before this function returns.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }.to_vec()
+        };
+        if t == kv_reply_error() {
+            return Err(invalid(format!(
+                "Valkey error (no redirect or mutation retry): {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        return Ok(Response::Bytes(bytes));
+    }
+    Err(invalid("unexpected libvalkey reply type"))
 }
 impl Connection {
     pub(super) fn connect(node: &str, ms: u64, rdma: bool) -> BackendResult<Self> {
@@ -130,9 +149,12 @@ impl Connection {
         rdma: bool,
         connect_ms: u64,
     ) -> BackendResult<Self> {
-        // SAFETY: LazyLock runs the upstream global registration once before
-        // any connection is created, avoiding concurrent registry writes.
-        static INIT: LazyLock<c_int> = LazyLock::new(|| unsafe { kv_rdma_init() });
+        static INIT: LazyLock<c_int> = LazyLock::new(|| {
+            // SAFETY: LazyLock runs the upstream global registration once
+            // before any connection is created, avoiding concurrent registry
+            // writes.
+            unsafe { kv_rdma_init() }
+        });
         if *INIT != 0 {
             return Err(invalid("libvalkey RDMA initialization failed"));
         }
@@ -177,15 +199,15 @@ impl Connection {
         self.poisoned || unsafe { kv_context_error(self.ptr.as_ptr()) } != 0
     }
     pub(super) fn error(&self) -> Box<dyn std::error::Error + Send + Sync> {
-        // SAFETY: ptr is a live context; its NUL-terminated error buffer remains
-        // valid throughout this synchronous borrow and is copied immediately.
-        let text = unsafe {
-            let p = kv_context_error_string(self.ptr.as_ptr());
-            if p.is_null() {
-                "unknown libvalkey failure".into()
-            } else {
-                CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
+        // SAFETY: ptr is a live context, so the shim returns its non-null,
+        // NUL-terminated error buffer.
+        let p = unsafe { kv_context_error_string(self.ptr.as_ptr()) };
+        let text = if p.is_null() {
+            "unknown libvalkey failure".into()
+        } else {
+            // SAFETY: p is non-null and NUL-terminated, and the context keeps
+            // the buffer valid for this synchronous borrow; it is copied now.
+            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
         };
         if self.timed_out {
             io::Error::new(io::ErrorKind::TimedOut, text).into()
