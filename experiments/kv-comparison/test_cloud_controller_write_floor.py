@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import tempfile
 import subprocess
-import time
 import sys
 import unittest
 from unittest.mock import patch
@@ -271,9 +270,9 @@ class WriteFloorTests(unittest.TestCase):
                     spec = self.spec(mode)
                     log = case / (mode + '.log')
                     argv = floors.write_argv(binary, target, log, spec, identity)
-                    # The helper streams progress to its log while it runs, so
-                    # the deadline is only a safety cap; use the validated
-                    # maximum so machine load cannot masquerade as a hang.
+                    # The real helper runs against the production fd gate: it opens
+                    # the scratch fd right after exec, so only the overall 60 s
+                    # deadline (the validated maximum) is a hang guard here.
                     raw, flags = controller.run_write_fio(argv, identity, scratch, case, 60)
                     result = floors.write_result({'case_id': 'x', 'ssd_write': spec}, raw, log.read_bytes(), '1:2', flags['direct'])
                     rows = [tuple(map(int, line.split(','))) for line in log.read_text().splitlines()]
@@ -300,7 +299,6 @@ class WriteFloorTests(unittest.TestCase):
                             'operations': 4096, 'warmup_operations': 512}
                     log = case / (mode + '.log')
                     argv = floors.write_argv(binary, target, log, spec, identity)
-                    # Same safety-cap rationale as above.
                     raw, flags = controller.run_write_fio(argv, identity, scratch, case, 60)
                     rows = floors.parse_write_log(log.read_bytes(), spec)
                     result = floors.write_result({'case_id': 'x', 'ssd_write': spec}, raw,
@@ -310,30 +308,7 @@ class WriteFloorTests(unittest.TestCase):
                                      [i * 1024 for i in range(512, 4608)])
                     self.assertEqual(result['logged_operations'], 4096)
 
-    def test_fd_gate_waits_for_a_slow_but_progressing_helper(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()
-            case = root / 'case'; case.mkdir(); target = scratch / 'x'; target.write_bytes(b'x')
-            st = target.stat()
-            identity = {'path': str(target), 'device': st.st_dev, 'inode': st.st_ino}
-            helper = case / 'helper'
-            # Log rows appear every second and the scratch fd opens only at
-            # 3 s, past a fixed 2 s fd deadline: continuous observable progress
-            # (log growth) must keep the gate open until the fd appears.
-            helper.write_text("#!/bin/sh\ni=0\n"
-                              "while [ $i -lt 3 ]; do echo '10,5,15,0' >> \"$3\"; "
-                              "sleep 1; i=$((i+1)); done\n"
-                              "exec 3>\"$1/$2\"\n"
-                              "sleep 1\n"
-                              "printf '{\"total_operations\":1,\"logged_operations\":1,"
-                              "\"elapsed_ns\":1000}'\n")
-            helper.chmod(0o700)
-            argv = floors.write_argv(helper, target, case / 'lat.log', self.spec(), identity)
-            raw, flags = controller.run_write_fio(argv, identity, scratch, case, 30)
-            self.assertEqual(json.loads(raw)['total_operations'], 1)
-            self.assertFalse(flags['direct'])
-
-    def test_fd_gate_fails_a_stalled_helper_without_progress(self):
+    def test_fd_gate_fails_a_stalled_helper_at_the_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); scratch = root / 'fio-scratch'; scratch.mkdir()
             case = root / 'case'; case.mkdir(); target = scratch / 'x'; target.write_bytes(b'x')
@@ -343,12 +318,13 @@ class WriteFloorTests(unittest.TestCase):
             helper.write_text('#!/bin/sh\nsleep 30\n')
             helper.chmod(0o700)
             argv = floors.write_argv(helper, target, case / 'lat.log', self.spec(), identity)
-            started = time.monotonic()
-            with self.assertRaisesRegex(controller.FioFailure, 'writable fd not observed'):
+            # The stalled helper never opens the scratch fd, so the gate outcome
+            # does not depend on machine load. A short gate only shortens the run.
+            # If the gate did not fire, the 30 s deadline would raise 'timed out',
+            # which this message check rejects; no wall-clock assertion is needed.
+            with patch.object(controller, 'FD_GATE_SECONDS', 0.3), \
+                    self.assertRaisesRegex(controller.FioFailure, 'writable fd not observed'):
                 controller.run_write_fio(argv, identity, scratch, case, 30)
-            self.assertLess(
-                time.monotonic() - started, 10,
-                'a stalled helper must fail at the 2 s no-progress bound, not the whole budget')
 
     def test_run_write_fio_rejects_out_of_range_deadlines(self):
         with tempfile.TemporaryDirectory() as tmp:

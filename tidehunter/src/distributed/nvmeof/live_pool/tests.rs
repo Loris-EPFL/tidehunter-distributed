@@ -40,7 +40,7 @@ fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_names
     let mut other = target.clone();
     other.nsid = 2;
     other.uuid = [3; 16];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROGRESS_CAP;
     let (first, how, _) = pool
         .acquire_shared(
             &target,
@@ -108,7 +108,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .insert(target.nqn.clone(), Entry::Pending(identity));
     let mut other = target.clone();
     other.nqn = "nqn.2026-01.test:two".into();
-    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = Instant::now() + PROGRESS_CAP;
     let mut different_proof = target.clone();
     different_proof.bytes = 8192;
     assert!(matches!(
@@ -245,7 +245,7 @@ fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:one");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_CAP;
     let key = target.nqn.clone();
 
     let mut state = pool.state.lock().unwrap();
@@ -317,7 +317,9 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
         });
         let (state, result) = pool
             .finish_close(state, &key, controller, |_| {
-                std::thread::sleep(Duration::from_millis(200));
+                // Hold the delete until the waiter is parked on the `Closing` entry, so
+                // the check below is made at a point where it cannot have returned.
+                pool.wait_parked_waiters(1, Instant::now() + PROGRESS_CAP);
                 deleted.store(true, Ordering::SeqCst);
                 Err(io::Error::other("delete failed"))
             })
@@ -330,7 +332,6 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
         assert!(delete_had_ended);
         assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::InvalidData));
     });
-    // The delete (200 ms floor inside the callback) has already ended, so
-    // this bound only needs headroom for teardown under load.
+    // The delete has already ended, so this bound is only a hang guard.
     pool.shutdown(Instant::now() + PROGRESS_CAP).unwrap();
 }

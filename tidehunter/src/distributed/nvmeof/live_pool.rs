@@ -206,6 +206,10 @@ struct State {
     // count. Entry creation/eviction never borrows a caller's Client lock.
     owners: HashMap<(String, [u8; 32], u32), Arc<LiveExportPinControl>>,
     closing: bool,
+    /// Park events on a `Pending` or `Closing` entry (a re-park counts again). Test
+    /// barrier only, see `LiveControllerPool::wait_parked_waiters`.
+    #[cfg(test)]
+    parked_waiters: u64,
 }
 pub struct LiveControllerPool {
     registry: LiveConnectionRegistry,
@@ -347,6 +351,8 @@ impl LiveControllerPool {
                 entries: HashMap::new(),
                 owners: HashMap::new(),
                 closing: false,
+                #[cfg(test)]
+                parked_waiters: 0,
             }),
             changed: Condvar::new(),
             #[cfg(any(test, feature = "test-utils"))]
@@ -672,6 +678,11 @@ impl LiveControllerPool {
                     let remaining = deadline
                         .checked_duration_since(Instant::now())
                         .ok_or_else(timeout)?;
+                    #[cfg(test)]
+                    {
+                        state.parked_waiters += 1;
+                        self.changed.notify_all();
+                    }
                     let (next, wait) = self
                         .changed
                         .wait_timeout(state, remaining)
@@ -936,6 +947,31 @@ impl LiveControllerPool {
         }
         self.changed.notify_all();
         Ok((state, result))
+    }
+    /// Test barrier: block until `count` park events happened on a `Pending` or `Closing`
+    /// entry. The count rises under the pool lock right before a caller parks, so a test
+    /// that sees it knows a caller is parked. A caller that wakes and parks again counts
+    /// again, so a test with more than one waiter must not read the count as a number of
+    /// distinct callers. Panics with a message if `deadline` (a hang guard, never a
+    /// premise) passes first.
+    #[cfg(test)]
+    fn wait_parked_waiters(&self, count: u64, deadline: Instant) {
+        let mut state = self.state.lock().expect("pool lock");
+        while state.parked_waiters < count {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            assert!(
+                !remaining.is_zero(),
+                "parked waiters stayed below {count} (now {}) before the hang-guard deadline",
+                state.parked_waiters
+            );
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("pool lock")
+                .0;
+        }
     }
     /// All accepted I/O must be drained, all namespace descriptors dropped and
     /// every externally held lease released before shutdown. Failed disconnects

@@ -240,10 +240,15 @@ struct State {
     syncer_exited: bool,
     failure: Option<String>,
     counters: Counters,
-    /// Flush waits that reached their first park. Test barrier only, see
-    /// [`Frontier::wait_parked_flush_waits`].
+    /// Waits that reached their first park, by kind, and syncer rounds that found
+    /// unsynced data with nothing due. Test barriers only, see
+    /// [`Frontier::wait_parked_flush_waits`] and [`Frontier::wait_undue_rounds_above`].
     #[cfg(test)]
     parked_flush_waits: u64,
+    #[cfg(test)]
+    parked_synced_waits: u64,
+    #[cfg(test)]
+    undue_rounds: u64,
 }
 
 /// The appended frontier at the instant the syncer picked its fsync target.
@@ -314,6 +319,10 @@ impl Frontier {
                 counters: Counters::default(),
                 #[cfg(test)]
                 parked_flush_waits: 0,
+                #[cfg(test)]
+                parked_synced_waits: 0,
+                #[cfg(test)]
+                undue_rounds: 0,
             }),
             appended_cv: Condvar::new(),
             synced_cv: Condvar::new(),
@@ -436,6 +445,8 @@ impl Frontier {
                 if !counted_full_wait {
                     counted_full_wait = true;
                     st.counters.completion_full_waits += 1;
+                    #[cfg(test)]
+                    self.parked_cv.notify_all();
                 }
                 self.space_cv.wait(st);
                 continue;
@@ -556,9 +567,16 @@ impl Frontier {
             if !parked {
                 parked = true;
                 #[cfg(test)]
-                if kind == WaitKind::Flush {
-                    st.parked_flush_waits += 1;
-                    self.parked_cv.notify_all();
+                match kind {
+                    WaitKind::Flush => {
+                        st.parked_flush_waits += 1;
+                        self.parked_cv.notify_all();
+                    }
+                    WaitKind::Synced => {
+                        st.parked_synced_waits += 1;
+                        self.parked_cv.notify_all();
+                    }
+                    WaitKind::Appended => {}
                 }
             }
             match deadline {
@@ -602,22 +620,90 @@ impl Frontier {
         outcome
     }
 
-    /// Test barrier: block until `count` flush waits have parked at least once, or until
-    /// `deadline`; returns whether the count was reached.
+    /// Test barrier: block until `count` flush waits have parked at least once. Panics
+    /// with a message if `deadline` (a hang guard, never a premise) passes first.
     ///
     /// `flush_waits` counts only waits that park. A test that releases an fsync while a
     /// flusher may still be before its park races the flusher: the flusher can find the
     /// target synced and not wait at all. Releasing the fsync only after this barrier
     /// returns removes that race.
     #[cfg(test)]
-    pub(super) fn wait_parked_flush_waits(&self, count: u64, deadline: Instant) -> bool {
+    pub(super) fn wait_parked_flush_waits(&self, count: u64, deadline: Instant) {
+        self.wait_test_counter("parked flush waits", count, deadline, |st| {
+            st.parked_flush_waits
+        });
+    }
+
+    /// Test barrier like [`Frontier::wait_parked_flush_waits`], for synced waits (the
+    /// synchronous acknowledgement path). A test that sees the count knows the waiter is
+    /// parked, so no acknowledgement can have returned yet.
+    #[cfg(test)]
+    pub(super) fn wait_parked_synced_waits(&self, count: u64, deadline: Instant) {
+        self.wait_test_counter("parked synced waits", count, deadline, |st| {
+            st.parked_synced_waits
+        });
+    }
+
+    /// Test hook: how many times the syncer found unsynced data but nothing due.
+    #[cfg(test)]
+    pub(super) fn undue_rounds(&self) -> u64 {
+        self.state.lock().undue_rounds
+    }
+
+    /// Test barrier: block until the syncer has evaluated its cadence with unsynced data
+    /// and found nothing due, more times than `baseline` (read through
+    /// [`Frontier::undue_rounds`] before the completion under test). Panics with a message
+    /// if `deadline` (a hang guard, never a premise) passes first.
+    ///
+    /// A test that asserts "nothing was synced" after this barrier asserts it at a point
+    /// where the syncer provably ran its policy on the data, so the check cannot pass
+    /// because the syncer was merely late.
+    #[cfg(test)]
+    pub(super) fn wait_undue_rounds_above(&self, baseline: u64, deadline: Instant) {
+        self.wait_test_counter("undue syncer rounds", baseline + 1, deadline, |st| {
+            st.undue_rounds
+        });
+    }
+
+    /// Wait on `parked_cv` until `read(state) >= target`. The counters live under the
+    /// state lock, so a satisfied check is ordered after the event it counts.
+    #[cfg(test)]
+    fn wait_test_counter(
+        &self,
+        what: &str,
+        target: u64,
+        deadline: Instant,
+        read: impl Fn(&State) -> u64,
+    ) {
         let mut st = self.state.lock();
-        while st.parked_flush_waits < count {
-            if self.parked_cv.wait_until(&mut st, deadline).timed_out() {
-                return st.parked_flush_waits >= count;
-            }
+        while read(&st) < target {
+            let timed_out = self.parked_cv.wait_until(&mut st, deadline).timed_out();
+            assert!(
+                !timed_out || read(&st) >= target,
+                "{what} stayed below {target} (now {}) before the hang-guard deadline",
+                read(&st)
+            );
         }
-        true
+    }
+
+    /// Test barrier: block until the synced frontier reaches `end`, without raising the
+    /// sync demand (unlike [`Frontier::wait_synced`]), so a test of the cadence policy
+    /// observes what the syncer does on its own. Panics with a message if `deadline` (a
+    /// hang guard, never a premise) passes first.
+    #[cfg(test)]
+    pub(super) fn wait_synced_passive(&self, end: u64, deadline: Instant) {
+        self.wait_test_counter("synced frontier", end, deadline, |st| st.synced_end);
+    }
+
+    /// Test barrier: block until `count` writers counted a full-buffer wait. The count is
+    /// taken under the state lock right before the writer parks, so a test that sees it
+    /// knows the writer is parked. Panics with a message if `deadline` (a hang guard,
+    /// never a premise) passes first.
+    #[cfg(test)]
+    pub(super) fn wait_full_waits(&self, count: u64, deadline: Instant) {
+        self.wait_test_counter("completion full waits", count, deadline, |st| {
+            st.counters.completion_full_waits
+        });
     }
 
     /// Poison the frontier. Every waiter and later completion gets [`FrontierError::Failed`].
@@ -652,6 +738,20 @@ impl Frontier {
 
     #[must_use]
     pub fn stats(&self) -> FrontierStats {
+        self.stats_with(Instant::now)
+    }
+
+    /// The statistics as seen at `now`: only `lag_age` depends on the time. A test passes
+    /// a chosen time, so it checks the age without a wait.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn stats_at(&self, now: Instant) -> FrontierStats {
+        self.stats_with(|| now)
+    }
+
+    /// `clock` is called inside the state lock and only when unsynced data exists, as
+    /// `Instant::elapsed` was before the split.
+    fn stats_with(&self, clock: impl FnOnce() -> Instant) -> FrontierStats {
         let st = self.state.lock();
         let c = &st.counters;
         FrontierStats {
@@ -665,9 +765,9 @@ impl Frontier {
             },
             lag_bytes: st.appended_end - st.synced_end,
             lag_batches: st.appended_batches - st.synced_batches,
-            lag_age: st
-                .unsynced_since
-                .map_or(Duration::ZERO, |since| since.elapsed()),
+            lag_age: st.unsynced_since.map_or(Duration::ZERO, |since| {
+                clock().saturating_duration_since(since)
+            }),
             peak_lag_bytes: c.peak_lag_bytes,
             peak_lag_batches: c.peak_lag_batches,
             peak_lag_age: c.peak_lag_age,
@@ -727,6 +827,11 @@ impl Frontier {
                         taken: now,
                     });
                 }
+                #[cfg(test)]
+                {
+                    st.undue_rounds += 1;
+                    self.parked_cv.notify_all();
+                }
                 // Fragment, demand, stop and failure changes notify the syncer; only the
                 // opt-in age bound needs a timed wait.
                 match self
@@ -767,6 +872,8 @@ impl Frontier {
         self.synced.store(capture.end, Ordering::Release);
         drop(st);
         self.synced_cv.notify_all();
+        #[cfg(test)]
+        self.parked_cv.notify_all();
     }
 
     fn fail_sync(&self, reason: String) {

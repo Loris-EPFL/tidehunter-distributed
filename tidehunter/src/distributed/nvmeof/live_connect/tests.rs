@@ -1,6 +1,14 @@
 use super::*;
 use crate::distributed::test_bounds::PROGRESS_CAP;
 
+/// Deadline of a call that must end by timing out. It is the stimulus, not a
+/// measurement: the call polls until the deadline and the outcome does not depend on
+/// its value. The only way to fail such a test is a stall of the test thread longer
+/// than this before the first pass of the call, so the value is large against a
+/// scheduling stall and small against the run time. `PROGRESS_CAP` stays the only
+/// hang guard.
+const EXPECTED_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[test]
 fn cpu_lists_parse_single_ranges_and_mixed_sets() {
     assert_eq!(parse_cpu_list("7\n").unwrap(), vec![7]);
@@ -297,7 +305,7 @@ fn retirement_does_not_touch_missing_or_replaced_original() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + PROGRESS_CAP,
         || panic!("removed controller must not be verified"),
         || panic!("removed controller must not be deleted"),
     )
@@ -311,7 +319,7 @@ fn retirement_does_not_touch_missing_or_replaced_original() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + PROGRESS_CAP,
         || panic!("replacement must not be verified"),
         || panic!("replacement must not be deleted"),
     )
@@ -333,7 +341,7 @@ fn retirement_missing_attribute_remains_uncertain_until_original_disappears() {
             &path,
             metadata.dev(),
             metadata.ino(),
-            Instant::now() + Duration::from_millis(100),
+            Instant::now() + EXPECTED_TIMEOUT,
             || Err(io::Error::from_raw_os_error(errno)),
             || panic!("missing verification attribute must not issue delete"),
         );
@@ -345,7 +353,7 @@ fn retirement_missing_attribute_remains_uncertain_until_original_disappears() {
             &path,
             metadata.dev(),
             metadata.ino(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + PROGRESS_CAP,
             || panic!("uncertain retry must not verify again"),
             || panic!("uncertain retry must not issue delete"),
         )
@@ -367,7 +375,7 @@ fn retirement_missing_delete_attribute_observes_without_reissue() {
             &path,
             metadata.dev(),
             metadata.ino(),
-            Instant::now() + Duration::from_millis(100),
+            Instant::now() + EXPECTED_TIMEOUT,
             || Ok(()),
             || Err(io::Error::from_raw_os_error(errno)),
         );
@@ -379,7 +387,7 @@ fn retirement_missing_delete_attribute_observes_without_reissue() {
             &path,
             metadata.dev(),
             metadata.ino(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + PROGRESS_CAP,
             || panic!("uncertain retry must not verify again"),
             || panic!("uncertain retry must not issue delete"),
         )
@@ -400,7 +408,7 @@ fn retirement_store_io_error_retains_uncertainty_without_retry() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + PROGRESS_CAP,
         || Ok(()),
         || Err(io::Error::from_raw_os_error(libc::EIO)),
     )
@@ -412,7 +420,7 @@ fn retirement_store_io_error_retains_uncertainty_without_retry() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_millis(100),
+        Instant::now() + EXPECTED_TIMEOUT,
         || panic!("uncertain retry must not verify again"),
         || panic!("uncertain retry must not issue delete"),
     )
@@ -426,8 +434,11 @@ fn missing_device_retries_but_other_failures_do_not() {
     let temp = tempdir::TempDir::new("device-readiness").unwrap();
     let path = temp.path().join("device");
     let created_path = path.clone();
+    // The creator makes the file appear only after the first open failed, so the retry
+    // path is certain to run; the wait follows that progress.
+    let (missing_tx, missing_rx) = std::sync::mpsc::channel();
     let creator = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(10));
+        missing_rx.recv().unwrap();
         File::create(created_path).unwrap();
     });
     let file = wait_for_device(
@@ -435,11 +446,16 @@ fn missing_device_retries_but_other_failures_do_not() {
         &path,
         "nvme5",
         DeviceNode::Namespace,
-        // The creator thread makes the file appear 10 ms in; the retry loop
-        // follows that progress.
         Instant::now() + PROGRESS_CAP,
         || Ok(()),
-        || File::open(&path),
+        || {
+            let opened = File::open(&path);
+            if opened.is_err() {
+                // A send after the creator ended is not an error.
+                missing_tx.send(()).ok();
+            }
+            opened
+        },
     )
     .unwrap();
     drop(file);
@@ -450,7 +466,7 @@ fn missing_device_retries_but_other_failures_do_not() {
         &path,
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + PROGRESS_CAP,
         || Ok(()),
         || {
             calls += 1;
@@ -469,7 +485,7 @@ fn missing_device_retries_but_other_failures_do_not() {
         &path,
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + PROGRESS_CAP,
         || Ok(()),
         || {
             calls += 1;
@@ -495,7 +511,7 @@ fn namespace_enxio_retries_reverify_the_controller_before_each_open() {
         &path,
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + PROGRESS_CAP,
         || {
             verifies += 1;
             Ok(())
@@ -521,7 +537,7 @@ fn namespace_enxio_retries_reverify_the_controller_before_each_open() {
 #[test]
 fn namespace_enxio_deadline_names_the_device_and_owned_controller() {
     let start = Instant::now();
-    let deadline = start + Duration::from_millis(40);
+    let deadline = start + EXPECTED_TIMEOUT;
     let mut opens = 0;
     let mut verifies = 0;
     let error = wait_for_device::<()>(
@@ -541,7 +557,7 @@ fn namespace_enxio_deadline_names_the_device_and_owned_controller() {
     )
     .unwrap_err();
     assert!(Instant::now() >= deadline);
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < PROGRESS_CAP);
     assert!(opens > 0);
     assert_eq!(verifies, opens);
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -572,7 +588,7 @@ fn namespace_retry_rejects_reused_controller_identity_before_foreign_open() {
         Path::new("/dev/nvme5n1"),
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + PROGRESS_CAP,
         || {
             verifies += 1;
             let current = controller.metadata()?;
@@ -617,7 +633,7 @@ fn namespace_open_io_and_permission_errors_and_admin_enxio_do_not_retry() {
             Path::new("/dev/nvme5n1"),
             "nvme5",
             node,
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + PROGRESS_CAP,
             || Ok(()),
             || {
                 opens += 1;
@@ -638,7 +654,7 @@ fn namespace_identity_enxio_is_not_a_retryable_device_open_error() {
         Path::new("/dev/nvme5n1"),
         "nvme5",
         DeviceNode::Namespace,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + PROGRESS_CAP,
         || {
             verifies += 1;
             Err(io::Error::from_raw_os_error(libc::ENXIO))
@@ -704,28 +720,28 @@ fn deletion_confirmation_waits_and_never_touches_replacement() {
         &path,
         metadata.dev(),
         metadata.ino(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + PROGRESS_CAP,
     )
     .unwrap();
     assert!(path.exists());
 }
 
 #[test]
-fn deletion_confirmation_observes_delayed_disappearance() {
+fn deletion_confirmation_ends_on_a_concurrent_removal() {
     let temp = tempdir::TempDir::new("controller-delayed").unwrap();
     let path = temp.path().join("controller");
     let original = File::create(&path).unwrap();
     let metadata = original.metadata().unwrap();
     let removed_path = path.clone();
     let remover = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(10));
         std::fs::remove_file(removed_path).unwrap();
     });
+    // The remover runs on its own thread; the wait ends on its removal whether the first
+    // poll sees the file or not. The deadline is a hang guard.
     wait_for_original_removal(
         &path,
         metadata.dev(),
         metadata.ino(),
-        // The remover thread acts 10 ms in; this wait follows that progress.
         Instant::now() + PROGRESS_CAP,
     )
     .unwrap();
@@ -810,7 +826,7 @@ fn reconcile_teardown_locks_every_visible_disk_without_resolve_history() {
         .collect();
     names.sort();
     assert_eq!(names, ["nvme9n1", "nvme9n2", "nvme9n3", "nvme9n4"]);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROGRESS_CAP;
     let locks = lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline).unwrap();
     assert_eq!(locks.len(), 2);
     // udevd's close-after-write reread takes LOCK_EX|LOCK_NB and its
@@ -829,7 +845,7 @@ fn disk_lock_is_taken_only_at_teardown_and_released_after_deletion() {
     let temp = tempdir::TempDir::new("teardown-order").unwrap();
     let (block, dev, ctrl) = fake_controller_disks(temp.path());
     let disk = dev.join("nvme9n1");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROGRESS_CAP;
     // Normal use: namespace I/O opens and closes the disk read-write, and
     // udev may process it; nothing holds the lock.
     drop(
@@ -887,7 +903,7 @@ fn teardown_lock_timeout_issues_no_delete() {
                 &dev,
                 &ctrl,
                 "nvme9",
-                Instant::now() + Duration::from_millis(50),
+                Instant::now() + EXPECTED_TIMEOUT,
             )
         },
         || {
@@ -914,7 +930,7 @@ fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
         File::open(&disk).unwrap(),
         &disk,
         "nvme9",
-        Instant::now() + Duration::from_millis(50),
+        Instant::now() + EXPECTED_TIMEOUT,
     )
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -930,7 +946,7 @@ fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
                 File::open(&disk).unwrap(),
                 &disk,
                 "nvme9",
-                Instant::now() + Duration::from_secs(10),
+                Instant::now() + PROGRESS_CAP,
             )
         })
     };
@@ -945,7 +961,7 @@ fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
         File::open(&disk).unwrap(),
         &disk,
         "nvme9",
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + PROGRESS_CAP,
     )
     .unwrap();
 }

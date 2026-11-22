@@ -1,7 +1,7 @@
 //! Behavioral tests of the shared frontier/syncer and of both tier contracts, plus a
 //! seeded crash model of the recovery invariant (checkpoints reference only synced
-//! positions). Timing assumptions exist only for negative checks ("has not happened after
-//! 100 ms"); every positive check waits on a channel or a frontier up to `PROGRESS_CAP`.
+//! positions). Every wait follows a signal (a channel, a frontier counter, or a
+//! test-only barrier of the frontier) up to `PROGRESS_CAP`; no check relies on a sleep.
 
 use super::frontier::{
     FlushTarget, Frontier, FrontierConfig, FrontierError, SyncPolicy, Syncer, flush_all,
@@ -10,18 +10,24 @@ use super::{DurabilityConfig, DurabilityTier, ReceiptDurability, native};
 use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Negative-settle floor: the sleeps with SETTLE prove a quiet syncer did NOT
-// sync. Under load the syncer may not run during the window at all, so the
-// check can pass vacuously; no negative check here can fail spuriously, so
-// machine load cannot turn a pass into a failure.
-const SETTLE: Duration = Duration::from_millis(100);
-// The progress polls below follow syncer thread progress.
+// The only time cap of this module: a hang guard for waits on a signal, never a premise.
 const LIMIT: Duration = PROGRESS_CAP;
+
+fn soon_instant() -> Instant {
+    Instant::now() + LIMIT
+}
+
+/// A deadline that already passed. A wait that cannot succeed parks once and returns
+/// `Timeout`; the outcome holds for any time, because the test itself holds the
+/// precondition (a hole in the frontier, a stalled fsync).
+fn expired() -> Option<Instant> {
+    Some(Instant::now())
+}
 
 fn soon() -> Option<Instant> {
     Some(Instant::now() + LIMIT)
@@ -74,14 +80,6 @@ fn recording(frontier: &Arc<Frontier>) -> (Syncer, Arc<Mutex<Vec<u64>>>) {
     })
     .unwrap();
     (syncer, calls)
-}
-
-fn poll_until(mut condition: impl FnMut() -> bool) {
-    let limit = Instant::now() + LIMIT;
-    while !condition() {
-        assert!(Instant::now() < limit, "condition not reached in {LIMIT:?}");
-        thread::sleep(Duration::from_millis(1));
-    }
 }
 
 #[test]
@@ -177,8 +175,12 @@ fn synchronous_ack_never_precedes_the_covering_fsync() {
     };
     // The waiter alone started the fsync (lazy policy), and the fsync covers the batch.
     assert_eq!(stall.entered.recv_timeout(LIMIT), Ok(100));
+    // The waiter raised the demand and parked under one lock hold before the syncer
+    // could start the fsync. Hold the fsync and assert at the point where the waiter is
+    // provably parked: it cannot have returned.
+    f.wait_parked_synced_waits(1, soon_instant());
     assert!(
-        done.recv_timeout(SETTLE).is_err(),
+        matches!(done.try_recv(), Err(TryRecvError::Empty)),
         "ack returned during the fsync"
     );
     assert_eq!(f.synced(), 0);
@@ -199,13 +201,12 @@ fn synchronous_ack_waits_for_earlier_batches_to_complete() {
     let (syncer, calls) = recording(&f);
     f.complete(50, 100, 1).unwrap();
     assert_eq!(
-        DurabilityTier::Synchronous.acknowledge(&f, 100, Some(Instant::now() + SETTLE)),
+        DurabilityTier::Synchronous.acknowledge(&f, 100, expired()),
         Err(FrontierError::Timeout)
     );
-    assert!(
-        calls.lock().unwrap().is_empty(),
-        "synced a range with a hole"
-    );
+    // Nothing is appended, so the syncer has no capture to take: the frontier state is
+    // the proof. The final call list shows no earlier fsync of a holed range.
+    assert_eq!((f.appended(), f.synced()), (0, 0), "hole held the frontier");
     f.complete(0, 50, 1).unwrap();
     assert_eq!(
         DurabilityTier::Synchronous.acknowledge(&f, 100, soon()),
@@ -242,7 +243,7 @@ fn native_ack_does_not_wait_for_fsync() {
     // An earlier position still unfinished: the native ack waits for it (contiguity).
     f.complete(300, 400, 1).unwrap();
     assert_eq!(
-        DurabilityTier::Native.acknowledge(&f, 400, Some(Instant::now() + SETTLE)),
+        DurabilityTier::Native.acknowledge(&f, 400, expired()),
         Err(FrontierError::Timeout)
     );
     f.complete(200, 300, 1).unwrap();
@@ -270,7 +271,7 @@ fn flush_waits_for_everything_appended_before_it() {
     assert_eq!(stall.entered.recv_timeout(LIMIT), Ok(10));
     // `flush_waits` counts only waits that blocked. The first flusher may still be between
     // `begin_flush` and its wait; release the fsync only once it is parked.
-    assert!(f.wait_parked_flush_waits(1, Instant::now() + LIMIT));
+    f.wait_parked_flush_waits(1, soon_instant());
 
     // Acknowledged after the first flush began, before the second one begins.
     f.complete(10, 20, 1).unwrap();
@@ -286,7 +287,7 @@ fn flush_waits_for_everything_appended_before_it() {
     assert_eq!(first.join().unwrap(), Ok(10));
     assert_eq!(stall.entered.recv_timeout(LIMIT), Ok(20));
     assert_eq!(
-        f.finish_flush(ticket, Some(Instant::now() + SETTLE)),
+        f.finish_flush(ticket, expired()),
         Err(FrontierError::Timeout)
     );
     // The timed-out wait parked (count 2). Park the finishing wait (count 3) before the
@@ -295,7 +296,7 @@ fn flush_waits_for_everything_appended_before_it() {
         let f = Arc::clone(&f);
         thread::spawn(move || f.finish_flush(ticket, soon()))
     };
-    assert!(f.wait_parked_flush_waits(3, Instant::now() + LIMIT));
+    f.wait_parked_flush_waits(3, soon_instant());
     stall.release.send(()).unwrap();
     assert_eq!(second.join().unwrap(), Ok(20));
 
@@ -323,10 +324,7 @@ fn only_waits_that_park_are_counted() {
     assert_eq!(f.wait_flush(0, soon()), Ok(0));
 
     // Not reached: the wait parks until its deadline and is counted.
-    assert_eq!(
-        f.wait_appended(10, Some(Instant::now() + SETTLE)),
-        Err(FrontierError::Timeout)
-    );
+    assert_eq!(f.wait_appended(10, expired()), Err(FrontierError::Timeout));
 
     // Not reached, but the frontier already failed: the locked path returns before it
     // parks, so these calls did not block and are not counted.
@@ -387,12 +385,22 @@ fn one_fsync_covers_everything_completed_meanwhile() {
 
 #[test]
 fn lag_counters_report_unsynced_bytes_batches_and_age() {
+    // A chosen age, added to the time of the read. No wait: `stats_at` takes the time.
+    const AGE: Duration = Duration::from_millis(5);
     let f = Frontier::with_config(lazy(0, 8)).unwrap();
+    // The frontier takes `unsynced_since` inside `complete`, so it lies in `before..=after`.
+    let before = Instant::now();
     f.complete(0, 30, 2).unwrap();
-    thread::sleep(Duration::from_millis(5));
-    let stats = f.stats();
+    let after = Instant::now();
+    let read_at = after + AGE;
+    let stats = f.stats_at(read_at);
     assert_eq!((stats.lag_bytes, stats.lag_batches), (30, 2));
-    assert!(stats.lag_age >= Duration::from_millis(5));
+    let upper = read_at.duration_since(before);
+    assert!(
+        stats.lag_age >= AGE && stats.lag_age <= upper,
+        "lag age {:?} outside {AGE:?}..={upper:?}",
+        stats.lag_age
+    );
 }
 
 #[test]
@@ -406,8 +414,15 @@ fn native_cadence_syncs_when_a_fragment_is_finalized_and_has_no_age_bound() {
     })
     .unwrap();
     let (syncer, calls) = recording(&f);
+    let baseline = f.undue_rounds();
     f.complete(0, 50, 1).unwrap();
-    thread::sleep(SETTLE);
+    // The syncer evaluated its cadence with these 50 bytes pending and found nothing
+    // due; only now is "nothing synced" a statement about the syncer, not about a late one.
+    f.wait_undue_rounds_above(baseline, soon_instant());
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "synced inside the first fragment"
+    );
     assert_eq!(
         f.synced(),
         0,
@@ -415,10 +430,11 @@ fn native_cadence_syncs_when_a_fragment_is_finalized_and_has_no_age_bound() {
     );
     f.complete(50, 130, 1).unwrap();
     // The boundary at 100 was crossed. One fsync covers the whole appended frontier.
-    poll_until(|| f.synced() == 130);
+    f.wait_synced_passive(130, soon_instant());
     assert_eq!(*calls.lock().unwrap(), vec![130]);
+    let baseline = f.undue_rounds();
     f.complete(130, 190, 1).unwrap();
-    thread::sleep(SETTLE);
+    f.wait_undue_rounds_above(baseline, soon_instant());
     assert_eq!(f.synced(), 130, "the open fragment stays unsynced");
     syncer.shutdown().unwrap();
 }
@@ -436,7 +452,10 @@ fn opt_in_age_bound_syncs_an_open_fragment() {
     .unwrap();
     let (syncer, calls) = recording(&f);
     f.complete(0, 10, 1).unwrap();
-    poll_until(|| f.synced() == 10);
+    // A positive "eventually": the 20 ms age bound makes the syncer run on its own, and
+    // the wait ends when it does. `LIMIT` is a hang guard far above that bound, so
+    // only a dead syncer reaches it, and the test never passes because time passed.
+    f.wait_synced_passive(10, soon_instant());
     assert_eq!(*calls.lock().unwrap(), vec![10]);
     syncer.shutdown().unwrap();
 }
@@ -446,8 +465,9 @@ fn checkpoint_capture_requests_a_sync_and_cuts_at_the_synced_frontier() {
     // Native cadence, open fragment: nothing is synced until the capture asks.
     let f = Frontier::with_config(lazy(0, 8)).unwrap();
     let (syncer, _) = recording(&f);
+    let baseline = f.undue_rounds();
     f.complete(0, 40, 2).unwrap();
-    thread::sleep(SETTLE);
+    f.wait_undue_rounds_above(baseline, soon_instant());
     assert_eq!(f.synced(), 0);
     let ticket = f.begin_flush().unwrap();
     let cut = f.finish_flush(ticket, soon()).unwrap();
@@ -506,8 +526,11 @@ fn full_completion_buffer_blocks_non_head_writers_only() {
         let f = Arc::clone(&f);
         thread::spawn(move || done_tx.send(f.complete(50, 60, 1)).unwrap())
     };
+    // The writer counts its full-buffer wait under the frontier lock right before it
+    // parks; once the count shows, it cannot have returned.
+    f.wait_full_waits(1, soon_instant());
     assert!(
-        done.recv_timeout(SETTLE).is_err(),
+        matches!(done.try_recv(), Err(TryRecvError::Empty)),
         "buffer bound was exceeded"
     );
     assert_eq!(f.stats().pending_completions, 2);
@@ -532,7 +555,11 @@ fn stop_and_failure_release_blocked_writers() {
             let f = Arc::clone(&f);
             thread::spawn(move || done_tx.send(f.complete(30, 40, 1)).unwrap())
         };
-        assert!(done.recv_timeout(SETTLE).is_err());
+        f.wait_full_waits(1, soon_instant());
+        assert!(
+            matches!(done.try_recv(), Err(TryRecvError::Empty)),
+            "a writer on a full buffer returned before stop or failure"
+        );
         if fail {
             f.fail("test");
         } else {
@@ -585,10 +612,7 @@ fn synced_wait_times_out_while_the_fsync_is_stalled() {
     let f = Frontier::with_config(lazy(0, 8)).unwrap();
     let stall = stalled(&f);
     f.complete(0, 10, 1).unwrap();
-    assert_eq!(
-        f.wait_synced(10, Some(Instant::now() + SETTLE)),
-        Err(FrontierError::Timeout)
-    );
+    assert_eq!(f.wait_synced(10, expired()), Err(FrontierError::Timeout));
     assert_eq!(stall.entered.recv_timeout(LIMIT), Ok(10));
     stall.release.send(()).unwrap();
     assert_eq!(f.wait_synced(10, soon()), Ok(()));
