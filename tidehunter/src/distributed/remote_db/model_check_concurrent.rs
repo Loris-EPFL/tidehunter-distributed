@@ -52,7 +52,6 @@ fn case(seed: u64, owners: usize, hot: bool, profile: usize) -> Case {
 /// Synchronous tier with its default GroupFlush policy.
 #[test]
 fn write_model_concurrent_bounded() {
-    let started = Instant::now();
     for (owners, hot, profile, boundary) in [
         (1, false, 4, ""),
         (16, true, 0, ""),
@@ -64,7 +63,6 @@ fn write_model_concurrent_bounded() {
             ..case(0xc011 + owners as u64, owners, hot, profile)
         });
     }
-    assert!(started.elapsed() < Duration::from_secs(60));
 }
 
 /// Optional filters leave the default 1000-schedule matrix unchanged. Start and

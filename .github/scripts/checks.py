@@ -315,7 +315,9 @@ def check(profile, env):
     elif profile == "native":
         cargo(env, "test", "-p", "tidehunter")
     elif profile == "distributed":
-        cargo(env, "test", "-p", "tidehunter", "--features", "experimental-distributed,test-utils")
+        # test_methods adds only test-facing items (observed relocation); it enables relocation_tests.
+        cargo(env, "test", "-p", "tidehunter", "--features",
+              "experimental-distributed,test-utils,test_methods")
         cargo(env, "test", "-p", "kv-research", "--features", "test-utils")
     elif profile == "fabric":
         fabric = fabric_environment(env)
