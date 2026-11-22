@@ -18,6 +18,14 @@
 //!
 //! Every directory is opened `O_NOFOLLOW` and its `(device, inode)` is
 //! revalidated against the path after locking. Conflicts are `AlreadyExists`.
+//!
+//! A `flock` lock belongs to the open file description, not to the descriptor.
+//! A child forked by any thread of the process inherits a copy of each open
+//! descriptor, and closing ours would leave the lock held until the child
+//! execs or exits. [`HeldLocks`] therefore calls `File::unlock` (`LOCK_UN`)
+//! on every locked directory before the descriptor closes, on the guard drop
+//! and on every early return of an acquire. `LOCK_UN` releases the lock on
+//! the shared description even while a forked copy still exists.
 
 use super::{AuthorityLifecycle, read_lifecycle};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -38,7 +46,43 @@ pub(crate) enum NamespaceMode {
 pub(crate) struct NamespaceGuard {
     target: PathBuf,
     /// Ancestors (shared) then the target (exclusive), in lock order.
-    _held: Vec<File>,
+    _held: HeldLocks,
+}
+
+/// Locked directories in lock order. The `Drop` unlocks them explicitly, last
+/// first, so a copy of a descriptor in a forked child cannot keep a lock.
+/// Only a directory whose lock succeeded may be pushed; a directory whose
+/// lock failed holds no lock and closes normally.
+struct HeldLocks(Vec<File>);
+
+impl HeldLocks {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, directory: File) {
+        self.0.push(directory);
+    }
+
+    fn last(&self) -> Option<&File> {
+        self.0.last()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for HeldLocks {
+    fn drop(&mut self) {
+        while let Some(directory) = self.0.pop() {
+            // `File::unlock` is `flock(LOCK_UN)`: it drops the lock of the open file
+            // description, which a forked child may still share. A failure cannot be
+            // returned from `drop`; closing the descriptor at the end of this
+            // iteration still releases the lock once every copy is closed.
+            let _ = directory.unlock();
+        }
+    }
 }
 
 fn open_directory(path: &Path) -> io::Result<File> {
@@ -79,7 +123,11 @@ fn lock(file: &File, path: &Path, exclusive: bool) -> io::Result<()> {
         file.try_lock_shared()
     };
     match result {
-        Ok(()) => revalidate(file, path),
+        // A lock taken by a directory that failed the identity check is released here,
+        // because the caller never pushes the directory into `HeldLocks`.
+        Ok(()) => revalidate(file, path).inspect_err(|_| {
+            let _ = file.unlock();
+        }),
         Err(TryLockError::WouldBlock) => Err(busy(path)),
         Err(TryLockError::Error(error)) => Err(error),
     }
@@ -102,12 +150,13 @@ impl NamespaceGuard {
             .unwrap_or(Path::new("."));
         // Same path-based NotFound as native open's canonicalization.
         let parent = parent.canonicalize()?;
-        let mut held = Vec::new();
+        let mut held = HeldLocks::new();
         let mut prefix = PathBuf::new();
         for component in parent.components() {
             prefix.push(component);
             let file = open_directory(&prefix)?;
             lock(&file, &prefix, false)?;
+            held.push(file);
             if mode == NamespaceMode::Open
                 && let Some((Some(AuthorityLifecycle::Dropping { .. }), _)) =
                     read_lifecycle(&prefix)?
@@ -117,7 +166,6 @@ impl NamespaceGuard {
                     format!("database {} is dropping", prefix.display()),
                 ));
             }
-            held.push(file);
         }
         let target = parent.join(&name);
         if mode == NamespaceMode::Open {
@@ -164,7 +212,7 @@ impl NamespaceGuard {
                 format!("{} is not below {}", child.display(), self.target.display()),
             )
         })?;
-        let mut held = Vec::new();
+        let mut held = HeldLocks::new();
         let mut prefix = self.target.clone();
         let components: Vec<_> = relative.components().collect();
         for (index, component) in components.iter().enumerate() {
@@ -191,3 +239,6 @@ impl NamespaceGuard {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
