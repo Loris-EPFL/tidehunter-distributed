@@ -342,10 +342,6 @@ impl Info {
     }
 }
 
-fn source_address_matches(info: &ffi::fi_info, requested: std::net::IpAddr) -> bool {
-    selected_source_address(info) == Some(requested)
-}
-
 fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
     if pointer.is_null() {
         None
@@ -359,17 +355,20 @@ fn optional_c_string(pointer: *const libc::c_char) -> Option<String> {
         )
     }
 }
-fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
-    // Callers keep the fi_getinfo result and its source allocation live.
-    // Format, length and null checks bound each read; read_unaligned does not
-    // require the provider's sockaddr pointer to have Rust alignment.
+/// Reads the source address selected in `info`.
+///
+/// # Safety
+/// `info` must come from a live `fi_getinfo` result: a non-null `src_addr`
+/// then points to a live libfabric-owned allocation of `src_addrlen` bytes.
+unsafe fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
+    // The guards bound each read; read_unaligned needs no Rust alignment.
     match info.addr_format {
         ffi::FI_SOCKADDR_IN
             if info.src_addrlen >= mem::size_of::<libc::sockaddr_in>()
                 && !info.src_addr.is_null() =>
         {
-            // SAFETY: the guard bounds src_addrlen by sockaddr_in and src_addr
-            // is non-null; read_unaligned needs no Rust alignment.
+            // SAFETY: the function contract holds; the guard bounds
+            // `src_addrlen` by sockaddr_in.
             let address = unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>()) };
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
                 address.sin_addr.s_addr.to_ne_bytes(),
@@ -379,8 +378,8 @@ fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
             if info.src_addrlen >= mem::size_of::<libc::sockaddr_in6>()
                 && !info.src_addr.is_null() =>
         {
-            // SAFETY: the guard bounds src_addrlen by sockaddr_in6 and
-            // src_addr is non-null; read_unaligned needs no Rust alignment.
+            // SAFETY: the function contract holds; the guard bounds
+            // `src_addrlen` by sockaddr_in6.
             let address =
                 unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>()) };
             Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
@@ -390,16 +389,16 @@ fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
         ffi::FI_SOCKADDR
             if info.src_addrlen >= mem::size_of::<libc::sockaddr>() && !info.src_addr.is_null() =>
         {
-            // SAFETY: the guard bounds src_addrlen by sockaddr and src_addr
-            // is non-null; read_unaligned needs no Rust alignment.
+            // SAFETY: the function contract holds; the guard bounds
+            // `src_addrlen` by sockaddr.
             let family =
                 unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr>()) }.sa_family;
             if i32::from(family) == libc::AF_INET {
                 if info.src_addrlen < mem::size_of::<libc::sockaddr_in>() {
                     return None;
                 }
-                // SAFETY: the family check and src_addrlen bound this
-                // sockaddr_in read; read_unaligned needs no Rust alignment.
+                // SAFETY: the function contract holds; the checks above bound
+                // this sockaddr_in read.
                 let address =
                     unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in>()) };
                 Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
@@ -409,8 +408,8 @@ fn selected_source_address(info: &ffi::fi_info) -> Option<std::net::IpAddr> {
                 if info.src_addrlen < mem::size_of::<libc::sockaddr_in6>() {
                     return None;
                 }
-                // SAFETY: the family check and src_addrlen bound this
-                // sockaddr_in6 read; read_unaligned needs no Rust alignment.
+                // SAFETY: the function contract holds; the checks above bound
+                // this sockaddr_in6 read.
                 let address =
                     unsafe { ptr::read_unaligned(info.src_addr.cast::<libc::sockaddr_in6>()) };
                 Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
@@ -693,14 +692,12 @@ impl Resources {
         if info.0.is_null() {
             return Err(invalid("fabric returned no provider info"));
         }
-        // info owns the non-null fi_getinfo result throughout this section.
-        // Required attribute pointers are checked before use; optional NIC
-        // fields and strings are checked before dereference. Native handles
-        // are used only after successful creation and saved for ordered
-        // teardown. Registered buffers and contexts stay allocated until close
-        // succeeds; output pointers address live locals or owned fields.
-        // SAFETY: the non-null fi_getinfo result info owns was initialized by
-        // libfabric; this shared reference keeps it live for every read below.
+        // info owns the non-null fi_getinfo result; its pointers are checked
+        // before use. Registered buffers stay allocated until close succeeds.
+        // SAFETY: info owns the non-null result fi_getinfo initialized. This
+        // reference and the attribute references below end before the first
+        // FFI call that receives a pointer into info, which libfabric may
+        // write through; `selected` is derived again after the last such call.
         let selected = unsafe { &*info.0 };
         if selected.fabric_attr.is_null()
             || selected.domain_attr.is_null()
@@ -710,24 +707,21 @@ impl Resources {
         {
             return Err(invalid("incomplete fabric provider capabilities"));
         }
-        // SAFETY: the guard above checked fabric_attr non-null; fi_getinfo
-        // initialized it and info keeps it allocated.
+        // SAFETY: non-null per the guard above; info keeps it allocated.
         let fabric_attr = unsafe { &*selected.fabric_attr };
-        // SAFETY: the guard above checked domain_attr non-null; fi_getinfo
-        // initialized it and info keeps it allocated.
+        // SAFETY: non-null per the guard above; info keeps it allocated.
         let domain_attr = unsafe { &*selected.domain_attr };
-        // SAFETY: the guard above checked ep_attr non-null; fi_getinfo
-        // initialized it and info keeps it allocated.
+        // SAFETY: non-null per the guard above; info keeps it allocated.
         let ep_attr = unsafe { &*selected.ep_attr };
-        // SAFETY: the guard above checked tx_attr non-null; fi_getinfo
-        // initialized it and info keeps it allocated.
+        // SAFETY: non-null per the guard above; info keeps it allocated.
         let tx_attr = unsafe { &*selected.tx_attr };
-        // SAFETY: the guard above checked rx_attr non-null; fi_getinfo
-        // initialized it and info keeps it allocated.
+        // SAFETY: non-null per the guard above; info keeps it allocated.
         let rx_attr = unsafe { &*selected.rx_attr };
+        // SAFETY: `selected` is the live fi_getinfo result that info owns.
+        let source_address = unsafe { selected_source_address(selected) };
         if config
             .source_address
-            .is_some_and(|source| !source_address_matches(selected, source))
+            .is_some_and(|requested| source_address != Some(requested))
         {
             return Err(invalid(
                 "provider did not return the explicitly requested source address",
@@ -747,7 +741,9 @@ impl Resources {
             }
         }
         let provider_name = fabric_attr.prov_name;
-        let fabric_name = fabric_attr.name;
+        // `fabric_attr` and `domain_attr` end before the FFI calls below.
+        let fabric_name = optional_c_string(fabric_attr.name);
+        let domain_name = optional_c_string(domain_attr.name);
         let mr_mode = domain_attr.mr_mode;
         let supported_mr_modes = if provider.as_bytes() == b"verbs;ofi_rxm" {
             ffi::FI_MR_LOCAL | ffi::FI_MR_PROV_KEY | ffi::FI_MR_VIRT_ADDR | ffi::FI_MR_ALLOCATED
@@ -758,6 +754,7 @@ impl Resources {
         // libfabric-owned, NUL-terminated provider name.
         let valid_identity = !provider_name.is_null()
             && unsafe { CStr::from_ptr(provider_name) } == provider.as_c_str();
+        let provider_string = optional_c_string(provider_name).unwrap_or_default();
         let valid_normal = ep_attr.max_msg_size >= CHUNK
             && selected.caps & (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
                 == (u64::from(ffi::FI_MSG) | ffi::FI_DIRECTED_RECV)
@@ -800,12 +797,12 @@ impl Resources {
         ) {
             return Err(invalid("unsupported fabric address format"));
         }
+        let fabric_attr_ptr = selected.fabric_attr;
         let stage = Instant::now();
-        // SAFETY: the validated attribute pointers address allocations info
-        // owns and keeps live; the output slot stays live for this
-        // synchronous call.
+        // SAFETY: the pointer addresses an allocation info keeps live; the
+        // output slot stays live for this synchronous call.
         check("open fabric", unsafe {
-            ffi::fi_fabric(selected.fabric_attr, &raw mut self.fabric, ptr::null_mut())
+            ffi::fi_fabric(fabric_attr_ptr, &raw mut self.fabric, ptr::null_mut())
         })?;
         self.open_profile.fabric_ns = elapsed_ns(stage);
         let stage = Instant::now();
@@ -875,6 +872,9 @@ impl Resources {
         AlignedAddress::new(self.addr_format, len, &address.bytes[..len])?;
         self.address = address.bytes[..len].to_vec();
         self.open_profile.address_ns = elapsed_ns(stage);
+        // SAFETY: info owns the result; no FFI call that receives info.0
+        // follows, so nothing writes through it while this reference lives.
+        let selected = unsafe { &*info.0 };
         let (device, driver, bus_address) = if selected.nic.is_null() {
             (None, None, None)
         } else {
@@ -918,10 +918,10 @@ impl Resources {
         };
         self.provider_info = Some(ProviderInfo {
             backend: config.backend,
-            provider: optional_c_string(provider_name).unwrap_or_default(),
-            fabric: optional_c_string(fabric_name),
-            domain: optional_c_string(domain_attr.name),
-            source_address: selected_source_address(selected),
+            provider: provider_string,
+            fabric: fabric_name,
+            domain: domain_name,
+            source_address,
             device,
             driver,
             bus_address,
@@ -1280,10 +1280,10 @@ impl Resources {
         }
         let len = bytes.len().min(self.rx_len[slot] - self.rx_offset);
         let began = self.time_progress.then(Instant::now);
-        // SAFETY: A terminal completion set rx_len[slot] <= CHUNK and cleared
-        // pending; rx_offset < rx_len[slot] (the subtraction above would
-        // underflow otherwise), so the add stays inside the slot's live
-        // CHUNK-byte buffer.
+        // SAFETY: `rx_len[slot]` is in 1..=CHUNK (`complete` stores nothing
+        // else; 0 returned above). `rx_offset` is below it: only this function
+        // advances it, by at most `rx_len[slot] - rx_offset`, and resets it to
+        // 0 with `rx_len[slot]`. So the add stays inside the slot's buffer.
         let source = unsafe { self.memory.rx(slot).add(self.rx_offset) };
         // SAFETY: len = min(bytes.len(), rx_len[slot] - rx_offset), so the range
         // ends within the received, initialized bytes of the slot and cannot

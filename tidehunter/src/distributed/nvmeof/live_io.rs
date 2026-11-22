@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 mod buffers;
 
-// These tests drive a real io_uring; off Linux `LiveIo` cannot be constructed.
 #[cfg(test)]
 mod tests;
 

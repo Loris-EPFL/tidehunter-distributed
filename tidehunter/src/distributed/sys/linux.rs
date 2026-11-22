@@ -42,12 +42,10 @@ pub(crate) fn set_thread_affinity(cpu: usize) -> io::Result<()> {
             "CPU outside affinity mask",
         ));
     }
-    // SAFETY: `zeroed` is valid for `cpu_set_t`, an all-zero bitset.
+    // SAFETY: `cpu_set_t` is a plain integer bitset, so the all-zero value is
+    // valid and initialized; it is the empty CPU set, so no `CPU_ZERO` is
+    // needed.
     let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `mask` is an initialized `cpu_set_t`; `CPU_ZERO` only clears it.
-    unsafe {
-        libc::CPU_ZERO(&mut mask);
-    }
     // SAFETY: cpu is inside cpu_set_t's bounds (checked above), so `CPU_SET`
     // only flips one bit in the initialized mask.
     unsafe {
