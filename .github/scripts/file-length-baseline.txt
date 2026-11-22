@@ -1,11 +1,13 @@
 # File-length ratchet baseline (R6). Each line is "<path> <current lines>".
-# The file-length check fails if a listed file grows past its count or any
-# unlisted Rust file in the audited trees exceeds 1500 lines. Remove a line
-# when the file is split; never raise a count.
+# The baseline is exact: the check fails if a listed file differs from its
+# count, if an unlisted Rust file in the audited trees exceeds 1500 lines, or if
+# a listed file is within the cap or gone. Change a line only in the change
+# that splits or shrinks the file.
 benchmarks/kv-research/src/backends/tidehunter.rs 2942
 benchmarks/kv-research/src/mainnet_replay.rs 2440
 benchmarks/kv-research/src/runner.rs 7196
 tidehunter-fabric/src/endpoint/resources.rs 1965
+tidehunter/benches/admission_options/core.rs 2040
 tidehunter/src/distributed/codec.rs 1976
 tidehunter/src/distributed/native_index.rs 2695
 tidehunter/src/distributed/nvmeof/live_target.rs 1502
@@ -29,4 +31,4 @@ tidehunter/src/distributed/tcp/control_tests.rs 2542
 tidehunter/src/distributed/tcp/inventory.rs 1963
 tidehunter/src/distributed/tcp/live_client.rs 5506
 tidehunter/src/distributed/tcp/live_read.rs 3278
-tidehunter/src/distributed/tcp/reactor.rs 2318
+tidehunter/src/distributed/tcp/reactor.rs 2303

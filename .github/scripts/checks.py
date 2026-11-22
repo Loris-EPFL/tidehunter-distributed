@@ -99,52 +99,81 @@ def selected_ignored(env, target, selector, expected):
 
 
 FILE_LENGTH_LIMIT = 1500
-FILE_LENGTH_ROOTS = (
+RATCHET_ROOTS = (
     "tidehunter/src/distributed",
+    "tidehunter/examples/support",
+    "tidehunter/benches",
     "benchmarks/kv-research/src",
     "tidehunter-fabric/src",
 )
 FILE_LENGTH_BASELINE = ROOT / ".github/scripts/file-length-baseline.txt"
+TEST_LAYOUT_BASELINE = ROOT / ".github/scripts/test-layout-baseline.txt"
+TEST_LAYOUT_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+# `#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = "multi_thread")]` and any `#[a::b::test]`.
+TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*test\s*(?:\(|\])")
+MODULE_DECLARATION = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*([{;])")
 
 
-def check_file_length():
-    """Ratchet: listed oversized files may not grow; unlisted files stay at or below 1500."""
+def read_baseline(path, fields):
+    """Parse "<path> <n>..." lines; `fields` numbers follow each path."""
     baseline = {}
-    for line in FILE_LENGTH_BASELINE.read_text().splitlines():
+    for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        path, lines = line.rsplit(maxsplit=1)
-        baseline[path] = int(lines)
-    over = []
+        parts = line.rsplit(maxsplit=fields)
+        try:
+            numbers = tuple(int(value) for value in parts[1:])
+        except ValueError:
+            numbers = ()
+        if len(parts) != fields + 1 or len(numbers) != fields:
+            raise RuntimeError(
+                f"{path.name}: malformed baseline line {line!r}; "
+                f"expected a path followed by {fields} whole number(s)")
+        if parts[0] in baseline:
+            raise RuntimeError(f"{path.name}: duplicate baseline entry for {parts[0]}")
+        baseline[parts[0]] = numbers
+    return baseline
+
+
+def rust_files(root):
+    """Yield (relative path, absolute path) of every Rust file under the ratchet roots."""
+    for relative_root in RATCHET_ROOTS:
+        directory = root / relative_root
+        if not directory.is_dir():
+            raise RuntimeError(f"ratchet root is missing: {relative_root}")
+        for path in directory.rglob("*.rs"):
+            yield path.relative_to(root), path
+
+
+def check_file_length(root=ROOT, baseline_path=FILE_LENGTH_BASELINE):
+    """Exact ratchet: a listed file equals its recorded length; others stay within the cap."""
+    baseline = {path: values[0] for path, values in read_baseline(baseline_path, 1).items()}
+    problems = []
     counts = {}
-    for root in FILE_LENGTH_ROOTS:
-        for path in sorted((ROOT / root).rglob("*.rs")):
-            relative = str(path.relative_to(ROOT))
-            lines = len(path.read_bytes().splitlines())
-            counts[relative] = lines
-            recorded = baseline.get(relative)
-            if recorded is None:
-                if lines > FILE_LENGTH_LIMIT:
-                    over.append(f"{relative}: {lines} (over cap, not in baseline)")
-            elif lines > recorded:
-                over.append(f"{relative}: {lines} (grew past baseline {recorded})")
+    for relative, path in sorted(rust_files(root)):
+        relative = str(relative)
+        counts[relative] = len(path.read_bytes().splitlines())
+    for relative, lines in counts.items():
+        recorded = baseline.get(relative)
+        if recorded is None:
+            if lines > FILE_LENGTH_LIMIT:
+                problems.append(f"{relative}: {lines} lines, over the cap and not in the baseline")
+        elif lines > recorded:
+            problems.append(f"{relative}: {lines} lines, grew past baseline {recorded}")
+        elif lines < recorded and lines > FILE_LENGTH_LIMIT:
+            problems.append(f"{relative}: {lines} lines, below baseline {recorded}; "
+                            f"change the baseline line to: {relative} {lines}")
     for relative in sorted(baseline):
         lines = counts.get(relative)
         if lines is None or lines <= FILE_LENGTH_LIMIT:
-            over.append(f"{relative}: stale baseline entry (missing or within the cap); remove it")
-    if over:
+            problems.append(f"{relative}: stale baseline entry (file missing or within the cap); "
+                            f"delete the line: {relative} {baseline[relative]}")
+    if problems:
         raise RuntimeError(
-            "file-length ratchet failed; split or shrink, never raise the baseline:\n  "
-            + "\n  ".join(over))
-
-
-TEST_LAYOUT_ROOTS = FILE_LENGTH_ROOTS
-TEST_LAYOUT_BASELINE = ROOT / ".github/scripts/test-layout-baseline.txt"
-TEST_LAYOUT_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
-TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*test\s*\]")
-MODULE_DECLARATION = re.compile(
-    r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*([{;])")
+            "file-length ratchet failed; the baseline may only shrink, in the same change "
+            "that shrinks the file:\n  " + "\n  ".join(problems))
 
 
 def without_comments_and_strings(source):
@@ -193,8 +222,10 @@ def without_comments_and_strings(source):
     return "".join(out)
 
 
+
+
 def count_inline_tests(source):
-    """Return (inline #[cfg(test)] module bodies, #[test] functions) in one file."""
+    """Return (inline #[cfg(test)] module bodies, test functions) in one file."""
     stripped = without_comments_and_strings(source)
     modules = 0
     for attribute in TEST_LAYOUT_ATTRIBUTE.finditer(stripped):
@@ -220,58 +251,52 @@ def count_inline_tests(source):
     return modules, len(TEST_ATTRIBUTE.findall(stripped))
 
 
+def is_test_only_file(relative):
+    """Recognise separate test files by name only; no module-tree parsing."""
+    return (relative.name == "tests.rs" or relative.name.endswith("_tests.rs")
+            or any(part == "tests" or part.endswith("_tests") for part in relative.parts[:-1]))
+
+
 def layout_counts(root):
     """Count inline tests per production file; separate test files are skipped."""
-    counts = {}
-    for relative_root in TEST_LAYOUT_ROOTS:
-        for path in sorted((root / relative_root).rglob("*.rs")):
-            relative = path.relative_to(root)
-            if (relative.name == "tests.rs" or relative.name.endswith("_tests.rs")
-                    or "tests" in relative.parts):
-                continue
-            counts[str(relative)] = count_inline_tests(path.read_text(errors="replace"))
-    return counts
+    return {str(relative): count_inline_tests(path.read_text(encoding="utf-8"))
+            for relative, path in rust_files(root) if not is_test_only_file(relative)}
 
 
 def check_test_layout(root=ROOT, baseline_path=TEST_LAYOUT_BASELINE):
-    """Ratchet: inline test modules and #[test] functions only shrink."""
-    baseline = {}
-    for line in baseline_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        path, modules, tests = line.rsplit(maxsplit=2)
-        baseline[path] = (int(modules), int(tests))
+    """Exact ratchet: inline test modules and test functions equal the baseline."""
+    baseline = read_baseline(baseline_path, 2)
     counts = layout_counts(root)
     problems = []
+    total = [0, 0, 0]
     for relative, (modules, tests) in sorted(counts.items()):
+        if not modules and not tests:
+            continue
         recorded = baseline.get(relative)
         if recorded is None:
-            if modules or tests:
-                problems.append(
-                    f"{relative}: {modules} inline test modules and {tests} tests "
-                    "(not in baseline; move them to a sibling test file)")
-        elif modules > recorded[0] or tests > recorded[1]:
             problems.append(
-                f"{relative}: {modules} modules and {tests} tests "
-                f"(grew past baseline {recorded[0]}/{recorded[1]})")
-    debt = []
+                f"{relative}: {modules} inline test modules and {tests} tests, not in the "
+                "baseline; move them to a sibling test file")
+            continue
+        total = [total[0] + 1, total[1] + modules, total[2] + tests]
+        if recorded != (modules, tests):
+            direction = "grew past" if modules > recorded[0] or tests > recorded[1] else "fell below"
+            problems.append(
+                f"{relative}: {modules} modules and {tests} tests {direction} baseline "
+                f"{recorded[0]}/{recorded[1]}; the baseline line must read: "
+                f"{relative} {modules} {tests}")
     for relative in sorted(baseline):
-        modules, tests = counts.get(relative, (0, 0))
-        if not modules and not tests:
-            problems.append(f"{relative}: stale baseline entry (no inline tests left); remove it")
-        else:
-            debt.append(f"{relative}: {modules} modules, {tests} tests")
-    print("test-layout debt (inline tests in production files):", flush=True)
-    for line in debt:
-        print(f"  {line}", flush=True)
-    print(f"  total: {len(debt)} files, "
-          f"{sum(counts.get(path, (0, 0))[0] for path in baseline)} modules, "
-          f"{sum(counts.get(path, (0, 0))[1] for path in baseline)} tests", flush=True)
+        if counts.get(relative, (0, 0)) == (0, 0):
+            problems.append(
+                f"{relative}: stale baseline entry (file missing or no inline tests left); "
+                f"delete the line: {relative} {baseline[relative][0]} {baseline[relative][1]}")
+    print("test-layout debt (inline tests in production files): "
+          f"{total[0]} files, {total[1]} modules, {total[2]} tests", flush=True)
     if problems:
         raise RuntimeError(
-            "test-layout ratchet failed; move tests to sibling files, never raise the baseline:\n  "
-            + "\n  ".join(problems))
+            "test-layout ratchet failed; the baseline may only shrink, in the same change "
+            "that moves the tests:\n  " + "\n  ".join(problems))
+
 
 
 def check(profile, env):
@@ -333,7 +358,7 @@ def main():
     try:
         for profile in PROFILES[:-1] if args.profile == "all" else (args.profile,):
             check(profile, env)
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"checks: {error}", file=sys.stderr)
         return 1
     return 0
