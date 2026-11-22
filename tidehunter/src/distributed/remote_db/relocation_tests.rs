@@ -630,7 +630,9 @@ fn restart_after_completed_pass_is_idempotent() {
 
 /// Native index state before the pass, set through native's own forced flush
 /// (`force_rebuild_control_region`) so the oracle never depends on when the
-/// background flusher ran or whether it promoted the cell.
+/// background flusher ran or whether it promoted the cell. The write path
+/// queues no flush because `max_dirty_keys` exceeds the row count, so the
+/// forced rebuild's flush alone decides the level state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeIndexState {
     /// Every entry flushed into L0; `l0_max_entries` exceeds the row count.
@@ -652,12 +654,23 @@ enum Decisions {
     KeepAfterRemoves,
 }
 
-fn native_config(state: NativeIndexState) -> Arc<crate::config::Config> {
+fn native_config(state: NativeIndexState, writes: u64) -> Arc<crate::config::Config> {
     let mut config = crate::config::Config::small();
     config.frag_size = FRAGMENT;
     config.wal_file_size = FILE;
     config.relocation_max_reclaim_pct = 100;
     config.snapshot_written_bytes = u64::MAX;
+    // The write path queues a background flush when a cell holds more dirty
+    // rows than `max_dirty_keys` (`LargeTable::too_many_dirty`). Keep the
+    // threshold above every row this test writes (two members per sequence)
+    // so that only `force_rebuild_control_region` flushes, and therefore only
+    // it decides the level state. Otherwise a background flush can promote
+    // the cell, and a later forced flush of at most `l0_max_entries` rows
+    // writes a new L0 above that L1 (`IndexFlusherThread::handle_command`,
+    // the L0-or-promote decision) and leaves `[L0, L1]`, which is not a state
+    // this oracle describes.
+    let rows = writes.saturating_mul(2);
+    config.max_dirty_keys = usize::try_from(rows.saturating_mul(4)).unwrap_or(usize::MAX / 16);
     config.l0_max_entries = Some(match state {
         NativeIndexState::FlushedL0 => 4096,
         NativeIndexState::PromotedL1 => 8,
@@ -763,7 +776,7 @@ fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
             let leased = fixture.open();
             let native_policy = Policy::new();
             let native_root = tempdir::TempDir::new("r1-native-parity").unwrap();
-            let config = native_config(state);
+            let config = native_config(state, WRITES);
             let native = open_native(native_root.path(), &native_policy, &config);
             let a = leased.ks("a");
             for db in [&leased, &native] {
