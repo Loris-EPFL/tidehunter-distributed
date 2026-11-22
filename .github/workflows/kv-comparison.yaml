@@ -397,3 +397,65 @@ jobs:
           path: ${{ runner.temp }}/replay-stores/
           if-no-files-found: error
           retention-days: 7
+
+  lint-backends:
+    # Clippy `-D warnings` for every feature-gated kv-research backend. No hardware
+    # runs: valkey-rdma only compiles against rdma-core headers and the pinned libvalkey.
+    name: Lint feature-gated backends
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+        with:
+          toolchain: '1.90'
+          components: clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-kv-rust-1.90-${{ hashFiles('Cargo.lock') }}
+      - name: Install build packages
+        timeout-minutes: 8
+        # Packages follow the replay-stores job; libibverbs-dev and librdmacm-dev
+        # provide the rdma-core headers that libvalkey_rdma and the shim include.
+        run: |
+          set -euo pipefail
+          sudo timeout 180 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
+          sudo env DEBIAN_FRONTEND=noninteractive timeout 300 apt-get \
+            -o Acquire::Retries=2 -o Acquire::http::Timeout=30 \
+            install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev \
+            protobuf-compiler libssl-dev libfontconfig1-dev ca-certificates openssl bzip2 \
+            python3-venv libibverbs-dev librdmacm-dev
+      - name: Prepare isolated Python dependencies
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/lint-python"
+          "$RUNNER_TEMP/lint-python/bin/pip" install --disable-pip-version-check --retries 2 --timeout 30 \
+            boto3==1.35.99 PyYAML==6.0.2
+          echo "$RUNNER_TEMP/lint-python/bin" >> "$GITHUB_PATH"
+      - name: Prepare pinned FDB client and paired Valkey source
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          python3 experiments/kv-comparison/local.py prepare-fdb --prefix "$RUNNER_TEMP/lint-fdb"
+          python3 experiments/kv-comparison/prepare_valkey_rdma.py --output "$RUNNER_TEMP/lint-valkey"
+          echo "FDB_CLIENT_LIB_DIR=$RUNNER_TEMP/lint-fdb/lib" >> "$GITHUB_ENV"
+          echo "FDB_CLIENT_LIB_PATH=$RUNNER_TEMP/lint-fdb/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/lint-fdb/lib" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$RUNNER_TEMP/lint-fdb/lib" >> "$GITHUB_ENV"
+          echo "VALKEY_SOURCE_DIR=$RUNNER_TEMP/lint-valkey" >> "$GITHUB_ENV"
+      - name: Fetch locked dependencies
+        timeout-minutes: 10
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo +1.90 fetch --locked
+      - name: Clippy every feature-gated backend
+        timeout-minutes: 45
+        run: python3 .github/scripts/checks.py lint-backends

@@ -15,7 +15,19 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from resident_config import software_fabric_environment
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness",
-            "file-length", "test-layout", "all")
+            "file-length", "test-layout", "lint-backends", "all")
+# Needs hosted-runner system packages; never part of `all` on a developer machine.
+ALL_PROFILES = tuple(profile for profile in PROFILES[:-1] if profile != "lint-backends")
+# Every feature-gated kv-research backend, grouped as a hosted runner can build it.
+# The first set matches the replay-stores build plus the RESP clients; rocksdb compiles
+# its own C++ tree and is linted alone so a failure names it. valkey-tcp alone compiles
+# the `not(feature = "valkey-rdma")` arms that the full set turns off; the default
+# features (the `lint` profile) compile the arms with both valkey features off.
+BACKEND_FEATURE_SETS = (
+    "tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks,valkey-rdma",
+    "valkey-tcp",
+    "rocksdb",
+)
 SOFTWARE_STREAM_TESTS = (
     "software_provider_preserves_stream_bytes_across_reused_buffers",
     "software_provider_timeout_poison_and_teardown_preserve_buffer_lifetimes",
@@ -312,6 +324,13 @@ def check(profile, env):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
+    elif profile == "lint-backends":
+        if env.get("GITHUB_ACTIONS") != "true" or not env.get("VALKEY_SOURCE_DIR"):
+            raise RuntimeError("lint-backends needs the hosted runner packages and a prepared "
+                               "VALKEY_SOURCE_DIR; run it only from the kv-comparison workflow")
+        for features in BACKEND_FEATURE_SETS:
+            cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--features", features,
+                  "--", "-D", "warnings")
     elif profile == "native":
         cargo(env, "test", "-p", "tidehunter")
     elif profile == "distributed":
@@ -348,7 +367,8 @@ def main():
         "Cargo uses --locked --offline and rust-toolchain.toml. Set TIDEHUNTER_LIBFABRIC_PREFIX for a "
         "custom provider install; existing PKG_CONFIG_*/LD_LIBRARY_PATH and Cargo/Rust controls are retained. "
         "Tests default to two parallel cases; an explicit RUST_TEST_THREADS is retained. "
-        "all includes software-fabric and fails if tcp;ofi_rxm cannot execute."))
+        "all includes software-fabric and fails if tcp;ofi_rxm cannot execute. "
+        "lint-backends runs only on a GitHub-hosted runner (see kv-comparison.yaml) and is not part of all."))
     parser.add_argument("profile", choices=PROFILES)
     args = parser.parse_args()
     env = os.environ.copy()
@@ -358,7 +378,7 @@ def main():
     # Do not let rustup bootstrap a missing toolchain during ordinary checks.
     env["RUSTUP_AUTO_INSTALL"] = "0"
     try:
-        for profile in PROFILES[:-1] if args.profile == "all" else (args.profile,):
+        for profile in ALL_PROFILES if args.profile == "all" else (args.profile,):
             check(profile, env)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"checks: {error}", file=sys.stderr)

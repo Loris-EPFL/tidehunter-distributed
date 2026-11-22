@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -289,6 +290,23 @@ class BaselineParsingTests(RatchetFixture):
         self.baseline.write_text("a.rs\n")
         with self.assertRaisesRegex(RuntimeError, "malformed baseline line 'a.rs'"):
             checks.read_baseline(self.baseline, 1)
+
+
+class ProfileTests(unittest.TestCase):
+    def test_hosted_only_profile_is_not_part_of_all(self):
+        self.assertIn("lint-backends", checks.PROFILES)
+        self.assertNotIn("lint-backends", checks.ALL_PROFILES)
+        self.assertEqual(set(checks.PROFILES) - set(checks.ALL_PROFILES), {"lint-backends", "all"})
+
+    def test_backend_lint_refuses_to_run_outside_the_hosted_runner(self):
+        with self.assertRaisesRegex(RuntimeError, "only from the kv-comparison workflow"):
+            checks.check("lint-backends", {})
+
+    def test_every_gated_backend_is_linted(self):
+        manifest = tomllib.loads((ROOT / "benchmarks/kv-research/Cargo.toml").read_text())
+        gated = set(manifest["features"]) - {"default", "fabric", "test-utils"}
+        linted = {name for group in checks.BACKEND_FEATURE_SETS for name in group.split(",")}
+        self.assertEqual(gated, linted)
 
 
 if __name__ == "__main__":
