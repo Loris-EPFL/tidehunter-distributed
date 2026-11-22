@@ -1,14 +1,15 @@
 # Rust guidelines
 
 Binding rules for Rust work in this repository. Scope: `tidehunter/src/distributed/`,
-`benchmarks/kv-research/src/`, `tidehunter-fabric/src/`, and every new Rust file. The
-native engine under `tidehunter/src/` outside `distributed/` is excluded except for
-defect fixes, so it stays rebasable on upstream MystenLabs.
+`benchmarks/kv-research/src/`, `tidehunter-fabric/src/`, and every new Rust file,
+including a new file in the native tree. Existing native code under `tidehunter/src/`
+outside `distributed/` is excluded, except for defect fixes and the DEC-4 exception.
+This keeps it rebasable on upstream MystenLabs.
 
 Precedence: `AGENTS.md`, then the `kvstore-concurrency` skill (an installed agent skill, not a file in this repository), then this document. If a
 rule here conflicts with `AGENTS.md` or the skill, the higher document wins and this
 document is wrong. Toolchain: Rust 1.90, edition 2024. A named lint is enforced only
-where DEC-5 lists it as landed (stage 1 via R6, stage 2 via R7); a rule with no lint, or
+where DEC-5 lists it as landed; a rule with no lint, or
 with a lint not yet landed, is enforced in review.
 
 Rule IDs are stable. Reviews cite the ID, for example `OWN-3`. Each rule gives one
@@ -71,7 +72,8 @@ exists, and a source link.
 - **CLN-11** Use `dst.clone_from(&src)` instead of `dst = src.clone()` when `dst` already owns a buffer that can be reused.
   Lint: `clippy::assigning_clones`.
   [Perf Book, heap allocations](https://nnethercote.github.io/perf-book/heap-allocations.html)
-- **CLN-12** Use `Arc::make_mut` or `Rc::make_mut` for clone-on-write of shared state; it clones only when the reference count is above one.
+- **CLN-12** Use `Arc::make_mut` or `Rc::make_mut` for clone-on-write of a value you own through `&mut Arc` or `&mut Rc`; it clones only when another strong reference exists. It does not publish a shared pointer without a lock (see DEC-8).
+  Source: Perf Book (rustguides `#ffd530`, `line:957`): "If the refcount is greater than one, they will clone the inner value"; "They are not needed often". `make_mut` takes a mutable reference, so it is not lock-free publication (std docs, outside rustguides).
   [Perf Book, standard library types](https://nnethercote.github.io/perf-book/standard-library-types.html)
 
 ## Error handling and Result/Option
@@ -107,7 +109,8 @@ exists, and a source link.
   Lint: `clippy::manual_let_else`.
   [Book 6.1](https://doc.rust-lang.org/book/ch06-01-defining-an-enum.html)
 - **ERR-13** Build an expensive error value lazily: use `ok_or_else` and `map_or_else`, not `ok_or` or `map_or` with a function call.
-  Lint: `clippy::or_fun_call`.
+  Lint (nursery, not enabled): `clippy::or_fun_call`. It fires on any non-trivial call and cannot tell whether the call is expensive.
+  Source: Perf Book (rustguides `#ffd530`, `line:943-951`): `ok_or` computes the error eagerly; use `ok_or_else` when it is expensive. `line:953` names the same for `map_or`. The "nursery" group and the limit of the lint come from the Clippy source at tag rust-1.90.0 (outside rustguides).
   [Perf Book, standard library types](https://nnethercote.github.io/perf-book/standard-library-types.html)
 
 ## Types, newtypes, and enums
@@ -134,8 +137,9 @@ exists, and a source link.
   [C-COMMON-TRAITS](https://rust-lang.github.io/api-guidelines/interoperability.html#c-common-traits)
 - **TYP-10** Mark a public enum `#[non_exhaustive]` when a new variant must not break downstream matches.
   [non_exhaustive attribute](https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute)
-- **TYP-11** Put `#[repr(transparent)]` on a newtype whose inner layout must stay the same, for example a newtype that crosses an FFI or on-disk layout boundary.
-  [Effective Rust, Item 6](https://effective-rust.com/newtype.html)
+- **TYP-11** Put `#[repr(transparent)]` on a newtype whose inner layout must stay the same, for example a newtype passed through FFI or cast to and from its inner type. On-disk bytes stay in an explicit codec (DEC-1), never in a cast.
+  Source: Effective Rust Item 6 (rustguides `#9c82c6`, `line:1596`): "the `#[repr(transparent)]` attribute ensures that a newtype has the same representation in memory as the inner type"; Rustonomicon (rustguides `#d23ca5`, `line:582`): passing the struct through FFI where the inner type is expected is guaranteed to work. Neither source covers on-disk formats.
+  [Effective Rust, Item 6](https://www.lurklurk.org/effective-rust/newtype.html)
 
 ## Traits and generics
 
@@ -209,7 +213,8 @@ exists, and a source link.
   [Perf Book, iterators](https://nnethercote.github.io/perf-book/iterators.html)
 - **ITR-9** Give every loop a fixed upper bound, or document and assert its non-termination contract.
   [AGENTS.md, Correctness](../AGENTS.md)
-- **ITR-10** Give a custom `Iterator` that is collected on a hot path an accurate `size_hint` (and `ExactSizeIterator::len` when exact), so `collect` allocates once.
+- **ITR-10** Give a custom `Iterator` that is collected on a hot path an accurate `size_hint`. If the length is exact, also implement `ExactSizeIterator`. Then `collect` can reserve once.
+  Source: Perf Book (rustguides `#ffd530`, `line:975-977`): it is worth implementing `Iterator::size_hint` or `ExactSizeIterator::len`; `collect` and `extend` "may then do fewer allocations".
   [Perf Book, iterators](https://nnethercote.github.io/perf-book/iterators.html)
 
 ## Threads and standard concurrency
@@ -290,7 +295,8 @@ exists, and a source link.
 - **UNS-9** Do not remove a bounds check with `get_unchecked` unless a benchmark shows the check is hot.
   [Perf Book, bounds checks](https://nnethercote.github.io/perf-book/bounds-checks.html)
 - **UNS-10** Do not use `transmute` or a raw-pointer dereference to extend a lifetime; bound the lifetime at the function boundary instead.
-  Lint: `clippy::transmute_ptr_to_ref`.
+  Lint: `clippy::transmute_ptr_to_ref` (group `complexity`) flags only a `transmute` from a raw pointer to a reference. No lint flags `&*ptr` or `transmute_copy`, so review enforces this rule for them.
+  Source: Rustonomicon, Unbounded Lifetimes (rustguides `#d23ca5`, `line:1143-1150`): "transmute and transmute_copy are the two other primary offenders. One should endeavor to bound an unbounded lifetime as quickly as possible, especially across function boundaries." The lint facts come from the Clippy source at tag rust-1.90.0 (outside rustguides).
   [Rustonomicon, unbounded lifetimes](https://doc.rust-lang.org/nomicon/unbounded-lifetimes.html)
 
 ## Documentation
@@ -317,8 +323,9 @@ exists, and a source link.
   [AGENTS.md, Task Quality](../AGENTS.md)
 - **TST-2** A crash-consistency change tests every crash boundary it adds or moves.
   [AGENTS.md, Correctness](../AGENTS.md)
-- **TST-3** Keep test bodies out of production files: end the file with only `#[cfg(test)] mod tests;` and put the tests in `foo/tests.rs`, or in `foo_tests.rs` declared with `#[path = "foo_tests.rs"]`. No inline `mod tests { ... }` body and no `#[test]` function in a production file. Enforced by `.github/scripts/checks.py test-layout` against a baseline that may only shrink.
-  [Book 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html), [Effective Rust, Item 30](https://effective-rust.com/testing.html)
+- **TST-3** Test bodies live in separate files. A production file has no `mod <name> { ... }` test body and no `#[test]` function. It declares each test module as `#[cfg(test)] mod <name>;`. The test file is `foo/<name>.rs`, for example `foo/tests.rs`. It can also be `foo_tests.rs`, declared with `#[path = "foo_tests.rs"]`. For many test files, use a directory: `foo/tests/mod.rs` with sub-modules. A mod.rs-style parent (`mod.rs`, `lib.rs`, `main.rs`) can declare `mod foo_tests;`, with sub-modules in `foo_tests/`. A non-mod-rs `foo.rs` declares `#[cfg(test)] #[path = "foo_tests/mod.rs"] mod tests;`. The sub-modules then sit next to that `mod.rs`, because a `#[path]` file resolves its children relative to itself. Put end-to-end tests of the public API in `tests/`, with helpers in `tests/common/mod.rs`. Use doc tests only as examples of the public API, not as unit tests. A child test module keeps access to private items through `use super::*;`. The check `.github/scripts/checks.py test-layout` treats these as test-only files: `tests.rs`, `*_tests.rs`, any `tests/` directory, and any `*_tests/` directory. It does not read the module tree. Name each test-only file in one of these ways. The check counts inline test bodies and test functions in all other files. Each count must match its baseline exactly, and a difference in either direction fails. A baseline entry only shrinks. The PR that removes inline tests lowers the entry.
+  Source: project rule, owner decision of 2026-11-19 (tests live in separate files). Book 11.3 (rustguides `#4a01ba`, `line:8910`: "unit tests go in the same files as the code") teaches the inline form, so it does not support the ban. Book 11.3 (`line:9025`, `line:9086-9101`) supports the `tests/` and `tests/common/mod.rs` clauses. Book 14.2 (`line:11252`) supports the doc-test clause. Effective Rust Item 30 (rustguides `#9c82c6`, `line:7989` and `line:8177`) supports integration tests for the public API and doc tests as examples of the public API.
+  [Book 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html), [Effective Rust, Item 30](https://www.lurklurk.org/effective-rust/testing.html)
 - **TST-4** Test code may use `unwrap` and `expect`; set `allow-unwrap-in-tests` and `allow-expect-in-tests` in `clippy.toml`.
   [Clippy lint configuration](https://doc.rust-lang.org/clippy/lint_configuration.html#allow-unwrap-in-tests)
 - **TST-5** A test name states the behavior and the condition it exercises.
@@ -357,7 +364,7 @@ exists, and a source link.
 
 ## Rules from The Rust Programming Language, chapter by chapter
 
-Rules derived from the book's chapters and appendices. The record of how the book was read is in the RustRules handoff report, not in this document.
+Rules derived from the book's chapters and appendices. The record of how the book was read is not part of this document.
 A rule here adds to the topic sections above; where a book rule repeats one above, only
 the topic rule is kept. Lint names marked "not enabled" exist but are not on the deny list.
 
@@ -426,7 +433,7 @@ the topic rule is kept. Lint names marked "not enabled" exist but are not on the
   [Ch 10.1](https://doc.rust-lang.org/book/ch10-01-syntax.html)
 ### Ch 11 Automated Tests
 
-- **BK11-1** Unit tests live in a sibling test module (`foo/tests.rs` or `foo_tests.rs`, declared with `#[cfg(test)] mod tests;`), never in an inline body; tests of the public API live in `tests/` with helpers in `tests/common/mod.rs`.
+- **BK11-1** Unit tests live in a sibling test module and never in an inline body. End-to-end tests of the public API live in `tests/`. TST-3 has the full rule.
   [Ch 11.3](https://doc.rust-lang.org/book/ch11-03-test-organization.html)
 - **BK11-2** Tests run in parallel; give each a unique temp path, and use `--test-threads=1` only for tests that share global state.
   [Ch 11.2](https://doc.rust-lang.org/book/ch11-02-running-tests.html)
@@ -458,8 +465,9 @@ the topic rule is kept. Lint names marked "not enabled" exist but are not on the
 - **BK14-3** Split crates inside one workspace (one `Cargo.lock`, one `target/`) and declare each inter-crate dependency explicitly; helper `cargo-*` tools are separate binaries, never runtime dependencies.
   [Ch 14.3](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html),
   [Ch 14.4](https://doc.rust-lang.org/book/ch14-04-installing-binaries.html)
-- **BK14-4** Make Cargo features additive: enabling a feature must only add items, never remove or change behavior, and no feature may exclude another.
-  [Effective Rust, Item 26](https://effective-rust.com/features.html)
+- **BK14-4** Make Cargo features additive: enabling a feature adds items or capabilities. It never removes an item and never makes another feature fail to compile. A disabled-feature stub that returns a named error is allowed.
+  Source: Effective Rust Item 26 (rustguides `#9c82c6`, `line:6978`): "features should be additive; it's a bad idea to have mutually incompatible features". The list at `line:7052` says "Features should be additive". `line:7054` says to avoid feature gates on public struct fields or trait methods. The source does not forbid a change of behavior, so this rule does not.
+  [Effective Rust, Item 26](https://www.lurklurk.org/effective-rust/features.html)
 ### Ch 15 Smart Pointers
 
 - **BK15-1** Use `Box<T>` to move a large value cheaply or to build a recursive type, not as a default wrapper.
@@ -565,27 +573,41 @@ not replace `AGENTS.md` or the `kvstore-concurrency` skill.
   error type (today `LocalDbError` and `TcpError`); `Error::source` itself returns
   `dyn Error`, and the `Arc` keeps the error `Clone`. Document the slot at the type.
   `benchmarks/kv-research` is benchmark-driver class: its `BackendResult`
-  (`Box<dyn Error + Send + Sync>`) and string errors stay, and R7 does not replace them
+  (`Box<dyn Error + Send + Sync>`) and string errors stay, and no planned change replaces them
   with an enum. Binaries and tests may use `Box<dyn Error>` at the top level.
 - **DEC-3** Newtype every position, generation, epoch, partition, batch identity, and
   mutation version where a bare integer could be mixed up. `distributed/types.rs`
   (`BatchId`, `BatchVersion`, `MutationVersion`, `PhysicalValueAddress`) is the model.
 - **DEC-4** The native engine (`tidehunter/src/` outside `distributed/`) is out of scope
   for idiom and lint changes. Change it only to fix a defect, and keep the change
-  minimal for rebasing on upstream MystenLabs.
-- **DEC-5** The lint scaffold has two stages. Stage 1 (R6, zero-hit lints, enforced once
-  R6 patch 17 lands): `deny` for `unwrap_used`, `expect_used`,
+  minimal for rebasing on upstream MystenLabs. One exception, owner decision of
+  2026-11-20: the series that replaces the distributed index with the native index
+  may change native code for the WAL position trait and the generic native index.
+  Each such hunk passes a gate. The native benches stay within 1% of the base (owner
+  rule), and an `objdump` comparison covers the gated hunks. The owner accepted the
+  native bench result for these two changes on 2026-11-20. A later amendment of the
+  same plan adds the gated `pub(crate)` function `Wal::plan_frame` in `wal/mod.rs`
+  under the same gate. Its gate has not run yet, and no accepted result exists for it.
+  Every other native change keeps the rule above.
+  New tests for a changed native file go in a sibling test file (TST-3). Existing
+  inline native tests stay.
+- **DEC-5** The lint scaffold has two stages. Stage 1 (zero-hit lints): `deny` for
+  `unwrap_used`, `expect_used`,
   `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`, `mutex_atomic`,
   `await_holding_lock`, `await_holding_refcell_ref`, `arc_with_non_send_sync`, and
   `unsafe_op_in_unsafe_fn`, plus a workspace `clippy.toml` that allows unwrap and expect
-  in tests. Stage 2 (R7, deferred by the owner decision "option B"):
-  `#![warn(clippy::pedantic)]`, `redundant_clone`, and `clone_on_ref_ptr`. Until stage 2
-  lands, review enforces CLN-1 and CLN-2. A pedantic allow is item-level with a
+  in tests. Stage 1 is in force at `c97de76b` in all three scopes: inner attributes in
+  `tidehunter/src/distributed/mod.rs`, inner attributes in
+  `benchmarks/kv-research/src/lib.rs` and `main.rs`, and `[lints]` in
+  `tidehunter-fabric/Cargo.toml`. Stage 2 (deferred by the owner): `clippy::pedantic`,
+  `redundant_clone`, and `clone_on_ref_ptr`. Only `tidehunter-fabric` denies `pedantic`
+  today. In the other two scopes, review enforces CLN-1 and CLN-2 until stage 2
+  lands. A pedantic allow is item-level with a
   `reason`; only `module_name_repetitions` may be allowed module-wide.
-- **DEC-6** Production and test files target 1,000 lines. Once R6 patch 17 lands,
+- **DEC-6** Production and test files target 1,000 lines.
   `.github/scripts/checks.py file-length` enforces a ratchet: a file listed in
-  `.github/scripts/file-length-baseline.txt` may not grow, and any other file in the
-  audited trees stays at or below 1,500 lines. Split a baseline file; never raise its count.
+  `.github/scripts/file-length-baseline.txt` must match its entry exactly. Any other file in the
+  audited trees stays at or below 1,500 lines. A difference in either direction fails the check. Split a baseline file and lower its entry in the same PR; never raise it.
 - **DEC-7** A hot-path change needs the local live bench at c=1, 4, and 16 with the
   no-waiting rule, 5 interleaved repeats, and p50/p99 within 3% or a written
   justification. Run it in a quiet window: load below 5, no other cargo, rustc, or dd.
@@ -599,7 +621,11 @@ not replace `AGENTS.md` or the `kvstore-concurrency` skill.
   named, documented message (for example the `TH_SYNC_WRITES` mismatch).
 - **DEC-11** Default visibility in `distributed/` is private or `pub(crate)`. `pub` is
   for the Sui adapter boundary (`distributed/sui.rs`) and for the kv-research backend
-  API, not for internal storage types.
+  API, not for internal storage types. Known debt at `c97de76b`: 19 of the 20 non-test
+  modules in `distributed/mod.rs` are `pub mod`. Thirteen have a consumer outside the
+  module tree. Six have none: `index_reference`, `native_publication`,
+  `reference_directory`, `sequence`, `shard_lock`, and `write_timeline`. This debt only
+  shrinks: do not add a `pub mod`, and narrow a module to `pub(crate)` when you touch it.
 - **DEC-12** Use `Bytes` for payloads on the wire and disk paths; do not copy them into
   `Vec<u8>`. Use `&[u8]` for borrowed views.
 - **DEC-13** No new dependency without the `AGENTS.md` dependency review. Prefer the
@@ -609,6 +635,8 @@ not replace `AGENTS.md` or the `kvstore-concurrency` skill.
 - **DEC-15** Record every benchmark result and its environment under the project
   evidence directory `checkpoint-work/` (not tracked in this repository). A performance
   claim without recorded evidence is not accepted.
-- **DEC-16** Every Rust patch gets a guideline review from the Rust review contact
-  (`RustReview`, successor of `RustRules`) before it is exported. Fix each rule-numbered
-  finding, or state the justification in the patch report.
+- **DEC-16** Every PR gets one review by a reviewer agent before merge, in addition to
+  one CI run per PR (no retry). The review is a text review grounded in `rustguides`
+  and cites the rule ID of each finding. Fix each rule-numbered finding, or state the
+  justification in the PR body. A PR that touches code the series deletes states its
+  reason in the PR body.
