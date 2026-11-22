@@ -30,15 +30,11 @@ pub fn table_mutexes(table: &Table) -> usize {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexCell {
-    Uniform(u32),
+    Uniform(u64),
     Prefix([u8; 18]),
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "the shifted product stays below the cell count bound checked here"
-)]
-fn index_cell(table: &Table, key: &[u8]) -> IndexCell {
+fn index_cell(table: &Table, key: &[u8]) -> BackendResult<IndexCell> {
     let prefix_bits: usize = match table.key_shape.as_str() {
         "sequence_prefix_48" => 48,
         "epoch_digest_prefix_140" => 140,
@@ -50,16 +46,25 @@ fn index_cell(table: &Table, key: &[u8]) -> IndexCell {
         let mut prefix = [0; 4];
         let len = key.len().min(4);
         prefix[..len].copy_from_slice(&key[..len]);
+        // The product is below `table_mutexes(table)`, so the bucket is a cell number.
         let bucket = (u64::from(u32::from_be_bytes(prefix)) * table_mutexes(table) as u64) >> 32;
-        return IndexCell::Uniform(u32::try_from(bucket).expect("at most 8192 cells"));
+        return Ok(IndexCell::Uniform(bucket));
     }
     let bytes = prefix_bits.div_ceil(8);
+    let Some(head) = key.get(..bytes) else {
+        return Err(format!(
+            "table {} key of {} bytes is shorter than its {bytes}-byte prefix",
+            table.name,
+            key.len()
+        )
+        .into());
+    };
     let mut prefix = [0; 18];
-    prefix[..bytes].copy_from_slice(&key[..bytes]);
+    prefix[..bytes].copy_from_slice(head);
     if !prefix_bits.is_multiple_of(8) {
         prefix[bytes - 1] &= 0xff << (8 - prefix_bits % 8);
     }
-    IndexCell::Prefix(prefix)
+    Ok(IndexCell::Prefix(prefix))
 }
 
 pub struct NativeReplayBackend {
@@ -167,7 +172,7 @@ impl NativeReplayBackend {
             } else {
                 row.key.clone()
             };
-            let cell = index_cell(table, &reduced);
+            let cell = index_cell(table, &reduced)?;
             if keys.insert((row.table, reduced)) {
                 let count = cells.entry((row.table, cell)).or_default();
                 *count = count

@@ -301,18 +301,11 @@ impl Session {
         sock.socket.set_nonblocking(true)?;
         Ok(Self::from_parts(None, sock, 0, false))
     }
-    #[allow(
-        clippy::expect_used,
-        reason = "queue_inner appends the frame before returning Ok"
-    )]
     fn queue<T: Serialize>(&mut self, id: u64, body: &T, limit: usize) -> Result<(), TcpError> {
         let began = self.time_work.then(Instant::now);
-        let result = self.queue_inner(id, body, limit);
-        let bytes = result
-            .as_ref()
-            .map(|()| self.output.back().expect("queued frame").len);
-        self.stats.frame_encode.record(began, &bytes);
-        result
+        let queued = self.queue_inner(id, body, limit);
+        self.stats.frame_encode.record(began, &queued);
+        queued.map(|_| ())
     }
 
     fn queue_response(
@@ -350,12 +343,13 @@ impl Session {
         self.output.len() < SESSION_REQUESTS
             && self.output_fits(self.spare_output.capacity().max(size.saturating_add(4)))
     }
+    /// Queues one frame and returns its length, for the encode statistics.
     fn queue_inner<T: Serialize>(
         &mut self,
         id: u64,
         body: &T,
         limit: usize,
-    ) -> Result<(), TcpError> {
+    ) -> Result<usize, TcpError> {
         if self.closed {
             return Err(TcpError::new("session is closed"));
         }
@@ -396,7 +390,7 @@ impl Session {
         });
         self.stats.peak_output_frames = self.stats.peak_output_frames.max(self.output.len() as u64);
         self.stats.peak_output_bytes = self.stats.peak_output_bytes.max(self.output_bytes as u64);
-        Ok(())
+        Ok(len)
     }
     /// Tells a TCP peer why this side ends the session before `abort` closes it:
     /// one unsolicited `Response::Error` frame with ID 0. Best effort and never
@@ -461,10 +455,6 @@ impl Session {
         self.input.clear();
     }
     #[cfg(feature = "experimental-fabric")]
-    #[allow(
-        clippy::expect_used,
-        reason = "stage timestamps exist only when timing is enabled, as the branch requires"
-    )]
     fn write_native(&mut self, budget: usize) -> Result<usize, TcpError> {
         if budget == 0 {
             return Ok(0);
@@ -493,8 +483,8 @@ impl Session {
                 if n != 0
                     && start == 0
                     && let Some(queued) = output.stage_started
+                    && let Some(started) = began
                 {
-                    let started = began.expect("timed output requires enabled diagnostics");
                     self.stats.output_queue_ns = self.stats.output_queue_ns.saturating_add(
                         started
                             .duration_since(queued)
@@ -512,10 +502,6 @@ impl Session {
             Err(error) => Err(error.into()),
         }
     }
-    #[allow(
-        clippy::expect_used,
-        reason = "stage timestamps exist only when timing is enabled, as the branch requires"
-    )]
     fn write_plaintext(&mut self, budget: usize) -> Result<usize, TcpError> {
         #[cfg(feature = "experimental-fabric")]
         if self.conn.is_none() && self.is_fabric() {
@@ -550,8 +536,8 @@ impl Session {
                 if n != 0
                     && output.offset == 0
                     && let Some(queued) = output.stage_started
+                    && let Some(started) = began
                 {
-                    let started = began.expect("timed output requires enabled diagnostics");
                     self.stats.output_queue_ns = self.stats.output_queue_ns.saturating_add(
                         started
                             .duration_since(queued)
@@ -783,10 +769,6 @@ impl Session {
     }
     /// Keep submission separate from retirement. Native and TLS output frames
     /// share the same bounded provider ownership and contiguous completion rules.
-    #[allow(
-        clippy::expect_used,
-        reason = "the front fence check above proves a frame to retire"
-    )]
     fn finish_output(&mut self, accepted: u64, completed: u64) -> bool {
         if !self.output_budget.frame_gate_observed
             && self.output.len() > self.submitted + 1
@@ -817,12 +799,7 @@ impl Session {
             self.stats.frames_submitted = self.stats.frames_submitted.saturating_add(1);
             changed = true;
         }
-        while self
-            .output
-            .front()
-            .is_some_and(|output| output.fence.is_some_and(|fence| fence <= completed))
-        {
-            let output = self.output.pop_front().expect("front frame present");
+        while let Some(output) = pop_retired(&mut self.output, completed) {
             if let Some(submitted) = output.stage_started {
                 let now = *transition_time.get_or_insert_with(Instant::now);
                 self.stats.output_retire_ns = self.stats.output_retire_ns.saturating_add(
@@ -1491,10 +1468,6 @@ impl Client {
         })
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "the correlated result is present when the exchange reports it"
-    )]
     pub(super) fn exchange_correlated(
         &mut self,
         request: &Request,
@@ -1543,8 +1516,10 @@ impl Client {
                 self.fail_connection();
                 return Err(error);
             }
-            if self.reactor.control_result.is_some() && !self.stream.output_pending(id) {
-                let response = self.reactor.control_result.take().expect("checked above");
+            if self.reactor.control_result.is_some()
+                && !self.stream.output_pending(id)
+                && let Some(response) = self.reactor.control_result.take()
+            {
                 self.trace_control_complete(id, !matches!(&response, Response::Error(_)));
                 self.reactor.control = None;
                 self.reactor.control_profiled = false;
@@ -1687,10 +1662,6 @@ fn revalidate_client_peer(
     Ok(())
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "the dispatch loop bounds its pops by the queue it just filled"
-)]
 pub(super) fn serve_session(
     node: &Arc<StorageNode>,
     mut stream: Session,
@@ -2031,7 +2002,11 @@ pub(super) fn serve_session(
             // busy control owner cannot block unrelated requests.
             let mut blocked_control = false;
             for _ in 0..controls.len() {
-                let (id, request) = controls.pop_front().expect("bounded by controls.len()");
+                let Some((id, request)) = controls.pop_front() else {
+                    // Unreachable: each pass pops one entry and pushes at most one
+                    // back, so `controls.len()` at loop entry bounds the pops.
+                    break;
+                };
                 let is_append = control::is_stream_request(&request);
                 if blocked_control || barrier_active || (!is_append && active_appends != 0) {
                     #[cfg(test)]
@@ -2197,6 +2172,16 @@ pub(super) fn serve_session(
         workers -= 1;
     }
     result
+}
+
+/// Removes the front output frame once its completion fence has retired.
+/// Check and removal share one borrow, so no unreachable `pop_front` result exists.
+fn pop_retired(output: &mut VecDeque<Output>, completed: u64) -> Option<Output> {
+    if output.front()?.fence? <= completed {
+        output.pop_front()
+    } else {
+        None
+    }
 }
 
 // Stable diagnostic codes, independent of bincode enum discriminants and

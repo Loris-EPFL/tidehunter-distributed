@@ -300,22 +300,20 @@ impl CompleteGroup {
     }
 
     /// Decode stable, owned bytes without a second whole-group copy.
-    #[allow(
-        clippy::expect_used,
-        reason = "the length check at the top covers every fixed header window"
-    )]
     fn decode_owned(
         shape: &KeyShape,
         encoded: Bytes,
         batch_limits: BatchLimits,
         limits: GroupLimits,
     ) -> Result<Self, GroupError> {
-        if encoded.len() < GROUP_HEADER_LEN {
+        // `header` is a `&[u8; GROUP_HEADER_LEN]`: the compiler rejects any constant
+        // index outside the header, so every field read below is proven in range.
+        let Some(header) = encoded.first_chunk::<GROUP_HEADER_LEN>() else {
             return Err(GroupError::Truncated);
-        }
-        let version = u16::from_be_bytes(encoded[8..10].try_into().expect("header window"));
-        let flags = u16::from_be_bytes(encoded[10..12].try_into().expect("header window"));
-        if &encoded[..8] != MAGIC
+        };
+        let version = u16::from_be_bytes([header[8], header[9]]);
+        let flags = u16::from_be_bytes([header[10], header[11]]);
+        if header[..8] != *MAGIC
             || !matches!(
                 (version, flags),
                 (FORMAT_VERSION, 0) | (LIVE_FORMAT_VERSION, LIVE_BLOCK_SHIFT)
@@ -323,7 +321,7 @@ impl CompleteGroup {
         {
             return Err(GroupError::InvalidFormat);
         }
-        let count = u32::from_be_bytes(encoded[12..16].try_into().expect("header window")) as usize;
+        let count = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
         check_count(count, limits)?;
         // At least an inner CRC and one payload byte rounded to alignment.
         // Reject impossible peer-provided counts before count-sized allocation.

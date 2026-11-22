@@ -26,10 +26,6 @@ pub struct Table {
     pub control: bool,
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "the static table list above is fixed at seventeen entries"
-)]
 pub fn tables() -> Vec<Table> {
     [
         ("certified_checkpoints", 1, 8, "sequence_prefix_48"),
@@ -76,9 +72,9 @@ pub fn tables() -> Vec<Table> {
         ("watermarks", 1, 4, "control"),
     ]
     .into_iter()
-    .enumerate()
-    .map(|(id, (name, db_id, key_bytes, shape))| Table {
-        id: u16::try_from(id).expect("17 static tables"),
+    .zip(0u16..)
+    .map(|((name, db_id, key_bytes, shape), id)| Table {
+        id,
         db_id,
         name: name.into(),
         node_name: if id == 5 {

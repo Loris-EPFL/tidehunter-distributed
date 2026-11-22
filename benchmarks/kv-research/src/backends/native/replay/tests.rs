@@ -62,3 +62,28 @@ fn actual_index_serializer_confirms_geometry_rejection_before_open() {
     let actual_frame = ((serialized.len() as u64 + 10).div_ceil(8)) * 8;
     assert_eq!(admission["maximum_index_frame_bytes"], actual_frame);
 }
+
+#[test]
+fn geometry_admission_rejects_a_key_shorter_than_its_prefix_bits() {
+    let tables = crate::mainnet_trace::tables();
+    // Table 0 routes on a 48-bit sequence prefix, so a key needs six bytes.
+    let row = |len: usize| Row {
+        table: 0,
+        tx: 0,
+        backend_key: Bytes::from(vec![1; len]),
+        backend_owner: 0,
+        key: Bytes::from(vec![1; len]),
+        value: Bytes::new(),
+    };
+    let options = serde_json::json!({"path":"not-opened", "native_wal_geometry":"native_default"});
+    let short = row(5);
+    let error = NativeReplayBackend::validate_geometry(&options, &tables, [&short].into_iter())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("shorter than its 6-byte prefix"),
+        "short key must name the prefix bound, got: {error}"
+    );
+    let exact = row(6);
+    NativeReplayBackend::validate_geometry(&options, &tables, [&exact].into_iter())
+        .expect("a key with the full prefix is admitted");
+}
