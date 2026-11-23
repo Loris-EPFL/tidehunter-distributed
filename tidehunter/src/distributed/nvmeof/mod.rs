@@ -11,6 +11,10 @@ pub(crate) mod live_prometheus;
 /// payloads carry them (see `tcp::live_wire`).
 pub mod live_storage;
 pub mod live_target;
+
+#[cfg(test)]
+#[path = "kernel_write_protect_tests.rs"]
+mod kernel_write_protect_tests;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
