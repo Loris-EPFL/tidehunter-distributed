@@ -276,3 +276,106 @@ fn recovery_stats_report_the_control_region_load() {
     assert!(db.recovery_stats().checkpoint_loaded);
     assert!(db.recovery_stats().checkpoint_load_ns > 0);
 }
+
+/// Per owner: the namespaces its permanent exports exposed, then the inline
+/// exports it created while a resolve or a replay request waited.
+fn owner_exports(fixture: &Fixture) -> Vec<(u64, u64, u64)> {
+    fixture
+        .nodes
+        .iter()
+        .map(|node| {
+            let exposed = node
+                .with_live_target(|target| target.stats())
+                .expect("target statistics")
+                .namespaces_exposed;
+            let inline = node.live_inline_export_stats();
+            (exposed, inline.resolve, inline.replay)
+        })
+        .collect()
+}
+
+/// D26: after a clean close the reopen extends the persisted durable cut over
+/// no batch and creates no owner export; it only re-merges the tail above the
+/// stored cell frontier. The stored region names that frontier, which lies
+/// below the last batch, so the tail re-merges idempotently by version (paper
+/// 3.3-3.4). The sealed files keep the permanent exports of the write path, so
+/// neither the reopen nor the reads of the sealed generation create an owner
+/// export. `flush` certifies every batch at the owners before the close on the
+/// native tier; the synchronous tier has nothing unsynced, so it needs none and
+/// never tracks a durable cut.
+fn clean_restart(fixture: Fixture, flush: bool, track_cut: bool, label: &str) {
+    let db = fixture.open();
+    let epoch = db.epoch();
+    write_keys(&fixture, &db, 1);
+    if flush {
+        db.core.flush_durable().expect("flush");
+    }
+    db.shutdown().expect("clean shutdown");
+    drop(db);
+
+    let sealed = owner_exports(&fixture);
+    assert!(
+        sealed.iter().any(|(exposed, _, _)| *exposed > 0),
+        "{label}: the write path exposed permanent exports: {sealed:?}"
+    );
+
+    let mut db = fixture.open();
+    let recovery = db.recovery_stats();
+    assert!(
+        recovery.checkpoint_loaded,
+        "{label}: the clean close stored a control region"
+    );
+    let expected_cut = track_cut.then_some(RecoveredCut {
+        epoch,
+        next: u64::from(KEYS),
+    });
+    assert_eq!(
+        recovery.recovered_cut, expected_cut,
+        "{label}: the tracked cut certified every batch before the close, and an untracked synchronous epoch has no cut to extend: {recovery:?}"
+    );
+    assert_eq!(
+        recovery.cut_extended_batches, 0,
+        "{label}: the reopen extended the persisted cut over no batch: {recovery:?}"
+    );
+    assert_eq!(
+        recovery.tail_batches,
+        u64::from(KEYS),
+        "{label}: the region names the cell frontier, so the tail re-merges idempotently: {recovery:?}"
+    );
+    assert_eq!(
+        recovery.below_cut_skipped, 0,
+        "{label}: every re-merged batch lies above the stored frontier: {recovery:?}"
+    );
+    assert_eq!(
+        owner_exports(&fixture),
+        sealed,
+        "{label}: the reopen created no export beyond the permanent ones"
+    );
+
+    for key in 0..KEYS {
+        assert_eq!(
+            db.get(KeySpace(0), &key.to_be_bytes())
+                .expect("read")
+                .expect("the written key survived the clean restart")
+                .as_ref(),
+            &value_of(key),
+            "{label}: key {key}"
+        );
+    }
+    assert_eq!(
+        owner_exports(&fixture),
+        sealed,
+        "{label}: reads of the sealed generation reused the permanent exports"
+    );
+}
+
+#[test]
+fn clean_restart_replays_only_the_tail_and_creates_no_export() {
+    clean_restart(
+        Fixture::new(),
+        true,
+        true,
+        "native, flushed before the close",
+    );
+    clean_restart(Fixture::new().synchronous(), false, false, "synchronous");
+}
