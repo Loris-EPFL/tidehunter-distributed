@@ -27,6 +27,7 @@ use std::sync::Arc;
 mod anchor;
 mod boundary;
 mod layout;
+mod shard_preload;
 
 fn shape() -> Arc<KeyShape> {
     Arc::new(KeyShape::new_single(4, 1, KeyType::uniform(1)))
