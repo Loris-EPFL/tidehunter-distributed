@@ -39,6 +39,10 @@ struct LockCounters {
     wait_ns: AtomicU64,
     hold_samples: AtomicU64,
     hold_ns: AtomicU64,
+    /// Test observable: set once a caller has taken its wait timestamp and is
+    /// about to block, so a reader that observes it knows the wait is queued.
+    #[cfg(test)]
+    blocked: AtomicU64,
 }
 
 fn nanos(duration: Duration) -> u64 {
@@ -100,6 +104,11 @@ impl<T> ShardMutex<T> {
         self.counters.enter();
         let guard = self.lock.try_lock().unwrap_or_else(|| {
             let waiting = Instant::now();
+            // Release publishes the queued wait; a test reader pairs it with an
+            // Acquire load, while the statistics below stay Relaxed because no
+            // data is published through them.
+            #[cfg(test)]
+            self.counters.blocked.fetch_add(1, Ordering::Release);
             let guard = self.lock.lock();
             self.counters.waited(waiting);
             guard
@@ -109,6 +118,14 @@ impl<T> ShardMutex<T> {
             counters: &self.counters,
             held_since: Instant::now(),
         }
+    }
+
+    /// Number of acquisitions that entered the blocking path. The wait timer
+    /// starts before this count moves, so a reader that observes it knows the
+    /// acquisition is queued and the eventual `wait_ns` covers the interval.
+    #[cfg(test)]
+    fn blocked_waits(&self) -> u64 {
+        self.counters.blocked.load(Ordering::Acquire)
     }
 
     pub(crate) fn stats(&self) -> ShardLockStats {

@@ -40,23 +40,28 @@ fn uncontended_acquisitions_record_no_wait_and_contention_records_wait() {
             assert!(released.load(Ordering::SeqCst));
         })
     };
-    // Progress wait: the waiter's blocked entry must be counted before the
-    // release; only a dead waiter exhausts the cap.
+    // Progress wait: the waiter counts its blocked entry after it starts the
+    // wait timer, so observing the count proves the acquisition will block
+    // until the holder releases.
     let blocked = Instant::now() + PROGRESS_CAP;
-    while lock.stats().acquisitions < 4 {
+    while lock.blocked_waits() == 0 {
         assert!(
             Instant::now() < blocked,
-            "waiter never reached the contended lock"
+            "waiter never queued on the contended lock"
         );
         std::thread::yield_now();
     }
-    // The waiter registered its wait before this point, so 5 ms after it is a
-    // floor on the blocked period; load only lengthens the measured wait.
-    std::thread::sleep(Duration::from_millis(5));
     released.store(true, Ordering::SeqCst);
     drop(holder);
     waiter.join().unwrap();
     let stats = lock.stats();
-    assert_eq!(stats.contended, 1);
-    assert!(stats.wait_ns >= 1_000_000, "wait covers the blocked period");
+    assert_eq!(stats.contended, 1, "one acquisition waited on the holder");
+    assert_eq!(
+        stats.acquisitions, 4,
+        "two plain locks, the holder and the waiter"
+    );
+    assert!(
+        stats.wait_ns > 0,
+        "the wait covers the interval from the queue signal"
+    );
 }

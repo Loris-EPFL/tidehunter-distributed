@@ -52,10 +52,13 @@ fn polled_ring_reads_or_reports_unsupported() {
         LiveSubmitOutcome::Submitted
     );
     assert!(polled.wait(Duration::from_secs(10)).unwrap());
-    let completed = polled
-        .progress_one()
-        .unwrap()
-        .expect("polled CQE must retire");
+    let mut completions = polled.progress().unwrap();
+    assert_eq!(
+        completions.len(),
+        1,
+        "the polled CQE retires exactly one completion"
+    );
+    let completed = completions.remove(0);
     match completed.result {
         Ok(LiveIoResult::Reads(records)) => {
             assert_eq!(records.len(), 1);
@@ -96,7 +99,13 @@ fn polled_ring_writes_or_reports_unsupported() {
             LiveSubmitOutcome::Submitted
         );
         assert!(polled.wait(Duration::from_secs(10)).unwrap());
-        let completed = polled.progress_one().unwrap().unwrap();
+        let mut completions = polled.progress().unwrap();
+        assert_eq!(
+            completions.len(),
+            1,
+            "the polled write retires exactly one completion"
+        );
+        let completed = completions.remove(0);
         assert_eq!(completed.id, id);
         match completed.result {
             Ok(LiveIoResult::Written) => {}
@@ -913,22 +922,6 @@ fn terminal_write_result_override_is_one_shot_and_keeps_unknown_outcomes() {
     assert_eq!(io.stats().short_write_bytes, 2048);
     assert_eq!(io.stats().completed_write_ops, 1);
     assert_eq!(io.stats().completions, 3);
-}
-
-impl LiveIo {
-    /// Scalar retirement without allocating a completion Vec.
-    fn progress_one(&mut self) -> Result<Option<LiveCompletion>, LiveIoError> {
-        let mut out = None;
-        let mut multiple = false;
-        self.progress_with(|completion| {
-            multiple |= out.is_some();
-            out = Some(completion);
-        })?;
-        if multiple {
-            return Err(LiveIoError::Invalid("multiple scalar completions"));
-        }
-        Ok(out)
-    }
 }
 
 /// Unit test of `MemberBuffer` alone: a member slice is a refcounted view of a
