@@ -134,6 +134,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-rust-1.90-mainnet-native-${{ hashFiles('Cargo.lock') }}-
 
+      - name: Test the engine-scoped replay audit
+        # Pure Python; no build and no database. Guards the native constants and
+        # the hybrid table the differential oracle gate uses.
+        timeout-minutes: 1
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_mainnet_replay_engine.py' -v
+
       - name: Build native replay only
         # Seven minutes covers cold registry access and native release compilation;
         # the remaining eight minutes cover cache/setup, replay and evidence upload.
