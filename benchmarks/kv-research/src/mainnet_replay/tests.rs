@@ -9,17 +9,11 @@ fn trace() -> Trace {
     )
     .unwrap()
 }
-fn temp(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "mainnet-replay-{label}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    root
+/// Replay tree of one test case. `Drop` removes it also when an assertion
+/// panics.
+fn temp(label: &str) -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix(format!("mainnet-replay-{label}-"))
+        .expect("create the replay directory")
 }
 fn config(root: &Path) -> ReplayConfig {
     ReplayConfig {
@@ -89,7 +83,8 @@ fn native_disk_reservation_covers_measured_growth_without_whole_wal_preallocatio
 
 #[test]
 fn configuration_admission_reports_estimates_without_host_capacity() {
-    let root = temp("configuration-admission");
+    let guard = temp("configuration-admission");
+    let root = guard.path().to_path_buf();
     let cfg = config(&root);
     let (_, prepared, resources) = cfg.admit_configuration().unwrap();
     assert_eq!(prepared.len(), 2);
@@ -113,12 +108,12 @@ fn configuration_admission_reports_estimates_without_host_capacity() {
     assert!(resources.get("available_bytes").is_none());
     assert!(resources.get("memory_available_bytes").is_none());
     assert!(!root.join("db").exists());
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn configuration_admission_accepts_estimates_that_execution_rejects() {
-    let root = temp("oversized-admission");
+    let guard = temp("oversized-admission");
+    let root = guard.path().to_path_buf();
     let cfg = config(&root);
     // The distributed arm needs the leased live route; replay::tests owns its
     // fixture options and is gated the same way.
@@ -178,7 +173,6 @@ fn configuration_admission_accepts_estimates_that_execution_rejects() {
         }
     }
     assert!(!root.join("db").exists());
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -187,7 +181,8 @@ async fn real_native_two_repeats_same_final_contents_for_one_and_four_callers() 
     let prepared = Arc::new(prepare(&trace, 2).unwrap());
     let mut finals = Vec::new();
     for n in [1, 4] {
-        let root = temp(&format!("native-{n}"));
+        let guard = temp(&format!("native-{n}"));
+        let root = guard.path().to_path_buf();
         let cfg = config(&root);
         let backend =
             Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
@@ -247,7 +242,6 @@ async fn real_native_two_repeats_same_final_contents_for_one_and_four_callers() 
         );
         finals.push(actual);
         drop(backend);
-        std::fs::remove_dir_all(root).unwrap();
     }
     assert_eq!(finals[0], finals[1]);
     let a = &prepared[0];
@@ -274,7 +268,8 @@ async fn real_native_two_repeats_same_final_contents_for_one_and_four_callers() 
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_report_keeps_parent_batches_and_rejects_short_window() {
-    let root = temp("report");
+    let guard = temp("report");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.workload.repetitions = 1;
     cfg.workload.minimum_measurement_seconds = 30.0;
@@ -299,11 +294,11 @@ async fn native_report_keeps_parent_batches_and_rejects_short_window() {
     assert!(rows.lines().next().unwrap().contains(
         "source_checkpoint,source_tx,repetition,db,table,batch_phase,parent_batch,members"
     ));
-    std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn replay_client_shards_validation_is_host_independent() {
-    let root = temp("replay-shards");
+    let guard = temp("replay-shards");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.execution.concurrency = 16;
     cfg.execution.queue_capacity = 16;
@@ -320,12 +315,12 @@ fn replay_client_shards_validation_is_host_independent() {
                 .contains("client_shards=1")
         );
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn discriminant_and_manifest_bounds_reject_mixed_synthetic_options() {
-    let root = temp("config");
+    let guard = temp("config");
+    let root = guard.path().to_path_buf();
     let cfg = config(&root);
     cfg.validate().unwrap();
     for field in ["dataset", "phases", "seed"] {
@@ -351,11 +346,11 @@ fn discriminant_and_manifest_bounds_reject_mixed_synthetic_options() {
     c.backend.kind = "tidehunter".into();
     let error = c.validate().unwrap_err();
     assert!(error.downcast_ref::<UnsupportedReplayBackend>().is_some());
-    std::fs::remove_dir_all(root).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_callers_reject_busy_dispatch_and_join_on_deadline() {
-    let root = temp("bounded");
+    let guard = temp("bounded");
+    let root = guard.path().to_path_buf();
     let t = trace();
     let p = Arc::new(prepare(&t, 1).unwrap());
     let c = config(&root);
@@ -384,12 +379,12 @@ async fn bounded_callers_reject_busy_dispatch_and_join_on_deadline() {
         .unwrap();
     assert!(pool.recycle(result).is_err());
     pool.close().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_native_bytes_fail_before_finalization() {
-    let root = temp("wrong-bytes");
+    let guard = temp("wrong-bytes");
+    let root = guard.path().to_path_buf();
     let t = trace();
     let cfg = config(&root);
     let mut p = prepare(&t, 1).unwrap();
@@ -418,7 +413,6 @@ async fn wrong_native_bytes_fail_before_finalization() {
     );
     assert!(backend.get(11, b"").unwrap().is_none());
     drop(backend);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A gate around the real native commit is a deterministic blocked-I/O test hook.
@@ -467,7 +461,8 @@ impl ReplayBackend for GatedNative {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_native_commit_times_out_within_deadline_and_grace() {
-    let root = temp("blocked-commit");
+    let guard = temp("blocked-commit");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.workload.repetitions = 1;
     cfg.execution.request_timeout_ms = 1000;
@@ -524,13 +519,13 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     assert_eq!(Arc::strong_count(&native), 1);
     assert!(native.get(16, &2_u32.to_be_bytes()).unwrap().is_none());
     drop(native);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_background_failure_rejects_each_replay_boundary() {
     for boundary in 0..3 {
-        let root = temp(&format!("health-{boundary}"));
+        let guard = temp(&format!("health-{boundary}"));
+        let root = guard.path().to_path_buf();
         let mut cfg = config(&root);
         cfg.workload.repetitions = 1;
         let trace = cfg.validate().unwrap();
@@ -573,7 +568,6 @@ async fn injected_background_failure_rejects_each_replay_boundary() {
             if boundary == 0 { 0 } else { 1 }
         );
         drop(native);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -599,7 +593,8 @@ impl ReplayBackend for PartialNative {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_partial_commit_stops_without_retry_or_final_get_recovery() {
-    let root = temp("partial");
+    let guard = temp("partial");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.workload.repetitions = 1;
     let trace = cfg.validate().unwrap();
@@ -629,12 +624,12 @@ async fn unknown_partial_commit_stops_without_retry_or_final_get_recovery() {
     assert!(native.get(11, b"").unwrap().is_none());
     assert!(native.get(16, &2_u32.to_be_bytes()).unwrap().is_none());
     drop(native);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn perpetual_subset_has_exact_counts_and_real_native_contents() {
-    let root = temp("perpetual");
+    let guard = temp("perpetual");
+    let root = guard.path().to_path_buf();
     let mut config = config(&root);
     config.workload.node_databases = Some(vec![0]);
     let selected = config.validate().unwrap();
@@ -692,7 +687,6 @@ async fn perpetual_subset_has_exact_counts_and_real_native_contents() {
         config.workload.node_databases = Some(ids);
         assert!(config.validate().is_err());
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -742,7 +736,8 @@ fn all_node_database_subsets_preserve_source_phases() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_replay_records_committed_payload_and_device_counter_scope() {
-    let root = temp("amplification");
+    let guard = temp("amplification");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.workload.node_databases = Some(vec![0]);
     cfg.execution.concurrency = 4;
@@ -814,7 +809,6 @@ async fn native_replay_records_committed_payload_and_device_counter_scope() {
         assert_eq!(scope["artifact"], "device_counters.json");
         assert_eq!(scope["payload"], "write_amplification.payload");
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1002,7 +996,8 @@ fn assert_pipeline_order(calls: &[Call], repetitions: usize, depth: usize, reade
 
 #[test]
 fn pipeline_depth_is_optional_bounded_and_absent_by_default() {
-    let root = temp("depth-config");
+    let guard = temp("depth-config");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     let value = serde_json::to_value(&cfg).unwrap();
     assert!(value["workload"].get("checkpoint_pipeline_depth").is_none());
@@ -1025,14 +1020,14 @@ fn pipeline_depth_is_optional_bounded_and_absent_by_default() {
                 .contains("checkpoint_pipeline_depth")
         );
     }
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn depth_one_replays_checkpoints_strictly_in_sequence() {
     let trace = trace();
     let prepared = Arc::new(prepare(&trace, 3).unwrap());
-    let root = temp("depth-one");
+    let guard = temp("depth-one");
+    let root = guard.path().to_path_buf();
     let backend = native(&root, &trace);
     let m = replay(
         Arc::clone(&backend),
@@ -1084,7 +1079,6 @@ async fn depth_one_replays_checkpoints_strictly_in_sequence() {
             .all(|(a, b)| a.0 == b.0 && a.1.value == b.1.value)
     );
     drop(backend);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,7 +1088,8 @@ async fn pipelined_depths_keep_sui_stage_order_counts_and_contents() {
     let prepared = Arc::new(prepare(&trace, repetitions as u64).unwrap());
     let expected = expected_final_rows(&prepared);
     for depth in [1, 2, 4] {
-        let root = temp(&format!("depth-{depth}"));
+        let guard = temp(&format!("depth-{depth}"));
+        let root = guard.path().to_path_buf();
         let backend = native(&root, &trace);
         let m = replay(
             Arc::clone(&backend),
@@ -1135,7 +1130,6 @@ async fn pipelined_depths_keep_sui_stage_order_counts_and_contents() {
             .verify_final(&expected, Instant::now() + Duration::from_secs(60))
             .unwrap();
         drop(backend);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -1251,7 +1245,8 @@ async fn later_checkpoint_reads_in_flight_output_through_overlay() {
     let deadline = || Instant::now() + Duration::from_secs(60);
 
     // K=1: repetition 0 committed before repetition 1 starts; the store serves the read.
-    let root = temp("cross-depth-one");
+    let guard = temp("cross-depth-one");
+    let root = guard.path().to_path_buf();
     let backend = native(&root, &selected);
     let m = replay(
         Arc::clone(&backend),
@@ -1268,10 +1263,10 @@ async fn later_checkpoint_reads_in_flight_output_through_overlay() {
     assert_eq!((m.cross_overlay_reads, m.cross_store_reads), (0, 0));
     assert_contents(&backend, &expected_final_rows(&prepared));
     drop(backend);
-    std::fs::remove_dir_all(root).unwrap();
 
     // K=2: the read happens while repetition 0's outputs are held uncommitted.
-    let root = temp("cross-depth-two");
+    let guard = temp("cross-depth-two");
+    let root = guard.path().to_path_buf();
     let inner = native(&root, &selected);
     #[allow(clippy::mutex_atomic, reason = "Condvar gate needs the mutex")]
     let held = Arc::new(HeldOutputs {
@@ -1317,7 +1312,6 @@ async fn later_checkpoint_reads_in_flight_output_through_overlay() {
     assert!(produced <= first_read && first_read < outputs_committed);
     assert_contents(&inner, &expected_final_rows(&prepared));
     drop(inner);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The final-state oracle is independent of the observed commit order: replaying two
@@ -1343,7 +1337,8 @@ fn final_oracle_rejects_reversed_or_skipped_same_key_commits() {
     watermark.value = Bytes::from_static(b"repetition-1");
     let expected = expected_final_rows(&prepared);
     let apply = |order: &[(usize, usize)]| {
-        let root = temp("oracle");
+        let guard = temp("oracle");
+        let root = guard.path().to_path_buf();
         let backend = native(&root, &selected);
         for chunk in prepared.iter().flat_map(|p| p.preload.chunks(256)) {
             backend.commit(0, chunk).unwrap();
@@ -1354,7 +1349,6 @@ fn final_oracle_rejects_reversed_or_skipped_same_key_commits() {
         }
         let verdict = backend.verify_final(&expected, Instant::now() + Duration::from_secs(60));
         drop(backend);
-        std::fs::remove_dir_all(root).unwrap();
         verdict
     };
     let batches = prepared[0].batches.len();
@@ -1466,7 +1460,8 @@ fn cross_checkpoint_links_gate_reject_conflicts_and_wrong_overlay_values() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipelined_report_records_depth_and_verifies_final_contents() {
-    let root = temp("report-depth");
+    let guard = temp("report-depth");
+    let root = guard.path().to_path_buf();
     let mut cfg = config(&root);
     cfg.execution.concurrency = 4;
     cfg.workload.checkpoint_pipeline_depth = Some(2);
@@ -1486,5 +1481,4 @@ async fn pipelined_report_records_depth_and_verifies_final_contents() {
     assert_eq!(profile["pipeline"]["checkpoint_pipeline_depth"], 2);
     assert_eq!(profile["pipeline"]["max_in_flight_checkpoints"], 2);
     assert_eq!(profile["pipeline"]["read_callers"], 4);
-    std::fs::remove_dir_all(root).unwrap();
 }

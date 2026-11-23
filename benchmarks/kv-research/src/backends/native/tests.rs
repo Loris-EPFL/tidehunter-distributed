@@ -2,14 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn sampled_native_scalar_write_reports_real_append_and_index_stages() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-write-profile-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-write-profile-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let backend = open(
         &serde_json::json!({"path": root.clone(), "durability": "page_cache"}),
         &prometheus::Registry::new(),
@@ -32,19 +27,13 @@ async fn sampled_native_scalar_write_reports_real_append_and_index_stages() {
         "not_applicable"
     );
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn native_barrier_profile_reports_inventory_and_layout() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-barrier-inventory-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-barrier-inventory-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let backend = open(
         &serde_json::json!({"path": root.clone(), "durability": "value_wal_barrier"}),
         &prometheus::Registry::new(),
@@ -72,19 +61,13 @@ async fn native_barrier_profile_reports_inventory_and_layout() {
         persistence["file_calls"]
     );
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn owner_matched_native_geometry_keeps_barrier_and_reads() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-owner-geometry-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-owner-geometry-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let backend = open(
         &serde_json::json!({
             "path": root.clone(),
@@ -117,19 +100,13 @@ async fn owner_matched_native_geometry_keeps_barrier_and_reads() {
     assert_eq!(evidence["value_wal_persistence"]["profiled_barriers"], 1);
     assert_eq!(evidence["value_wal_persistence"]["barrier_errors"], 0);
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn reopening_native_with_mismatched_geometry_is_rejected() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-geometry-mismatch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-geometry-mismatch-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let registry = prometheus::Registry::new();
     let options = serde_json::json!({
         "path": root.clone(),
@@ -159,19 +136,13 @@ async fn reopening_native_with_mismatched_geometry_is_rejected() {
         b"preserved"
     );
     reopened.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn large_files_native_geometry_keeps_barrier_and_reads() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-large-files-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-large-files-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let backend = open(
         &serde_json::json!({
             "path": root.clone(),
@@ -196,20 +167,13 @@ async fn large_files_native_geometry_keeps_barrier_and_reads() {
     assert_eq!(evidence["value_wal_persistence"]["profiled_barriers"], 1);
     assert_eq!(evidence["value_wal_persistence"]["barrier_errors"], 0);
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn native_benchmark_rejects_nonempty_path_without_geometry_witness() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-unwitnessed-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-unwitnessed-").expect("test tree");
+    let root = guard.path().to_path_buf();
     std::fs::write(root.join("wal_0000000000000000"), b"existing").unwrap();
     let error = open(
         &serde_json::json!({"path": root.clone(), "native_wal_geometry": "large_files"}),
@@ -223,19 +187,13 @@ async fn native_benchmark_rejects_nonempty_path_without_geometry_witness() {
         std::fs::read(root.join("wal_0000000000000000")).unwrap(),
         b"existing"
     );
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn grouped_barrier_covers_concurrent_mutations_and_exports_metrics() {
-    let root = std::env::temp_dir().join(format!(
-        "kv-research-native-group-barrier-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-group-barrier-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let options = serde_json::json!({
         "path": root,
         "durability": "value_wal_group_barrier",
@@ -360,16 +318,17 @@ async fn grouped_barrier_covers_concurrent_mutations_and_exports_metrics() {
         vec![1., 2., 3., 4., 6., 8., 12., 16., 24., 32., 64.]
     );
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
 async fn group_barrier_metric_registration_error_propagates_from_open() {
     let registry = prometheus::Registry::new();
     let _barrier = GroupBarrier::new(&registry).unwrap();
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-unused-path-").expect("test tree");
     let error = open(
         &serde_json::json!({
-            "path": std::env::temp_dir().join("kv-research-native-unused-path"),
+            "path": guard.path().join("database"),
             "durability": "value_wal_group_barrier"
         }),
         &registry,
@@ -378,4 +337,27 @@ async fn group_barrier_metric_registration_error_propagates_from_open() {
     .err()
     .unwrap();
     assert!(error.to_string().contains("Duplicate"));
+}
+
+/// A panicking test must not leave its fixture tree behind. Every fixture in
+/// this crate holds a `TempDir`, whose `Drop` runs while the panic unwinds;
+/// this contains that unwind so the property is observable in a passing test.
+#[test]
+fn fixture_tree_is_removed_when_a_test_panics() {
+    let mut seen = std::path::PathBuf::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let guard = tempfile::TempDir::with_prefix("kv-research-panic-cleanup-").unwrap();
+        seen = guard.path().to_path_buf();
+        panic!("simulated test failure");
+    }));
+    assert!(outcome.is_err(), "the simulated failure must unwind");
+    assert!(
+        !seen.as_os_str().is_empty(),
+        "the fixture tree must exist before the simulated panic"
+    );
+    assert!(
+        !seen.exists(),
+        "fixture tree {} must be removed when its test panics",
+        seen.display()
+    );
 }

@@ -23,14 +23,11 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 /// Rows as an engine iterator yields them.
 type RowResults = Vec<BackendResult<(Vec<u8>, Vec<u8>)>>;
 
-fn scratch(name: &str) -> BackendResult<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "op-replay-{name}-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&path)?;
-    Ok(path)
+/// Replay tree of one test case. `Drop` removes it also when an assertion
+/// panics.
+fn scratch(name: &str) -> BackendResult<tempfile::TempDir> {
+    let guard = tempfile::TempDir::with_prefix(format!("op-replay-{name}-"))?;
+    Ok(guard)
 }
 
 fn key(i: u32) -> Vec<u8> {
@@ -400,11 +397,14 @@ fn synthetic_stream_version(
     Ok(s.w)
 }
 
-fn replay(name: &str, stream: &StreamWriter) -> BackendResult<(PathBuf, super::TraceReport)> {
+fn replay(
+    name: &str,
+    stream: &StreamWriter,
+) -> BackendResult<(tempfile::TempDir, super::TraceReport)> {
     let root = scratch(name)?;
-    let trace = root.join("trace");
+    let trace = root.path().join("trace");
     write_trace(&trace, &[("authorities_db/epoch_0", stream)])?;
-    let report = replay_trace(&trace, &root.join("work"))?;
+    let report = replay_trace(&trace, &root.path().join("work"))?;
     Ok((root, report))
 }
 
@@ -428,7 +428,7 @@ fn pass(arm: Option<&super::stream::ArmPass>) -> BackendResult<&super::stream::A
 
 #[test]
 fn synthetic_stream_matches_native_and_leased_with_reopen() -> BackendResult<()> {
-    let (root, report) = replay("synthetic", &synthetic_stream(None)?)?;
+    let (_guard, report) = replay("synthetic", &synthetic_stream(None)?)?;
     let stream = only(&report)?;
     let pretty = serde_json::to_string_pretty(&report)?;
     assert_eq!(stream.status, StreamStatus::Passed, "{pretty}");
@@ -452,7 +452,6 @@ fn synthetic_stream_matches_native_and_leased_with_reopen() -> BackendResult<()>
         pass(fence.leased.as_ref())?.filters.unrecorded_candidates,
         0
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -460,14 +459,13 @@ fn synthetic_stream_matches_native_and_leased_with_reopen() -> BackendResult<()>
 /// reported on the fence and listed as an uncompared gap until R1.
 #[test]
 fn version_two_stream_replays_and_reports_uncompared_evidence() -> BackendResult<()> {
-    let (root, report) = replay("synthetic-v2", &synthetic_stream_version(None, 2)?)?;
+    let (_guard, report) = replay("synthetic-v2", &synthetic_stream_version(None, 2)?)?;
     let stream = only(&report)?;
     assert_eq!(stream.status, StreamStatus::Passed, "{stream:?}");
     assert!(stream.gaps.contains_key("exact_r1_evidence"));
     let fence = first_fence(stream)?;
     assert!(fence.recorded_evidence.is_some());
     assert!(pass(fence.native.as_ref())?.filters.ordered_match);
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -476,7 +474,7 @@ fn version_two_stream_replays_and_reports_uncompared_evidence() -> BackendResult
 /// pass agree. Before R1 the leased pass deleted every live `Remove` row.
 #[test]
 fn leased_relocation_matches_native_removed_set_after_r1() -> BackendResult<()> {
-    let (root, report) = replay("remove", &synthetic_stream(Some(7))?)?;
+    let (_guard, report) = replay("remove", &synthetic_stream(Some(7))?)?;
     let stream = only(&report)?;
     assert_eq!(stream.status, StreamStatus::Passed, "{stream:?}");
     let fence = first_fence(stream)?;
@@ -484,7 +482,6 @@ fn leased_relocation_matches_native_removed_set_after_r1() -> BackendResult<()> 
     let leased = pass(fence.leased.as_ref())?;
     assert!(leased.extra_removals.is_empty(), "{leased:?}");
     assert!(stream.divergences.is_empty(), "{:?}", stream.divergences);
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -497,12 +494,11 @@ fn drop_completes_on_both_arms() -> BackendResult<()> {
     s.w.database(&Op::Drop {
         result: Outcome::Ok(()),
     });
-    let (root, report) = replay("drop", &s.w)?;
+    let (_guard, report) = replay("drop", &s.w)?;
     let stream = only(&report)?;
     assert_eq!(stream.status, StreamStatus::Passed, "{stream:?}");
     assert!(stream.divergences.is_empty());
     assert_eq!(stream.replayed_frames, stream.frames);
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -542,7 +538,7 @@ fn live_iterator_after_write_is_a_named_class() -> BackendResult<()> {
         },
     );
     s.w.database(&Op::Close);
-    let (root, report) = replay("live-iterator", &s.w)?;
+    let (_guard, report) = replay("live-iterator", &s.w)?;
     let stream = only(&report)?;
     assert!(
         stream.gaps.contains_key("live_iterator_after_write"),
@@ -554,7 +550,6 @@ fn live_iterator_after_write_is_a_named_class() -> BackendResult<()> {
             .iter()
             .all(|divergence| divergence.op == "live_iterator_after_write")
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -618,7 +613,7 @@ fn non_prefix_key_reduction_matches_on_both_arms() -> BackendResult<()> {
     s.w.database(&Op::Open(spec));
     s.reads(A, &probe);
     s.w.database(&Op::Close);
-    let (root, report) = replay("reduction", &s.w)?;
+    let (_guard, report) = replay("reduction", &s.w)?;
     let stream = only(&report)?;
     assert_eq!(stream.status, StreamStatus::Passed, "{stream:?}");
     assert_eq!(stream.final_digests, stream.reopen_digests);
@@ -627,7 +622,6 @@ fn non_prefix_key_reduction_matches_on_both_arms() -> BackendResult<()> {
         .as_ref()
         .and_then(|digests| digests.first());
     assert_eq!(rows.map(|digest| digest.rows), Some(31));
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -644,7 +638,7 @@ fn wrong_recorded_read_is_reported_on_both_arms() -> BackendResult<()> {
         },
     );
     s.w.database(&Op::Close);
-    let (root, report) = replay("mismatch", &s.w)?;
+    let (_guard, report) = replay("mismatch", &s.w)?;
     let stream = only(&report)?;
     assert_eq!(stream.status, StreamStatus::Diverged);
     let arms: Vec<_> = stream
@@ -653,14 +647,13 @@ fn wrong_recorded_read_is_reported_on_both_arms() -> BackendResult<()> {
         .map(|divergence| divergence.arm)
         .collect();
     assert_eq!(arms, ["native", "leased"]);
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
 #[test]
 fn objects_compactor_keeps_latest_versions_on_both_arms() -> BackendResult<()> {
-    let root = scratch("compactor")?;
-    let report = compactor_parity(&root.join("work"))?;
+    let guard = scratch("compactor")?;
+    let report = compactor_parity(&guard.path().join("work"))?;
     let json = serde_json::to_string(&report)?;
     assert!(report.passed, "{json}");
     // Raw model before the force; exact raw winners after it and after reopen.
@@ -674,7 +667,6 @@ fn objects_compactor_keeps_latest_versions_on_both_arms() -> BackendResult<()> {
         assert_eq!(arm.invocations_after_reopen, 0);
     }
     eprintln!("compactor-parity {json}");
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -683,8 +675,8 @@ fn objects_compactor_keeps_latest_versions_on_both_arms() -> BackendResult<()> {
 /// oracle. It shows the forced snapshot is what compacts.
 #[test]
 fn flush_only_leased_forcing_fails_the_raw_compactor_oracle() -> BackendResult<()> {
-    let root = scratch("compactor-negative")?;
-    let report = compactor_parity_with(&root.join("work"), LeasedForce::FlushOnly)?;
+    let guard = scratch("compactor-negative")?;
+    let report = compactor_parity_with(&guard.path().join("work"), LeasedForce::FlushOnly)?;
     assert!(!report.passed);
     assert_eq!(report.leased.rows_after_compaction, report.versions_written);
     assert_eq!(report.leased.invocations, 0);
@@ -696,7 +688,6 @@ fn flush_only_leased_forcing_fails_the_raw_compactor_oracle() -> BackendResult<(
         "{:?}",
         report.problems
     );
-    std::fs::remove_dir_all(root)?;
     Ok(())
 }
 

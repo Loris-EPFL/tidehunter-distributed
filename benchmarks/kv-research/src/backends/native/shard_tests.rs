@@ -2,15 +2,13 @@ use super::*;
 use crate::workload::key_bytes;
 use prometheus::Registry;
 
-fn temporary_path(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "kv-research-native-shards-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+/// Tree and database path of one test case. `Drop` removes the tree even when
+/// an assertion panics.
+fn temporary_path(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let guard = tempfile::TempDir::with_prefix(format!("kv-research-native-shards-{label}-"))
+        .expect("create the shard test tree");
+    let database = guard.path().join("database");
+    (guard, database)
 }
 
 #[test]
@@ -58,7 +56,7 @@ fn harness_keys_have_pinned_deterministic_five_shard_population() {
 
 #[tokio::test]
 async fn single_shard_keeps_database_path_info_and_unlabelled_metrics() {
-    let root = temporary_path("single");
+    let (_guard, root) = temporary_path("single");
     let mut options = serde_json::json!({
         "path": root,
         "native_wal_geometry": "small",
@@ -130,7 +128,6 @@ async fn single_shard_keeps_database_path_info_and_unlabelled_metrics() {
         b"single"
     );
     reopened.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -142,7 +139,7 @@ fn filesystem_comparison_requires_nonempty_equal_device_ids() {
 
 #[tokio::test]
 async fn two_shard_directories_report_observed_filesystem_devices() {
-    let root = temporary_path("filesystem");
+    let (_guard, root) = temporary_path("filesystem");
     let backend = open(
         &serde_json::json!({
             "path": root,
@@ -172,11 +169,10 @@ async fn two_shard_directories_report_observed_filesystem_devices() {
     );
     assert!(info.topology.get("same_ssd_and_filesystem").is_none());
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 async fn concurrent_five_shards(durability: &str) {
-    let root = temporary_path(durability);
+    let (_guard, root) = temporary_path(durability);
     let registry = Registry::new();
     let options = serde_json::json!({
         "path": root,
@@ -389,7 +385,6 @@ async fn concurrent_five_shards(durability: &str) {
         assert_eq!(total_runs, 0);
     }
     backend.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -409,7 +404,7 @@ async fn five_shards_group_barrier_routes_concurrent_calls() {
 
 #[tokio::test]
 async fn shard_metric_registration_errors_propagate() {
-    let root = temporary_path("duplicate-metrics");
+    let (_guard, root) = temporary_path("duplicate-metrics");
     let registry = Registry::new();
     let _barrier = GroupBarrier::new_for_shard(&registry, 0).unwrap();
     let error = open(

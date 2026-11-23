@@ -11,7 +11,7 @@
 //! rule for a nested submodule file (#4a01ba, line:4690-4700).
 #![cfg(all(feature = "test-utils", target_os = "linux"))]
 
-use super::{BTreeMap, BTreeSet, Duration, Instant, Path, PathBuf, fixture_at, root, trace};
+use super::{BTreeMap, BTreeSet, Duration, Instant, Path, fixture_at, root, trace};
 use crate::backends::native::replay::NativeReplayBackend;
 use crate::backends::replay::{FinalRows, ReplayBackend, verify_rows};
 use crate::mainnet_replay::{Counts, Prepared, execute, prepare};
@@ -221,19 +221,10 @@ fn native_options(root: &Path) -> serde_json::Value {
     })
 }
 
-/// Remove the fixture tree even when an assertion fails: a leaked tree holds
-/// WAL and coordinator files and fills the shared disk every agent builds on.
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_and_hybrid_replays_return_equal_reads_and_equal_final_state() {
-    let root = root();
-    let _cleanup = Cleanup(root.clone());
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let trace = trace();
     let prepared = Arc::new(prepare(&trace, REPETITIONS).unwrap());
     let expected = expected_final_rows(&prepared);

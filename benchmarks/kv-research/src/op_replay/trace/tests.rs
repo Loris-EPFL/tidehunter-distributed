@@ -4,16 +4,12 @@ use super::{
     StreamObservation, magic,
 };
 use crate::backend::BackendResult;
-use std::path::PathBuf;
 
-fn scratch(name: &str) -> BackendResult<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "op-replay-trace-{name}-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&path)?;
-    Ok(path)
+/// Trace tree of one test case. `Drop` removes it also when an assertion
+/// panics.
+fn scratch(name: &str) -> BackendResult<tempfile::TempDir> {
+    let guard = tempfile::TempDir::with_prefix(format!("op-replay-trace-{name}-"))?;
+    Ok(guard)
 }
 
 /// The error text of an expected failure.
@@ -122,7 +118,7 @@ fn every_kind() -> Vec<Op> {
 
 #[test]
 fn every_kind_round_trips_with_sequence_and_keyspace() -> BackendResult<()> {
-    let dir = scratch("roundtrip")?;
+    let guard = scratch("roundtrip")?;
     let ops = every_kind();
     let mut stream = StreamWriter::new();
     for (i, op) in ops.iter().enumerate() {
@@ -133,7 +129,7 @@ fn every_kind_round_trips_with_sequence_and_keyspace() -> BackendResult<()> {
         };
         stream.push(keyspace, op);
     }
-    let path = dir.join("ops-0000.bin");
+    let path = guard.path().join("ops-0000.bin");
     std::fs::write(&path, stream.finish()?)?;
     let mut reader = Reader::open(&path, 1)?;
     for (i, op) in ops.iter().enumerate() {
@@ -145,7 +141,6 @@ fn every_kind_round_trips_with_sequence_and_keyspace() -> BackendResult<()> {
         }
     }
     assert!(reader.next_frame()?.is_none());
-    std::fs::remove_dir_all(dir)?;
     Ok(())
 }
 
@@ -156,8 +151,8 @@ fn read_all(bytes: &[u8]) -> BackendResult<usize> {
 /// Read every frame of `bytes` as a stream of `version`; the scratch file is
 /// removed before the result is returned.
 fn read_version(bytes: &[u8], version: u32) -> BackendResult<usize> {
-    let dir = scratch("corrupt")?;
-    let path = dir.join("ops.bin");
+    let guard = scratch("corrupt")?;
+    let path = guard.path().join("ops.bin");
     std::fs::write(&path, bytes)?;
     let result = (|| {
         let mut reader = Reader::open(&path, version)?;
@@ -167,7 +162,6 @@ fn read_version(bytes: &[u8], version: u32) -> BackendResult<usize> {
         }
         BackendResult::Ok(frames)
     })();
-    std::fs::remove_dir_all(dir)?;
     result
 }
 
@@ -249,11 +243,11 @@ fn v2_completion() -> Op {
 
 #[test]
 fn version_two_completion_round_trips_and_versions_do_not_mix() -> BackendResult<()> {
-    let dir = scratch("v2")?;
+    let guard = scratch("v2")?;
     let mut v2 = StreamWriter::with_version(2);
     v2.database(&Op::RelocationStart);
     v2.database(&v2_completion());
-    let path = dir.join("ops-0000.bin");
+    let path = guard.path().join("ops-0000.bin");
     std::fs::write(&path, v2.finish()?)?;
     let mut reader = Reader::open(&path, 2)?;
     assert_eq!(
@@ -268,7 +262,6 @@ fn version_two_completion_round_trips_and_versions_do_not_mix() -> BackendResult
         Reader::open(&path, 1).is_err(),
         "header version must match the index"
     );
-    std::fs::remove_dir_all(dir)?;
 
     // A v1 stream rejects tag 20 and a v2 stream rejects tag 17.
     let (kind, body) = payload(&v2_completion());
@@ -290,24 +283,29 @@ fn version_two_completion_round_trips_and_versions_do_not_mix() -> BackendResult
 
 #[test]
 fn index_requires_completion_and_plain_stream_names() -> BackendResult<()> {
-    let dir = scratch("index")?;
-    assert!(failure(Index::load(&dir))?.contains("did not finish"));
+    let guard = scratch("index")?;
+    assert!(failure(Index::load(guard.path()))?.contains("did not finish"));
     let index = |file: &str| {
         serde_json::json!({"format_version": 1, "objects_compactor_enabled": false,
             "databases": {"authorities_db/perpetual": {"file": file, "frames": 1,
             "objects_compactor_enabled": false}}})
     };
-    std::fs::write(dir.join("index.json"), index("ops-0000.bin").to_string())?;
-    assert_eq!(Index::load(&dir)?.databases.len(), 1);
-    std::fs::write(dir.join("index.json"), index("../ops-0000.bin").to_string())?;
-    assert!(Index::load(&dir).is_err());
+    std::fs::write(
+        guard.path().join("index.json"),
+        index("ops-0000.bin").to_string(),
+    )?;
+    assert_eq!(Index::load(guard.path())?.databases.len(), 1);
+    std::fs::write(
+        guard.path().join("index.json"),
+        index("../ops-0000.bin").to_string(),
+    )?;
+    assert!(Index::load(guard.path()).is_err());
     let mut version = index("ops-0000.bin");
     version["format_version"] = 2.into();
-    std::fs::write(dir.join("index.json"), version.to_string())?;
-    assert_eq!(Index::load(&dir)?.format_version, 2);
+    std::fs::write(guard.path().join("index.json"), version.to_string())?;
+    assert_eq!(Index::load(guard.path())?.format_version, 2);
     version["format_version"] = 3.into();
-    std::fs::write(dir.join("index.json"), version.to_string())?;
-    assert!(Index::load(&dir).is_err());
-    std::fs::remove_dir_all(dir)?;
+    std::fs::write(guard.path().join("index.json"), version.to_string())?;
+    assert!(Index::load(guard.path()).is_err());
     Ok(())
 }

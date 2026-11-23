@@ -22,14 +22,10 @@ fn fixed_owners(count: u32) -> Vec<FixtureOwner> {
         .collect()
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "{name}-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    root
+/// Fixture root of one test case. `Drop` removes it also when an assertion
+/// panics.
+fn scratch(name: &str) -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix(format!("{name}-")).expect("create the fixture root")
 }
 
 #[test]
@@ -146,7 +142,8 @@ fn spec_round_trips_and_rejects_unknown_fields_bad_owners_and_oversized_frames()
 
 #[test]
 fn saved_spec_keeps_identity_and_rejects_duplicate_endpoints() {
-    let root = scratch("leased-fixture-spec");
+    let guard = scratch("leased-fixture-spec");
+    let root = guard.path().to_path_buf();
     let mut saved = spec(
         root.join("fixture"),
         DurabilityTier::Native,
@@ -157,12 +154,12 @@ fn saved_spec_keeps_identity_and_rejects_duplicate_endpoints() {
     assert!(saved.create().is_err());
     saved.owners[1].address = saved.owners[0].address;
     assert!(saved.remote_config().is_err());
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn in_process_owners_serve_reopen_with_owner_state_kept() {
-    let root = scratch("in-process");
+    let guard = scratch("in-process");
+    let root = guard.path().to_path_buf();
     let spec = spec(
         root.join("fixture"),
         DurabilityTier::Native,
@@ -197,5 +194,4 @@ fn in_process_owners_serve_reopen_with_owner_state_kept() {
     );
     db.wait_for_background_threads_to_finish().unwrap();
     owner.stop().unwrap();
-    fs::remove_dir_all(root).unwrap();
 }

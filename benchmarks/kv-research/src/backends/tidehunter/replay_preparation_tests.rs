@@ -4,14 +4,11 @@ use super::*;
 use blake2::{Blake2b512, Digest};
 use std::collections::BTreeMap;
 
-fn temp() -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "replay-owner-preparation-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    fs::create_dir(&root).unwrap();
-    root
+/// Input and output tree of one test case. `Drop` removes it also when an
+/// assertion panics.
+fn temp() -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix("replay-owner-preparation-")
+        .expect("create the preparation tree")
 }
 fn synthetic_input() -> serde_json::Value {
     serde_json::json!({
@@ -66,7 +63,8 @@ fn collect_hashes(root: &Path, directory: &Path, files: &mut BTreeMap<String, St
 }
 #[test]
 fn preparation_outputs_are_deterministic_apart_from_initiator_identities() {
-    let root = temp();
+    let guard = temp();
+    let root = guard.path();
     let input = root.join("input.json");
     fs::write(&input, serde_json::to_vec(&synthetic_input()).unwrap()).unwrap();
     let mut previous = None;
@@ -108,11 +106,11 @@ fn preparation_outputs_are_deterministic_apart_from_initiator_identities() {
         }
         previous = Some(hashes);
     }
-    fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
-    let root = temp();
+    let guard = temp();
+    let root = guard.path();
     let input = root.join("input.json");
     let mut config = synthetic_input();
     config.as_object_mut().unwrap().remove("read_lanes");
@@ -135,13 +133,13 @@ fn automatic_preparation_keeps_runtime_counts_out_of_generated_configs() {
         }
         previous = Some(hashes);
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap() {
     use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
-    let root = temp();
+    let guard = temp();
+    let root = guard.path();
     let input = root.join("input.json");
     let mut config = synthetic_input();
     for (name, lanes, expected) in [("auto", None, 132), ("explicit", Some(100), 204)] {
@@ -172,12 +170,12 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
     assert!(error.contains("require 258 connections"));
     assert!(error.contains("ceiling 256"));
     assert!(!rejected.exists());
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn replay_preparation_rejects_configured_identity_missing_limits_and_unknown_node_db() {
-    let root = temp();
+    let guard = temp();
+    let root = guard.path();
     let input = root.join("input.json");
     for variant in 0..4 {
         let mut value = synthetic_input();
@@ -193,7 +191,6 @@ fn replay_preparation_rejects_configured_identity_missing_limits_and_unknown_nod
         assert!(prepare_external_case_file(&input, &output).is_err());
         assert!(!output.exists());
     }
-    fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_output() {
@@ -206,7 +203,8 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
         "4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa",
     )
     .unwrap();
-    let root = temp();
+    let guard = temp();
+    let root = guard.path();
     let mut databases = Vec::new();
     let mut initiators = std::collections::BTreeSet::new();
     for id in 0..3_u16 {
@@ -307,5 +305,4 @@ fn external_live_replay_preparation_preserves_three_table_domains_and_atomic_out
     insufficient["databases"][0]["options"]["external_remote_config"]["storage"]["batch_limits"]
         ["max_operations"] = serde_json::json!(518);
     assert!(replay::TidehunterReplayBackend::validate(&insufficient, &trace).is_err());
-    fs::remove_dir_all(root).unwrap();
 }

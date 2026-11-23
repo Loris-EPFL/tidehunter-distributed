@@ -32,14 +32,10 @@ fn trace() -> Trace {
     )
     .unwrap()
 }
-fn root() -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "distributed-mainnet-replay-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+/// Replay tree of one test case. `Drop` removes it also when an assertion
+/// panics.
+fn root() -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix("distributed-mainnet-replay-").expect("create the replay tree")
 }
 fn tls() -> TlsFiles {
     TlsFiles {
@@ -110,7 +106,8 @@ fn embedded_remote_config_parses_and_refuses_deleted_keys() {
 #[test]
 fn explicit_domains_and_complete_batch_limits_are_admitted_before_open() {
     let trace = trace();
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let good = local_options(&root);
     TidehunterReplayBackend::validate(&good, &trace).unwrap();
     for field in ["max_operations", "max_encoded_bytes"] {
@@ -133,7 +130,6 @@ fn explicit_domains_and_complete_batch_limits_are_admitted_before_open() {
     bad["databases"].as_array_mut().unwrap().pop();
     assert!(TidehunterReplayBackend::validate(&bad, &trace).is_err());
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 struct Owners {
@@ -277,7 +273,8 @@ fn fixture_at(
     )
 }
 async fn replay(callers: usize) -> BTreeMap<(u16, Bytes), Bytes> {
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let trace = trace();
     let prepared = Arc::new(prepare(&trace, 2).unwrap());
     let (backend, owners) = fixture(&root, &trace);
@@ -434,7 +431,6 @@ async fn replay(callers: usize) -> BTreeMap<(u16, Bytes), Bytes> {
             actual as f64 / predicted as f64
         );
     }
-    std::fs::remove_dir_all(root).unwrap();
     expected
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,7 +439,8 @@ async fn real_local_file_live_mainnet_replay_matches_one_and_four_callers() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_real_owners_fail_replay_and_authority_health() {
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let trace = trace();
     let (backend, mut owners) = fixture(&root, &trace);
     // Stop the actual owner reactors, not a wrapper health hook. Release pairs
@@ -469,11 +466,11 @@ async fn stopped_real_owners_fail_replay_and_authority_health() {
     );
     drop(backend);
     drop(owners);
-    std::fs::remove_dir_all(root).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn perpetual_only_replay_uses_exact_database_population() {
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let mut trace = trace();
     trace.select_node_databases(&[0]).unwrap();
     let mut options = local_options(&root);
@@ -504,14 +501,14 @@ async fn perpetual_only_replay_uses_exact_database_population() {
     assert_eq!(backend.info().unwrap().topology["node_databases"], 1);
     drop(backend);
     drop(owners);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The replay's logical WAL bytes are the put cases' counter: the gate-boundary delta of
 /// live leased `completed_write_bytes`, divided by successful committed payload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_local_file_live_replay_records_logical_wal_amplification() {
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let mut trace = trace();
     trace.select_node_databases(&[0]).unwrap();
     let prepared = Arc::new(prepare(&trace, 2).unwrap());
@@ -583,7 +580,6 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
     );
     drop(backend);
     drop(owners);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// A real local file replay through `run_prepared` writes its result
@@ -592,7 +588,8 @@ async fn real_local_file_live_replay_records_logical_wal_amplification() {
 /// the owner write counters for the single-database TCP backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_local_file_live_replay_writes_its_result_document() {
-    let root = root();
+    let guard = root();
+    let root = guard.path().to_path_buf();
     let mut trace = trace();
     trace.select_node_databases(&[0]).unwrap();
     let prepared = Arc::new(prepare(&trace, 2).unwrap());
@@ -651,7 +648,6 @@ async fn real_local_file_live_replay_writes_its_result_document() {
     );
     drop(backend);
     drop(owners);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
