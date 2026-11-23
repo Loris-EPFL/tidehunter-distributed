@@ -1064,14 +1064,11 @@ mod tests {
     fn client_metric_handle_cost() {
         for clients in [1, 2, 4] {
             for shared in [false, true] {
-                let root = std::env::temp_dir().join(format!(
-                    "kv-client-metrics-{}-{}-{clients}-{shared}",
-                    std::process::id(),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
+                let guard = tempfile::TempDir::with_prefix(format!(
+                    "kv-client-metrics-{clients}-{shared}-"
+                ))
+                .expect("test tree");
+                let root = guard.path().to_path_buf();
                 let mut parents = (0..if shared { 1 } else { clients })
                     .map(|index| {
                         Reporter::create(
@@ -1135,21 +1132,15 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 }
-                std::fs::remove_dir_all(root).unwrap();
             }
         }
     }
 
     #[tokio::test]
     async fn client_reports_merge_counts_distributions_and_all_raw_rows_once() {
-        let path = std::env::temp_dir().join(format!(
-            "kv-research-client-report-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let guard =
+            tempfile::TempDir::with_prefix("kv-research-client-report-").expect("test tree");
+        let path = guard.path().to_path_buf();
         let mut parent = Reporter::create(&path, Registry::new(), "test".into()).unwrap();
         for (index, latency) in [3, 255].into_iter().enumerate() {
             let mut client = parent.fork_client();
@@ -1182,7 +1173,6 @@ mod tests {
         );
         drop(receiver);
         drop(parent);
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     use super::*;
@@ -1204,14 +1194,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tails_and_outcomes_are_not_pooled_and_rejections_have_no_api_tail() {
-        let path = std::env::temp_dir().join(format!(
-            "kv-research-tail-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let guard = tempfile::TempDir::with_prefix("kv-research-tail-").expect("test tree");
+        let path = guard.path().to_path_buf();
         let mut reporter = Reporter::create(&path, Registry::new(), "test".into()).unwrap();
         for (stream, operation, outcome, latency) in [
             (Stream::Read, "read", "success", 3),
@@ -1261,7 +1245,6 @@ mod tests {
             .join()
             .unwrap()
             .unwrap();
-        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

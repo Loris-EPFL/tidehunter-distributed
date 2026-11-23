@@ -34,12 +34,8 @@ fn table_bound_matches_the_hand_computed_formula() {
 
 #[test]
 fn cloud_perpetual_reservation_counts_coordinator_metadata_not_external_wal() {
-    let root = std::env::temp_dir().join(format!(
-        "replay-resource-bound-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let guard = tempfile::TempDir::with_prefix("replay-resource-bound-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let input = serde_json::json!({
         "guest_root":root.join("guest"),"addresses":["127.0.0.1:19001","127.0.0.1:19002"],
         "transport":{"kind":"tcp-trusted"},
@@ -81,5 +77,4 @@ fn cloud_perpetual_reservation_counts_coordinator_metadata_not_external_wal() {
     // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
     assert!(bound["reservation_bytes"].as_u64().unwrap() < 14000 * 1024_u64.pow(3) / 2);
     eprintln!("cloud-replay-coordinator-bound={bound}");
-    std::fs::remove_dir_all(root).unwrap();
 }

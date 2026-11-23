@@ -1252,12 +1252,8 @@ mod tests {
 
     #[test]
     fn local_file_qualification_persists_and_recovers_real_frames() {
-        let root = std::env::temp_dir().join(format!(
-            "live-file-qualification-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("live-file-qualification-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         fs::write(
             &input,
@@ -1278,7 +1274,6 @@ mod tests {
         assert_eq!(proof["kind"], "live_nvmeof_file_component_qualification");
         assert_eq!(proof["frame_count"], 3);
         assert_eq!(proof["owner_validate_persist_retry_recovery"], true);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1345,12 +1340,9 @@ mod tests {
 
     #[test]
     fn progress_events_carry_elapsed_time_and_detail() {
-        let root = std::env::temp_dir().join(format!(
-            "live-qualification-progress-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard =
+            tempfile::TempDir::with_prefix("live-qualification-progress-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let mut progress = QualificationProgress {
             directory: root.clone(),
             file_name: "progress.json",
@@ -1371,6 +1363,5 @@ mod tests {
         assert!(events[0]["detail"].is_null());
         assert_eq!(events[1]["phase"], "phase_writes");
         assert_eq!(events[1]["detail"]["writes_acknowledged"], 8);
-        fs::remove_dir_all(root).unwrap();
     }
 }

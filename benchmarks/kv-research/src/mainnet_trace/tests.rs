@@ -226,8 +226,8 @@ fn manifest_hash_network_format_paths_and_file_mutation_are_rejected() {
     let sha = "4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa";
     Trace::load(&root.join("manifest.json"), sha).unwrap();
     assert!(Trace::load(&root.join("manifest.json"), &"0".repeat(64)).is_err());
-    let temp = std::env::temp_dir().join(format!("mainnet-parser-{}", std::process::id()));
-    std::fs::create_dir_all(&temp).unwrap();
+    let guard = tempfile::TempDir::with_prefix("mainnet-parser-").expect("test tree");
+    let temp = guard.path().to_path_buf();
     for entry in std::fs::read_dir(&root).unwrap() {
         let entry = entry.unwrap();
         std::fs::copy(entry.path(), temp.join(entry.file_name())).unwrap();
@@ -247,5 +247,4 @@ fn manifest_hash_network_format_paths_and_file_mutation_are_rejected() {
     std::fs::remove_file(temp.join("preload.bin")).unwrap();
     std::os::unix::fs::symlink(root.join("preload.bin"), temp.join("preload.bin")).unwrap();
     assert!(Trace::load(&temp.join("manifest.json"), sha).is_err());
-    std::fs::remove_dir_all(temp).unwrap();
 }

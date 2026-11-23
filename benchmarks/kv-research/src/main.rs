@@ -266,9 +266,8 @@ mod tests {
             let _ = thread.join();
             panic!("panic hook did not abort");
         }
-        let output =
-            std::env::temp_dir().join(format!("mainnet-panic-hook-{}", std::process::id()));
-        std::fs::create_dir_all(&output).unwrap();
+        let guard = tempfile::TempDir::with_prefix("mainnet-panic-hook-").expect("test tree");
+        let output = guard.path().to_path_buf();
         // Avoid producing a core dump for this deliberately aborting child.
         let child = std::process::Command::new("bash")
             .args(["-c", "ulimit -c 0; exec \"$@\"", "--"])
@@ -288,6 +287,5 @@ mod tests {
         let error = std::fs::read_to_string(output.join("panic.txt")).unwrap();
         assert!(error.contains("replay background health regression"));
         assert!(error.contains("src/main.rs:"));
-        std::fs::remove_dir_all(output).unwrap();
     }
 }

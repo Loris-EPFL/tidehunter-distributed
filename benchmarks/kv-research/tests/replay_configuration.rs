@@ -3,12 +3,8 @@ use std::process::Command;
 
 #[test]
 fn replay_validate_config_reports_estimates_without_host_availability() {
-    let root = std::env::temp_dir().join(format!(
-        "replay-configuration-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let guard = tempfile::TempDir::with_prefix("replay-configuration-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let config = serde_json::json!({
         "schema_version": 1,
         "backend": {"kind": "native", "options": {"path": root.join("db"), "native_wal_geometry": "small"}},
@@ -63,5 +59,4 @@ fn replay_validate_config_reports_estimates_without_host_availability() {
     assert!(resources.get("available_bytes").is_none());
     assert!(resources.get("memory_available_bytes").is_none());
     assert!(!root.join("db").exists());
-    std::fs::remove_dir_all(root).unwrap();
 }

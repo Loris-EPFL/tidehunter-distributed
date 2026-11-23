@@ -1956,12 +1956,8 @@ mod tests {
 
     #[test]
     fn external_preparation_launches_leased_owners_and_rejects_removed_keys() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-history-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("kv-history-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         let config = serde_json::json!({
             "guest_root": root.join("guest"), "addresses": ["127.0.0.1:44000"],
@@ -2010,7 +2006,6 @@ mod tests {
         let rejected = root.join("rejected-no-live");
         refusal(&input, &rejected);
         assert!(!rejected.exists());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2024,12 +2019,8 @@ mod tests {
 
     #[test]
     fn external_preparation_selects_owner_wal_geometry() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-external-wal-geometry-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("kv-external-wal-geometry-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         let mut config = serde_json::json!({
             "guest_root": root.join("guest"),
@@ -2103,13 +2094,12 @@ mod tests {
                 }
             }
         }
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn external_preparation_rejects_invalid_owner_file_sizes() {
-        let root = std::env::temp_dir().join(format!("kv-invalid-wal-{}", rand::random::<u64>()));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("kv-invalid-wal-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         let mut config = controller_live_preparation_input();
         config["transport"] = serde_json::json!({"kind": "tcp"});
@@ -2120,7 +2110,6 @@ mod tests {
             refusal(&input, &root.join("output"));
             assert!(!root.join("output").exists());
         }
-        fs::remove_dir_all(root).unwrap();
     }
 
     // Run-12 G18W-r0-219b8b655801a7844229 input with current write settings.
@@ -2194,12 +2183,9 @@ mod tests {
     #[cfg(feature = "fabric")]
     #[test]
     fn controller_live_input_preserves_write_settings_and_owner_documents() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-controller-live-settings-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard =
+            tempfile::TempDir::with_prefix("kv-controller-live-settings-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         for (name, ahead, polled) in [("controller", true, false), ("polled", false, true)] {
             let mut value = controller_live_preparation_input();
@@ -2232,17 +2218,12 @@ mod tests {
             assert!(pool.get("host_nqn").is_none());
             assert_eq!(remote["storage"]["fragment_bytes"], 134217728);
         }
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn external_coordinator_cache_requires_explicit_adequate_allowance() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-external-cache-budget-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("kv-external-cache-budget-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         let mut config = serde_json::json!({
             "guest_root": root.join("guest"),
@@ -2440,17 +2421,12 @@ mod tests {
             assert!(one.join("node-0/launch.yaml").exists());
             assert!(!one.join("node-1").exists());
         }
-        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn rejects_authority_limit_above_engine_bound_before_emitting_launch_files() {
-        let root = std::env::temp_dir().join(format!(
-            "kv-external-limit-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        fs::create_dir(&root).unwrap();
+        let guard = tempfile::TempDir::with_prefix("kv-external-limit-").expect("test tree");
+        let root = guard.path().to_path_buf();
         let input = root.join("input.json");
         let output = root.join("prepared");
         let config = serde_json::json!({
@@ -2467,7 +2443,6 @@ mod tests {
         fs::write(&input, serde_json::to_vec(&config).unwrap()).unwrap();
         let result = prepare_external_case_file(&input, &output);
         let output_exists = output.exists();
-        fs::remove_dir_all(&root).unwrap();
         assert!(result.is_err());
         assert!(!output_exists);
     }

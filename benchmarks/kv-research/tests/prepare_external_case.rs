@@ -48,12 +48,8 @@ fn check_owner(output: &Path, partition: u32, slots: usize, bases: (u16, u16, u1
 
 #[test]
 fn python_kernel_prepare_input_and_multi_database_pool_pass_the_cli() {
-    let root = std::env::temp_dir().join(format!(
-        "prepare-external-case-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    fs::create_dir(&root).unwrap();
+    let guard = tempfile::TempDir::with_prefix("prepare-external-case-").expect("test tree");
+    let root = guard.path().to_path_buf();
     let generated = Command::new("python3")
         .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../experiments/kv-comparison"))
         .args([
@@ -102,5 +98,4 @@ fn python_kernel_prepare_input_and_multi_database_pool_pass_the_cli() {
         );
         assert!(!rejected.exists());
     }
-    fs::remove_dir_all(root).unwrap();
 }
