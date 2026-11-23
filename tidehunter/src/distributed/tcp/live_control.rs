@@ -439,4 +439,82 @@ impl Client {
             response => self.invalid_live_response(epoch, response),
         }
     }
+
+    /// Replace an aborted read-lane session before the read lane issues its next
+    /// control RPC. A healthy client is left unchanged.
+    ///
+    /// The read lane aborts the session when a control exchange fails, so its
+    /// next read would otherwise find no session. The fresh session reuses the
+    /// client's authenticated route, counters, pool and export evidence, so the
+    /// read keeps its owner. One absolute deadline, the caller's read deadline,
+    /// bounds the TCP connect, the transport handshake and the Status reply;
+    /// each stage derives its budget from it, so a spent deadline is `TimedOut`
+    /// and installs no session. Every error keeps its kind, so the caller
+    /// decides; in particular a failed replacement is not a failed subsystem
+    /// and must not enter `failed_subsystems`.
+    ///
+    /// Refused while a live writer or an outstanding exchange exists: an
+    /// outcome that is unknown must fail stop, not continue on another session.
+    /// The aborted session cleared its input and output buffers (`abort`), and
+    /// live NVMe buffers belong to the lane's grants, so no buffer is reused
+    /// while DMA or a late reply could still arrive.
+    pub(crate) fn replace_read_session(&mut self, deadline: Instant) -> Result<(), TcpError> {
+        if !self.broken {
+            return Ok(());
+        }
+        if self.live_writer.is_some() || self.has_pending_io() {
+            return Err(TcpError::with_kind(
+                io::ErrorKind::NotConnected,
+                "live writer or exchange outstanding; the read session cannot be replaced",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TcpError::with_kind(
+                io::ErrorKind::TimedOut,
+                "read deadline expired before the session replacement",
+            ));
+        }
+        let route = self.route.clone();
+        let mut fresh = super::connect_shared::connect(
+            &route.endpoint,
+            &route.tls,
+            route.config.clone(),
+            route.expected.clone(),
+            &route.shape,
+            super::connect_shared::SessionSetup {
+                deadline,
+                timeout: route.timeout,
+                progress: None,
+            },
+        )?;
+        fresh.route = route;
+        fresh.live_config = self.live_config.clone();
+        fresh.live_pool = self.live_pool.clone();
+        fresh.live_counters = self.live_counters.clone();
+        fresh.live_metrics = self.live_metrics.clone();
+        fresh.live_exports = self.live_exports.clone();
+        fresh.diagnostics = self.diagnostics;
+        fresh.page_limit = self.page_limit;
+        fresh.max_reads = self.max_reads;
+        fresh.polling = self.polling;
+        #[cfg(test)]
+        {
+            fresh.reactor.control_cap = self.reactor.control_cap.take();
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            fresh.live_write_local_fixture = self.live_write_local_fixture;
+        }
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Test only: point the authenticated route at another endpoint, so a test
+    /// exercises a refused replacement without building a second owner. The
+    /// session itself is unchanged; mark it broken first.
+    #[cfg(test)]
+    pub(crate) fn rebind_endpoint_for_test(&mut self, endpoint: &str) {
+        self.route.endpoint = endpoint.to_owned();
+    }
 }

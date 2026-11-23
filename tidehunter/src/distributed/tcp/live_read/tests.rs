@@ -9,6 +9,9 @@ use std::os::unix::fs::FileExt;
 #[path = "subsystem_tests.rs"]
 mod subsystem_tests;
 
+#[path = "reconnect_tests.rs"]
+mod reconnect_tests;
+
 #[test]
 fn namespace_device_is_owned_before_the_cached_grant_is_retired() {
     let mut lane = lane(4);

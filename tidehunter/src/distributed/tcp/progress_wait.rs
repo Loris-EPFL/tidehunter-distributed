@@ -16,6 +16,7 @@
 
 use super::*;
 use std::fs::File;
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 
 #[cfg(test)]

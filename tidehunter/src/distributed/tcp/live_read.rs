@@ -25,7 +25,6 @@
 //! its whole block alive, so a long-lived cache should copy before retaining.
 use super::LiveRecordLocation;
 use super::{Client, TcpError};
-use crate::crc::CrcFrame;
 use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
 use crate::distributed::nvmeof::live_io::{
@@ -41,7 +40,7 @@ use crate::distributed::nvmeof::live_storage::{
     FILES_PER_SUBSYSTEM, LiveWalSegment, wal_export_name,
 };
 use crate::distributed::remote_db::ReadTraceChild;
-use connect::{ConnectError, connect_budget, failed, failed_io, pool_deadline};
+use connect::{ConnectError, connect_budget, failed, failed_io, member_range, pool_deadline};
 use minibytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -545,23 +544,6 @@ fn drain_failed_io(grant: &mut Grant) {
     }
 }
 
-fn member_range(grant: &Grant, position: &VersionPosition) -> Result<(u64, usize), TcpError> {
-    // The position names the member frame itself: `offset` already includes the
-    // batch's 8-byte CRC header and the member's descriptor offset, and `len`
-    // covers the member header plus its native entry. A member never straddles
-    // a WAL file, so the file index computed from it equals the batch's.
-    let bytes = grant.scope.file_bytes();
-    let offset = position.address.offset % bytes;
-    let len = position.address.len as usize;
-    if len < CrcFrame::CRC_HEADER_LENGTH
-        || !grant.scope.covers(position)
-        || offset.checked_add(len as u64).is_none_or(|end| end > bytes)
-    {
-        return Err(TcpError::new("invalid cached live member geometry"));
-    }
-    Ok((offset, len))
-}
-
 /// Lane state: file grants, requests in flight and unreleased owner pins.
 ///
 /// Owner: the lane's driver lock, borrowed by its worker or an idle caller.
@@ -674,7 +656,9 @@ impl LiveReadCache {
             return Err(LiveReadSubmitError::Full(request));
         }
         if !self.unreleased.is_empty()
-            && let Err(error) = self.release_pending(client, epoch)
+            && let Err(error) = client
+                .replace_read_session(request.deadline)
+                .and_then(|()| self.release_pending(client, epoch))
         {
             if let Some(counters) = &client.live_counters {
                 counters.record_error();
@@ -986,6 +970,10 @@ impl LiveReadCache {
                 "live read deadline expired before admission",
             ));
         }
+        // The lane aborts its session when a control exchange fails; a later
+        // read replaces it here, before its first control RPC, inside its own
+        // deadline. A healthy client is unchanged.
+        client.replace_read_session(state.deadline)?;
         let mut blocked: Vec<u64> = Vec::new();
         let mut no_new_grant = false;
         // Each pass starts members, blocks one grant, or stops new grants.
@@ -1147,9 +1135,13 @@ impl LiveReadCache {
             .is_none_or(|(current, _, count)| *current != epoch || file >= *count)
             && let Err(error) = client.open_live_exports(epoch)
         {
-            // A control timeout says nothing about the subsystem and is not
-            // cached; the next attempt asks the owner again.
-            if error.kind() != std::io::ErrorKind::TimedOut {
+            // A control timeout or a missing session says nothing about the
+            // subsystem and is not cached; the next attempt asks the owner
+            // again after it replaced the session.
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotConnected
+            ) {
                 self.failed_subsystems.insert((epoch, file / files));
             }
             return Err(error);

@@ -23,7 +23,7 @@
 //! ReFlex source: papers/parsed/ReFlex-2017.md, §§3.1 and 4.1.
 use super::*;
 use std::collections::{HashMap, VecDeque};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 
@@ -1101,10 +1101,10 @@ impl Write for NonblockingIo<'_> {
 
 #[derive(Default)]
 pub(super) struct ClientState {
-    /// Test only: shorten one control exchange's budget, including a lifecycle
-    /// request, so a test observes the typed deadline without a long wait.
-    #[cfg(test)]
-    pub(super) control_budget_cap: Option<Duration>,
+    /// Per-call cap of one control exchange's budget, applied on top of
+    /// [`Request::timeout`]. `None` keeps the request's own policy; a session
+    /// replacement and its tests set it to bound the exchange by a deadline.
+    pub(super) control_cap: Option<Duration>,
     next_id: u64,
     control: Option<(u64, Instant)>,
     control_result: Option<Response>,
@@ -1225,10 +1225,9 @@ impl Client {
         self.stream.transport_stats()
     }
     fn ensure_connection(&self) -> Result<(), TcpError> {
+        let message = "connection requires replacement; request outcome may be unknown";
         if self.broken {
-            Err(TcpError::new(
-                "connection requires replacement; request outcome may be unknown",
-            ))
+            Err(TcpError::with_kind(io::ErrorKind::NotConnected, message))
         } else {
             Ok(())
         }
@@ -1476,8 +1475,8 @@ impl Client {
         }
         let id = self.reactor.allocate_id()?;
         let budget = request.timeout(self.timeout);
-        #[cfg(test)]
-        let budget = budget.min(self.reactor.control_budget_cap.unwrap_or(budget));
+        let cap = self.reactor.control_cap.unwrap_or(budget);
+        let budget = budget.min(cap);
         let deadline = Instant::now() + budget;
         let size_began = profile.as_ref().map(|_| Instant::now());
         let queue_size = self.stream.queue_size(id, request, self.frame_limit)?;

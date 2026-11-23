@@ -203,7 +203,7 @@ fn an_open_live_exports_deadline_does_not_quarantine_the_subsystem() {
     let mut lane = subsystem_lane();
     let grants = std::mem::take(&mut lane.cache.grants);
     lane.client.live_exports = None;
-    lane.client.reactor.control_budget_cap = Some(Duration::ZERO);
+    lane.client.reactor.control_cap = Some(Duration::ZERO);
     let position = lane.a;
     let mut state = InFlightRequest {
         positions: vec![position],
@@ -242,7 +242,7 @@ fn an_open_live_exports_deadline_does_not_quarantine_the_subsystem() {
         "a deadline must not cache the subsystem as failed"
     );
     // The deadline poisoned nothing: the fixture grants still serve the member.
-    lane.client.reactor.control_budget_cap = None;
+    lane.client.reactor.control_cap = None;
     lane.cache.grants = grants;
     let a = lane.a;
     let frame = member_frame(&lane.first, &a);

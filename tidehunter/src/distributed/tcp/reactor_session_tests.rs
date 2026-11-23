@@ -383,3 +383,23 @@ fn lease_triggers_file_preparation_and_fence_joins_its_worker() {
         assert_eq!(fixture.node.control.preparer_count(), 0);
     }
 }
+
+impl Client {
+    /// Test only: leave the session unusable exactly as a transport failure
+    /// does, including the abort that clears its buffers.
+    pub(crate) fn fail_connection_for_test(&mut self) {
+        self.fail_connection();
+    }
+
+    /// Test only: leave the session unusable and park one control exchange, so
+    /// a replacement refuses while that exchange's outcome is unknown.
+    pub(crate) fn park_control_for_test(&mut self) {
+        self.broken = true;
+        self.reactor.control = Some((1, Instant::now() + Duration::from_secs(1)));
+    }
+
+    /// Test only: release the parked exchange; the session stays unusable.
+    pub(crate) fn clear_parked_control_for_test(&mut self) {
+        self.reactor.control = None;
+    }
+}

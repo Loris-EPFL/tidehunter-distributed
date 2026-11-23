@@ -3,6 +3,7 @@ use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
 use crate::distributed::storage::StaticInventory;
 use crate::key_shape::{KeySpace, KeyType};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
 

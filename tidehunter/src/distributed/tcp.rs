@@ -46,6 +46,8 @@ pub use host::{
     DatabaseLiveTarget, DatabaseProvisionSpec, HostDurabilityDefaults, HostStatus, LiveTargetPool,
     OwnerHost, OwnerHostConfig,
 };
+mod connect_shared;
+mod deadline_io;
 mod listener;
 pub use super::nvmeof::LiveQueueGeometry;
 #[cfg(test)]
@@ -66,6 +68,8 @@ pub use live_wire::{
     LiveRecordLocations,
 };
 #[cfg(test)]
+mod connection_tests;
+#[cfg(test)]
 mod probe;
 #[cfg(test)]
 mod tests;
@@ -81,6 +85,7 @@ use super::types::{BatchId, BatchVersion, PayloadDigest, PhysicalValueAddress, R
 use crate::key_shape::KeyShape;
 use crate::metrics::Metrics;
 use bincode::Options;
+use deadline_io::DeadlineIo;
 use parking_lot::Mutex;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{
@@ -90,7 +95,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1367,6 +1372,10 @@ pub struct Client {
     connected_status: Option<NodeStatus>,
     connect_profile: ClientConnectProfile,
     polling: PollingPolicy,
+    /// The authenticated route of this session, kept so the read lane can
+    /// rebuild an aborted session on the same owner. It carries no pin state:
+    /// the lifetime-export model removed the export pins.
+    route: connect_shared::ReconnectRoute,
     live_config: Option<LiveClientConfig>,
     live_exports: Option<(u64, LiveExportInfo, u64)>,
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
@@ -1410,14 +1419,17 @@ impl Client {
         expected: PartitionConfig,
         shape: &KeyShape,
     ) -> Result<Self, TcpError> {
-        Self::connect_shared_with_progress(
+        connect_shared::connect(
             endpoint,
             tls,
             client_config,
-            timeout,
             expected,
             shape,
-            None,
+            connect_shared::SessionSetup {
+                deadline: Instant::now() + timeout,
+                timeout,
+                progress: None,
+            },
         )
     }
 
@@ -1430,90 +1442,20 @@ impl Client {
         shape: &KeyShape,
         stop: Arc<WakeFd>,
     ) -> Result<Self, TcpError> {
-        Self::connect_shared_with_progress(
+        connect_shared::connect(
             endpoint,
             tls,
             client_config,
-            timeout,
             expected,
             shape,
-            Some(stop),
+            connect_shared::SessionSetup {
+                deadline: Instant::now() + timeout,
+                timeout,
+                progress: Some(stop),
+            },
         )
     }
 
-    fn connect_shared_with_progress(
-        endpoint: &str,
-        tls: &TlsFiles,
-        client_config: ClientTlsConfig,
-        timeout: Duration,
-        expected: PartitionConfig,
-        shape: &KeyShape,
-        progress: Option<Arc<WakeFd>>,
-    ) -> Result<Self, TcpError> {
-        expected.validate().map_err(TcpError::component)?;
-        let listener::ClientSession {
-            session,
-            connect_ns,
-            tls_ns,
-            fabric_ns,
-        } = listener::open_client_session(
-            endpoint,
-            tls,
-            client_config,
-            timeout,
-            progress.is_some(),
-        )?;
-        let shape = shape.clone();
-        let mut client = Self {
-            stream: session,
-            expected,
-            shape,
-            timeout,
-            broken: false,
-            frame_limit: HARD_FRAME_LIMIT,
-            max_reads: 256,
-            page_limit: 1024,
-            diagnostics: None,
-            reactor: reactor::ClientState::default(),
-            connected_status: None,
-            connect_profile: ClientConnectProfile {
-                connect_ns,
-                tls_ns,
-                fabric_ns,
-                status_ns: 0,
-                #[cfg(feature = "experimental-fabric")]
-                fabric_open: None,
-            },
-            polling: PollingPolicy::Adaptive,
-            live_config: None,
-            live_exports: None,
-            live_pool: None,
-            live_writer: None,
-            live_writer_closing: false,
-            live_leased: live_client::LeasedWriter::default(),
-            live_write_failed: false,
-            #[cfg(any(test, feature = "test-utils"))]
-            live_write_local_fixture: false,
-            live_counters: None,
-            live_metrics: None,
-            progress_wait: progress.map(progress_wait::ClientProgressWait::new),
-        };
-        let began = Instant::now();
-        client.connected_status = Some(client.status()?);
-        client.connect_profile.status_ns = elapsed_ns(began);
-        #[cfg(feature = "experimental-fabric")]
-        {
-            // Provider setup may defer bounded resources until its first CQ
-            // progress, inside status rather than endpoint creation.
-            client.connect_profile.fabric_open = client
-                .stream
-                .sock
-                .fabric
-                .as_ref()
-                .map(tidehunter_fabric::Endpoint::open_profile);
-        }
-        Ok(client)
-    }
     /// Authenticated status captured during connect; not a fresh health probe.
     #[allow(
         clippy::expect_used,
@@ -2140,115 +2082,4 @@ fn encode_sized_frame_into<T: Serialize>(
 }
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-}
-
-/// Absolute deadline checked for every underlying TLS socket operation, so a
-/// trickling peer cannot renew the timeout for each byte of one frame.
-struct DeadlineIo {
-    #[cfg(feature = "experimental-fabric")]
-    fabric: Option<tidehunter_fabric::Endpoint>,
-    socket: TcpStream,
-    deadline: Instant,
-    read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
-    profile: Option<SocketProfile>,
-}
-impl DeadlineIo {
-    fn new(socket: TcpStream, timeout: Duration) -> io::Result<Self> {
-        socket.set_nodelay(true)?;
-        Ok(Self {
-            socket,
-            #[cfg(feature = "experimental-fabric")]
-            fabric: None,
-            deadline: Instant::now() + timeout,
-            read_timeout: None,
-            write_timeout: None,
-            profile: None,
-        })
-    }
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "TLS frame deadline expired"))
-    }
-    fn prepare(&mut self, read: bool) -> io::Result<()> {
-        let began = self.profile.map(|_| Instant::now());
-        let remaining = self.remaining()?;
-        #[cfg(feature = "experimental-fabric")]
-        if self.fabric.is_some() {
-            return Err(io::Error::other(
-                "blocking I/O forbidden after fabric switch",
-            ));
-        }
-        // Never round a timeout upwards: keep the absolute deadline and use
-        // sub-millisecond precision for its final fraction. Reusing the same
-        // millisecond avoids a setsockopt for every small TLS read/write.
-        let timeout = if remaining >= Duration::from_millis(1) {
-            Duration::from_millis(remaining.as_millis() as u64)
-        } else {
-            remaining
-        };
-        let cached = if read {
-            &mut self.read_timeout
-        } else {
-            &mut self.write_timeout
-        };
-        let changed = *cached != Some(timeout);
-        if changed {
-            if read {
-                self.socket.set_read_timeout(Some(timeout))?;
-            } else {
-                self.socket.set_write_timeout(Some(timeout))?;
-            }
-            *cached = Some(timeout);
-        }
-        if let Some(p) = self.profile.as_mut() {
-            p.timeout_setup_ns += began.map_or(0, elapsed_ns);
-            p.timeout_sets += u64::from(changed);
-        }
-        Ok(())
-    }
-}
-impl Read for DeadlineIo {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.prepare(true)?;
-        let began = self.profile.map(|_| Instant::now());
-        let result = self.socket.read(bytes);
-        if let Some(p) = self.profile.as_mut() {
-            p.read_ns += began.map_or(0, elapsed_ns);
-            p.read_calls += 1;
-            p.read_bytes += result.as_ref().copied().unwrap_or(0) as u64;
-        }
-        result
-    }
-}
-impl Write for DeadlineIo {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.prepare(false)?;
-        let began = self.profile.map(|_| Instant::now());
-        let result = self.socket.write(bytes);
-        if let Some(p) = self.profile.as_mut() {
-            p.write_ns += began.map_or(0, elapsed_ns);
-            p.write_calls += 1;
-            p.write_bytes += result.as_ref().copied().unwrap_or(0) as u64;
-        }
-        result
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.socket.flush()
-    }
-    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        // rustls offers multiple encrypted records together. The default Write
-        // implementation only uses the first slice and defeats that batching.
-        self.prepare(false)?;
-        let began = self.profile.map(|_| Instant::now());
-        let result = self.socket.write_vectored(buffers);
-        if let Some(p) = self.profile.as_mut() {
-            p.write_ns += began.map_or(0, elapsed_ns);
-            p.write_calls += 1;
-            p.write_bytes += result.as_ref().copied().unwrap_or(0) as u64;
-        }
-        result
-    }
 }

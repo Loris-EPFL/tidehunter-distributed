@@ -1,9 +1,12 @@
-//! The connect budget and the typed errors of a live read grant.
+//! The connect budget, the typed errors of a live read grant, and the member
+//! geometry check.
 //!
 //! Split out of `live_read.rs` to hold that file under its length ratchet; the
 //! items stay private to that module through `pub(super)`.
 
 use super::TcpError;
+use super::{Grant, VersionPosition};
+use crate::crc::CrcFrame;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -40,6 +43,27 @@ pub(super) fn pool_deadline(error: io::Error) -> TcpError {
 /// deadline again.
 pub(super) fn connect_budget(call: Instant, since: Instant, connect_timeout: Duration) -> Instant {
     call.min(since + connect_timeout)
+}
+
+/// The member's in-file offset and length, checked against its grant.
+pub(super) fn member_range(
+    grant: &Grant,
+    position: &VersionPosition,
+) -> Result<(u64, usize), TcpError> {
+    // The position names the member frame itself: `offset` already includes the
+    // batch's 8-byte CRC header and the member's descriptor offset, and `len`
+    // covers the member header plus its native entry. A member never straddles
+    // a WAL file, so the file index computed from it equals the batch's.
+    let bytes = grant.scope.file_bytes();
+    let offset = position.address.offset % bytes;
+    let len = position.address.len as usize;
+    if len < CrcFrame::CRC_HEADER_LENGTH
+        || !grant.scope.covers(position)
+        || offset.checked_add(len as u64).is_none_or(|end| end > bytes)
+    {
+        return Err(TcpError::new("invalid cached live member geometry"));
+    }
+    Ok((offset, len))
 }
 
 #[cfg(test)]
