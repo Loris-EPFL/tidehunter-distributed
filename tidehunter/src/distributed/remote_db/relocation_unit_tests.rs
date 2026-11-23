@@ -120,8 +120,31 @@ fn span_budget_consumes_the_oldest_generation_first() {
         FILE,
         50,
     );
+    // The budget is a share of all files (50 % of 8 = 4 files), spent in
+    // generation order: the oldest generation takes all of it, so the newer one
+    // keeps its start.
     assert_eq!(ends.get(&1).copied(), Some(4 * FILE));
-    assert_eq!(ends.get(&2).copied(), Some(4 * FILE));
+    assert_eq!(ends.get(&2).copied(), Some(0));
+    // The oldest generation holds fewer files than the budget (50 % of 6 = 3
+    // files, 2 of them in generation 1): the newer generation gets the remainder.
+    let ends = span_budget_end(
+        &[
+            OwnerSpan {
+                generation: 2,
+                lo: 0,
+                hi: 4 * FILE,
+            },
+            OwnerSpan {
+                generation: 1,
+                lo: 0,
+                hi: 2 * FILE,
+            },
+        ],
+        FILE,
+        50,
+    );
+    assert_eq!(ends.get(&1).copied(), Some(2 * FILE));
+    assert_eq!(ends.get(&2).copied(), Some(FILE));
 }
 
 #[test]
@@ -314,4 +337,94 @@ fn a_forced_store_is_bounded_by_its_flush_frontier_not_its_cut() {
         assert!(usable_after_snapshot(true, true, cut, version(10), q));
         assert!(usable_after_snapshot(true, true, cut, version(11), q));
     }
+}
+
+const SEALED: u64 = 1;
+const SERVING: u64 = 2;
+
+fn sealed_reports(
+    end: u64,
+    upper: Option<u64>,
+    stop: Option<(usize, BatchVersion, u64)>,
+    pct: u8,
+) -> StreamReport {
+    let cursors = vec![
+        cursor(scan(0, 0, SEALED, 0, end), 0, upper, None, version(0)),
+        cursor(scan(0, 0, SERVING, 0, FILE), 0, None, None, version(0)),
+    ];
+    stream_reports(&cursors, stop, FILE, pct, SERVING)
+        .unwrap()
+        .remove(0)
+}
+
+#[test]
+fn a_sealed_clean_tail_rounds_up_to_the_end_of_its_last_file() {
+    for (end, expected) in [
+        (4 * FILE + 4096, 5 * FILE),
+        (4 * FILE + 1, 5 * FILE),
+        (5 * FILE - 1, 5 * FILE),
+        (4 * FILE, 4 * FILE),
+    ] {
+        let report = sealed_reports(end, None, None, 100);
+        assert_eq!(report.rounded_target, expected, "stream end {end}");
+        assert_eq!(report.rounded_target % FILE, 0, "aligned, stream end {end}");
+        assert!(
+            report.rounded_target >= end,
+            "not below the end, stream end {end}"
+        );
+    }
+}
+
+#[test]
+fn a_sealed_stream_the_scan_did_not_finish_rounds_down() {
+    let report = sealed_reports(4 * FILE + 4096, Some(2 * FILE + 4096), None, 100);
+    assert_eq!(report.processed_upper, 2 * FILE + 4096);
+    assert_eq!(report.stream_end, 4 * FILE + 4096);
+    assert_eq!(report.rounded_target, 2 * FILE);
+}
+
+#[test]
+fn a_sealed_stream_with_a_stop_or_a_budget_cut_rounds_down() {
+    let stopped = sealed_reports(8 * FILE, None, Some((0, version(7), 3 * FILE + 4096)), 100);
+    assert_eq!(stopped.terminal_position, 3 * FILE + 4096);
+    assert_eq!(stopped.rounded_target, 3 * FILE);
+    let budgeted = sealed_reports(10 * FILE + 4096, None, None, 10);
+    // 10 % of the 11 files and 4 KiB the owner holds is 1.1 files, rounded down
+    // to one whole file.
+    assert_eq!(
+        budgeted.rounded_target, FILE,
+        "a 10 % budget stops at one whole file"
+    );
+}
+
+/// The serving stream's tail may still grow, so it is never rounded up even
+/// when nothing cuts it: its scan reached its end, no Stop precedes it and the
+/// budget covers the whole span (an older sealed stream sits beside it).
+#[test]
+fn a_serving_stream_tail_is_never_rounded_up() {
+    let end = 4 * FILE + 4096;
+    // The older stream's span plus the serving span is a whole number of files,
+    // so the rounded-down budget does not cut the serving stream.
+    let cursors = vec![
+        cursor(
+            scan(0, 0, SEALED, 0, FILE - 4096),
+            0,
+            None,
+            None,
+            version(0),
+        ),
+        cursor(scan(0, 0, SERVING, 0, end), 0, None, None, version(0)),
+    ];
+    let reports = stream_reports(&cursors, None, FILE, 100, SERVING).unwrap();
+    let serving = &reports[1];
+    assert_eq!(
+        (
+            serving.processed_upper,
+            serving.stream_end,
+            serving.terminal_position
+        ),
+        (end, end, end),
+        "premise: the serving scan reached its end with no Stop"
+    );
+    assert_eq!(serving.rounded_target, 4 * FILE);
 }

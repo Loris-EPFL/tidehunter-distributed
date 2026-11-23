@@ -2676,6 +2676,13 @@ mod drop_cells_tests;
 mod durable_cut_tests;
 #[cfg(test)]
 mod format_gate_tests;
+
+#[cfg(test)]
+mod retained_generation_counter_tests;
+
+#[cfg(test)]
+mod retained_generation_tests;
+
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
