@@ -16,7 +16,6 @@ fn position(partition: u32, generation: u64) -> StreamPosition {
     StreamPosition {
         partition,
         epoch: generation,
-        replay_from: 0,
         last_offset: None,
         durable_end: 0,
         complete: true,

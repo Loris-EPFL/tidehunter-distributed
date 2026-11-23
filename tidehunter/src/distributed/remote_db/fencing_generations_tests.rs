@@ -650,7 +650,6 @@ fn stream_position(
         StreamPosition {
             partition,
             epoch: generation,
-            replay_from: 0,
             last_offset: None,
             durable_end,
             complete,

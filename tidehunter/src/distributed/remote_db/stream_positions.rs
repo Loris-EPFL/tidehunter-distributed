@@ -150,7 +150,6 @@ pub(super) fn seed_positions(
                 StreamPosition {
                     partition,
                     epoch: generation,
-                    replay_from: 0,
                     last_offset: None,
                     durable_end,
                     complete,
@@ -209,7 +208,6 @@ pub(super) fn record_extent(
         .or_insert(StreamPosition {
             partition,
             epoch: generation,
-            replay_from: 0,
             last_offset: None,
             durable_end: 0,
             complete: true,

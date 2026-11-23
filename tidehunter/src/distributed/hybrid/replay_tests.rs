@@ -1066,6 +1066,45 @@ fn an_entry_re_read_at_or_above_the_cut_is_followed_by_its_newer_entry() {
 }
 
 #[test]
+fn the_batch_at_the_cut_is_not_in_the_blobs_and_recovery_applies_it() {
+    // Paper 3.4: recovery replays the WAL from `replay-from`. A version cut is
+    // exclusive (A13: cuts are exclusive, starts inclusive), so a cell holds
+    // every batch BELOW the cut and none at or above it. The batch at exactly
+    // the cut is the first batch written after the checkpoint, so no blob holds
+    // it and recovery must apply it.
+    //
+    // A `version <= region_cut` filter would skip this batch and lose its keys:
+    // the region's version cut is exclusive, while a stream's `replay_from` is
+    // an inclusive BYTE start (region.rs `StreamFront`). The two bounds must not
+    // be exchanged. This test is RED under that mutant.
+    let at_cut = [7, 0, 0, 0];
+    let (dir, cuts) = disk_after_a_store_at_cut_3(&[(1, KEY, 0, 0)]);
+    let table = reopen(&dir, &cuts);
+    assert_eq!(table.opened_cut(), version(3));
+    let pages = ScriptedPages::new().page(
+        0,
+        1,
+        128,
+        vec![(batch(3, &[(at_cut, b"at-cut")]), 128)],
+        None,
+    );
+    let fronts = [front(0, 1, 128)];
+    let report =
+        replay_pages(&table, pages, |_| true, &fronts, &live_of(&fronts), 8, 64).expect("replay");
+    assert_eq!(report.tail_batches, 1, "the batch at the cut is the tail");
+    assert_eq!(
+        report.below_cut_skipped, 0,
+        "a batch at the cut is not below it"
+    );
+    let position = indexed(&table, at_cut).expect("the batch at the cut is applied");
+    assert_eq!(
+        position.batch,
+        version(3),
+        "the at-cut batch is applied at its own version"
+    );
+}
+
+#[test]
 fn the_cut_comes_from_the_region_loaded_at_open_not_from_a_later_store() {
     let (dir, cuts) = disk_after_a_store_at_cut_3(&[(1, KEY, 0, 0), (2, KEY, 1, 0)]);
     let table = reopen(&dir, &cuts);

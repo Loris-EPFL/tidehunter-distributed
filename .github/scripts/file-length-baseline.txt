@@ -10,7 +10,7 @@ benchmarks/kv-research/src/runner.rs 7057
 tidehunter-fabric/src/endpoint/resources.rs 1965
 tidehunter/benches/admission_options/core.rs 2040
 tidehunter/src/distributed/nvmeof/live_target.rs 1502
-tidehunter/src/distributed/remote_db.rs 2681
+tidehunter/src/distributed/remote_db.rs 2680
 tidehunter/src/distributed/remote_db/live_bench_tests.rs 1828
 tidehunter/src/distributed/remote_db/pending_read.rs 2247
 tidehunter/src/distributed/remote_db/pipeline_tests.rs 2153

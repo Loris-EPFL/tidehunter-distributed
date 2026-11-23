@@ -594,7 +594,6 @@ fn new_authority_manifest(config: &RemoteDatabaseConfig, shape_yaml: &str) -> Au
 struct StreamPosition {
     partition: u32,
     epoch: u64,
-    replay_from: u64,
     last_offset: Option<u64>,
     durable_end: u64,
     complete: bool,

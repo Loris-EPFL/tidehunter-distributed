@@ -132,8 +132,19 @@ fn wal_replay_checkpointed_dataset_owner_restart_reads_all_keys() {
         if id == 2499 {
             db.flush_index().unwrap();
             // The position proof persists the owner root at this fragment.
-            // Thus the restart window no longer starts at WAL offset zero.
-            assert!(db.core.publisher.lock().positions[&(0, epoch)].replay_from > 0);
+            // Thus the restart window no longer starts at WAL offset zero: the
+            // stored region row of this stream is the owner's tail, a byte start
+            // above zero.
+            let fronts = db.core.table.stored_fronts();
+            let front = fronts
+                .iter()
+                .find(|front| front.partition == 0 && front.generation == epoch)
+                .expect("the stored region names the serving generation");
+            assert!(
+                front.replay_from > 0,
+                "the stored replay start of (0, {epoch}) is {}",
+                front.replay_from
+            );
         }
     }
     db.shutdown().unwrap();
@@ -193,9 +204,18 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
 #[test]
 fn wal_replay_reopen_fails_when_owner_wal_content_ends_below_checkpoint_position() {
     let mut fixture = Fixture::new();
+    // The checkpoint covers a batch only when the cell's blob holds it. Pass 1
+    // flushes a dirty cell only when it is stale by this threshold, so flush
+    // every dirty cell at the checkpoint.
+    fixture.config.index.snapshot_unload_threshold = 0;
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
         .unwrap();
+    // A native-tier checkpoint never forces an owner sync and `flush_index`
+    // stores at `min(durable, applied, held)`. Make the batch durable first:
+    // the checkpoint then stores the position root that the zero-filled WAL is
+    // checked against.
+    db.core.flush_durable().unwrap();
     db.flush_index().unwrap();
     let position = db.core.publisher.lock().positions[&(0, 1)].clone();
     assert!(position.durable_end > 0);
@@ -254,10 +274,21 @@ fn wal_replay_pending_budget_requires_one_whole_group_per_owner() {
 
 #[test]
 fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    // The checkpoint covers a batch only when the cell's blob holds it. Pass 1
+    // flushes a dirty cell only when it is stale by this threshold, so flush
+    // every dirty cell at the checkpoint.
+    fixture.config.index.snapshot_unload_threshold = 0;
     let db = fixture.open();
     db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
+    // A native-tier checkpoint never forces an owner sync (A25; see
+    // `tests::native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled`)
+    // and `flush_index` stores at `min(durable, applied, held)`. This fixture is
+    // the native tier and its durable-cut record lags, so without this wait the
+    // pass stores no region and the restart replays the whole WAL instead of the
+    // suffix. Make the batch durable first: the checkpoint then covers it.
+    db.core.flush_durable().unwrap();
     db.flush_index().unwrap();
     for n in 2..5 {
         db.write_batch(fixture.operation(0, n), vec![checkpoint_put(1, n as u8)])
@@ -290,22 +321,45 @@ fn wal_replay_second_crash_repeats_suffix_before_committing_completion() {
 }
 
 #[test]
-fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
+fn wal_replay_durable_owner_loss_above_the_checkpoint_fails_closed() {
+    // A checkpoint that covers a batch must not make recovery read a shorter
+    // WAL when the owner also made a later frame durable: the lost frame is
+    // acknowledged data, so the owner refuses the open instead of truncating
+    // the stream. (The tolerated case, a loss beyond the durable end, needs the
+    // owner not to name the frame; this test makes the later frame durable with
+    // the explicit `flush_durable` barrier below, so the owner names it and the
+    // tolerated case is unreachable here.
+    // `wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position`
+    // covers the refusal of a truncated stream.)
+    //
+    // The checkpoint covers batch 1 only when the cell's blob holds it, and the
+    // cell flushes only when it is stale by the threshold.
     use std::os::unix::fs::FileExt;
     let mut fixture = Fixture::new();
+    fixture.config.index.snapshot_unload_threshold = 0;
     let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
+    let first = db
+        .write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 1)])
         .unwrap();
+    // A native-tier checkpoint never forces an owner sync (A25; see
+    // `tests::native_checkpoint_commits_no_image_while_an_owner_sync_is_stalled`)
+    // and `flush_index` stores at `min(durable, applied, held)`. Make the batch
+    // durable first: the checkpoint then covers it.
+    db.core.flush_durable().unwrap();
     db.flush_index().unwrap();
+    let stored = db.core.table.stored_cut();
+    assert!(
+        stored.sequence > first.sequence,
+        "the stored cut {stored:?} must be above the checkpointed batch {first:?}"
+    );
     let frame_end = fixture.nodes[0].log_for_test(1).appended_frontier();
-    assert!(frame_end >= db.core.publisher.lock().positions[&(0, 1)].durable_end);
-    let operation = fixture.operation(0, 2);
-    let lost = db
-        .write_batch(operation, vec![checkpoint_put(1, 2)])
+    db.write_batch(fixture.operation(0, 2), vec![checkpoint_put(1, 2)])
         .unwrap();
+    // Make the later frame durable too, so losing its bytes is a durable loss.
+    db.core.flush_durable().unwrap();
     fail_stop_without_checkpoint(db);
     fixture.stop_owners();
-    // Simulate lost native-tier page-cache bytes, not a synchronous-tier loss.
+    // Lost page-cache bytes leave an allocated frame whose header is zero.
     let path = fixture
         .owner_database_root(0)
         .join("epoch_0000000000000001/wal_0000000000000000");
@@ -313,22 +367,14 @@ fn wal_replay_native_owner_loss_beyond_durable_end_keeps_checkpoint() {
     file.write_all_at(&[0; 8], frame_end).unwrap();
     file.sync_all().unwrap();
     drop(file);
-    fixture.restart_owners().unwrap();
-    let mut reopened = fixture.open();
-    assert_eq!(reopened.recovery_stats().tail_batches, 0);
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[1; 32]
-    );
+    let error = fixture
+        .restart_owners()
+        .expect_err("a lost durable frame must refuse the owner open");
     assert!(
-        reopened
-            .write_batch(operation, vec![checkpoint_put(1, 2)])
-            .unwrap()
-            > lost
+        error
+            .to_string()
+            .contains("replay position is not a frame boundary"),
+        "unexpected owner open error: {error}"
     );
 }
 
