@@ -636,6 +636,12 @@ pub struct RecoveryStats {
     pub fencing_ns: u64,
     pub tail_batches: u64,
     pub tail_bytes: u64,
+    /// Batches below the loaded region's cut that replay read again and did not
+    /// apply, because the stored blobs already hold them. Sources: the
+    /// per-stream fragment floor, a retained generation with no stored row
+    /// (replayed from offset 0), the dropped floor at the extent-queue cap, and
+    /// an older-generation row carried forward. Not part of `tail_batches`.
+    pub below_cut_skipped: u64,
     /// Per-open credential parsing/configuration, before parallel connections.
     pub tls_config_ns: u64,
     /// Read-connection worker wall time; overlaps control setup and recovery.
@@ -1280,7 +1286,8 @@ impl RemoteDatabase {
         // starts empty and is never replayed, and asking the owner for its pages
         // fails ("recovery requires sealed immutable epoch"). A stream with a
         // stored front resumes there; one without (a generation opened and not
-        // yet snapshotted) replays from its start, which is idempotent by version.
+        // yet snapshotted) replays from its start. Batches below the loaded
+        // region's cut are read again and dropped by the replay merge.
         let mut fronts = Vec::new();
         let mut live_streams = Vec::new();
         for (node, partition) in partitions.iter().enumerate() {
@@ -1333,6 +1340,7 @@ impl RemoteDatabase {
         };
         recovery_stats.tail_batches = report.tail_batches;
         recovery_stats.tail_bytes = report.tail_bytes;
+        recovery_stats.below_cut_skipped = report.below_cut_skipped;
         #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
             return Err(LocalDbError::new("injected interruption during WAL replay"));

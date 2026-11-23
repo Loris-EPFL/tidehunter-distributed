@@ -303,6 +303,16 @@ kv-research open record exports them.
   skips the row and the next store drops it. Non-zero is an operator-visible
   state after a trim.
 
+`below_cut_skipped` is an engine counter in `RecoveryStats`, exported by
+the same open record. It is information, not a defect: it counts batches below
+the loaded control region's cut that the replay read again and did not apply,
+because the stored index blobs already hold them. A batch is read again for one
+of four reasons: the per-stream fragment floor, a retained generation with no
+stored row that replays from offset 0, the dropped floor at the extent-queue
+cap, or an older-generation row carried forward. Paper section 3.4: replay
+starts at the snapshot's replay-from position. It is not part of `tail_batches`
+or `tail_bytes`. Only batches at or above the cut reach the index.
+
 ### Index cell size and the index WAL fragment
 
 - A hybrid index row is the key plus 48 bytes (the version-carrying position,

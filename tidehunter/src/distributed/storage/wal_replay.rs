@@ -74,9 +74,12 @@ pub(super) const FRAME_BOUNDARY: &str = "replay position is not a frame boundary
 ///
 /// A stored stream front is fragment aligned, and an aligned offset is always a
 /// frame boundary, which is what the owner's page read requires. Flooring an
-/// unaligned offset widens the replay instead of narrowing it, and re-applying a
-/// batch below the true start is idempotent by version, so the floor is the safe
-/// direction for both the writer of a front and the reader of one.
+/// unaligned offset widens the replay instead of narrowing it, so no batch at
+/// or above the true start is missed. It can also reach batches below the true
+/// start. Those are not harmless to apply: the replay driver must drop every
+/// batch below the region cut (`hybrid::replay`, `below_cut_skipped`), because a
+/// replayed entry hides a newer blob entry of the same key that another
+/// stream's floor did not re-read.
 pub(crate) fn aligned_replay_start(offset: u64, fragment_bytes: u64) -> u64 {
     if fragment_bytes == 0 {
         return offset;

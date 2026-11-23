@@ -82,6 +82,7 @@ fn recovery_json(stats: &RecoveryStats) -> Value {
     json!({
         "tail_batches": stats.tail_batches,
         "tail_bytes": stats.tail_bytes,
+        "below_cut_skipped": stats.below_cut_skipped,
         "tail_replay_ns": stats.tail_replay_ns,
         "old_generation_replayed_from_zero": stats.old_generation_replayed_from_zero,
         "stale_region_rows_skipped": stats.stale_region_rows_skipped,

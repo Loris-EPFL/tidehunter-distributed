@@ -10,7 +10,10 @@
 
 use super::position::VersionPosition;
 use super::region::StreamFront;
-use super::replay::{HybridReplaySource, OwnerPages, ReplayOutcome, ReplaySourceError};
+use super::replay::{
+    HybridReplaySource, OwnerPages, ReplayOutcome, ReplaySourceError, replay_pages,
+};
+use super::table::HybridTable;
 use crate::cell::CellId;
 use crate::crc::CrcFrame;
 use crate::db::WalEntry;
@@ -23,6 +26,7 @@ use crate::distributed::types::{
 use crate::key_shape::{KeyShape, KeyType};
 use crate::wal_replay::{ReplayFrame, ReplaySource};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn shape() -> KeyShape {
     KeyShape::new_single(4, 1, KeyType::uniform(1))
@@ -42,6 +46,12 @@ fn version(sequence: u64) -> BatchVersion {
 fn version_of(epoch: u64, sequence: u64) -> BatchVersion {
     BatchVersion { epoch, sequence }
 }
+
+/// No region: nothing is below the cut, as in a database that never stored one.
+const NO_CUT: BatchVersion = BatchVersion {
+    epoch: 0,
+    sequence: 0,
+};
 
 fn batch(sequence: u64, keys: &[([u8; 4], &[u8])]) -> CompleteBatch {
     batch_of(1, sequence, keys)
@@ -158,14 +168,24 @@ fn live_of(fronts: &[StreamFront]) -> Vec<(u32, u64)> {
         .collect()
 }
 
-/// A source with every front live and a page limit of 8.
+/// A source with every front live, a page limit of 8 and no region cut.
 fn source<P: OwnerPages, K: FnMut(BatchVersion) -> bool>(
     pages: P,
     keep: K,
     fronts: &[StreamFront],
 ) -> Result<HybridReplaySource<P, K>, ReplaySourceError> {
+    source_at(pages, keep, fronts, NO_CUT)
+}
+
+/// [`source`] started at the region cut `region_cut`.
+fn source_at<P: OwnerPages, K: FnMut(BatchVersion) -> bool>(
+    pages: P,
+    keep: K,
+    fronts: &[StreamFront],
+    region_cut: BatchVersion,
+) -> Result<HybridReplaySource<P, K>, ReplaySourceError> {
     let live = live_of(fronts);
-    HybridReplaySource::new(pages, keep, fronts, &live, 8, 64)
+    HybridReplaySource::new(pages, keep, fronts, &live, region_cut, 8, 64)
 }
 
 /// Acknowledges everything below `exclusive` in epoch 1, like a plan whose open
@@ -362,8 +382,8 @@ fn a_front_for_a_dead_generation_is_skipped() {
     let e2 = batch_of(2, 1, &[([1, 2, 0, 0], b"kept")]);
     let pages = ScriptedPages::new().page(0, 2, 0, vec![(e2, 0)], None);
     let fronts = [front(0, 1, 0), front(0, 2, 0)];
-    let source =
-        HybridReplaySource::new(pages, |_| true, &fronts, &[(0, 2)], 8, 64).expect("source");
+    let source = HybridReplaySource::new(pages, |_| true, &fronts, &[(0, 2)], NO_CUT, 8, 64)
+        .expect("source");
     let (frames, outcome) = drain(source);
     assert_eq!(sequences(&frames), vec![1]);
     assert_eq!(outcome.skipped_dead, 1);
@@ -375,10 +395,17 @@ fn a_live_generation_without_a_front_is_refused() {
     // Replaying without the front of a generation the manifest still retains
     // would silently drop that stream's suffix.
     let pages = ScriptedPages::new();
-    let error =
-        HybridReplaySource::new(pages, |_| true, &[front(0, 1, 0)], &[(0, 1), (0, 2)], 8, 64)
-            .err()
-            .expect("a live generation without a front must fail");
+    let error = HybridReplaySource::new(
+        pages,
+        |_| true,
+        &[front(0, 1, 0)],
+        &[(0, 1), (0, 2)],
+        NO_CUT,
+        8,
+        64,
+    )
+    .err()
+    .expect("a live generation without a front must fail");
     assert!(error.to_string().contains("has no stored replay front"));
 }
 
@@ -395,15 +422,16 @@ fn stored_front_is_the_replay_start() {
 }
 
 #[test]
-fn over_wide_start_replays_the_same_state_again() {
+fn over_wide_start_is_read_again_by_the_source() {
     let earlier = batch(1, &[([1, 0, 0, 0], b"a1")]);
     let later = batch(2, &[([2, 0, 0, 0], b"a2")]);
     let pages = ScriptedPages::new().page(0, 1, 0, vec![(earlier, 0), (later, 128)], None);
     // One batch wider than the exact start at 128.
     let source = source(pages, |_| true, &[front(0, 1, 0)]).expect("source");
     let (frames, outcome) = drain(source);
-    // The early batch is applied a second time; idempotent by version in the
-    // index, so an over-wide front costs replay time and changes no state.
+    // The early batch is read a second time. With no region cut the source
+    // yields it; the cut filter is what keeps it out of the index (see the
+    // `below_the_region_cut` tests at the end of this file).
     assert_eq!(sequences(&frames), vec![1, 2]);
     assert_eq!(frames.len(), 4);
     assert_eq!(outcome.applied, Some(version(2)));
@@ -492,9 +520,17 @@ fn invalid_pages_are_rejected() {
     let a1 = batch(1, &[([1, 0, 0, 0], b"a1")]);
     let a2 = batch(2, &[([2, 0, 0, 0], b"a2")]);
     let overfull = ScriptedPages::new().page(0, 1, 0, vec![(a1, 0), (a2, 128)], None);
-    let error = HybridReplaySource::new(overfull, |_| true, &[front(0, 1, 0)], &[(0, 1)], 1, 64)
-        .err()
-        .expect("overfull page must fail");
+    let error = HybridReplaySource::new(
+        overfull,
+        |_| true,
+        &[front(0, 1, 0)],
+        &[(0, 1)],
+        NO_CUT,
+        1,
+        64,
+    )
+    .err()
+    .expect("overfull page must fail");
     assert!(error.to_string().contains("exceeds its limit"));
 
     // A batch from another fencing generation cannot be replayed under this
@@ -793,4 +829,308 @@ fn a_relocated_copy_the_filter_refuses_is_discarded_not_skipped() {
     assert_eq!(outcome.discarded, 1);
     assert_eq!(outcome.relocated_skipped, 0);
     assert_eq!(outcome.applied, Some(version(3)));
+}
+
+#[test]
+fn batches_below_the_region_cut_are_read_and_not_yielded() {
+    // The stream's floor is below the cut, so the owner page holds batches 1 and
+    // 2 that the stored blobs already hold. Only the batch at the cut is the
+    // tail.
+    let a1 = batch(1, &[(KEY, b"a1")]);
+    let a2 = batch(2, &[([2, 0, 0, 0], b"a2")]);
+    let a3 = batch(3, &[([3, 0, 0, 0], b"a3")]);
+    let tail_bytes = a3.encoded().len() as u64;
+    let pages = ScriptedPages::new().page(0, 1, 0, vec![(a1, 0), (a2, 128), (a3, 256)], None);
+    let source = source_at(pages, |_| true, &[front(0, 1, 0)], version(3)).expect("source");
+    let (frames, outcome) = drain(source);
+    assert_eq!(
+        sequences(&frames),
+        vec![3],
+        "the cut itself is not below it"
+    );
+    assert_eq!(outcome.merged, 3);
+    assert_eq!(outcome.below_cut_skipped, 2);
+    assert_eq!(outcome.discarded, 0);
+    assert_eq!(outcome.applied, Some(version(3)));
+    assert_eq!(
+        outcome.tail_bytes, tail_bytes,
+        "only the batch at the cut counts as tail bytes"
+    );
+}
+
+#[test]
+fn without_the_region_cut_the_same_pages_yield_every_batch() {
+    // Negative control for the test above: with no cut the source yields batches
+    // 1 and 2 again. The cut is the only thing that keeps them out.
+    let a1 = batch(1, &[(KEY, b"a1")]);
+    let a2 = batch(2, &[([2, 0, 0, 0], b"a2")]);
+    let a3 = batch(3, &[([3, 0, 0, 0], b"a3")]);
+    let pages = ScriptedPages::new().page(0, 1, 0, vec![(a1, 0), (a2, 128), (a3, 256)], None);
+    let source = source_at(pages, |_| true, &[front(0, 1, 0)], NO_CUT).expect("source");
+    let (frames, outcome) = drain(source);
+    assert_eq!(sequences(&frames), vec![1, 2, 3]);
+    assert_eq!(outcome.below_cut_skipped, 0);
+}
+
+#[test]
+fn the_cut_skip_follows_the_version_b_filter_and_the_relocated_check() {
+    // Version B and the relocated check decide first, so their counters keep
+    // their meaning for batches below the cut: batch 1 is refused by the
+    // filter, batch 2 is a relocated copy, batch 3 is an ordinary batch below
+    // the cut, batch 4 is the tail.
+    let a1 = batch(1, &[(KEY, b"a1")]);
+    let r2 = relocated_batch(2, &[(KEY, b"r2")]);
+    let a3 = batch(3, &[([3, 0, 0, 0], b"a3")]);
+    let a4 = batch(4, &[([4, 0, 0, 0], b"a4")]);
+    let pages = ScriptedPages::new().page(
+        0,
+        1,
+        0,
+        vec![(a1, 0), (r2, 128), (a3, 256), (a4, 384)],
+        None,
+    );
+    let source = source_at(
+        pages,
+        |version| version.sequence != 1,
+        &[front(0, 1, 0)],
+        version(4),
+    )
+    .expect("source");
+    let (frames, outcome) = drain(source);
+    assert_eq!(sequences(&frames), vec![4]);
+    assert_eq!(outcome.discarded, 1, "the filter refusal is counted once");
+    assert_eq!(outcome.relocated_skipped, 1);
+    assert_eq!(outcome.below_cut_skipped, 1, "only the ordinary batch 3");
+    assert_eq!(outcome.merged, 4);
+}
+
+/// One put of `key` at `sequence` published into `table`, whose value frame is
+/// at `offset` of stream `partition`.
+fn published_put(
+    table: &HybridTable,
+    shape: &KeyShape,
+    sequence: u64,
+    key: [u8; 4],
+    partition: u32,
+    offset: u64,
+) {
+    let keyspace = shape.iter_ks().next().expect("one keyspace").id();
+    let position = VersionPosition::member(
+        version(sequence),
+        PhysicalValueAddress {
+            partition,
+            segment_generation: 1,
+            offset,
+            len: 64,
+        },
+        0,
+        RecordDescriptor {
+            operation_index: 0,
+            offset: 8,
+            len: 24,
+            keyspace: 0,
+            kind: RecordKind::Put,
+            key_len: 4,
+            value_offset: 14,
+            value_len: 2,
+            checksum: MemberChecksum(0),
+        },
+        crc32fast::hash(b"value"),
+    );
+    table
+        .insert_published(
+            &[super::table::PublishedMutation {
+                keyspace,
+                key: &key,
+                kind: RecordKind::Put,
+                position,
+            }],
+            64,
+        )
+        .expect("publish");
+}
+
+/// The disk a crash leaves right after a forced store at cut 3: every put in
+/// `puts` (`sequence`, key, stream, offset) is below the cut and in a blob, and
+/// the process is gone. Returns the directory and the cuts a reopen shares.
+fn disk_after_a_store_at_cut_3(
+    puts: &[(u64, [u8; 4], u32, u64)],
+) -> (tempdir::TempDir, super::loader::CutSources) {
+    use crate::distributed::durability::DurabilityTier;
+    let shape = Arc::new(shape());
+    let dir = tempdir::TempDir::new("hybrid-replay-below-cut").expect("scratch directory");
+    let cuts = super::loader::CutSources::new(1, DurabilityTier::Native);
+    let table = HybridTable::open(
+        dir.path(),
+        shape.clone(),
+        &super::config::HybridIndexConfig::default(),
+        cuts.clone(),
+        crate::metrics::Metrics::new(),
+    )
+    .expect("open table");
+    for &(sequence, key, partition, offset) in puts {
+        published_put(&table, &shape, sequence, key, partition, offset);
+    }
+    cuts.set_applied(version(3));
+    cuts.set_published(version(3));
+    cuts.set_durable(version(3));
+    let stored = table.snapshot_for_relocation(version(3)).expect("store");
+    assert!(stored.stored, "{stored:?}");
+    assert_eq!(stored.cut, version(3));
+    drop(table);
+    (dir, cuts)
+}
+
+fn reopen(dir: &tempdir::TempDir, cuts: &super::loader::CutSources) -> HybridTable {
+    HybridTable::open(
+        dir.path(),
+        Arc::new(shape()),
+        &super::config::HybridIndexConfig::default(),
+        cuts.clone(),
+        crate::metrics::Metrics::new(),
+    )
+    .expect("reopen table")
+}
+
+fn indexed(table: &HybridTable, key: [u8; 4]) -> Option<VersionPosition> {
+    let shape = shape();
+    let keyspace = shape.iter_ks().next().expect("one keyspace").id();
+    table.get(keyspace, &key, version(10)).expect("lookup")
+}
+
+#[test]
+fn a_stream_floor_below_the_cut_cannot_hide_a_newer_blob_entry() {
+    // The shape of the seed-49185 loss. K is written at v1 on stream 0 and
+    // overwritten at v2 on stream 1; both are below the stored cut 3, so the
+    // blob holds K at v2. Stream 0's stored front is floored to offset 0 and
+    // re-reads v1; stream 1's front (128) is above v2, so v2 is not re-read.
+    // Applied, the re-read v1 would replace the cell overlay and hide the
+    // blob's v2 (a read finds the overlay first).
+    let (dir, cuts) = disk_after_a_store_at_cut_3(&[(1, KEY, 0, 0), (2, KEY, 1, 0)]);
+    let table = reopen(&dir, &cuts);
+    assert_eq!(table.opened_cut(), version(3));
+    let other = [9, 0, 0, 0];
+    let pages = ScriptedPages::new()
+        .page(0, 1, 0, vec![(batch(1, &[(KEY, b"old")]), 0)], None)
+        .page(1, 1, 128, vec![(batch(4, &[(other, b"tail")]), 128)], None);
+    let fronts = [front(0, 1, 0), front(1, 1, 128)];
+    let report =
+        replay_pages(&table, pages, |_| true, &fronts, &live_of(&fronts), 8, 64).expect("replay");
+
+    // The read first: this is the lost-key symptom, an older entry hiding the
+    // blob's newer one.
+    let position = indexed(&table, KEY).expect("K is indexed");
+    assert_eq!(
+        (position.batch, position.address.partition),
+        (version(2), 1),
+        "the blob's newer entry must win over the re-read older batch"
+    );
+    let tail = indexed(&table, other).expect("the tail batch is applied");
+    assert_eq!(tail.batch, version(4));
+    assert_eq!(report.below_cut_skipped, 1, "v1 is read and not applied");
+    assert_eq!(report.tail_batches, 1, "only v4 is the tail");
+}
+
+#[test]
+fn an_entry_re_read_at_or_above_the_cut_is_followed_by_its_newer_entry() {
+    // Second half of the argument. Every batch at or above the cut is yielded in
+    // version order, so a key whose entries straddle the cut ends at its newest
+    // one: K is v1 (stream 0, below the cut, re-read and dropped), v2 (stream
+    // 1, below the cut, in the blob) and v4 (stream 1, above the cut, replayed).
+    // Z has only the dropped v1 and must come from the blob.
+    let z = [2, 0, 0, 0];
+    let (dir, cuts) = disk_after_a_store_at_cut_3(&[(1, KEY, 0, 0), (1, z, 0, 0), (2, KEY, 1, 0)]);
+    let table = reopen(&dir, &cuts);
+    let pages = ScriptedPages::new()
+        .page(
+            0,
+            1,
+            0,
+            vec![(batch(1, &[(KEY, b"old"), (z, b"z")]), 0)],
+            None,
+        )
+        .page(1, 1, 128, vec![(batch(4, &[(KEY, b"newest")]), 128)], None);
+    let fronts = [front(0, 1, 0), front(1, 1, 128)];
+    let report =
+        replay_pages(&table, pages, |_| true, &fronts, &live_of(&fronts), 8, 64).expect("replay");
+    assert_eq!(report.below_cut_skipped, 1);
+    assert_eq!(report.tail_batches, 1);
+
+    let newest = indexed(&table, KEY).expect("K is indexed");
+    assert_eq!((newest.batch, newest.address.partition), (version(4), 1));
+    let from_blob = indexed(&table, z).expect("Z is in the blob");
+    assert_eq!(
+        (from_blob.batch, from_blob.address.partition),
+        (version(1), 0)
+    );
+}
+
+#[test]
+fn the_cut_comes_from_the_region_loaded_at_open_not_from_a_later_store() {
+    let (dir, cuts) = disk_after_a_store_at_cut_3(&[(1, KEY, 0, 0), (2, KEY, 1, 0)]);
+    let table = reopen(&dir, &cuts);
+    assert_eq!(table.opened_cut(), version(3));
+    // A later store moves the stored cut; the cut recovery replays from stays.
+    published_put(&table, &shape(), 3, [5, 0, 0, 0], 1, 128);
+    cuts.set_applied(version(5));
+    cuts.set_published(version(5));
+    cuts.set_durable(version(5));
+    let later = table
+        .snapshot_for_relocation(version(5))
+        .expect("later store");
+    assert!(later.stored && later.cut > version(3), "{later:?}");
+    assert_eq!(table.stored_cut(), later.cut);
+    assert_eq!(table.opened_cut(), version(3));
+}
+
+#[test]
+fn a_range_clear_below_the_cut_is_skipped_and_resurrects_no_key() {
+    // K is put at v1 on stream 0 and the whole cell range is cleared at v2 on
+    // stream 1; both are below the stored cut 3, so the region holds the cell
+    // empty. Stream 0's floor re-reads the put (v1); stream 1's front is past
+    // the clear, so the clear is not re-read. Applied, the put would bring K
+    // back. Skipped, the cell stays empty, which the region already says.
+    use crate::distributed::durability::DurabilityTier;
+    let shape = Arc::new(shape());
+    let keyspace = shape.iter_ks().next().expect("one keyspace").id();
+    let dir = tempdir::TempDir::new("hybrid-replay-drop-below-cut").expect("scratch directory");
+    let cuts = super::loader::CutSources::new(1, DurabilityTier::Native);
+    {
+        let table = HybridTable::open(
+            dir.path(),
+            shape.clone(),
+            &super::config::HybridIndexConfig::default(),
+            cuts.clone(),
+            crate::metrics::Metrics::new(),
+        )
+        .expect("open table");
+        published_put(&table, &shape, 1, KEY, 0, 0);
+        table
+            .drop_cells(keyspace, CellId::Integer(0), CellId::Integer(0), version(2))
+            .expect("range clear");
+        cuts.set_applied(version(3));
+        cuts.set_published(version(3));
+        cuts.set_durable(version(3));
+        let stored = table.snapshot_for_relocation(version(3)).expect("store");
+        assert!(stored.stored && stored.cut == version(3), "{stored:?}");
+        assert!(indexed(&table, KEY).is_none(), "the clear is live");
+    }
+    let table = reopen(&dir, &cuts);
+    assert_eq!(table.opened_cut(), version(3));
+    assert!(
+        indexed(&table, KEY).is_none(),
+        "the region holds the cell empty"
+    );
+    let pages = ScriptedPages::new()
+        .page(0, 1, 0, vec![(batch(1, &[(KEY, b"old")]), 0)], None)
+        .page(1, 1, 128, vec![], None);
+    let fronts = [front(0, 1, 0), front(1, 1, 128)];
+    let report =
+        replay_pages(&table, pages, |_| true, &fronts, &live_of(&fronts), 8, 64).expect("replay");
+    assert!(
+        indexed(&table, KEY).is_none(),
+        "a put below the cut must not bring back a key the stored clear removed"
+    );
+    assert_eq!(report.below_cut_skipped, 1);
+    assert_eq!(report.tail_batches, 0);
 }

@@ -122,8 +122,8 @@ impl ExtentQueue {
         }
         // At the cap: keep the oldest head, remember the lowest dropped offset
         // and the highest dropped version, then move the tail. The snapshot
-        // replays from the floor, which is idempotent by version, so the extent
-        // is recovered even though it was not queued.
+        // replays from the floor, so the extent is recovered even though it was
+        // not queued; the replay merge drops what lies below the region cut.
         self.dropped_min_offset = self.dropped_min_offset.min(offset);
         self.dropped_max_version = Some(match self.dropped_max_version {
             Some(current) => current.max(version),

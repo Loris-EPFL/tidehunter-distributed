@@ -13,10 +13,16 @@
 //!   its members, all with the batch's version. The index never sees a partial
 //!   batch: an owner page holds only fully validated batches, and this source
 //!   yields a batch's frames only once the whole batch is in hand.
-//! * **Truncation at the stored suffix start.** Replay begins at the per-stream
-//!   offset the control region recorded (I3/I4), not at zero, and re-applying a
-//!   batch at or below that offset is idempotent by version, so an over-wide
-//!   start costs replay time and changes no state.
+//! * **Start at the region cut.** Replay begins at the replay-from position the
+//!   control region recorded (paper 3.3 and 3.4). Each stream has a stored byte
+//!   front (I3/I4), floored to a fragment, so a stream may re-read batches below
+//!   the cut. Such a batch is already in the stored blobs, and applying it again
+//!   is not harmless: a replayed entry sits in the cell overlay, and a read finds
+//!   the overlay before the blob, so an old entry from one stream would hide a
+//!   newer entry of the same key that the blob holds from another stream whose
+//!   floor lies above it. The merge therefore never yields a batch below the
+//!   cut (`ReplayOutcome::below_cut_skipped`), as native replay yields no frame
+//!   below `replay_from`.
 //! * **The acknowledgement filter is per batch, not one global cut.** Version B
 //!   records a truncation per fencing generation: an older generation's
 //!   unacknowledged tail stays in the retained owner WALs after the next open
@@ -179,6 +185,12 @@ pub(crate) struct ReplayOutcome {
     /// Merged batches the acknowledgement filter rejected; they stay in their
     /// owner WALs, unindexed.
     pub(crate) discarded: u64,
+    /// Acknowledged batches below the region cut that the merge read again: a
+    /// fragment-aligned stream front, a retained generation with no stored row
+    /// (replayed from offset 0), the dropped floor at the extent-queue cap, or
+    /// an older-generation row carried forward. The stored blobs already hold
+    /// them, so the index never receives them (see the module comment).
+    pub(crate) below_cut_skipped: u64,
     /// Stored fronts whose generation the manifest no longer retains: a
     /// trim-pending or already-trimmed generation, dead by construction.
     pub(crate) skipped_dead: u64,
@@ -210,6 +222,9 @@ pub(crate) struct ReplayReport {
     /// Relocated copies skipped (never indexed; they consumed an allocator
     /// version and are not part of the tail).
     pub(crate) relocated_skipped: u64,
+    /// Batches below the region cut that were read again and not indexed; not
+    /// part of the tail.
+    pub(crate) below_cut_skipped: u64,
 }
 
 /// One owner stream's read state.
@@ -385,13 +400,16 @@ fn member_payload_crc(
 }
 
 /// K-way merge of owner streams in [`BatchVersion`] order, filtered by Version
-/// B's per-generation acknowledgement rule.
+/// B's per-generation acknowledgement rule and started at the region cut.
 pub(crate) struct HybridReplaySource<P: OwnerPages, K: FnMut(BatchVersion) -> bool> {
     pages: P,
     /// Decides whether the index may see a batch. Version B's recovery plan
     /// supplies it (`RecoveryPlan::keep`), so a recorded truncation of an older
     /// generation and the open cut of the current one both apply.
     keep: K,
+    /// The cut of the control region this open loaded: every batch below it is
+    /// in the stored blobs, so none is yielded. Fixed at construction.
+    region_cut: BatchVersion,
     streams: Vec<Stream>,
     ready: BinaryHeap<Reverse<(BatchVersion, usize)>>,
     current: Option<BatchCursor>,
@@ -404,8 +422,9 @@ pub(crate) struct HybridReplaySource<P: OwnerPages, K: FnMut(BatchVersion) -> bo
 impl<P: OwnerPages, K: FnMut(BatchVersion) -> bool> HybridReplaySource<P, K> {
     /// `fronts` are the stored per-stream starts (I3/I4); `live_streams` is the
     /// coordinator manifest's retained authority as `(partition, generation)`;
-    /// `page_limit` bounds retained batches; `fragment_bytes` floors an
-    /// unaligned start.
+    /// `region_cut` is the cut of the loaded control region, below which no
+    /// batch reaches the index; `page_limit` bounds retained batches;
+    /// `fragment_bytes` floors an unaligned start.
     ///
     /// A stored front outside `live_streams` belongs to a trim-pending or
     /// already-absent generation: dead by construction, so it is skipped. A live
@@ -416,6 +435,7 @@ impl<P: OwnerPages, K: FnMut(BatchVersion) -> bool> HybridReplaySource<P, K> {
         keep: K,
         fronts: &[StreamFront],
         live_streams: &[(u32, u64)],
+        region_cut: BatchVersion,
         page_limit: usize,
         fragment_bytes: u64,
     ) -> Result<Self, ReplaySourceError> {
@@ -455,6 +475,7 @@ impl<P: OwnerPages, K: FnMut(BatchVersion) -> bool> HybridReplaySource<P, K> {
         let mut source = Self {
             pages,
             keep,
+            region_cut,
             streams,
             ready: BinaryHeap::new(),
             current: None,
@@ -579,6 +600,19 @@ impl<P: OwnerPages, K: FnMut(BatchVersion) -> bool> HybridReplaySource<P, K> {
                 self.outcome.applied = Some(version);
                 continue;
             }
+            if version < self.region_cut {
+                // Read again for one of four reasons: the stream's front is
+                // floored to a fragment; a retained generation with no stored
+                // row replays from offset 0; the dropped floor at the queue cap
+                // lies below it; or an older generation's row was carried
+                // forward. The stored blobs hold this batch (the region cut is
+                // the minimum frontier over its non-empty cells, and a blob holds
+                // every entry below its cell's frontier). It is after `keep` and
+                // the relocated check, so Version B accounting is unchanged, and
+                // before the cursor, so the batch is not decoded.
+                self.outcome.below_cut_skipped += 1;
+                continue;
+            }
             return Ok(Some(BatchCursor::new(batch, address)?));
         }
     }
@@ -623,9 +657,10 @@ impl<P: OwnerPages, K: FnMut(BatchVersion) -> bool> ReplaySource<VersionPosition
     }
 }
 
-/// Replays every retained owner stream into `table` and returns the cut the
-/// index now reflects: the highest acknowledged batch, or the stored cut when
-/// nothing new was replayed.
+/// Replays every retained owner stream into `table` from the cut of the control
+/// region the table opened with. Batches below that cut are read but not
+/// applied (`ReplayOutcome::below_cut_skipped`); every batch at or above it is
+/// applied in version order.
 ///
 /// `keep` is Version B's recovery filter (`RecoveryPlan::keep` in the
 /// coordinator). It is per batch because a truncation is recorded per fencing
@@ -644,11 +679,35 @@ pub(crate) fn replay_into(
 ) -> Result<ReplayReport, LocalDbError> {
     let page_limit = transport.page_limit;
     let fragment_bytes = transport.fragment_bytes;
-    let source = HybridReplaySource::new(
+    replay_pages(
+        table,
         TransportPages::new(transport),
         keep,
         fronts,
         live_streams,
+        page_limit,
+        fragment_bytes,
+    )
+}
+
+/// [`replay_into`] over any owner page reader, so a test can script the owners.
+/// The replay starts at `table.opened_cut()`, the cut of the region loaded at
+/// open, and never at a later store.
+pub(crate) fn replay_pages<P: OwnerPages>(
+    table: &HybridTable,
+    pages: P,
+    keep: impl FnMut(BatchVersion) -> bool,
+    fronts: &[StreamFront],
+    live_streams: &[(u32, u64)],
+    page_limit: usize,
+    fragment_bytes: u64,
+) -> Result<ReplayReport, LocalDbError> {
+    let source = HybridReplaySource::new(
+        pages,
+        keep,
+        fronts,
+        live_streams,
+        table.opened_cut(),
         page_limit,
         fragment_bytes,
     )
@@ -671,11 +730,13 @@ pub(crate) fn replay_into(
         tail_batches: outcome
             .merged
             .saturating_sub(outcome.discarded)
-            .saturating_sub(outcome.relocated_skipped),
+            .saturating_sub(outcome.relocated_skipped)
+            .saturating_sub(outcome.below_cut_skipped),
         tail_bytes: outcome.tail_bytes,
         tail_replay_ns,
         discarded: outcome.discarded,
         skipped_dead: outcome.skipped_dead,
         relocated_skipped: outcome.relocated_skipped,
+        below_cut_skipped: outcome.below_cut_skipped,
     })
 }

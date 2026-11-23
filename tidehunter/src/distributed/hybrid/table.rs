@@ -124,6 +124,9 @@ pub(crate) struct TableInner {
     region: Mutex<HybridRegionStore>,
     /// The per-stream replay table the region loaded at open named.
     opened_fronts: Vec<StreamFront>,
+    /// The cut of the region loaded at open ([`IndexCut::NONE`] without one).
+    /// Fixed at open: recovery replays from it, never from a later store.
+    opened_cut: BatchVersion,
     /// Whether the open found a stored control region (native: a snapshot to
     /// load), and how long reading and validating it took. Recovery
     /// diagnostics only (`RecoveryStats::checkpoint_loaded/_load_ns`).
@@ -254,6 +257,11 @@ impl HybridTable {
             .as_ref()
             .map(|region| region.streams.clone())
             .unwrap_or_default();
+        let opened_cut = region
+            .as_ref()
+            .map_or(<BatchVersion as IndexCut>::NONE, |region| {
+                region.last_position()
+            });
         let stored_cell_bytes = region
             .as_ref()
             .map(|region| region.cell_bytes.clone())
@@ -273,6 +281,7 @@ impl HybridTable {
             table,
             region: Mutex::new(region_store),
             opened_fronts,
+            opened_cut,
             region_loaded: region.is_some(),
             region_load_ns,
             pass: Mutex::new(()),
@@ -572,6 +581,12 @@ impl TableInner {
     /// The replay table the region loaded at open named, for recovery.
     pub(crate) fn opened_fronts(&self) -> &[StreamFront] {
         &self.opened_fronts
+    }
+
+    /// The cut of the region loaded at open: every batch below it is in the
+    /// stored blobs, so recovery replay applies none (`replay::replay_into`).
+    pub(crate) fn opened_cut(&self) -> BatchVersion {
+        self.opened_cut
     }
 
     /// A stored control region was loaded at open.
