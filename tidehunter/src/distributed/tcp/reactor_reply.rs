@@ -3,6 +3,8 @@
 //! A control worker's completion becomes a resident reply: it waits in the
 //! session's `pending` map, is encoded once the request's own deadline still
 //! holds, and refunds its byte lease only when the local submission retires.
+//! The replay-page stage note of an expired reply comes from
+//! [`super::replay_page`].
 
 use super::*;
 
@@ -83,16 +85,26 @@ pub(super) fn flush_responses(
     pending: &mut HashMap<u64, ServerPending>,
     limits: TcpLimits,
     mut diagnostics: Option<&mut ConnectionProfile>,
+    replay_stages: &super::replay_page::ReplayStages,
 ) -> Result<bool, TcpError> {
     let mut progressed = false;
     for (&id, request) in pending.iter_mut() {
+        if request.ready_response.is_some() {
+            // Check the deadline while the reply is still present, so the
+            // stage note can name a reply that was ready but not queued.
+            let now = Instant::now();
+            if now >= request.deadline {
+                return Err(request.deadline_error(
+                    id,
+                    "had a response ready to send",
+                    now,
+                    replay_stages.describe(id, request, now),
+                ));
+            }
+        }
         let Some(response) = request.ready_response.take() else {
             continue;
         };
-        let now = Instant::now();
-        if now >= request.deadline {
-            return Err(request.deadline_error(id, "had a response ready to send", now));
-        }
         let began = request.measured.then(Instant::now);
         stream.queue_response(id, response, limits.max_frame_bytes)?;
         if request.measured
@@ -117,11 +129,15 @@ pub(super) fn retire_responses(
     pending: &mut HashMap<u64, ServerPending>,
     retained_bytes: &mut usize,
     mut diagnostics: Option<&mut ConnectionProfile>,
+    replay_stages: &mut super::replay_page::ReplayStages,
 ) {
     // Completion of plaintext/TLS submission alone never refunds reply leases.
     pending.retain(|id, request| {
         let keep = !request.response_queued || stream.output_pending(*id);
         if !keep {
+            // The reply left the owner: the page stage is no longer needed.
+            // Until here the entry answers where a page stopped.
+            replay_stages.complete(*id);
             *retained_bytes -= request.charge;
             stream.stats.retained_reply_credit_bytes -= request.charge as u64;
             if request.measured

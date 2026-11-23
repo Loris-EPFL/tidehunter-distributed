@@ -1,6 +1,7 @@
 //! Real rustls framing with a deterministic partial transport writer. The native
 //! endpoint tests separately drive actual generated provider callbacks/CQEs.
 use super::super::tests::certificates;
+use super::replay_page::ReplayStages;
 use super::*;
 use std::io::Cursor;
 
@@ -479,7 +480,13 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
     submit_frames(&mut pair.session, &mut wire, SESSION_REQUESTS);
     for _ in 0..64 {
         step(&mut pair.session, &mut wire, 0);
-        retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+        retire_responses(
+            &mut pair.session,
+            &mut pending,
+            &mut retained,
+            None,
+            &mut ReplayStages::new(),
+        );
     }
     assert_eq!(pending.len(), SESSION_REQUESTS);
     assert_eq!(retained, SESSION_REQUESTS * 4096);
@@ -497,11 +504,23 @@ fn stalled_fences_bound_output_and_keep_actual_reply_leases() {
     );
     let first_fence = pair.session.output[0].fence.unwrap();
     pair.session.finish_output(wire.accepted, first_fence);
-    retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+    retire_responses(
+        &mut pair.session,
+        &mut pending,
+        &mut retained,
+        None,
+        &mut ReplayStages::new(),
+    );
     assert_eq!(pending.len(), SESSION_REQUESTS - 1);
     assert_eq!(retained, (SESSION_REQUESTS - 1) * 4096);
     pair.session.finish_output(wire.accepted, wire.accepted);
-    retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+    retire_responses(
+        &mut pair.session,
+        &mut pending,
+        &mut retained,
+        None,
+        &mut ReplayStages::new(),
+    );
     assert!(pending.is_empty());
     assert_eq!(retained, 0);
     assert_eq!(
@@ -853,7 +872,13 @@ fn ready_reply_deadline_and_retirement_follow_transport_fences() {
         let mut request = pending_reply(charge, false, deadline);
         request.ready_response = Some(Response::Error("ready reply".into()));
         let mut pending = HashMap::from([(1, request)]);
-        let queued = flush_responses(&mut pair.session, &mut pending, TcpLimits::default(), None);
+        let queued = flush_responses(
+            &mut pair.session,
+            &mut pending,
+            TcpLimits::default(),
+            None,
+            &replay_page::ReplayStages::new(),
+        );
         if expired {
             assert!(queued.is_err());
             assert!(pair.session.output.is_empty());
@@ -874,10 +899,22 @@ fn ready_reply_deadline_and_retirement_follow_transport_fences() {
         };
         submit_frames(&mut pair.session, &mut wire, 1);
         let mut retained = charge;
-        retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+        retire_responses(
+            &mut pair.session,
+            &mut pending,
+            &mut retained,
+            None,
+            &mut ReplayStages::new(),
+        );
         assert_eq!(pending.len(), 1, "TLS acceptance is not CQ retirement");
         pair.session.finish_output(wire.accepted, wire.accepted);
-        retire_responses(&mut pair.session, &mut pending, &mut retained, None);
+        retire_responses(
+            &mut pair.session,
+            &mut pending,
+            &mut retained,
+            None,
+            &mut ReplayStages::new(),
+        );
         assert!(pending.is_empty());
         assert_eq!(retained, 0);
         assert_eq!(pair.session.stats.retained_reply_credit_bytes, 0);

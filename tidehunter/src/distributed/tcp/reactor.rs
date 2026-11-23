@@ -34,6 +34,8 @@ mod output_tests;
 #[cfg(test)]
 #[path = "reactor_plain_tests.rs"]
 mod plain_tests;
+#[path = "reactor_replay_page.rs"]
+mod replay_page;
 #[path = "reactor_reply.rs"]
 mod reply;
 #[cfg(test)]
@@ -41,6 +43,7 @@ mod reply;
 mod session_tests;
 #[path = "reactor_wait.rs"]
 mod wait;
+
 pub(crate) use host_session::HostClient;
 pub(super) use host_session::serve_host_session;
 use reply::{flush_responses, pop_retired, queue_response, request_kind_code, retire_responses};
@@ -1433,7 +1436,7 @@ impl Client {
             .ok_or_else(|| TcpError::new("request ID space exhausted"))?;
         let size = self.stream.queue_size(id, request, self.frame_limit)?;
         if Instant::now() >= deadline {
-            return Err(TcpError::new("control output admission deadline expired"));
+            return Err(wait::admission_deadline());
         }
         if !self.stream.can_queue(size) {
             return Ok(false);
@@ -1462,7 +1465,6 @@ impl Client {
             response => Ok(response),
         })
     }
-
     pub(super) fn exchange_correlated(
         &mut self,
         request: &Request,
@@ -1563,8 +1565,9 @@ struct ServerPending {
 impl ServerPending {
     /// Names the owner deadline that ends the session: which request, at which
     /// stage, after how long. The owner logs it and sends it to the peer before
-    /// closing, so the peer does not see only a TLS teardown.
-    fn deadline_error(&self, id: u64, stage: &str, now: Instant) -> TcpError {
+    /// closing, so the peer does not see only a TLS teardown. `detail` is the
+    /// replay-page stage note, empty for every other kind.
+    fn deadline_error(&self, id: u64, stage: &str, now: Instant, detail: String) -> TcpError {
         let age = self
             .deadline
             .checked_sub(self.timeout)
@@ -1573,7 +1576,7 @@ impl ServerPending {
             });
         TcpError::new(format!(
             "owner request deadline expired: request {id} (kind {}) {stage} after {age:?} \
-             (owner deadline {:?}); its outcome is unknown and the session is closed",
+             (owner deadline {:?}){detail}; its outcome is unknown and the session is closed",
             self.kind, self.timeout
         ))
     }
@@ -1671,6 +1674,7 @@ pub(super) fn serve_session(
 ) -> Result<(), TcpError> {
     let (completed, completions) = mpsc::sync_channel::<WorkCompletion>(SESSION_REQUESTS);
     let mut pending = HashMap::<u64, ServerPending>::new();
+    let mut replay_stages = replay_page::ReplayStages::new();
     let mut controls = VecDeque::<(u64, Request)>::new();
     // One decoded input frame may await byte credits; never drain more input
     // behind it. Its original deadline and the negotiated frame bound apply.
@@ -1715,7 +1719,16 @@ pub(super) fn serve_session(
                 } else {
                     "was still executing"
                 };
-                return Err(request.deadline_error(id, stage, now));
+                return Err(request.deadline_error(
+                    id,
+                    stage,
+                    now,
+                    format!(
+                        "{}{}",
+                        replay_stages.describe(id, request, now),
+                        replay_page::test_queue_note(node)
+                    ),
+                ));
             }
             if let Some((envelope, _, _)) = held_request
                 .as_ref()
@@ -1759,6 +1772,7 @@ pub(super) fn serve_session(
                 &mut pending,
                 &mut retained_bytes,
                 diagnostics.as_mut(),
+                &mut replay_stages,
             );
             while let Ok(completion) = completions.try_recv() {
                 progressed = true;
@@ -1876,9 +1890,12 @@ pub(super) fn serve_session(
                             return Ok(());
                         }
                         Err(_) if stream.peer_finished() => {
+                            let note = replay_stages.closed_session_note(&pending);
                             return Err(TcpError::new(format!(
-                                "peer closed the session with {} accepted requests outstanding",
-                                pending.len()
+                                "peer closed the session with {} accepted requests outstanding\
+                                 {note}{}",
+                                pending.len(),
+                                replay_page::test_queue_note(node)
                             )));
                         }
                         Err(error) => return Err(error),
@@ -1993,6 +2010,9 @@ pub(super) fn serve_session(
                         output_started: None,
                     },
                 );
+                if matches!(&envelope.body, Request::ReplayLiveWal { .. }) {
+                    replay_stages.accept(envelope.id);
+                }
                 controls.push_back((envelope.id, envelope.body));
             }
             // Dispatch newly decoded requests in this sweep, not after another
@@ -2006,7 +2026,10 @@ pub(super) fn serve_session(
                     break;
                 };
                 let is_append = control::is_stream_request(&request);
-                if blocked_control || barrier_active || (!is_append && active_appends != 0) {
+                // A sealed-epoch page reads immutable bytes: no stream wait.
+                let waits_for_appends =
+                    !is_append && !control::is_sealed_replay_page(&request) && active_appends != 0;
+                if blocked_control || barrier_active || waits_for_appends {
                     #[cfg(test)]
                     node.control.note_session_barrier_wait();
                     controls.push_back((id, request));
@@ -2090,6 +2113,7 @@ pub(super) fn serve_session(
                                 barrier_active = true;
                             }
                             workers += 1;
+                            replay_stages.dispatch(id);
                         }
                         Err(work) => {
                             // Do not let a later fence/seal pass a backpressured
@@ -2102,7 +2126,13 @@ pub(super) fn serve_session(
                 }
                 progressed = true;
             }
-            if flush_responses(&mut stream, &mut pending, limits, diagnostics.as_mut())? {
+            if flush_responses(
+                &mut stream,
+                &mut pending,
+                limits,
+                diagnostics.as_mut(),
+                &replay_stages,
+            )? {
                 // Do not defer a bounded resident reply behind the next sweep's
                 // socket/CQ read. This is output-only; cold I/O stays off-owner.
                 stream.progress_output()?;

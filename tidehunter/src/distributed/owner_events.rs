@@ -64,6 +64,7 @@ event_kinds! {
     RevokeStart => "revoke_start", RevokeEnd => "revoke_end",
     AdoptionRoundStart => "adoption_round_start", AdoptionRoundEnd => "adoption_round_end",
     ControlReceived => "control_received", ControlReplied => "control_replied",
+    ReplayPageStart => "replay_page_start",
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

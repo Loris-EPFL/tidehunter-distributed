@@ -2374,18 +2374,18 @@ pub(crate) mod leased_tests {
         pub(crate) fn single_partition(tier: DurabilityTier, fragment: u64) -> Self {
             Self::new_with_partitions(tier, fragment, vec![2])
         }
-
-        fn new_with_partitions(tier: DurabilityTier, fragment: u64, partitions: Vec<u32>) -> Self {
+        pub(crate) fn new_with_partitions(t: DurabilityTier, f: u64, parts: Vec<u32>) -> Self {
             let temp = tempdir::TempDir::new("leased-coordinator").unwrap();
             let mut config = tcp::tests::config(&temp.path().join("node"));
-            config.partition.inventory.partitions = partitions;
-            config.partition.fragment_bytes = fragment;
-            config.partition.wal_file_bytes = fragment * 2;
+            config.partition.partition = parts[0];
+            config.partition.inventory.partitions = parts;
+            config.partition.fragment_bytes = f;
+            config.partition.wal_file_bytes = f * 2;
             config.partition.batch_limits.max_encoded_bytes = 8192;
-            config.partition.group_limits.max_encoded_bytes = 16376.min(fragment as usize - 8);
+            config.partition.group_limits.max_encoded_bytes = 16376.min(f as usize - 8);
             config.partition.max_batches = 4096;
             config.partition.max_reference_metadata_bytes = 64 * 1024 * 1024;
-            Self::open(tier, config, temp, Duration::from_secs(10))
+            Self::open(t, config, temp, Duration::from_secs(10))
         }
 
         pub(crate) fn native_geometry() -> Self {

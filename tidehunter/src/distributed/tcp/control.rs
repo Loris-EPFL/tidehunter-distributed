@@ -42,10 +42,26 @@ mod tests;
 const MAX_COMMANDS: usize = 64;
 const MAX_COMMAND_BYTES: usize = 256 * 1024 * 1024;
 // See `Shared::flush` for the capacity bound.
-const FLUSH_QUEUE: usize = 2 * MAX_COMMANDS + 16;
+pub(super) const FLUSH_QUEUE: usize = 2 * MAX_COMMANDS + 16;
+
+/// Outcome of the non-blocking barrier enqueue under the queue lock.
+enum BarrierEnqueue {
+    Sent,
+    /// The flusher has not drained the channel: reject only this control.
+    Full,
+    /// The flusher stopped or persistence already failed: keep the poison path.
+    Failed,
+}
 // Fixed worker set. Stream requests overlap up to this many at a time; the
 // partition's state lock orders their state changes, not this pool.
 const CONTROL_WORKERS: usize = 4;
+// Bound of one control's flush barrier. The barrier runs `flush_logs`, which
+// syncs every log, so a loaded disk can take seconds. For a lifecycle-class
+// control it stays below the 34.5 s deadline and the owner answers first; a
+// data-path control's shorter budget can expire first (peer timeout, not a
+// lost reply). A timeout fails only that control: no metadata was touched,
+// nothing is poisoned, and the flusher may still complete the barrier.
+const FLUSH_BARRIER_TIMEOUT: Duration = Duration::from_secs(20);
 
 type PublishedLiveLeases = (
     [u8; 16],
@@ -124,11 +140,13 @@ struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
     context: Arc<ControlContext>,
-    // Owner: the flusher thread (sole receiver). Capacity: at most one
-    // `Barrier` per control worker (each waits for its own before continuing);
-    // the capacity below exceeds that, so a send made under the queue lock
-    // never blocks. Full-queue policy: unreachable by this bound.
-    // Shutdown: `Stop` after the workers joined; queued items are served first.
+    // Owner: the flusher thread (sole receiver). Capacity: `FLUSH_QUEUE`
+    // barriers. A worker uses `try_send` under the queue lock; shutdown sets
+    // `stopped` there, releases it, then sends, so no enqueue blocks under the
+    // mutex. Full-queue policy: reject only that control with a typed
+    // `WouldBlock`, touch no metadata and poison nothing; the worker continues.
+    // An abandoned barrier stays queued until the flusher serves it. Shutdown:
+    // `Stop` after the workers joined; queued items are served first.
     flush: mpsc::SyncSender<FlushCommand>,
     // Lock order: `durability` before `syncers`. Both are cold on the append
     // path (first append of each log, configuration and live fencing). A live
@@ -146,6 +164,14 @@ struct Shared {
     // A long cap lets a test tell a wake from a deadline reply without a clock.
     #[cfg(test)]
     progress_cap_ms: std::sync::atomic::AtomicU64,
+    // Test-only cap of one flush barrier (ms), default `FLUSH_BARRIER_TIMEOUT`.
+    // A short cap lets a test see the named barrier timeout.
+    #[cfg(test)]
+    barrier_cap_ms: std::sync::atomic::AtomicU64,
+    // Test-only pause inside a stream request's worker, before it takes any
+    // storage lock. A test holds the append ticket without blocking the flusher.
+    #[cfg(test)]
+    before_stream_request: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     session_barrier_waits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -411,6 +437,12 @@ impl ControlOwner {
             progress_cap_ms: std::sync::atomic::AtomicU64::new(
                 super::DURABLE_PROGRESS_MAX_WAIT.as_millis() as u64,
             ),
+            #[cfg(test)]
+            barrier_cap_ms: std::sync::atomic::AtomicU64::new(
+                FLUSH_BARRIER_TIMEOUT.as_millis() as u64
+            ),
+            #[cfg(test)]
+            before_stream_request: Mutex::new(None),
             durability: Mutex::new(DurabilityState {
                 config: DurabilityConfig::default(),
                 started: false,
@@ -505,6 +537,35 @@ impl ControlOwner {
         self.shared.session_barrier_waits.load(Ordering::Relaxed)
     }
 
+    /// Test hook: cap of one flush barrier, so a test sees the named timeout.
+    #[cfg(test)]
+    pub(super) fn set_flush_barrier_cap_for_test(&self, cap: Duration) {
+        // Relaxed: read by the next barrier; tests order it before the request.
+        self.shared.barrier_cap_ms.store(
+            u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Test hook: park the next position proof in its worker, before it takes
+    /// any storage lock. It holds the append ticket, not the flusher. Returns
+    /// (entered, resume).
+    #[cfg(test)]
+    pub(super) fn pause_next_stream_request(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered, started) = mpsc::sync_channel(1);
+        let (resume, released) = mpsc::sync_channel(1);
+        *self.shared.before_stream_request.lock() = Some(Box::new(move || {
+            let _ = entered.send(());
+            let _ = released.recv();
+        }));
+        (started, resume)
+    }
+
+    #[cfg(test)]
+    pub(super) fn stopped_for_test(&self) -> bool {
+        self.shared.queue.lock().stopped
+    }
+
     #[cfg(test)]
     pub(super) fn pending_requests_for_test(&self) -> usize {
         self.shared.queue.lock().requests
@@ -562,11 +623,14 @@ impl ControlOwner {
             }
             queue.stopped = true;
             self.shared.ready.notify_all();
-            self.shared
-                .flush
-                .send(FlushCommand::Barrier(done))
-                .map_err(|_| TcpError::new("log flusher stopped before shutdown"))?;
         }
+        // Released first: the channel can hold abandoned barriers and the
+        // flusher's failure path needs this lock. `requests == 0` + `stopped`
+        // keep workers out in between, so the barrier keeps its FIFO position.
+        self.shared
+            .flush
+            .send(FlushCommand::Barrier(done))
+            .map_err(|_| TcpError::new("log flusher stopped before shutdown"))?;
         completed
             .recv()
             .map_err(|_| TcpError::new("log flusher stopped before shutdown"))?;
@@ -776,6 +840,16 @@ pub(super) fn is_maintenance_request(request: &Request) -> bool {
     }
 }
 
+/// A read-only page of a sealed owner epoch. Its handler accepts only a
+/// `Sealed` (or abandoned) source generation, so the bytes it reads are
+/// immutable and stream work on the active epoch cannot change them. The live
+/// control gate still orders it against fence, seal and generation trim, and a
+/// trim of its own generation is an exclusive control. It therefore must not
+/// wait for active stream work before it starts.
+pub(super) fn is_sealed_replay_page(request: &Request) -> bool {
+    matches!(request, Request::ReplayLiveWal { .. })
+}
+
 /// Stream requests overlap; the log orders their state changes. Exclusive
 /// controls wait for all earlier stream operations, including position proofs,
 /// and block later work until completion. Returns `None` once stopped and empty.
@@ -791,6 +865,7 @@ fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>)> {
             {
                 Some(true)
             }
+            Some(front) if is_sealed_replay_page(&front.request) => Some(false),
             Some(_) => (queue.active_appends == 0).then_some(false),
         };
         let Some(append) = runnable else {
@@ -839,6 +914,25 @@ fn run(shared: &Shared) {
             }
             profile.control_queue_samples = 1;
             profile.handler_ns = began.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        }
+        // The replay page is the one control whose start the owner must be able
+        // to name: a session admission is not a worker start, and the peer's
+        // control deadline is stamped before the owner's.
+        if matches!(&request, Request::ReplayLiveWal { .. }) {
+            super::super::owner_events::record(
+                super::super::owner_events::OwnerEventKind::ReplayPageStart,
+                shared.context.partition.partition,
+                id,
+                0,
+            );
+        }
+        #[cfg(test)]
+        if matches!(&request, Request::CheckpointPosition { .. }) {
+            // Drop the guard before the pause: the test resumes from another thread.
+            let pause = shared.before_stream_request.lock().take();
+            if let Some(pause) = pause {
+                pause();
+            }
         }
         if shared.context.terminal.load(Ordering::Acquire)
             && !shared.context.permits_recovery_control(&request)
@@ -1026,31 +1120,80 @@ fn run(shared: &Shared) {
             Request::CheckpointPosition { .. } | Request::ResolveLiveRecords { .. } => true,
             request => is_maintenance_request(request),
         };
-        let (barrier_ok, barrier_wait_ns) = if read_owned_barrier {
-            (true, 0)
+        let (barrier_ok, barrier_wait_ns, barrier_expired) = if read_owned_barrier {
+            (true, 0, false)
         } else {
             let (barrier_done, barrier_result) = mpsc::sync_channel(0);
             let barrier_started = measured.then(Instant::now);
-            let barrier_sent = {
+            // Enqueue without blocking under the queue lock: the channel can
+            // hold the abandoned barriers of earlier timed-out controls, and a
+            // blocking send here would stop every path that needs that lock.
+            let enqueued = {
                 let queue = shared.queue.lock();
-                !queue.flush_failed
-                    && shared
-                        .flush
-                        .send(FlushCommand::Barrier(barrier_done))
-                        .is_ok()
+                if queue.flush_failed {
+                    BarrierEnqueue::Failed
+                } else {
+                    match shared.flush.try_send(FlushCommand::Barrier(barrier_done)) {
+                        Ok(()) => BarrierEnqueue::Sent,
+                        Err(mpsc::TrySendError::Full(_)) => BarrierEnqueue::Full,
+                        Err(mpsc::TrySendError::Disconnected(_)) => BarrierEnqueue::Failed,
+                    }
+                }
             };
-            let (barrier_ok, barrier_wait_ns) = if barrier_sent {
-                let result = barrier_result.recv();
+            if matches!(enqueued, BarrierEnqueue::Full) {
+                // The flusher is slower than the whole queue. Nothing was
+                // touched, so only this control fails; the worker continues and
+                // the flusher keeps serving what it already holds.
+                complete(
+                    shared,
+                    id,
+                    charge,
+                    completed,
+                    Err(TcpError::with_kind(
+                        std::io::ErrorKind::WouldBlock,
+                        "flush barrier: the owner flush queue is full",
+                    )),
+                    profile,
+                    measured,
+                    began,
+                );
+                continue;
+            }
+            if matches!(enqueued, BarrierEnqueue::Sent) {
+                #[cfg(test)]
+                let timeout = Duration::from_millis(shared.barrier_cap_ms.load(Ordering::Relaxed));
+                #[cfg(not(test))]
+                let timeout = FLUSH_BARRIER_TIMEOUT;
+                let result = barrier_result.recv_timeout(timeout);
                 let wait = barrier_started.map_or(0, elapsed_ns);
                 if measured {
                     profile.control_queue_ns = profile.control_queue_ns.saturating_add(wait);
                 }
-                (result.is_ok(), wait)
+                let expired = result == Err(mpsc::RecvTimeoutError::Timeout);
+                (result.is_ok(), wait, expired)
             } else {
-                (false, 0)
-            };
-            (barrier_ok, barrier_wait_ns)
+                (false, 0, false)
+            }
         };
+        if barrier_expired {
+            // The flusher did not answer this barrier in time; it may still be
+            // running. Nothing was touched, so only this control fails with its
+            // named stage and the authority stays live.
+            complete(
+                shared,
+                id,
+                charge,
+                completed,
+                Err(TcpError::with_kind(
+                    std::io::ErrorKind::TimedOut,
+                    "flush barrier: the owner flusher did not answer a flush barrier in time",
+                )),
+                profile,
+                measured,
+                began,
+            );
+            continue;
+        }
         if !barrier_ok {
             shared.context.poison_readers();
             {
