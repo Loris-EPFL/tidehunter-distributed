@@ -31,10 +31,6 @@ fn record_lease_reservations(
 
 impl ClientWorker {
     #[allow(
-        clippy::expect_used,
-        reason = "the queued control front just matched is owned by this loop alone"
-    )]
-    #[allow(
         clippy::too_many_arguments,
         reason = "construction takes the bounded control channels, the shared diagnostics and the one allocation stream; a builder would duplicate this list without removing a parameter"
     )]
@@ -715,11 +711,12 @@ impl ClientWorker {
                             {
                                 break;
                             }
-                            match queued.pop_front().expect("front control exists") {
-                                WorkerItem::Control(Command::Control(operation)) => {
-                                    operation(&mut client)
-                                }
-                                WorkerItem::Control(Command::DrainTo(target, ack)) => {
+                            let Some(WorkerItem::Control(command)) = queued.pop_front() else {
+                                break;
+                            };
+                            match command {
+                                Command::Control(operation) => operation(&mut client),
+                                Command::DrainTo(target, ack) => {
                                     // Cold path, at most once per real snapshot
                                     // store. Reserve everything the writer has
                                     // allocated first, then treat the
@@ -734,22 +731,22 @@ impl ClientWorker {
                                     allocations.drain_to(target);
                                     let _ = ack.send(Ok(()));
                                 }
-                                WorkerItem::Control(Command::Stats(reply)) => {
+                                Command::Stats(reply) => {
                                     let _ =
                                         reply.send(client.stats().map_err(LocalDbError::component));
                                 }
-                                WorkerItem::Control(Command::OwnerTimelineArm(limit, reply)) => {
+                                Command::OwnerTimelineArm(limit, reply) => {
                                     let _ = reply.send(
                                         client
                                             .owner_timeline_arm(limit)
                                             .map_err(LocalDbError::component),
                                     );
                                 }
-                                WorkerItem::Control(Command::Seal(epoch, reply)) => {
+                                Command::Seal(epoch, reply) => {
                                     let _ = reply
                                         .send(client.seal(epoch).map_err(LocalDbError::component));
                                 }
-                                WorkerItem::Control(Command::ArmProfile(limit, reply)) => {
+                                Command::ArmProfile(limit, reply) => {
                                     write_profile_limit = limit;
                                     profile_requests = 0;
                                     profile_attempted = limit != 0;
@@ -764,7 +761,7 @@ impl ClientWorker {
                                     }
                                     let _ = reply.send(result);
                                 }
-                                WorkerItem::Control(Command::FinishProfile(reply)) => {
+                                Command::FinishProfile(reply) => {
                                     let result = if profile_enabled {
                                         match client.connection_profile(false, false) {
                                             Ok(profile) => {
@@ -783,10 +780,7 @@ impl ClientWorker {
                                     };
                                     let _ = reply.send(result);
                                 }
-                                WorkerItem::Control(Command::QueueReady) => {}
-                                WorkerItem::Append(..) => {
-                                    unreachable!()
-                                }
+                                Command::QueueReady => {}
                             }
                             progressed = true;
                         }

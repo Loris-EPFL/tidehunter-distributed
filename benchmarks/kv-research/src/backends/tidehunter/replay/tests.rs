@@ -629,3 +629,22 @@ async fn real_local_file_live_replay_writes_its_result_document() {
     drop(owners);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn info_rejects_an_empty_database_set() {
+    // `options()` refuses an empty database list before `open`, so this arm is
+    // reachable only through a backend built from that internal state; the test
+    // pins the arm's contract instead of leaving it untested.
+    let backend = TidehunterReplayBackend {
+        databases: BTreeMap::new(),
+        tables: Vec::new(),
+    };
+    let error = backend
+        .info()
+        .expect_err("an empty set must not report info");
+    assert_eq!(
+        format!("{error}"),
+        "distributed replay database set is empty",
+        "the empty-set arm names its contract"
+    );
+}

@@ -1321,10 +1321,9 @@ impl Db {
     pub fn set_native_durable(&self, enabled: bool) {
         self.durable_native.store(enabled, Ordering::Relaxed);
     }
-    #[allow(
-        clippy::expect_used,
-        reason = "callers name a keyspace declared at open; the expect names the contract"
-    )]
+    /// # Panics
+    /// Panics when `name` is not a live keyspace; see [`Self::try_ks`].
+    #[allow(clippy::expect_used, reason = "callers name a declared keyspace")]
     pub fn ks(&self, name: &str) -> KeySpace {
         self.try_ks(name).expect("declared keyspace")
     }

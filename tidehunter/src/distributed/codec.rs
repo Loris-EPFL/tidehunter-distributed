@@ -1076,9 +1076,11 @@ impl<'a> Cursor<'a> {
         Ok(result)
     }
     fn take_array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        // `take` returns exactly `N` bytes or errors; the conversion only
-        // narrows the type and cannot fail.
-        self.take(N)?.try_into().map_err(|_| CodecError::Truncated)
+        // `take` returns exactly `N` bytes or errors, so the copy has matching
+        // lengths and cannot panic.
+        let mut array = [0; N];
+        array.copy_from_slice(self.take(N)?);
+        Ok(array)
     }
     fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])
