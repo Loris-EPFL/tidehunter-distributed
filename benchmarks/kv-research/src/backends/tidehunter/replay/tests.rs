@@ -22,6 +22,8 @@ use tidehunter::distributed::tcp::{
 };
 use tidehunter::metrics::Metrics;
 
+mod native_oracle_tests;
+
 fn trace() -> Trace {
     Trace::load(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -143,11 +145,28 @@ impl Drop for Owners {
         // Release wakes the owner reactor; join before deleting its WAL directory.
         self.stop.store(true, Ordering::Release);
         for server in self.servers.drain(..) {
-            server.join().unwrap();
+            if let Err(failure) = server.join() {
+                // A panic inside this guard while the test already unwinds would
+                // abort the process and hide the original failure.
+                if std::thread::panicking() {
+                    continue;
+                }
+                std::panic::resume_unwind(failure);
+            }
         }
     }
 }
 fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners) {
+    fixture_at(root, trace, &mut BTreeMap::new())
+}
+
+/// Build the leased fixture at `root`. `endpoints` keeps every owner address,
+/// so a restarted process binds the address that the authority manifest recorded.
+fn fixture_at(
+    root: &Path,
+    trace: &Trace,
+    endpoints: &mut BTreeMap<u16, String>,
+) -> (Arc<TidehunterReplayBackend>, Owners) {
     let mut owners = Owners {
         stop: Arc::new(AtomicBool::new(false)),
         servers: Vec::new(),
@@ -163,8 +182,13 @@ fn fixture(root: &Path, trace: &Trace) -> (Arc<TidehunterReplayBackend>, Owners)
         let base = root.join(format!("db-{id}"));
         std::fs::create_dir_all(&base).unwrap();
         let shape = shape(&trace.tables, id);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let config = remote_config(id, &listener.local_addr().unwrap().to_string());
+        let listener = match endpoints.get(&id) {
+            Some(address) => TcpListener::bind(address).unwrap(),
+            None => TcpListener::bind("127.0.0.1:0").unwrap(),
+        };
+        let address = listener.local_addr().unwrap().to_string();
+        endpoints.insert(id, address.clone());
+        let config = remote_config(id, &address);
         let host_config = OwnerHostConfig {
             root: base.join("owner"),
             max_databases: 1,

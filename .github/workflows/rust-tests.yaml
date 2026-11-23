@@ -434,6 +434,18 @@ jobs:
           python3 -B .github/scripts/distributed_mainnet_ci.py \
             2>&1 | tee "$RUNNER_TEMP/distributed-mainnet/run.log"
 
+      - name: Gate the native-vs-hybrid differential oracle
+        # One Rust test replays the committed Sui trace through the native engine
+        # and the leased hybrid fixture, then compares per-key reads and final
+        # state before and after a restart. No cluster and no kernel target.
+        if: matrix.profile == 'distributed'
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s .github/scripts -p 'test_hybrid_native_oracle_ci.py' -v
+          python3 -B .github/scripts/hybrid_native_oracle_ci.py \
+            2>&1 | tee "$RUNNER_TEMP/distributed-mainnet/hybrid-oracle.log"
+
       - name: Retain distributed replay failures
         if: always() && matrix.profile == 'distributed'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
