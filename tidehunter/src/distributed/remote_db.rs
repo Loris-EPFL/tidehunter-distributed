@@ -822,17 +822,6 @@ pub struct WriteProfileSnapshot {
     pub sampled_requests: u64,
     pub profile_activation_errors: u64,
     pub profile_capture_errors: u64,
-    /// Sampled checkpoint admissions (bounded by the per-connection limit).
-    pub checkpoint_requests: u64,
-    /// Terminal sampled controls, including errors; in-flight controls are excluded.
-    pub checkpoint_completed: u64,
-    /// Submit-to-retirement time for terminal samples, including server waits.
-    pub checkpoint_wait_ns: u64,
-    /// Append replies forwarded while terminal sampled controls were pending.
-    pub checkpoint_append_completions: u64,
-    /// Failed admission polls for sampled controls that were eventually admitted.
-    /// Committed at admission; pre-admission failures are not counted.
-    pub checkpoint_admission_stalls: u64,
     pub profile: super::tcp::ConnectionProfile,
 }
 
@@ -957,19 +946,6 @@ impl RemoteDatabase {
             config,
             Some(OpenInterruption::AfterFences(successful_fences)),
         )
-    }
-
-    /// Open with a hook over the read-lane clients and a read-only config clone
-    /// before `ReadService::from_clients`. The write route, worker clients and
-    /// manifest identity use the unmodified `config`.
-    #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn open_with_read_hook(
-        path: &Path,
-        shape: &KeyShape,
-        config: RemoteDatabaseConfig,
-        hook: impl FnOnce(&mut RemoteDatabaseConfig, &mut Vec<Client>),
-    ) -> Result<Self, LocalDbError> {
-        Self::open_inner_with(path, shape, config, None, Some(Box::new(hook)), Some(false))
     }
 
     fn open_inner(
@@ -2320,7 +2296,7 @@ fn trace_worker_dequeue(timeline: &WriteTimeline, partition: u32, command: &Work
 }
 #[derive(Clone)]
 struct ControlHandle {
-    #[cfg(any(test, feature = "experimental-fabric"))]
+    #[cfg(feature = "experimental-fabric")]
     client: Arc<Mutex<Client>>,
     sender: std::sync::Weak<OwnerSender>,
     worker_wake: std::sync::Weak<std::os::fd::OwnedFd>,
@@ -2514,7 +2490,7 @@ impl ClientWorker {
     }
     fn control_handle(&self) -> ControlHandle {
         ControlHandle {
-            #[cfg(any(test, feature = "experimental-fabric"))]
+            #[cfg(feature = "experimental-fabric")]
             client: self.client.clone(),
             sender: self.sender.as_ref().map(Arc::downgrade).unwrap_or_default(),
             worker_wake: Arc::downgrade(&self.worker_wake),

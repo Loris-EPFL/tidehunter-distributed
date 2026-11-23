@@ -149,11 +149,6 @@ impl ReceiptWindow {
     }
 
     #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn is_empty(&self) -> bool {
-        self.order.is_empty()
-    }
-
-    #[cfg(test)]
     pub(in crate::distributed::remote_db) fn iter(&self) -> impl Iterator<Item = &RecentReceipt> {
         self.order.iter()
     }

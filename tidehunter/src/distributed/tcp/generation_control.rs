@@ -227,6 +227,10 @@ impl Client {
 /// Test-only: the owner reports an error at the point and the test restarts it
 /// from disk, which is exactly the durable state at that boundary.
 #[cfg(test)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "each variant names the durable trim step the owner has just completed"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerTrimCrash {
     /// A zero-end seal for an abandoned generation was installed.

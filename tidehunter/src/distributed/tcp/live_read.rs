@@ -539,8 +539,6 @@ pub(crate) struct LiveReadCache {
         std::sync::mpsc::SyncSender<()>,
         std::sync::mpsc::Receiver<()>,
     )>,
-    #[cfg(test)]
-    fail_inline_wait: bool,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -579,8 +577,6 @@ impl LiveReadCache {
             scratch: Vec::with_capacity(max_requests),
             #[cfg(test)]
             inline_submitted_pause: None,
-            #[cfg(test)]
-            fail_inline_wait: false,
         }
     }
 
@@ -1838,24 +1834,6 @@ pub(crate) mod tests {
         assert!(history_export_exists(&fixture));
     }
 
-    pub(crate) fn pause_inline_submitted(
-        cache: &mut LiveReadCache,
-        entered: std::sync::mpsc::SyncSender<()>,
-        resume: std::sync::mpsc::Receiver<()>,
-    ) {
-        cache.inline_submitted_pause = Some((entered, resume));
-    }
-
-    pub(crate) fn override_inline_completion(cache: &mut LiveReadCache, result: i32) {
-        cache.grants[0]
-            .inline_io_mut()
-            .override_next_completion_result(result);
-    }
-
-    pub(crate) fn fail_inline_wait(cache: &mut LiveReadCache) {
-        cache.fail_inline_wait = true;
-    }
-
     #[test]
     fn namespace_device_is_owned_before_the_cached_grant_is_retired() {
         let mut lane = lane(4);
@@ -1969,10 +1947,6 @@ pub(crate) mod tests {
         drop(inventory);
         install_existing_local(cache, location, token);
         path
-    }
-
-    pub(crate) fn owner_local_pin_count(node: &super::super::StorageNode) -> usize {
-        node.inventory.lock().live_pins.len()
     }
 
     pub(crate) fn install_existing_local(

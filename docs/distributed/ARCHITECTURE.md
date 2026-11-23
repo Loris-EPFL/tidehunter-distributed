@@ -407,6 +407,10 @@ Accepted weakenings against the Exact index (owner decision, 2026-11-20):
   instead. The parity row "dispatch-instant observation is not available after
   the hybrid" records it, including that the proof is code-level until the
   test runs on a compilable tree.
+- `Client::checkpoint_position` (`tcp/checkpoint.rs:26`) is a retained
+  test-observability path. It asks the owner for a synced position bound, and
+  production code sends no such request after the hybrid. The wire variant
+  `Request::CheckpointPosition` stays because the owner answers it.
 
 ## 12. File map
 

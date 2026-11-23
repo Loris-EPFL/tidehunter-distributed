@@ -32,9 +32,12 @@ pub(crate) mod table;
 pub use config::HybridIndexConfig;
 
 pub(crate) mod replay;
-pub(crate) mod snapshot;
+mod snapshot;
 
 pub(crate) use snapshot::{SnapshotConfig, StoredSnapshot, spawn_snapshot_thread};
+// The crash-injection boundary is read only by test modules outside `hybrid`.
+#[cfg(test)]
+pub(crate) use snapshot::{SnapshotBoundary, inject_snapshot_fault};
 
 #[cfg(test)]
 mod replay_tests;

@@ -22,7 +22,7 @@ use super::*;
 use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::hybrid::snapshot::{SnapshotBoundary, inject_snapshot_fault};
+use crate::distributed::hybrid::{SnapshotBoundary, inject_snapshot_fault};
 use crate::distributed::sui::Db;
 use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
 use std::ops::Range;

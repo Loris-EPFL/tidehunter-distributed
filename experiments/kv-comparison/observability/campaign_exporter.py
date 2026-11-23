@@ -1146,23 +1146,8 @@ def write_diagnostic_metrics(evidence, labels):
         stage_tree(stages, "stages")
     if persistence is not None:
         stage_tree(persistence, "value_wal_persistence")
-    checkpoint_fields = {"write_profile_checkpoint_requests", "write_profile_checkpoint_completed",
-                         "write_profile_checkpoint_wait_ns", "write_profile_checkpoint_append_completions",
-                         "write_profile_checkpoint_admission_stalls"}
-    checkpoint_state = stages.get("write_profile_checkpoint_available") if stages else None
-    if checkpoint_state is not None:
-        if type(checkpoint_state) is not int or checkpoint_state not in (0, 1):
-            raise ValueError("invalid sampled checkpoint availability")
-        if checkpoint_state and not checkpoint_fields <= stages.keys():
-            raise ValueError("sampled checkpoint counters incomplete")
-        checkpoint_available = bool(checkpoint_state and boundary_eligible and evidence["error"] is None)
-        result += sample("kv_case_write_diagnostic_available", int(checkpoint_available),
-                         local | {"scope": "sampled_checkpoint_control"})
-    else:
-        checkpoint_available = False
     for metric, value, dimensions in counters:
-        field = dimensions.get("stage", dimensions.get("counter"))
-        if (checkpoint_available if field in checkpoint_fields else available):
+        if available:
             result += sample(metric, value, local | dimensions)
     inventory = profile.get("value_wal_inventory")
     if inventory is not None and boundary_eligible:

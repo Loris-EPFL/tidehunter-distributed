@@ -484,6 +484,10 @@ fn region_rows(
 /// side effect up to it and none after, exactly what a process crash at that
 /// boundary leaves on disk.
 #[cfg(test)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "each variant names the durable step the pass has just completed"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SnapshotBoundary {
     /// Pass-1 flushes completed; nothing stored.

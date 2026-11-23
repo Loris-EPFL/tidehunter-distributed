@@ -128,6 +128,13 @@ pub(in crate::distributed::remote_db) struct OpenState {
     pub first_failure: Arc<OnceLock<super::super::FirstFailure>>,
 }
 
+/// Sends the keyspace and first reduced key, then waits for the resume signal.
+#[cfg(test)]
+type RelocationCopyPause = (
+    mpsc::SyncSender<(crate::key_shape::KeySpace, Option<minibytes::Bytes>)>,
+    mpsc::Receiver<()>,
+);
+
 #[cfg(test)]
 #[derive(Default)]
 pub(in crate::distributed::remote_db) struct TestHooks {
@@ -143,15 +150,10 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_release: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_publication: Option<u64>,
-    /// Named-force waiter deadline instead of `config.timeout`.
-    pub force_timeout: Option<std::time::Duration>,
     /// Replaces the configuration-derived bound of `await_copies_durable`.
     pub copy_durable_timeout: Option<std::time::Duration>,
     /// Sends the keyspace and first reduced key, then parks before re-point.
-    pub relocation_copy_pause: Option<(
-        mpsc::SyncSender<(crate::key_shape::KeySpace, Option<minibytes::Bytes>)>,
-        mpsc::Receiver<()>,
-    )>,
+    pub relocation_copy_pause: Option<RelocationCopyPause>,
     /// Parks the shutdown snapshot: sends on the first, waits on the second.
     pub checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     /// Fails the shutdown snapshot before it stores anything.

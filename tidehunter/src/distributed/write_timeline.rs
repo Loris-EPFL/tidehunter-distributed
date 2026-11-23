@@ -198,8 +198,10 @@ pub struct WriteTimelineExport {
     pub owner_storage_durations_available: bool,
     /// Always empty: S11f removed the position-proof path that was the only
     /// producer. The field and `dropped_checkpoint_events` stay in the export
-    /// shape for the analyzer (`experiments/kv-comparison/analyze.py`), which
-    /// reads them with a default.
+    /// shape because the analyzer (`experiments/kv-comparison/analyze.py`)
+    /// requires both keys: it rejects a missing key, a non-integer
+    /// `dropped_checkpoint_events`, and a `checkpoint_events` that is not a
+    /// list.
     pub checkpoint_events: Vec<CheckpointTimelineEvent>,
     /// Always 0 for the same reason as [`Self::checkpoint_events`].
     pub dropped_checkpoint_events: u64,

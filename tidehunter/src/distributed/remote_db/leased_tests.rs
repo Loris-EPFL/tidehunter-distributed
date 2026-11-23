@@ -214,7 +214,15 @@ fn leased_worker_group_flush_replies_and_closed_extent_checkpoint_cover_the_dura
     assert!(counts.leased_flushes > 0);
     assert_eq!(counts.leased_flushes, counts.leased_flush_samples);
     assert_eq!(counts.fua_writes + counts.leased_flush_covered_frames, 8);
-    let written = worker.client.lock().leased_test_frontier().0;
+    let (written, extent_open, _) = worker.client.lock().leased_test_frontier();
+    // Premise: the group flush leaves a durable prefix behind, and it leaves
+    // the leased extent open. A close before the control would make the
+    // closed-extent claim below true for the wrong reason.
+    assert!(written > 0, "the group flush must leave a durable prefix");
+    assert!(
+        extent_open,
+        "the group flush must leave the leased extent open"
+    );
     let (reply, checkpoint) = mpsc::sync_channel(1);
     worker
         .send(Command::Control(Box::new(move |client| {
@@ -231,7 +239,8 @@ fn leased_worker_group_flush_replies_and_closed_extent_checkpoint_cover_the_dura
     );
     // `Command::Control` closes the leased extent at dispatch, so this proof
     // runs against the closed extent that the control left behind; the removed
-    // `Command::CheckpointPosition` arm kept it open.
+    // `Command::CheckpointPosition` arm kept it open. The open-extent premise
+    // above attributes this close to the control.
     assert!(!worker.client.lock().leased_test_frontier().1);
     // A position proof persists the WAL position root, not adopted-receipt
     // bookkeeping (the removed receipt-prefix proof did that).
@@ -430,50 +439,59 @@ fn leased_worker_clean_shutdown_closes_owner_allocation_guard() {
 #[test]
 fn leased_worker_unknown_write_poison_stops_queued_commands() {
     for result in [Some(-libc::EIO), Some(2048), None] {
-        let fixture = Fixture::new(DurabilityTier::Native, 16384);
-        let mut client = fixture.writer();
-        if let Some(result) = result {
-            client.leased_test_fail_write(result);
-        } else {
-            client.leased_test_timeout_write();
-        }
-        let (worker, failure) = worker(&fixture, client);
-        let guard = worker.client.lock();
-        let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
-        let (reply, stats) = mpsc::sync_channel(1);
-        // A queued typed command behind the failed first frame.
-        worker.send(Command::Stats(reply)).unwrap();
-        let (reply, control) = mpsc::sync_channel(1);
-        // A failed typed command stops a later queued generic control too.
-        worker
-            .send(Command::Control(Box::new(move |_| {
+        for control_first in [false, true] {
+            let fixture = Fixture::new(DurabilityTier::Native, 16384);
+            let mut client = fixture.writer();
+            if let Some(result) = result {
+                client.leased_test_fail_write(result);
+            } else {
+                client.leased_test_timeout_write();
+            }
+            let (worker, failure) = worker(&fixture, client);
+            let guard = worker.client.lock();
+            let first = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
+            let (reply, stats) = mpsc::sync_channel(1);
+            let stats_command = Command::Stats(reply);
+            let (reply, control) = mpsc::sync_channel(1);
+            let control_command = Command::Control(Box::new(move |_| {
                 let _ = reply.send(());
-            })))
-            .unwrap();
-        let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
-        drop(guard);
-        assert!(first.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
-        assert!(!matches!(
-            later.recv_timeout(Duration::from_secs(5)),
-            Ok(Ok(_))
-        ));
-        // The worker drops the queued commands, and their reply senders, when
-        // its fail-stop break leaves the loop. Stop it before asserting the
-        // disconnect; the deleted test also dropped the worker before it read
-        // the queued replies.
-        drop(worker);
-        assert!(matches!(
-            stats.recv_timeout(Duration::from_secs(5)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        ));
-        assert!(matches!(
-            control.recv_timeout(Duration::from_secs(5)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        ));
-        // Acquire observes the worker's fatal-outcome publication.
-        assert!(failure.load(Ordering::Acquire));
-        assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 0);
-        assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
+            }));
+            // Queued typed commands behind the failed first frame, in both
+            // orders: neither order may be dispatched.
+            let commands = if control_first {
+                [control_command, stats_command]
+            } else {
+                [stats_command, control_command]
+            };
+            for command in commands {
+                worker.send(command).unwrap();
+            }
+            let later = worker.enqueue(1, vec![fixture.batch(1)]).unwrap();
+            drop(guard);
+            assert!(first.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+            let error = later
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.uncertain_version, Some(fixture.batch(1).version()));
+            // The worker drops the queued commands, and their reply senders, when
+            // its fail-stop break leaves the loop. Stop it before asserting the
+            // disconnect; the deleted test also dropped the worker before it read
+            // the queued replies.
+            drop(worker);
+            assert!(matches!(
+                stats.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+            assert!(matches!(
+                control.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+            // Acquire observes the worker's fatal-outcome publication.
+            assert!(failure.load(Ordering::Acquire));
+            assert_eq!(fixture.metrics.snapshot().counts.leased_frames, 0);
+            assert_eq!(fixture.metrics.snapshot().counts.unknown_writes, 1);
+        }
     }
 }
 

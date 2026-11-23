@@ -162,41 +162,6 @@ macro_rules! visit_stages {
     };
 }
 
-fn visit_checkpoint_profile(
-    set: &mut impl FnMut(&'static str, u64),
-    profile: &super::remote_db::WriteProfileSnapshot,
-) {
-    let enabled = profile.limit_per_connection != 0;
-    set("write_profile_checkpoint_available", u64::from(enabled));
-    if !enabled {
-        return;
-    }
-    for (name, value) in [
-        (
-            "write_profile_checkpoint_requests",
-            profile.checkpoint_requests,
-        ),
-        (
-            "write_profile_checkpoint_completed",
-            profile.checkpoint_completed,
-        ),
-        (
-            "write_profile_checkpoint_wait_ns",
-            profile.checkpoint_wait_ns,
-        ),
-        (
-            "write_profile_checkpoint_append_completions",
-            profile.checkpoint_append_completions,
-        ),
-        (
-            "write_profile_checkpoint_admission_stalls",
-            profile.checkpoint_admission_stalls,
-        ),
-    ] {
-        set(name, value);
-    }
-}
-
 #[derive(Default)]
 struct NativeWriteProfile {
     limit: AtomicU64,
@@ -1100,7 +1065,6 @@ impl Db {
                 set("cache_admitted_bytes", cache.admitted_bytes);
                 set("cache_entries", cache.entries as u64);
                 let write_profile = snapshot.write_profile;
-                visit_checkpoint_profile(&mut set, &write_profile);
                 set(
                     "write_profile_limit",
                     write_profile.limit_per_connection as u64,
@@ -1289,7 +1253,6 @@ impl Db {
                 set("cache_admitted_bytes", cache.admitted_bytes);
                 set("cache_entries", cache.entries as u64);
                 let write_profile = snapshot.write_profile;
-                visit_checkpoint_profile(&mut set, &write_profile);
                 set(
                     "write_profile_limit",
                     write_profile.limit_per_connection as u64,

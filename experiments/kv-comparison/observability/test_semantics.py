@@ -128,10 +128,9 @@ class DashboardSemantics(unittest.TestCase):
             self.assertIn('changes(kv_comparison_snapshot_timestamp_seconds', target['expr'])
             self.assertIn(' > 0)', target['expr'])
 
-    def test_campaign_exposes_checkpoint_availability_and_wal_inventory(self):
+    def test_campaign_exposes_wal_inventory(self):
         dashboard = self.dashboard('campaign')
         panels = {panel['id']: panel for panel in dashboard['panels']}
-        self.assertIn('sampled_checkpoint_control', panels[28]['targets'][0]['expr'])
         inventory = panels[39]['targets'][0]['expr']
         for metric in ('inventory_available', 'registered_files', 'logical_file_length_bytes'):
             self.assertIn(metric, inventory)

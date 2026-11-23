@@ -734,8 +734,6 @@ struct State {
     /// count and generation the waiter observed under the retained lock.
     #[cfg(test)]
     admission_wait_pause: Mutex<Option<AdmissionWaitPause>>,
-    #[cfg(test)]
-    wake_pending: Box<[AtomicBool]>,
     // Fixed flight signals, weak slots and exact-reference index are reserved from pending bytes.
     flight_ready: Box<[FlightSignal]>,
     live_read_submissions: AtomicU64,
@@ -849,9 +847,6 @@ struct Request {
 }
 enum ReadCommand {
     Request(Request),
-    /// Test barrier: the actor clears `wake_pending[node]` when it takes this.
-    #[cfg(test)]
-    Wake,
     #[cfg(test)]
     DrainLive(mpsc::SyncSender<Result<(), String>>),
     EvictRetirement(Arc<RetirementEviction>),
@@ -1247,8 +1242,6 @@ fn drive_live_reads(
                 }
             }
             #[cfg(test)]
-            ReadCommand::Wake => state.wake_pending[node].store(false, Ordering::Release),
-            #[cfg(test)]
             ReadCommand::DrainLive(reply) => {
                 for lane in &inboxes {
                     // Release: publish the drain before the worker can receive it.
@@ -1300,8 +1293,6 @@ pub(crate) struct ReadService {
     max_requests: usize,
     max_bytes: usize,
     timeout: Duration,
-    #[cfg(test)]
-    epoch: u64,
     /// Test-only override of `max_bytes`; `usize::MAX` means none. Relaxed:
     /// a knob read on admission, set by the test thread between operations.
     #[cfg(test)]
@@ -1566,11 +1557,6 @@ impl ReadService {
             admission_changed: parking_lot::Condvar::new(),
             #[cfg(test)]
             admission_wait_pause: Mutex::new(None),
-            #[cfg(test)]
-            wake_pending: (0..config.endpoints.len())
-                .map(|_| AtomicBool::new(false))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
             flight_ready: (0..flight_slots)
                 .map(|_| FlightSignal::new())
                 .collect::<Vec<_>>()
@@ -1616,8 +1602,6 @@ impl ReadService {
                 .max_pending_read_bytes
                 .saturating_sub(flight_metadata_bytes),
             timeout: config.timeout,
-            #[cfg(test)]
-            epoch,
             #[cfg(test)]
             test_max_bytes: AtomicUsize::new(usize::MAX),
             #[cfg(test)]

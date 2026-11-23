@@ -1960,8 +1960,7 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         .unwrap();
     }
     // All eleven whole batches remain READY until the worker owns its client.
-    // With max_batches=4 it will form [0..4), [4..8), [8..11), not authority
-    // groups plus three staged batches.
+    // With max_batches=4 it forms [0..4), [4..8), [8..11), not authority groups.
     assert_eq!(
         db.core.clients[0].queue.snapshot(),
         (1, 12, (0..11).map(|seq| (seq + 1, seq, 3)).collect())
@@ -2084,6 +2083,7 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         // empty after a restart, so the retry is a new write in a later epoch.
         assert!(version.epoch > versions[key as usize].epoch);
     }
+    reopened.drain().unwrap();
     assert_eq!(value(&mut reopened, 300), Some(vec![10; 32]));
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, 200 + key), Some(vec![key as u8; 32]));

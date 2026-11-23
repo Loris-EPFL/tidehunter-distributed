@@ -8,7 +8,7 @@ use super::retained_generation_tests::{
     EXTRA, WRITES, epoch, fill, fixture_eager, open, open_report, partition, read_back,
     retire_generation_one, row, store, write_range,
 };
-use crate::distributed::hybrid::snapshot::{SnapshotBoundary, inject_snapshot_fault};
+use crate::distributed::hybrid::{SnapshotBoundary, inject_snapshot_fault};
 use crate::distributed::sui::Db;
 use std::sync::atomic::Ordering;
 

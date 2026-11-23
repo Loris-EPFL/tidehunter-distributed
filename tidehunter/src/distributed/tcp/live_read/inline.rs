@@ -135,15 +135,6 @@ impl LiveReadCache {
             } else {
                 remaining
             };
-            #[cfg(test)]
-            let waited = if std::mem::take(&mut self.fail_inline_wait) {
-                Err(crate::distributed::nvmeof::live_io::LiveIoError::Invalid(
-                    "injected inline wait failure",
-                ))
-            } else {
-                grant.inline_io_mut().wait(timeout)
-            };
-            #[cfg(not(test))]
             let waited = grant.inline_io_mut().wait(timeout);
             if let Err(error) = waited {
                 drain_failed_io(grant);

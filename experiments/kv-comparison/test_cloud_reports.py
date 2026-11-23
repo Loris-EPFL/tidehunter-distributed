@@ -1152,23 +1152,6 @@ class CloudReports(unittest.TestCase):
         del row["write_diagnostics"]["observed"]["pre_completion_gate"]["stages"]["write_storage_wait_ns"]
         self.assertEqual(cloud.write_diagnostic_summary(row), [])
 
-    def test_sampled_checkpoint_wait_uses_completed_controls_not_appends(self):
-        evidence = {"phase_attempted": True, "runtime_enabled": True, "error": None,
-                    "selection": {"observed_samples": 20}, "profile": {"stages": {
-                        "write_profile_checkpoint_available": 1,
-                        "write_profile_checkpoint_wait_ns": 600,
-                        "write_profile_checkpoint_completed": 3,
-                        "write_profile_checkpoint_requests": 4}}}
-        row = {"write_diagnostics": {"observed": evidence}}
-        clock = cloud.write_diagnostic_summary(row)[0]
-        self.assertEqual(clock["count"], 3)
-        self.assertEqual(clock["mean_ns"], 200)
-        evidence["profile"]["stages"]["write_profile_checkpoint_completed"] = 0
-        self.assertIsNone(cloud.write_diagnostic_summary(row)[0]["mean_ns"])
-        evidence["profile"]["stages"]["write_profile_checkpoint_completed"] = 3
-        del evidence["profile"]["stages"]["write_profile_checkpoint_available"]
-        self.assertIsNone(cloud.write_diagnostic_summary(row)[0]["mean_ns"])
-
     def test_write_stage_missing_and_unavailable_is_not_zero(self):
         for total, count in ((None, 2), (0, None), (0, 0), (-1, 2), (1, True)):
             with self.subTest(total=total, count=count):

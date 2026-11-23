@@ -3997,18 +3997,13 @@ impl PartitionLog {
         self.failed_live_progress.load(Ordering::Acquire)
     }
 
-    /// Whether the syncer reached its hold point (after the self-adoption of
-    /// the live extent, before the appended persist) since the last take.
-    /// It proves the setup happened, not that the persist ran or failed.
+    /// Whether the syncer ever reached its hold point (after the
+    /// self-adoption of the live extent, before the appended persist). The
+    /// flag is set once and never cleared, so this reports that the setup
+    /// happened, not that the persist ran or failed.
     #[cfg(test)]
     pub(crate) fn syncer_persist_hold_reached(&self) -> bool {
         self.syncer_persist_hold_reached.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_syncer_persist_hold_reached(&self) -> bool {
-        self.syncer_persist_hold_reached
-            .swap(false, Ordering::AcqRel)
     }
 
     /// Fail a sealed retirement after target revoke and before root install.

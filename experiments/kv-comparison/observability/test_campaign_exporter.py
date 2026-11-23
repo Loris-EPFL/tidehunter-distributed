@@ -1102,24 +1102,6 @@ class CaseIdentityTests(unittest.TestCase):
         text = campaign.write_diagnostic_metrics(evidence, {})
         self.assertIn('stage="write_checkpoint_ns"} 2.0', text)
 
-    def test_checkpoint_control_metrics_require_explicit_availability(self):
-        evidence = write_diagnostics()
-        evidence["profile"]["stages"] = {
-            "write_profile_checkpoint_available": 1,
-            "write_profile_checkpoint_requests": 2,
-            "write_profile_checkpoint_completed": 1,
-            "write_profile_checkpoint_wait_ns": 1000000000,
-            "write_profile_checkpoint_append_completions": 3,
-            "write_profile_checkpoint_admission_stalls": 4}
-        text = campaign.write_diagnostic_metrics(evidence, {})
-        self.assertIn('stage="write_profile_checkpoint_wait_ns"} 1.0', text)
-        self.assertIn('counter="write_profile_checkpoint_append_completions"} 3', text)
-        self.assertIn('counter="write_profile_checkpoint_admission_stalls"} 4', text)
-        del evidence["profile"]["stages"]["write_profile_checkpoint_available"]
-        text = campaign.write_diagnostic_metrics(evidence, {})
-        self.assertNotIn('stage="write_profile_checkpoint_wait_ns"', text)
-        self.assertNotIn('counter="write_profile_checkpoint_admission_stalls"', text)
-
     def test_transport_pressure_requires_observed_poll_denominator(self):
         evidence = read_diagnostics()
         counters = evidence["profile"]["counters"]

@@ -3768,10 +3768,6 @@ def write_diagnostic_summary(row):
                 observe(field[:-3], nvme, field, samples_field(field),
                         "measurement_nvme_io_cumulative_delta",
                         eligible and evidence.get("measurement_drained") is True)
-    observe("checkpoint_wait", stages, "write_profile_checkpoint_wait_ns",
-            "write_profile_checkpoint_completed", "sampled_checkpoint_submit_to_retire_post_gate_capture",
-            boundary_eligible and evidence.get("error") is None
-            and stages.get("write_profile_checkpoint_available") == 1)
     pre = evidence.get("pre_completion_gate") or {}
     if pre.get("available") is True:
         coordinator = pre.get("stages") or {}

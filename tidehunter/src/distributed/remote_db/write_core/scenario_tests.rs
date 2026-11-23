@@ -100,6 +100,9 @@ fn shape() -> KeyShape {
 /// A rejected non-blocking submit must leave every dimension unchanged.
 /// Publication returns index/partition charges after waking its caller, so
 /// first wait until only unpublished generations still hold a partition batch.
+/// The caller must also quiesce publications that can still return charges:
+/// a generation that resolves during the check would change the dimensions
+/// under the comparison.
 fn assert_capacity_rejected(core: &Arc<WriteCore>, operation: [u8; 16], key: u32) {
     wait_for("publication releases settled", || {
         core.admission.charges().partition_batches == core.unresolved_slots()
@@ -285,6 +288,17 @@ fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
     assert_eq!(core.sequencer.generation(1), Some(1));
     assert!(core.is_published(version(&core, 0)));
     assert_eq!(core.admission.charges().slots, CAPACITY as usize);
+    // The reused generation publishes on its own worker and briefly still
+    // holds its request, byte and checkpoint charges. Wait for that release:
+    // the rejection check compares every admission dimension, so a publication
+    // still in flight would change them under it.
+    wait_for(
+        "the reused generation publishes and returns its charges",
+        || {
+            let charges = core.admission.charges();
+            charges.requests == 0 && charges.bytes == 0 && charges.partition_batches == 1
+        },
+    );
     // The released-but-unresolved generation still pins its slot.
     assert_capacity_rejected(&core, fixture.operation(0, 101), 101);
 
