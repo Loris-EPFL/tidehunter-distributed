@@ -31,6 +31,24 @@ def inventory():
             "controllers": controllers}
 
 
+def proof_defect(state, name):
+    """Return the reason a proof is unclean, or None when it is clean."""
+    path = state / name / "proof.json"
+    try:
+        proof = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        return f"{name} proof missing or unreadable: {error}"
+    if not isinstance(proof, dict):
+        return f"{name} proof is not a JSON object"
+    for key in ("complete", "cleanup_complete", "fixture_removed"):
+        if proof.get(key) is not True:
+            return f"{name} proof {key} is not true"
+    errors = proof.get("errors")
+    if not isinstance(errors, list) or errors:
+        return f"{name} proof errors is not an empty list"
+    return None
+
+
 def interrupted(signum, _frame):
     # The maintained proof catches this exception and executes stop_tide in finally.
     # Do not interrupt that drain a second time.
@@ -44,7 +62,8 @@ def run(args):
     import local_multiowner_check
     import local_dry_run_targets
 
-    dump(args.state / "before.json", inventory())
+    before = inventory()
+    dump(args.state / "before.json", before)
     dump(args.state / "host.json", {"kernel": os.uname().release,
          "cpu_count": os.cpu_count(), "meminfo": Path("/proc/meminfo").read_text(),
          "disk_free_bytes": shutil.disk_usage(args.state).free,
@@ -56,16 +75,18 @@ def run(args):
                 "--libs", str(args.state / "libs"), "--owners", "4",
                 "--output", str(args.state / "proof"), "--no-wal-prewrite"]
     result = 1
+    passed = False
+    defect = None
+    final = None
     # sudo already runs this wrapper in the hosted runner's host namespace.
     # The local development Docker image is not installed on hosted runners.
     original_root = local_dry_run_targets.ROOT
     local_dry_run_targets.ROOT = []
     try:
         result = local_multiowner_check.main()
-        first = json.loads((args.state / "proof/proof.json").read_text())
+        defect = proof_defect(args.state, "proof")
         prewrite = {"attempted": False}
-        if (first.get("cleanup_complete") is True and first.get("fixture_removed") is True
-                and json.loads((args.state / "before.json").read_text()) == inventory()):
+        if defect is None and inventory() == before:
             prewrite["attempted"] = True
             sys.argv = [str(local_multiowner_check.__file__), "--binary", str(args.binary.resolve(strict=True)),
                         "--libs", str(args.state / "libs"), "--owners", "4",
@@ -75,14 +96,28 @@ def run(args):
             except (Exception, SystemExit) as error:
                 prewrite["error"] = str(error)
             prewrite["passed"] = prewrite.get("exit_code") == 0
-        else:
+            defect = proof_defect(args.state, "proof-prewrite")
+        elif defect is None:
+            defect = "first pass left the host inventory changed"
             prewrite["reason"] = "first pass cleanup unconfirmed; second pass is unsafe"
+        else:
+            prewrite["reason"] = "first pass proof is unclean; second pass is unsafe"
+        final = inventory()
+        if defect is None and final != before:
+            defect = "last pass left the host inventory changed"
+        prewrite["defect"] = defect
         dump(args.state / "prewrite-result.json", prewrite)
-        return result
+        # Both passes carry reviewed evidence and the last pass must restore the
+        # exact host inventory, so each pass gates the step.
+        passed = (result == 0 and prewrite.get("attempted") is True
+                  and prewrite.get("passed") is True and defect is None
+                  and final == before)
+        return 0 if passed else 1
     finally:
         local_dry_run_targets.ROOT = original_root
-        dump(args.state / "after.json", inventory())
-        dump(args.state / "result.json", {"exit_code": result, "passed": result == 0})
+        final = inventory() if final is None else final
+        dump(args.state / "after.json", final)
+        dump(args.state / "result.json", {"exit_code": 0 if passed else 1, "passed": passed})
 
 
 def qualify(args):
@@ -120,19 +155,17 @@ def cleanup(args):
     before = json.loads((args.state / "before.json").read_text())
     after = inventory()
     dump(args.state / "cleanup-inventory.json", after)
-    proof = json.loads((args.state / "proof/proof.json").read_text())
-    complete = (proof.get("cleanup_complete") is True and proof.get("fixture_removed") is True
-                and before == after)
+    defects = [proof_defect(args.state, "proof")]
     prewrite_path = args.state / "proof-prewrite"
     if prewrite_path.exists():
-        prewrite = json.loads((prewrite_path / "proof.json").read_text())
-        prewrite_clean = (prewrite.get("cleanup_complete") is True
-                          and prewrite.get("fixture_removed") is True)
-        complete = complete and prewrite_clean
-        dump(args.state / "prewrite-cleanup.json", {"complete": prewrite_clean})
+        prewrite_defect = proof_defect(args.state, "proof-prewrite")
+        defects.append(prewrite_defect)
+        dump(args.state / "prewrite-cleanup.json", {"complete": prewrite_defect is None})
+    defects = [defect for defect in defects if defect is not None]
+    inventory_restored = before == after
+    complete = not defects and inventory_restored
     dump(args.state / "cleanup.json", {"complete": complete,
-         "proof_cleanup_complete": proof.get("cleanup_complete"),
-         "fixture_removed": proof.get("fixture_removed"), "inventory_restored": before == after})
+         "defects": defects, "inventory_restored": inventory_restored})
     if not complete:
         raise RuntimeError("Owned kernel TCP cleanup unconfirmed; retained proof names exact resources")
     return 0

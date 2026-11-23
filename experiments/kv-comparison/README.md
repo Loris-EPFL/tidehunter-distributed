@@ -72,7 +72,7 @@ one that differs from a case that sets the value. `local_multiowner_check.py`
 prewrites by default (`--no-wal-prewrite` opts out; `--wal-prewrite` is still
 accepted), and `local_dry_run.py --wal-prewrite`/`--no-wal-prewrite` overrides a
 case that does not set the value. The CI kernel NVMe/TCP proof runs a gating
-`--no-wal-prewrite` pass, then a non-gating `--wal-prewrite` pass.
+`--no-wal-prewrite` pass, then a gating `--wal-prewrite` pass.
 
 For the NVMe-oF write-engine selections, `nvmeof_path.py` exports the scalar
 controls in `puts.csv` (`G35W`) and `reads.csv` (`G35R`). Each `replays.csv`

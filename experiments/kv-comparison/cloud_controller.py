@@ -1992,7 +1992,14 @@ def load_owner_launch(job, launch_path):
     return launch
 
 
-def validate_launch(config, launch, case, index, polling=None):
+def validate_launch(config, launch, case, index, polling=None, planning_job=None):
+    """Validate one prepared owner launch against its case and its planning job.
+
+    The planning job is the job that the controller prepared the launch from.
+    A cloud case passes the reviewed matrix job. A local functional case passes
+    its own job, which can select a control transport that differs from the
+    reviewed case whose topology it reuses.
+    """
     root = Path(config["fleet"]["data_root"]) / "cells" / case
     node = root / f"node-{index}"
     if polling is not None and launch.get("limits", {}).get("polling") != polling:
@@ -2007,6 +2014,9 @@ def validate_launch(config, launch, case, index, polling=None):
         raise SafetyError("typed database root escapes exact case/node")
     guarded(node / "storage", root)
     job = case_owner_job(config, case)
+    if planning_job is not None and planning_job.get("case_id") != case:
+        raise SafetyError("planning job names a different case")
+    planned = job if planning_job is None else planning_job
     actual_prewrite = owner.get("wal_prewrite")
     if type(actual_prewrite) is not bool:
         raise SafetyError("owner launch must carry an explicit boolean wal_prewrite")
@@ -2040,8 +2050,8 @@ def validate_launch(config, launch, case, index, polling=None):
         transport = validate_transport(tls.get("transport"))
     except ValueError as error:
         raise SafetyError("invalid typed transport") from error
-    expected_transport = (owner_control_settings(job)["owner_transport"]
-                          if job.get("backend") in cloud_campaign.NVME_BACKENDS else None)
+    expected_transport = (owner_control_settings(planned)["owner_transport"]
+                          if planned.get("backend") in cloud_campaign.NVME_BACKENDS else None)
     if expected_transport is not None and protocol_key(transport) != protocol_key(expected_transport):
         raise SafetyError("typed transport differs from the planned leased owner control protocol")
     if protocol_key(transport) not in {
@@ -3959,7 +3969,7 @@ class Controller:
         def start(index):
             launch_path = prepared / f"node-{index}" / "launch.yaml"
             launch = load_owner_launch(job, launch_path)
-            validate_launch(self.config, launch, case, index, polling)
+            validate_launch(self.config, launch, case, index, polling, planning_job=job)
             if job.get("nvmeof_route") == "live" and "host" in launch:
                 if (launch["host"].get("live_target_pool")
                         != live_target_pool_for_owner(self.config, case, index, live_transport)):

@@ -115,7 +115,7 @@ class ReplayCITests(unittest.TestCase):
                 self.assertEqual(list(summary), expected)
                 self.assertEqual(summary["wal_replay"]["inventory_restored"], restored)
 
-    def test_prewrite_pass_is_non_gating_but_cleanup_is_required(self):
+    def test_prewrite_pass_gates_the_run(self):
         import argparse
         import local_multiowner_check
         import local_dry_run_targets
@@ -136,24 +136,184 @@ class ReplayCITests(unittest.TestCase):
                     output = Path(sys.argv[sys.argv.index("--output") + 1])
                     output.mkdir()
                     kernel.dump(output / "proof.json", {
+                        "complete": True,
                         "cleanup_complete": clean if prewrite else True,
                         "fixture_removed": clean if prewrite else True,
+                        "errors": [],
                     })
                     return 1 if prewrite else 0
                 with patch.object(kernel, "inventory", return_value={}), \
                         patch.object(kernel.signal, "signal"), \
                         patch.object(sys, "argv", ["test"]), \
                         patch.object(local_multiowner_check, "main", side_effect=proof):
-                    self.assertEqual(kernel.run(args), 0)
+                    self.assertEqual(kernel.run(args), 1)
                     self.assertIs(local_dry_run_targets.ROOT, original_root)
                     self.assertEqual(calls, [False, True])
-                    self.assertFalse(json.loads((state / "prewrite-result.json").read_text())["passed"])
+                    prewrite = json.loads((state / "prewrite-result.json").read_text())
+                    self.assertTrue(prewrite["attempted"])
+                    self.assertFalse(prewrite["passed"])
+                    self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
                     if clean:
                         self.assertEqual(kernel.cleanup(args), 0)
                     else:
                         with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
                             kernel.cleanup(args)
                         self.assertFalse(json.loads((state / "cleanup.json").read_text())["complete"])
+
+    def test_both_passes_gate_the_run(self):
+        import argparse
+        import local_multiowner_check
+        import local_dry_run_targets
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                self.assertEqual(local_dry_run_targets.ROOT, [])
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": True, "cleanup_complete": True,
+                    "fixture_removed": True, "errors": []})
+                return 0
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 0)
+                prewrite = json.loads((state / "prewrite-result.json").read_text())
+                self.assertTrue(prewrite["attempted"])
+                self.assertTrue(prewrite["passed"])
+                self.assertTrue(json.loads((state / "result.json").read_text())["passed"])
+
+    def test_changed_final_inventory_gates_the_run(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": True, "cleanup_complete": True,
+                    "fixture_removed": True, "errors": []})
+                return 0
+            with patch.object(kernel, "inventory", side_effect=[{}, {}, {"leak": True}]), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 1)
+                prewrite = json.loads((state / "prewrite-result.json").read_text())
+                self.assertTrue(prewrite["attempted"])
+                self.assertTrue(prewrite["passed"])
+                self.assertEqual(prewrite["defect"],
+                                 "last pass left the host inventory changed")
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
+
+    def test_prewrite_proof_fixture_removal_gates_the_run(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                prewrite = "--wal-prewrite" in sys.argv
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": True, "cleanup_complete": True,
+                    "fixture_removed": not prewrite, "errors": []})
+                return 0
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 1)
+                prewrite = json.loads((state / "prewrite-result.json").read_text())
+                self.assertTrue(prewrite["attempted"])
+                self.assertTrue(prewrite["passed"])
+                self.assertEqual(prewrite["defect"],
+                                 "proof-prewrite proof fixture_removed is not true")
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
+
+    def test_missing_prewrite_proof_gates_the_run(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                if "--wal-prewrite" not in sys.argv:
+                    output = Path(sys.argv[sys.argv.index("--output") + 1])
+                    output.mkdir()
+                    kernel.dump(output / "proof.json", {
+                        "complete": True, "cleanup_complete": True,
+                        "fixture_removed": True, "errors": []})
+                return 0
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 1)
+                prewrite = json.loads((state / "prewrite-result.json").read_text())
+                self.assertTrue(prewrite["attempted"])
+                self.assertTrue(prewrite["passed"])
+                self.assertIn("proof-prewrite proof missing", prewrite["defect"])
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
+
+    def test_proof_errors_gate_the_run(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": True, "cleanup_complete": True,
+                    "fixture_removed": True, "errors": ["kernel log interval incomplete"]})
+                return 0
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 1)
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
+
+    def test_first_pass_failure_gates_even_when_prewrite_passes(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            args = argparse.Namespace(state=state, binary=binary)
+            def proof():
+                prewrite = "--wal-prewrite" in sys.argv
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": True, "cleanup_complete": True,
+                    "fixture_removed": True, "errors": []})
+                return 0 if prewrite else 1
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(args), 1)
+                self.assertTrue(json.loads((state / "prewrite-result.json").read_text())["passed"])
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
 
     def test_prewrite_pass_does_not_start_after_incomplete_cleanup(self):
         import argparse

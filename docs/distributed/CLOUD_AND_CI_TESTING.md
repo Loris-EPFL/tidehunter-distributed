@@ -30,7 +30,8 @@ single-owner qualification runs the same four-epoch sequence as the cloud
 qualifier: a coordinator child exits without dropping the database or
 checkpointing, then the parent reopens it. It covers WAL-replay history, each
 with native and synchronous durability. The
-four-owner admission and second-open proof remains non-gating.
+four-owner admission and second-open proof is gating. The `--wal-prewrite`
+pass is also gating.
 CI uses 8 MiB WAL members with 4 MiB fragments to keep the real member and
 fragment crossings small. Cloud qualification keeps its 1 GiB members.
 

@@ -216,6 +216,11 @@ class LocalMode:
         return {"logical_guest": index, "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                 "scope": "logical guest on shared local kernel"}
 
+    def planning_job(self, case):
+        """Return the job that planned this case, or None when no job names it."""
+        return next((job for job in self.config.get("jobs", [])
+                     if job.get("case_id") == case), None)
+
     def monitor_spec(self, results):
         return {"schema_version": 1, "run_id": self.config["prefix"],
                 "state_dir": str(self.fixture / "monitor-state"), "results_root": str(results),
@@ -429,7 +434,8 @@ class LocalMode:
         if "wal_prewrite" in self.config:
             self.cloud.cloud_campaign.owner_launch_config(launch)["wal_prewrite"] = self.config["wal_prewrite"]
         launch_path.write_text(yaml.safe_dump(launch, sort_keys=False))
-        self.cloud.validate_launch(self.config, launch, case, index)
+        self.cloud.validate_launch(self.config, launch, case, index,
+                                   planning_job=self.planning_job(case))
         # Archive single-database launches carry their target; an owner host
         # derives each database's target and state directory itself.
         live = launch.get("node", {}).get("live_target")
@@ -493,7 +499,8 @@ class LocalMode:
         root = self.fixture / "cells" / case
         launch_path = root / f"node-{index}" / "launch.yaml"
         launch = yaml.safe_load(launch_path.read_text())
-        self.cloud.validate_launch(self.config, launch, case, index)
+        self.cloud.validate_launch(self.config, launch, case, index,
+                                   planning_job=self.planning_job(case))
         name = self.cloud.unit_name(self.config, case, f"storage-{index}")
         if name not in self.units:
             raise ValueError("owner unit is not owned")

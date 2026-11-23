@@ -229,9 +229,8 @@ jobs:
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py qualify \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
             2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/single-owner.log"
-      - name: Run existing kernel TCP admission and second-open proof (non-gating)
+      - name: Run kernel TCP four-owner admission and second-open proof
         id: four_owner
-        continue-on-error: true
         timeout-minutes: 13
         run: |
           set -euo pipefail
@@ -272,7 +271,7 @@ jobs:
             else
               echo "No single-owner summary; inspect setup and single-owner logs."
             fi
-            echo "Four-owner admission and second-open proof (non-gating)."
+            echo "Four-owner admission and second-open proof."
             echo "No RDMA, independent SSD, HA or performance qualification."
             if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json" ]; then
               echo '```json'
