@@ -126,9 +126,9 @@ pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// (payloads change in place; tags are unchanged), and adds `durable_end`, the
 /// end of the highest durable frame of the generation's log, to every
 /// `InventoryGeneration` of the inventory sweep.
-/// 36 (lifetime exports) removes AcquireLiveExportPin, ReleaseLiveExportPin and
-/// `NvmeofEpochPinned` (request tags 22-23, response tag 13; later tags shift),
-/// because an export now lives as long as its file.
+/// 36 (lifetime exports) removes AcquireLiveExportPin/ReleaseLiveExportPin (tags 22-23) and
+/// `NvmeofEpochPinned` (tag 13); later tags shift. Exports live as long as their files,
+/// `export_pins` leaves `WalFileObservation`, and write-protect counters join `LiveTargetStats`.
 const PROTOCOL: u32 = 36;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.

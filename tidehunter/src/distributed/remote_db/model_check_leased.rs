@@ -167,3 +167,34 @@ fn write_model_leased_seeded_crashes() {
         }
     }
 }
+
+#[test]
+fn write_model_leased_reopen_rejects_missing_target_identity() {
+    let mut fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("write-model-missing-identity").unwrap(),
+        1,
+        128,
+        KeyShape::new_single(4, 8, KeyType::uniform(8)),
+        2,
+        |config| configure(config, profile(0)),
+        |_| {},
+    );
+    let root = fixture.startups[0].0.root.clone();
+    fixture.stop_owners();
+    let target = root.join("live-target");
+    let identity = target.join("target-id");
+    assert!(identity.is_file(), "premise: the target identity exists");
+    // Model a marker left by a previous seal. Without its identity witness it
+    // must never be adopted, because the owner could then re-expose a fenced
+    // file writable.
+    fs::write(target.join("sealed/marker"), b"sealed WAL marker").unwrap();
+    fs::remove_file(&identity).unwrap();
+    let error = fixture.restart_owners().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("target state directory identity changed"),
+        "{error}"
+    );
+    assert!(!identity.exists(), "reopen recreated a missing identity");
+}

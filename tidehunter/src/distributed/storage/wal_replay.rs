@@ -1047,8 +1047,6 @@ impl PartitionLog {
             #[cfg(test)]
             syncer_persist_hold_reached: AtomicBool::new(false),
             #[cfg(test)]
-            fail_sealed_before_root: AtomicBool::new(false),
-            #[cfg(test)]
             fail_appended_persist: AtomicBool::new(false),
             #[cfg(test)]
             failed_appended_persist: AtomicBool::new(false),

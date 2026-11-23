@@ -68,10 +68,6 @@ impl NodeInventory {
                 None
             }
         };
-        #[cfg(test)]
-        if log.take_sealed_before_root_failure() {
-            return Err(TcpError::new("injected failure after revoke before root"));
-        }
         // Counted on submission, before any root install or unlink, so a
         // partially failed retirement still shows that unlinks were attempted.
         inventory.value_wal_unlinks = inventory

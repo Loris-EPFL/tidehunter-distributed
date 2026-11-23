@@ -107,7 +107,19 @@ impl Client {
                     LiveReadTiming::start(&self.live_counters, LiveTimingStage::NamespaceSetup);
                 let deadline = Instant::now() + Duration::from_millis(config.connect_timeout_ms);
                 let (lease, acquisition) = pool
-                    .get_or_connect(&target, &config.host_nqn, config.host_id, access, deadline)
+                    .acquire_file(
+                        &target,
+                        &config.host_nqn,
+                        config.host_id,
+                        access,
+                        deadline,
+                        (
+                            first.segment.partition,
+                            first.segment.epoch,
+                            first.segment.file_index,
+                        ),
+                    )
+                    .map(|(lease, acquisition, _)| (lease, acquisition))
                     .map_err(TcpError::component)?;
                 let namespace = lease.open_namespace().map_err(TcpError::component)?;
                 drop(setup);

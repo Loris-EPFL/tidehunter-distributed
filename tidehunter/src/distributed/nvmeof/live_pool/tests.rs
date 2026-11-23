@@ -266,6 +266,46 @@ fn ready_shared_idle(
 }
 
 #[test]
+fn eviction_ignores_a_busy_controller_of_another_file_in_the_subsystem() {
+    let dir = tempdir::TempDir::new("live-pool-exact-evict").unwrap();
+    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:evict");
+    let (held, how, _) = pool
+        .acquire(
+            &target,
+            "nqn.2026-01.test:host",
+            [2; 16],
+            LiveNamespaceAccess::ReadWrite,
+            Instant::now() + PROGRESS_CAP,
+        )
+        .unwrap();
+    assert_eq!(how, LivePoolAcquisition::Reused);
+    {
+        let mut state = pool.state.lock().unwrap();
+        if let Some(Entry::Ready { identity, .. }) =
+            state.entries.get_mut(&(target.nqn.clone(), target.nsid))
+        {
+            // This controller serves file 1; the retirement victim is file 2.
+            identity.file = Some((0, 1, 1));
+        }
+    }
+    let result = pool
+        .evict_files(0, 1, 4096, &[2 * 4096], Instant::now() + PROGRESS_CAP)
+        .unwrap();
+    assert_eq!(result, RetirementResult::Completed);
+    assert!(
+        pool.state
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&(target.nqn.clone(), target.nsid))
+    );
+    drop(held);
+    pool.shutdown(Instant::now() + PROGRESS_CAP).unwrap();
+}
+
+#[test]
 fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
     let dir = tempdir::TempDir::new("live-pool-close").unwrap();
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();

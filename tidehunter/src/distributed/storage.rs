@@ -683,8 +683,6 @@ pub struct PartitionLog {
     #[cfg(test)]
     syncer_persist_hold_reached: AtomicBool,
     #[cfg(test)]
-    fail_sealed_before_root: AtomicBool,
-    #[cfg(test)]
     fail_appended_persist: AtomicBool,
     #[cfg(test)]
     failed_appended_persist: AtomicBool,
@@ -864,8 +862,6 @@ impl PartitionLog {
             failed_live_progress: AtomicBool::new(false),
             #[cfg(test)]
             syncer_persist_hold_reached: AtomicBool::new(false),
-            #[cfg(test)]
-            fail_sealed_before_root: AtomicBool::new(false),
             #[cfg(test)]
             fail_appended_persist: AtomicBool::new(false),
             #[cfg(test)]
@@ -4015,11 +4011,6 @@ impl PartitionLog {
     #[cfg(test)]
     pub(crate) fn syncer_persist_hold_reached(&self) -> bool {
         self.syncer_persist_hold_reached.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_sealed_before_root_failure(&self) -> bool {
-        self.fail_sealed_before_root.swap(false, Ordering::AcqRel)
     }
 
     /// Fail one appended persist after its serialization lock is held.
