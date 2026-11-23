@@ -355,8 +355,21 @@ fn spawn(directory: &Path, stage: &str) -> Output {
     }
 }
 
+/// Root of the retained drop-cells crash artifacts. The first case of a test
+/// process removes the root, so repeated failing runs cannot accumulate
+/// artifacts while the artifacts of the current run stay readable.
+fn artifacts_root() -> &'static std::path::Path {
+    static ROOT: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+        let root = std::env::temp_dir().join("tidehunter-drop-cells-artifacts");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the drop-cells artifact root");
+        root
+    });
+    &ROOT
+}
+
 fn run(case: &DropCase) {
-    let temp = tempdir::TempDir::new("drop-cells-model-case").unwrap();
+    let temp = tempdir::TempDir::new_in(artifacts_root(), "case").unwrap();
     // Retain on any failure, delete on success.
     let directory = temp.into_path();
     fs::write(

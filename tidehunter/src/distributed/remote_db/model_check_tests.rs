@@ -847,8 +847,21 @@ fn child(directory: &Path, stage: &str) -> Output {
     }
 }
 
+/// Root of the retained write-model crash artifacts. The first case of a test
+/// process removes the root, so repeated failing runs cannot accumulate
+/// artifacts while the artifacts of the current run stay readable.
+fn artifacts_root() -> &'static std::path::Path {
+    static ROOT: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+        let root = std::env::temp_dir().join("tidehunter-write-model-artifacts");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the write-model artifact root");
+        root
+    });
+    &ROOT
+}
+
 fn run_case(case: &Case) {
-    let temp = tempdir::TempDir::new("write-model-case").unwrap();
+    let temp = tempdir::TempDir::new_in(artifacts_root(), "case").unwrap();
     // Retain on *any* failure (including a checker assertion), delete on success.
     let directory = temp.into_path();
     fs::write(
