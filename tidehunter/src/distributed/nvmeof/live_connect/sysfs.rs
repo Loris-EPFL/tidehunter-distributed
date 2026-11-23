@@ -116,7 +116,11 @@ pub(super) fn vanished(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
 }
 
-pub(super) fn verify_queue_geometry(path: &Path, geometry: LiveQueueGeometry) -> io::Result<()> {
+/// Verifies the queue geometry and returns the observed `(queue_count, sqsize)`.
+pub(super) fn verify_queue_geometry(
+    path: &Path,
+    geometry: LiveQueueGeometry,
+) -> io::Result<(u32, u32)> {
     geometry.validate().map_err(invalid)?;
     let count_path = path.join("queue_count");
     let size_path = path.join("sqsize");
@@ -137,7 +141,7 @@ pub(super) fn verify_queue_geometry(path: &Path, geometry: LiveQueueGeometry) ->
             format!("unexpected controller queue geometry: queue_count={count}, sqsize={size}"),
         ));
     }
-    Ok(())
+    Ok((count, size))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -84,7 +84,6 @@ pub struct LiveClientConfig {
     #[serde(default)]
     pub queue_geometry: LiveQueueGeometry,
 }
-
 fn default_inline_reads() -> bool {
     true
 }
@@ -1517,6 +1516,7 @@ impl super::Client {
                             nsid: observed.nsid,
                             bytes: observed.bytes,
                             block_size: observed.block_size,
+                            controller: lease.evidence(),
                         },
                 },
             );

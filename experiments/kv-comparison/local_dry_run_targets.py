@@ -36,45 +36,32 @@ NVMET_CONFIGFS = Path("/sys/kernel/config/nvmet")
 KERNEL_PORT_STATE = Path("/run/tidehunter-kernel-live-ports")
 IPV4_PORT_SYSCTLS = Path("/proc/sys/net/ipv4")
 KERNEL_SERVICE_PORTS = range(20000, 65535, 2)
+# The client connects with this geometry; the proof must record exactly its queue and submission counts.
+KERNEL_QUEUE_GEOMETRY = {"io_queues": 1, "queue_size": 32, "poll_queues": 0}
 # Bound every diagnostic listing; evidence must not grow with host state.
 DIAGNOSTIC_ENTRIES = 256
 
 
-def _owned_controllers(sysfs, transport, address, services, identity, *, sample_errors=None):
+def _owned_controllers(sysfs, transport, address, services, identity):
     """Initiator controllers scoped to this run's addresses, services and NQN."""
     rows = []
     services = {str(service) for service in services}
     for path in sysfs.glob("nvme*"):
         if not re.fullmatch(r"nvme[0-9]+", path.name):
             continue
-        attrs, attribute = {}, path
+        attrs = {}
         try:
             for name in ("transport", "address", "subsysnqn", "hostnqn", "hostid", "queue_count", "sqsize"):
-                attribute = path / name
-                attrs[name] = attribute.read_text().strip()
+                attrs[name] = (path / name).read_text().strip()
             fields = dict(p.split("=", 1) for p in attrs["address"].split(",") if "=" in p)
             if (attrs["transport"] == transport and fields.get("traddr") == address
                     and fields.get("trsvcid") in services
                     and (identity(attrs["hostnqn"], attrs["subsysnqn"]) if callable(identity)
                          else attrs["hostnqn"] == identity)):
-                attribute = path
                 stat = path.stat()
                 rows.append(dict(attrs, controller=path.name, device=stat.st_dev, inode=stat.st_ino))
         except FileNotFoundError:
             continue
-        except OSError as error:
-            if sample_errors is None:
-                raise
-            disappeared = False
-            if error.errno == errno.ENODEV:
-                try:
-                    path.stat()
-                except OSError as probe:
-                    disappeared = probe.errno in (errno.ENOENT, errno.ENODEV)
-            sample_errors.append({"path": str(attribute), "errno": error.errno, "disappeared": disappeared,
-                                  "identity": dict(controller=path.name, **{
-                                      key: attrs[key] for key in ("transport", "address", "subsysnqn", "hostnqn", "hostid")
-                                      if key in attrs})})
     return rows
 
 
@@ -563,38 +550,50 @@ def _kernel_live_ports(address, *, commissioning_address, control_address, state
     raise TargetError(f"no free adjacent non-ephemeral kernel NVMe services ({busy} bind conflicts)")
 
 
-def _queue_identity(row):
-    return row["controller"], row["subsysnqn"], row["hostnqn"], row["hostid"]
+def _admit_kernel_geometry(record, lifecycles, geometry):
+    """Admit the controllers the client itself recorded, per database lifecycle.
 
+    Each lifecycle is (step, routes, effective owner). A route must name the owner and carry exactly
+    one controller record of the configured geometry. One controller serves several routes, so routes
+    may repeat a (sysfs_device, sysfs_inode) pair, but all routes of one pair must agree on controller
+    instance, subsystem, host and geometry. The kernel reuses instance numbers: the same name under
+    another pair is a new controller and is admitted.
+    """
+    queue_count = geometry["io_queues"] + geometry["poll_queues"] + 1
+    sqsize = geometry["queue_size"] - 1
+    import cloud_campaign as campaign
 
-def _resolved_sample_error(error, rows):
-    """A disappeared controller that is in the admitted set is a transient."""
-    identity = error.get("identity") or {}
-    controller = identity.get("controller")
-    if not error.get("disappeared") or not controller:
-        return False
-    for row in rows:
-        if row["controller"] == controller and (
-                not identity.get("subsysnqn") or row["subsysnqn"] == identity["subsysnqn"]):
-            return True
-    return False
-
-
-def _admit_kernel_geometry(record, routes, snapshot):
-    """Admit the accumulated controller set and its unresolved sampling errors."""
-    expected = {(f"nvme{r['namespace_identity']['controller_instance']}",
-                 r["namespace_identity"]["nqn"], r["host_nqn"],
-                 str(uuid.UUID(bytes=bytes(r["host_id"])))) for r in routes}
-    rows = snapshot["rows"]
-    matched = [r for r in rows if _queue_identity(r) in expected]
-    missing = sorted(expected - {_queue_identity(r) for r in matched})
-    invalid = [r for r in matched if (r["queue_count"], r["sqsize"]) != ("2", "31")]
-    record.update(queue_samples=matched, missing_queue_identities=missing, invalid_queue_samples=invalid)
-    hard_errors = sum(not _resolved_sample_error(error, rows) for error in snapshot["errors"])
-    truncated = snapshot["truncated"]
-    if not expected or missing or invalid or hard_errors or truncated:
-        raise TargetError(f"live 1x32 controller geometry not proven; missing identities: {missing!r}; "
-                          f"wrong geometry: {len(invalid)}; sampling errors: {hard_errors}; truncated: {truncated}")
+    admitted = []
+    for step, routes, owner in lifecycles:
+        if not isinstance(routes, list) or not routes:
+            raise TargetError(f"live controller geometry not proven: no route record at {step}")
+        pairs = {}
+        for route in routes:
+            identity = route.get("namespace_identity") if isinstance(route, dict) else None
+            if not campaign.live_route_matches_owner(route, owner):
+                raise TargetError(f"live controller geometry not proven: route at {step} names another "
+                                  "initiator or subsystem")
+            controller = identity.get("controller")
+            instance = identity.get("controller_instance")
+            if (not isinstance(controller, dict)
+                    or set(controller) != {"queue_count", "sqsize", "sysfs_device", "sysfs_inode"}
+                    or any(type(value) is not int for value in controller.values())
+                    or type(instance) is not int or instance < 0):
+                raise TargetError(f"live controller geometry not proven: controller record missing at {step}")
+            if (controller["queue_count"], controller["sqsize"]) != (queue_count, sqsize):
+                raise TargetError(f"live controller geometry not proven: {step} controller nvme{instance} has "
+                                  f"queue_count={controller['queue_count']}, sqsize={controller['sqsize']}; "
+                                  f"expected {queue_count}, {sqsize}")
+            # The sysfs device is shared by every sysfs entry: only the pair names one directory.
+            pair = (controller["sysfs_device"], controller["sysfs_inode"])
+            facts = (instance, identity["nqn"], route["host_nqn"], tuple(route["host_id"]),
+                     controller["queue_count"], controller["sqsize"])
+            if pairs.setdefault(pair, facts) != facts:
+                raise TargetError(f"live controller geometry not proven: {step} controller nvme{instance} "
+                                  "has routes that disagree on instance, subsystem, host or geometry")
+            admitted.append({"step": step, "controller": f"nvme{instance}", "nqn": identity["nqn"],
+                             "host_nqn": route["host_nqn"], "host_id": route["host_id"], **controller})
+    record["controller_records"] = admitted
 
 
 def _admit_kernel_durability(remote, tier):
@@ -665,6 +664,7 @@ def _admit_kernel_reuse(proof, remote, address, service, transport, endpoint):
     writer_routes = proof.get("member_transition", {}).get("writer_routes")
     if not isinstance(writer_routes, list) or not writer_routes:
         raise TargetError("kernel qualification lacks writer routes")
+    lifecycles = []
     for db_key, initiator_key, route_key in (
         ("dropped_database", "dropped_initiators", "routes_before_drop"),
         ("database", "initiators", "routes_after_reprovision"),
@@ -683,6 +683,9 @@ def _admit_kernel_reuse(proof, remote, address, service, transport, endpoint):
                        or route["namespace_identity"]["controller_instance"] < 0
                        for route in routes + (writer_routes if db_key == "dropped_database" else []))):
             raise TargetError("kernel target reuse route differs from the provisioned database and slot")
+        lifecycles.append((route_key, routes, effective))
+        if db_key == "dropped_database":
+            lifecycles.append(("writer_routes", writer_routes, effective))
     shutdown = proof.get("target_shutdown")
     if not isinstance(shutdown, list) or len(shutdown) != 1 or not isinstance(shutdown[0], dict):
         raise TargetError("kernel target shutdown proof missing")
@@ -694,7 +697,7 @@ def _admit_kernel_reuse(proof, remote, address, service, transport, endpoint):
             or not isinstance(stats, dict) or stats.get("fixture_only") is not False
             or any(type(stats.get(key)) is not int or stats[key] != 0 for key in ("errors", "owned_namespace_count"))):
         raise TargetError("kernel target shutdown does not name the clean reprovisioned database")
-    return reuse, writer_routes + reuse["routes_after_reprovision"]
+    return reuse, lifecycles
 
 
 def _kernel_live_prepare_input(guest, control_endpoint, transport, addr, service, port_id, tier,
@@ -709,7 +712,7 @@ def _kernel_live_prepare_input(guest, control_endpoint, transport, addr, service
         # One host slot: drop -> reprovision must reuse it.
         "live_nvmeof": {"transport": transport, "addresses": [addr], "service": service,
             "port_id": port_id, "max_databases": 1, "max_inflight_requests": 32,
-            "queue_geometry": {"io_queues": 1, "queue_size": 32, "poll_queues": 0},
+            "queue_geometry": dict(KERNEL_QUEUE_GEOMETRY),
             "max_inflight_bytes": 16 * 1024**2, "connect_timeout_ms": 30000, "io_timeout_ms": 30000}}
     if owner_wal_file_bytes is not None:
         prep["owner_wal_file_bytes"] = owner_wal_file_bytes
@@ -722,7 +725,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
     import shutil
     import signal
     import sys
-    import threading
     import time
     import traceback
     import yaml
@@ -788,10 +790,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                   "port_claim": str(claim), "public_service": service, "commissioning_service": commissioning}
         attempted = captured = False
         client = None
-        sampler = None
-        stop = threading.Event()
-        samples = {}
-        record.update(sample_errors=[], sample_errors_truncated=False)
         launch = remote = reprovisioned_database = None
 
         def remaining(cap):
@@ -808,27 +806,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             if value.get("LoadState") != "not-found" and value.get("Description") != description:
                 raise TargetError("owner unit identity changed")
             return value
-
-        def sample():
-            while not stop.wait(.02):
-                errors = []
-                try:
-                    rows = _owned_controllers(SYSFS_NVME, transport, addr, (service,),
-                                              _kernel_public_identity, sample_errors=errors)
-                except OSError as error:
-                    rows = []
-                    errors.append({"path": str(error.filename or SYSFS_NVME), "errno": error.errno,
-                                   "disappeared": False, "identity": {}})
-                for row in rows:
-                    key = (row["controller"], row["device"], row["inode"])
-                    if len(samples) < 4096:
-                        samples[key] = row
-                if errors:
-                    seen = sorted({_queue_identity(row) for row in rows})
-                    kept = record["sample_errors"]
-                    available = 20 - len(kept)
-                    kept.extend(dict(error, observed_identities=seen) for error in errors[:available])
-                    record["sample_errors_truncated"] |= len(errors) > available
 
         def diagnose(name, capture):
             # Failure evidence is best-effort; it never replaces the failure.
@@ -930,8 +907,6 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             input_path.write_text(json.dumps({"remote_config": remote, "coordinator_path": str(directory / "database"),
                 "namespace": list(uuid.uuid4().bytes), "expected_route": transport,
                 "durability_tier": tier, "value_bytes": 1024}))
-            sampler = threading.Thread(target=sample, daemon=True)
-            sampler.start()
             budget = remaining(seconds) - 75
             if budget <= 0:
                 raise TimeoutError("insufficient cleanup reserve")
@@ -967,29 +942,17 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
                     or proof.get("durability_tier") != receipt["durability"]["tier"]
                     or any(checks.get(k) is not True for k in required)):
                 raise TargetError("kernel qualification proof incomplete")
-            stop.set()
-            sampler.join(timeout=5)
-            if sampler.is_alive():
-                raise TargetError("controller sampler did not stop")
-            reuse, routes = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
+            reuse, lifecycles = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
             reprovisioned_database = reuse["database"]
             record["target_reuse"] = {key: reuse[key] for key in ("dropped_database", "database")}
-            _admit_kernel_geometry(record, routes, {
-                "rows": tuple(samples.values()),
-                "errors": tuple(record["sample_errors"]),
-                "truncated": record["sample_errors_truncated"]})
+            _admit_kernel_geometry(record, lifecycles, KERNEL_QUEUE_GEOMETRY)
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
         except Exception as error:
             record["errors"].append({"phase": "qualification", "error": repr(error), "traceback": traceback.format_exc()})
         finally:
-            stop.set()
-            if sampler is not None:
-                sampler.join(timeout=5)
             try:
-                if sampler is not None and sampler.is_alive():
-                    raise TargetError("controller sampler did not stop")
                 if client is not None:
                     if client.poll() is None:
                         raise TargetError("client is still running")

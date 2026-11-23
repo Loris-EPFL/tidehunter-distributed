@@ -187,6 +187,19 @@ fn verify_routes(sample: &serde_json::Value, expected: &str) -> BackendResult<()
                     .and_then(serde_json::Value::as_u64)
                     .is_some()
                 && identity
+                    .get("controller")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|controller| {
+                        ["queue_count", "sqsize", "sysfs_device", "sysfs_inode"]
+                            .iter()
+                            .all(|key| {
+                                controller
+                                    .get(*key)
+                                    .and_then(serde_json::Value::as_u64)
+                                    .is_some_and(|n| n > 0)
+                            })
+                    })
+                && identity
                     .get("block_size")
                     .and_then(serde_json::Value::as_u64)
                     .is_some_and(|n| n >= 512 && n.is_power_of_two())
@@ -1296,7 +1309,8 @@ mod tests {
                 "transport":"rdma", "address":"10.0.0.2", "service":4420,
                 "namespace_identity":{"namespace_path":"/dev/nvme0n1",
                     "nqn":"nqn.2026-01.test:wal", "nsid":1, "bytes":4096,
-                    "controller_instance":0, "block_size":4096, "uuid":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}
+                    "controller_instance":0, "block_size":4096, "uuid":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                    "controller":{"queue_count":2, "sqsize":31, "sysfs_device":22, "sysfs_inode":9}}
             }],
             "fences":[{"partition":0,"authority_epoch":2,
                 "target":{"fixture_only":false,"disable_drain_successes":1,"errors":0}}]
@@ -1311,6 +1325,25 @@ mod tests {
         assert!(verify_fences(&sample, &[0]).is_err());
         sample["route_evidence_dropped"] = serde_json::json!(1);
         assert!(verify_routes(&sample, "rdma").is_err());
+        sample["route_evidence_dropped"] = serde_json::json!(0);
+        let record = sample["routes"][0]["namespace_identity"]["controller"].clone();
+        for key in ["queue_count", "sqsize", "sysfs_device", "sysfs_inode"] {
+            for bad in [serde_json::json!(0), serde_json::Value::Null] {
+                let mut broken = sample.clone();
+                broken["routes"][0]["namespace_identity"]["controller"][key] = bad;
+                assert!(verify_routes(&broken, "rdma").is_err(), "{key} accepted");
+            }
+            let mut missing = sample.clone();
+            missing["routes"][0]["namespace_identity"]["controller"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(verify_routes(&missing, "rdma").is_err(), "{key} optional");
+        }
+        sample["routes"][0]["namespace_identity"]["controller"] = serde_json::Value::Null;
+        assert!(verify_routes(&sample, "rdma").is_err());
+        sample["routes"][0]["namespace_identity"]["controller"] = record;
+        assert!(verify_routes(&sample, "rdma").is_ok());
     }
 
     #[test]

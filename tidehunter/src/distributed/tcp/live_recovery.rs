@@ -149,6 +149,7 @@ impl Client {
                             nsid: observed.nsid,
                             bytes: observed.bytes,
                             block_size: observed.block_size,
+                            controller: lease.evidence(),
                         },
                     });
                 }

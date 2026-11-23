@@ -3,6 +3,7 @@
 use super::live_connect::{
     LiveConnectTarget, LiveConnectionRegistry, LiveController, LiveNamespaceResolver,
 };
+use super::live_metrics::LiveControllerEvidence;
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
 use crate::distributed::tcp::checkpoint::RetirementResult;
 use crate::distributed::tcp::{LiveExportPin, LiveExportPinControl, LiveExportPinRequest};
@@ -74,6 +75,11 @@ impl LiveControllerLease {
     /// Instance returned by the successful kernel fabrics creation.
     pub fn controller_instance(&self) -> u32 {
         self.instance
+    }
+    /// Queue geometry and sysfs identity the connect-time check recorded;
+    /// `None` for a local-file fixture.
+    pub(crate) fn evidence(&self) -> Option<LiveControllerEvidence> {
+        self.resolver.evidence()
     }
     pub fn open_namespace(&self) -> io::Result<LiveNamespace> {
         #[cfg(any(test, feature = "test-utils"))]

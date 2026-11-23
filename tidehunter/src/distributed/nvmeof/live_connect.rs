@@ -3,6 +3,7 @@
 //! not a durability or authorization receipt.
 pub use super::LiveQueueGeometry;
 use super::NvmeofTransport;
+use super::live_metrics::LiveControllerEvidence;
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
 use crate::distributed::sys;
 use std::fs::{File, OpenOptions};
@@ -12,7 +13,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 mod registry;
@@ -148,6 +149,8 @@ pub(crate) struct LiveNamespaceResolver {
     directory: File,
     inode: u64,
     device: u64,
+    /// Queue count and submission queue size read from sysfs by the geometry check.
+    queue: OnceLock<(u32, u32)>,
 }
 impl LiveController {
     /// Controller instance returned by the Linux fabrics control response.
@@ -271,6 +274,7 @@ impl LiveController {
                 directory,
                 inode: metadata.ino(),
                 device: metadata.dev(),
+                queue: OnceLock::new(),
             }),
             instance,
             deletion: DeletionState::NotStarted,
@@ -290,6 +294,17 @@ impl LiveController {
     }
 }
 impl LiveNamespaceResolver {
+    /// What the connect-time geometry check observed on this controller. `None`
+    /// before that check, so a fixture controller never reports a geometry.
+    pub(crate) fn evidence(&self) -> Option<LiveControllerEvidence> {
+        let (queue_count, sqsize) = *self.queue.get()?;
+        Some(LiveControllerEvidence {
+            queue_count,
+            sqsize,
+            sysfs_device: self.device,
+            sysfs_inode: self.inode,
+        })
+    }
     fn pinned(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
@@ -475,8 +490,17 @@ impl LiveController {
     }
     fn verify_queue_geometry(&self) -> io::Result<()> {
         self.verify()?;
-        verify_queue_geometry(&self.pinned(), self.resolver.target.geometry)?;
+        self.record_queue_geometry(&self.pinned())?;
         self.verify()
+    }
+    /// Checks the geometry under `path` and keeps what it observed. Recorded
+    /// once per controller lifetime: a reconnect creates a new resolver.
+    fn record_queue_geometry(&self, path: &Path) -> io::Result<()> {
+        let observed = verify_queue_geometry(path, self.resolver.target.geometry)?;
+        self.resolver
+            .queue
+            .set(observed)
+            .map_err(|_| invalid("controller queue geometry recorded twice"))
     }
     /// Set and read back namespace write protection on the owned controller.
     /// This is a point-in-time guard under the trusted-initiator assumption.
@@ -599,6 +623,7 @@ impl LiveController {
                 inode: metadata.ino(),
                 device: metadata.dev(),
                 directory,
+                queue: OnceLock::new(),
             }),
             instance: 0,
             deletion: DeletionState::Gone,

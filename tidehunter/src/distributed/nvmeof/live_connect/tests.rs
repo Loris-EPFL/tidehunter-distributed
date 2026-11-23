@@ -188,7 +188,10 @@ fn queue_geometry_admission_requires_exact_readable_kernel_attributes() {
     let path = temp.path();
     std::fs::write(path.join("queue_count"), "5\n").unwrap();
     std::fs::write(path.join("sqsize"), "127\n").unwrap();
-    verify_queue_geometry(path, LiveQueueGeometry::default()).unwrap();
+    assert_eq!(
+        verify_queue_geometry(path, LiveQueueGeometry::default()).unwrap(),
+        (5, 127)
+    );
     for (geometry, count, size) in [
         (
             LiveQueueGeometry {
@@ -964,4 +967,65 @@ fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
         Instant::now() + PROGRESS_CAP,
     )
     .unwrap();
+}
+
+#[test]
+fn controller_evidence_is_the_geometry_the_check_observed_and_is_recorded_once() {
+    let temp = tempdir::TempDir::new("controller-evidence").unwrap();
+    let registry = LiveConnectionRegistry::open(&temp.path().join("registry")).unwrap();
+    let target = LiveConnectTarget {
+        nqn: "nqn.2026-01.test:wal".into(),
+        uuid: [1; 16],
+        nsid: 1,
+        bytes: 4096,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: Default::default(),
+    };
+    let controller = LiveController::deleted_for_test(&registry, temp.path(), &target).unwrap();
+    let resolver = controller.resolver();
+    assert!(resolver.evidence().is_none());
+    // A geometry that differs from the configured one records nothing.
+    std::fs::write(temp.path().join("queue_count"), "7\n").unwrap();
+    std::fs::write(temp.path().join("sqsize"), "127\n").unwrap();
+    assert!(controller.record_queue_geometry(temp.path()).is_err());
+    assert!(resolver.evidence().is_none());
+    std::fs::write(temp.path().join("queue_count"), "5\n").unwrap();
+    controller.record_queue_geometry(temp.path()).unwrap();
+    let directory = std::fs::metadata(temp.path()).unwrap();
+    let evidence = resolver.evidence().unwrap();
+    assert_eq!(
+        (
+            evidence.queue_count,
+            evidence.sqsize,
+            evidence.sysfs_device,
+            evidence.sysfs_inode
+        ),
+        (5, 127, directory.dev(), directory.ino())
+    );
+    // A second record would replace what the client verified: it must fail.
+    assert!(controller.record_queue_geometry(temp.path()).is_err());
+    assert_eq!(resolver.evidence(), Some(evidence));
+    let json = serde_json::to_value(evidence).unwrap();
+    let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["queue_count", "sqsize", "sysfs_device", "sysfs_inode"]
+    );
+}
+
+#[test]
+fn namespace_identity_without_a_controller_record_deserializes_as_none() {
+    let uuid = vec![1u8; 16];
+    let json = serde_json::json!({
+        "namespace_path": "/dev/nvme0n1", "controller_instance": 0,
+        "nqn": "nqn.2026-01.test:wal", "uuid": uuid, "nsid": 1,
+        "bytes": 4096, "block_size": 4096
+    });
+    let identity: crate::distributed::nvmeof::live_metrics::LiveNamespaceIdentity =
+        serde_json::from_value(json).unwrap();
+    assert_eq!(identity.controller, None);
 }

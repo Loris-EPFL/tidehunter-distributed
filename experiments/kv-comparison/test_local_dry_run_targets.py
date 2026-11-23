@@ -283,7 +283,8 @@ class OwnedControllerTeardownTests(unittest.TestCase):
         def admit():
             return targets._admit_kernel_reuse(proof, remote, address, service, 'tcp', endpoint)
 
-        self.assertEqual(admit()[1], [before, after])
+        self.assertEqual([step for step, _, _ in admit()[1]],
+                         ['routes_before_drop', 'writer_routes', 'routes_after_reprovision'])
         shutdown['database'] = list(bytes.fromhex(old))
         with self.assertRaisesRegex(targets.TargetError, 'clean reprovisioned database'):
             admit()
@@ -503,109 +504,111 @@ class KernelPortsContractTests(unittest.TestCase):
         probe.bind.assert_called_once_with(("127.0.0.1", 0))
         self.assertEqual(list(self.state.glob("*.claim")), [])
 
-    def geometry_fixture(self):
-        address = "127.0.0.1"
-        with patch.object(targets.socket, "socket", side_effect=self.socket_probe):
-            _, public, private, _ = self.allocate(address=address)
-        sysfs = self.root / "sysfs"
-        sysfs.mkdir()
-        seed = {"host_id": [1] * 16}
-        first, second = [campaign.effective_live_owner(seed, byte * 16, 0) for byte in ("aa", "bb")]
 
-        def controller(instance, service, identity, *, queues="2", initiator=None):
-            directory = sysfs / f"nvme{instance}"
-            directory.mkdir()
-            subsystem = identity["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001"
-            for key, value in {"transport": "tcp", "address": f"traddr={address},trsvcid={service}",
-                               "hostnqn": initiator or identity["host_nqn"], "subsysnqn": subsystem,
-                               "hostid": str(uuid.UUID(bytes=bytes(identity["host_id"]))),
-                               "queue_count": queues, "sqsize": "31"}.items():
-                (directory / key).write_text(value)
-            return directory, {"host_nqn": identity["host_nqn"], "host_id": identity["host_id"],
-                               "namespace_identity": {"controller_instance": instance, "nqn": subsystem}}
+class KernelGeometryAdmissionTests(unittest.TestCase):
+    """The client records each controller it connected; the harness admits those records exactly."""
 
-        expected, before = controller(0, public, first)
-        unrelated, _ = controller(1, public, first)
-        controller(2, private, first, queues="5", initiator="nqn.commissioning")
-        _, after = controller(3, public, second)
+    GEOMETRY = {"io_queues": 1, "queue_size": 32, "poll_queues": 0}
 
-        def scan(errors):
-            return targets._owned_controllers(sysfs, "tcp", address, (public,),
-                                              targets._kernel_public_identity, sample_errors=errors)
+    def setUp(self):
+        self.live = {"host_id": [1] * 16, "address": "10.99.0.2", "service": 4420}
+        self.first = campaign.effective_live_owner(self.live, "aa" * 16, 0)
+        self.second = campaign.effective_live_owner(self.live, "bb" * 16, 0)
 
-        return [before, after], expected, unrelated, scan
+    def route(self, owner, instance, *, queue_count=2, sqsize=31, inode=100):
+        return {"host_nqn": owner["host_nqn"], "host_id": owner["host_id"], "address": owner["address"],
+                "service": owner["service"], "transport": "tcp",
+                "namespace_identity": {
+                    "controller_instance": instance,
+                    "nqn": owner["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001",
+                    "controller": {"queue_count": queue_count, "sqsize": sqsize,
+                                   "sysfs_device": 22, "sysfs_inode": inode}}}
 
-    def test_geometry_on_allocator_chosen_public_service(self):
-        routes, _, _, scan = self.geometry_fixture()
-        record = {"sample_errors": [], "sample_errors_truncated": False}
-        rows = scan(record["sample_errors"])
-        targets._admit_kernel_geometry(record, routes,
-                                       {"rows": tuple(rows), "errors": (), "truncated": False})
-        self.assertEqual({row["controller"] for row in record["queue_samples"]}, {"nvme0", "nvme3"})
-        with self.assertRaisesRegex(targets.TargetError, "missing identities"):
-            targets._admit_kernel_geometry(
-                record, routes,
-                {"rows": tuple(row for row in rows if row["controller"] != "nvme3"),
-                 "errors": (), "truncated": False})
-        self.assertEqual([row[0] for row in record["missing_queue_identities"]], ["nvme3"])
-        self.assertEqual(record["sample_errors"], [])
+    def lifecycles(self, first=None, second=None):
+        return [("writer_routes", [self.route(self.first, 0)] if first is None else first, self.first),
+                ("routes_after_reprovision", [self.route(self.second, 3, inode=103)] if second is None else second,
+                 self.second)]
 
-    def scan_with_error(self, directory, code, scan):
-        read = Path.read_text
-        failed = directory / "sqsize"
-        moved = self.root / "disconnected"
+    def admit(self, lifecycles, record=None):
+        record = {} if record is None else record
+        targets._admit_kernel_geometry(record, lifecycles, self.GEOMETRY)
+        return record
 
-        def during_teardown(path, *args, **kwargs):
-            if path == failed:
-                if code == errno.ENODEV:
-                    directory.rename(moved)
-                raise OSError(code, "test", str(path))
-            return read(path, *args, **kwargs)
+    def refuse(self, lifecycles, pattern):
+        with self.assertRaisesRegex(targets.TargetError, pattern):
+            self.admit(lifecycles)
 
-        record = {"sample_errors": [], "sample_errors_truncated": False}
-        try:
-            with patch.object(Path, "read_text", during_teardown):
-                scan(record["sample_errors"])
-        finally:
-            if moved.exists():
-                moved.rename(directory)
-        error, = record["sample_errors"]
-        self.assertEqual(error["path"], str(failed))
-        self.assertEqual(error["errno"], code)
-        self.assertEqual(error["identity"]["controller"], directory.name)
-        self.assertEqual(error["disappeared"], code == errno.ENODEV)
-        return error
+    def test_configured_geometry_is_the_one_the_client_connects_with(self):
+        self.assertEqual(targets._kernel_live_prepare_input(
+            "g", "e", "tcp", "a", 1, 1, "t")["live_nvmeof"]["queue_geometry"], targets.KERNEL_QUEUE_GEOMETRY)
+        self.assertEqual(targets.KERNEL_QUEUE_GEOMETRY, self.GEOMETRY)
 
-    def test_resolved_disappeared_error_does_not_fail_admission(self):
-        routes, _, _, scan = self.geometry_fixture()
-        rows = scan([])
-        error = {"path": "/sys/class/nvme/nvme0/hostnqn", "errno": errno.ENODEV,
-                 "disappeared": True,
-                 "identity": {"controller": "nvme0",
-                              "subsysnqn": routes[0]["namespace_identity"]["nqn"]}}
-        targets._admit_kernel_geometry(
-            {"sample_errors": [error], "sample_errors_truncated": False}, routes,
-            {"rows": tuple(rows), "errors": (error,), "truncated": False})
-        self.assertEqual({row["controller"] for row in rows}, {"nvme0", "nvme1", "nvme3"})
+    def test_both_lifecycles_are_admitted_with_their_records(self):
+        record = self.admit(self.lifecycles())
+        self.assertEqual([(row["step"], row["controller"], row["queue_count"], row["sqsize"])
+                          for row in record["controller_records"]],
+                         [("writer_routes", "nvme0", 2, 31), ("routes_after_reprovision", "nvme3", 2, 31)])
 
-    def test_disappeared_controller_error_is_resolved_by_the_set(self):
-        routes, expected, unrelated, scan = self.geometry_fixture()
-        earlier = scan([])
-        for directory in (unrelated, expected):
-            with self.subTest(controller=directory.name):
-                error = self.scan_with_error(directory, errno.ENODEV, scan)
-                targets._admit_kernel_geometry(
-                    {"sample_errors": [error], "sample_errors_truncated": False}, routes,
-                    {"rows": tuple(earlier), "errors": (error,), "truncated": False})
+    def test_missing_route_record_is_refused(self):
+        self.refuse(self.lifecycles(second=[]), "no route record at routes_after_reprovision")
 
-    def test_io_error_is_not_tolerated(self):
-        routes, _, unrelated, scan = self.geometry_fixture()
-        earlier = scan([])
-        error = self.scan_with_error(unrelated, errno.EIO, scan)
-        with self.assertRaisesRegex(targets.TargetError, "sampling errors: 1"):
-            targets._admit_kernel_geometry(
-                {"sample_errors": [error], "sample_errors_truncated": False}, routes,
-                {"rows": tuple(earlier), "errors": (error,), "truncated": False})
+    def test_missing_controller_record_is_refused(self):
+        route = self.route(self.first, 0)
+        del route["namespace_identity"]["controller"]
+        self.refuse(self.lifecycles(first=[route]), "controller record missing at writer_routes")
+
+    def test_incomplete_or_mistyped_controller_record_is_refused(self):
+        for change in ({"sysfs_inode": None}, {"queue_count": "2"}, {"extra": 1}):
+            with self.subTest(change=change):
+                route = self.route(self.first, 0)
+                route["namespace_identity"]["controller"].update(change)
+                self.refuse(self.lifecycles(first=[route]), "controller record missing")
+
+    def test_wrong_queue_count_is_refused(self):
+        self.refuse(self.lifecycles(first=[self.route(self.first, 0, queue_count=5)]),
+                    "nvme0 has queue_count=5, sqsize=31; expected 2, 31")
+
+    def test_wrong_sqsize_is_refused(self):
+        self.refuse(self.lifecycles(second=[self.route(self.second, 3, sqsize=127, inode=103)]),
+                    "nvme3 has queue_count=2, sqsize=127")
+
+    def test_wrong_subsystem_is_refused(self):
+        route = self.route(self.first, 0)
+        route["namespace_identity"]["nqn"] = self.second["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001"
+        self.refuse(self.lifecycles(first=[route]), "names another initiator or subsystem")
+
+    def test_wrong_initiator_is_refused(self):
+        self.refuse(self.lifecycles(second=[self.route(self.first, 3, inode=103)]),
+                    "names another initiator or subsystem")
+
+    def test_one_controller_serves_several_routes_of_one_lifecycle(self):
+        members = [self.route(self.first, 0) for _ in range(3)]
+        record = self.admit(self.lifecycles(first=members))
+        self.assertEqual([row["controller"] for row in record["controller_records"]][:3], ["nvme0"] * 3)
+
+    def test_one_pair_under_two_subsystems_is_refused(self):
+        other = self.route(self.first, 0)
+        other["namespace_identity"]["nqn"] = (
+            self.first["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000002")
+        self.refuse(self.lifecycles(first=[self.route(self.first, 0), other]), "disagree on instance, subsystem")
+
+    def test_one_pair_under_two_instances_is_refused(self):
+        self.refuse(self.lifecycles(first=[self.route(self.first, 0), self.route(self.first, 1)]),
+                    "controller nvme1 has routes that disagree")
+
+    def test_a_reused_instance_name_under_another_pair_is_admitted(self):
+        self.admit(self.lifecycles(first=[self.route(self.first, 0), self.route(self.first, 0, inode=101)]))
+
+    def test_distinct_controllers_sharing_the_sysfs_device_are_admitted(self):
+        self.admit(self.lifecycles(first=[self.route(self.first, 0), self.route(self.first, 1, inode=101)]))
+
+    def test_a_bad_controller_instance_is_refused(self):
+        for instance in (-1, "0", True, None):
+            with self.subTest(instance=instance):
+                self.refuse(self.lifecycles(first=[self.route(self.first, instance)]), "controller record missing")
+
+    def test_a_reused_controller_name_across_lifecycles_is_admitted(self):
+        self.admit(self.lifecycles(second=[self.route(self.second, 0, inode=104)]))
 
 
 if __name__ == '__main__':

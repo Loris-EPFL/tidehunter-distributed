@@ -114,6 +114,7 @@ impl LiveConnectionRegistry {
                         directory,
                         inode: metadata.ino(),
                         device: metadata.dev(),
+                        queue: OnceLock::new(),
                     }),
                     instance,
                     deletion: DeletionState::NotStarted,

@@ -51,7 +51,6 @@ pub(crate) const LIVE_READ_LANE_REQUESTS: usize = 32;
 const DRAIN_BOUND: Duration = Duration::from_secs(35);
 /// Pause before a request retries a controller pool that had no free slot.
 const POOL_RETRY: Duration = Duration::from_millis(1);
-
 pub(super) struct LiveReadTiming {
     counters: Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>,
     stage: LiveTimingStage,
@@ -1525,6 +1524,7 @@ impl LiveReadCache {
                     nsid: observed.nsid,
                     bytes: observed.bytes,
                     block_size: observed.block_size,
+                    controller: lease.evidence(),
                 },
             });
         }

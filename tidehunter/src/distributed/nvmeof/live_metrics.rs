@@ -22,6 +22,21 @@ pub struct LiveNamespaceIdentity {
     pub nsid: u32,
     pub bytes: u64,
     pub block_size: u32,
+    /// What the connect-time geometry check read from the controller. `None`
+    /// for a local-file fixture that has no kernel controller.
+    #[serde(default)]
+    pub(crate) controller: Option<LiveControllerEvidence>,
+}
+
+/// Sysfs facts of one connected controller, recorded after its queue geometry
+/// was verified. The sysfs device is shared by every sysfs entry: only the
+/// pair of device and inode names one controller directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LiveControllerEvidence {
+    pub(crate) queue_count: u32,
+    pub(crate) sqsize: u32,
+    pub(crate) sysfs_device: u64,
+    pub(crate) sysfs_inode: u64,
 }
 
 /// Native member identity from an authenticated writable reservation.
