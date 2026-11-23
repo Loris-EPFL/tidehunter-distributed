@@ -4,7 +4,7 @@
 # a listed file is within the cap or gone. Change a line only in the change
 # that splits or shrinks the file.
 
-benchmarks/kv-research/src/backends/tidehunter.rs 2757
+benchmarks/kv-research/src/backends/tidehunter.rs 2629
 benchmarks/kv-research/src/mainnet_replay.rs 2355
 benchmarks/kv-research/src/runner.rs 7057
 tidehunter-fabric/src/endpoint/resources.rs 1965

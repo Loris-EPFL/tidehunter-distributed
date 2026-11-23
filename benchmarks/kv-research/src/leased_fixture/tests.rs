@@ -1,4 +1,5 @@
 use super::*;
+use tidehunter::distributed::remote_db::HybridIndexConfig;
 use tidehunter::distributed::tcp::LeasedSync;
 use tidehunter::key_shape::KeyType;
 
@@ -7,6 +8,7 @@ fn spec(root: PathBuf, tier: DurabilityTier, owners: Vec<FixtureOwner>) -> Fixtu
         fragment_bytes: 4 * MIB as u64,
         wal_file_bytes: 64 * MIB as u64,
         max_admitted_batches: 262_144,
+        index: None,
     }
     .spec(root, tier, owners)
 }
@@ -53,6 +55,41 @@ fn benchmark_spec_translates_to_the_leased_per_owner_route() {
 }
 
 #[test]
+fn qualification_index_geometry_reaches_the_coordinator_config() {
+    let production = HybridIndexConfig::default();
+    let spec = spec(
+        PathBuf::from("/fixture"),
+        DurabilityTier::Native,
+        fixed_owners(1),
+    );
+    let config = spec.remote_config().unwrap();
+    assert_eq!(
+        config.index.frag_size, production.frag_size,
+        "absent index row keeps the production fragment"
+    );
+    assert_eq!(
+        config.index.wal_file_size, production.wal_file_size,
+        "absent index row keeps the production WAL file size"
+    );
+    let mut small = spec;
+    small.index = Some(FixtureIndexGeometry {
+        frag_size: 1024 * 1024,
+        wal_file_size: 4 * 1024 * 1024,
+    });
+    let config = small.remote_config().unwrap();
+    assert_eq!(config.index.frag_size, 1024 * 1024, "fragment override");
+    assert_eq!(
+        config.index.wal_file_size,
+        4 * 1024 * 1024,
+        "WAL file override"
+    );
+    assert_eq!(
+        config.index.max_index_maps, production.max_index_maps,
+        "unset index rows keep their production values"
+    );
+}
+
+#[test]
 fn owner_hosts_take_disjoint_slot_ranges_and_the_fixture_principal() {
     let spec = spec(
         PathBuf::from("/fixture"),
@@ -83,6 +120,16 @@ fn spec_round_trips_and_rejects_unknown_fields_bad_owners_and_oversized_frames()
     assert_eq!(
         serde_json::from_value::<FixtureSpec>(document.clone()).unwrap(),
         spec
+    );
+    let mut with_index = spec.clone();
+    with_index.index = Some(FixtureIndexGeometry {
+        frag_size: 1024 * 1024,
+        wal_file_size: 4 * 1024 * 1024,
+    });
+    let indexed = serde_json::to_value(&with_index).unwrap();
+    assert_eq!(
+        serde_json::from_value::<FixtureSpec>(indexed).unwrap(),
+        with_index
     );
     document["write_mode"] = serde_json::json!("leased");
     assert!(serde_json::from_value::<FixtureSpec>(document).is_err());

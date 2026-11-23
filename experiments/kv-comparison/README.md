@@ -659,10 +659,20 @@ python3 experiments/kv-comparison/cleanup.py --root /tmp/kv-campaign-new
 ```
 An explicit `--backends` subset must be admitted by the selected tracked or
 custom manifest; the option cannot add an ID the manifest does not name.
-This local runner handles native TideHunter and the other stores. To exercise
-distributed TideHunter, use `local_dry_run.py` with a leased NVMe-oF case or
-the kernel qualification in `local_dry_run_targets.py`; there is no in-process
-owner-RPC mode.
+This local runner handles native TideHunter and the other stores. The `hybrid`
+ID runs the leased hybrid engine on the rootless ordinary-file fixture, which a
+Linux `test-utils` build admits: the coordinator and one owner process use
+trusted loopback TCP with ordinary-file targets, and no kernel target or RDMA
+hardware is involved. A qualification cell also sets the fixture's coordinator
+`index` geometry to the native small values (1 MiB fragment, 4 MiB WAL): the
+production default pre-faults three 1 GiB writer-window fragments of the
+coordinator's index WAL at open (3 GiB resident for zero operations, measured
+2026-11-23), while the native-scale geometry maps 3 MiB. The ID is an API
+qualification cell only: the fixture is a loopback route with no independent
+device, so `campaign.py` refuses a non-qualification hybrid cell and timing
+belongs to `local_dry_run.py`. For kernel routes or several owners, use
+`local_dry_run.py` with a leased NVMe-oF case or the kernel qualification in
+`local_dry_run_targets.py`.
 
 
 ### Valkey TCP and matched RDMA controls

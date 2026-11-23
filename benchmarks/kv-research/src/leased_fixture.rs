@@ -19,6 +19,7 @@
 #![cfg(all(feature = "test-utils", target_os = "linux"))]
 
 use crate::backend::BackendResult;
+use crate::backends::tidehunter::FixtureIndexGeometry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -110,6 +111,12 @@ pub(crate) struct FixtureSpec {
     pub max_reference_metadata_bytes: usize,
     pub coordinator: CoordinatorSpec,
     pub live: LiveSpec,
+    /// Coordinator index geometry. Absent keeps the hybrid's production
+    /// defaults (Sui's 1 GiB fragment), whose three eagerly pre-faulted writer
+    /// fragments are 3 GiB resident at open; a qualification cell can ask for
+    /// the native small geometry instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<FixtureIndexGeometry>,
 }
 
 /// A fresh live initiator identity: random, never all zero.
@@ -261,7 +268,7 @@ impl FixtureSpec {
                     "server_name": SERVER_NAME})
             })
             .collect();
-        let document = json!({
+        let mut document = json!({
             "storage": {"partitions": partitions,
                 "batch_limits": self.batch_limits, "group_limits": self.group_limits,
                 "fragment_bytes": self.fragment_bytes, "wal_file_bytes": self.wal_file_bytes,
@@ -277,6 +284,12 @@ impl FixtureSpec {
             "read_lanes": 2, "max_pending_reads": 64, "max_pending_read_bytes": 16 * MIB,
             "live_nvme": live,
         });
+        // Absent keeps the hybrid's production index defaults, which is the
+        // coordinator behavior every non-qualification fixture had before this
+        // row existed.
+        if let Some(index) = &self.index {
+            document["index"] = serde_json::to_value(index)?;
+        }
         let config: RemoteDatabaseConfig = serde_json::from_value(document)?;
         config
             .validate()
@@ -676,6 +689,9 @@ pub(crate) struct BenchmarkGeometry {
     pub fragment_bytes: u64,
     pub wal_file_bytes: u64,
     pub max_admitted_batches: usize,
+    /// Coordinator index geometry; `None` keeps the hybrid's production
+    /// defaults.
+    pub index: Option<FixtureIndexGeometry>,
 }
 
 impl BenchmarkGeometry {
@@ -714,6 +730,7 @@ impl BenchmarkGeometry {
                 write_window: Some(1),
                 per_frame_fua: true,
             },
+            index: self.index,
         }
     }
 }

@@ -59,6 +59,16 @@ def admit_rocky9_abi(abi):
             if cloud_package.version_tuple(version) > maximum:
                 raise ValueError(f'Rocky 9 build requires unsupported {family}_{version}')
 
+def qualification_backend_arguments(focused, admitted):
+    """`--backends` for the packaged qualification run.
+
+    The shared CI manifest also names local-only IDs (the leased ordinary-file
+    hybrid fixture). Cloud admission requires exactly `ci_prepare.BACKENDS`, so
+    the unfocused run passes that explicit set instead of every manifest ID.
+    """
+    backends = ['native'] if focused else sorted(admitted)
+    return ['--backends', ','.join(backends)]
+
 def remove_build_container(name, owner):
     inspected = subprocess.run(['docker', 'container', 'inspect', name],
                                capture_output=True, text=True, timeout=30)
@@ -216,8 +226,7 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     qualification_command = [sys.executable, engine / 'experiments/kv-comparison/campaign.py', '--manifest',
                              engine / 'experiments/kv-comparison/ci.json', '--binary', package / 'runtime/bin/kv-research',
                              '--qualification', '--output', raw]
-    if focused:
-        qualification_command.extend(['--backends', 'native'])
+    qualification_command.extend(qualification_backend_arguments(focused, ci_prepare.BACKENDS))
     ci_prepare.bounded(qualification_command, deadline, environment=env, cwd=engine)
     proof = output / 'qualification'
     proof.mkdir()

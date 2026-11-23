@@ -296,6 +296,8 @@ pub(super) fn leased_owner(
             write_window: None,
             per_frame_fua: false,
         },
+        // Owner-only fixture: the coordinator is opened elsewhere.
+        index: None,
     };
     LeasedOwner::start(&spec)
 }

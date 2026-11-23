@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portable_transport import select_backends
 
 
-BACKENDS = {"native", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb",
+BACKENDS = {"native", "hybrid", "rocksdb", "blobdb", "tikv", "cassandra", "foundationdb",
             "valkey_tcp", "valkey_rdma", "garnet", "kvrocks"}
 
 
@@ -280,6 +280,24 @@ def backend_options(kind, state, output, ack_contract="synced"):
         if contract != "synced":
             options["ack_contract"] = contract
         return options
+    if kind == "hybrid":
+        # Rootless leased ordinary-file fixture: the coordinator and its owner
+        # process run here over trusted loopback TCP. The Rust backend kind is
+        # `tidehunter`; an absent external_remote_config selects the fixture,
+        # which only a test-utils Linux build admits.
+        return {"transport": {"kind": "tcp-trusted"},
+                "path": str((Path(output) / "database").resolve()),
+                "owners": 1,
+                "durability_tier": "native",
+                # Qualification-only bound: smaller than the adapter default
+                # (16384) so a zero-operation cell reserves no retained-batch
+                # capacity it cannot use. Measured 2026-11-23: this knob does
+                # not move the open peak (the index WAL window does), so it is
+                # not a memory lever.
+                "max_batches_per_partition": 256,
+                # The fixture geometry's own complete-batch bound (320 KiB);
+                # a larger limit would not fit one 4 MiB live fragment.
+                "batch_limits": {"max_operations": 32, "max_encoded_bytes": 320 * 1024}}
     return {"path": str(output / "database")}
 
 
@@ -290,11 +308,34 @@ def build_config(base, job, state, output, seed, qualification):
     kwargs = {"ack_contract": contract} if contract != "synced" else {}
     if kind not in BACKENDS:
         raise ValueError("unsupported local campaign backend; use local_dry_run.py for leased Tidehunter")
-    config["backend"] = {"kind": kind, "options": backend_options(kind, state, output, **kwargs)}
+    if kind == "hybrid" and not qualification:
+        # The leased fixture is a rootless loopback route with no independent
+        # device, so its timing is no performance claim. At production index
+        # geometry it also opens above the one manifest memory budget (3 GiB of
+        # pre-faulted index WAL fragments). Qualification is the only run this
+        # route admits.
+        raise ValueError("hybrid runs only as an API qualification cell; use "
+                         "local_dry_run.py for a leased Tidehunter timing case")
+    options = backend_options(kind, state, output, **kwargs)
+    # The manifest names the engine that ships; the Rust registry names the
+    # adapter route. `hybrid` is the leased route, whose kind is `tidehunter`.
+    config["backend"] = {"kind": "tidehunter" if kind == "hybrid" else kind, "options": options}
     if kind == "native":
         config["backend"]["options"].update(
             durability="page_cache",
             native_wal_geometry="small" if qualification else "native_default")
+    if kind == "hybrid":
+        # The refusal above leaves qualification as the only hybrid run, so the
+        # native-scale geometry below always applies to this route.
+        # The coordinator inherits Sui's production index geometry by default:
+        # a 1 GiB fragment, so the three eagerly pre-faulted writer-window
+        # fragments of its index WAL are 3 GiB resident at open. Measured
+        # 2026-11-23: 3087 MiB of coordinator RSS for zero operations. A
+        # qualification cell writes a handful of keys, so it uses the native
+        # qualification geometry instead (1 MiB fragment, 4 MiB WAL) and stays
+        # inside the single manifest budget; measured 19 MiB.
+        config["backend"]["options"]["index"] = {
+            "frag_size": 1024 * 1024, "wal_file_size": 4 * 1024 * 1024}
     config["seed"] = seed
     config["namespace"] = "local-" + uuid.uuid4().hex
     config["dataset"]["keys"] = job["profile"]["keys"]
@@ -508,7 +549,8 @@ def run_one(args, spec, base, job, index):
         # CPU affinity is enforced; RSS budget is sampled at 250ms, not a hard cgroup.
         with (run_dir / "run.log").open("w") as log:
             returncode = supervise([str(args.binary), "--config", str(run_dir / "normalized-config.json"), "--output", str(result_dir)],
-                                   log, run_dir / "client-resources.jsonl", cpus, spec.get("client_memory_mib", 2048),
+                                   log, run_dir / "client-resources.jsonl", cpus,
+                                   spec.get("client_memory_mib", 2048),
                                    config["limits"]["deadline_seconds"], config["limits"]["shutdown_grace_seconds"], child_environment)
         timeline = analyze.admit_write_timeline(
             run_dir, config, completed=returncode == 0, expected_backend=job["backend"])

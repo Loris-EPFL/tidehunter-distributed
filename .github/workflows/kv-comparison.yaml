@@ -174,13 +174,20 @@ jobs:
         run: |
           python3 -m unittest discover -s experiments/kv-comparison -p 'test_*.py'
           python3 -B -m unittest discover -s .github/scripts -p 'test_replay_ci.py'
-      - name: Build actual external adapters
-        timeout-minutes: 25
-        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       - name: Test the comparison crate with actual adapter features
         # 7m14s at 31d4845; the mainnet replay suites (native, distributed, RESP) exceed 10 minutes.
         timeout-minutes: 20
         run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
+      # This build must stay the last cargo step before the campaign below:
+      # `cargo test` builds the integration tests' `CARGO_BIN_EXE_kv-research`
+      # with the test step's features and overwrites target/debug/kv-research,
+      # so a build placed before it would be replaced by a binary without
+      # test-utils (rust-lang/cargo#11954).
+      - name: Build actual external adapters
+        timeout-minutes: 25
+        # test-utils admits the rootless leased ordinary-file fixture that the
+        # `hybrid` manifest ID needs (Linux only; additive for every other adapter).
+        run: cargo build --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks,test-utils
       - name: Check monitoring freshness and metric semantics
         run: python3 -m unittest discover -s experiments/kv-comparison/observability -p 'test_*.py'
       - name: Validate sparse-series Prometheus query semantics

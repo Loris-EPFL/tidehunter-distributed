@@ -137,6 +137,27 @@ class BuildContainerOwnershipTest(unittest.TestCase):
         with patch.object(prepare.subprocess, 'run', side_effect=[self.inspect_result('ours'), absent]):
             prepare.remove_build_container('owned', 'ours')
 
+class QualificationBackendSelectionTest(unittest.TestCase):
+    def test_cloud_qualification_runs_the_admitted_set(self):
+        arguments = prepare.qualification_backend_arguments(False, prepare.ci_prepare.BACKENDS)
+        self.assertEqual(arguments[0], '--backends')
+        selected = set(arguments[1].split(','))
+        self.assertEqual(selected, set(prepare.ci_prepare.BACKENDS))
+        self.assertNotIn('hybrid', selected)
+
+    def test_focused_qualification_stays_native_only(self):
+        self.assertEqual(
+            prepare.qualification_backend_arguments(True, prepare.ci_prepare.BACKENDS),
+            ['--backends', 'native'])
+
+    def test_shared_manifest_names_the_hybrid_but_admission_does_not(self):
+        # The cloud run reads the same ci.json; only the explicit admission set
+        # keeps the local-only leased fixture out of it.
+        manifest = json.loads((prepare.ROOT / 'experiments/kv-comparison/ci.json').read_text())
+        self.assertIn('hybrid', manifest['backends'])
+        self.assertNotIn('hybrid', prepare.ci_prepare.BACKENDS)
+
+
 class TransferAdmissionTest(unittest.TestCase):
     def test_rejects_qualification_from_another_binary_before_rebinding(self):
         revision = 'a' * 40

@@ -2,7 +2,12 @@
 mod live_qualification;
 mod live_write_profile;
 mod open_record;
+mod options;
 use open_record::{OpenKind, OpenRecord};
+// Only the Linux test-utils fixture names the geometry outside this module.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub(crate) use options::FixtureIndexGeometry;
+use options::{Options, parse_options};
 pub mod replay;
 #[allow(clippy::too_many_lines)]
 // Its TLS setup is inherited and outside timed calls; do not restyle the shared engine helper.
@@ -86,36 +91,6 @@ pub fn maybe_run_storage_node() -> BackendResult<bool> {
     tcp_cluster::maybe_run_storage_node().map_err(|error| error.to_string().into())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Options {
-    transport: Transport,
-    path: PathBuf,
-    #[serde(default)]
-    evidence: Option<PathBuf>,
-    #[serde(default = "default_owners")]
-    owners: usize,
-    #[serde(default = "default_key_count")]
-    key_count: u64,
-    #[serde(default = "default_retained_batches")]
-    max_batches_per_partition: usize,
-    /// Explicit complete-batch admission for table-aware checkpoint replay.
-    #[serde(default)]
-    batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
-    #[serde(default)]
-    coordinator_read_cache_bytes: Option<usize>,
-    #[serde(default)]
-    owner_append_occupancy: Option<usize>,
-    /// Kernel route when present; only Linux test-utils admits a local fixture.
-    external_remote_config: Option<RemoteDatabaseConfig>,
-    /// Owner acknowledgement tier. Applied inside each owner process and confirmed back by it.
-    #[serde(default)]
-    durability_tier: DurabilityTier,
-    /// External topology only: one owner-published `ready.durability.json` per owner, in
-    /// partition order, copied to the coordinator host. Required there; a missing file fails open.
-    #[serde(default)]
-    external_owner_durability_receipts: Vec<PathBuf>,
-}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExternalLiveNvmeof {
@@ -252,15 +227,6 @@ fn select_owner_transports(
     Ok(transports)
 }
 
-fn default_owners() -> usize {
-    5
-}
-fn default_key_count() -> u64 {
-    1 << 20
-}
-fn default_retained_batches() -> usize {
-    16_384
-}
 // Keep unvalidated launch files private and remove them on every failed preparation.
 struct ExternalPreparationStaging(PathBuf);
 
@@ -616,109 +582,6 @@ pub struct TidehunterBackend {
     local_owners: Vec<crate::leased_fixture::OwnerChild>,
 }
 
-// External transport, owner identity and payload bounds form one admission boundary.
-#[allow(clippy::too_many_lines)]
-fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
-    let options = Options::deserialize(value)?;
-    let name = backend_name(&options.transport);
-    if let Some(limits) = options.batch_limits {
-        limits.validate()?;
-    }
-    if options.owner_append_occupancy.is_some_and(|limit| {
-        !(1..=RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY).contains(&limit)
-    }) {
-        return Err(
-            format!("{name} owner append occupancy exceeds the reserved-control window").into(),
-        );
-    }
-    if options.path.as_os_str().is_empty()
-        || options
-            .evidence
-            .as_ref()
-            .is_some_and(|path| path.as_os_str().is_empty())
-    {
-        return Err(format!("{name} path and evidence path must not be empty").into());
-    }
-    if !matches!(options.owners, 1 | 2 | 4 | 5 | 16) {
-        return Err(format!("{name} owners must be one of 1, 2, 4, 5, or 16").into());
-    }
-    if options.key_count == 0 || options.max_batches_per_partition == 0 {
-        return Err("key_count and max_batches_per_partition must be positive".into());
-    }
-    usize::try_from(options.key_count).map_err(|_| "key_count exceeds platform limit")?;
-    options
-        .transport
-        .validate()
-        .map_err(|error| format!("{name} transport unavailable: {error}"))?;
-    let Some(config) = options.external_remote_config.as_ref() else {
-        if cfg!(all(feature = "test-utils", target_os = "linux"))
-            && options.transport == Transport::TcpTrusted
-            && options.external_owner_durability_receipts.is_empty()
-        {
-            return Ok(options);
-        }
-        return Err(format!(
-            "{name} backends require external_remote_config with live_nvme (leased live NVMe-oF); only the Linux test-utils trusted TCP fixture may omit it"
-        )
-        .into());
-    };
-    if !options.transport.same_protocol(&config.tls.transport) {
-        return Err(format!(
-            "{name} requires external_remote_config.tls.transport={}",
-            options.transport.label()
-        )
-        .into());
-    }
-    if config.storage.partitions.len() != options.owners || config.endpoints.len() != options.owners
-    {
-        return Err(
-            "external remote configuration must contain exactly one partition and endpoint per owner"
-                .into(),
-        );
-    }
-    let partitions: HashSet<u32> = config.storage.partitions.iter().copied().collect();
-    let endpoints: HashSet<u32> = config
-        .endpoints
-        .iter()
-        .map(|endpoint| endpoint.partition)
-        .collect();
-    let coordinator_cache_bytes = options
-        .coordinator_read_cache_bytes
-        .unwrap_or(config.read_cache_bytes);
-    if coordinator_cache_bytes
-        .checked_add(config.max_pending_read_bytes)
-        .is_none_or(|bytes| bytes > config.read_memory_allowance_bytes)
-    {
-        return Err(
-            "coordinator read cache plus pending reads exceeds read_memory_allowance_bytes".into(),
-        );
-    }
-    let group_limit_with_header = config.storage.group_limits.max_encoded_bytes.checked_add(8);
-    if partitions.len() != options.owners
-        || endpoints.len() != options.owners
-        || endpoints != partitions
-        || config
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.address.is_empty())
-        || config.timeout.is_zero()
-        || group_limit_with_header
-            .is_none_or(|minimum| config.storage.fragment_bytes < minimum as u64)
-        || config.storage.fragment_bytes == 0
-        || !config.storage.fragment_bytes.is_multiple_of(8)
-        || config.storage.wal_file_bytes == 0
-        || !config
-            .storage
-            .wal_file_bytes
-            .is_multiple_of(config.storage.fragment_bytes)
-        || config.storage.max_batches_per_partition == 0
-        || config.storage.max_batches_per_partition > 1_000_000
-    {
-        return Err("invalid external remote owner configuration".into());
-    }
-    Ok(options)
-}
-
 pub fn validate_options(value: &serde_json::Value) -> BackendResult<()> {
     parse_options(value).map(|_| ())
 }
@@ -813,6 +676,7 @@ async fn open_with_shape(
                 options.durability_tier,
                 options.max_batches_per_partition,
                 options.batch_limits,
+                options.index,
             )?;
             local_owners = children;
             config
@@ -940,7 +804,9 @@ async fn open_with_shape(
         },
         "coordinator": {
             "read_cache_bytes": remote_config.read_cache_bytes,
-            "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes
+            "read_memory_allowance_bytes": remote_config.read_memory_allowance_bytes,
+            "index_frag_bytes": remote_config.index.frag_size,
+            "index_wal_file_bytes": remote_config.index.wal_file_size
         },
         "client": {
             "timeout_ms": remote_config.timeout.as_millis(),
@@ -1092,6 +958,7 @@ fn open_local_fixture(
     tier: DurabilityTier,
     max_batches: usize,
     batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
+    index: Option<FixtureIndexGeometry>,
 ) -> BackendResult<(RemoteDatabaseConfig, Vec<crate::leased_fixture::OwnerChild>)> {
     use crate::leased_fixture::{BenchmarkGeometry, FixtureSpec, OwnerChild, fresh_owners};
 
@@ -1115,6 +982,7 @@ fn open_local_fixture(
         fragment_bytes: NATIVE_FRAGMENT_BYTES,
         wal_file_bytes: NATIVE_WAL_FILE_BYTES,
         max_admitted_batches: max_batches,
+        index,
     }
     .spec(root, tier, addresses);
     if let Some(limits) = batch_limits {
@@ -1940,6 +1808,10 @@ pub(crate) fn test_live_nvmeof(owners: usize) -> serde_json::Value {
 #[cfg(test)]
 #[path = "tidehunter/replay_preparation_tests.rs"]
 mod replay_preparation_tests;
+
+#[cfg(test)]
+#[path = "tidehunter/option_tests.rs"]
+mod option_tests;
 
 #[cfg(test)]
 mod tests {
