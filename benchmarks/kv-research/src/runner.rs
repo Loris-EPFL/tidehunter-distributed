@@ -3586,7 +3586,8 @@ mod tests {
 
     #[tokio::test]
     async fn client_shards_one_raw_operation_sequence_matches_original_generator() {
-        let directory = result_directory("client-one-sequence");
+        let guard = result_directory("client-one-sequence");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = read_test_config();
         config.execution.concurrency = 1;
@@ -3640,13 +3641,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_shards_bound_overload_and_cancel_timed_out_calls() {
         for overload in [false, true] {
-            let directory = result_directory("client-shards-bounds");
+            let guard = result_directory("client-shards-bounds");
+            let directory = guard.path().to_path_buf();
             let mut config = read_test_config();
             config.execution.concurrency = 7;
             config.execution.queue_capacity = 11;
@@ -3701,7 +3702,6 @@ mod tests {
             let receiver = reporter.stall_sample_writer_for_test();
             drop(receiver);
             drop(reporter);
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -3786,7 +3786,8 @@ mod tests {
     async fn client_shards_preserve_sample_counts_and_oracle_results() {
         for clients in [1, 3] {
             for mixed in [false, true] {
-                let directory = result_directory("client-shards-counts");
+                let guard = result_directory("client-shards-counts");
+                let directory = guard.path().to_path_buf();
                 let output = directory.join("result");
                 let mut config = read_test_config();
                 config.execution.concurrency = 7;
@@ -3848,7 +3849,6 @@ mod tests {
                     .sum();
                 assert_eq!(measurement_count, 127);
                 assert!((fraction - 1.0).abs() < 1e-12);
-                std::fs::remove_dir_all(directory).unwrap();
             }
         }
     }
@@ -3857,7 +3857,8 @@ mod tests {
     async fn client_shards_sweeps_find_the_same_lost_baseline_key() {
         for clients in [1, 3] {
             for missing in [false, true] {
-                let directory = result_directory("client-shards-sweep");
+                let guard = result_directory("client-shards-sweep");
+                let directory = guard.path().to_path_buf();
                 let output = directory.join("result");
                 let mut config = read_test_config();
                 config.execution.concurrency = 7;
@@ -3884,7 +3885,6 @@ mod tests {
                         .count(),
                     usize::from(missing)
                 );
-                std::fs::remove_dir_all(directory).unwrap();
             }
         }
     }
@@ -3892,7 +3892,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_shards_open_loop_keeps_global_due_times() {
         for clients in [1, 3] {
-            let directory = result_directory("client-shards-arrivals");
+            let guard = result_directory("client-shards-arrivals");
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut config = read_test_config();
             config.execution.mode = ExecutionMode::OpenLoop;
@@ -3927,13 +3928,13 @@ mod tests {
                     duration_ns(Duration::from_secs_f64(index as f64 / 200.0))
                 );
             }
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_shards_expired_deadline_joins_without_offering_work() {
-        let directory = result_directory("client-shards-deadline");
+        let guard = result_directory("client-shards-deadline");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.execution.concurrency = 7;
         config.execution.queue_capacity = 11;
@@ -3967,7 +3968,6 @@ mod tests {
         let receiver = reporter.stall_sample_writer_for_test();
         drop(receiver);
         drop(reporter);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     use super::*;
@@ -3977,7 +3977,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     #[tokio::test]
     async fn native_group_barrier_receipt_has_synchronous_cohort() {
-        let directory = result_directory("native-group-barrier-receipt");
+        let guard = result_directory("native-group-barrier-receipt");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.backend.kind = "native".to_owned();
         config.backend.options = serde_json::json!({
@@ -3997,7 +3998,6 @@ mod tests {
             DurabilityTier::Synchronous.comparison_cohort()
         );
         backend.shutdown().await.unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4057,7 +4057,8 @@ mod tests {
     #[tokio::test]
     async fn new_put_keys_reach_all_workers_across_phases_and_manifest() {
         for batch in [false, true] {
-            let directory = result_directory(if batch { "new-batch" } else { "new-put" });
+            let guard = result_directory(if batch { "new-batch" } else { "new-put" });
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut config = read_test_config();
             let namespace = [3; 16];
@@ -4109,7 +4110,6 @@ mod tests {
                 "new"
             );
             assert_eq!(manifest["run"]["data_policy"]["put_key_policy"], "new");
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -4139,7 +4139,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_evidence_excludes_warmup_and_postqualification() {
-        let directory = result_directory("read-boundary");
+        let guard = result_directory("read-boundary");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = read_test_config();
         config.phases.preload = true;
@@ -4170,14 +4171,14 @@ mod tests {
             assert_eq!(evidence["end"]["coordinator"][name], 0);
             assert_eq!(evidence["deltas"]["coordinator"]["counters"][name], 0);
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(target_os = "linux", feature = "test-utils"))]
     #[tokio::test]
     async fn mapped_wal_eviction_precedes_measurement_and_failure_blocks_gate() {
         for supported in [true, false] {
-            let directory = result_directory(if supported { "evict-ok" } else { "evict-fail" });
+            let guard = result_directory(if supported { "evict-ok" } else { "evict-fail" });
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut config = read_test_config();
             config.backend.kind = "native".into();
@@ -4214,13 +4215,13 @@ mod tests {
                 assert!(result.is_err());
                 assert!(!directory.join("ready").exists());
             }
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test]
     async fn read_profile_is_confined_to_measurement_and_exports_empty_coverage() {
-        let directory = result_directory("read-profile-boundary");
+        let guard = result_directory("read-profile-boundary");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut backend = MemoryBackend::new(false, false);
@@ -4264,12 +4265,12 @@ mod tests {
             evidence["profile"]["read_evidence"]["measurement_attempted"],
             true
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn read_profile_exports_arm_failure_and_incomplete_measurement() {
-        let directory = result_directory("read-profile-failure");
+        let guard = result_directory("read-profile-failure");
+        let directory = guard.path().to_path_buf();
         std::fs::create_dir_all(&directory).unwrap();
         let mut config = read_test_config();
         config.diagnostics.read_profile_limit = 1;
@@ -4314,12 +4315,12 @@ mod tests {
         .unwrap();
         assert!(error.unwrap().contains("did not complete and drain"));
         assert_eq!(events.lock().unwrap().as_slice(), ["arm", "finish"]);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn read_profile_rejects_unobserved_activation_and_missing_rpc_samples() {
-        let directory = result_directory("read-profile-missing-coverage");
+        let guard = result_directory("read-profile-missing-coverage");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.diagnostics.read_profile_limit = 2;
         let mut backend = MemoryBackend::new(false, false);
@@ -4349,13 +4350,13 @@ mod tests {
                 .unwrap()
                 .contains("selected no requests")
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn failed_read_boundaries_fail_case_and_preserve_terminal_evidence() {
         for boundary in [0, 1] {
-            let directory = result_directory(&format!("read-boundary-error-{boundary}"));
+            let guard = result_directory(&format!("read-boundary-error-{boundary}"));
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut backend = MemoryBackend::new(false, false);
             backend.observation_failure_at = Some(boundary);
@@ -4380,7 +4381,6 @@ mod tests {
             assert_eq!(evidence["measurement_attempted"], boundary == 1);
             assert_eq!(evidence["measurement_drained"], false);
             assert!(output.join("manifest.json").exists());
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -4866,20 +4866,18 @@ mod tests {
             .collect()
     }
 
-    fn result_directory(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "kv-research-{name}-{}-{}",
-            std::process::id(),
-            hex(&fresh_namespace().unwrap())
-        ));
-        std::fs::create_dir(&path).unwrap();
-        path
+    /// Result tree of one test case. `Drop` removes the tree also when an
+    /// assertion panics, so a failing run cannot leave it behind.
+    fn result_directory(name: &str) -> tempfile::TempDir {
+        tempfile::TempDir::with_prefix(format!("kv-research-{name}-"))
+            .expect("create the result directory")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_health_failure_at_each_boundary_fails_and_preserves_reason() {
         for boundary in 0..3 {
-            let directory = result_directory(&format!("background-health-{boundary}"));
+            let guard = result_directory(&format!("background-health-{boundary}"));
+            let directory = guard.path().to_path_buf();
             let mut backend = MemoryBackend::new(false, false);
             backend.health_failure_at = Some(boundary);
             let result = run(
@@ -4903,7 +4901,6 @@ mod tests {
                     .unwrap()
                     .contains("native flusher panic: background health regression")
             );
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -4977,7 +4974,8 @@ mod tests {
             Duration::from_millis(4),
             INTERFERENCE_ARRIVAL_CATCH_UP + Duration::from_millis(10),
         ] {
-            let directory = result_directory("interference-arrival-tail");
+            let guard = result_directory("interference-arrival-tail");
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut config = interference_test_config();
             let settings = config.interference.as_mut().unwrap();
@@ -5073,14 +5071,14 @@ mod tests {
                 assert_eq!(scheduled, admission_end_ns - 1_000_000);
                 assert!(scheduling_ns >= duration_ns(lateness) + 1_000_000);
             }
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interference_keeps_read_arrivals_independent_of_slow_puts_and_drains() {
         for read_delay in [Duration::ZERO, Duration::from_millis(40)] {
-            let directory = result_directory("interference-streams");
+            let guard = result_directory("interference-streams");
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let config = interference_test_config();
             let inner = Arc::new(MemoryBackend::new(false, false));
@@ -5187,13 +5185,13 @@ mod tests {
                 );
             }
             drop(data);
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_sample_writer_fails_interference_without_delaying_admission_or_drain() {
-        let directory = result_directory("interference-stalled-writer");
+        let guard = result_directory("interference-stalled-writer");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = interference_test_config();
         config.interference.as_mut().unwrap().duration_seconds = 20;
@@ -5281,13 +5279,13 @@ mod tests {
                 .unwrap()
                 > 0
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interference_timeouts_cancel_async_calls_and_leave_no_pending_work() {
         for (timeout_ms, deadline_ms) in [(10, 5000), (1000, 50)] {
-            let directory = result_directory("interference-timeout");
+            let guard = result_directory("interference-timeout");
+            let directory = guard.path().to_path_buf();
             let mut config = interference_test_config();
             config.execution.request_timeout_ms = timeout_ms;
             let backend = Arc::new(InterferenceBackend {
@@ -5350,13 +5348,13 @@ mod tests {
             reporter
                 .finish(&summary, true, &serde_json::json!({}))
                 .unwrap();
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interference_native_barrier_puts_survive_local_reopen() {
-        let directory = result_directory("interference-native-barrier");
+        let guard = result_directory("interference-native-barrier");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = interference_test_config();
         config.phases.measurement_operations = 1_000_000;
@@ -5405,12 +5403,12 @@ mod tests {
             );
         }
         reopened.shutdown().await.unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn interference_safety_ceiling_fails_closed_and_still_drains_both_streams() {
-        let directory = result_directory("interference-ceiling");
+        let guard = result_directory("interference-ceiling");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = interference_test_config();
         config.phases.measurement_operations = 101;
@@ -5432,7 +5430,6 @@ mod tests {
             assert_eq!(result[stream]["admitted"], result[stream]["completed"]);
             assert_eq!(result[stream]["failed"], 0);
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -5444,7 +5441,8 @@ mod tests {
             }))),
         });
         for focused in [false, true] {
-            let directory = result_directory("write-wait-export");
+            let guard = result_directory("write-wait-export");
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut config = read_test_config();
             config.backend.kind = "tidehunter".into();
@@ -5475,13 +5473,13 @@ mod tests {
                 assert_eq!(value["complete"], metrics["complete"]);
                 assert_eq!(value["windows"], metrics["windows"]);
             }
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_worker_starts_replacement_while_first_request_is_gated() {
-        let directory = result_directory("idle-worker-progress");
+        let guard = result_directory("idle-worker-progress");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config: RunConfig = serde_json::from_str(include_str!("../example.json")).unwrap();
         config.execution.concurrency = 2;
@@ -5558,7 +5556,6 @@ mod tests {
         pool.shutdown(true);
         drop(pool);
         drop(reporter);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(completed_while_slow_pending);
         assert_eq!(slow_id, 0);
         assert_eq!(replacement_id, 2);
@@ -5566,7 +5563,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_preload_missing_scalar_read_is_wrong_value() {
-        let directory = result_directory("full-preload-missing-read");
+        let guard = result_directory("full-preload-missing-read");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.phases.preload = true;
         let output = directory.join("result");
@@ -5578,14 +5576,14 @@ mod tests {
         )
         .await;
         let outcomes = measurement_outcomes(&output);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_err());
         assert_eq!(outcomes, ["wrong_value"]);
     }
 
     #[tokio::test]
     async fn full_preload_missing_get_many_value_is_wrong_value() {
-        let directory = result_directory("full-preload-missing-many");
+        let guard = result_directory("full-preload-missing-many");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.dataset.keys = 2;
         config.workload.mix = crate::config::OperationMix {
@@ -5616,14 +5614,14 @@ mod tests {
         )
         .await;
         let outcomes = measurement_outcomes(&output);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_err());
         assert_eq!(outcomes, ["wrong_value"]);
     }
 
     #[tokio::test]
     async fn partial_preload_missing_scalar_read_remains_success() {
-        let directory = result_directory("partial-preload-missing-read");
+        let guard = result_directory("partial-preload-missing-read");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.phases.preload = false;
         let output = directory.join("result");
@@ -5635,14 +5633,14 @@ mod tests {
         )
         .await;
         let outcomes = measurement_outcomes(&output);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_ok());
         assert_eq!(outcomes, ["success"]);
     }
 
     #[tokio::test]
     async fn aging_delete_keeps_later_missing_read_valid() {
-        let directory = result_directory("aging-delete-missing-read");
+        let guard = result_directory("aging-delete-missing-read");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.workload.mix = crate::config::OperationMix {
             read: 1,
@@ -5675,14 +5673,14 @@ mod tests {
         )
         .await;
         let outcomes = measurement_outcomes(&output);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_ok());
         assert_eq!(outcomes, ["success"]);
     }
 
     #[tokio::test]
     async fn mixed_delete_run_fails_when_a_never_deleted_key_is_lost() {
-        let directory = result_directory("mixed-delete-lost-key");
+        let guard = result_directory("mixed-delete-lost-key");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.dataset.keys = 2;
         config.execution.concurrency = 1;
@@ -5718,14 +5716,14 @@ mod tests {
         )
         .await;
         let outcomes = measurement_outcomes(&output);
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_err());
         assert_eq!(outcomes, ["wrong_value"]);
     }
 
     #[tokio::test]
     async fn samples_carry_a_worker_release_clock_after_the_api_boundary() {
-        let directory = result_directory("worker-release-clock");
+        let guard = result_directory("worker-release-clock");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let result = run(
             MemoryBackend::new(false, false),
@@ -5750,7 +5748,6 @@ mod tests {
         }
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(rows > 0);
         assert_eq!(
             manifest["worker_release"]["samples"],
@@ -5992,7 +5989,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_refuses_a_tier_the_backend_receipt_does_not_confirm() {
-        let directory = result_directory("tier-unconfirmed");
+        let guard = result_directory("tier-unconfirmed");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.backend.kind = "tidehunter".to_owned();
         config.backend.options = serde_json::json!({"durability_tier": "synchronous"});
@@ -6006,14 +6004,14 @@ mod tests {
         )
         .await;
         let created = output.exists();
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_err());
         assert!(!created, "no artifact may describe an unconfirmed tier");
     }
 
     #[tokio::test]
     async fn confirmed_tier_and_cohort_are_recorded_in_summary_and_manifest() {
-        let directory = result_directory("tier-confirmed");
+        let guard = result_directory("tier-confirmed");
+        let directory = guard.path().to_path_buf();
         let mut config = read_test_config();
         config.backend.kind = "tidehunter".to_owned();
         let output = directory.join("result");
@@ -6028,7 +6026,6 @@ mod tests {
             serde_json::from_slice(&std::fs::read(output.join(name)).unwrap()).unwrap()
         };
         let (summary, manifest) = (read("summary.json"), read("manifest.json"));
-        std::fs::remove_dir_all(&directory).unwrap();
         assert!(result.is_ok());
         for durability in [&summary["durability"], &manifest["durability"]] {
             assert_eq!(durability["tier"], "native");
@@ -6039,12 +6036,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_loop_completions_do_not_release_future_arrivals() {
-        let directory = std::env::temp_dir().join(format!(
-            "kv-research-arrivals-{}-{}",
-            std::process::id(),
-            hex(&fresh_namespace().unwrap())
-        ));
-        std::fs::create_dir(&directory).unwrap();
+        let guard = result_directory("arrivals");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config: RunConfig = serde_json::from_str(include_str!("../example.json")).unwrap();
         config.dataset.keys = 8;
@@ -6071,7 +6064,6 @@ mod tests {
         )
         .await;
         let raw = std::fs::read_to_string(output.join("samples.csv"));
-        std::fs::remove_dir_all(&directory).unwrap();
         result.unwrap();
         let raw = raw.unwrap();
         let rows: Vec<_> = raw
@@ -6167,7 +6159,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qualification_read_error_substep_is_retained_in_manifest() {
         for (call, step) in QUALIFICATION_READ_STEPS.into_iter().enumerate() {
-            let directory = result_directory(&format!("qualification-read-{call}"));
+            let guard = result_directory(&format!("qualification-read-{call}"));
+            let directory = guard.path().to_path_buf();
             let mut backend = MemoryBackend::new(false, false);
             backend.read_failure_at = Some(call);
             let result = run(
@@ -6180,7 +6173,6 @@ mod tests {
             let manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(directory.join("manifest.json")).unwrap())
                     .unwrap();
-            std::fs::remove_dir_all(&directory).unwrap();
             assert!(result.is_err());
             let failure = manifest["run"]["qualification_failure"].as_str().unwrap();
             assert!(
@@ -6235,7 +6227,8 @@ mod tests {
     }
     #[tokio::test]
     async fn write_snapshot_precedes_completion_gate_without_finishing_profile() {
-        let directory = result_directory("write-profile-gate");
+        let guard = result_directory("write-profile-gate");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let ready = directory.join("complete");
         let release = directory.join("observed");
@@ -6277,12 +6270,12 @@ mod tests {
                 .unwrap();
         assert_eq!(evidence["pre_completion_gate"]["value"], 7);
         assert_eq!(evidence["profile"]["post_gate_value"], 19);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn disabled_write_profile_never_snapshots_or_finishes() {
-        let directory = result_directory("write-profile-disabled");
+        let guard = result_directory("write-profile-disabled");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let backend = MemoryBackend::new(false, false);
         let snapshots = Arc::clone(&backend.write_snapshot_calls);
@@ -6299,14 +6292,14 @@ mod tests {
         assert_eq!(finishes.load(Ordering::Relaxed), 0);
         assert!(!output.join("write-diagnostics.json").exists());
         assert!(!output.join("write-timeline.json").exists());
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn timeline_dispatch_and_csv_join_are_bounded_and_disabled_cleanly() {
         for operation in ["put", "delete", "put_batch"] {
             for limit in [0, 3] {
-                let directory = result_directory("timeline-end-to-end");
+                let guard = result_directory("timeline-end-to-end");
+                let directory = guard.path().to_path_buf();
                 let output = directory.join("result");
                 let state = Arc::new(Mutex::new(TimelineTestState::default()));
                 let backend = TimelineTestBackend {
@@ -6413,7 +6406,6 @@ mod tests {
                     assert!(!output.join("write-timeline.json").exists());
                 }
                 drop(state);
-                std::fs::remove_dir_all(directory).unwrap();
             }
         }
     }
@@ -6444,7 +6436,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_drain_and_stalled_finalizer_still_publish_terminal_artifacts() {
-        let directory = result_directory("timeline-stalled-finalizer");
+        let guard = result_directory("timeline-stalled-finalizer");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let (mutation_release, mutation_gate) = std_mpsc::channel();
         let (finish_release, finish_gate) = std_mpsc::channel();
@@ -6490,12 +6483,12 @@ mod tests {
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         let _ = mutation_release.send(());
         let _ = finish_release.send(());
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn partial_owner_timeline_export_fails_run_but_retains_records() {
-        let directory = result_directory("timeline-partial-owner");
+        let guard = result_directory("timeline-partial-owner");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let state = Arc::new(Mutex::new(TimelineTestState {
             partial_owner_export: true,
@@ -6535,12 +6528,12 @@ mod tests {
         assert_eq!(evidence["timeline"]["owner_records"][0]["envelope_id"], 10);
         assert_eq!(evidence["timeline"]["records"][0]["caller_sample_id"], 0);
         assert_eq!(state.lock().unwrap().finishes, 1);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn write_timeline_arm_error_exports_unavailable_evidence() {
-        let directory = result_directory("timeline-arm-error");
+        let guard = result_directory("timeline-arm-error");
+        let directory = guard.path().to_path_buf();
         let output = directory.join("result");
         let mut config = read_test_config();
         config.backend.kind = "tidehunter".to_owned();
@@ -6561,13 +6554,13 @@ mod tests {
         assert_eq!(evidence["available"], false);
         assert!(evidence["error"].as_str().unwrap().contains("timeline"));
         assert!(evidence["timeline"].is_null());
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn write_snapshot_error_is_unavailable_but_profile_still_finishes() {
         for adoption_boundary in [false, true] {
-            let directory = result_directory(&format!("write-snapshot-error-{adoption_boundary}"));
+            let guard = result_directory(&format!("write-snapshot-error-{adoption_boundary}"));
+            let directory = guard.path().to_path_buf();
             let output = directory.join("result");
             let mut backend = MemoryBackend::new(false, false);
             backend.write_gate_counter = Some(Arc::new(AtomicUsize::new(7)));
@@ -6603,13 +6596,13 @@ mod tests {
                     .contains("snapshot unavailable")
             );
             assert_eq!(evidence["profile"]["post_gate_value"], 7);
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
     #[tokio::test]
     async fn measurement_completion_gate_waits_for_release_with_process_live() {
-        let directory = result_directory("measurement-completion-gate");
+        let guard = result_directory("measurement-completion-gate");
+        let directory = guard.path().to_path_buf();
         let ready_file = directory.join("measurement.complete");
         let release_file = directory.join("measurement.observed");
         let gate = crate::config::MeasurementGateConfig {
@@ -6632,12 +6625,12 @@ mod tests {
             .unwrap();
         controller.await.unwrap();
         assert!(gate.ready_file.exists());
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn measurement_completion_gate_timeout_preserves_ready_marker() {
-        let directory = result_directory("measurement-completion-timeout");
+        let guard = result_directory("measurement-completion-timeout");
+        let directory = guard.path().to_path_buf();
         let gate = crate::config::MeasurementGateConfig {
             ready_file: directory.join("measurement.complete"),
             release_file: directory.join("measurement.observed"),
@@ -6649,7 +6642,6 @@ mod tests {
                 .is_err()
         );
         assert!(gate.ready_file.exists());
-        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn timeline_selection_is_measurement_only_and_includes_batches() {
@@ -6708,7 +6700,8 @@ mod tests {
     #[tokio::test]
     async fn existing_dataset_checks_all_values_before_measurement_without_overwriting() {
         for scenario in ["present", "missing", "corrupt"] {
-            let directory = result_directory(&format!("existing-{scenario}"));
+            let guard = result_directory(&format!("existing-{scenario}"));
+            let directory = guard.path().to_path_buf();
             let mut config = read_test_config();
             let namespace = [9; 16];
             config.key_namespace_hex = Some(hex(&namespace));
@@ -6748,7 +6741,6 @@ mod tests {
                         .any(|line| line.starts_with("verify_existing_dataset,read,wrong_value,"))
                 );
             }
-            std::fs::remove_dir_all(directory).unwrap();
         }
     }
 
