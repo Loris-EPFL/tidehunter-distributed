@@ -330,6 +330,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tidehunter_repo_ref || github.sha }}
+          # The per-tip lint runner resolves the PR base commit from history.
+          # A numeric 0 is falsy in expressions, so invert the test: the Lint
+          # job gets 0 (full history) and the other profiles get 1.
+          fetch-depth: ${{ matrix.profile != 'lint' && 1 || 0 }}
           persist-credentials: false
 
       - name: Set up repository Rust
@@ -400,6 +404,17 @@ jobs:
       - name: Run selected profile
         run: python3 .github/scripts/checks.py "${{ matrix.profile }}"
 
+      - name: Run the lint profile at every stack tip
+        if: matrix.profile == 'lint' && github.event_name == 'pull_request'
+        timeout-minutes: 30
+        env:
+          # Reuse the lint-profile build directory so each tip is incremental.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: >-
+          python3 -B .github/scripts/lint_stack.py
+          --base "${{ github.event.pull_request.base.sha }}"
+          --tip "${{ github.sha }}"
+
       - name: Enforce file length and test layout
         if: matrix.profile == 'format'
         timeout-minutes: 5
@@ -408,6 +423,7 @@ jobs:
           python3 -B .github/scripts/checks.py file-length
           python3 -B .github/scripts/checks.py test-layout
           python3 -B -m unittest discover -s .github/scripts -p 'test_checks.py' -v
+          python3 -B -m unittest discover -s .github/scripts -p 'test_lint_stack.py' -v
 
       - name: Prepare Darwin standard library for boundary check
         if: matrix.profile == 'lint'
