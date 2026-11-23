@@ -23,11 +23,16 @@
 //! | Test | Removed production line | Effect |
 //! |---|---|---|
 //! | `inline_read_serves_a_cached_grant_and_skips_the_actor` | `ReadService::read_inline`'s `self.read_live_inline(..)` dispatch (`pending_read.rs`) | the read takes the actor, `live_inline == 0` |
-//! | `inline_fallback_serves_through_the_lane_worker` | `read_live_inline`'s `if !cache.inline_ready(position)` fallback (`live_inline.rs`) | a grantless lane attempts I/O inline, the fallback counters stay 0 |
+//! | `inline_fallback_serves_through_the_lane_worker` | `read_live_inline`'s `if !cache.inline_ready(position)` fallback (`live_inline.rs`) | a grantless lane attempts I/O inline, the grant fallback counter stays 0 |
 //! | `admission_park_is_bounded_by_the_read_deadline` | `Some(deadline)` in `ValueReader::fetch`'s `wait_admission` (`hybrid/read.rs`) | the read parks until `WAIT`; the test then fails at its `expect`, it does not hang |
 //! | `coalesced_submissions_share_one_flight` | the `flights.find(node, position)` reuse arm of `submit_until_planned` (`pending_read.rs`) | a second flight is allocated, `coalesced_members == 0` |
 //! | `byte_limited_dispatch_splits_waves_and_preserves_order` | the per-member charge check in `ReadBatch::dispatch_traced` (`pending_read.rs`) | all members are admitted in one wave |
 //! | `retirement_pause_refuses_outstanding_reads_and_blocks_admission` | `retained.0 != 0` in `pause_idle_nvme` (`pending_read.rs`) | retirement starts while a caller still holds a read |
+//! | `a_batch_read_i_o_deadline_must_stay_typed_and_retryable` | the `TimedOut` arm in `Request::complete_nvme` (`pending_read.rs`), reached through `LiveReadCache::admit`'s early return on a spent remaining budget (`tcp/live_read.rs`) | the lane completion poisons the authority, so the stored result reaches the caller as "read authority is poisoned or closed" and the second read fails |
+//! | `a_published_completion_outlives_the_call_deadline` | the ready check before the deadline in `ReadRequest::finish` (`pending_read.rs`) | the published frame is reported as `TimedOut` and never decoded |
+//! | `a_copied_flight_result_keeps_its_error_kind` | `error.kind()` in `copied_read_error` (`pending_read.rs`) | the stored deadline reaches the caller as `Other` |
+//! | `an_inline_read_i_o_deadline_must_stay_typed_and_retryable` | `live_error`'s `Timeout` arm (`tcp/live_read.rs`) and the `TimedOut` arm in `read_live_inline` (`live_inline.rs`) | the error is `Other` and the inline path poisons the authority |
+//! | `a_submission_time_timeout_is_retried_within_the_call_deadline` | the retry loop in `LiveReadCache::advance` (`tcp/live_read.rs`) | the forced timeout surfaces and `read_retries == 0` |
 
 use super::*;
 use crate::distributed::codec::{CompleteBatch, Mutation};
@@ -58,6 +63,9 @@ struct Case {
     fixture: Fixture,
     reads: Arc<ReadService>,
     reader: ValueReader,
+    /// The keyspace shape, so a test can decode a returned frame the same way
+    /// the value path does.
+    shape: Arc<KeyShape>,
     positions: Vec<VersionPosition>,
     /// The member frame each position names, derived from the batch encoding.
     frames: Vec<Bytes>,
@@ -168,6 +176,7 @@ impl Case {
             fixture,
             reads,
             reader,
+            shape,
             positions,
             frames,
             key,
@@ -192,11 +201,19 @@ impl Case {
             .load(Ordering::Relaxed)
     }
 
-    fn grantless_fallbacks(&self) -> u64 {
+    fn grant_fallbacks(&self) -> u64 {
         self.reads
             .state
             .diagnostics
             .live_inline_fallback_grant
+            .load(Ordering::Relaxed)
+    }
+
+    fn busy_fallbacks(&self) -> u64 {
+        self.reads
+            .state
+            .diagnostics
+            .live_inline_fallback_busy
             .load(Ordering::Relaxed)
     }
 
@@ -257,6 +274,58 @@ fn put_key(batch: &CompleteBatch) -> Bytes {
     only_put(batch).0.clone()
 }
 
+/// Verify a returned member frame and decode it exactly as the value path
+/// does: the length header, the position's payload CRC and the native entry.
+fn decoded_value(case: &Case, position: &VersionPosition, frame: &Bytes) -> Bytes {
+    let header = frame.get(..8).expect("a member frame carries its header");
+    let declared = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let payload = frame.slice(8..);
+    assert_eq!(
+        declared,
+        payload.len(),
+        "the member frame length matches its header"
+    );
+    assert_eq!(
+        crc32fast::hash(&payload),
+        position.payload_crc,
+        "the member payload matches the publisher's CRC"
+    );
+    let (key, value) = crate::db::decode_record_frame(
+        case.shape.ks(KeySpace(0)),
+        &case.key,
+        Bytes::copy_from_slice(&payload),
+    )
+    .expect("the member decodes as a native entry")
+    .expect("the member is a put");
+    assert_eq!(
+        key, case.key,
+        "the member names the key the index asked for"
+    );
+    value
+}
+
+/// A stored result reaches each consumer through `try_result`'s copy, so the
+/// copy must keep the class: a caller that classifies by kind cannot tell a
+/// deadline from a broken lane once the kind is flattened to `Other`.
+#[test]
+fn a_copied_flight_result_keeps_its_error_kind() {
+    let stored = LocalDbError::with_kind(
+        std::io::ErrorKind::TimedOut,
+        "remote read I/O deadline expired",
+    );
+    let copy = copied_read_error(&stored);
+    assert_eq!(
+        copy.kind(),
+        std::io::ErrorKind::TimedOut,
+        "a copied deadline stays a deadline: {copy}"
+    );
+    assert_eq!(
+        copy.to_string(),
+        stored.to_string(),
+        "the copy keeps the stored message"
+    );
+}
+
 /// A cached grant lets the caller read on the lane it already owns; the actor
 /// never sees the request.
 #[test]
@@ -276,24 +345,44 @@ fn inline_read_serves_a_cached_grant_and_skips_the_actor() {
     assert_eq!(case.actor_reads(), 0, "no reactor lane touched the request");
 }
 
-/// Without a cached grant the inline route must decline, not fail: the same
-/// read completes through the lane worker.
+/// Without a cached grant the inline route must decline for that grant, not
+/// fail: the same value read completes through the lane worker.
+///
+/// The worker is parked at its loop-top test hook first. At that point it owns
+/// neither `lane.driver` nor `lane.client`, so the decline cannot be the
+/// scheduling-dependent `busy` reason: the test proves the missing-grant
+/// premise, and the busy counter is a control.
 #[test]
 fn inline_fallback_serves_through_the_lane_worker() {
     let case = Case::new(1);
+    let parked = case.reads.bench_park_live_lane(0);
+    let inline = case
+        .reads
+        .read_inline(0, &case.positions[0], 0)
+        .expect("a missing grant is a decline, not a failure");
+    assert!(
+        inline.is_none(),
+        "no cached grant: the inline route hands the member back"
+    );
+    assert_eq!(
+        case.grant_fallbacks(),
+        1,
+        "the missing grant is the recorded decline"
+    );
+    assert_eq!(
+        case.busy_fallbacks(),
+        0,
+        "the parked worker owns no lane lock, so busy cannot be the reason"
+    );
+    drop(parked);
     let value = case
         .reader
         .read(KeySpace(0), &case.key, case.positions[0])
         .unwrap()
         .expect("a put member returns its value");
     assert_eq!(value, case.values[0]);
-    assert_eq!(case.inline_reads(), 0);
-    assert_eq!(
-        case.grantless_fallbacks(),
-        1,
-        "a missing grant falls back instead of reading uncached"
-    );
-    assert_eq!(case.actor_reads(), 1);
+    assert_eq!(case.inline_reads(), 0, "no grant means no inline serve");
+    assert_eq!(case.actor_reads(), 1, "the lane worker served the read");
 }
 
 /// A caller that cannot be admitted parks on admission progress with the read
@@ -333,8 +422,9 @@ fn admission_park_is_bounded_by_the_read_deadline() {
     let refused = result
         .expect("the read ended within the bound instead of parking without a deadline")
         .unwrap_err();
-    assert!(
-        refused.to_string().contains("admission deadline expired"),
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::TimedOut,
         "a full authority must end the park with a typed timeout: {refused}"
     );
 }
@@ -382,7 +472,13 @@ fn byte_limited_dispatch_splits_waves_and_preserves_order() {
         (0, case.positions[1]),
         (1, case.positions[2]),
     ];
-    let mut batch = ReadBatch::new(&case.reads, vec![None; 3], vec![rows]).unwrap();
+    let mut batch = ReadBatch::new(
+        &case.reads,
+        vec![None; 3],
+        vec![rows],
+        Instant::now() + WAIT,
+    )
+    .unwrap();
     batch.dispatch(&case.reads).unwrap();
     assert_eq!(batch.reads.len(), 1, "one wave is one owner request");
     assert_eq!(
@@ -465,4 +561,223 @@ fn retirement_pause_refuses_outstanding_reads_and_blocks_admission() {
         .unwrap()
         .expect("the same lanes serve after the pause");
     assert_eq!(value, case.values[0]);
+}
+
+/// A transport deadline is a transient, idempotent-read failure, not a
+/// permanent authority failure.
+///
+/// The submission is admitted with a spent call deadline, so `admit` returns
+/// early on the spent remaining budget and the lane's terminal completion is a
+/// typed `TimedOut`. The terminal completion is held inside `Request::complete_nvme`
+/// after the result is stored, so the test reaches the lane completion and its
+/// `TimedOut` exemption instead of the batch's own deadline branch. The first
+/// read must report `io::ErrorKind::TimedOut`, and the next read must still be
+/// served: a deadline is not a broken lane. The old code flattened it to
+/// `Other` and poisoned the whole service, which is the observed
+/// `drop_cells_tests` flake.
+#[test]
+fn a_batch_read_i_o_deadline_must_stay_typed_and_retryable() {
+    let case = Case::new(1);
+    let (held, completion) = case.reads.bench_hold_completion();
+    let mut request = case
+        .reads
+        .submit_positions_before(0, &[case.positions[0]], None, Instant::now())
+        .expect("admission does not consume the call deadline");
+    held.recv_timeout(WAIT)
+        .expect("the lane reaches its timed-out terminal completion");
+    let signal = Arc::new(BatchSignal::new());
+    request.subscribe(&signal);
+    completion.release();
+    {
+        // Wait for the flight to retire before the result is read, so its slot
+        // is reusable and the next read cannot coalesce onto it.
+        let mut wait_guard = signal.wait_lock.lock();
+        while !request
+            .parts
+            .iter()
+            .all(|(flight, _)| flight._credit.state.flight_ready[flight.slot].is_ready())
+        {
+            let waited = signal
+                .changed
+                .wait_until(&mut wait_guard, Instant::now() + WAIT);
+            assert!(
+                !waited.timed_out(),
+                "the timed-out flight retires within the test bound"
+            );
+        }
+    }
+    let error = request
+        .finish()
+        .expect_err("a spent call deadline cannot serve the member");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut,
+        "the lane deadline must keep its class: {error}"
+    );
+    // The deadline poisoned nothing: the same authority serves the member.
+    let value = case
+        .reader
+        .read(KeySpace(0), &case.key, case.positions[0])
+        .unwrap()
+        .expect("one expired deadline must not fail-stop the read authority");
+    assert_eq!(value, case.values[0], "the retried read returns the value");
+}
+
+/// A flight whose CQE was accepted and published is a success even when the
+/// caller observes it at or after the call deadline. The payload is in hand,
+/// so reporting `TimedOut` would drop it and repeat the I/O.
+///
+/// The terminal completion is held inside `Request::complete_nvme` after the
+/// result is stored and before the slot retires. The caller's deadline
+/// therefore passes with an accepted CQE and no sleep or load decides the
+/// outcome; the release and the readiness wait are the only signals.
+#[test]
+fn a_published_completion_outlives_the_call_deadline() {
+    let case = Case::new(1);
+    let (held, completion) = case.reads.bench_hold_completion();
+    let mut request = case
+        .reads
+        .submit_positions_before(0, &[case.positions[0]], None, Instant::now() + WAIT)
+        .expect("the fixture admits one member");
+    held.recv_timeout(WAIT)
+        .expect("the lane reaches its terminal completion");
+    // The caller's budget is spent while the accepted CQE is still held.
+    request.deadline = Instant::now();
+    let signal = Arc::new(BatchSignal::new());
+    request.subscribe(&signal);
+    completion.release();
+    {
+        let mut wait_guard = signal.wait_lock.lock();
+        while !request
+            .parts
+            .iter()
+            .all(|(flight, _)| flight._credit.state.flight_ready[flight.slot].is_ready())
+        {
+            let waited = signal
+                .changed
+                .wait_until(&mut wait_guard, Instant::now() + WAIT);
+            assert!(
+                !waited.timed_out(),
+                "the published flight wakes its caller within the test bound"
+            );
+        }
+    }
+    let frames = request
+        .finish()
+        .expect("a published completion is returned, not discarded at the deadline");
+    assert_eq!(
+        frames,
+        vec![case.frames[0].clone()],
+        "the frame the flight read"
+    );
+    assert_eq!(
+        decoded_value(&case, &case.positions[0], &frames[0]),
+        case.values[0],
+        "the returned frame decodes to the value the fixture wrote"
+    );
+    assert_eq!(
+        case.reads
+            .state
+            .diagnostics
+            .read_timeouts
+            .load(Ordering::Relaxed),
+        0,
+        "a read that returned its data is not a timeout"
+    );
+}
+
+/// The caller-inline path has its own error mapping and its own poison site.
+/// A deadline there must also stay typed and leave the authority usable.
+#[test]
+fn an_inline_read_i_o_deadline_must_stay_typed_and_retryable() {
+    let case = Case::with_timeout(1, Duration::ZERO);
+    // Own the lane so the reads cannot fall back to its worker: the cached
+    // grant is installed while the worker is parked, and the park handle stays
+    // alive across both reads.
+    let parked = case.reads.bench_park_live_lane(0);
+    case.reads
+        .bench_install_owner_local(&case.fixture.node, case.positions[0]);
+    let error = case
+        .reader
+        .read(KeySpace(0), &case.key, case.positions[0])
+        .expect_err("a spent call deadline cannot serve the member");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut,
+        "the inline transport deadline must keep its class: {error}"
+    );
+    assert_eq!(
+        case.inline_reads(),
+        1,
+        "the caller-inline route served the attempt"
+    );
+    assert_eq!(case.actor_reads(), 0, "no reactor lane touched the request");
+    assert_eq!(
+        case.reads
+            .state
+            .diagnostics
+            .read_timeouts
+            .load(Ordering::Relaxed),
+        1,
+        "one caller-visible timeout is counted once"
+    );
+    let again = case
+        .reader
+        .read(KeySpace(0), &case.key, case.positions[0])
+        .expect_err("the fixture keeps the call deadline at zero");
+    assert_eq!(
+        again.kind(),
+        std::io::ErrorKind::TimedOut,
+        "one expired inline deadline must not fail-stop the read authority: {again}"
+    );
+    assert_eq!(
+        case.inline_reads(),
+        2,
+        "the second read takes the same caller-inline route"
+    );
+    assert_eq!(
+        case.reads
+            .state
+            .diagnostics
+            .read_timeouts
+            .load(Ordering::Relaxed),
+        2,
+        "each caller-visible timeout is counted once"
+    );
+    drop(parked);
+}
+
+/// A submission-time timeout that never reached the ring is retried inside the
+/// caller's deadline, and the retry is counted. The hook fails exactly one
+/// member submission before any SQE exists, which is the only retry-safe
+/// timeout: no buffer can still receive DMA.
+#[test]
+fn a_submission_time_timeout_is_retried_within_the_call_deadline() {
+    let case = Case::new(1);
+    {
+        let lanes = case.reads.lanes.read();
+        let mut driver = lanes[0][0].driver.lock();
+        driver
+            .live_cache
+            .as_mut()
+            .expect("the lane owns its read cache")
+            .fail_next_read_submission();
+    }
+    let value = case
+        .reader
+        .read(KeySpace(0), &case.key, case.positions[0])
+        .expect("the retry inside the call deadline serves the member")
+        .expect("the member holds a value");
+    assert_eq!(value, case.values[0]);
+    let diagnostics = &case.reads.state.diagnostics;
+    assert_eq!(
+        diagnostics.read_retries.load(Ordering::Relaxed),
+        1,
+        "one submission-time timeout is retried once"
+    );
+    assert_eq!(
+        diagnostics.read_timeouts.load(Ordering::Relaxed),
+        0,
+        "the retried read is not a caller-visible timeout"
+    );
 }

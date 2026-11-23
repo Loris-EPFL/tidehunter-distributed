@@ -29,7 +29,8 @@ use crate::crc::CrcFrame;
 use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
 use crate::distributed::nvmeof::live_io::{
-    LiveCompletion, LiveIo, LiveIoResult, LiveIoStats, LiveSubmitOutcome, NamespaceSlot,
+    LiveCompletion, LiveIo, LiveIoError, LiveIoResult, LiveIoStats, LiveSubmitOutcome,
+    NamespaceSlot,
 };
 use crate::distributed::nvmeof::live_metrics::{
     LiveNamespaceIdentity, LiveNvmeCounters, LiveRouteEvidence, LiveTimingStage,
@@ -40,6 +41,7 @@ use crate::distributed::nvmeof::live_storage::{
     FILES_PER_SUBSYSTEM, LiveWalSegment, wal_export_name,
 };
 use crate::distributed::remote_db::ReadTraceChild;
+use connect::{ConnectError, connect_budget, failed, failed_io, pool_deadline};
 use minibytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -54,6 +56,10 @@ pub(crate) const LIVE_READ_LANE_REQUESTS: usize = 32;
 const DRAIN_BOUND: Duration = Duration::from_secs(35);
 /// Pause before a request retries a controller pool that had no free slot.
 const POOL_RETRY: Duration = Duration::from_millis(1);
+/// At most this many submission-time read retries per request. A retry is
+/// allowed only when no member of the request reached the ring, so no buffer
+/// can still receive DMA; the retry must also start before the call deadline.
+const MAX_READ_START_RETRIES: u8 = 2;
 pub(super) struct LiveReadTiming {
     counters: Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>,
     stage: LiveTimingStage,
@@ -78,6 +84,19 @@ impl Drop for LiveReadTiming {
             self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             1,
         );
+    }
+}
+
+/// Keep a live I/O deadline typed. `TcpError::component` maps every class to
+/// `Other`, which erases the one class the value path must tell apart: a
+/// deadline (transient, never submitted or retired) from a broken ring.
+pub(super) fn live_error(error: LiveIoError) -> TcpError {
+    match error {
+        LiveIoError::Timeout => TcpError::with_kind(
+            std::io::ErrorKind::TimedOut,
+            "live read I/O deadline expired",
+        ),
+        other => TcpError::component(other),
     }
 }
 
@@ -134,9 +153,10 @@ pub(crate) struct LiveReadToken(u64);
 /// Members of one logical read, in caller order.
 pub(crate) struct LiveReadRequest {
     pub(crate) positions: Vec<VersionPosition>,
-    /// Bound of each submitted flight and grant connect, counted from its own
-    /// start. Time a member waits for grant credit does not count.
-    pub(crate) timeout: Duration,
+    /// Absolute call deadline: no flight may start with a deadline past this
+    /// and no retry may start after it. Time a member waits for grant credit
+    /// is bounded by it, not by a per-I/O timer.
+    pub(crate) deadline: Instant,
     pub(crate) trace: Option<ReadTraceChild>,
 }
 
@@ -152,6 +172,9 @@ pub(crate) enum LiveReadSubmitError {
 pub(crate) struct LiveReadDone {
     pub(crate) token: LiveReadToken,
     pub(crate) result: Result<Vec<Bytes>, TcpError>,
+    /// Retries of a submission that never reached the ring. Operator data;
+    /// zero for the normal path.
+    pub(crate) retries: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -394,7 +417,12 @@ struct Flight {
 
 struct InFlightRequest {
     positions: Vec<VersionPosition>,
-    timeout: Duration,
+    /// Absolute deadline of the caller's read. Every flight starts with
+    /// `min(io_timeout, deadline - now)`, so no observed I/O outlives it.
+    deadline: Instant,
+    /// Submission-time retries already spent; the bound is
+    /// [`MAX_READ_START_RETRIES`].
+    retries: u8,
     /// Deadline of the latest submitted flight; `None` while no flight is
     /// outstanding.
     io_deadline: Option<Instant>,
@@ -420,6 +448,11 @@ impl InFlightRequest {
             self.error = Some(error);
         }
     }
+    /// Time left before the caller's absolute deadline. Zero means no new
+    /// flight and no retry may start.
+    fn remaining(&self, now: Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
 }
 
 enum Opened {
@@ -433,14 +466,6 @@ enum Group {
     Submitted,
     /// The grant has no credit now; retry after one of its flights completes.
     Blocked,
-}
-enum ConnectError {
-    /// The controller pool has no free slot; may clear soon.
-    PoolFull(std::io::Error),
-    Failed(TcpError),
-}
-fn failed(error: impl std::fmt::Display) -> ConnectError {
-    ConnectError::Failed(TcpError::component(error))
 }
 
 /// A file grant covers a position when the position's address names a member of
@@ -539,6 +564,11 @@ pub(crate) struct LiveReadCache {
         std::sync::mpsc::SyncSender<()>,
         std::sync::mpsc::Receiver<()>,
     )>,
+    /// Fail the next member submission with a typed `TimedOut` before it
+    /// reaches the ring. Test-only: it models the one retry-safe timeout (no
+    /// SQE and no buffer owned), so a retry can be proved.
+    #[cfg(test)]
+    fail_next_read_submission: bool,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -577,7 +607,15 @@ impl LiveReadCache {
             scratch: Vec::with_capacity(max_requests),
             #[cfg(test)]
             inline_submitted_pause: None,
+            #[cfg(test)]
+            fail_next_read_submission: false,
         }
+    }
+
+    /// Arm one submission-time timeout on the next member group. Test-only.
+    #[cfg(test)]
+    pub(crate) fn fail_next_read_submission(&mut self) {
+        self.fail_next_read_submission = true;
     }
 
     /// Requests admitted and not yet returned by `poll`.
@@ -620,7 +658,8 @@ impl LiveReadCache {
         let members = request.positions.len();
         let mut state = InFlightRequest {
             positions: request.positions,
-            timeout: request.timeout,
+            deadline: request.deadline,
+            retries: 0,
             io_deadline: None,
             trace: request.trace,
             slots: vec![Slot::Pending; members],
@@ -871,6 +910,13 @@ impl LiveReadCache {
 
     /// Starts as many of the request's pending members as credit allows. A
     /// failure is recorded on the request and its flights are cancelled.
+    ///
+    /// One class is retried: a `TimedOut` submission that left
+    /// `state.flights == 0`, so no SQE reached the ring and no buffer can
+    /// still receive DMA. The retry is bounded by
+    /// [`MAX_READ_START_RETRIES`] and must start before the absolute call
+    /// deadline. Every other failure is final; a deadline that passes with
+    /// I/O outstanding is never retried here.
     fn advance(
         &mut self,
         client: &mut Client,
@@ -888,10 +934,22 @@ impl LiveReadCache {
         state.retry_at = None;
         // Parked members never expire: each flight's deadline starts at its
         // submission (`submit_group`), as a native read waits for the disk.
-        let failure = self.admit(client, epoch, token, state).err();
-        if let Some(error) = failure {
-            state.fail(error);
-            self.cancel_flights(token);
+        loop {
+            let failure = self.admit(client, epoch, token, state).err();
+            let Some(error) = failure else {
+                return;
+            };
+            let retry_safe = error.kind() == std::io::ErrorKind::TimedOut
+                && state.flights == 0
+                && state.pending > 0
+                && state.retries < MAX_READ_START_RETRIES
+                && Instant::now() < state.deadline;
+            if !retry_safe {
+                state.fail(error);
+                self.cancel_flights(token);
+                return;
+            }
+            state.retries += 1;
         }
     }
 
@@ -909,6 +967,14 @@ impl LiveReadCache {
             ),
             None => return Err(TcpError::new("live NVMe is not configured")),
         };
+        if state.remaining(Instant::now()).is_zero() {
+            // No time left for a flight or a connect. Typed, so the caller
+            // does not mistake a spent budget for a broken lane.
+            return Err(TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
+                "live read deadline expired before admission",
+            ));
+        }
         let mut blocked: Vec<u64> = Vec::new();
         let mut no_new_grant = false;
         // Each pass starts members, blocks one grant, or stops new grants.
@@ -1018,7 +1084,7 @@ impl LiveReadCache {
             return Err(TcpError::new("missing live location"));
         };
         let since = *state.connect_since.get_or_insert_with(Instant::now);
-        let connect_deadline = since + connect_timeout.min(state.timeout);
+        let connect_deadline = connect_budget(state.deadline, since, connect_timeout);
         let id = self.next_grant;
         match Self::connect_grant(client, epoch, location, pin, id, connect_deadline) {
             Ok(mut grant) => {
@@ -1040,7 +1106,7 @@ impl LiveReadCache {
                         state.retry_at = Some(Instant::now() + POOL_RETRY);
                         Ok(Opened::Retry)
                     }
-                    ConnectError::PoolFull(error) => Err(TcpError::component(error)),
+                    ConnectError::PoolFull(error) => Err(pool_deadline(error)),
                     ConnectError::Failed(error) => Err(error),
                 }
             }
@@ -1070,7 +1136,11 @@ impl LiveReadCache {
             .is_none_or(|(current, _, count)| *current != epoch || file >= *count)
             && let Err(error) = client.open_live_exports(epoch)
         {
-            self.failed_subsystems.insert((epoch, file / files));
+            // A control timeout says nothing about the subsystem and is not
+            // cached; the next attempt asks the owner again.
+            if error.kind() != std::io::ErrorKind::TimedOut {
+                self.failed_subsystems.insert((epoch, file / files));
+            }
             return Err(error);
         }
         let (_, info, count) = client
@@ -1092,7 +1162,7 @@ impl LiveReadCache {
             file,
         );
         let since = *state.connect_since.get_or_insert_with(Instant::now);
-        let deadline = since + connect_timeout.min(state.timeout);
+        let deadline = connect_budget(state.deadline, since, connect_timeout);
         if let Some(index) = self
             .grants
             .iter()
@@ -1112,7 +1182,13 @@ impl LiveReadCache {
                         LiveNamespaceAccess::ReadShared,
                         deadline,
                     )
-                    .map_err(TcpError::component)?;
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::TimedOut {
+                            TcpError::with_kind(error.kind(), error.to_string())
+                        } else {
+                            TcpError::component(error)
+                        }
+                    })?;
                 let slot = grant
                     .io
                     .attach(handle.clone())
@@ -1128,7 +1204,11 @@ impl LiveReadCache {
                 Ok::<(), TcpError>(())
             })();
             if let Err(error) = attached {
-                self.fail_grant(client, index, &error);
+                // A namespace setup that hit its deadline is transient: the
+                // grant keeps its other namespaces, so a retry may attach again.
+                if error.kind() != std::io::ErrorKind::TimedOut {
+                    self.fail_grant(client, index, &error);
+                }
                 return Err(error);
             }
             if let Some(counters) = &client.live_counters {
@@ -1200,9 +1280,15 @@ impl LiveReadCache {
                 state.retry_at = Some(Instant::now() + POOL_RETRY);
                 Ok(Opened::Retry)
             }
-            Err(ConnectError::PoolFull(error)) => Err(TcpError::component(error)),
+            // The connect budget is spent with the pool still full: a
+            // deadline, not a broken subsystem.
+            Err(ConnectError::PoolFull(error)) => Err(pool_deadline(error)),
             Err(ConnectError::Failed(error)) => {
-                self.failed_subsystems.insert((epoch, name.subsystem));
+                // A connect that hit its deadline is retried inside the call;
+                // caching it would fail-stop the authority on the retry.
+                if error.kind() != std::io::ErrorKind::TimedOut {
+                    self.failed_subsystems.insert((epoch, name.subsystem));
+                }
                 Err(error)
             }
         }
@@ -1314,16 +1400,16 @@ impl LiveReadCache {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 ConnectError::PoolFull(error)
             } else {
-                ConnectError::Failed(TcpError::component(error))
+                failed_io(error)
             }
         })?;
         let (namespace, opened) = if shared {
             let (namespace, opened) = lease
                 .namespace(target.nsid, target.uuid, access, connect_deadline)
-                .map_err(failed)?;
+                .map_err(failed_io)?;
             (namespace, Some(opened))
         } else {
-            (Arc::new(lease.open_namespace().map_err(failed)?), None)
+            (Arc::new(lease.open_namespace().map_err(failed_io)?), None)
         };
         drop(setup);
         if let Some(counters) = &client.live_counters {
@@ -1415,6 +1501,14 @@ impl LiveReadCache {
         index: usize,
         io_timeout: Duration,
     ) -> Result<Group, TcpError> {
+        #[cfg(test)]
+        if self.fail_next_read_submission {
+            self.fail_next_read_submission = false;
+            return Err(TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
+                "forced submission-time read timeout",
+            ));
+        }
         self.clock += 1;
         let grant = &mut self.grants[index];
         grant.last_used = self.clock;
@@ -1469,8 +1563,17 @@ impl LiveReadCache {
             }
             return Ok(Group::Blocked);
         }
+        // The flight deadline never outlives the caller's absolute deadline:
+        // a retry or a first submission can only consume what is left.
+        let remaining = state.remaining(Instant::now());
+        if remaining.is_zero() {
+            return Err(TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
+                "live read deadline expired before submission",
+            ));
+        }
         let flight = self.next_flight;
-        let deadline = Instant::now() + io_timeout.min(state.timeout);
+        let deadline = Instant::now() + io_timeout.min(remaining);
         let slot = grant.scope.slot(&state.positions[selected[0]]);
         let submitted = match slot {
             Some(slot) => {
@@ -1482,7 +1585,7 @@ impl LiveReadCache {
                 .io
                 .submit_reads_traced(flight, &ranges, deadline, state.trace.as_ref()),
         };
-        match submitted.map_err(TcpError::component)? {
+        match submitted.map_err(live_error)? {
             LiveSubmitOutcome::Submitted => {}
             LiveSubmitOutcome::Full => return Ok(Group::Blocked),
         }
@@ -1556,7 +1659,7 @@ impl LiveReadCache {
         };
         state.last_cqe = Some(completion.completed_at);
         let mut cancel = false;
-        let mut failed_io = false;
+        let mut io_failed = false;
         match completion.result {
             Ok(LiveIoResult::Reads(records)) => {
                 if state.error.is_none()
@@ -1571,18 +1674,20 @@ impl LiveReadCache {
                 cancel = true;
             }
             Err(error) => {
-                failed_io = matches!(
+                io_failed = matches!(
                     error,
                     crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
                 );
                 cancel = state.error.is_none();
-                state.fail(TcpError::component(error));
+                // Keep the deadline class: the caller and the counters must
+                // tell a transient timeout from a broken ring.
+                state.fail(live_error(error));
             }
         }
         if cancel {
             self.cancel_flights(flight.token);
         }
-        if failed_io
+        if io_failed
             && let Some(grant) = self.grants.iter_mut().find(|grant| {
                 grant.id == flight.grant && matches!(grant.scope, GrantScope::Subsystem { .. })
             })
@@ -1703,7 +1808,11 @@ impl LiveReadCache {
         {
             counters.record_error();
         }
-        LiveReadDone { token, result }
+        LiveReadDone {
+            token,
+            result,
+            retries: state.retries,
+        }
     }
 }
 
@@ -1725,7 +1834,7 @@ impl Client {
     ) -> Result<Vec<Bytes>, TcpError> {
         let request = LiveReadRequest {
             positions: positions.to_vec(),
-            timeout: deadline.saturating_duration_since(Instant::now()),
+            deadline,
             trace: trace.cloned(),
         };
         let token = match cache.submit(self, epoch, request) {
@@ -1748,6 +1857,7 @@ impl Client {
     }
 }
 
+mod connect;
 mod inline;
 
 #[cfg(test)]

@@ -6,6 +6,9 @@ use crate::distributed::types::PhysicalValueAddress;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
+#[path = "subsystem_tests.rs"]
+mod subsystem_tests;
+
 /// Ported from the per-file active-epoch export fixture: on-demand and
 /// per-file export modes were removed (R2), active-epoch exports are now
 /// permanent and never pinned, so pinned exports exist only for history
@@ -324,8 +327,12 @@ fn cached_scalar_expired_deadline_does_not_submit_or_drop_pin() {
     assert_eq!(lane.metrics.snapshot().counts.completed_read_ops, 0);
 }
 
+/// A read whose CQE reports success is a success even when the queue
+/// observes it past the flight deadline. The grant keeps its credit and
+/// pin until that terminal CQE, and the late observation is not counted
+/// as a timeout.
 #[test]
-fn cached_scalar_deadline_holds_credit_until_terminal_cqe() {
+fn cached_scalar_late_success_holds_credit_until_terminal_cqe() {
     let mut lane = lane(4);
     let before = local_snapshot(&lane.cache);
     let (entered, waiting) = std::sync::mpsc::sync_channel(1);
@@ -346,9 +353,14 @@ fn cached_scalar_deadline_holds_credit_until_terminal_cqe() {
     std::thread::sleep(Duration::from_millis(30));
     release.send(()).unwrap();
     let (lane, result) = worker.join().unwrap();
-    assert!(result.is_err());
+    let frames = result.expect("a terminal success stays a success");
+    assert_eq!(frames, vec![member_frame(&lane.first, &lane.a)]);
     assert_eq!(local_snapshot(&lane.cache), before);
-    assert_eq!(lane.cache.grants[0].io.stats().timeouts, 1);
+    assert_eq!(
+        lane.cache.grants[0].io.stats().timeouts,
+        0,
+        "a late success is not a timeout"
+    );
 }
 
 pub(crate) fn local_snapshot(cache: &LiveReadCache) -> (usize, usize, usize) {
@@ -942,7 +954,8 @@ fn failed_subsystem_is_not_reopened_and_new_epoch_drops_old_failures() {
     assert_eq!(after.namespace_connects, before.namespace_connects);
     let mut state = InFlightRequest {
         positions: vec![a],
-        timeout: Duration::from_secs(1),
+        deadline: Instant::now() + Duration::from_secs(1),
+        retries: 0,
         io_deadline: None,
         trace: None,
         slots: vec![Slot::Pending],
@@ -1052,7 +1065,7 @@ impl Lane {
     fn submit(&mut self, positions: Vec<VersionPosition>) -> LiveReadToken {
         let request = LiveReadRequest {
             positions,
-            timeout: Duration::from_secs(10),
+            deadline: Instant::now() + Duration::from_secs(10),
             trace: None,
         };
         match self.cache.submit(&mut self.client, 1, request) {
@@ -1239,7 +1252,7 @@ fn lane_rejects_when_full() {
     }
     let request = LiveReadRequest {
         positions: vec![a],
-        timeout: Duration::from_secs(10),
+        deadline: Instant::now() + Duration::from_secs(10),
         trace: None,
     };
     match lane.cache.submit(&mut lane.client, 1, request) {
@@ -1250,18 +1263,19 @@ fn lane_rejects_when_full() {
     assert_eq!(lane.cache.grants[0].io.outstanding(), 0);
 }
 
-/// Native parity: a member that waits for grant credit longer than its
-/// timeout does not expire; its I/O deadline starts at device submission.
+/// Native parity: a member parked for grant credit owns no flight, so it
+/// has no I/O deadline. Its flight timer starts at submission; the
+/// caller's absolute deadline is the only bound on how long it may park.
 #[test]
-fn parked_member_waits_for_grant_credit_longer_than_its_timeout() {
+fn parked_member_has_no_flight_deadline_until_submission() {
     // One queue slot: the first request's flight holds the grant credit.
     let mut lane = lane(1);
     let a = lane.a;
     let first = lane.submit(vec![a]);
-    let timeout = Duration::from_millis(50);
+    let wait = Duration::from_millis(50);
     let request = LiveReadRequest {
         positions: vec![a],
-        timeout,
+        deadline: Instant::now() + Duration::from_secs(10),
         trace: None,
     };
     let Ok(parked) = lane.cache.submit(&mut lane.client, 1, request) else {
@@ -1270,7 +1284,7 @@ fn parked_member_waits_for_grant_credit_longer_than_its_timeout() {
     assert_eq!(lane.cache.requests[&parked].pending, 1);
     assert!(lane.cache.io_deadline(first).is_some());
     assert_eq!(lane.cache.io_deadline(parked), None);
-    std::thread::sleep(3 * timeout);
+    std::thread::sleep(3 * wait);
     let done = lane.collect(2);
     let one = member_frame(&lane.first, &a);
     for finished in &done {

@@ -360,6 +360,33 @@ fn local_file_exact_write_and_ordered_ranged_reads() {
     assert_eq!(io.stats().barrier_count, 0);
     assert!(io.shutdown().unwrap().is_empty());
 }
+
+/// A read whose SQEs were accepted and whose CQE reports success is a
+/// success even when the queue observes it after the deadline. The deadline
+/// bounds how long a caller waits for an outstanding I/O, not whether data
+/// that arrived is usable. The hook moves the deadline to the insertion time,
+/// so the CQE is necessarily observed overdue without a sleep or device delay.
+#[test]
+fn a_successful_read_observed_after_its_deadline_is_still_success() {
+    let (_dir, mut io) = fixture();
+    let data = write_pattern(&mut io, 0, 3);
+    io.expire_read_after_submit();
+    assert_eq!(
+        io.submit_reads(7, &[(10, 20)], Instant::now() + Duration::from_secs(10))
+            .unwrap(),
+        LiveSubmitOutcome::Submitted
+    );
+    let completed = completion(&mut io);
+    let LiveIoResult::Reads(mut records) = completed
+        .result
+        .expect("a terminal success stays a success after its deadline")
+    else {
+        panic!("expected a read completion");
+    };
+    assert_eq!(&records.pop().unwrap()[..], &data[10..30]);
+    assert_eq!(io.stats().timeouts, 0, "a late success is not a timeout");
+    assert!(io.shutdown().unwrap().is_empty());
+}
 fn write_pattern(io: &mut LiveIo, offset: u64, seed: u8) -> Vec<u8> {
     let data: Vec<u8> = (0..4096).map(|n| (n % 250) as u8 ^ seed).collect();
     let deadline = Instant::now() + Duration::from_secs(10);

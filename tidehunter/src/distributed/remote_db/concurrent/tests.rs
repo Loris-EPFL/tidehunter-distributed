@@ -3,6 +3,9 @@
 use super::super::pipeline_tests::Fixture;
 use super::*;
 
+/// Liveness guard for hook handshakes; never a latency bound.
+const WAIT: Duration = Duration::from_secs(30);
+
 fn put(key: u32, value: u8) -> Mutation {
     Mutation::Put {
         keyspace: KeySpace(0),
@@ -19,7 +22,9 @@ fn get(db: &ConcurrentRemoteDatabase, key: u32) -> Option<Vec<u8>> {
 /// Native parity for read admission: load alone never fails an ordinary read
 /// (it passes no deadline), and only an explicit deadline can expire. The only
 /// credit is held by a caller's request, so the parked wait is proven from the
-/// admission state at the wait, never from a timing bound.
+/// admission state at the wait, never from a timing bound. The read's terminal
+/// completion is held so its flight cannot retire and change the generation
+/// while the waiter is observed.
 #[test]
 fn ordinary_reads_never_fail_on_load_and_explicit_deadlines_expire() {
     let mut fixture = Fixture::new();
@@ -47,8 +52,14 @@ fn ordinary_reads_never_fail_on_load_and_explicit_deadlines_expire() {
         .position(|endpoint| endpoint.partition == position.address.partition)
         .expect("an endpoint owns the position");
     // The caller keeps the credit: it is released when this request is
-    // consumed, whatever its lane does meanwhile.
+    // consumed, whatever its lane does meanwhile. Hold the terminal completion
+    // first, so the flight cannot retire and change the generation under the
+    // waiter: the caller's credit is then the only admission change it can see.
+    let (completed, completion) = db.reads.bench_hold_completion();
     let held = db.reads.submit_positions(node, &[position], None).unwrap();
+    completed
+        .recv_timeout(WAIT)
+        .expect("the held read reaches its terminal completion");
     let observed = db.read_admission_generation();
     let (entered, resume) = db.reads.pause_admission_wait();
     let waiter_db = Arc::clone(&db);
@@ -60,7 +71,7 @@ fn ordinary_reads_never_fail_on_load_and_explicit_deadlines_expire() {
     // credit still held and the generation unchanged, so it cannot have
     // returned.
     let (credits, generation) = entered
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(WAIT)
         .expect("the waiter must reach the admission wait");
     assert_eq!(credits, 1, "the request holds the only read credit");
     assert_eq!(
@@ -68,10 +79,13 @@ fn ordinary_reads_never_fail_on_load_and_explicit_deadlines_expire() {
         "the waiter must observe no credit change"
     );
     resume.send(()).expect("the paused waiter resumes");
+    // Retiring the held completion changes the generation and wakes the waiter;
+    // the caller's member then reads the stored result.
+    completion.release();
     held.finish_member().expect("the held read completes");
     result
-        .recv_timeout(Duration::from_secs(5))
-        .expect("a released credit must wake the waiter")
+        .recv_timeout(WAIT)
+        .expect("a retired read must wake the waiter")
         .expect("a wait with no deadline must not fail on load");
     waiter.join().unwrap();
     // An explicit deadline is honoured: an already expired one is reported.

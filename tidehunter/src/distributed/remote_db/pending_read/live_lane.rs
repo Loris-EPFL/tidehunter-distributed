@@ -110,6 +110,12 @@ impl LaneInbox<'_> {
                 self.state.poison();
                 continue;
             };
+            if finished.retries > 0 {
+                request
+                    ._credit
+                    .state
+                    .note_read_retries(request.flight.node, finished.retries);
+            }
             request.complete_nvme(finished.result.map_err(super::transport_error));
         }
         delivered
@@ -275,7 +281,7 @@ pub(super) fn run(
             }
             let live = LiveReadRequest {
                 positions: std::mem::take(&mut request.positions),
-                timeout: request.timeout,
+                deadline: request.deadline,
                 trace: request.trace.clone(),
             };
             match cache.submit(&mut client, epoch, live) {

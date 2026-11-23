@@ -1,6 +1,8 @@
 //! Read-profile counters and their lock-free snapshot handle.
 //!
 //! Split out of `pending_read.rs` to hold that file under its length ratchet.
+//! The counters are cumulative atomics; `select` gates only the finite latency
+//! sample, so operator counters keep counting after the sample is exhausted.
 
 use super::*;
 
@@ -56,6 +58,10 @@ read_diagnostics!(
     live_inline_fallback_credit,
     live_inline_fallback_paused,
     live_inline_fallback_coalesced,
+    // Operator counters for the read deadline path: a final caller-visible
+    // timeout, and a submission-time retry of an idempotent member read.
+    read_timeouts,
+    read_retries,
 );
 impl ReadDiagnostics {
     pub(super) fn inline_complete(&self, elapsed_ns: u64) {
@@ -124,11 +130,44 @@ impl ReadProfileMonitor {
                             | "read_profile_actor_completed"
                             | "read_profile_errors"
                             | "read_profile_failed_owner_profile_not_applicable"
+                            | "read_profile_read_timeouts"
+                            | "read_profile_read_retries"
                     )
                 {
                     set(*partition, name, value);
                 }
             });
+        }
+    }
+}
+
+/// A deadline the caller observes: typed, so the value path can tell a
+/// transient deadline from a broken authority and may retry the read.
+pub(super) fn deadline_error(message: &'static str) -> LocalDbError {
+    LocalDbError::with_kind(std::io::ErrorKind::TimedOut, message)
+}
+
+impl State {
+    /// One caller-visible read timeout, per service and per owner partition.
+    pub(super) fn note_read_timeout(&self, node: usize) {
+        self.diagnostics
+            .read_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some((_, owner)) = self.owner_diagnostics.get(node) {
+            owner.read_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// Submission-time retries of one idempotent member request.
+    pub(super) fn note_read_retries(&self, node: usize, retries: u8) {
+        if retries == 0 {
+            return;
+        }
+        let retries = u64::from(retries);
+        self.diagnostics
+            .read_retries
+            .fetch_add(retries, Ordering::Relaxed);
+        if let Some((_, owner)) = self.owner_diagnostics.get(node) {
+            owner.read_retries.fetch_add(retries, Ordering::Relaxed);
         }
     }
 }

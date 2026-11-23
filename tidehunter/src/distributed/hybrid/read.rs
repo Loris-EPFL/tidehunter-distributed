@@ -323,12 +323,15 @@ impl ValueReader {
         let deadline = Instant::now() + self.read_timeout;
         loop {
             let generation = self.lanes.admission_generation();
-            if let Some(mut frames) = self.lanes.read_inline(node, &position, extra_bytes)? {
+            if let Some(mut frames) =
+                self.lanes
+                    .read_inline_before(node, &position, extra_bytes, deadline)?
+            {
                 return frames
                     .pop()
                     .ok_or_else(|| LocalDbError::new("inline member read returned no value"));
             }
-            match self.lanes.submit_member(node, position) {
+            match self.lanes.submit_member_before(node, position, deadline) {
                 Ok(request) => return request.finish_member(),
                 Err(error) if admission_error(&error) => {
                     self.lanes.wait_admission(generation, Some(deadline))?;
@@ -374,7 +377,12 @@ impl ValueReader {
             remote[slot] = Some(*position);
             groups[self.node(*position)?].push((slot, *position));
         }
-        let mut batch = ReadBatch::new(&self.lanes, values, groups)?;
+        let mut batch = ReadBatch::new(
+            &self.lanes,
+            values,
+            groups,
+            Instant::now() + self.read_timeout,
+        )?;
         self.drain(&mut batch)?;
         for (slot, key_and_position) in rows.iter().enumerate() {
             let Some(position) = remote[slot] else {
@@ -422,7 +430,9 @@ impl ValueReader {
     /// The batch owns its admitted requests; a full read service is load, not a
     /// failure, so the caller parks on admission progress instead of spinning.
     fn drain(&self, batch: &mut ReadBatch) -> Result<(), LocalDbError> {
-        let deadline = Instant::now() + self.read_timeout;
+        // The batch owns the single absolute deadline of this call, so a
+        // dispatch wave, an admission park and a member retry all share it.
+        let deadline = batch.deadline();
         while !batch.complete() {
             let generation = self.lanes.admission_generation();
             match batch.dispatch(&self.lanes) {
@@ -564,12 +574,22 @@ fn member_error(position: VersionPosition, what: &str) -> LocalDbError {
 
 /// A single-member read kept for callers that already own one position.
 impl ReadService {
+    #[cfg(test)]
     pub(crate) fn submit_member(
         &self,
         node: usize,
         position: VersionPosition,
     ) -> Result<ReadRequest, LocalDbError> {
         self.submit_positions(node, std::slice::from_ref(&position), None)
+    }
+    /// Submit one member under the caller's absolute deadline.
+    pub(crate) fn submit_member_before(
+        &self,
+        node: usize,
+        position: VersionPosition,
+        deadline: Instant,
+    ) -> Result<ReadRequest, LocalDbError> {
+        self.submit_positions_before(node, std::slice::from_ref(&position), None, deadline)
     }
 }
 

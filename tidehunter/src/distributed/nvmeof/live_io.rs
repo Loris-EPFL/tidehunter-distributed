@@ -186,6 +186,10 @@ pub struct LiveIo {
     completion_results: Vec<(u64, i32)>,
     #[cfg(test)]
     held_completions: Vec<LiveCompletion>,
+    /// Expire the next accepted read at submission time, after its SQEs are
+    /// queued, so its success CQE is observed past the deadline.
+    #[cfg(test)]
+    expire_read_after_submit: bool,
 }
 impl LiveIo {
     /// Polled queues require kernel and device IOPOLL support. A setup or I/O
@@ -241,6 +245,8 @@ impl LiveIo {
             completion_results: Vec::new(),
             #[cfg(test)]
             held_completions: Vec::new(),
+            #[cfg(test)]
+            expire_read_after_submit: false,
         })
     }
     pub(crate) fn register_worker_wake(&self, fd: std::os::fd::RawFd) -> io::Result<()> {
@@ -256,6 +262,15 @@ impl LiveIo {
     #[cfg(test)]
     pub(crate) fn release_held(&mut self) {
         self.held_ids.clear();
+    }
+
+    /// The next accepted read is submitted normally, then its deadline is set
+    /// to the insertion time. The kernel CQE arrives for a request already
+    /// past its deadline: a terminal success, observed late. No sleep and no
+    /// device delay are involved.
+    #[cfg(test)]
+    pub(crate) fn expire_read_after_submit(&mut self) {
+        self.expire_read_after_submit = true;
     }
 
     pub(crate) fn attach(
@@ -662,6 +677,10 @@ impl LiveIo {
             return Err(LiveIoError::Invalid("empty or duplicate request"));
         }
         if Instant::now() >= deadline {
+            // Nothing was submitted and no buffer left the pool: the caller
+            // may retry this read. A reused buffer could still receive DMA, so
+            // only a request that never reached the ring is retry-safe.
+            self.stats.timeouts += 1;
             return Err(LiveIoError::Timeout);
         }
         let charge = self.plan_charge(&ranges)?;
@@ -781,6 +800,14 @@ impl LiveIo {
                 trace.event("live_io_queue_id_exhausted");
             }
         }
+        // Test-only: an accepted read can be made already overdue at insertion
+        // so its successful CQE is observed past the deadline, with no sleep.
+        #[cfg(test)]
+        let deadline = if data.is_none() && std::mem::take(&mut self.expire_read_after_submit) {
+            Instant::now()
+        } else {
+            deadline
+        };
         self.requests.insert(
             id,
             Request {
@@ -1057,7 +1084,11 @@ impl LiveIo {
                 self.stats.completed_read_bytes += buffer.len as u64;
                 self.stats.completed_read_ops += 1;
             }
-            if complete && !write && req.cancelled_at.is_none() && Instant::now() < req.deadline {
+            // A terminal success is data in hand. The deadline bounds how long
+            // the caller waits for an outstanding I/O; it does not discard a
+            // CQE that arrived. Lending here releases the block only when every
+            // slice of it drops, so a late observer never sees it refilled.
+            if complete && !write && req.cancelled_at.is_none() {
                 // Lend the block: it leaves the byte budget until it returns.
                 self.allocated_bytes -= buffer.data.len();
                 let whole = Bytes::from_owner(MemberBuffer {
@@ -1078,7 +1109,13 @@ impl LiveIo {
                     std::process::abort()
                 };
                 self.used_bytes -= req.charge;
-                let timed_out = Instant::now() >= req.deadline;
+                // A read whose every CQE reports success is a success even when
+                // the queue observes it after the deadline: the deadline bounds
+                // the wait, not the data. Writes and flushes keep the late rule
+                // because an acknowledgement time is part of their contract.
+                let read_complete =
+                    !req.write && !req.flush && req.error.is_none() && req.cancelled_at.is_none();
+                let timed_out = Instant::now() >= req.deadline && !read_complete;
                 if timed_out {
                     self.stats.timeouts += 1;
                 }

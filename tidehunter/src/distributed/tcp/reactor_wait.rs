@@ -14,6 +14,31 @@ use super::*;
 #[path = "reactor_wait_tests.rs"]
 mod tests;
 
+/// poll(2) timeout for one readiness wait: never past the deadline, and never
+/// past the shutdown recheck interval.
+pub(super) fn idle_wait_timeout(deadline: Instant, now: Instant) -> libc::c_int {
+    // Milliseconds, rounded DOWN: the final sub-millisecond turn is nonblocking.
+    deadline
+        .saturating_duration_since(now)
+        .min(IDLE_SHUTDOWN_CHECK_INTERVAL)
+        .as_millis() as libc::c_int
+}
+
+/// A control exchange that spent its budget is a typed timeout: an idempotent
+/// request may be repeated, and no caller poisons on it.
+pub(super) fn correlated_deadline() -> TcpError {
+    TcpError::with_kind(io::ErrorKind::TimedOut, "remote operation deadline expired")
+}
+
+/// The output-admission budget is spent before the request was sent: nothing
+/// entered the output queue, so the typed timeout is retry-safe.
+pub(super) fn admission_deadline() -> TcpError {
+    TcpError::with_kind(
+        io::ErrorKind::TimedOut,
+        "control output admission deadline expired",
+    )
+}
+
 impl Session {
     /// No buffered input or output that a readiness wait could leave unprocessed:
     /// every frame retired (so no write interest), no decrypted plaintext pending

@@ -55,12 +55,14 @@ impl LiveReadCache {
     /// until the terminal CQE (deadline and wait failures included), and the
     /// cached grant's pin is released only after it. Poison is the read
     /// service's fail-stop, not the buffer-lifetime mechanism, so exempting a
-    /// retired member can neither free nor reuse an in-flight buffer. The
-    /// exemption stays bounded: a return with DMA outstanding is `TimedOut` or
-    /// `Other`, which still poison, and today `NotFound` can only come from
-    /// geometry/resolve or a completed reply. If a `NotFound` ever arrives from
-    /// the I/O layer itself, narrow the exemption to the geometry and resolve
-    /// stages.
+    /// retired member can neither free nor reuse an in-flight buffer.
+    ///
+    /// The exemption stays bounded. A deadline is reported as `TimedOut` and
+    /// never poisons: nothing was submitted or the terminal CQE retired, and
+    /// the caller may retry the idempotent read. A ring failure is `Other` and
+    /// still poisons. Today `NotFound` can only come from geometry/resolve or
+    /// a completed reply; if a `NotFound` ever arrives from the I/O layer
+    /// itself, narrow the exemption to the geometry and resolve stages.
     pub(crate) fn read_inline_cached(
         &mut self,
         client: &Client,
@@ -112,7 +114,7 @@ impl LiveReadCache {
                 .inline_io_mut()
                 .submit_reads_traced(flight, &ranges, deadline, trace),
         };
-        match result.map_err(TcpError::component)? {
+        match result.map_err(live_error)? {
             LiveSubmitOutcome::Submitted => {}
             LiveSubmitOutcome::Full => return Err(TcpError::new("inline live credit disappeared")),
         }
@@ -148,7 +150,7 @@ impl LiveReadCache {
                     self.failed_subsystems.insert((*generation, *subsystem));
                 }
                 fold_stats(client.live_counters.as_deref(), grant);
-                return Err(TcpError::component(error));
+                return Err(live_error(error));
             }
             let completions = match grant.inline_io_mut().progress() {
                 Ok(completions) => completions,
@@ -164,7 +166,7 @@ impl LiveReadCache {
                         self.failed_subsystems.insert((*generation, *subsystem));
                     }
                     fold_stats(client.live_counters.as_deref(), grant);
-                    return Err(TcpError::component(error));
+                    return Err(live_error(error));
                 }
             };
             fold_stats(client.live_counters.as_deref(), grant);
@@ -195,7 +197,7 @@ impl LiveReadCache {
                             grant.broken = true;
                             self.failed_subsystems.insert((*generation, *subsystem));
                         }
-                        return Err(TcpError::component(error));
+                        return Err(live_error(error));
                     }
                 };
                 let LiveIoResult::Reads(mut records) = result else {

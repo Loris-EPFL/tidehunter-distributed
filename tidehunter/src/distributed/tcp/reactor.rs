@@ -41,6 +41,7 @@ mod session_tests;
 mod wait;
 pub(crate) use host_session::HostClient;
 pub(super) use host_session::serve_host_session;
+use wait::idle_wait_timeout;
 
 pub(super) const TLS_BUFFER_BYTES: usize = 256 * 1024;
 pub(super) const SESSION_REQUESTS: usize = 32;
@@ -57,15 +58,6 @@ const CONTROL_PEER_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 /// the maximum requested wait before checking the atomic shutdown flag again,
 /// not an arrival latency floor or a scheduler-latency guarantee.
 const IDLE_SHUTDOWN_CHECK_INTERVAL: Duration = Duration::from_millis(10);
-
-fn idle_wait_timeout(deadline: Instant, now: Instant) -> libc::c_int {
-    // poll(2) takes milliseconds. Round DOWN rather than extending a deadline;
-    // the final sub-millisecond turn remains nonblocking.
-    deadline
-        .saturating_duration_since(now)
-        .min(IDLE_SHUTDOWN_CHECK_INTERVAL)
-        .as_millis() as libc::c_int
-}
 
 /// One allocation-free readiness wait. EINTR returns to the owner so shutdown
 /// and deadlines are rechecked; EOF/errors are handled by ordinary TLS progress.
@@ -1103,6 +1095,10 @@ impl Write for NonblockingIo<'_> {
 
 #[derive(Default)]
 pub(super) struct ClientState {
+    /// Test only: shorten one control exchange's budget, including a lifecycle
+    /// request, so a test observes the typed deadline without a long wait.
+    #[cfg(test)]
+    pub(super) control_budget_cap: Option<Duration>,
     next_id: u64,
     control: Option<(u64, Instant)>,
     control_result: Option<Response>,
@@ -1290,7 +1286,7 @@ impl Client {
                 .position
                 .is_some_and(|(_, deadline)| now >= deadline)
         {
-            return Err(TcpError::new("remote operation deadline expired"));
+            return Err(wait::correlated_deadline());
         }
         let (progressed, _) = self.stream.progress(None)?;
         self.reactor.progressed = progressed;
@@ -1474,7 +1470,10 @@ impl Client {
             return Err(TcpError::new("control exchange already active"));
         }
         let id = self.reactor.allocate_id()?;
-        let deadline = Instant::now() + request.timeout(self.timeout);
+        let budget = request.timeout(self.timeout);
+        #[cfg(test)]
+        let budget = budget.min(self.reactor.control_budget_cap.unwrap_or(budget));
+        let deadline = Instant::now() + budget;
         let size_began = profile.as_ref().map(|_| Instant::now());
         let queue_size = self.stream.queue_size(id, request, self.frame_limit)?;
         let size_ns = size_began.map_or(0, elapsed_ns);
@@ -1484,7 +1483,7 @@ impl Client {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err(TcpError::new("control output admission deadline expired"));
+                return Err(wait::admission_deadline());
             }
             if let Err(error) = self.progress_correlated() {
                 self.fail_connection();

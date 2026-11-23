@@ -12,7 +12,41 @@ impl Drop for BenchIdleLiveLane {
 }
 
 #[cfg(test)]
+pub(in crate::distributed::remote_db) struct BenchHeldCompletion(Option<mpsc::SyncSender<()>>);
+
+#[cfg(test)]
+impl BenchHeldCompletion {
+    /// Let the held terminal completion publish. Every exit path releases it,
+    /// so a failing assertion cannot strand the lane worker.
+    pub(in crate::distributed::remote_db) fn release(mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BenchHeldCompletion {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.try_send(());
+        }
+    }
+}
+
+#[cfg(test)]
 impl ReadService {
+    /// Hold the next terminal completion after its result is stored and before
+    /// its slot retires. Returns the notice it sends and the release handle.
+    pub(in crate::distributed::remote_db) fn bench_hold_completion(
+        &self,
+    ) -> (mpsc::Receiver<()>, BenchHeldCompletion) {
+        let (entered, held) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        *self.state.completion_pause.lock() = Some((entered, resume));
+        (held, BenchHeldCompletion(Some(release)))
+    }
+
     /// Park outside the driver lock before installing a cached fixture grant.
     pub(in crate::distributed::remote_db) fn bench_park_live_lane(
         &self,
@@ -63,6 +97,7 @@ impl ReadService {
         node: usize,
         position: &VersionPosition,
         extra_bytes: usize,
+        deadline: Instant,
         trace: Option<&ReadTraceChild>,
     ) -> Result<Option<Vec<Bytes>>, LocalDbError> {
         let bytes = self
@@ -242,17 +277,22 @@ impl ReadService {
         let _poison = PoisonOnPanic(&self.state);
         let sampled = self.state.diagnostics.select();
         let started = sampled.then(Instant::now);
-        // The I/O deadline starts at transport submission, as for queued reads.
-        let deadline = Instant::now() + self.timeout();
+        // The flight timer starts at transport submission and never outlives
+        // the caller's absolute deadline; time in admission is not I/O time.
         *flight.io_deadline.lock() = Some(deadline);
         let result = cache
             .read_inline_cached(&client, position, deadline, trace)
             .map_err(|error| {
                 let mapped = super::transport_error(error);
-                // A retired member address is not a lane failure: the value path
-                // re-resolves it once, so poisoning here would fail-stop the
-                // engine and kill the only recovery route.
-                if !super::member_read_is_retired(&mapped) {
+                if mapped.kind() == std::io::ErrorKind::TimedOut {
+                    // A deadline is transient and the read is idempotent. The
+                    // flight below owns its buffer until the terminal CQE, so
+                    // no retry can touch it; the caller gets a typed timeout.
+                    self.state.note_read_timeout(node);
+                } else if !super::member_read_is_retired(&mapped) {
+                    // A retired member address is not a lane failure: the value
+                    // path re-resolves it once, so poisoning here would
+                    // fail-stop the engine and kill the only recovery route.
                     super::super::record_first_failure(
                         &self.state.first_failure,
                         Some(position.address.partition),
