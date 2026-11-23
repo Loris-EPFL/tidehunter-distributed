@@ -16,7 +16,6 @@ import subprocess
 import threading
 import time
 import uuid
-import zlib
 
 ROOT = ["docker", "run", "--rm", "--privileged", "--network=host", "--pid=host",
         "--cgroupns=host", "--entrypoint", "nsenter",
@@ -609,8 +608,18 @@ def _kernel_public_identity(host_nqn, subsystem):
             and campaign.scoped_live_subsystem(subsystem, match[1]))
 
 
-def _kernel_commissioning_identities(root, address, transport, service, port_id):
-    """Bind commissioning identities to this owner's exact persisted slot journals."""
+TARGET_ID_BYTES = 32
+
+
+def _kernel_commissioning_identities(root, _address=None, _transport=None, _service=None,
+                                     _port_id=None):
+    """Bind commissioning identities to this owner's persisted target identity.
+
+    The protocol-36 owner keeps one `target-id` per state directory: a 16-byte
+    registry id followed by the little-endian device and inode of its sealed
+    marker directory. The commissioning host is derived from the database
+    scope, so no journal is read.
+    """
     import cloud_campaign as campaign
     import nvme_campaign_owner as owner
 
@@ -628,27 +637,24 @@ def _kernel_commissioning_identities(root, address, transport, service, port_id)
         if not entry.name.startswith("db-") or not campaign.live_database_id(database):
             continue
         state_dir = Path(entry.path) / "live-target"
+        sealed_dir = state_dir / "sealed"
         try:
             owner._trusted_dir(state_dir)
-            maximum = 4 * 1024**2  # live_target.rs::MAX_STATE
-            raw = owner._read_bytes(state_dir / "live-target.json", maximum)
-            if not 4 < len(raw) <= maximum or int.from_bytes(raw[:4], "little") != zlib.crc32(raw[4:]):
-                raise TargetError("invalid commissioning journal checksum or size")
-            state = json.loads(raw[4:])
+            owner._trusted_dir(sealed_dir)
+            raw = owner._read_bytes(state_dir / "target-id", TARGET_ID_BYTES)
         except FileNotFoundError:
             continue
+        if len(raw) != TARGET_ID_BYTES or raw[:16] == bytes(16):
+            raise TargetError("invalid commissioning target identity")
+        sealed = sealed_dir.stat()
+        device = int.from_bytes(raw[16:24], "little")
+        inode = int.from_bytes(raw[24:32], "little")
+        if sealed.st_dev != device or sealed.st_ino != inode:
+            raise TargetError("commissioning sealed marker directory identity changed")
         scope = f"nqn.2026-01.local.tidehunter:db-{database}-p00000000-"
-        config = state.get("config") if isinstance(state, dict) else None
-        expected = {"state_dir": str(state_dir), "host_nqn": scope + "host", "address": address,
-                    "transport": transport, "service": service, "port_id": port_id,
-                    "commissioning_service": service + 1, "commissioning_port_id": port_id + 1}
-        private = state.get("private_host") if isinstance(state, dict) else None
-        if (not isinstance(config, dict) or state.get("version") != 1
-                or any(config.get(key) != value for key, value in expected.items())
-                or not isinstance(private, str) or not re.fullmatch(
-                    r"nqn\.2026-01\.local\.tidehunter:commission-" + campaign.UUID_TEXT, private)
-                or private in identities):
-            raise TargetError("commissioning journal differs from the exact owner slot")
+        private = scope + "commission"
+        if private in identities:
+            raise TargetError("commissioning identity is shared by two owner slots")
         identities[private] = scope
     return identities
 
@@ -935,7 +941,7 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             checks = proof.get("checks", {})
             required = ("scalar_write_delete", "mixed_batch", "ordered_batch_missing_exists",
                         "checkpoint_iteration", "cache_miss_hit", "flush_reopen",
-                        "abrupt_tail_recovery", "fence_drain", "target_reuse")
+                        "abrupt_tail_recovery", "fence_write_protect", "target_reuse")
             if (proof.get("kind") != "live_nvmeof_qualification" or proof.get("schema_version") != 2
                     or proof.get("expected_route") != transport
                     or proof.get("durability_tier") != receipt["durability"]["tier"]

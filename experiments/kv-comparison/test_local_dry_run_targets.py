@@ -2,7 +2,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import errno
-import json
 import tempfile
 from pathlib import Path
 import threading
@@ -10,7 +9,6 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 import uuid
-import zlib
 
 import cloud_campaign as campaign
 import nvme_campaign_owner as owner
@@ -227,36 +225,37 @@ class OwnedControllerTeardownTests(unittest.TestCase):
         matches = targets._owned_controllers(self.sysfs, 'tcp', '127.0.0.1', (4420,), targets._kernel_public_identity)
         self.assertEqual([row['controller'] for row in matches], ['nvme0'])
 
-    def test_private_identity_comes_from_checksummed_exact_slot_journal(self):
+    def test_private_identity_comes_from_the_persisted_target_identity(self):
         db = 'aa' * 16
         root = Path(self.tmp.name) / 'storage'
         directory = root / ('db-' + db) / 'live-target'
-        directory.mkdir(parents=True)
-        path = directory / 'live-target.json'
+        sealed = directory / 'sealed'
+        sealed.mkdir(parents=True)
         scope = campaign.effective_live_owner({'host_id': [1] * 16}, db, 0)['subsystem_scope']
-        private = 'nqn.2026-01.local.tidehunter:commission-00000000-0000-0000-0000-000000000001'
-        config = {'state_dir': str(directory), 'host_nqn': scope + 'host', 'address': '10.2.0.2',
-                  'transport': 'rdma', 'service': 4420, 'port_id': 1000,
-                  'commissioning_service': 4421, 'commissioning_port_id': 1001}
+        private = scope + 'commission'
+        stat = sealed.stat()
 
-        def journal():
-            payload = json.dumps({'version': 1, 'private_host': private, 'config': config}).encode()
-            path.write_bytes(zlib.crc32(payload).to_bytes(4, 'little') + payload)
+        def write_identity(registry=bytes(range(1, 17)), device=None, inode=None):
+            raw = (registry + (stat.st_dev if device is None else device).to_bytes(8, 'little')
+                   + (stat.st_ino if inode is None else inode).to_bytes(8, 'little'))
+            (directory / 'target-id').write_bytes(raw)
 
         def identities():
             return targets._kernel_commissioning_identities(root, '10.2.0.2', 'rdma', 4420, 1000)
 
         with patch.object(owner, '_trusted_dir'), patch.object(
                 owner, '_read_bytes', side_effect=lambda file, limit: file.read_bytes()[:limit + 1]):
-            journal()
+            write_identity()
             self.assertEqual(identities(), {private: scope})
-            path.write_bytes(b'\0\0\0\0' + path.read_bytes()[4:])
-            with self.assertRaisesRegex(targets.TargetError, 'checksum'):
+            write_identity(device=stat.st_dev + 1)
+            with self.assertRaisesRegex(targets.TargetError, 'identity changed'):
                 identities()
-            config['commissioning_port_id'] = 1002
-            journal()
-            with self.assertRaisesRegex(targets.TargetError, 'exact owner slot'):
+            write_identity(registry=bytes(16))
+            with self.assertRaisesRegex(targets.TargetError,
+                                        'invalid commissioning target identity'):
                 identities()
+            (directory / 'target-id').unlink()
+            self.assertEqual(identities(), {})
 
     def test_kernel_reuse_requires_shutdown_of_exact_reprovisioned_database(self):
         remote = {'live_nvme': {'host_id': [1] * 16}}
