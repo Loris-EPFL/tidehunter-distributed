@@ -18,8 +18,17 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
+#[path = "control/completion.rs"]
+mod completion;
 #[path = "control/durable_poll.rs"]
 mod durable_poll;
+#[path = "control/flush.rs"]
+mod flush;
+#[path = "control/publication.rs"]
+mod publication;
+
+use completion::{complete, release};
+use flush::{FlushCommand, fail_queued_flush, flush_run};
 
 #[cfg(test)]
 #[path = "control_forced_pause_tests.rs"]
@@ -372,11 +381,6 @@ impl Shared {
     }
 }
 
-enum FlushCommand {
-    /// A frontier flush ordered after every earlier command.
-    Barrier(mpsc::SyncSender<()>),
-    Stop,
-}
 pub(super) struct ControlOwner {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -1104,74 +1108,6 @@ fn run(shared: &Shared) {
     }
 }
 
-fn flush_run(shared: &Shared, receiver: &mpsc::Receiver<FlushCommand>) {
-    while let Ok(command) = receiver.recv() {
-        match command {
-            FlushCommand::Barrier(done) => {
-                // Every command before this one is replied; now make anything
-                // acknowledged under the native tier durable too.
-                if shared.flush_logs().is_err() {
-                    drop(done);
-                    shared.context.poison_readers();
-                    {
-                        let mut queue = shared.queue.lock();
-                        queue.flush_failed = true;
-                        queue.stopped = true;
-                    }
-                    fail_queued_flush(receiver);
-                    return;
-                }
-                let _ = done.send(());
-            }
-            FlushCommand::Stop => return,
-        }
-    }
-}
-
-/// Drop every queued barrier after a persistence failure: its waiter sees the
-/// disconnect and fails its control.
-fn fail_queued_flush(receiver: &mpsc::Receiver<FlushCommand>) {
-    while let Ok(FlushCommand::Barrier(done)) = receiver.try_recv() {
-        drop(done);
-    }
-}
-
-// Keep completion fields inline; a wrapper would only move this argument list.
-#[allow(clippy::too_many_arguments)]
-fn complete(
-    shared: &Shared,
-    id: u64,
-    charge: usize,
-    completed: mpsc::SyncSender<reactor::WorkCompletion>,
-    response: Result<Response, TcpError>,
-    profile: ConnectionProfile,
-    measured: bool,
-    began: Option<Instant>,
-) {
-    // Retire the admission before publishing the reply. The reply is the last
-    // effect of an admitted command, so a thread that holds it (or is ordered
-    // after its receiver, e.g. by a session join) must see the owner quiescent:
-    // `finish_live_target_shutdown` refuses teardown while `requests != 0`, and
-    // a session retrying a full `try_submit` after this reply must find the
-    // slot free. The queue mutex release is sequenced before `try_send`, and the
-    // channel orders it before the receiver's next queue lock. Crash
-    // consistency is unchanged: every durable effect of the command (the WAL
-    // write, and the covering sync for Synchronous) precedes this call; only
-    // delivery of the already computed reply follows the release. Releasing
-    // first admits at most one extra in-transit completion per worker and the
-    // flusher beyond `MAX_COMMANDS`, so admission stays bounded. Parked
-    // durable-progress polls add at most the progress hub's waiter bound.
-    release(shared, charge);
-    deliver(id, completed, response, profile, measured, began);
-}
-
-/// Retire one admitted command's request and byte credits.
-fn release(shared: &Shared, charge: usize) {
-    let mut queue = shared.queue.lock();
-    queue.requests -= 1;
-    queue.bytes -= charge;
-}
-
 /// Publish a command's reply to its session. The admission must already be retired.
 pub(super) fn deliver(
     id: u64,
@@ -1272,86 +1208,6 @@ impl ControlContext {
         if !self.terminal.swap(true, Ordering::AcqRel) {
             self.readers.write().invalidate();
         }
-    }
-    /// `kind` names the request (resolve, recovery or replay) that counts an
-    /// export created inline here.
-    fn publish_live_leases(
-        &self,
-        epoch: u64,
-        leases: Vec<super::super::nvmeof::live_storage::LiveRecordLease>,
-        kind: super::inventory::InlineExport,
-    ) -> Result<PublishedLiveLeases, TcpError> {
-        let metadata: Vec<_> = leases
-            .iter()
-            .map(|lease| (lease.segment.clone(), lease.offset, u64::from(lease.len)))
-            .collect();
-        let gate = self.live_control_gate.lock();
-        if !self.readers.read().active_valid(epoch, &self.terminal) {
-            return Err(TcpError::new("stale live read authority"));
-        }
-        // Lock order: live-control gate, lifecycle gate, inventory. Each export below
-        // releases the inventory across its journal syncs and configfs work.
-        let mut lifecycle = self.lifecycle.lock();
-        let mut inventory = self.inventory.lock();
-        inventory.active(epoch)?;
-        let target = lifecycle
-            .as_mut()
-            .ok_or_else(|| TcpError::new("live target not configured"))?;
-        if inventory.live_pins.len() >= 1024 {
-            return Err(TcpError::new("live pin capacity reached"));
-        }
-        let token = (0..16)
-            .find_map(|_| {
-                let candidate = rand::random::<[u8; 16]>();
-                (candidate != [0; 16] && !inventory.live_pins.contains_key(&candidate))
-                    .then_some(candidate)
-            })
-            .ok_or_else(|| TcpError::new("live pin token allocation failed"))?;
-        inventory.live_pins.insert(token, (epoch, leases));
-        if let Some(events) = inventory.r1_events.as_mut() {
-            events.pin(
-                "pin_held",
-                "record",
-                token,
-                metadata.iter().map(|(segment, _, _)| {
-                    (
-                        segment.epoch,
-                        segment.file_index,
-                        Some((segment.device, segment.inode)),
-                    )
-                }),
-                "resolve",
-            );
-        }
-        let mut locations = Vec::with_capacity(metadata.len());
-        for (segment, offset, len) in metadata {
-            let binding = match inventory.live_segment_writable(epoch, &segment) {
-                Ok(writable) => NodeInventory::publish_live_segment(
-                    &mut inventory,
-                    target,
-                    &segment,
-                    writable,
-                    kind,
-                ),
-                Err(error) => Err(error),
-            };
-            match binding {
-                Ok(binding) => locations.push((segment, binding, offset, len)),
-                Err(error) => {
-                    // Publication can fail after creating a kernel capability.
-                    // Keep its in-memory epoch pin and file leases quarantined;
-                    // the durable target registry is drained on restart.
-                    drop(inventory);
-                    drop(lifecycle);
-                    drop(gate);
-                    self.poison_readers();
-                    return Err(TcpError::new(format!(
-                        "live read export failed; outcome unknown: {error}"
-                    )));
-                }
-            }
-        }
-        Ok((token, locations))
     }
     fn bounded_live_response(
         &self,

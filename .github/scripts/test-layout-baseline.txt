@@ -44,6 +44,5 @@ tidehunter/src/distributed/remote_db/write_core/transport_budget.rs 1 2
 tidehunter/src/distributed/sui.rs 1 1
 tidehunter/src/distributed/tcp/inventory.rs 1 8
 tidehunter/src/distributed/tcp/live_client.rs 3 59
-tidehunter/src/distributed/tcp/live_recovery.rs 1 1
 tidehunter/src/distributed/tcp/probe.rs 0 1
 tidehunter/src/distributed/write_timeline.rs 1 1
