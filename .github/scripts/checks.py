@@ -324,6 +324,10 @@ def check(profile, env):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
+        # The -p clippy runs above do not build every workspace member, for
+        # example benchmarks/index_benchmark. The vendored third-party/minibytes
+        # bench needs nightly #![feature(test)], so exclude it on stable.
+        cargo(env, "check", "--workspace", "--all-targets", "--exclude", "minibytes")
     elif profile == "lint-backends":
         if env.get("GITHUB_ACTIONS") != "true" or not env.get("VALKEY_SOURCE_DIR"):
             raise RuntimeError("lint-backends needs the hosted runner packages and a prepared "
