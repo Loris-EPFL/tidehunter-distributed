@@ -236,6 +236,11 @@ while the database is open.
   durable-cut actor forgets one retired generation. It runs only while the
   pressure gauge is set. It is not scheduled. It is not proven safe next to
   readers, grants and the relocation worker.
+  The owner trim holds the exclusive control-queue slot for its whole run, so
+  queued live-lane lease renewals wait behind it. An online trigger must not be
+  enabled until the deletion runs off the control queue or lease renewal is
+  exempt from `control_active`. Today the trim runs only at open, before any
+  serving session.
 
 ## 8. Capacity
 

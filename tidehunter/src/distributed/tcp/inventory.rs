@@ -279,16 +279,14 @@ pub struct NodeInventory {
     metrics: Arc<Metrics>,
     // Owner incarnation, created once at open (see `durable_progress::new_incarnation`).
     incarnation: [u8; 16],
-    /// Incarnation-local ledger revision, raised before every ledger install
-    /// (`persist_manifest`). Inventory pages are frozen at one revision.
+    /// Ledger revision of this incarnation, raised per `persist_manifest`; pages freeze at one.
     revision: u64,
     #[cfg(test)]
     trim_crash: Option<super::generation_control::OwnerTrimCrash>,
     #[cfg(test)]
-    trim_detach_pause: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
+    trim_detach_pause: Option<generations::TrimPause>,
+    #[cfg(test)]
+    trim_delete_pause: Option<generations::TrimPause>,
     /// Value WAL files passed to a successful retirement unlink step by this
     /// process. Read by the R0 inventory page; R0 asserts it does not move.
     value_wal_unlinks: u64,
@@ -653,6 +651,8 @@ impl NodeInventory {
             trim_crash: None,
             #[cfg(test)]
             trim_detach_pause: None,
+            #[cfg(test)]
+            trim_delete_pause: None,
             value_wal_unlinks: 0,
             file_maintenance: FileMaintenanceStats::default(),
             r1_events: None,

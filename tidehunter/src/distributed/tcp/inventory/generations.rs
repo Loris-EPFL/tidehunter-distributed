@@ -17,6 +17,12 @@
 //! directory, removes the generation directory and syncs the owner root, and
 //! clears `trim_pending`. A restart with the intent repeats deletion before
 //! publishing readers. Recovery refuses to extend an existing SEAL.
+//!
+//! Gate scope: the validation and the `trim_pending` install (phase 1) and
+//! the final install (phase 3) hold the live-control and lifecycle gates. The
+//! deletion (phase 2) holds no gate; each live target step takes the lifecycle
+//! gate alone. The durable order of fsync, rename and unlink is the same in
+//! all phases and in the open-time resume, which share `delete_generation`.
 
 #[cfg(test)]
 use super::super::generation_control::OwnerTrimCrash;
@@ -99,12 +105,13 @@ pub(super) fn resume_trim(
     let Some(generation) = manifest.trim_pending else {
         return Ok(());
     };
+    let mut access = TrimTargetAccess::Owned(target);
     delete_generation(
         root,
         generation,
         manifest.partition.wal_file_bytes,
-        target,
         TrimCrashCuts::default(),
+        &mut access,
     )?;
     manifest.trim_pending = None;
     persist(root, manifest)
@@ -137,7 +144,7 @@ fn wal_name(directory: &Path, id: u64) -> PathBuf {
     directory.join(format!("wal_{id:016x}"))
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct TrimCrashCuts {
     before_marker_sync: bool,
     after_marker: bool,
@@ -145,15 +152,94 @@ struct TrimCrashCuts {
     after_file_sync: bool,
 }
 
+/// Test pause of one trim phase: `(entered, resume)`.
+#[cfg(test)]
+pub(super) type TrimPause = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+/// A pause and the test side of it: the receiver observes entry, the sender
+/// resumes.
+#[cfg(test)]
+fn trim_pause() -> (
+    TrimPause,
+    (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ),
+) {
+    let (entered, observed) = std::sync::mpsc::sync_channel(0);
+    let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+    ((entered, resume_rx), (observed, resume))
+}
+
+/// Report entry to the test, then wait for its resume.
+#[cfg(test)]
+fn hold_trim_pause(pause: Option<TrimPause>) {
+    if let Some((entered, resume)) = pause {
+        let _ = entered.send(());
+        let _ = resume.recv();
+    }
+}
+
+/// Live target access of one deletion step.
+enum TrimTargetAccess<'a> {
+    /// Offline (`resume_trim` or an owned test inventory): the caller owns the
+    /// lifecycle slot, so the target can be used directly.
+    Owned(TrimTarget<'a>),
+    /// Online: the caller holds no gate. Each step takes the lifecycle gate and
+    /// the inventory, and releases the inventory across its I/O.
+    Gated {
+        inventory: &'a Mutex<NodeInventory>,
+        lifecycle: &'a LifecycleGate,
+    },
+}
+
+impl TrimTargetAccess<'_> {
+    /// Run one deletion step with the live target (`None` when the node has no
+    /// target). The target borrow never outlives this call.
+    fn step<R>(
+        &mut self,
+        run: impl FnOnce(Option<&mut LiveTarget>) -> Result<R, TcpError>,
+    ) -> Result<R, TcpError> {
+        match self {
+            Self::Owned(target) => run(target.as_deref_mut()),
+            Self::Gated {
+                inventory,
+                lifecycle,
+            } => {
+                let mut slot = lifecycle.lock();
+                let mut guard = inventory.lock();
+                let target = live_target(&guard, &mut slot)?;
+                guard.released(|| run(target))
+            }
+        }
+    }
+
+    /// Test pause after one file step, with no gate and no inventory held. The
+    /// pause is taken out of the inventory first, so its guard does not live
+    /// through the wait. The owned access has no inventory and never pauses.
+    #[cfg(test)]
+    fn hold_after_file_step(&self) {
+        if let Self::Gated { inventory, .. } = self {
+            let pause = inventory.lock().trim_delete_pause.take();
+            hold_trim_pause(pause);
+        }
+    }
+}
+
 /// Delete the intended generation and sync the owner root. The seal remains
 /// until all WAL files are gone. An interrupted final directory removal may
 /// lose the seal only after marker cleanup and WAL deletion have completed.
+/// The offline resume and the online phase use this one function, so their
+/// sync, unlink and rename order is identical; only the target access differs.
 fn delete_generation(
     root: &Path,
     generation: u64,
     file_bytes: u64,
-    target: TrimTarget<'_>,
     cuts: TrimCrashCuts,
+    access: &mut TrimTargetAccess<'_>,
 ) -> Result<(), TcpError> {
     let path = epoch_path(root, generation);
     match fs::symlink_metadata(&path) {
@@ -167,58 +253,21 @@ fn delete_generation(
                     .ok_or_else(|| TcpError::new("trim WAL files have no sealed end"))?;
                 Some(end.div_ceil(file_bytes))
             };
-            if let Some(target) = target {
-                let probe = present.last().map_or(Some(0), |last| last.checked_add(1));
-                if let Some(identity) = probe
-                    .map(|id| target.sealed_file(&wal_name(&path, id)))
-                    .transpose()
-                    .map_err(TcpError::component)?
-                    .flatten()
-                {
-                    target
-                        .retire_deleted_file(&identity)
-                        .map_err(TcpError::component)?;
-                }
-                for &id in present.iter().rev() {
-                    let file = wal_name(&path, id);
-                    if first_ahead.is_some_and(|first| id >= first) {
-                        target
-                            .release_trim_lookahead(&file, cuts.before_marker_sync)
-                            .map_err(TcpError::component)?;
-                        if cuts.after_marker {
-                            return Err(TcpError::new(
-                                "injected owner crash after lookahead marker",
-                            ));
-                        }
-                        fs::remove_file(&file)?;
-                        if cuts.after_unlink {
-                            return Err(TcpError::new(
-                                "injected owner crash before WAL directory sync",
-                            ));
-                        }
-                        File::open(&path)?.sync_all()?;
-                        if cuts.after_file_sync {
-                            return Err(TcpError::new(
-                                "injected owner crash after lookahead unlink",
-                            ));
-                        }
-                    } else {
-                        let identity = target.sealed_file(&file).map_err(TcpError::component)?;
-                        fs::remove_file(&file)?;
-                        if let Some(identity) = identity {
-                            target
-                                .retire_deleted_file(&identity)
-                                .map_err(TcpError::component)?;
-                        } else {
-                            File::open(&path)?.sync_all()?;
-                        }
-                    }
-                }
-            } else {
-                for &id in present.iter().rev() {
-                    fs::remove_file(wal_name(&path, id))?;
-                    File::open(&path)?.sync_all()?;
-                }
+            // A crash after one unlink leaves exactly one marker without its
+            // WAL: the file above the present set. Retire it before the loop.
+            if let Some(id) = present.last().map_or(Some(0), |last| last.checked_add(1)) {
+                let file = wal_name(&path, id);
+                access.step(|target| match target {
+                    Some(target) => probe_retire(target, &file),
+                    None => Ok(()),
+                })?;
+            }
+            for &id in present.iter().rev() {
+                let file = wal_name(&path, id);
+                let lookahead = first_ahead.is_some_and(|first| id >= first);
+                access.step(|target| delete_one_file(&path, &file, target, lookahead, cuts))?;
+                #[cfg(test)]
+                access.hold_after_file_step();
             }
             fs::remove_dir_all(&path)?;
         }
@@ -232,6 +281,61 @@ fn delete_generation(
         Err(error) => return Err(error.into()),
     }
     File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+/// Retire the sealed marker of the one file above the present set.
+fn probe_retire(target: &mut LiveTarget, file: &Path) -> Result<(), TcpError> {
+    let Some(identity) = target.sealed_file(file).map_err(TcpError::component)? else {
+        return Ok(());
+    };
+    target
+        .retire_deleted_file(&identity)
+        .map_err(TcpError::component)
+}
+
+/// Delete one WAL file of the intended generation. The marker identity is read
+/// and retired in the same target hold; it never crosses a gate release.
+fn delete_one_file(
+    path: &Path,
+    file: &Path,
+    target: Option<&mut LiveTarget>,
+    lookahead: bool,
+    cuts: TrimCrashCuts,
+) -> Result<(), TcpError> {
+    let Some(target) = target else {
+        fs::remove_file(file)?;
+        File::open(path)?.sync_all()?;
+        return Ok(());
+    };
+    if lookahead {
+        target
+            .release_trim_lookahead(file, cuts.before_marker_sync)
+            .map_err(TcpError::component)?;
+        if cuts.after_marker {
+            return Err(TcpError::new("injected owner crash after lookahead marker"));
+        }
+        fs::remove_file(file)?;
+        if cuts.after_unlink {
+            return Err(TcpError::new(
+                "injected owner crash before WAL directory sync",
+            ));
+        }
+        File::open(path)?.sync_all()?;
+        if cuts.after_file_sync {
+            return Err(TcpError::new("injected owner crash after lookahead unlink"));
+        }
+        return Ok(());
+    }
+    let identity = target.sealed_file(file).map_err(TcpError::component)?;
+    fs::remove_file(file)?;
+    if let Some(identity) = identity {
+        target
+            .retire_deleted_file(&identity)
+            .map_err(TcpError::component)?;
+    } else {
+        File::open(path)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -439,17 +543,18 @@ impl NodeInventory {
         Ok(result)
     }
 
-    /// Fenced trim of `generation`. The caller holds the lifecycle gate
-    /// (`slot` is its content) or owns the inventory exclusively. The ledger
-    /// install, the directory deletion and the final install run with the
-    /// inventory released; readiness is rechecked here, never trusted from a
-    /// previous `CheckTrimGeneration`.
-    pub(in crate::distributed::tcp) fn trim_generation<H: InventoryAccess>(
+    /// Phase 1 of a fenced trim: validate the authority and the readiness,
+    /// detach the readers entry and the log, finish the tombstones, revoke the
+    /// bindings, install the empty seal of an abandoned generation, and install
+    /// the ledger with `trim_pending` durable. The caller holds the live-control
+    /// gate and the lifecycle gate (`slot` is its content) or owns the inventory
+    /// exclusively. Returns whether the directory deletion must follow.
+    fn trim_generation_prepare<H: InventoryAccess>(
         inventory: &mut H,
         slot: &mut LifecycleSlot,
         authority_generation: u64,
         generation: u64,
-    ) -> Result<(), TcpError> {
+    ) -> Result<bool, TcpError> {
         let partition = inventory.config.partition.partition;
         let refuse = |reason: &str| {
             TcpError::new(format!(
@@ -470,7 +575,7 @@ impl NodeInventory {
             // Already trimmed: success only with the same absent-state checks.
             Err(_) => {
                 return match Self::trim_readiness(inventory, authority_generation, generation)? {
-                    (TrimReadiness::Absent, _) => Ok(()),
+                    (TrimReadiness::Absent, _) => Ok(false),
                     (_, reason) => Err(refuse(reason)),
                 };
             }
@@ -487,10 +592,7 @@ impl NodeInventory {
                 // snapshots and leases obtained before that removal.
                 inventory.readers.write().logs.remove(&generation);
                 #[cfg(test)]
-                if let Some((entered, resume)) = inventory.trim_detach_pause.take() {
-                    let _ = entered.send(());
-                    let _ = resume.recv();
-                }
+                hold_trim_pause(inventory.trim_detach_pause.take());
                 let detached = inventory.logs.remove(&generation);
                 if detached
                     .as_ref()
@@ -608,31 +710,150 @@ impl NodeInventory {
             inventory.healthy = false;
             return Err(TcpError::new("injected owner crash after trim ledger"));
         }
+        Ok(true)
+    }
+
+    /// Phase 2 of a fenced trim: delete the generation whose intent is durable.
+    /// The caller holds no gate. Each target step takes the lifecycle gate with
+    /// the inventory, and releases the inventory across its I/O, so live work
+    /// interleaves between files. The sync order is `delete_generation`'s.
+    fn trim_generation_delete(
+        inventory: &Mutex<NodeInventory>,
+        lifecycle: &LifecycleGate,
+        generation: u64,
+    ) -> Result<(), TcpError> {
+        let (root, file_bytes, cuts) = {
+            let mut guard = inventory.lock();
+            (
+                guard.config.root.clone(),
+                guard.config.partition.wal_file_bytes,
+                Self::take_trim_cuts(&mut guard),
+            )
+        };
+        let mut access = TrimTargetAccess::Gated {
+            inventory,
+            lifecycle,
+        };
+        let result = delete_generation(&root, generation, file_bytes, cuts, &mut access);
+        let mut guard = inventory.lock();
+        if result.is_err() {
+            guard.healthy = false;
+            return result;
+        }
+        #[cfg(test)]
+        if guard.take_trim_crash(OwnerTrimCrash::AfterUnlink) {
+            guard.healthy = false;
+            return Err(TcpError::new("injected owner crash after trim unlink"));
+        }
+        Ok(())
+    }
+
+    /// Phase 3 of a fenced trim: clear the durable intent. The caller holds both
+    /// gates, so the ledger install stays the single lifecycle writer.
+    fn trim_generation_finish<H: InventoryAccess>(inventory: &mut H) -> Result<(), TcpError> {
+        inventory.manifest.trim_pending = None;
+        Self::persist_manifest(inventory)
+    }
+
+    /// One fenced trim from the control owner: phase 1 and phase 3 under both
+    /// gates, phase 2 with no gate held.
+    ///
+    /// The queue slot of the request stays exclusive for all three phases
+    /// (`control_active`), so queued live-lane lease renewals still wait
+    /// behind the deletion. Do not call this from an online trigger until the
+    /// deletion runs off the control queue or lease renewal is exempt from
+    /// `control_active` (see the generation-trim section of
+    /// `docs/distributed/ARCHITECTURE.md`). Today the trim request comes only
+    /// from the coordinator's open-time `maintain`, before any serving session.
+    pub(in crate::distributed::tcp) fn trim_generation_online(
+        inventory: &Mutex<NodeInventory>,
+        lifecycle: &LifecycleGate,
+        live_control_gate: &Mutex<()>,
+        authority_generation: u64,
+        generation: u64,
+    ) -> Result<(), TcpError> {
+        let delete = {
+            let _gate = live_control_gate.lock();
+            let mut slot = lifecycle.lock();
+            let mut guard = inventory.lock();
+            Self::trim_generation_prepare(&mut guard, &mut slot, authority_generation, generation)?
+        };
+        if delete {
+            Self::trim_generation_delete(inventory, lifecycle, generation)?;
+            let _gate = live_control_gate.lock();
+            let _slot = lifecycle.lock();
+            Self::trim_generation_finish(&mut inventory.lock())?;
+        }
+        Ok(())
+    }
+
+    /// Offline trim with an exclusively owned inventory: the caller holds the
+    /// lifecycle slot and no other thread can observe it. Test support for the
+    /// crash-point matrix; production trims use `trim_generation_online`.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn trim_generation<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
+        authority_generation: u64,
+        generation: u64,
+    ) -> Result<(), TcpError> {
+        if !Self::trim_generation_prepare(inventory, slot, authority_generation, generation)? {
+            return Ok(());
+        }
         let root = inventory.config.root.clone();
         let file_bytes = inventory.config.partition.wal_file_bytes;
-        #[cfg(test)]
-        let cuts = TrimCrashCuts {
+        let cuts = Self::take_trim_cuts(inventory);
+        let target = live_target(&*inventory, slot)?;
+        let mut access = TrimTargetAccess::Owned(target);
+        let result = inventory
+            .released(|| delete_generation(&root, generation, file_bytes, cuts, &mut access));
+        if result.is_err() {
+            inventory.healthy = false;
+            return result;
+        }
+        if inventory.take_trim_crash(OwnerTrimCrash::AfterUnlink) {
+            inventory.healthy = false;
+            return Err(TcpError::new("injected owner crash after trim unlink"));
+        }
+        Self::trim_generation_finish(inventory)
+    }
+
+    #[cfg(test)]
+    fn take_trim_cuts<H: InventoryAccess>(inventory: &mut H) -> TrimCrashCuts {
+        TrimCrashCuts {
             before_marker_sync: inventory
                 .take_trim_crash(OwnerTrimCrash::AfterLookaheadMarkerUnlink),
             after_marker: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadMarker),
             after_unlink: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadFileUnlink),
             after_file_sync: inventory.take_trim_crash(OwnerTrimCrash::AfterLookaheadUnlink),
-        };
-        #[cfg(not(test))]
-        let cuts = TrimCrashCuts::default();
-        let result =
-            inventory.released(|| delete_generation(&root, generation, file_bytes, target, cuts));
-        if result.is_err() {
-            inventory.healthy = false;
         }
-        result?;
-        #[cfg(test)]
-        if inventory.take_trim_crash(OwnerTrimCrash::AfterUnlink) {
-            inventory.healthy = false;
-            return Err(TcpError::new("injected owner crash after trim unlink"));
-        }
-        inventory.manifest.trim_pending = None;
-        Self::persist_manifest(inventory)
+    }
+
+    #[cfg(not(test))]
+    fn take_trim_cuts(_inventory: &mut impl InventoryAccess) -> TrimCrashCuts {
+        TrimCrashCuts::default()
+    }
+
+    /// The trim intent in the ledger file on disk (not the in-memory ledger).
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn durable_trim_pending(
+        &self,
+    ) -> Result<Option<u64>, TcpError> {
+        read_manifest(&self.config.root.join(MANIFEST)).map(|manifest| manifest.trim_pending)
+    }
+
+    /// Pause after the first deleted WAL file, with no gate and no inventory
+    /// held: the next file is still present.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn pause_trim_after_file_step(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (pause, handles) = trim_pause();
+        self.trim_delete_pause = Some(pause);
+        handles
     }
 
     /// Pause after reader detachment, while the inventory lock is held.
@@ -643,10 +864,9 @@ impl NodeInventory {
         std::sync::mpsc::Receiver<()>,
         std::sync::mpsc::SyncSender<()>,
     ) {
-        let (entered, observed) = std::sync::mpsc::sync_channel(0);
-        let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
-        self.trim_detach_pause = Some((entered, resume_rx));
-        (observed, resume)
+        let (pause, handles) = trim_pause();
+        self.trim_detach_pause = Some(pause);
+        handles
     }
 
     #[cfg(test)]
@@ -667,3 +887,7 @@ impl NodeInventory {
 #[cfg(test)]
 #[path = "generations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trim_scheduling_tests.rs"]
+mod trim_scheduling_tests;

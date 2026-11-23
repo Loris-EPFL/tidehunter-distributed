@@ -1510,7 +1510,7 @@ impl ControlContext {
 
     /// `kind` names the request (lease, prelease or rollover) that counts an
     /// export created inline here.
-    fn lease_live_published(
+    pub(super) fn lease_live_published(
         &self,
         epoch: u64,
         tier: DurabilityTier,
@@ -2283,11 +2283,10 @@ impl ControlContext {
                 ))
             }
             Request::TrimGeneration(trim) => {
-                let _gate = self.live_control_gate.lock();
-                let mut lifecycle = self.lifecycle.lock();
-                NodeInventory::trim_generation(
-                    &mut self.inventory.lock(),
-                    &mut lifecycle,
+                NodeInventory::trim_generation_online(
+                    &self.inventory,
+                    &self.lifecycle,
+                    &self.live_control_gate,
                     trim.authority_generation,
                     trim.generation,
                 )?;

@@ -19,7 +19,7 @@ tidehunter/src/distributed/storage.rs 4799
 tidehunter/src/distributed/storage/tests.rs 2074
 tidehunter/src/distributed/sui.rs 2059
 tidehunter/src/distributed/tcp.rs 2283
-tidehunter/src/distributed/tcp/control.rs 2308
+tidehunter/src/distributed/tcp/control.rs 2307
 tidehunter/src/distributed/tcp/control_tests.rs 2542
 tidehunter/src/distributed/tcp/inventory.rs 1930
 tidehunter/src/distributed/tcp/live_client.rs 5367
