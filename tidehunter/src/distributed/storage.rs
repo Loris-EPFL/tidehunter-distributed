@@ -622,21 +622,7 @@ impl BusyEvents {
 }
 
 #[cfg(test)]
-#[test]
-fn busy_events_drop_oldest() {
-    let mut ring = BusyEvents::default();
-    for file in 0..66 {
-        ring.record(BusyEvent {
-            epoch: 7,
-            file,
-            cause: BusyCause::RecordPin,
-        });
-    }
-    assert_eq!(ring.events.len(), 64);
-    assert_eq!(ring.dropped, 2);
-    assert_eq!(ring.events.front().unwrap().file, 2);
-    assert_eq!(ring.events.back().unwrap().file, 65);
-}
+mod busy_events_tests;
 
 /// A local storage node component; caller threads serialize appends per partition.
 /// Different instances/partitions may append concurrently.
@@ -4782,48 +4768,6 @@ impl std::error::Error for StorageError {}
 #[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
-mod tests;
-
+mod native_layout_tests;
 #[cfg(test)]
-#[test]
-fn native_layout_matches_the_original_engine_defaults() {
-    let native = crate::config::Config::default();
-    assert_eq!(
-        (
-            native.frag_size,
-            native.wal_file_size,
-            native.max_maps,
-            native.direct_io,
-        ),
-        (
-            NATIVE_FRAGMENT_BYTES,
-            NATIVE_WAL_FILE_BYTES,
-            NATIVE_MAX_MAPS,
-            false,
-        )
-    );
-    let mut config = PartitionConfig {
-        inventory: StaticInventory {
-            database: [1; 16],
-            epoch: 1,
-            segment_generation: 1,
-            partitions: vec![0],
-        },
-        partition: 0,
-        batch_limits: BatchLimits {
-            max_operations: 1,
-            max_encoded_bytes: 1024,
-        },
-        group_limits: GroupLimits {
-            max_batches: 1,
-            max_encoded_bytes: 2048,
-        },
-        fragment_bytes: NATIVE_FRAGMENT_BYTES,
-        wal_file_bytes: NATIVE_WAL_FILE_BYTES,
-        max_batches: 1024,
-        max_reference_metadata_bytes: 1024 * 1024,
-    };
-    assert_eq!(config.layout().max_maps, NATIVE_MAX_MAPS);
-    config.fragment_bytes = 4 * 1024 * 1024;
-    assert_eq!(config.layout().max_maps, RESEARCH_MAX_MAPS);
-}
+mod tests;
