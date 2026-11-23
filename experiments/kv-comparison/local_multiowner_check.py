@@ -108,6 +108,42 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def local_config(token, binary, libs, fixture, owners, wal_prewrite,
+                 backends=('tidehunter_nvme_tcp',)):
+    """Build the local functional case from the reviewed colocated topology.
+
+    The reviewed topology supplies cloud slice/owner mapping only. The local
+    workload below is deliberately not a reviewed RDMA campaign cell. The test
+    suite calls this builder, so a change here also reaches the tests.
+    """
+    topology = next(j for j in cloud_campaign.make_focused_matrix('nvmeof_m3_t1')
+                    if j.get('owner_count') == 16 and j.get('owner_topology') == 'colocated')
+    case = topology['case_id']
+    job = dict(topology)
+    job.update(owner_count=owners, owner_topology='colocated')
+    for key in ('case_kind', 'measurement_sizing', 'device_counters', 'thread_cpu_sampling'):
+        job.pop(key, None)
+    job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=owners,
+               warmup_operations=0, measurement_operations=owners, concurrency=owners,
+               owner_wal_geometry='research', owner_wal_file_bytes=8388608)
+    now = datetime.now(timezone.utc)
+    config = {'prefix': token, 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
+              'source_revision': 'local-functional-unsealed',
+              'wal_prewrite': wal_prewrite,
+              'repository_root': str(Path(__file__).resolve().parents[2]),
+              'fdb_library_dir': str(libs), 'deadline_utc': (now + timedelta(seconds=600)).isoformat(),
+              'fleet': {'run_id': token, 'data_root': str(fixture),
+                        'coordinator': {'instance_id': 'local-client', 'address': '127.0.0.1'},
+                        'nodes': [{'index': 0, 'instance_id': 'local-owner-host', 'address': '127.0.0.1'}],
+                        'client_cpus': 4, 'client_memory_mib': 2048,
+                        'server_cpus': 4, 'server_memory_mib': 8192},
+              'spec': {'mode': 'standard-with-live-nvmeof', 'selection': 'nvmeof_m3_t1',
+                       'backends': list(backends), 'hard_deadline_seconds': 600,
+                       'case_deadline_seconds': 180, 'export_reserve_seconds': 120},
+              'jobs': [job]}
+    return config, case, job
+
+
 def main():
     args = parse_args()
     if os.geteuid() != 0:
@@ -124,33 +160,7 @@ def main():
     token = 'th-' + uuid.uuid4().hex[:16]
     fixture = Path('/mnt/tidehunter-kv-comparison') / token
     fixture.mkdir(mode=0o700, parents=True)
-    # The reviewed topology supplies cloud slice/owner mapping only. The local
-    # workload below is deliberately not a reviewed RDMA campaign cell.
-    topology = next(j for j in cloud_campaign.make_focused_matrix('nvmeof_m3_t1')
-                    if j.get('owner_count') == 16 and j.get('owner_topology') == 'colocated')
-    case = topology['case_id']
-    job = dict(topology)
-    job.update(owner_count=args.owners, owner_topology='colocated')
-    for key in ('case_kind', 'measurement_sizing', 'device_counters', 'thread_cpu_sampling'):
-        job.pop(key, None)
-    job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=args.owners,
-               warmup_operations=0, measurement_operations=args.owners, concurrency=args.owners,
-               owner_wal_geometry='research', owner_wal_file_bytes=8388608)
-    now = datetime.now(timezone.utc)
-    config = {'prefix': token, 'binary': str(binary), 'binary_sha256': cloud.digest(binary),
-              'source_revision': 'local-functional-unsealed',
-              'wal_prewrite': args.wal_prewrite,
-              'repository_root': str(Path(__file__).resolve().parents[2]),
-              'fdb_library_dir': str(libs), 'deadline_utc': (now + timedelta(seconds=600)).isoformat(),
-              'fleet': {'run_id': token, 'data_root': str(fixture),
-                        'coordinator': {'instance_id': 'local-client', 'address': '127.0.0.1'},
-                        'nodes': [{'index': 0, 'instance_id': 'local-owner-host', 'address': '127.0.0.1'}],
-                        'client_cpus': 4, 'client_memory_mib': 2048,
-                        'server_cpus': 4, 'server_memory_mib': 8192},
-              'spec': {'mode': 'standard-with-live-nvmeof', 'selection': 'nvmeof_m3_t1',
-                       'backends': ['tidehunter_nvme_tcp'], 'hard_deadline_seconds': 600,
-                       'case_deadline_seconds': 180, 'export_reserve_seconds': 120},
-              'jobs': [job]}
+    config, case, job = local_config(token, binary, libs, fixture, args.owners, args.wal_prewrite)
     objects = fixture / 'objects'
     objects.mkdir()
     mode = MultiownerMode(fixture, config, libs)

@@ -13,38 +13,18 @@ from unittest.mock import Mock, patch
 
 import yaml
 
-import cloud_campaign
 import cloud_controller as cloud
+import local_multiowner_check
 
 
-def local_config(root):
-    """Build the local functional case that local_multiowner_check plans."""
-    topology = next(job for job in cloud_campaign.make_focused_matrix('nvmeof_m3_t1')
-                    if job.get('owner_count') == 16 and job.get('owner_topology') == 'colocated')
-    case = topology['case_id']
-    job = dict(topology)
-    job.update(owner_count=4, owner_topology='colocated')
-    for key in ('case_kind', 'measurement_sizing', 'device_counters', 'thread_cpu_sampling'):
-        job.pop(key, None)
-    job.update(selection='local_functional', backend='tidehunter_nvme_tcp', keys=4,
-               warmup_operations=0, measurement_operations=4, concurrency=4,
-               owner_wal_geometry='research', owner_wal_file_bytes=8388608,
-               owner_read_memory_allowance_bytes=128 * 1024**2)
-    config = {'prefix': 'th-0123456789abcdef', 'binary': '/opt/source/runtime/bin/kv-research',
-              'source_revision': 'local-functional-unsealed', 'repository_root': '/opt/source',
-              'fdb_library_dir': '/opt/source/runtime/lib',
-              'deadline_utc': '2099-01-01T02:00:00Z',
-              'fleet': {'run_id': 'th-0123456789abcdef', 'data_root': str(root),
-                        'coordinator': {'instance_id': 'local-client', 'address': '127.0.0.1'},
-                        'nodes': [{'index': 0, 'instance_id': 'local-owner-host',
-                                   'address': '127.0.0.1'}],
-                        'client_cpus': 4, 'client_memory_mib': 2048,
-                        'server_cpus': 4, 'server_memory_mib': 8192},
-              'spec': {'mode': 'standard-with-live-nvmeof', 'selection': 'nvmeof_m3_t1',
-                       'backends': ['tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'], 'hard_deadline_seconds': 600,
-                       'case_deadline_seconds': 180, 'export_reserve_seconds': 120},
-              'jobs': [job]}
-    return config, case, job
+def local_config(root, backends=('tidehunter_nvme_tcp',)):
+    """Build the config through the builder that local_multiowner_check.main uses."""
+    binary = root / 'binary'
+    binary.write_bytes(b'')
+    libs = root / 'libs'
+    libs.mkdir()
+    return local_multiowner_check.local_config('th-0123456789abcdef', binary, libs, root, 4, False,
+                                               backends=backends)
 
 
 def owner_launch(config, case, index, transport):
@@ -93,7 +73,8 @@ class LocalPlanTests(unittest.TestCase):
 
     def test_reviewed_case_still_rejects_a_launch_that_differs_from_its_plan(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config, case, _ = local_config(Path(temporary))
+            config, case, _ = local_config(
+                Path(temporary), ('tidehunter_nvme_tcp', 'tidehunter_nvme_rdma'))
             reviewed = cloud.case_owner_job(config, case)
             verbs = {'kind': 'ofi', 'fabric': {'backend': 'verbs'}, 'security': 'trusted'}
             cloud.validate_launch(config, owner_launch(config, case, 0, verbs), case, 0,
