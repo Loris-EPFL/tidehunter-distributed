@@ -93,6 +93,9 @@ impl Running {
         )
         .unwrap()
     }
+    pub(in crate::distributed::tcp) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
 }
 impl Drop for Running {
     fn drop(&mut self) {

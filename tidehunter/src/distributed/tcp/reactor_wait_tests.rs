@@ -1,4 +1,5 @@
 use super::*;
+use std::net::TcpStream;
 
 fn plain_session() -> (Session, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

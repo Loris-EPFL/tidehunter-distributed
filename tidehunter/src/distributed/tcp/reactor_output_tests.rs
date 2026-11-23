@@ -4,6 +4,7 @@ use super::super::tests::certificates;
 use super::replay_page::ReplayStages;
 use super::*;
 use std::io::Cursor;
+use std::net::TcpStream;
 
 struct Pair {
     session: Session,

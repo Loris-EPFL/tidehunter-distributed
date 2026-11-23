@@ -3,6 +3,7 @@
 //! turn timings into flaky pass/fail assertions.
 use super::*;
 use std::hint::black_box;
+use std::net::TcpStream;
 
 struct CountIo {
     inner: DeadlineIo,

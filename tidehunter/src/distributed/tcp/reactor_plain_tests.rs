@@ -2,6 +2,7 @@
 //! Real loopback sockets and the real session; no storage node is involved.
 use super::*;
 use std::io::Write as _;
+use std::net::TcpStream;
 
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

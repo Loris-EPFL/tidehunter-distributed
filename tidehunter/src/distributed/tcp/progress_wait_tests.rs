@@ -9,6 +9,7 @@ use super::progress_wait::{
 use super::tests::software_transport;
 use super::tests::{batch, certificates, config, metrics};
 use super::*;
+use std::net::TcpStream;
 use std::sync::mpsc;
 
 /// The owner hub never ends a parked poll by time in these tests (except where a

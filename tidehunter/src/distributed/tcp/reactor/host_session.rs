@@ -284,12 +284,15 @@ impl HostClient {
         tls: &TlsFiles,
         timeout: Duration,
     ) -> Result<Self, TcpError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(TcpError::new("invalid client timeout"));
+        }
         let client_config = tls.client_config_with_identity()?;
         let session = super::super::listener::open_client_session(
             endpoint,
             tls,
             client_config,
-            timeout,
+            Instant::now() + timeout,
             false,
         )?
         .session;

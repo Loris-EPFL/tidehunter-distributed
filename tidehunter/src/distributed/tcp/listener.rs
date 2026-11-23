@@ -3,6 +3,7 @@
 //! authenticated (or explicitly trusted) session before its first request.
 
 use super::*;
+use std::net::{SocketAddr, TcpStream};
 
 /// Serves one accepted session to completion. Called on a bounded worker.
 pub(super) type SessionHandler = Arc<
@@ -211,22 +212,26 @@ pub(super) fn open_client_session(
     endpoint: &str,
     tls: &TlsFiles,
     client_config: ClientTlsConfig,
-    timeout: Duration,
+    deadline: Instant,
     progress: bool,
 ) -> Result<ClientSession, TcpError> {
     #[cfg(not(feature = "experimental-fabric"))]
     let _ = progress;
     tls.transport.validate()?;
-    if timeout.is_zero() || timeout > Duration::from_secs(300) {
-        return Err(TcpError::new("invalid client timeout"));
-    }
     let address: SocketAddr = endpoint.parse().map_err(|_| {
         TcpError::new("endpoint must be numeric IP:port; set TLS server_name separately")
     })?;
+    let budget = deadline.saturating_duration_since(Instant::now());
+    if budget.is_zero() {
+        return Err(TcpError::with_kind(
+            std::io::ErrorKind::TimedOut,
+            "client connect deadline expired",
+        ));
+    }
     let began = Instant::now();
-    let socket = TcpStream::connect_timeout(&address, timeout)?;
+    let socket = TcpStream::connect_timeout(&address, budget)?;
     let connect_ns = elapsed_ns(began);
-    let mut io = DeadlineIo::new(socket, timeout)?;
+    let mut io = DeadlineIo::new_until(socket, deadline)?;
     let setup_started = Instant::now();
     if tls.transport.is_native() {
         write_transport_mode(&mut io, &tls.transport)?;

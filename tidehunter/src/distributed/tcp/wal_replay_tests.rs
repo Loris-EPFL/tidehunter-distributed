@@ -259,7 +259,7 @@ fn replay_page_waits_behind_a_running_exclusive_control() {
         entered_rx.recv_timeout(WAIT_CAP).is_ok(),
         "the held fence never started, so no exclusive control owns the slot"
     );
-    blocked.reactor.control_budget_cap = Some(WAIT_CAP);
+    blocked.reactor.control_cap = Some(WAIT_CAP);
     let page = std::thread::spawn(move || blocked.replay_live_wal_page(2, 1, 0, 1, through));
     // Follow observed progress: the owner holds the fence and now holds the
     // page request too, so the page waits for the exclusive slot.
@@ -290,7 +290,7 @@ fn replay_page_waits_behind_a_running_exclusive_control() {
         .join()
         .expect("the fence thread panicked")
         .expect("the fence completes after release");
-    released.reactor.control_budget_cap = Some(WAIT_CAP);
+    released.reactor.control_cap = Some(WAIT_CAP);
     let page = released
         .replay_live_wal_page(3, 1, 0, 1, through)
         .expect("the released page completes");
@@ -329,7 +329,7 @@ fn replay_page_barrier_names_the_flush_barrier_timeout() {
         .node
         .control
         .set_flush_barrier_cap_for_test(BARRIER_CAP);
-    blocked.reactor.control_budget_cap = Some(WAIT_CAP);
+    blocked.reactor.control_cap = Some(WAIT_CAP);
     let error = match blocked.replay_live_wal_page(2, 1, 0, 1, source.through) {
         Ok(page) => panic!(
             "the barrier cannot answer while the flusher is paused; got {} batches",
@@ -354,7 +354,7 @@ fn replay_page_barrier_names_the_flush_barrier_timeout() {
         .node
         .control
         .set_flush_barrier_cap_for_test(WAIT_CAP);
-    released.reactor.control_budget_cap = Some(WAIT_CAP);
+    released.reactor.control_cap = Some(WAIT_CAP);
     let page = released
         .replay_live_wal_page(2, 1, 0, 1, source.through)
         .expect("the page completes after the flusher resumes");
@@ -398,7 +398,7 @@ fn replay_page_completes_while_a_stream_request_is_active() {
         "the owner event capture dropped {dropped} events"
     );
     let before = before.len();
-    page_reader.reactor.control_budget_cap = Some(WAIT_CAP);
+    page_reader.reactor.control_cap = Some(WAIT_CAP);
     let through = source.through;
     let page = std::thread::spawn(move || page_reader.replay_live_wal_page(2, 1, 0, 1, through));
     // Follow observed progress: the owner starts the page control and replies
