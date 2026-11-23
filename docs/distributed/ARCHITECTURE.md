@@ -32,8 +32,8 @@ leased NVMe-oF extent (`write_core/worker.rs`) → owner page-cache publication
 → logical version (`write_core/publisher.rs`). A group is the completeness
 boundary; one group holds whole batches with independent inner CRC frames.
 Backpressure: bounded pending batches/bytes (`RemoteDatabaseConfig`:
-`max_pending_batches`, `max_pending_bytes`, `owner_append_occupancy`); the
-drain is the ack barrier. Foreground writes take the shared write gate only.
+`max_pending_batches`, `max_pending_bytes`, `owner_append_occupancy`,
+`coordinator_lease_ms`); the drain is the ack barrier. Foreground writes take the shared write gate only.
 Pruning never takes it (section 8).
 
 `RemoteDatabaseConfig` (`remote_db.rs`) is `deny_unknown_fields`. A key of a
@@ -153,7 +153,7 @@ write.
 
 Transports: `Tcp` (mTLS), `TcpTrusted` (loopback tests and local benchmarks)
 and OFI verbs control (`remote_db/transports.rs` `connect`, `tcp.rs`).
-The protocol version is 35 (`PROTOCOL` in `tcp.rs`). Every request and
+The protocol version is 37 (`PROTOCOL` in `tcp.rs`). Every request and
 response variant has an explicit documented wire tag. `tcp/wire_tag_tests.rs`
 freezes the tags.
 
@@ -167,6 +167,8 @@ Protocol history:
 - 34: L2 provision and drop.
 - 35: keyed `ResolveLiveRecords` by the member address. Added `durable_end` to
   the inventory sweep.
+- 36: exports live as long as their files; removed the export pins.
+- 37: added `RenewCoordinatorLease` and its granted-duration reply.
 
 The remaining request classes are: control, live lease/grant/pin, lifecycle,
 durable progress, file inventory, relocation and host provision/drop.
@@ -180,6 +182,22 @@ expects. The coordinator holds that expectation. It verifies the member CRC-32
 from the index position. A relocated position keeps its logical epoch. It
 names the generation that now holds its bytes. The generation is never
 inferred from the epoch. A retired range answers `NotFound`.
+
+### Coordinator lease: one writer across machines
+
+The distributed form of single Tidehunter's database lock. An owner grants a
+time-bounded right to write the fenced authority epoch to one holder
+(`RenewCoordinatorLease`, protocol 37; `tcp/coordinator_lease.rs`). The reactor
+answers a renewal inline, ahead of the control queue, so an exclusive fence,
+seal or trim cannot delay it. The coordinator holds one dedicated renewal
+session per owner (`remote_db/coordinator_lease.rs`) and renews at a fifth of
+the granted duration; every write worker checks its owner's validity stamp
+before it submits a frame, so no lease work runs on the submission path. The
+owner write-protects the epoch's exports once a grant passes its expiry plus a
+one-second margin. A lapse on any owner is fail-stop for the database: later
+writes fail and the application reopens. A failure of one owner therefore
+stops the database, exactly as a disk failure stops single Tidehunter. There is
+no degraded mode.
 
 ## 7. Lifecycle
 
@@ -237,10 +255,10 @@ while the database is open.
   pressure gauge is set. It is not scheduled. It is not proven safe next to
   readers, grants and the relocation worker.
   The owner trim holds the exclusive control-queue slot for its whole run, so
-  queued live-lane lease renewals wait behind it. An online trigger must not be
-  enabled until the deletion runs off the control queue or lease renewal is
-  exempt from `control_active`. Today the trim runs only at open, before any
-  serving session.
+  every other queued control waits behind it. A coordinator lease renewal is
+  exempt: the reactor answers it inline, ahead of the queue (protocol 37). An
+  online trigger must not be enabled until the deletion runs off the control
+  queue. Today the trim runs only at open, before any serving session.
 
 ## 8. Capacity
 
@@ -426,13 +444,15 @@ Accepted weakenings against the Exact index (owner decision, 2026-11-20):
 - Coordinator: `remote_db.rs` + `remote_db/` (`write_core/` write path,
   `pending_read/` read lanes, `durable_cut.rs` version B,
   `fencing_generations.rs` L1, `stream_positions.rs` stream bound,
-  `authority_lifecycle/` L2 drop, `relocation.rs` and `dead_wal_files.rs`
+  `authority_lifecycle/` L2 drop, `coordinator_lease.rs` the renewers,
+  `relocation.rs` and `dead_wal_files.rs`
   relocation and file retirement, `r1_events.rs`, `read_cache.rs`).
 - Sui adapter: `sui.rs` (open, drop, range drop, relocation entry;
   `sui/relocation.rs` relocation worker, `sui/drop_cells.rs`,
   `sui/coordinator_evidence.rs`).
 - Owners: `storage.rs` + `storage/` (WAL, replay, seal, retirement, file
   inventory), `tcp/` (`control.rs`, `inventory.rs`, `host.rs` L2 host,
+  `coordinator_lease.rs` the owner cell and lapse watchdog,
   `live_client.rs` lease, `live_read.rs`, `durable_progress.rs`),
   `nvmeof/` (`live_target.rs` kernel target, `live_{connect,io,pool,namespace}.rs`).
 - Shared: `codec.rs` (batch members incl. `DropCells`), `native_publication.rs`,

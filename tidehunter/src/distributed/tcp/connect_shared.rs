@@ -118,6 +118,7 @@ pub(super) fn connect(
         live_counters: None,
         live_metrics: None,
         progress_wait: progress.map(progress_wait::ClientProgressWait::new),
+        lease_validity: None,
     };
     let budget = deadline.saturating_duration_since(Instant::now());
     if budget.is_zero() {

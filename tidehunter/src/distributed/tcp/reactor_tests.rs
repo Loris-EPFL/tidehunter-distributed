@@ -692,3 +692,49 @@ fn fabric_control_violation_closes_a_live_session_without_waiting_for_rpc_deadli
         thread::yield_now();
     }
 }
+
+/// A lease renewal never waits behind an exclusive control. The fence holds
+/// the owner's single exclusive slot through the existing `before_fence` pause;
+/// the renewal of the still-active epoch is answered while the fence is held.
+/// Every wait follows an observed signal.
+#[test]
+fn lease_renewal_is_answered_while_an_exclusive_control_holds_the_slot() {
+    use std::sync::mpsc::sync_channel;
+    let server = Running::new(Transport::TcpTrusted, WalMemberReadPolicy::Positional);
+    // Both sessions connect before the fence holds the owner: a Status
+    // handshake is a queued control too.
+    let mut fencer = server.client();
+    let mut renewer = server.client();
+    fencer
+        .fence_to(1)
+        .expect("the first fence activates epoch 1");
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (resume_tx, resume_rx) = sync_channel(1);
+    *server.node.control_context.before_fence.lock() = Some(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+    let fence = std::thread::spawn(move || fencer.fence_to(2));
+    assert!(
+        entered_rx.recv_timeout(PROGRESS_CAP).is_ok(),
+        "the held fence never started, so no exclusive control owns the slot"
+    );
+    let granted = renewer
+        .renew_coordinator_lease(1, [9; 16], 5_000)
+        .expect("a renewal is answered while the exclusive slot is held");
+    assert_eq!(granted, 5_000, "the owner granted the requested duration");
+    resume_tx.send(()).expect("the fence holder is live");
+    fence
+        .join()
+        .expect("the fence thread panicked")
+        .expect("the fence completes after release");
+    assert!(
+        server
+            .node
+            .control_context
+            .coordinator_lease
+            .check_writable(2)
+            .is_ok(),
+        "the completed fence activates its epoch without a lapse"
+    );
+}

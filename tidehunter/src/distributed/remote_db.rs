@@ -49,6 +49,7 @@ mod callback_starts;
 mod stream_positions;
 use stream_positions::{OwnerTail, check_stream_bound, seed_positions};
 mod coordinator_io;
+pub(crate) mod coordinator_lease;
 use coordinator_io::CoordinatorIoCategory;
 mod authority_lifecycle;
 pub(crate) use authority_lifecycle::drop_db;
@@ -161,6 +162,12 @@ pub struct RemoteDatabaseConfig {
     /// Per-append-connection bounded sample; zero keeps storage profiling disabled.
     #[serde(default = "default_write_profile_limit")]
     pub write_profile_limit: usize,
+    /// Coordinator lease duration in milliseconds, validated to
+    /// 1000..=30000. The owner clamps and returns the granted value; the
+    /// renewer renews at a fifth of it, so a lapse is detected within about one
+    /// lease. Absent means 5000.
+    #[serde(default = "default_coordinator_lease_ms")]
+    pub coordinator_lease_ms: u32,
     /// The leased live owner-WAL NVMe-oF route; required. Remote databases have
     /// no other data path.
     pub live_nvme: super::tcp::LiveClientConfig,
@@ -203,6 +210,10 @@ fn default_write_profile_limit() -> usize {
     0
 }
 
+fn default_coordinator_lease_ms() -> u32 {
+    5_000
+}
+
 fn default_owner_append_occupancy() -> usize {
     DEFAULT_OWNER_APPEND_OCCUPANCY
 }
@@ -227,8 +238,12 @@ impl RemoteDatabaseConfig {
     const APPEND_CONTROL_CONNECTIONS: usize = 1;
     /// The durable-cut poller owns one plain session per owner.
     const DURABLE_PROGRESS_CONNECTIONS: usize = 1;
-    pub const NON_READ_CONNECTIONS: usize =
-        Self::APPEND_CONTROL_CONNECTIONS + Self::DURABLE_PROGRESS_CONNECTIONS;
+    /// The coordinator lease renewer owns one dedicated session per owner, so
+    /// a renewal never waits behind a leased frame or a long poll.
+    const LEASE_RENEWAL_CONNECTIONS: usize = 1;
+    pub const NON_READ_CONNECTIONS: usize = Self::APPEND_CONTROL_CONNECTIONS
+        + Self::DURABLE_PROGRESS_CONNECTIONS
+        + Self::LEASE_RENEWAL_CONNECTIONS;
     /// Budget two complete coordinator session sets so a reopen can overlap
     /// old sessions until their owner permits observe EOF. Auto configs use
     /// the cap, not the preparing host's CPU count.
@@ -321,6 +336,12 @@ impl RemoteDatabaseConfig {
     pub fn validate(&self) -> Result<(), LocalDbError> {
         self.index.validate()?;
         self.durable_cut.validate().map_err(LocalDbError::new)?;
+        if !(1_000..=30_000).contains(&self.coordinator_lease_ms) {
+            return Err(LocalDbError::new(format!(
+                "coordinator_lease_ms {} outside 1000..=30000",
+                self.coordinator_lease_ms
+            )));
+        }
         {
             let live = &self.live_nvme;
             live.validate().map_err(LocalDbError::new)?;
@@ -840,6 +861,9 @@ pub struct RemoteDatabase {
     /// The value path over the owners' read lanes; shared with the concurrent
     /// facade so a read is one fetch, one CRC check and one native decode.
     reader: Arc<ValueReader>,
+    /// Coordinator lease renewers, one per owner. Dropped after
+    /// `Drop::drop` stopped and joined them.
+    lease: coordinator_lease::CoordinatorLease,
     // The shared core joins every worker before this directory lock is dropped.
     _lock: DbLock,
 }
@@ -921,6 +945,8 @@ impl RemoteDatabase {
             None,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
             Some(buffered),
         )
     }
@@ -960,6 +986,8 @@ impl RemoteDatabase {
             interruption,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
             #[cfg(any(test, feature = "test-utils"))]
             None,
         )
@@ -985,7 +1013,37 @@ impl RemoteDatabase {
         config: RemoteDatabaseConfig,
         interruption: Option<OpenInterruption>,
     ) -> Result<Self, LocalDbError> {
-        Self::open_inner_with(path, shape, config, interruption, None, Some(false))
+        Self::open_inner_with(
+            path,
+            shape,
+            config,
+            interruption,
+            None,
+            #[cfg(test)]
+            None,
+            Some(false),
+        )
+    }
+
+    /// `open_local_live_fixture` with a renewal send hook: `hook(owner)`
+    /// returns `false` to drop that owner's next renewal request, so a test can
+    /// stop one owner's renewals without stopping the owner.
+    #[cfg(test)]
+    pub(crate) fn open_local_live_fixture_with_lease_hook(
+        path: &Path,
+        shape: &KeyShape,
+        config: RemoteDatabaseConfig,
+        lease_hook: coordinator_lease::SendHook,
+    ) -> Result<Self, LocalDbError> {
+        Self::open_inner_with(
+            path,
+            shape,
+            config,
+            None,
+            None,
+            Some(lease_hook),
+            Some(false),
+        )
     }
 
     fn open_inner_with(
@@ -994,6 +1052,9 @@ impl RemoteDatabase {
         config: RemoteDatabaseConfig,
         interruption: Option<OpenInterruption>,
         #[cfg(test)] read_hook: Option<ReadHook<'_>>,
+        // Test-only: the renewer's send decision per owner, so a test can stop
+        // one owner's renewals without a stopped owner or a clock.
+        #[cfg(test)] lease_hook: Option<coordinator_lease::SendHook>,
         // `Some(buffered)` selects the ordinary-file live I/O fixture on every
         // client before any live I/O; `None` uses the real live route.
         #[cfg(any(test, feature = "test-utils"))] local_fixture: Option<bool>,
@@ -1506,6 +1567,14 @@ impl RemoteDatabase {
             epoch,
         )?;
         let mut cut_record = cut_record;
+        // One dedicated renewal session per owner. It is opened like the
+        // durable-cut poller's (a plain session over the epoch-1 inventory the
+        // owner registered with), and its handshake is interruptible by the
+        // renewer's stop wake.
+        let lease_duration_ms = config.coordinator_lease_ms;
+        let lease_epoch = epoch;
+        let lease_holder = rand::random::<[u8; 16]>();
+        let lease_targets = coordinator_lease::targets(&config, &tls_config, &shape);
         let core = write_core::core::WriteCore::new(write_core::core::OpenState {
             clients: workers,
             reads,
@@ -1552,9 +1621,29 @@ impl RemoteDatabase {
             },
         });
         completion.bind(&core);
+        // The first grant of every owner must succeed before this database
+        // accepts a write. Each write worker's client checks its owner's
+        // validity stamp before it submits a frame, so no lease work runs on
+        // the submission path.
+        let lease = coordinator_lease::CoordinatorLease::start(
+            lease_targets,
+            lease_epoch,
+            lease_holder,
+            lease_duration_ms,
+            core.clone(),
+            #[cfg(test)]
+            lease_hook,
+        )?;
+        for (index, worker) in core.clients.iter().enumerate() {
+            worker
+                .client
+                .lock()
+                .set_lease_validity(lease.validity(index));
+        }
         let database = Self {
             core,
             reader,
+            lease,
             _lock: lock,
         };
         // Offline fencing-generation maintenance (L1): no handle escaped, no
@@ -2070,6 +2159,9 @@ impl RemoteDatabase {
             .map(|(endpoint, client)| Ok((endpoint.partition, receive(client.stats()?)?)))
     }
     pub fn shutdown(&self) -> Result<(), LocalDbError> {
+        // Stop renewals before the Seal: a renewal that lands after it is
+        // refused by the owner, and a lapsed lease must not fail a clean close.
+        self.lease.stop();
         self.core.shutdown()
     }
 }

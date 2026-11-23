@@ -2323,7 +2323,7 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 36);
+    assert_eq!(PROTOCOL, 37);
     preface[4..6].copy_from_slice(&u16::try_from(PROTOCOL - 1).unwrap().to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }

@@ -1143,6 +1143,20 @@ impl NodeInventory {
         Ok(())
     }
 
+    /// Write-protect the writable exports of `epoch` after its coordinator
+    /// lease lapsed. The caller holds the live-control gate, the lifecycle gate
+    /// and the inventory; the target work releases the inventory.
+    pub(super) fn protect_lapsed_epoch<H: InventoryAccess>(
+        inventory: &mut H,
+        slot: &mut LifecycleSlot,
+        epoch: u64,
+    ) -> Result<(), TcpError> {
+        if let Some(target) = live_target(inventory, slot)? {
+            Self::protect_live_targets(inventory, target, epoch)?;
+        }
+        Ok(())
+    }
+
     /// The caller holds the lifecycle gate; `target` is its content.
     pub(super) fn release_live_pin<H: InventoryAccess>(
         inventory: &mut H,

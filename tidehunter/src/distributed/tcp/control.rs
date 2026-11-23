@@ -105,6 +105,9 @@ pub(super) struct ControlContext {
     /// against exclusive controls; it does not take this gate. Terminal
     /// publication only `try_lock`s it and defers while it is held.
     pub(super) live_control_gate: Mutex<()>,
+    /// The coordinator lease of the current authority epoch. A leaf lock: the
+    /// reactor renews it and the lapse watchdog takes it, never with I/O.
+    pub(super) coordinator_lease: Arc<coordinator_lease::CoordinatorLeaseCell>,
     #[cfg(test)]
     pub(super) before_fence: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -160,6 +163,9 @@ struct Shared {
     preparers: Mutex<Vec<PreparerSlot>>,
     // Parked durable-progress polls. Log syncers notify it after each sync.
     progress: HubSender,
+    // Stops the lease lapse watchdog. Set under no lock; the cell's condvar is
+    // notified after the store so a parked watchdog leaves at once.
+    lease_stop: AtomicBool,
     // Test-only cap of a poll's wait (ms), default `DURABLE_PROGRESS_MAX_WAIT`.
     // A long cap lets a test tell a wake from a deadline reply without a clock.
     #[cfg(test)]
@@ -411,6 +417,9 @@ pub(super) struct ControlOwner {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     flush_thread: Option<JoinHandle<()>>,
+    // Joined before the workers: a lapse protection may be waiting for the
+    // inventory or the lifecycle gate a worker holds.
+    lease_thread: Option<JoinHandle<()>>,
     // Declared last: drops after `Drop::drop` joined the workers, then answers every
     // parked poll and joins the hub thread.
     _progress: durable_progress::Hub,
@@ -433,6 +442,7 @@ impl ControlOwner {
             context,
             flush,
             progress: progress.sender(),
+            lease_stop: AtomicBool::new(false),
             #[cfg(test)]
             progress_cap_ms: std::sync::atomic::AtomicU64::new(
                 super::DURABLE_PROGRESS_MAX_WAIT.as_millis() as u64,
@@ -494,10 +504,35 @@ impl ControlOwner {
                 }
             }
         }
+        // One watchdog per database: it write-protects the epoch whose lease
+        // lapsed. It takes no control slot, so a renewal can never wait for it.
+        let lease_thread = {
+            let watchdog = shared.clone();
+            match thread::Builder::new()
+                .name("coordinator-lease-watch".into())
+                .spawn(move || {
+                    coordinator_lease::lease_watch(&watchdog.context, &watchdog.lease_stop)
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    shared.lease_stop.store(true, Ordering::Release);
+                    shared.queue.lock().stopped = true;
+                    shared.ready.notify_all();
+                    for thread in threads {
+                        let _ = thread.join();
+                    }
+                    shared.context.coordinator_lease.stop_waiting();
+                    let _ = shared.flush.send(FlushCommand::Stop);
+                    let _ = flush_thread.join();
+                    return Err(TcpError::from(error));
+                }
+            }
+        };
         Ok(Self {
             shared,
             threads,
             flush_thread: Some(flush_thread),
+            lease_thread: Some(lease_thread),
             _progress: progress,
         })
     }
@@ -671,6 +706,15 @@ mod preparation_tests;
 
 impl Drop for ControlOwner {
     fn drop(&mut self) {
+        // The watchdog may be protecting exports under the gates the workers
+        // take, so stop and join it before them.
+        self.shared.lease_stop.store(true, Ordering::Release);
+        self.shared.context.coordinator_lease.stop_waiting();
+        if let Some(thread) = self.lease_thread.take()
+            && thread.join().is_err()
+        {
+            self.shared.context.poison_readers();
+        }
         self.shared.queue.lock().stopped = true;
         self.shared.ready.notify_all();
         for thread in self.threads.drain(..) {
@@ -962,6 +1006,9 @@ fn run(shared: &Shared) {
                     _ => unreachable!("matched live extent request"),
                 };
                 let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A lapsed lease refuses every write of its epoch before any
+                    // owner file is touched.
+                    shared.context.coordinator_lease.check_writable(epoch)?;
                     #[cfg(test)]
                     let prelog_started = Instant::now();
                     let log = shared.context.inventory.lock().active(epoch)?;
@@ -2133,6 +2180,9 @@ impl ControlContext {
                         _drain_log,
                     )?
                 };
+                // The epoch is active and installed: from here its coordinator
+                // may renew. A new epoch starts with no holder and not lapsed.
+                self.coordinator_lease.activate(epoch);
                 status.max_frame_bytes = limits.max_frame_bytes;
                 status.max_reads = self.effective_max_reads(limits);
                 status.recovery_page_batches = limits.recovery_page_batches;
@@ -2152,6 +2202,8 @@ impl ControlContext {
                     epoch,
                     _drain_log,
                 )?;
+                // A sealed epoch grants no lease; the watchdog parks.
+                self.coordinator_lease.deactivate();
                 Ok(Response::Sealed)
             }
             Request::StatsDetailed => {
@@ -2245,6 +2297,11 @@ impl ControlContext {
                     std::io::ErrorKind::InvalidInput,
                     "provision and drop require a host-scope session",
                 ))
+            }
+            // The reactor answers a renewal inline, ahead of this queue, so an
+            // exclusive control can never delay it.
+            Request::RenewCoordinatorLease { .. } => {
+                Err(TcpError::new("lease renewal requires the session reactor"))
             }
         }
     }

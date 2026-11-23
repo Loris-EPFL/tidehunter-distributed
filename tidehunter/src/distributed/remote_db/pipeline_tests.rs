@@ -100,6 +100,7 @@ pub(super) fn coordinator_config(
         max_pending_reads: 256,
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
+        coordinator_lease_ms: 5_000,
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
         index: Default::default(),

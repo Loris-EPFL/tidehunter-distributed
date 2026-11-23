@@ -2047,6 +2047,12 @@ impl super::Client {
         use crate::distributed::group::LiveFrame;
         use crate::distributed::nvmeof::live_storage::extend_live_receipt_digest;
         use crate::distributed::write_timeline::WriteTimelineStage as Stage;
+        // The coordinator's right to write this owner ends before the owner's
+        // grant does: a lapsed lease refuses the frame before it is encoded,
+        // with one Acquire load and no lock.
+        if let Some(validity) = &self.lease_validity {
+            validity.ensure_writable(self.expected.partition)?;
+        }
         self.ensure_leased_healthy()?;
         if self.live_writer_closing || !self.live_nvme_configured() {
             return Err(super::TcpError::new(

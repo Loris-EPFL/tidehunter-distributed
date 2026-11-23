@@ -142,7 +142,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
     let root = guard.path();
     let input = root.join("input.json");
     let mut config = synthetic_input();
-    for (name, lanes, expected) in [("auto", None, 132), ("explicit", Some(100), 204)] {
+    for (name, lanes, expected) in [("auto", None, 134), ("explicit", Some(100), 206)] {
         if let Some(lanes) = lanes {
             config["read_lanes"] = serde_json::json!(lanes);
         } else {
@@ -167,7 +167,7 @@ fn generated_owner_connection_budget_covers_auto_and_explicit_lanes_with_overlap
         .unwrap_err()
         .to_string();
     assert!(error.contains("read_lanes=127"));
-    assert!(error.contains("require 258 connections"));
+    assert!(error.contains("require 260 connections"));
     assert!(error.contains("ceiling 256"));
     assert!(!rejected.exists());
 }

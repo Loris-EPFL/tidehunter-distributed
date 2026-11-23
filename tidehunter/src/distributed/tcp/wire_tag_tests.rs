@@ -1,6 +1,6 @@
 //! Frozen owner-protocol wire tags. Bincode encodes an enum variant as its
 //! declaration index, so the ordered variant list below *is* the tag table of
-//! protocol 36. Changing it requires a protocol bump.
+//! protocol 37. Changing it requires a protocol bump.
 
 use super::{HARD_FRAME_LIMIT, PROTOCOL, Request, Response, wire_codec};
 use bincode::Options;
@@ -53,48 +53,49 @@ fn variants<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
 }
 
 #[test]
-fn protocol_36_request_tags_are_frozen() {
-    assert_eq!(PROTOCOL, 36);
+fn protocol_37_request_tags_are_frozen() {
+    assert_eq!(PROTOCOL, 37);
     assert_eq!(
         variants::<Request>(),
         [
-            "RetirementFiles",     // 0
-            "Status",              // 1
-            "Fence",               // 2
-            "Seal",                // 3
-            "Stats",               // 4
-            "StatsDetailed",       // 5
-            "ConnectionProfile",   // 6
-            "OwnerTimelineArm",    // 7
-            "OwnerTimelineFetch",  // 8
-            "CheckpointPosition",  // 9
-            "RetireWalFiles",      // 10
-            "DurableProgress",     // 11
-            "PartitionStats",      // 12
-            "ReleaseLiveEpochPin", // 13
-            "ResolveLiveRecords",  // 14
-            "LiveTargetStats",     // 15
-            "ShutdownLiveTarget",  // 16
-            "LeaseLiveExtent",     // 17
-            "AdoptLiveExtent",     // 18
-            "OpenLiveExports",     // 19
-            "PreleaseLiveExtent",  // 20
-            "ReplayLiveWal",       // 21
-            "ReadEvidence",        // 22
-            "ProcessResources",    // 23
-            "InventoryPage",       // 24
-            "CheckTrimGeneration", // 25
-            "TrimGeneration",      // 26
-            "FileInventoryPage",   // 27
-            "RelocationPage",      // 28
-            "ProvisionDatabase",   // 29
-            "DropDatabase",        // 30
+            "RetirementFiles",       // 0
+            "Status",                // 1
+            "Fence",                 // 2
+            "Seal",                  // 3
+            "Stats",                 // 4
+            "StatsDetailed",         // 5
+            "ConnectionProfile",     // 6
+            "OwnerTimelineArm",      // 7
+            "OwnerTimelineFetch",    // 8
+            "CheckpointPosition",    // 9
+            "RetireWalFiles",        // 10
+            "DurableProgress",       // 11
+            "PartitionStats",        // 12
+            "ReleaseLiveEpochPin",   // 13
+            "ResolveLiveRecords",    // 14
+            "LiveTargetStats",       // 15
+            "ShutdownLiveTarget",    // 16
+            "LeaseLiveExtent",       // 17
+            "AdoptLiveExtent",       // 18
+            "OpenLiveExports",       // 19
+            "PreleaseLiveExtent",    // 20
+            "ReplayLiveWal",         // 21
+            "ReadEvidence",          // 22
+            "ProcessResources",      // 23
+            "InventoryPage",         // 24
+            "CheckTrimGeneration",   // 25
+            "TrimGeneration",        // 26
+            "FileInventoryPage",     // 27
+            "RelocationPage",        // 28
+            "ProvisionDatabase",     // 29
+            "DropDatabase",          // 30
+            "RenewCoordinatorLease", // 31
         ]
     );
 }
 
 #[test]
-fn protocol_36_response_tags_are_frozen() {
+fn protocol_37_response_tags_are_frozen() {
     assert_eq!(
         variants::<Response>(),
         [
@@ -127,6 +128,7 @@ fn protocol_36_response_tags_are_frozen() {
             "RelocationPage",      // 26
             "ProvisionDatabase",   // 27
             "DropDatabase",        // 28
+            "CoordinatorLease",    // 29
         ]
     );
 }
@@ -151,6 +153,14 @@ fn bincode_tag_is_the_declaration_index() {
         (Request::PartitionStats, 12),
         (Request::LiveTargetStats, 15),
         (Request::ProcessResources { epoch: 3 }, 23),
+        (
+            Request::RenewCoordinatorLease {
+                authority_epoch: 4,
+                holder: [7; 16],
+                duration_ms: 5_000,
+            },
+            31,
+        ),
     ] {
         assert_eq!(encode(&request)[..4], tag.to_le_bytes());
     }
@@ -160,6 +170,10 @@ fn bincode_tag_is_the_declaration_index() {
         ))
         .expect("encode response");
     assert_eq!(reply[..4], 2u32.to_le_bytes());
+    let reply = wire_codec(HARD_FRAME_LIMIT)
+        .serialize(&Response::CoordinatorLease { granted_ms: 5_000 })
+        .expect("encode response");
+    assert_eq!(reply[..4], 29u32.to_le_bytes());
 }
 
 /// `ResolveLiveRecords` is keyed by member address alone: tag 14, the authority

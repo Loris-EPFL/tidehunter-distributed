@@ -2012,6 +2012,28 @@ pub(super) fn serve_session(
                 if matches!(&envelope.body, Request::ReplayLiveWal { .. }) {
                     replay_stages.accept(envelope.id);
                 }
+                // A lease renewal is memory work of the database's lease cell,
+                // and a renewal that waits behind an exclusive fence, seal or
+                // trim would lapse a live coordinator. Answer it here, on the
+                // queued-response path, before the control queue. It touches no
+                // log or export, so `control_active` does not order it.
+                if let Request::RenewCoordinatorLease {
+                    authority_epoch,
+                    holder,
+                    duration_ms,
+                } = &envelope.body
+                {
+                    let response = match node.control_context.coordinator_lease.renew(
+                        *authority_epoch,
+                        *holder,
+                        *duration_ms,
+                    ) {
+                        Ok(granted_ms) => Response::CoordinatorLease { granted_ms },
+                        Err(error) => Response::Error(error.into()),
+                    };
+                    queue_response(&mut pending, envelope.id, response)?;
+                    continue;
+                }
                 controls.push_back((envelope.id, envelope.body));
             }
             // Dispatch newly decoded requests in this sweep, not after another

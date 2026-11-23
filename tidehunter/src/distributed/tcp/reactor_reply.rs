@@ -54,6 +54,7 @@ pub(super) fn request_kind_code(request: &Request) -> u64 {
         Request::RelocationPage { .. } => 50,
         Request::ProvisionDatabase { .. } => 51,
         Request::DropDatabase { .. } => 52,
+        Request::RenewCoordinatorLease { .. } => 53,
     }
 }
 

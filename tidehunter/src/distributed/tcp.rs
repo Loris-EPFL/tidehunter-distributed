@@ -26,6 +26,7 @@ pub use owner_transport::OwnerTransportStats;
 #[cfg(feature = "experimental-fabric")]
 pub use tidehunter_fabric::ProviderInfo;
 mod control;
+mod coordinator_lease;
 mod durable_progress;
 pub use durable_progress::{DURABLE_PROGRESS_MAX_WAIT, DurableProgressReport};
 mod generation_control;
@@ -134,7 +135,9 @@ pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// 36 (lifetime exports) removes AcquireLiveExportPin/ReleaseLiveExportPin (tags 22-23) and
 /// `NvmeofEpochPinned` (tag 13); later tags shift. Exports live as long as their files,
 /// `export_pins` leaves `WalFileObservation`, and write-protect counters join `LiveTargetStats`.
-const PROTOCOL: u32 = 36;
+/// 37 (coordinator leases) appends RenewCoordinatorLease (request 31) and its
+/// granted-duration reply (response 29).
+const PROTOCOL: u32 = 37;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -741,6 +744,15 @@ enum Request {
         authority: [u8; 32],
         generation: u64,
     },
+    /// Tag 31. Renew the coordinator lease of `authority_epoch` for `holder`.
+    /// The reactor answers it inline, ahead of the control queue, so an
+    /// exclusive fence, seal or trim cannot delay a renewal. `duration_ms` is
+    /// clamped by the owner; the reply carries the granted value.
+    RenewCoordinatorLease {
+        authority_epoch: u64,
+        holder: [u8; 16],
+        duration_ms: u32,
+    },
 }
 impl Request {
     /// Startup/recovery negotiation, durable epoch/retirement maintenance and
@@ -766,7 +778,11 @@ impl Request {
             | Self::ConnectionProfile { .. }
             | Self::OwnerTimelineArm { .. }
             | Self::OwnerTimelineFetch { .. }
-            | Self::CheckpointPosition { .. } => false,
+            | Self::CheckpointPosition { .. }
+            // A lease renewal is memory work on a lease thread: it must not
+            // wait for a lifecycle-class budget, and the data timeout bounds
+            // the request's own flight.
+            | Self::RenewCoordinatorLease { .. } => false,
             // A long-poll parks for its capped wait on top of the data-path SLA.
             Self::DurableProgress { max_wait_ms, .. } => {
                 return data_timeout.saturating_add(durable_progress::capped_wait(*max_wait_ms));
@@ -931,6 +947,8 @@ enum Response {
     },
     /// Tag 28.
     DropDatabase { database: [u8; 16], generation: u64 },
+    /// Tag 29. The clamped lease duration this owner granted.
+    CoordinatorLease { granted_ms: u32 },
 }
 
 /// Named error of a benchmark evidence request this owner build cannot serve.
@@ -1011,6 +1029,7 @@ impl StorageNode {
             max_device_reads_per_status,
             transport: Arc::default(),
             live_control_gate: Mutex::new(()),
+            coordinator_lease: Arc::new(coordinator_lease::CoordinatorLeaseCell::new()),
             #[cfg(test)]
             before_fence: Mutex::new(None),
         });
@@ -1388,6 +1407,9 @@ pub struct Client {
     live_counters: Option<Arc<super::nvmeof::live_metrics::LiveNvmeCounters>>,
     live_metrics: Option<Arc<super::nvmeof::live_metrics::LiveNvmeMetrics>>,
     progress_wait: Option<progress_wait::ClientProgressWait>,
+    /// The coordinator's lease on this owner, when this client is a write
+    /// worker's client. Leased writes check it before every submission.
+    lease_validity: Option<Arc<super::remote_db::coordinator_lease::LeaseValidity>>,
 }
 impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.

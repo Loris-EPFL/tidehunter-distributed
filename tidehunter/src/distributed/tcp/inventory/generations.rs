@@ -751,12 +751,13 @@ impl NodeInventory {
     /// gates, phase 2 with no gate held.
     ///
     /// The queue slot of the request stays exclusive for all three phases
-    /// (`control_active`), so queued live-lane lease renewals still wait
-    /// behind the deletion. Do not call this from an online trigger until the
-    /// deletion runs off the control queue or lease renewal is exempt from
-    /// `control_active` (see the generation-trim section of
-    /// `docs/distributed/ARCHITECTURE.md`). Today the trim request comes only
-    /// from the coordinator's open-time `maintain`, before any serving session.
+    /// (`control_active`), so every other queued control waits behind the
+    /// deletion. A coordinator lease renewal is exempt: the reactor answers it
+    /// inline, ahead of the queue (protocol 37). Do not call this from an
+    /// online trigger until the deletion runs off the control queue (see the
+    /// generation-trim section of `docs/distributed/ARCHITECTURE.md`). Today
+    /// the trim request comes only from the coordinator's open-time
+    /// `maintain`, before any serving session.
     pub(in crate::distributed::tcp) fn trim_generation_online(
         inventory: &Mutex<NodeInventory>,
         lifecycle: &LifecycleGate,
