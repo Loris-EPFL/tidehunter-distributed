@@ -30,6 +30,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = { version = "2", optional = true }
 redis = { version = "=1.8.0", default-features = false, features = ["cluster-async", "tokio-comp"], optional = true }
 
+[dev-dependencies]
+# Test fixtures hold a `TempDir` so a panicking test still removes its tree.
+# Already in Cargo.lock through the orchestrator and the benchmark crates.
+tempfile = "3.20.0"
+
 [features]
 default = []
 tikv = ["dep:tikv-client", "dep:reqwest", "dep:tonic"]
