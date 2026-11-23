@@ -1809,11 +1809,21 @@ fn test_wal_relocation_exists_agrees_with_get_on_stale_l1() {
 // A row of an auto-sharded cell lives only in an L1 shard when the pass
 // copies it. The relocation view must include the shards, and the relocated
 // copy must re-point the shard entry.
+//
+// Premise: the cell's L1 must be sharded before the pass starts. Only a
+// promote splits L1, and a promote writes only the entries below the cut the
+// requester captured (`FlushKind::Flush::cut`, filtered by `retain_processed`
+// in `flusher.rs`). A flush dispatched by the insert loop can therefore carry
+// a partial image, write L0 instead of promoting, and leave the split to
+// tracker timing. The rows stay below `max_dirty_keys`, so no flush runs
+// while they are written; the tracker barrier then pins the frontier past all
+// of them, and the rebuild dispatches one flush whose promote sees the whole
+// cell.
 fn sharded_cell_keeps_rows(filtered: bool) {
     let mut config = Config::small();
     config.frag_size = 64 * 1024;
     config.wal_file_size = 2 * config.frag_size;
-    config.max_dirty_keys = 8;
+    config.max_dirty_keys = 4096;
     config.l0_max_entries = Some(16);
     config.snapshot_unload_threshold = 0;
     config.snapshot_written_bytes = u64::MAX;
@@ -1843,8 +1853,28 @@ fn sharded_cell_keeps_rows(filtered: bool) {
     batch.write(ks, class_key(KEEP, 1), value.clone());
     batch.write(ks, class_key(STOP, 0), value.clone());
     batch.commit().unwrap();
-    db.large_table.flusher.barrier();
+    // Rows written before the barrier: the KEEP 0 row, the REMOVE filler, and
+    // the two batch rows.
+    let bulk_rows = number as usize + 3;
+    assert!(
+        bulk_rows < config.max_dirty_keys,
+        "{bulk_rows} bulk rows must stay below max_dirty_keys={} so that no \
+         insert dispatches a flush from an older frontier",
+        config.max_dirty_keys,
+    );
+    let l0_threshold = config
+        .l0_max_entries
+        .expect("the fixture sets l0_max_entries");
+    assert!(
+        bulk_rows > l0_threshold,
+        "the promote needs more rows than l0_max_entries: {bulk_rows} rows, \
+         threshold {l0_threshold}",
+    );
+    // Pin the frontier past every row, then flush. The rebuild requests the
+    // flush with that pinned frontier, so the promote below it retains every
+    // row and the L1 image exceeds the shard threshold.
     db.wal_writer.wal_tracker_barrier();
+    db.force_rebuild_control_region().unwrap();
     assert!(
         metrics.l1_shard_split_total.with_label_values(&["k"]).get() > 0,
         "the fixture must shard the cell's L1"
