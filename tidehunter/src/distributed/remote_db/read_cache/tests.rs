@@ -436,6 +436,11 @@ fn per_keyspace_counters_follow_lookup_and_evicted_entry_ownership() {
         }
     }
     let (overflow_ref, overflow_mutation) = overflow.expect("collision candidate");
+    // RejectFirst: a key seen once may not displace a resident that was
+    // seen twice (every resident here was missed once and then inserted).
+    // The second miss admits the candidate; the cold target then evicts.
+    assert!(cache.get(&overflow_ref).is_none());
+    assert!(cache.get(&overflow_ref).is_none());
     assert!(cache.insert_verified(overflow_ref, &overflow_mutation));
 
     let stats = cache.per_keyspace_stats();
@@ -449,7 +454,7 @@ fn per_keyspace_counters_follow_lookup_and_evicted_entry_ownership() {
         }
     );
     assert_eq!(stats[1].hits, 1);
-    assert_eq!(stats[1].misses, (WAYS - 1) as u64);
+    assert_eq!(stats[1].misses, (WAYS + 1) as u64);
     assert_eq!(stats[1].inserts, WAYS as u64);
     assert_eq!(stats[1].evictions, 0);
     assert_eq!(
