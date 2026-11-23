@@ -65,16 +65,9 @@ impl NodeInventory {
         // the totals differ, some pin is not attributable to a file.
         let attributed: u64 = leases.values().sum();
         let exact = log_read_pins == Some(attributed);
-        let mut exports: BTreeMap<u64, u64> = BTreeMap::new();
-        for (_, (source, file)) in self.live_export_pins.values() {
-            if *source == source_generation {
-                *exports.entry(*file).or_default() += 1;
-            }
-        }
         for row in &mut reply.rows {
             let file = row.file_start / bytes;
             row.read_pins = exact.then(|| leases.get(&file).copied().unwrap_or(0));
-            row.export_pins = Some(exports.get(&file).copied().unwrap_or(0));
             row.target_access = match self.live_bindings.get(&(source_generation, file)) {
                 Some((_, _, true)) => TargetAccess::Writable,
                 Some((_, _, false)) => TargetAccess::ReadOnly,

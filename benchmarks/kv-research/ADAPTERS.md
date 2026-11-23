@@ -373,11 +373,11 @@ index position carries.
 
 A caller that can authenticate to the owner control channel already has more
 access than one address. It can obtain whole live files of its own authority
-epoch and partition through `OpenLiveExports` (tag 19) and
-`AcquireLiveExportPin` (tag 22). It can read the frames of retained generations
-through `ReplayLiveWal` (tag 21). Address keying therefore adds no access to
-files of that owner. It narrows one thing: a pin now covers one range, not one
-whole file.
+epoch and partition through `OpenLiveExports` (tag 19). A permanent export now
+lives as long as its file, and sealing write-protects it instead of revoking it.
+It can read the frames of retained generations through `ReplayLiveWal` (tag 21).
+Address keying therefore adds no access to files of that owner. It narrows one
+thing: a record pin covers one range, not one whole file.
 
 A retired range answers `NotFound`. The coordinator re-resolves once. Then it
 returns the typed error "value evicted during read".

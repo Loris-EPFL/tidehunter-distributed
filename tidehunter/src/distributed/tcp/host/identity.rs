@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 
 /// Prefix of every effective initiator NQN (`nqn.<date>.<reverse domain>:`).
-const NQN_PREFIX: &str = "nqn.2026-01.local.tidehunter:";
+pub(crate) const NQN_PREFIX: &str = "nqn.2026-01.local.tidehunter:";
 const INITIATOR_DOMAIN: &[u8] = b"tidehunter-db-initiator-v1";
 const PRINCIPAL_DOMAIN: &[u8] = b"tidehunter-owner-client-trust-v1";
 

@@ -476,7 +476,10 @@ pub(super) mod live_fencing {
                 address: "127.0.0.1".into(),
                 service: 4420,
                 transport: NvmeofTransport::Tcp,
-                host_nqn: "nqn.2026-01.local.test:live-fence".into(),
+                host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+                    &config.partition.inventory.database,
+                    config.partition.partition,
+                ),
                 port_id: 42,
                 state_dir,
                 commissioning_port_id: 43,
@@ -596,6 +599,7 @@ pub(super) mod live_fencing {
                     inventory,
                     slot.as_mut().unwrap(),
                     &segment,
+                    false,
                 )
             })
             .unwrap();
@@ -625,6 +629,7 @@ pub(super) mod live_fencing {
                     inventory,
                     slot.as_mut().unwrap(),
                     &changed,
+                    false,
                 )
             })
             .unwrap_err()
@@ -686,7 +691,7 @@ pub(super) mod live_fencing {
     }
 
     #[test]
-    fn prepared_never_granted_exports_are_revoked_on_fence_and_seal() {
+    fn prepared_never_granted_exports_survive_fence_and_seal() {
         for seal in [false, true] {
             let temp = tempdir::TempDir::new("prepared-retirement").unwrap();
             let (_, node) = open_live(temp.path(), DurabilityTier::Native);
@@ -706,11 +711,14 @@ pub(super) mod live_fencing {
                 fence(&node, 2).unwrap();
             }
             assert_eq!(node.control.preparer_count(), 0);
+            // A permanent export lives as long as its file: a fence
+            // write-protects it instead of removing it, while a shutdown
+            // reconciles every scoped object away.
             assert_eq!(
                 node.with_live_target(|target| target.stats())
                     .unwrap()
                     .owned_namespace_count,
-                0
+                if seal { 0 } else { 2 }
             );
         }
     }
@@ -812,20 +820,19 @@ pub(super) mod live_fencing {
         );
     }
 
-    /// A grant whose export is paused inside a target journal sync holds only
+    /// A grant whose export is paused inside a configfs mutation holds only
     /// the lifecycle gate: an inventory reader and a position proof on another
-    /// control worker complete while the sync is still paused.
+    /// control worker complete while the export is still paused.
     #[test]
-    fn foreground_work_proceeds_while_a_target_journal_sync_is_paused() {
-        use crate::distributed::nvmeof::live_target::SaveStep;
-        let temp = tempdir::TempDir::new("paused-target-journal").unwrap();
+    fn foreground_work_proceeds_while_a_target_export_is_paused() {
+        let temp = tempdir::TempDir::new("paused-target-export").unwrap();
         let (_, node) = open_live(temp.path(), DurabilityTier::Native);
         let (entered, paused) = mpsc::sync_channel(1);
         let (resume, resumed) = mpsc::sync_channel::<()>(1);
         let mut armed = true;
         node.with_live_target(|target| {
-            target.set_save_hook(Box::new(move |step| {
-                if armed && step == SaveStep::Prepared {
+            target.set_configfs_hook(Box::new(move |_index| {
+                if armed {
                     armed = false;
                     entered.send(()).map_err(io::Error::other)?;
                     // `resume` drops on test unwind, so this cannot hang.
@@ -845,7 +852,7 @@ pub(super) mod live_fencing {
         let inventory = node
             .inventory
             .try_lock_for(Duration::from_secs(5))
-            .expect("inventory is held across a target journal sync");
+            .expect("inventory is held across a target export");
         assert!(inventory.active(1).is_ok());
         drop(inventory);
         let (completed, completions) = mpsc::sync_channel(1);
@@ -901,12 +908,20 @@ pub(super) mod live_fencing {
     #[test]
     fn preparer_export_failure_poison_fences() {
         let temp = tempdir::TempDir::new("prepared-publication-error").unwrap();
-        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
         let log = node.inventory.lock().active(1).unwrap();
         log.lease_live_extent(RequestAuthority { epoch: 1 })
             .unwrap();
-        // The registry's pending path must be a regular file.
-        fs::create_dir(temp.path().join("target/.live-target.pending")).unwrap();
+        // A regular file where the export must create its subsystem makes
+        // publication fail after the lease exists.
+        let name = crate::distributed::nvmeof::live_storage::wal_export_name(
+            crate::distributed::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+            config.partition.inventory.database,
+            config.partition.partition,
+            1,
+            0,
+        );
+        fs::write(temp.path().join("configfs/subsystems").join(&name.nqn), b"").unwrap();
         node.control.shared.trigger_file_preparation(&log);
         wait_prepared(&log, 0);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -976,16 +991,8 @@ pub(super) mod live_fencing {
         );
         let receipt = log.receipt_page(0, 1).unwrap()[0];
         let reference = batch.record_reference(receipt.address(), 0).unwrap();
-        let segment = &leased.extent.segment;
-        let file = LiveFileIdentity {
-            path: segment.path.clone(),
-            device: segment.device,
-            inode: segment.inode,
-            bytes: segment.bytes,
-            block_size: segment.block_size,
-        };
-        // Pin release and idle reaping must retain this exact permanent export
-        // both before and after the preparer publishes the next WAL file.
+        // Pin release must retain this exact permanent export both before and
+        // after the preparer publishes the next WAL file.
         for prepared in [false, true] {
             if prepared {
                 resume.send(()).unwrap();
@@ -998,11 +1005,6 @@ pub(super) mod live_fencing {
                 NodeInventory::release_live_pin(inventory, slot.as_mut(), 1, token).unwrap();
                 assert!(!inventory.live_pins.contains_key(&token));
                 let target = slot.as_mut().unwrap();
-                NodeInventory::reap_idle_live_segments(inventory, target, 1).unwrap();
-                assert_eq!(
-                    target.binding_for_file(&file).as_ref(),
-                    Some(&leased.binding)
-                );
                 assert_eq!(
                     target.stats().unwrap().owned_namespace_count,
                     if prepared { 2 } else { 1 }
@@ -1074,10 +1076,6 @@ pub(super) mod live_fencing {
                 assert_eq!(stats.owned_namespace_count, expected_namespaces);
                 assert!(leased.binding.permanent);
             }
-            node.with_lifecycle(|inventory, slot| {
-                NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 1)
-            })
-            .unwrap();
             assert_eq!(
                 node.with_live_target(|target| target.stats())
                     .unwrap()
@@ -1199,7 +1197,10 @@ pub(super) mod live_fencing {
         leased
     }
 
-    fn fence(node: &StorageNode, epoch: u64) -> Result<Response, TcpError> {
+    pub(in crate::distributed::tcp::control) fn fence(
+        node: &StorageNode,
+        epoch: u64,
+    ) -> Result<Response, TcpError> {
         let (completed, completions) = mpsc::sync_channel(1);
         assert!(command(node, 1, Request::Fence { epoch }, 1, &completed).is_ok());
         receive(&completions, 1).response
@@ -1222,7 +1223,11 @@ pub(super) mod live_fencing {
         }
     }
 
-    fn leased_history(node: &StorageNode, config: &NodeConfig, extents: usize) -> u64 {
+    pub(in crate::distributed::tcp::control) fn leased_history(
+        node: &StorageNode,
+        config: &NodeConfig,
+        extents: usize,
+    ) -> u64 {
         let Response::LiveLeased(mut leased) =
             extent_exchange(node, Request::LeaseLiveExtent { epoch: 1 })
         else {
@@ -1290,7 +1295,7 @@ pub(super) mod live_fencing {
         assert_eq!(page.entries.len(), 1);
         let entry = &page.entries[0];
         assert!(entry.binding.readonly);
-        assert!(!entry.binding.permanent);
+        assert!(entry.binding.permanent);
         let mut bytes = vec![0; entry.len as usize];
         fs::File::open(&entry.segment.path)
             .unwrap()
@@ -1339,7 +1344,10 @@ pub(super) mod live_fencing {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            host_nqn: "nqn.2026-01.local.test:trim-tombstones".into(),
+            host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+                &config.partition.inventory.database,
+                config.partition.partition,
+            ),
             port_id: 42,
             state_dir: state_dir.clone(),
             commissioning_port_id: 43,
@@ -1435,82 +1443,27 @@ pub(super) mod live_fencing {
             let temp = tempdir::TempDir::new("retained-history-pages").unwrap();
             let (config, node) = open_live(temp.path(), DurabilityTier::Native);
             let end = leased_history(&node, &config, 2);
-            assert_eq!(target_stats(&node).owned_namespace_count, 0);
+            // The fence that sealed the stream write-protects its exports and
+            // keeps them for the life of their files.
+            assert!(target_stats(&node).owned_namespace_count > 0);
             let first = history_page(&node, &config, 0, end, 0);
             let exposed = target_stats(&node).namespaces_exposed;
             release_history_page(&node, &first);
-            node.with_lifecycle(|inventory, slot| {
-                NodeInventory::reap_idle_live_segments(inventory, slot.as_mut().unwrap(), 2)
-            })
-            .unwrap();
-            let retained = true;
-            assert_eq!(
-                target_stats(&node).owned_namespace_count,
-                u64::from(retained)
-            );
+            assert!(target_stats(&node).owned_namespace_count > 0);
             let second = history_page(&node, &config, first.next.unwrap() as u64, end, 1);
             assert_eq!(first.entries[0].segment, second.entries[0].segment);
-            assert_eq!(
+            assert!(
                 first.entries[0].binding == second.entries[0].binding,
-                retained
+                "the sealed page reused a different export binding"
             );
-            assert_eq!(
-                target_stats(&node).namespaces_exposed,
-                exposed + u64::from(!retained)
-            );
+            assert_eq!(target_stats(&node).namespaces_exposed, exposed);
             release_history_page(&node, &second);
-            // A higher-epoch reopen's replayed history remains readable, but
-            // no export survives the following authority cut.
+            // A higher-epoch fence write-protects the exports; they remain
+            // readable until their files are retired or the owner shuts down.
             fence(&node, 3).unwrap();
-            assert_eq!(target_stats(&node).owned_namespace_count, 0);
+            assert!(target_stats(&node).owned_namespace_count > 0);
             shutdown(&node, 3);
         }
-    }
-
-    #[test]
-    fn readonly_export_connection_pin_survives_record_release_and_idle_history_eviction() {
-        let temp = tempdir::TempDir::new("pinned-history-export").unwrap();
-        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let count = 2 * (super::super::inventory::MAX_IDLE_HISTORY_EXPORTS + 2);
-        let end = leased_history(&node, &config, count);
-        let first = history_page(&node, &config, 0, end, 0);
-        let entry = &first.entries[0];
-        let Response::NvmeofEpochPinned(token) = extent_exchange(
-            &node,
-            Request::AcquireLiveExportPin {
-                epoch: 2,
-                segment: entry.segment.clone(),
-                binding: entry.binding.clone(),
-            },
-        ) else {
-            panic!("expected export pin")
-        };
-        let file = LiveFileIdentity {
-            path: entry.segment.path.clone(),
-            device: entry.segment.device,
-            inode: entry.segment.inode,
-            bytes: entry.segment.bytes,
-            block_size: entry.segment.block_size,
-        };
-        let mut next = first.next;
-        release_history_page(&node, &first);
-        for sequence in 1..count {
-            let page = history_page(&node, &config, next.unwrap() as u64, end, sequence as u64);
-            next = page.next;
-            release_history_page(&node, &page);
-        }
-        assert_eq!(node.inventory.lock().live_export_pins.len(), 1);
-        assert_eq!(
-            node.with_live_target(|target| target.binding_for_file(&file)),
-            Some(entry.binding.clone()),
-        );
-        assert!(matches!(
-            extent_exchange(&node, Request::ReleaseLiveExportPin { epoch: 2, token }),
-            Response::NvmeofEpochReleased,
-        ));
-        assert!(node.inventory.lock().live_export_pins.is_empty());
-        fence(&node, 3).unwrap();
-        shutdown(&node, 3);
     }
 
     #[test]
@@ -1522,29 +1475,21 @@ pub(super) mod live_fencing {
             let page = history_page(&node, &config, 0, end, 0);
             let segment = &page.entries[0].segment;
             release_history_page(&node, &page);
-            assert_eq!(target_stats(&node).owned_namespace_count, 1);
+            assert!(target_stats(&node).owned_namespace_count > 0);
             node.with_lifecycle(|inventory, slot| {
                 let target = slot.as_mut().unwrap();
                 assert_eq!(
-                    NodeInventory::publish_live_segment(
-                        inventory,
-                        target,
-                        segment,
-                        true,
-                        inventory::InlineExport::Lease,
-                    )
-                    .err()
-                    .unwrap()
-                    .to_string(),
-                    "live segment identity or access changed"
-                );
-                assert_eq!(
-                    NodeInventory::publish_permanent_segment(inventory, target, segment)
+                    NodeInventory::publish_permanent_segment(inventory, target, segment, false)
                         .err()
                         .unwrap()
                         .to_string(),
                     "live segment identity or access changed"
                 );
+                let (binding, created) =
+                    NodeInventory::publish_permanent_segment(inventory, target, segment, true)
+                        .unwrap();
+                assert!(!created, "a sealed page reused its existing export");
+                assert!(binding.readonly, "a sealed page stayed read-only");
             });
             assert_eq!(
                 fence(&node, 1).err().unwrap().to_string(),
@@ -1556,7 +1501,7 @@ pub(super) mod live_fencing {
                         extent_exchange(&node, Request::Seal { epoch: 2 }),
                         Response::Sealed
                     ));
-                    assert_eq!(target_stats(&node).owned_namespace_count, 0);
+                    assert!(target_stats(&node).owned_namespace_count > 0);
                     fence(&node, 3).unwrap();
                     assert!(matches!(
                         extent_exchange(
@@ -1608,67 +1553,6 @@ pub(super) mod live_fencing {
                 assert!(!segment.path.exists(), "retirement must unlink the WAL");
             }
         }
-    }
-
-    #[test]
-    fn retained_history_cache_evicts_oldest_unpinned_export_not_an_inflight_page() {
-        let temp = tempdir::TempDir::new("retained-history-bound").unwrap();
-        let (config, node) = open_live(temp.path(), DurabilityTier::Native);
-        let bound = inventory::MAX_IDLE_HISTORY_EXPORTS;
-        let end = leased_history(&node, &config, (bound + 2) * 2);
-        let mut from = 0;
-        let mut first_binding = None;
-        let mut second_binding = None;
-        for sequence in 0..bound * 2 {
-            let page = history_page(&node, &config, from, end, sequence as u64);
-            from = page.next.unwrap() as u64;
-            if sequence == 0 {
-                first_binding = Some(page.entries[0].binding.clone());
-            }
-            if sequence == 2 {
-                second_binding = Some(page.entries[0].binding.clone());
-            }
-            release_history_page(&node, &page);
-            assert!(target_stats(&node).owned_namespace_count <= bound as u64);
-        }
-        // Repin the oldest file and keep that page in flight while a new
-        // history file needs cache space. It must not be an eviction victim.
-        let pinned = history_page(&node, &config, 0, end, 0);
-        assert_eq!(Some(&pinned.entries[0].binding), first_binding.as_ref());
-        let new = history_page(&node, &config, from, end, (bound * 2) as u64);
-        from = new.next.unwrap() as u64;
-        node.with_lifecycle(|inventory, slot| {
-            NodeInventory::release_live_pin(inventory, slot.as_mut(), 2, new.epoch_pin_token)
-        })
-        .unwrap();
-        assert_eq!(
-            target_stats(&node).owned_namespace_count,
-            (bound + 1) as u64
-        );
-        release_history_page(&node, &pinned);
-        assert_eq!(target_stats(&node).owned_namespace_count, bound as u64);
-        assert!(
-            !temp
-                .path()
-                .join("configfs/subsystems")
-                .join(&second_binding.unwrap().nqn)
-                .exists(),
-            "the oldest unpinned history export must be revoked"
-        );
-        // One more new file evicts file 2 (file 1 was evicted when the pinned
-        // page joined the idle cache); the recently pinned file 0 survives.
-        let skip = history_page(&node, &config, from, end, (bound * 2 + 1) as u64);
-        from = skip.next.unwrap() as u64;
-        release_history_page(&node, &skip);
-        let next = history_page(&node, &config, from, end, (bound * 2 + 2) as u64);
-        release_history_page(&node, &next);
-        assert_eq!(target_stats(&node).owned_namespace_count, bound as u64);
-        let reread = history_page(&node, &config, 0, end, 0);
-        assert_eq!(Some(&reread.entries[0].binding), first_binding.as_ref());
-        release_history_page(&node, &reread);
-        fence(&node, 3).unwrap();
-        assert_eq!(target_stats(&node).owned_namespace_count, 0);
-        shutdown(&node, 3);
     }
 
     fn assert_recovered(node: &StorageNode, config: &NodeConfig, receipts: &[Receipt]) {
@@ -2439,7 +2323,7 @@ fn protocol_rejects_the_previous_version() {
     let mut preface = std::io::Cursor::new(Vec::new());
     write_transport_mode(&mut preface, &Transport::TcpTrusted).unwrap();
     let mut preface = preface.into_inner();
-    assert_eq!(PROTOCOL, 35);
+    assert_eq!(PROTOCOL, 36);
     preface[4..6].copy_from_slice(&u16::try_from(PROTOCOL - 1).unwrap().to_be_bytes());
     assert!(read_transport_mode(&mut &preface[..], &Transport::TcpTrusted).is_err());
 }
@@ -2540,3 +2424,6 @@ fn max_reads_and_live_resolution_bound_are_unchanged() {
         }
     }
 }
+
+#[path = "control_tests/lifetime_export_tests.rs"]
+mod lifetime_export_tests;

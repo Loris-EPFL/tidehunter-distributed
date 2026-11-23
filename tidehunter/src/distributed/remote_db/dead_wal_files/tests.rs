@@ -289,7 +289,6 @@ fn rows_with_one_sealed_file(
         write_lease: false,
         validated_through: Some(file_start + size),
         read_pins: Some(0),
-        export_pins: Some(0),
         target_access: TargetAccess::None,
         seal,
     };

@@ -590,7 +590,6 @@ pub(crate) struct LiveTestAdoption {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BusyCause {
     RecordPin,
-    ExportPin,
     PendingCapacity,
     Other(&'static str),
 }
@@ -930,6 +929,18 @@ impl PartitionLog {
         log.state.lock().live = true;
         log.live_stream = true;
         Ok(log)
+    }
+
+    /// Durable end of this live stream's WAL root, the witness a restart
+    /// checks before any frame scan. `None` when the root is absent.
+    pub(crate) fn live_synced_end(
+        path: &Path,
+        config: &PartitionConfig,
+    ) -> Result<Option<u64>, StorageError> {
+        if !path.join(wal_replay::ROOT).exists() {
+            return Ok(None);
+        }
+        Ok(Some(wal_replay::WalRoot::open(path, config)?.synced_end))
     }
 
     /// The callback must synchronously revoke and drain all writable targets
@@ -4004,12 +4015,6 @@ impl PartitionLog {
     #[cfg(test)]
     pub(crate) fn syncer_persist_hold_reached(&self) -> bool {
         self.syncer_persist_hold_reached.load(Ordering::Acquire)
-    }
-
-    /// Fail a sealed retirement after target revoke and before root install.
-    #[cfg(test)]
-    pub(crate) fn fail_next_sealed_before_root(&self) {
-        self.fail_sealed_before_root.store(true, Ordering::Release);
     }
 
     #[cfg(test)]

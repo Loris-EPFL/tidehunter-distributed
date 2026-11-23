@@ -201,7 +201,6 @@ impl NodeInventory {
                         &revoked,
                         &serde_json::json!({
                             "record_pins": 0,
-                            "export_pins": 0,
                             "drain": "namespace_enable_0",
                         }),
                     );
@@ -345,16 +344,10 @@ impl NodeInventory {
                 }
             }
         }
-        for (_, (source, index)) in self.live_export_pins.values() {
-            let file = index * bytes;
-            if *source == epoch && files.contains(&file) {
-                log.record_busy(file, BusyCause::ExportPin);
-            }
-        }
     }
 
-    /// Any record lease or connection pin on a victim defers the request.
-    /// Pins on other files of the stream never block it.
+    /// Any record lease on a victim defers the request. Pins on other files
+    /// of the stream never block it.
     fn victims_pinned(&self, epoch: u64, files: &[u64]) -> bool {
         let bytes = self.config.partition.wal_file_bytes;
         let victim = |source: u64, file: u64| source == epoch && files.contains(&(file * bytes));
@@ -362,10 +355,7 @@ impl NodeInventory {
             leases
                 .iter()
                 .any(|lease| victim(lease.segment.epoch, lease.segment.file_index))
-        }) || self
-            .live_export_pins
-            .values()
-            .any(|(_, (source, file))| victim(*source, *file))
+        })
     }
 
     /// Prepared-successor priority: with a live target (permanent per-owner
@@ -413,7 +403,6 @@ impl NodeInventory {
             inventory.live_bindings.extend(claimed);
             return Err(error);
         }
-        inventory.idle_history_exports.retain(|key| !retired(key));
         let revoked: Vec<(u64, u64, u64)> = claimed
             .iter()
             .map(|((_, file), (segment, _, _))| (file * bytes, segment.device, segment.inode))

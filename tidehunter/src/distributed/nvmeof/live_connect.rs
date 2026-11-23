@@ -114,7 +114,7 @@ fn uuid_string(u: [u8; 16]) -> String {
         u[15]
     )
 }
-fn valid_nqn(nqn: &str) -> bool {
+pub(super) fn valid_nqn(nqn: &str) -> bool {
     nqn.starts_with("nqn.")
         && nqn.len() <= 223
         && nqn

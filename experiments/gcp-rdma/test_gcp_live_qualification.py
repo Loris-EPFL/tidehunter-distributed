@@ -46,7 +46,7 @@ def evidence():
              'checks': {'scalar_write_delete': True, 'mixed_batch': True,
                         'ordered_batch_missing_exists': True, 'checkpoint_iteration': True,
                         'flush_reopen': True, 'abrupt_tail_recovery': True,
-                        'fence_drain': True, 'cache_miss_hit': True},
+                        'fence_write_protect': True, 'cache_miss_hit': True},
              'member_transition': {'wal_file_bytes': 1048576, 'completed_write_bytes': 1114112,
                                    'completed_write_ops': 32, 'writes_acknowledged': 32,
                                    'writer_routes': [first_writer, next_writer],
@@ -61,7 +61,7 @@ def evidence():
                               'start': sample(), 'end': sample(completed_write_ops=1, completed_write_bytes=1024)},
              'abrupt_recovery': sample(recovery_read_ops=1, recovery_read_bytes=4096,
                  fences=[{'partition': 0, 'authority_epoch': 3,
-                          'target': {'fixture_only': False, 'disable_drain_successes': 1, 'errors': 0}}]),
+                          'target': {'fixture_only': False, 'fence_count': 1, 'write_protect_successes': 1, 'errors': 0}}]),
              'target_shutdown': [{'partition': 0, 'endpoint': '10.0.0.2:9400', 'epoch': 3, 'database': [1] * 16,
                                   'stats': {'fixture_only': False, 'owned_namespace_count': 0, 'errors': 0}}]}
     def counters(source, peer):

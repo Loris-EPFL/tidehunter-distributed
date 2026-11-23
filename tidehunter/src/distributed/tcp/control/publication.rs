@@ -4,7 +4,7 @@
 //! lease type and the inline-export kind are absolute and the published-lease
 //! alias is parent-relative because this module is one level deeper. Lock
 //! order: live-control gate, lifecycle gate, inventory; every export below
-//! releases the inventory across its journal syncs and configfs work.
+//! releases the inventory across its configfs and controller work.
 
 use super::*;
 
@@ -62,13 +62,20 @@ impl ControlContext {
         let mut locations = Vec::with_capacity(metadata.len());
         for (segment, offset, len) in metadata {
             let binding = match inventory.live_segment_writable(epoch, &segment) {
-                Ok(writable) => NodeInventory::publish_live_segment(
+                Ok(writable) => match NodeInventory::publish_permanent_segment(
                     &mut inventory,
                     target,
                     &segment,
-                    writable,
-                    kind,
-                ),
+                    !writable,
+                ) {
+                    Ok((binding, created)) => {
+                        if created {
+                            inventory.record_inline_export(kind);
+                        }
+                        Ok(binding)
+                    }
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             };
             match binding {
@@ -76,7 +83,7 @@ impl ControlContext {
                 Err(error) => {
                     // Publication can fail after creating a kernel capability.
                     // Keep its in-memory epoch pin and file leases quarantined;
-                    // the durable target registry is drained on restart.
+                    // the scoped configfs objects are reconciled on restart.
                     drop(inventory);
                     drop(lifecycle);
                     drop(gate);

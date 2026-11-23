@@ -167,30 +167,3 @@ fn write_model_leased_seeded_crashes() {
         }
     }
 }
-
-#[test]
-fn write_model_leased_reopen_rejects_missing_registry() {
-    let mut fixture = Fixture::new_with_root(
-        tempdir::TempDir::new("write-model-missing-registry").unwrap(),
-        1,
-        128,
-        KeyShape::new_single(4, 8, KeyType::uniform(8)),
-        2,
-        |config| configure(config, profile(0)),
-        |_| {},
-    );
-    let root = fixture.startups[0].0.root.clone();
-    fixture.stop_owners();
-    let registry = root.join("live-target/live-target.json");
-    assert!(registry.is_file());
-    fs::remove_file(&registry).unwrap();
-    let error = fixture.restart_owners().unwrap_err();
-    assert!(
-        error.to_string().contains("open target state registry"),
-        "{error}"
-    );
-    assert!(
-        !registry.exists(),
-        "reopen recreated a missing commissioned registry"
-    );
-}

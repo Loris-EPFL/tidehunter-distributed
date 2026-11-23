@@ -242,12 +242,13 @@ fn verify_fences(sample: &serde_json::Value, partitions: &[u32]) -> BackendResul
                         .and_then(serde_json::Value::as_u64)
                         .is_some_and(|epoch| epoch >= 2)
                     && f["target"]["fixture_only"] == false
-                    && f["target"]["disable_drain_successes"]
+                    && f["target"]["fence_count"].as_u64().is_some_and(|n| n > 0)
+                    && f["target"]["write_protect_successes"]
                         .as_u64()
                         .is_some_and(|n| n > 0)
                     && f["target"]["errors"].as_u64() == Some(0)
             }),
-            "missing observed target namespace fence/drain",
+            "missing observed target namespace fence/write-protect",
         )?;
     }
     Ok(())
@@ -1236,7 +1237,7 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery,
         "after_crash_reads": after_crash_reads, "target_reuse": target_reuse,
         "target_shutdown": target_shutdown,
-        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_drain":true,"cache_miss_hit":true,"target_reuse":true}
+        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_write_protect":true,"cache_miss_hit":true,"target_reuse":true}
     });
     fs::write(
         output.join("qualification.json"),
@@ -1305,7 +1306,8 @@ mod tests {
                     "controller":{"queue_count":2, "sqsize":31, "sysfs_device":22, "sysfs_inode":9}}
             }],
             "fences":[{"partition":0,"authority_epoch":2,
-                "target":{"fixture_only":false,"disable_drain_successes":1,"errors":0}}]
+                "target":{"fixture_only":false,"fence_count":1,
+                    "write_protect_successes":1,"errors":0}}]
         });
         assert!(verify_routes(&sample, "rdma").is_ok());
         assert!(verify_routes(&sample, "tcp").is_err());
@@ -1313,8 +1315,13 @@ mod tests {
         sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(true);
         assert!(verify_fences(&sample, &[0]).is_err());
         sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(false);
-        sample["fences"][0]["target"]["disable_drain_successes"] = serde_json::json!(0);
+        sample["fences"][0]["target"]["write_protect_successes"] = serde_json::json!(0);
         assert!(verify_fences(&sample, &[0]).is_err());
+        sample["fences"][0]["target"]["write_protect_successes"] = serde_json::json!(1);
+        sample["fences"][0]["target"]["fence_count"] = serde_json::json!(0);
+        assert!(verify_fences(&sample, &[0]).is_err());
+        sample["fences"][0]["target"]["fence_count"] = serde_json::json!(1);
+        assert!(verify_fences(&sample, &[0]).is_ok());
         sample["route_evidence_dropped"] = serde_json::json!(1);
         assert!(verify_routes(&sample, "rdma").is_err());
         sample["route_evidence_dropped"] = serde_json::json!(0);

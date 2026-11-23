@@ -33,9 +33,6 @@ pub(super) enum OpenMode {
     /// A Ready host entry requires the surviving ledger and target identity.
     Ready,
 }
-// Bound idle history namespaces, subsystem objects and pinned target FDs
-// independently of WAL history size. In-flight pages keep their separate pins.
-pub(super) const MAX_IDLE_HISTORY_EXPORTS: usize = 16;
 /// The owner request that created a live export inline, while its caller
 /// waited; selects the `LiveInlineExportStats` field it counts in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,8 +318,6 @@ pub struct NodeInventory {
     /// itself runs: a live file without a binding breaks `OpenLiveExports`.
     #[cfg(test)]
     retirement_revoke_report_skips: Vec<(u64, u64)>,
-    // Least recently released first; only unpinned readonly bindings enter.
-    idle_history_exports: std::collections::VecDeque<(u64, u64)>,
     pub(super) live_pins: BTreeMap<
         [u8; 16],
         (
@@ -330,12 +325,6 @@ pub struct NodeInventory {
             Vec<super::super::nvmeof::live_storage::LiveRecordLease>,
         ),
     >,
-    // Connection pins are distinct from record/page pins. One bounded pool
-    // entry owns one token until its controller is confirmed disconnected.
-    pub(super) live_export_pins: BTreeMap<[u8; 16], (u64, (u64, u64))>,
-    // At most 1024 outstanding tokens are fenced per retained epoch. Keep
-    // tombstones so only tokens actually cleared by a fence are idempotent.
-    fenced_export_pins: BTreeMap<[u8; 16], u64>,
     lock: Arc<DbLock>,
 }
 
@@ -576,6 +565,25 @@ impl NodeInventory {
                 Err(error) => return Err(error.into()),
             }
         };
+        // A live WAL file that is already empty or overlong is corrupt before
+        // the target open seals it; refuse it with its named cause so the
+        // recovery scan never meets a bare short read.
+        for epoch in &manifest.epochs {
+            if matches!(epoch.state, EpochState::Active | EpochState::Sealed) {
+                let path = epoch_path(&config.root, epoch.epoch);
+                if PartitionLog::is_live_path(&path).map_err(TcpError::component)? {
+                    let expected = partition_at(&config.partition, epoch.epoch);
+                    let synced = PartitionLog::live_synced_end(&path, &expected)
+                        .map_err(TcpError::component)?;
+                    super::super::nvmeof::live_target::verify_live_epoch_sizes(
+                        &path,
+                        expected.wal_file_bytes,
+                        synced,
+                    )
+                    .map_err(TcpError::component)?;
+                }
+            }
+        }
         // A durably intended trim names the only directory open accepts without
         // a ledger entry. Finish it before any log is recovered or published.
         generations::resume_trim(&config.root, &mut manifest, live_target.as_mut())?;
@@ -600,14 +608,20 @@ impl NodeInventory {
                     let path = epoch_path(&config.root, epoch.epoch);
                     directory(&path)?;
                     let expected = partition_at(&config.partition, epoch.epoch);
+                    let active = epoch.state == EpochState::Active;
                     let log = if PartitionLog::is_live_path(&path).map_err(TcpError::component)? {
-                        if live_target.is_none() {
-                            return Err(TcpError::new(
+                        let target = live_target.as_mut().ok_or_else(|| {
+                            TcpError::new(
                                 "live WAL recovery requires its configured target manager",
-                            ));
-                        }
+                            )
+                        })?;
                         // Manager::open already synchronously revoked and drained
-                        // the persisted targets while the root lock was held.
+                        // the persisted targets while the root lock was held. The
+                        // marker identity is checked before any WAL read, so a
+                        // truncated or replaced backing file names its cause.
+                        target
+                            .verify_live_epoch(&path, active)
+                            .map_err(TcpError::component)?;
                         PartitionLog::recover_live_sealed(&path, &expected, metrics.clone(), || {
                             Ok(())
                         })
@@ -666,10 +680,7 @@ impl NodeInventory {
             live_bindings: BTreeMap::new(),
             #[cfg(test)]
             retirement_revoke_report_skips: Vec::new(),
-            idle_history_exports: std::collections::VecDeque::new(),
             live_pins: BTreeMap::new(),
-            live_export_pins: BTreeMap::new(),
-            fenced_export_pins: BTreeMap::new(),
             lock,
         })
     }
@@ -814,39 +825,26 @@ impl NodeInventory {
                 readers.invalidate();
                 readers.logs.clear();
             }
-            Self::revoke_live_targets(inventory, target)?;
+            let sealing = inventory
+                .manifest
+                .epochs
+                .last()
+                .filter(|e| e.state == EpochState::Active)
+                .map(|e| e.epoch);
+            if let Some(sealing) = sealing {
+                Self::protect_live_targets(inventory, target, sealing)?;
+            }
             let inventory = &mut **inventory;
-            inventory.fenced_export_pins.extend(
-                inventory
-                    .live_export_pins
-                    .iter()
-                    .map(|(token, (epoch, _))| (*token, *epoch)),
-            );
             let record_pins: Vec<_> = inventory
                 .live_pins
                 .iter()
                 .map(|(token, (_, leases))| (*token, r1_events::lease_files(leases)))
                 .collect();
-            let export_pins: Vec<_> = inventory
-                .live_export_pins
-                .iter()
-                .map(|(token, (_, key))| (*token, *key))
-                .collect();
             // Dropping the record leases releases their inode/read pins.
             inventory.live_pins.clear();
-            inventory.live_export_pins.clear();
             if let Some(events) = inventory.r1_events.as_mut() {
                 for (token, files) in record_pins {
                     events.pin("pin_released", "record", token, files, "fence");
-                }
-                for (token, (source, file)) in export_pins {
-                    events.pin(
-                        "pin_released",
-                        "export",
-                        token,
-                        [(source, file, None)],
-                        "fence",
-                    );
                 }
             }
         }
@@ -1019,52 +1017,30 @@ impl NodeInventory {
             .map_err(TcpError::component)?)
     }
 
-    /// Revoke idle writable on-demand exports of `epoch`. The caller holds the
-    /// lifecycle gate; the claimed bindings leave `live_bindings` before the
-    /// inventory is released, so no pin can attach to a namespace that is
-    /// being revoked, and they return if the revocation fails.
-    pub(super) fn reap_idle_live_segments<H: InventoryAccess>(
-        inventory: &mut H,
-        target: &mut LiveTarget,
-        epoch: u64,
-    ) -> Result<(), TcpError> {
-        let mut revoke = Vec::new();
-        {
-            let inventory: &NodeInventory = inventory;
-            let log = inventory.active(epoch)?;
-            for (&key, (_, binding, writable)) in &inventory.live_bindings {
-                if key.0 == epoch
-                    && *writable
-                    && !binding.permanent
-                    && !inventory
-                        .live_export_pins
-                        .values()
-                        .any(|(_, file)| *file == key)
-                    && !inventory.live_pins.values().any(|(_, leases)| {
-                        leases
-                            .iter()
-                            .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-                    })
-                    && log
-                        .can_release_live_segment(key.1)
-                        .map_err(TcpError::component)?
-                {
-                    revoke.push(key);
-                }
-            }
-        }
-        if revoke.is_empty() {
-            return Ok(());
-        }
-        let claimed: Vec<_> = revoke
+    /// Test view of the installed bindings: key, binding and writability.
+    #[cfg(test)]
+    pub(super) fn live_binding_snapshot(
+        &self,
+    ) -> Vec<(
+        (u64, u64),
+        super::super::nvmeof::live_storage::LiveTargetBinding,
+        bool,
+    )> {
+        self.live_bindings
             .iter()
-            .filter_map(|key| inventory.live_bindings.remove_entry(key))
-            .collect();
-        let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
-        if result.is_err() {
-            inventory.live_bindings.extend(claimed);
-        }
-        result
+            .map(|(key, (_, binding, writable))| (*key, binding.clone(), *writable))
+            .collect()
+    }
+
+    /// Test view of one installed binding.
+    #[cfg(test)]
+    pub(super) fn live_binding_snapshot_for(
+        &self,
+        key: (u64, u64),
+    ) -> Option<(super::super::nvmeof::live_storage::LiveTargetBinding, bool)> {
+        self.live_bindings
+            .get(&key)
+            .map(|(_, binding, writable)| (binding.clone(), *writable))
     }
 
     /// Count one export that `kind` created inline.
@@ -1080,55 +1056,19 @@ impl NodeInventory {
         *count = count.saturating_add(1);
     }
 
-    /// Return the binding of `segment`, exporting it if needed and counting
-    /// the export for the request `kind`. The caller holds the lifecycle gate;
-    /// the export's journal syncs and configfs work run with the inventory
-    /// released, and the binding is installed after.
-    pub(super) fn publish_live_segment<H: InventoryAccess>(
-        inventory: &mut H,
-        target: &mut LiveTarget,
-        segment: &super::super::nvmeof::live_storage::LiveWalSegment,
-        writable: bool,
-        kind: InlineExport,
-    ) -> Result<super::super::nvmeof::live_storage::LiveTargetBinding, TcpError> {
-        let key = (segment.epoch, segment.file_index);
-        if let Some((existing, binding, was_writable)) = inventory.live_bindings.get(&key) {
-            if existing != segment || (writable && !was_writable) {
-                return Err(TcpError::new("live segment identity or access changed"));
-            }
-            let binding = binding.clone();
-            inventory.idle_history_exports.retain(|idle| *idle != key);
-            return Ok(binding);
-        }
-        let file = live_file(segment);
-        let export_span = export_span(segment);
-        let binding = inventory
-            .released(|| {
-                if writable {
-                    target.export_writable(file)
-                } else {
-                    target.export_readonly(file)
-                }
-            })
-            .map_err(TcpError::component)?;
-        export_span.end_at(segment.file_index);
-        inventory.record_inline_export(kind);
-        inventory
-            .live_bindings
-            .insert(key, (segment.clone(), binding.clone(), writable));
-        Ok(binding)
-    }
-
-    /// Same gate contract as `publish_live_segment`, for permanent exports.
+    /// Return the permanent binding of `segment`, creating it if needed. A
+    /// sealed segment can only be resolved read-only. The caller holds the
+    /// lifecycle gate; the export runs with the inventory released.
     pub(super) fn publish_permanent_segment<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
         segment: &super::super::nvmeof::live_storage::LiveWalSegment,
+        readonly: bool,
     ) -> Result<(super::super::nvmeof::live_storage::LiveTargetBinding, bool), TcpError> {
         use super::super::nvmeof::live_storage::wal_export_name;
         let key = (segment.epoch, segment.file_index);
         if let Some((existing, binding, writable)) = inventory.live_bindings.get(&key) {
-            if existing != segment || !writable {
+            if existing != segment || (!readonly && !writable) {
                 return Err(TcpError::new("live segment identity or access changed"));
             }
             return Ok((binding.clone(), false));
@@ -1144,105 +1084,50 @@ impl NodeInventory {
         let file = live_file(segment);
         let export_span = export_span(segment);
         let binding = inventory
-            .released(|| target.export_permanent(&name, file))
+            .released(|| target.export_permanent(&name, file, readonly))
             .map_err(TcpError::component)?;
         export_span.end_at(segment.file_index);
         inventory
             .live_bindings
-            .insert(key, (segment.clone(), binding.clone(), true));
+            .insert(key, (segment.clone(), binding.clone(), !readonly));
         Ok((binding, true))
     }
 
-    fn revoke_live_targets<H: InventoryAccess>(
+    /// Write-protect every writable binding of `epoch` and mark it read-only.
+    /// Exports stay alive and readable. The caller holds the lifecycle gate;
+    /// the target's configfs and controller work runs with the inventory
+    /// released. On error the bindings are left as they were and the owner is
+    /// unhealthy, because the device outcome is unknown.
+    fn protect_live_targets<H: InventoryAccess>(
         inventory: &mut H,
         target: &mut LiveTarget,
-    ) -> Result<(), TcpError> {
-        let claimed = std::mem::take(&mut inventory.live_bindings);
-        let idle = std::mem::take(&mut inventory.idle_history_exports);
-        let result = inventory.released(|| revoke_bindings(target, claimed.values()));
-        if result.is_err() {
-            inventory.live_bindings = claimed;
-            inventory.idle_history_exports = idle;
-        }
-        result
-    }
-    pub(super) fn acquire_live_export_pin(
-        &mut self,
         epoch: u64,
-        segment: &super::super::nvmeof::live_storage::LiveWalSegment,
-        binding: &super::super::nvmeof::live_storage::LiveTargetBinding,
-    ) -> Result<[u8; 16], TcpError> {
-        self.active(epoch)?;
-        let key = (segment.epoch, segment.file_index);
-        if !self
-            .live_bindings
-            .get(&key)
-            .is_some_and(|(current, exported, _)| {
-                current == segment && exported == binding && !exported.permanent
-            })
-        {
-            return Err(TcpError::new("export pin binding identity mismatch"));
-        }
-        if self.live_export_pins.len() >= 1024 {
-            return Err(TcpError::new("live export pin capacity reached"));
-        }
-        let token = (0..16)
-            .find_map(|_| {
-                let token = rand::random::<[u8; 16]>();
-                (token != [0; 16]
-                    && !self.live_export_pins.contains_key(&token)
-                    && !self.fenced_export_pins.contains_key(&token))
-                .then_some(token)
-            })
-            .ok_or_else(|| TcpError::new("live export pin token allocation failed"))?;
-        self.live_export_pins.insert(token, (epoch, key));
-        if let Some(events) = self.r1_events.as_mut() {
-            events.pin(
-                "pin_held",
-                "export",
-                token,
-                [(key.0, key.1, Some((segment.device, segment.inode)))],
-                "connect",
-            );
-        }
-        // A connected history export cannot be an idle-owner eviction victim.
-        self.idle_history_exports.retain(|file| *file != key);
-        Ok(token)
-    }
-
-    /// The caller holds the lifecycle gate; `target` is its content.
-    pub(super) fn release_live_export_pin<H: InventoryAccess>(
-        inventory: &mut H,
-        target: Option<&mut LiveTarget>,
-        epoch: u64,
-        token: [u8; 16],
     ) -> Result<(), TcpError> {
-        let Some(&(authority, key)) = inventory.live_export_pins.get(&token) else {
-            return if inventory.fenced_export_pins.get(&token) == Some(&epoch) {
-                Ok(())
-            } else {
-                Err(TcpError::new("unknown live export pin"))
-            };
+        let keys: Vec<_> = {
+            let inventory: &NodeInventory = inventory;
+            inventory
+                .live_bindings
+                .iter()
+                .filter(|((binding_epoch, _), (_, _, writable))| {
+                    *binding_epoch == epoch && *writable
+                })
+                .map(|(key, (_, binding, _))| (*key, binding.clone()))
+                .collect()
         };
-        if authority != epoch {
-            return Err(TcpError::new(
-                "export pin belongs to another authority epoch",
-            ));
+        if keys.is_empty() {
+            return Ok(());
         }
-        let identity = inventory
-            .live_bindings
-            .get(&key)
-            .map(|(segment, _, _)| (segment.device, segment.inode));
-        Self::release_live_bindings(inventory, target, [key], Some(token))?;
-        inventory.live_export_pins.remove(&token);
-        if let Some(events) = inventory.r1_events.as_mut() {
-            events.pin(
-                "pin_released",
-                "export",
-                token,
-                [(key.0, key.1, identity)],
-                "release",
-            );
+        let bindings: Vec<_> = keys.iter().map(|(_, binding)| binding.clone()).collect();
+        let result = inventory.released(|| target.write_protect(&bindings));
+        if let Err(error) = result {
+            inventory.healthy = false;
+            return Err(TcpError::component(error));
+        }
+        for (key, _) in keys {
+            if let Some((_, binding, writable)) = inventory.live_bindings.get_mut(&key) {
+                *writable = false;
+                binding.readonly = true;
+            }
         }
         Ok(())
     }
@@ -1250,7 +1135,7 @@ impl NodeInventory {
     /// The caller holds the lifecycle gate; `target` is its content.
     pub(super) fn release_live_pin<H: InventoryAccess>(
         inventory: &mut H,
-        target: Option<&mut LiveTarget>,
+        _target: Option<&mut LiveTarget>,
         epoch: u64,
         token: [u8; 16],
     ) -> Result<(), TcpError> {
@@ -1260,30 +1145,17 @@ impl NodeInventory {
         if *owner != epoch {
             return Err(TcpError::new("live pin belongs to another authority epoch"));
         }
-        let (authority, leases) = inventory
+        let (_, leases) = inventory
             .live_pins
             .remove(&token)
             .ok_or_else(|| TcpError::new("live pin disappeared"))?;
-        let result = Self::release_live_bindings(
-            inventory,
-            target,
-            leases
-                .iter()
-                .map(|lease| (lease.segment.epoch, lease.segment.file_index)),
-            None,
-        );
-        if let Err(error) = result {
-            // A revoke can fail after a partial target change. Restore the
-            // record leases, keeping their inode/read pins until a fence.
-            inventory.live_pins.insert(token, (authority, leases));
-            return Err(error);
-        }
         // Only an enabled stream pays for the file list (read release path).
         let files = inventory
             .r1_events
             .is_some()
             .then(|| r1_events::lease_files(&leases));
-        // Dropping the record leases releases their inode/read pins.
+        // Dropping the record leases releases their inode/read pins. The
+        // permanent export stays for the life of its file.
         drop(leases);
         if let (Some(events), Some(files)) = (inventory.r1_events.as_mut(), files) {
             events.pin("pin_released", "record", token, files, "release");
@@ -1291,102 +1163,6 @@ impl NodeInventory {
         Ok(())
     }
 
-    fn release_live_bindings<H: InventoryAccess>(
-        inventory: &mut H,
-        mut target: Option<&mut LiveTarget>,
-        keys: impl IntoIterator<Item = (u64, u64)>,
-        export_token: Option<[u8; 16]>,
-    ) -> Result<(), TcpError> {
-        let mut revoke = std::collections::BTreeSet::new();
-        let mut retain = std::collections::BTreeSet::new();
-        {
-            let inventory: &NodeInventory = inventory;
-            for key in keys {
-                let releasable = match inventory.live_bindings.get(&key) {
-                    Some((_, binding, writable)) if binding.permanent || !writable => false,
-                    Some(_) => inventory
-                        .logs
-                        .get(&key.0)
-                        .ok_or_else(|| TcpError::new("live segment stream absent"))?
-                        .can_release_live_segment(key.1)
-                        .map_err(TcpError::component)?,
-                    None => false,
-                };
-                if !inventory.live_pins.values().any(|(_, leases)| {
-                    leases
-                        .iter()
-                        .any(|lease| (lease.segment.epoch, lease.segment.file_index) == key)
-                }) && !inventory
-                    .live_export_pins
-                    .iter()
-                    .any(|(other, (_, file))| Some(*other) != export_token && *file == key)
-                {
-                    if releasable {
-                        revoke.insert(key);
-                    } else if inventory
-                        .live_bindings
-                        .get(&key)
-                        .is_some_and(|(_, binding, writable)| !binding.permanent && !writable)
-                    {
-                        retain.insert(key);
-                    }
-                }
-            }
-        }
-        for key in revoke {
-            let target = target
-                .as_deref_mut()
-                .ok_or_else(|| TcpError::new("live target disappeared"))?;
-            // Claim before releasing the inventory: no pin can attach to a
-            // binding whose namespace is being revoked.
-            let entry = inventory
-                .live_bindings
-                .remove(&key)
-                .ok_or_else(|| TcpError::new("live binding disappeared"))?;
-            let revoke_span = revoke_span(&entry.0);
-            let result = inventory.released(|| target.revoke(&entry.1));
-            revoke_span.end_at(entry.0.file_index);
-            if let Err(error) = result {
-                inventory.live_bindings.insert(key, entry);
-                inventory.healthy = false;
-                return Err(TcpError::component(error));
-            }
-        }
-        for key in retain {
-            Self::retain_idle_history_export(inventory, target.as_deref_mut(), key)?;
-        }
-        Ok(())
-    }
-
-    fn retain_idle_history_export<H: InventoryAccess>(
-        inventory: &mut H,
-        target: Option<&mut LiveTarget>,
-        key: (u64, u64),
-    ) -> Result<(), TcpError> {
-        inventory.idle_history_exports.retain(|idle| *idle != key);
-        if inventory.idle_history_exports.len() == MAX_IDLE_HISTORY_EXPORTS {
-            let oldest = *inventory
-                .idle_history_exports
-                .front()
-                .ok_or_else(|| TcpError::new("idle history queue disappeared"))?;
-            let target = target.ok_or_else(|| TcpError::new("live target disappeared"))?;
-            let entry = inventory
-                .live_bindings
-                .remove(&oldest)
-                .ok_or_else(|| TcpError::new("idle history binding disappeared"))?;
-            inventory.idle_history_exports.pop_front();
-            let revoke_span = revoke_span(&entry.0);
-            if let Err(error) = inventory.released(|| target.revoke(&entry.1)) {
-                inventory.live_bindings.insert(oldest, entry);
-                inventory.idle_history_exports.push_front(oldest);
-                inventory.healthy = false;
-                return Err(TcpError::component(error));
-            }
-            revoke_span.end_at(entry.0.file_index);
-        }
-        inventory.idle_history_exports.push_back(key);
-        Ok(())
-    }
     /// Seal an exclusively owned inventory. A live inventory needs its target
     /// registry: use `seal_epoch` with the lifecycle gate instead.
     pub fn seal(&mut self, epoch: u64) -> Result<(), TcpError> {
@@ -1409,7 +1185,7 @@ impl NodeInventory {
         drain_log: impl FnOnce(&Arc<PartitionLog>) -> Result<(), TcpError>,
     ) -> Result<(), TcpError> {
         inventory.ensure_healthy()?;
-        if !inventory.live_pins.is_empty() || !inventory.live_export_pins.is_empty() {
+        if !inventory.live_pins.is_empty() {
             return Err(TcpError::new("live NVMe-oF pins must drain before sealing"));
         }
         if inventory.manifest.epochs.iter().any(|e| {
@@ -1422,7 +1198,7 @@ impl NodeInventory {
         inventory.healthy = false;
         inventory.readers.write().invalidate();
         if let Some(target) = target {
-            Self::revoke_live_targets(inventory, target)?;
+            Self::protect_live_targets(inventory, target, epoch)?;
             inventory.released(|| {
                 drain_log(&log)?;
                 log.seal_live_epoch(RequestAuthority { epoch }, || Ok(()))
@@ -1531,7 +1307,6 @@ impl NodeInventory {
             return Err(TcpError::new("live target shutdown left owned namespaces"));
         }
         inventory.live_bindings.clear();
-        inventory.idle_history_exports.clear();
         Ok(stats)
     }
     pub(super) fn live_recovery_log(

@@ -284,7 +284,7 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
         raise ValueError('owner launch endpoint mismatch')
     checks = proof.get('checks', {})
     required = ('scalar_write_delete', 'mixed_batch', 'ordered_batch_missing_exists',
-                'checkpoint_iteration', 'flush_reopen', 'abrupt_tail_recovery', 'fence_drain', 'cache_miss_hit',
+                'checkpoint_iteration', 'flush_reopen', 'abrupt_tail_recovery', 'fence_write_protect', 'cache_miss_hit',
                 *(('target_reuse',) if owner_host else ()))
     if (not isinstance(checks, dict) or any(checks.get(name) is not True for name in required)
             or (archive_binary and checks.get('payload_rpc_fallback') is not False)):
@@ -430,10 +430,11 @@ def admit(proof, transport, owner_fabric, coordinator_fabric, owner_control, coo
             and f['authority_epoch'] >= 2 and isinstance(f.get('target'), dict)
             and f['target'].get('fixture_only') is False
             and (target != 'spdk' or f['target'].get('target_implementation') == 'spdk')
-            and type(f['target'].get('disable_drain_successes')) is int
-            and f['target']['disable_drain_successes'] > 0 and f['target'].get('errors') == 0
+            and type(f['target'].get('fence_count')) is int and f['target']['fence_count'] > 0
+            and type(f['target'].get('write_protect_successes')) is int
+            and f['target']['write_protect_successes'] > 0 and f['target'].get('errors') == 0
             for f in fences):
-        raise ValueError('kernel namespace fencing and drain evidence missing')
+        raise ValueError('kernel namespace fencing and write protection evidence missing')
     shutdown = proof.get('target_shutdown')
     # The shutdown runs on the reprovisioned database, whose first open is its
     # fencing generation 1; an archive owner's single database had reopened.

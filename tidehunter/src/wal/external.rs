@@ -266,5 +266,13 @@ mod tests {
         assert_eq!(bytes, [0; 8192]);
         assert_eq!(restarted.stats().0, 8192);
         assert_eq!(restarted.ready.load(Ordering::Acquire), 1);
+        // An empty successor created by `ensure_external_file` and left
+        // unallocated by a crash is prepared by the next restart.
+        let (_successor_dir, successor_file) = self::file();
+        assert_eq!(successor_file.metadata().unwrap().len(), 0);
+        restarted
+            .prepare(&successor_file, WalFileId(1), 8192, &mut Vec::new())
+            .unwrap();
+        assert_eq!(successor_file.metadata().unwrap().len(), 8192);
     }
 }

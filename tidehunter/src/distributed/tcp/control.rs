@@ -1288,11 +1288,8 @@ impl ControlContext {
         }
     }
     fn permits_recovery_control(&self, request: &Request) -> bool {
-        // Terminal publication does not revoke idle exports. Their pool
-        // must still be able to release pins after confirmed disconnects.
-        matches!(request, Request::ReleaseLiveExportPin { .. })
-            || (self.recoverable_live_failure.load(Ordering::Acquire)
-                && matches!(request, Request::Status { .. } | Request::Fence { .. }))
+        self.recoverable_live_failure.load(Ordering::Acquire)
+            && matches!(request, Request::Status { .. } | Request::Fence { .. })
     }
 
     fn poison_incomplete_live(&self) {
@@ -1460,7 +1457,8 @@ impl ControlContext {
             }
             #[cfg(test)]
             let export_started = Instant::now();
-            let result = NodeInventory::publish_permanent_segment(&mut inventory, target, &segment);
+            let result =
+                NodeInventory::publish_permanent_segment(&mut inventory, target, &segment, false);
             #[cfg(test)]
             log.record_test_file_export(
                 file,
@@ -1583,9 +1581,12 @@ impl ControlContext {
             let target = lifecycle
                 .as_mut()
                 .ok_or_else(|| TcpError::new("live target not configured"))?;
-            NodeInventory::reap_idle_live_segments(&mut inventory, target, epoch)?;
-            let (binding, created) =
-                NodeInventory::publish_permanent_segment(&mut inventory, target, &extent.segment)?;
+            let (binding, created) = NodeInventory::publish_permanent_segment(
+                &mut inventory,
+                target,
+                &extent.segment,
+                false,
+            )?;
             if created {
                 // Background preparation had not published this file yet.
                 inventory.record_inline_export(kind);
@@ -1729,26 +1730,6 @@ impl ControlContext {
             self.finish_poison_if_quiescent();
             return Ok(Response::NvmeofEpochReleased);
         }
-        if let Request::ReleaseLiveExportPin { epoch, token } = &request {
-            let (result, failed) = {
-                let mut lifecycle = self.lifecycle.lock();
-                let mut inventory = self.inventory.lock();
-                let result = NodeInventory::release_live_export_pin(
-                    &mut inventory,
-                    lifecycle.as_mut(),
-                    *epoch,
-                    *token,
-                );
-                let failed = result.is_err() && !inventory.healthy;
-                (result, failed)
-            };
-            if failed {
-                self.poison_readers();
-            }
-            result?;
-            self.finish_poison_if_quiescent();
-            return Ok(Response::NvmeofEpochReleased);
-        }
         // Admission can precede an earlier command's panic or uncertain I/O.
         // Queued work must recheck terminal health before decoding or mutation.
         if (self.poison_pending.load(Ordering::Acquire) || self.terminal.load(Ordering::Acquire))
@@ -1776,9 +1757,12 @@ impl ControlContext {
                         }
                         Err(error) => return Err(TcpError::component(error)),
                     };
-                    if let Err(error) =
-                        NodeInventory::publish_permanent_segment(&mut inventory, target, &segment)
-                    {
+                    if let Err(error) = NodeInventory::publish_permanent_segment(
+                        &mut inventory,
+                        target,
+                        &segment,
+                        false,
+                    ) {
                         drop(inventory);
                         drop(lifecycle);
                         log.poison_writer();
@@ -1938,19 +1922,6 @@ impl ControlContext {
                     limits.max_frame_bytes,
                 )
             }
-            Request::AcquireLiveExportPin {
-                epoch,
-                segment,
-                binding,
-            } => {
-                // Bindings and pins change only under the lifecycle gate, so
-                // a pin never attaches to a binding a revocation has claimed.
-                let _lifecycle = self.lifecycle.lock();
-                self.inventory
-                    .lock()
-                    .acquire_live_export_pin(epoch, &segment, &binding)
-                    .map(Response::NvmeofEpochPinned)
-            }
             Request::LiveTargetStats => {
                 // Stats verify configfs objects: file I/O, gate only.
                 let mut lifecycle = self.lifecycle.lock();
@@ -1970,7 +1941,7 @@ impl ControlContext {
                 NodeInventory::shutdown_live_target(&mut self.inventory.lock(), target, epoch)
                     .map(Response::LiveTargetStats)
             }
-            Request::ReleaseLiveEpochPin { .. } | Request::ReleaseLiveExportPin { .. } => {
+            Request::ReleaseLiveEpochPin { .. } => {
                 unreachable!("release handled before health check")
             }
             Request::CheckpointPosition {

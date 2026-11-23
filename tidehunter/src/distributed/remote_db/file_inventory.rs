@@ -64,8 +64,6 @@ pub(crate) struct WalFileObservation {
     pub validated_through: Option<u64>,
     /// Owner record/page read pins in the file; `None` when not attributable.
     pub read_pins: Option<u64>,
-    /// Owner connection (export) pins in the file; `None` when not attributable.
-    pub export_pins: Option<u64>,
     pub target_access: TargetAccess,
     /// Durable lease-logical `FileSeal` of this exact inode, if installed.
     pub seal: Option<crate::distributed::storage::FileSeal>,

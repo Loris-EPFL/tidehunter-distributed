@@ -45,8 +45,6 @@ pub(super) fn request_kind_code(request: &Request) -> u64 {
         Request::ReplayLiveWal { .. } => 37,
         Request::ReadEvidence { .. } => 38,
         Request::ProcessResources { .. } => 39,
-        Request::AcquireLiveExportPin { .. } => 42,
-        Request::ReleaseLiveExportPin { .. } => 43,
         Request::DurableProgress { .. } => 44,
         Request::PartitionStats => 45,
         Request::InventoryPage(_) => 46,

@@ -426,17 +426,12 @@ impl NodeInventory {
         })
     }
 
-    /// A retained record or export pin prevents trimming its backing files.
+    /// A retained record pin prevents trimming its backing files.
     fn trim_blocker(&self, generation: u64) -> Option<&'static str> {
-        (self
-            .live_pins
+        self.live_pins
             .values()
             .any(|(_, leases)| leases.iter().any(|lease| lease.segment.epoch == generation))
-            || self
-                .live_export_pins
-                .values()
-                .any(|(_, (source, _))| *source == generation))
-        .then_some("pin")
+            .then_some("pin")
     }
 
     /// Readiness of `generation` for trim under the current fence
@@ -666,9 +661,6 @@ impl NodeInventory {
                             inventory.healthy = false;
                             return Err(error);
                         }
-                        inventory
-                            .idle_history_exports
-                            .retain(|key| key.0 != generation);
                     }
                     let mut manifest = inventory.manifest.clone();
                     manifest.epochs.remove(index);

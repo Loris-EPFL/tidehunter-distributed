@@ -2339,8 +2339,7 @@ pub(crate) mod leased_tests {
     use super::*;
     use crate::distributed::durability::{DurabilityConfig, DurabilityTier};
     use crate::distributed::nvmeof::{
-        LiveTargetConfig, NvmeofTransport, live_metrics::LiveNvmeMetrics,
-        live_target::LiveTargetManager,
+        live_metrics::LiveNvmeMetrics, live_target::LiveTargetManager,
     };
     use crate::distributed::tcp::{self, Client, NodeConfig, StorageNode, TlsFiles, Transport};
     use crate::distributed::test_bounds::PROGRESS_CAP;
@@ -2424,16 +2423,7 @@ pub(crate) mod leased_tests {
                 std::fs::create_dir(configfs.join(name)).unwrap();
             }
             let target = LiveTargetManager::open_fixture(
-                LiveTargetConfig {
-                    address: "127.0.0.1".into(),
-                    service: 4420,
-                    transport: NvmeofTransport::Tcp,
-                    host_nqn: "nqn.2026-01.test:leased".into(),
-                    port_id: 42,
-                    state_dir,
-                    commissioning_port_id: 43,
-                    commissioning_service: 4421,
-                },
+                super::super::tests::live_fixture_target_config(&config.partition, state_dir),
                 configfs,
             )
             .unwrap();

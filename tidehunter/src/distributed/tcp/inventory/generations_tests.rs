@@ -393,7 +393,10 @@ fn trim_live_fixture(root: &Path) -> (NodeConfig, PathBuf) {
         address: "127.0.0.1".into(),
         service: 4420,
         transport: NvmeofTransport::Tcp,
-        host_nqn: "nqn.2026-01.local.test:generation-trim".into(),
+        host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+            &config.partition.inventory.database,
+            config.partition.partition,
+        ),
         port_id: 42,
         state_dir: root.join("target"),
         commissioning_port_id: 43,
@@ -677,7 +680,16 @@ fn trim_lookahead_marker_survives_each_crash_boundary() {
             .segment;
         if std::env::var_os("TH_TRIM_CONTROL_CRASH").is_none() {
             node.with_live_target(|target| {
-                let binding = target.export_writable(live_file(&segment)).unwrap();
+                let name = crate::distributed::nvmeof::live_storage::wal_export_name(
+                    crate::distributed::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+                    segment.database,
+                    segment.partition,
+                    segment.epoch,
+                    segment.file_index,
+                );
+                let binding = target
+                    .export_permanent(&name, live_file(&segment), false)
+                    .unwrap();
                 target.revoke(&binding).unwrap();
             });
         }
@@ -772,7 +784,16 @@ fn trim_refuses_an_outstanding_generation_snapshot() {
         .unwrap()
         .0;
     node.with_live_target(|target| {
-        let binding = target.export_writable(live_file(&extent.segment)).unwrap();
+        let name = crate::distributed::nvmeof::live_storage::wal_export_name(
+            crate::distributed::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+            extent.segment.database,
+            extent.segment.partition,
+            extent.segment.epoch,
+            extent.segment.file_index,
+        );
+        let binding = target
+            .export_permanent(&name, live_file(&extent.segment), false)
+            .unwrap();
         target.revoke(&binding).unwrap();
     });
     drop(log);

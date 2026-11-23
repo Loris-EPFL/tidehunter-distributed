@@ -106,25 +106,9 @@ impl Client {
                 let setup =
                     LiveReadTiming::start(&self.live_counters, LiveTimingStage::NamespaceSetup);
                 let deadline = Instant::now() + Duration::from_millis(config.connect_timeout_ms);
-                let (lease, acquisition) = if binding.permanent {
-                    pool.get_or_connect(&target, &config.host_nqn, config.host_id, access, deadline)
-                } else {
-                    pool.acquire_pinned(
-                        &target,
-                        &config.host_nqn,
-                        config.host_id,
-                        access,
-                        deadline,
-                        super::LiveExportPinRequest {
-                            recipe: &self.live_pin_recipe,
-                            epoch: authority_epoch,
-                            segment: &first.segment,
-                            binding,
-                        },
-                    )
-                    .map(|(lease, acquisition, _)| (lease, acquisition))
-                }
-                .map_err(TcpError::component)?;
+                let (lease, acquisition) = pool
+                    .get_or_connect(&target, &config.host_nqn, config.host_id, access, deadline)
+                    .map_err(TcpError::component)?;
                 let namespace = lease.open_namespace().map_err(TcpError::component)?;
                 drop(setup);
                 if let Some(counters) = &self.live_counters

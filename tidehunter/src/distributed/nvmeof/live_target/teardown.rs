@@ -1,15 +1,14 @@
 //! Database drop, `TargetCleanup` phase: tear a database's target down from
-//! its persisted journal without commissioning anything again.
+//! its configfs scope without commissioning anything again.
 
 use super::*;
 
 impl LiveTargetManager {
-    /// Reconcile the persisted journal (deny connections, disable and drain
-    /// every registered namespace, reconcile commissioning controllers) and
-    /// remove every registered configfs object, without recreating the host,
-    /// ports or commissioning objects. Succeeds only with proof that no
-    /// registered object, export or pin remains. With `expected` absent the
-    /// caller has proved the journal file exists; it must match `config`.
+    /// Reconcile the scoped configfs objects (disable and seal every enabled
+    /// namespace, disconnect commissioning controllers) and remove them,
+    /// without recreating the host, ports or commissioning objects. Succeeds
+    /// only with proof that no export or pin remains. With `expected` absent
+    /// the caller has proved that `target-id` exists; it must match `config`.
     pub(crate) fn teardown(
         config: LiveTargetConfig,
         expected: Option<LiveTargetIdentity>,
@@ -33,19 +32,14 @@ impl LiveTargetManager {
             None,
         )?;
         manager.shutdown()?;
-        if !manager.state.objects.is_empty()
-            || !manager.state.exports.is_empty()
-            || !manager.pins.is_empty()
-        {
-            return Err(invalid(
-                "target teardown left registered objects, exports or pins",
-            ));
+        if !manager.exports.is_empty() || !manager.pins.is_empty() {
+            return Err(invalid("target teardown left registered exports or pins"));
         }
         Ok(())
     }
 
-    /// Name of the journal file inside a target state directory.
-    pub(crate) fn journal_name() -> &'static str {
-        STATE
+    /// Name of the first-open witness inside a target state directory.
+    pub(crate) fn identity_name() -> &'static str {
+        TARGET_ID
     }
 }

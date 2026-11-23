@@ -50,6 +50,7 @@ fn scrape_aggregates_counters_and_latest_nonfixture_fence() {
             target: LiveTargetStats {
                 fixture_only: fixture,
                 disable_drain_successes: drains,
+                write_protect_successes: drains,
                 ..Default::default()
             },
         });
@@ -142,6 +143,10 @@ fn scrape_aggregates_counters_and_latest_nonfixture_fence() {
     );
     assert_eq!(
         counter("tidehunter_nvmeof_live_target_disable_drain_total"),
+        3.0
+    );
+    assert_eq!(
+        counter("tidehunter_nvmeof_live_target_write_protect_total"),
         3.0
     );
 }

@@ -111,7 +111,10 @@ impl LiveFixture {
             address: "127.0.0.1".into(),
             service: 4420,
             transport: NvmeofTransport::Tcp,
-            host_nqn: "nqn.2026-01.local.test:online-trim".into(),
+            host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+                &config.partition.inventory.database,
+                config.partition.partition,
+            ),
             port_id: 42,
             state_dir: root.join("target"),
             commissioning_port_id: 43,
@@ -150,7 +153,16 @@ fn trimmable_generation(node: &StorageNode, lookahead_files: u64) -> LiveWalSegm
         .0
         .segment;
     node.with_live_target(|target| {
-        let binding = target.export_writable(live_file(&segment)).unwrap();
+        let name = crate::distributed::nvmeof::live_storage::wal_export_name(
+            crate::distributed::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+            segment.database,
+            segment.partition,
+            segment.epoch,
+            segment.file_index,
+        );
+        let binding = target
+            .export_permanent(&name, live_file(&segment), false)
+            .unwrap();
         target.revoke(&binding).unwrap();
     });
     drop(log);
@@ -421,7 +433,14 @@ fn gated_deletion_retires_sealed_files_and_the_marker_above_the_present_set() {
         block_size: segment.block_size,
     };
     node.with_live_target(|target| {
-        let binding = target.export_writable(identity).unwrap();
+        let name = crate::distributed::nvmeof::live_storage::wal_export_name(
+            crate::distributed::nvmeof::live_storage::FILES_PER_SUBSYSTEM,
+            segment.database,
+            segment.partition,
+            segment.epoch,
+            segment.file_index + 1,
+        );
+        let binding = target.export_permanent(&name, identity, false).unwrap();
         target.revoke(&binding).unwrap();
     });
     drop(file);

@@ -1218,13 +1218,10 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
         let fronts = db.remote_for_test().hybrid_table().stored_fronts();
         let remaining = wal_files();
         let remote = db.remote_for_test();
-        let (record_pins, connection_pins) =
-            crate::distributed::tcp::export_pin_tests::owner_pins(&fixture.nodes[0]);
         eprintln!(
             "liveness pass {number}: receipt {receipt:?} stored fronts {fronts:?} \
              generation 1 WAL files {remaining:?} busy replies {} owner busy retirements {} \
-             latch caps {} missing rows {} owner record pins (epoch, file) {record_pins:?} \
-             owner connection pins {connection_pins:?}",
+             latch caps {} missing rows {}",
             remote.retirement_busy_replies(),
             fixture.nodes[0].file_maintenance_stats().busy_retirements,
             remote.retirement_latch_caps(),

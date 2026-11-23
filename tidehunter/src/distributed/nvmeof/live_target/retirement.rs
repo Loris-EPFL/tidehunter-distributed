@@ -20,7 +20,7 @@ impl LiveTargetManager {
         if self.poisoned {
             return Err(invalid("target manager is quarantined"));
         }
-        if self.state.exports.iter().any(|export| {
+        if self.exports.iter().any(|export| {
             export.file.path == wal_path
                 || (export.file.device, export.file.inode) == (device, inode)
         }) {
@@ -78,16 +78,11 @@ impl LiveTargetManager {
         if self.poisoned {
             return Err(invalid("target manager is quarantined"));
         }
-        if self
-            .state
-            .exports
-            .iter()
-            .any(|export| export.file.path == path)
-        {
+        if self.exports.iter().any(|export| export.file.path == path) {
             return Err(invalid("WAL namespace is still registered"));
         }
         if let Some(identity) = self.sealed_file(path)? {
-            if self.state.exports.iter().any(|export| {
+            if self.exports.iter().any(|export| {
                 export.file.path == path
                     || (export.file.device, export.file.inode) == (identity.device, identity.inode)
             }) {

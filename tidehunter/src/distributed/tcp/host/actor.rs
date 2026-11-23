@@ -603,10 +603,10 @@ impl Actor {
                     },
                 );
             }
-            // No marker: a journal saved before the marker was installed
-            // (the first open died in between) still owns objects.
+            // No marker: a target identity written before the marker was
+            // installed (the first open died in between) still owns objects.
             let state_dir = root.join(catalog::LIVE_TARGET_DIR);
-            if fs::symlink_metadata(state_dir.join(LiveTargetManager::journal_name())).is_ok() {
+            if fs::symlink_metadata(state_dir.join(LiveTargetManager::identity_name())).is_ok() {
                 let config = self
                     .core
                     .database_config(entry)?

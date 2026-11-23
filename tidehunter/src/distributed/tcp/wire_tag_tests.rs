@@ -1,6 +1,6 @@
 //! Frozen owner-protocol wire tags. Bincode encodes an enum variant as its
 //! declaration index, so the ordered variant list below *is* the tag table of
-//! protocol 35. Changing it requires a protocol bump.
+//! protocol 36. Changing it requires a protocol bump.
 
 use super::{HARD_FRAME_LIMIT, PROTOCOL, Request, Response, wire_codec};
 use bincode::Options;
@@ -53,50 +53,48 @@ fn variants<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
 }
 
 #[test]
-fn protocol_35_request_tags_are_frozen() {
-    assert_eq!(PROTOCOL, 35);
+fn protocol_36_request_tags_are_frozen() {
+    assert_eq!(PROTOCOL, 36);
     assert_eq!(
         variants::<Request>(),
         [
-            "RetirementFiles",      // 0
-            "Status",               // 1
-            "Fence",                // 2
-            "Seal",                 // 3
-            "Stats",                // 4
-            "StatsDetailed",        // 5
-            "ConnectionProfile",    // 6
-            "OwnerTimelineArm",     // 7
-            "OwnerTimelineFetch",   // 8
-            "CheckpointPosition",   // 9
-            "RetireWalFiles",       // 10
-            "DurableProgress",      // 11
-            "PartitionStats",       // 12
-            "ReleaseLiveEpochPin",  // 13
-            "ResolveLiveRecords",   // 14
-            "LiveTargetStats",      // 15
-            "ShutdownLiveTarget",   // 16
-            "LeaseLiveExtent",      // 17
-            "AdoptLiveExtent",      // 18
-            "OpenLiveExports",      // 19
-            "PreleaseLiveExtent",   // 20
-            "ReplayLiveWal",        // 21
-            "AcquireLiveExportPin", // 22
-            "ReleaseLiveExportPin", // 23
-            "ReadEvidence",         // 24
-            "ProcessResources",     // 25
-            "InventoryPage",        // 26
-            "CheckTrimGeneration",  // 27
-            "TrimGeneration",       // 28
-            "FileInventoryPage",    // 29
-            "RelocationPage",       // 30
-            "ProvisionDatabase",    // 31
-            "DropDatabase",         // 32
+            "RetirementFiles",     // 0
+            "Status",              // 1
+            "Fence",               // 2
+            "Seal",                // 3
+            "Stats",               // 4
+            "StatsDetailed",       // 5
+            "ConnectionProfile",   // 6
+            "OwnerTimelineArm",    // 7
+            "OwnerTimelineFetch",  // 8
+            "CheckpointPosition",  // 9
+            "RetireWalFiles",      // 10
+            "DurableProgress",     // 11
+            "PartitionStats",      // 12
+            "ReleaseLiveEpochPin", // 13
+            "ResolveLiveRecords",  // 14
+            "LiveTargetStats",     // 15
+            "ShutdownLiveTarget",  // 16
+            "LeaseLiveExtent",     // 17
+            "AdoptLiveExtent",     // 18
+            "OpenLiveExports",     // 19
+            "PreleaseLiveExtent",  // 20
+            "ReplayLiveWal",       // 21
+            "ReadEvidence",        // 22
+            "ProcessResources",    // 23
+            "InventoryPage",       // 24
+            "CheckTrimGeneration", // 25
+            "TrimGeneration",      // 26
+            "FileInventoryPage",   // 27
+            "RelocationPage",      // 28
+            "ProvisionDatabase",   // 29
+            "DropDatabase",        // 30
         ]
     );
 }
 
 #[test]
-fn protocol_35_response_tags_are_frozen() {
+fn protocol_36_response_tags_are_frozen() {
     assert_eq!(
         variants::<Response>(),
         [
@@ -113,23 +111,22 @@ fn protocol_35_response_tags_are_frozen() {
             "OwnerTimelinePage",   // 10
             "DurableProgress",     // 11
             "PartitionStats",      // 12
-            "NvmeofEpochPinned",   // 13
-            "NvmeofEpochReleased", // 14
-            "LiveRecords",         // 15
-            "LiveRecovery",        // 16
-            "LiveTargetStats",     // 17
-            "LiveLeased",          // 18
-            "LiveAdopted",         // 19
-            "LiveExports",         // 20
-            "ReadEvidence",        // 21
-            "ProcessResources",    // 22
-            "InventoryPage",       // 23
-            "CheckTrimGeneration", // 24
-            "TrimGeneration",      // 25
-            "FileInventoryPage",   // 26
-            "RelocationPage",      // 27
-            "ProvisionDatabase",   // 28
-            "DropDatabase",        // 29
+            "NvmeofEpochReleased", // 13
+            "LiveRecords",         // 14
+            "LiveRecovery",        // 15
+            "LiveTargetStats",     // 16
+            "LiveLeased",          // 17
+            "LiveAdopted",         // 18
+            "LiveExports",         // 19
+            "ReadEvidence",        // 20
+            "ProcessResources",    // 21
+            "InventoryPage",       // 22
+            "CheckTrimGeneration", // 23
+            "TrimGeneration",      // 24
+            "FileInventoryPage",   // 25
+            "RelocationPage",      // 26
+            "ProvisionDatabase",   // 27
+            "DropDatabase",        // 28
         ]
     );
 }
@@ -153,7 +150,7 @@ fn bincode_tag_is_the_declaration_index() {
         ),
         (Request::PartitionStats, 12),
         (Request::LiveTargetStats, 15),
-        (Request::ProcessResources { epoch: 3 }, 25),
+        (Request::ProcessResources { epoch: 3 }, 23),
     ] {
         assert_eq!(encode(&request)[..4], tag.to_le_bytes());
     }

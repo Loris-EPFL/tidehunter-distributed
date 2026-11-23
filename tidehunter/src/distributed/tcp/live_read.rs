@@ -1342,7 +1342,7 @@ impl LiveReadCache {
     #[allow(clippy::too_many_arguments)]
     fn connect_scope(
         client: &Client,
-        authority_epoch: u64,
+        _authority_epoch: u64,
         target: LiveConnectTarget,
         mut scope: GrantScope,
         token: Option<[u8; 16]>,
@@ -1360,7 +1360,7 @@ impl LiveReadCache {
         if client.live_write_local_fixture
             && let GrantScope::File(location) = &scope
         {
-            pool.register_local_target(&target.nqn, location.segment.path.clone());
+            pool.register_local_target(&target.nqn, target.nsid, location.segment.path.clone());
         }
         let setup = LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
         let acquisition = if shared {
@@ -1371,21 +1371,18 @@ impl LiveReadCache {
                 access,
                 connect_deadline,
             )
-        } else if let GrantScope::File(location) = &scope
-            && !location.binding.permanent
-        {
-            pool.acquire_pinned(
+        } else if let GrantScope::File(location) = &scope {
+            pool.acquire_file(
                 &target,
                 &config.host_nqn,
                 config.host_id,
                 access,
                 connect_deadline,
-                super::LiveExportPinRequest {
-                    recipe: &client.live_pin_recipe,
-                    epoch: authority_epoch,
-                    segment: &location.segment,
-                    binding: &location.binding,
-                },
+                (
+                    location.segment.partition,
+                    location.segment.epoch,
+                    location.segment.file_index,
+                ),
             )
         } else {
             pool.acquire(

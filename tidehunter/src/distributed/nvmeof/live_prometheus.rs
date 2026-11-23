@@ -521,6 +521,8 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
     let mut seconds = 0u64;
     let mut exposed = 0u64;
     let mut readonly = 0u64;
+    let mut write_protect = 0u64;
+    let mut write_protect_seconds = 0u64;
     let mut errors = 0u64;
     let mut fixtures = 0u64;
     for target in latest.values() {
@@ -532,6 +534,8 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
         drains = drains.saturating_add(target.disable_drain_successes);
         fences = fences.saturating_add(target.fence_count);
         seconds = seconds.saturating_add(target.disable_drain_time_ns);
+        write_protect = write_protect.saturating_add(target.write_protect_successes);
+        write_protect_seconds = write_protect_seconds.saturating_add(target.write_protect_time_ns);
         exposed = exposed.saturating_add(target.namespaces_exposed);
         readonly = readonly.saturating_add(target.readonly_commission_successes);
         errors = errors.saturating_add(target.errors);
@@ -572,6 +576,18 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             seconds,
             false,
             "Time spent in successful target disable/drains",
+        ),
+        (
+            "target_write_protect_total",
+            write_protect,
+            false,
+            "Successful namespace write protections at latest recorded kernel target snapshots",
+        ),
+        (
+            "target_write_protect_seconds_total",
+            write_protect_seconds,
+            false,
+            "Time spent in successful namespace write protections",
         ),
         (
             "target_readonly_commission_total",

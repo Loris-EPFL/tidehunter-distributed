@@ -196,6 +196,77 @@ fn wal_replay_reopen_fails_when_owner_wal_ends_below_checkpoint_position() {
     );
 }
 
+#[test]
+fn wal_replay_reopen_fails_when_owner_wal_is_short_below_its_durable_end() {
+    let mut fixture = Fixture::new();
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let position = db.core.publisher.lock().positions[&(0, 1)].clone();
+    let end = position.durable_end;
+    assert!(end > 1, "the durable end must cover the batch");
+    fail_stop_without_checkpoint(db);
+    fixture.stop_owners();
+    let file = fixture
+        .owner_database_root(0)
+        .join("epoch_0000000000000001/wal_0000000000000000");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_len(end - 1)
+        .unwrap();
+    // A nonzero truncation below the durable root must name the same cause
+    // before the scan reads a frame the root says exists.
+    let error = fixture.restart_owners().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("WAL backing file identity, size or allocation changed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn empty_unallocated_successor_wal_file_reopens() {
+    let mut fixture = Fixture::new();
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 1), vec![checkpoint_put(1, 7)])
+        .unwrap();
+    db.flush_index().unwrap();
+    let position = db.core.publisher.lock().positions[&(0, 1)].clone();
+    assert!(position.durable_end > 0);
+    fail_stop_without_checkpoint(db);
+    fixture.stop_owners();
+    let epoch = fixture
+        .owner_database_root(0)
+        .join("epoch_0000000000000001");
+    let mut last = None;
+    for entry in fs::read_dir(&epoch).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(index) = name
+            .strip_prefix("wal_")
+            .and_then(|index| u64::from_str_radix(index, 16).ok())
+        {
+            last = last.max(Some(index));
+        }
+    }
+    let successor = epoch.join(format!("wal_{:016x}", last.expect("a WAL file") + 1));
+    // `ensure_external_file` creates the successor at length 0 before
+    // `ExternalPreparation::prepare` grows it. A crash or ENOSPC between the
+    // two must leave an owner that still opens; the empty file lies above the
+    // durable end, so it is a normal unallocated successor, not truncated data.
+    fs::File::create(&successor).unwrap();
+    assert_eq!(fs::metadata(&successor).unwrap().len(), 0);
+    fixture.restart_owners().unwrap();
+    let db = fixture.open();
+    db.shutdown().unwrap();
+}
+
 /// The scan half of the test above: the WAL file keeps its identity, size
 /// and allocation (so the leased target binding accepts it), but its frames
 /// below the persisted position root are gone, as after dropped pages on a

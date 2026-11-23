@@ -20,6 +20,18 @@ fn frame_missing_or_invalid(error: &StorageError) -> bool {
     }
 }
 
+/// A frame the durable frontier or root requires is shorter than its header
+/// declares: name the changed WAL file instead of a bare short read.
+fn required_frame_error(error: StorageError, required: bool) -> StorageError {
+    if required
+        && matches!(&error, StorageError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+    {
+        StorageError::Invalid("WAL backing file identity, size or allocation changed")
+    } else {
+        error
+    }
+}
+
 /// A recovery read beyond the durable frontier. Names the read for the test hook,
 /// which can replace its result with EIO; production code passes results through.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1111,7 +1123,7 @@ impl PartitionLog {
                     fragment_end,
                 ) {
                     if cursor < strict_end || !frame_missing_or_invalid(&error) {
-                        return Err(error);
+                        return Err(required_frame_error(error, cursor < strict_end));
                     }
                     gap = true;
                     if live {
@@ -1129,7 +1141,7 @@ impl PartitionLog {
                 match current_file.and_then(|file| log.decode_group_from_file(file, cursor)) {
                     Ok(decoded) => decoded,
                     Err(error) if cursor < strict_end || !frame_missing_or_invalid(&error) => {
-                        return Err(error);
+                        return Err(required_frame_error(error, cursor < strict_end));
                     }
                     Err(_) if live => {
                         gap = true;

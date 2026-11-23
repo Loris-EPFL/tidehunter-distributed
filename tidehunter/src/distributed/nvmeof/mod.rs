@@ -75,4 +75,6 @@ pub struct LiveTargetStats {
     pub owned_namespace_count: u64,
     pub fence_count: u64,
     pub disable_drain_time_ns: u64,
+    pub write_protect_successes: u64,
+    pub write_protect_time_ns: u64,
 }

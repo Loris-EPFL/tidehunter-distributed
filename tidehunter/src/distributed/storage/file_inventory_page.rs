@@ -192,7 +192,6 @@ impl PartitionLog {
                     write_lease: false,
                     validated_through: None,
                     read_pins: None,
-                    export_pins: None,
                     target_access: TargetAccess::Unknown,
                     seal,
                 },

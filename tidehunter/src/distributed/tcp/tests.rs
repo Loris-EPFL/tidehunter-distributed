@@ -13,6 +13,26 @@ mod position_tests;
 #[path = "wal_replay_tests.rs"]
 mod wal_replay;
 
+/// One owner fixture target for a node partition on loopback TCP.
+pub(super) fn live_fixture_target_config(
+    partition: &crate::distributed::storage::PartitionConfig,
+    state_dir: std::path::PathBuf,
+) -> crate::distributed::nvmeof::LiveTargetConfig {
+    crate::distributed::nvmeof::LiveTargetConfig {
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
+        host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+            &partition.inventory.database,
+            partition.partition,
+        ),
+        port_id: 42,
+        state_dir,
+        commissioning_port_id: 43,
+        commissioning_service: 4421,
+    }
+}
+
 #[cfg(feature = "experimental-fabric")]
 pub(super) fn software_transport(security: FabricSecurity) -> Transport {
     Transport::ofi(FabricBackend::SoftwareTcp, security)
@@ -153,7 +173,10 @@ fn static_node_validation_opens_no_runtime_resources() {
         address: "127.0.0.1".into(),
         service: 4420,
         transport: crate::distributed::nvmeof::NvmeofTransport::Tcp,
-        host_nqn: "nqn.2026-01.test:static".into(),
+        host_nqn: crate::distributed::tcp::host_identity::effective_host_nqn(
+            &config.partition.inventory.database,
+            config.partition.partition,
+        ),
         port_id: 42,
         state_dir: temp.path().join("absent-target-state"),
         commissioning_port_id: 43,

@@ -25,18 +25,7 @@ fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_names
     let dir = tempdir::TempDir::new("live-pool-shared").unwrap();
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
-    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
-    if let Entry::Ready { identity, .. } = pool
-        .state
-        .lock()
-        .unwrap()
-        .entries
-        .get_mut(&target.nqn)
-        .unwrap()
-    {
-        identity.target.nsid = 0;
-        identity.target.uuid = [0; 16];
-    }
+    let target = ready_shared_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
     let mut other = target.clone();
     other.nsid = 2;
     other.uuid = [3; 16];
@@ -68,12 +57,22 @@ fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_names
     let registry = LiveConnectionRegistry::open(&dir.path().join("strict")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:strict");
-    let mut other = target.clone();
-    other.nsid = 2;
-    other.uuid = [3; 16];
+    // A permanent export shares one subsystem NQN across many namespaces, so
+    // a strict acquisition is keyed by namespace and never reuses another.
     assert!(
-        matches!(pool.acquire(&other, "nqn.2026-01.test:host", [2; 16], LiveNamespaceAccess::ReadWrite, deadline),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData)
+        pool.state
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&(target.nqn.clone(), target.nsid))
+    );
+    assert!(
+        !pool
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&(target.nqn.clone(), 2))
     );
     pool.shutdown(deadline).unwrap();
 }
@@ -105,7 +104,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .lock()
         .unwrap()
         .entries
-        .insert(target.nqn.clone(), Entry::Pending(identity));
+        .insert((target.nqn.clone(), target.nsid), Entry::Pending(identity));
     let mut other = target.clone();
     other.nqn = "nqn.2026-01.test:two".into();
     let deadline = Instant::now() + PROGRESS_CAP;
@@ -127,7 +126,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .lock()
         .unwrap()
         .entries
-        .insert(target.nqn.clone(), Entry::Quarantined { _export_pin: None });
+        .insert((target.nqn.clone(), target.nsid), Entry::Quarantined);
     assert!(
         matches!(pool.get_or_connect(&other, "nqn.2026-01.test:host", [2;16], LiveNamespaceAccess::ReadWrite, deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     );
@@ -147,8 +146,12 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .is_err()
     );
     assert!(matches!(
-        pool.state.lock().unwrap().entries.get(&target.nqn),
-        Some(Entry::Quarantined { .. })
+        pool.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(&(target.nqn.clone(), target.nsid)),
+        Some(Entry::Quarantined)
     ));
     assert!(matches!(pool.shutdown(deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
     std::fs::remove_file(journal).unwrap();
@@ -227,15 +230,38 @@ fn ready_idle(pool: &LiveControllerPool, dir: &std::path::Path, nqn: &str) -> Li
         file: None,
     };
     pool.state.lock().unwrap().entries.insert(
-        nqn.into(),
+        (nqn.to_owned(), target.nsid),
         Entry::Ready {
             identity,
             lease,
             controller: LiveController::deleted_for_test(&pool.registry, dir, &target).unwrap(),
             usable: true,
-            export_pin: None,
         },
     );
+    target
+}
+
+/// Cache one idle shared subsystem lease under the namespace-zero key.
+fn ready_shared_idle(
+    pool: &LiveControllerPool,
+    directory: &std::path::Path,
+    nqn: &str,
+) -> LiveConnectTarget {
+    let mut target = ready_idle(pool, directory, nqn);
+    let key = (target.nqn.clone(), target.nsid);
+    let mut state = pool.state.lock().unwrap();
+    let mut entry = state
+        .entries
+        .remove(&key)
+        .expect("fixture controller present");
+    if let Entry::Ready { identity, .. } = &mut entry {
+        identity.target.nsid = 0;
+        identity.target.uuid = [0; 16];
+    }
+    state.entries.insert((target.nqn.clone(), 0), entry);
+    drop(state);
+    target.nsid = 0;
+    target.uuid = [0; 16];
     target
 }
 
@@ -246,7 +272,7 @@ fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:one");
     let deadline = Instant::now() + PROGRESS_CAP;
-    let key = target.nqn.clone();
+    let key = (target.nqn.clone(), target.nsid);
 
     let mut state = pool.state.lock().unwrap();
     let controller = LiveControllerPool::begin_close(&mut state, &key).unwrap();
@@ -262,7 +288,7 @@ fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
                 .try_lock()
                 .expect("delete must not hold the pool lock");
             assert!(matches!(
-                state.entries.get("nqn.2026-01.test:one"),
+                state.entries.get(&key),
                 Some(Entry::Closing { .. })
             ));
             Err(io::Error::other("delete failed"))
@@ -299,7 +325,7 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:two");
-    let key = target.nqn.clone();
+    let key = (target.nqn.clone(), target.nsid);
     let deleted = AtomicBool::new(false);
     let mut state = pool.state.lock().unwrap();
     let controller = LiveControllerPool::begin_close(&mut state, &key).unwrap();

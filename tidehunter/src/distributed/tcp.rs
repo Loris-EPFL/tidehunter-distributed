@@ -53,8 +53,6 @@ pub(crate) use live_client::leased_tests;
 pub(super) use live_client::{LeasedSubmit, LiveGroupBudget};
 pub use live_client::{LeasedSync, LiveClientConfig, LiveInitiatorIdentity};
 pub(crate) use reactor::HostClient;
-#[cfg(test)]
-pub(crate) mod export_pin_tests;
 mod live_control;
 pub(super) mod live_read;
 mod live_recovery;
@@ -62,9 +60,7 @@ mod relocation_scan;
 pub use diagnostics::{ConnectionProfile, PollingProfile, SocketProfile, WorkProfile};
 pub use live_control::{LiveRecoveryEntry, LiveRecoveryPage};
 mod live_wire;
-pub(crate) use live_control::{
-    LiveExportPin, LiveExportPinControl, LiveExportPinRequest, LivePinRecipe,
-};
+
 pub use live_wire::{
     AdoptProfile, LeaseProfile, LiveAdopted, LiveExportInfo, LiveLeased, LiveRecordLocation,
     LiveRecordLocations,
@@ -130,7 +126,10 @@ pub use inventory::{FileMaintenanceStats, NodeInventory};
 /// (payloads change in place; tags are unchanged), and adds `durable_end`, the
 /// end of the highest durable frame of the generation's log, to every
 /// `InventoryGeneration` of the inventory sweep.
-const PROTOCOL: u32 = 35;
+/// 36 (lifetime exports) removes AcquireLiveExportPin, ReleaseLiveExportPin and
+/// `NvmeofEpochPinned` (request tags 22-23, response tag 13; later tags shift),
+/// because an export now lives as long as its file.
+const PROTOCOL: u32 = 36;
 pub(crate) const HARD_FRAME_LIMIT: usize = 64 * 1024 * 1024;
 /// Leave one protocol request slot available for ordered checkpoint control.
 pub(super) const APPEND_COMMAND_WINDOW: usize = reactor::SESSION_REQUESTS - 1;
@@ -693,34 +692,26 @@ enum Request {
         limit: usize,
         require_end: u64,
     },
-    /// Tag 22.
-    AcquireLiveExportPin {
-        epoch: u64,
-        segment: super::nvmeof::live_storage::LiveWalSegment,
-        binding: super::nvmeof::live_storage::LiveTargetBinding,
-    },
-    /// Tag 23.
-    ReleaseLiveExportPin { epoch: u64, token: [u8; 16] },
-    /// Tag 24. Benchmark evidence; owners built without Linux `test-utils`
+    /// Tag 22. Benchmark evidence; owners built without Linux `test-utils`
     /// reply with an error.
     ReadEvidence { epoch: u64, evict: bool },
-    /// Tag 25. Benchmark evidence; owners built without Linux `test-utils`
+    /// Tag 23. Benchmark evidence; owners built without Linux `test-utils`
     /// reply with an error.
     ProcessResources { epoch: u64 },
-    /// Tag 26.
+    /// Tag 24.
     InventoryPage(generation_control::InventoryPageRequest),
-    /// Tag 27.
+    /// Tag 25.
     CheckTrimGeneration(generation_control::CheckTrimRequest),
-    /// Tag 28.
+    /// Tag 26.
     TrimGeneration(generation_control::TrimRequest),
-    /// Tag 29. Read-only owner WAL file inventory for capacity accounting.
+    /// Tag 27. Read-only owner WAL file inventory for capacity accounting.
     FileInventoryPage {
         authority_generation: u64,
         source_generation: u64,
         after: Option<u64>,
         limit: u16,
     },
-    /// Tag 30. R1 relocation scan: metadata of the complete batches of one
+    /// Tag 28. R1 relocation scan: metadata of the complete batches of one
     /// stream in `[from, end)`, active or older sealed
     /// (`storage::RelocationPage`).
     RelocationPage {
@@ -730,7 +721,7 @@ enum Request {
         end: u64,
         limit: u16,
     },
-    /// Tag 31. Host scope only; idempotent for an identical request.
+    /// Tag 29. Host scope only; idempotent for an identical request.
     /// The authority may retry after an unknown outcome.
     ProvisionDatabase {
         database: [u8; 16],
@@ -738,7 +729,7 @@ enum Request {
         shape_yaml: String,
         live_target: DatabaseLiveTarget,
     },
-    /// Tag 32. Host scope only. `authority` is the bound trust principal and
+    /// Tag 30. Host scope only. `authority` is the bound trust principal and
     /// `generation` the coordinator's highest fencing reservation (0 if none).
     DropDatabase {
         database: [u8; 16],
@@ -787,8 +778,6 @@ impl Request {
             | Self::LeaseLiveExtent { .. } => true,
             Self::AdoptLiveExtent { lease_next, .. } => *lease_next,
             Self::ReleaseLiveEpochPin { .. }
-            | Self::AcquireLiveExportPin { .. }
-            | Self::ReleaseLiveExportPin { .. }
             | Self::LiveTargetStats
             | Self::ProcessResources { .. } => false,
             Self::ReadEvidence { evict, .. } => *evict,
@@ -901,43 +890,41 @@ enum Response {
     DurableProgress(DurableProgressReport),
     /// Tag 12. Boxed so ordinary responses do not grow.
     PartitionStats(Box<PartitionStatsReply>),
-    /// Tag 13. Live export pin token (`AcquireLiveExportPin`).
-    NvmeofEpochPinned([u8; 16]),
-    /// Tag 14. Live epoch or export pin released.
+    /// Tag 13. Live epoch pin released.
     NvmeofEpochReleased,
-    /// Tag 15.
+    /// Tag 14.
     LiveRecords(LiveRecordLocations),
-    /// Tag 16. `ReplayLiveWal` page.
+    /// Tag 15. `ReplayLiveWal` page.
     LiveRecovery(live_wire::LiveRecoveryWire),
-    /// Tag 17.
+    /// Tag 16.
     LiveTargetStats(super::nvmeof::LiveTargetStats),
-    /// Tag 18.
+    /// Tag 17.
     LiveLeased(LiveLeased),
-    /// Tag 19.
+    /// Tag 18.
     LiveAdopted(LiveAdopted),
-    /// Tag 20.
+    /// Tag 19.
     LiveExports(LiveExportInfo),
-    /// Tag 21.
+    /// Tag 20.
     ReadEvidence(crate::read_probe::ReadEvidence),
-    /// Tag 22.
+    /// Tag 21.
     ProcessResources(crate::read_probe::ProcessResources),
-    /// Tag 23.
+    /// Tag 22.
     InventoryPage(generation_control::InventoryPageReply),
-    /// Tag 24.
+    /// Tag 23.
     CheckTrimGeneration(generation_control::CheckTrimReply),
-    /// Tag 25.
+    /// Tag 24.
     TrimGeneration(generation_control::TrimReply),
-    /// Tag 26. Boxed so ordinary responses do not grow.
+    /// Tag 25. Boxed so ordinary responses do not grow.
     FileInventoryPage(Box<super::remote_db::file_inventory::FileInventoryReply>),
-    /// Tag 27. Boxed like FileInventoryPage.
+    /// Tag 26. Boxed like FileInventoryPage.
     RelocationPage(Box<super::storage::RelocationPage>),
-    /// Tag 28.
+    /// Tag 27.
     ProvisionDatabase {
         database: [u8; 16],
         partition: u32,
         durability_tier: super::durability::DurabilityTier,
     },
-    /// Tag 29.
+    /// Tag 28.
     DropDatabase { database: [u8; 16], generation: u64 },
 }
 
@@ -1355,8 +1342,6 @@ pub struct ClientConnectProfile {
 #[derive(Clone)]
 pub(crate) struct ClientTlsConfig {
     pub config: Option<Arc<ClientConfig>>,
-    /// Live-target connection key component (the credential digest).
-    pub identity: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -1383,7 +1368,6 @@ pub struct Client {
     connect_profile: ClientConnectProfile,
     polling: PollingPolicy,
     live_config: Option<LiveClientConfig>,
-    live_pin_recipe: Arc<LivePinRecipe>,
     live_exports: Option<(u64, LiveExportInfo, u64)>,
     live_pool: Option<Arc<super::nvmeof::live_pool::LiveControllerPool>>,
     live_writer: Option<live_client::LiveWriteQueue>,
@@ -1466,14 +1450,6 @@ impl Client {
         shape: &KeyShape,
         progress: Option<Arc<WakeFd>>,
     ) -> Result<Self, TcpError> {
-        let live_pin_recipe = Arc::new(LivePinRecipe::new(
-            endpoint,
-            tls,
-            &client_config,
-            timeout,
-            &expected,
-            shape,
-        ));
         expected.validate().map_err(TcpError::component)?;
         let listener::ClientSession {
             session,
@@ -1510,7 +1486,6 @@ impl Client {
             },
             polling: PollingPolicy::Adaptive,
             live_config: None,
-            live_pin_recipe,
             live_exports: None,
             live_pool: None,
             live_writer: None,
@@ -2045,12 +2020,9 @@ impl TlsFiles {
     }
     pub(crate) fn client_config_with_identity(&self) -> Result<ClientTlsConfig, TcpError> {
         if self.trusted_mode()? {
-            return Ok(ClientTlsConfig {
-                config: None,
-                identity: [0; 32],
-            });
+            return Ok(ClientTlsConfig { config: None });
         }
-        let (roots, cert, key, identity) = self.material()?;
+        let (roots, cert, key, _identity) = self.material()?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             Arc::new(roots),
@@ -2067,7 +2039,6 @@ impl TlsFiles {
         config.alpn_protocols = vec![self.transport.alpn()];
         Ok(ClientTlsConfig {
             config: Some(Arc::new(config)),
-            identity,
         })
     }
 }
