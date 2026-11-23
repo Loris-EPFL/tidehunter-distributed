@@ -204,7 +204,8 @@ impl Db {
             wal_iterator,
             &metrics,
             wal.as_ref(),
-        )?;
+        )
+        .map_err(crate::wal_replay::ReplayError::into_db_error)?;
         let last_index_position = control_region.last_index_wal_position();
         // Restore the mapped window over the fragments holding live index
         // blobs; see `WalIterator::premap_live_fragments` for why.
