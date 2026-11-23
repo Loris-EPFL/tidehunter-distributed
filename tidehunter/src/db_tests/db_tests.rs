@@ -49,7 +49,7 @@ pub(super) fn db_test(key_shape: KeyShape) {
         let ks = db.single_ks();
         assert_eq!(Some(vec![5, 6].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
         assert_eq!(Some(vec![7].into()), db.get(ks, &[3, 4, 5, 6]).unwrap());
-        thread::sleep(Duration::from_millis(10)); // todo replace this with wal tracker barrier
+        db.wal_writer.wal_tracker_barrier();
         db.rebuild_control_region().unwrap();
         assert!(
             db.large_table.is_all_clean(),
@@ -867,7 +867,7 @@ pub(super) fn test_remove(key_shape: KeyShape) {
         db.insert(ks, vec![1, 2, 3, 4], vec![9, 10]).unwrap();
         assert_eq!(Some(vec![7].into()), db.get(ks, &[3, 4, 5, 6]).unwrap());
         assert_eq!(Some(vec![9, 10].into()), db.get(ks, &[1, 2, 3, 4]).unwrap());
-        thread::sleep(Duration::from_millis(100)); // todo replace this with wal tracker barrier
+        db.wal_writer.wal_tracker_barrier();
         db.rebuild_control_region().unwrap();
         db.remove(ks, vec![1, 2, 3, 4]).unwrap();
         assert_eq!(None, db.get(ks, &[1, 2, 3, 4]).unwrap());
@@ -3348,7 +3348,11 @@ fn db_test_snapshot_unload_threshold() {
             .expect("insert failed");
     }
 
-    thread::sleep(Duration::from_millis(10));
+    // `rebuild_control_region` does not pin the WAL tracker (`db.rs:1616`),
+    // and `ks_snapshot` moves every clean cell's `last_processed` to the
+    // frontier it reads. Wait on that frontier instead of the clock, or the
+    // recorded replay position depends on the tracker thread's timing.
+    db.wal_writer.wal_tracker_barrier();
 
     // Get the current WAL position before snapshot
     let wal_position_before = db.wal_writer.position();
@@ -5028,23 +5032,100 @@ fn test_auto_sharding_concurrent() {
     }
 
     let label = &["root"];
-    let shards_total = metrics.l1_shards_total.with_label_values(label).get();
-    let splits = metrics.l1_shard_split_total.with_label_values(label).get();
-    let resharding = metrics
+    // Informational: which flushes land during the churn above depends on the
+    // schedule, so these counters vary and no assertion rides on them.
+    println!(
+        "auto-sharding counters: l1_shards_total={} l1_shard_split_total={} \
+         l1_shard_rewritten_total={} snapshot_forced_relocation={}",
+        metrics.l1_shards_total.with_label_values(label).get(),
+        metrics.l1_shard_split_total.with_label_values(label).get(),
+        metrics
+            .l1_shard_rewritten_total
+            .with_label_values(label)
+            .get(),
+        metrics
+            .snapshot_forced_relocation
+            .with_label_values(label)
+            .get(),
+    );
+
+    // Re-sharding must fire by construction, not by the churn's luck. A
+    // promote rewrites shards only when the cell is already sharded and the
+    // promote image exceeds `l0_max_entries`. This instance keeps the bulk
+    // below `max_dirty_keys` so no flush samples an older frontier, pins the
+    // tracker, and promotes once to shard L1, then once more into those shards.
+    const RESHARD_BULK: usize = 256;
+    let mut reshard_config = Config::small();
+    reshard_config.frag_size = 4 * 1024;
+    reshard_config.max_dirty_keys = RESHARD_BULK * 2;
+    reshard_config.l0_max_entries = Some(16);
+    reshard_config.snapshot_unload_threshold = 0;
+    reshard_config.with_index_auto_sharding();
+    let reshard_config = Arc::new(reshard_config);
+    let reshard_dir = tempdir::TempDir::new("test-auto-sharding-reshard").unwrap();
+    let reshard_metrics = Metrics::new();
+    let reshard_db = Db::open(
+        reshard_dir.path(),
+        key_shape.clone(),
+        reshard_config.clone(),
+        reshard_metrics.clone(),
+    )
+    .unwrap();
+    let reshard_value = vec![0x5A; 8];
+    let bulk_rows = RESHARD_BULK;
+    assert!(
+        bulk_rows < reshard_config.max_dirty_keys,
+        "{bulk_rows} bulk rows must stay below max_dirty_keys={} so that no \
+         insert dispatches a flush from an older frontier",
+        reshard_config.max_dirty_keys,
+    );
+    assert!(
+        bulk_rows
+            > reshard_config
+                .l0_max_entries
+                .expect("l0_max_entries is set"),
+        "the promote needs more rows than l0_max_entries: {bulk_rows} rows",
+    );
+    for row in 0..RESHARD_BULK {
+        reshard_db
+            .insert(
+                ks,
+                (row as u64).to_be_bytes().to_vec(),
+                reshard_value.clone(),
+            )
+            .unwrap();
+    }
+    reshard_db.wal_writer.wal_tracker_barrier();
+    reshard_db.force_rebuild_control_region().unwrap();
+    let splits = reshard_metrics
+        .l1_shard_split_total
+        .with_label_values(label)
+        .get();
+    assert!(
+        splits > 0,
+        "the first promoted image must split L1 into shards: \
+         l1_shard_split_total={splits}",
+    );
+
+    for row in RESHARD_BULK..(RESHARD_BULK * 2) {
+        reshard_db
+            .insert(
+                ks,
+                (row as u64).to_be_bytes().to_vec(),
+                reshard_value.clone(),
+            )
+            .unwrap();
+    }
+    reshard_db.wal_writer.wal_tracker_barrier();
+    reshard_db.force_rebuild_control_region().unwrap();
+    let resharding = reshard_metrics
         .l1_shard_rewritten_total
         .with_label_values(label)
         .get();
-    let forced_reloc = metrics
-        .snapshot_forced_relocation
-        .with_label_values(label)
-        .get();
-    println!(
-        "auto-sharding counters: l1_shards_total={shards_total} \
-         l1_shard_split_total={splits} l1_shard_rewritten_total={resharding} \
-         snapshot_forced_relocation={forced_reloc}"
-    );
     assert!(
         resharding > 0,
-        "expected re-sharding (incremental sharded promote) to fire"
+        "a promote into the sharded L1 must rewrite shards: \
+         l1_shard_rewritten_total={resharding}",
     );
+    reshard_db.wait_for_background_threads_to_finish();
 }
