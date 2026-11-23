@@ -54,6 +54,16 @@ struct Planned<'a> {
     publication: Option<SlotPublication>,
 }
 
+impl Planned<'_> {
+    /// An already-owned operation id: the retry window or an in-flight
+    /// generation answers it with the recorded version, so this plan allocates
+    /// nothing, takes no owner order and charges no slot (`WriteGrant`).
+    /// Evaluated before the allocation pass sets `in_flight` on a fresh plan.
+    fn is_owned(&self) -> bool {
+        self.retry.is_some() || self.in_flight.is_some()
+    }
+}
+
 /// Caller ownership, not a reply channel. Drop releases only generations this
 /// invocation allocated. Retry aliases never touch another caller's slot.
 struct QueuedWindow<'a> {
@@ -140,6 +150,10 @@ impl WriteCore {
             }
             break result;
         };
+        // The slot and credit are released (`queued` dropped with the loop
+        // body): an acknowledged write is readable by its writer, so wait for
+        // the published prefix to cover it (`wait_readable`).
+        let result = result.and_then(|version| self.wait_readable(version, deadline));
         // No queued routing/value handle retains caller backing after bind.
         // Release even arbitrarily large source allocations before returning.
         drop(inputs);
@@ -592,7 +606,7 @@ impl WriteCore {
                 } else {
                     in_flight
                 };
-                if plan.retry.is_none() && plan.in_flight.is_none() {
+                if !plan.is_owned() {
                     grant.slots += 1;
                     grant.add_partition(plan.owner, plan.validated.mutations().len())?;
                 }
@@ -650,7 +664,7 @@ impl WriteCore {
                 .shard_indices(plans.iter().flat_map(|plan| plan.keys.iter()));
             let mut owners: SmallVec<[(usize, &OwnerQueue); 2]> = plans
                 .iter()
-                .filter(|plan| plan.retry.is_none())
+                .filter(|plan| !plan.is_owned())
                 .map(|plan| (plan.owner, self.clients[plan.owner].queue.as_ref()))
                 .collect();
             if owners.is_empty() {
@@ -719,7 +733,7 @@ impl WriteCore {
                             }
                             queued._credit.mark_allocated();
                             for plan in plans.iter_mut() {
-                                if plan.retry.is_some() {
+                                if plan.is_owned() {
                                     continue;
                                 }
                                 let id = BatchId {

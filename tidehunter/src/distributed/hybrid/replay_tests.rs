@@ -600,8 +600,7 @@ fn finish_rejects_a_partial_batch() {
     );
     let error = source
         .finish(Some(cutoff))
-        .err()
-        .expect("a cutoff means half a batch reached the index");
+        .expect_err("a cutoff means half a batch reached the index");
     assert!(error.to_string().contains("inside a batch"));
 }
 
@@ -754,7 +753,7 @@ fn a_relocated_copy_never_overrides_a_newer_user_write() {
     let source = source(pages, |_| true, &[front(0, 1, 0)]).expect("source");
     let (writers, outcome) = last_writers(source);
     assert_eq!(
-        writers.get(&KEY.to_vec()),
+        writers.get(KEY.as_slice()),
         Some(&version(3)),
         "the user's write at vu must stay the winner"
     );
@@ -777,7 +776,7 @@ fn without_the_relocated_flag_the_stale_copy_resurrects() {
         ScriptedPages::new().page(0, 1, 0, vec![(original, 0), (user, 128), (copy, 256)], None);
     let source = source(pages, |_| true, &[front(0, 1, 0)]).expect("source");
     let (writers, outcome) = last_writers(source);
-    assert_eq!(writers.get(&KEY.to_vec()), Some(&version(5)));
+    assert_eq!(writers.get(KEY.as_slice()), Some(&version(5)));
     assert_eq!(outcome.relocated_skipped, 0);
 }
 
@@ -790,7 +789,7 @@ fn a_relocated_copy_the_filter_refuses_is_discarded_not_skipped() {
     let pages = ScriptedPages::new().page(0, 1, 0, vec![(user, 0), (copy, 128)], None);
     let source = source(pages, below(5), &[front(0, 1, 0)]).expect("source");
     let (writers, outcome) = last_writers(source);
-    assert_eq!(writers.get(&KEY.to_vec()), Some(&version(3)));
+    assert_eq!(writers.get(KEY.as_slice()), Some(&version(3)));
     assert_eq!(outcome.discarded, 1);
     assert_eq!(outcome.relocated_skipped, 0);
     assert_eq!(outcome.applied, Some(version(3)));

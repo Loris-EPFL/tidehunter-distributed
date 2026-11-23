@@ -131,11 +131,12 @@ pub(in crate::distributed::remote_db) struct OpenState {
 #[cfg(test)]
 #[derive(Default)]
 pub(in crate::distributed::remote_db) struct TestHooks {
-    pub retire_preflight_busy_once: bool,
     pub after_grant: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_preparation: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_prepared_operation: Option<[u8; 16]>,
     pub concurrent_progress: Option<mpsc::SyncSender<super::super::PipelineStats>>,
+    /// Sent once by the first drain, or acknowledged write, that is about to
+    /// wait for the published prefix.
     pub drain_wait_entered: Option<mpsc::SyncSender<()>>,
     pub panic_after_concurrent_admissions: Option<u64>,
     pub skip_shutdown_checkpoint: bool,
@@ -155,6 +156,10 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub checkpoint_pause: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     /// Fails the shutdown snapshot before it stores anything.
     pub checkpoint_interruption: Option<usize>,
+    /// Fails a relocation pass after its covering store and its callback-start
+    /// adoption, before any physical pruning: the crash boundary between the
+    /// durable relocation capture and the owner-file retirement.
+    pub relocation_prune_interruption: bool,
 }
 
 /// Lock order for the final engine: ascending key shards → owner order,
@@ -365,6 +370,12 @@ impl WriteCore {
         Ok(self.receipts.get(&operation))
     }
 
+    /// Admitted-but-unpublished operation ids (test observation).
+    #[cfg(test)]
+    pub(in crate::distributed::remote_db) fn active_identities(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Resident completed/in-flight write bookkeeping, excluding allocator
     /// overhead and the separately reported index. Publisher, in-flight and key
     /// shards are locked one at a time.
@@ -457,19 +468,7 @@ impl WriteCore {
     fn wait_published_inner(&self, next: u64) -> Result<(), LocalDbError> {
         self.ensure_healthy()?;
         let deadline = std::time::Instant::now() + self.config.timeout;
-        let mut publisher = self.publisher.lock();
-        while publisher.published_next < next {
-            self.ensure_healthy()?;
-            if self
-                .floor_changed
-                .wait_until(&mut publisher, deadline)
-                .timed_out()
-                && publisher.published_next < next
-            {
-                return Err(LocalDbError::new("published prefix wait deadline expired"));
-            }
-        }
-        drop(publisher);
+        self.wait_floor_covers(next, deadline)?;
         // Live sequences span at most the ring capacity above reuse_next. The
         // resolver sets the outcome under slot.data and finalize_slot notifies
         // slot.done under it: the standard predicate wait, no lost wakeup.
@@ -498,6 +497,64 @@ impl WriteCore {
         self.ensure_healthy()
     }
 
+    /// Waits until the published contiguous prefix covers every sequence below
+    /// `next`. The publisher sets the table's publication cut under the same
+    /// lock that advances `published_next`, so a read at `table.current()` sees
+    /// every batch below `next` once this returns. Holds no lock but the
+    /// publisher mutex, which the condvar releases while parked.
+    fn wait_floor_covers(
+        &self,
+        next: u64,
+        deadline: std::time::Instant,
+    ) -> Result<(), LocalDbError> {
+        let mut publisher = self.publisher.lock();
+        while publisher.published_next < next {
+            self.ensure_healthy()?;
+            if self
+                .floor_changed
+                .wait_until(&mut publisher, deadline)
+                .timed_out()
+                && publisher.published_next < next
+            {
+                return Err(LocalDbError::new("published prefix wait deadline expired"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `version` once a read can see it. Reads resolve at the published
+    /// prefix (paper 3.2; PARITY.md "Read visibility past an unresolved
+    /// prefix"), and a batch can publish beyond an unresolved earlier one, so
+    /// an acknowledged write waits here for the prefix to cover it: Ok means
+    /// readable, as in native, where the index insert precedes the return.
+    ///
+    /// The caller holds no slot, credit or lock here, and the earlier batches
+    /// resolve through the owners and the publisher, never through this caller,
+    /// so the wait has no cycle. The publisher crosses an aborted earlier slot.
+    /// When the prefix can never advance (fail-stop, fence, shutdown) or the
+    /// deadline passes, the error names `version` as uncertain: the batch is
+    /// durable at its owner and recovery replays it.
+    pub(super) fn wait_readable(
+        &self,
+        version: crate::distributed::types::BatchVersion,
+        deadline: std::time::Instant,
+    ) -> Result<crate::distributed::types::BatchVersion, LocalDbError> {
+        if version.epoch != self.epoch {
+            return Ok(version);
+        }
+        #[cfg(test)]
+        if self.publisher.lock().published_next <= version.sequence {
+            // The same signal a drain sends before it waits for the prefix.
+            let entered = self.test_hooks.lock().drain_wait_entered.take();
+            if let Some(entered) = entered {
+                let _ = entered.try_send(());
+            }
+        }
+        self.wait_floor_covers(version.sequence + 1, deadline)
+            .map(|()| version)
+            .map_err(|error| LocalDbError::unknown(version, error))
+    }
+
     pub(in crate::distributed::remote_db) fn control_owner<T: Send + 'static>(
         &self,
         owner: usize,
@@ -512,11 +569,6 @@ impl WriteCore {
             .ok_or_else(|| LocalDbError::new("unknown checkpoint owner"))?
             .1
             .control(operation)
-    }
-
-    #[cfg(test)]
-    pub(in crate::distributed::remote_db) fn take_retirement_preflight_busy(&self) -> bool {
-        std::mem::take(&mut self.test_hooks.lock().retire_preflight_busy_once)
     }
 
     /// Called before dropping publisher and slot guards on a publication failure.
@@ -712,276 +764,4 @@ impl WriteCore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::distributed::remote_db::pipeline_tests::Fixture;
-
-    #[test]
-    fn begin_failure_fences_cached_and_completed_values_before_notifications() {
-        use crate::distributed::codec::Mutation;
-        use crate::key_shape::KeySpace;
-
-        let fixture = Fixture::new();
-        let mut database = fixture.open();
-        let key = 17u32.to_be_bytes();
-        database
-            .write_batch(
-                fixture.operation(0, 17),
-                vec![Mutation::Put {
-                    keyspace: KeySpace(0),
-                    key: key.to_vec().into(),
-                    value: vec![7; 32].into(),
-                }],
-            )
-            .unwrap();
-        // A warm read: the value is resident and a later read must not serve it
-        // once the database failed.
-        assert!(database.get(KeySpace(0), &key).unwrap().is_some());
-        let core = Arc::clone(&database.core);
-        {
-            // No index-writer lock exists in the hybrid: the coordinator's
-            // index lives in `table`, whose flusher threads the read gates never
-            // touch. The publication lock is the one this test holds.
-            let _publisher = core.publisher.lock();
-            core.begin_failure(&LocalDbError::new("injected publication failure"));
-            // begin_failure is atomic-only: even while both publication locks
-            // remain held, a previously prepared cache hit and a completed
-            // transport value must fail their final serving gates. None of
-            // these read gates takes the index writer or publisher.
-            assert!(core.ensure_healthy().is_err());
-            assert!(core.reads.failed());
-            assert!(database.get(KeySpace(0), &key).is_err());
-        }
-        core.finish_failure();
-        core.finish_failure();
-        assert!(core.shutdown().is_err());
-        assert!(
-            core.first_failure
-                .get()
-                .unwrap()
-                .contains("injected publication failure")
-        );
-    }
-
-    #[test]
-    fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
-        use crate::distributed::types::BatchVersion;
-        use std::time::{Duration, Instant};
-
-        let fixture = Fixture::new();
-        let database = fixture.open();
-        let core = Arc::clone(&database.core);
-        let sequence = core.sequencer.allocate(crate::distributed::types::BatchId {
-            database: fixture.config.storage.database,
-            operation: fixture.operation(0, 18),
-        });
-        let version = BatchVersion {
-            epoch: core.epoch,
-            sequence,
-        };
-        let credit = core
-            .admission
-            .reserve(core.config.max_pending_bytes, || core.ensure_healthy())
-            .unwrap();
-        let read_generation = core.reads.admission_generation();
-        let (started, starting) = mpsc::sync_channel(4);
-        let (finished, finishing) = mpsc::sync_channel(4);
-        std::thread::scope(|scope| {
-            let slot_started = started.clone();
-            let slot_finished = finished.clone();
-            let core = &core;
-            scope.spawn(move || {
-                slot_started.send(()).unwrap();
-                let result = core
-                    .sequencer
-                    .wait(version, Instant::now() + Duration::from_secs(5));
-                slot_finished.send(result.map(|_| ())).unwrap();
-            });
-            let prefix_started = started.clone();
-            let prefix_finished = finished.clone();
-            scope.spawn(move || {
-                prefix_started.send(()).unwrap();
-                prefix_finished
-                    .send(core.wait_published_before(sequence + 1))
-                    .unwrap();
-            });
-            let read_started = started.clone();
-            let read_finished = finished.clone();
-            scope.spawn(move || {
-                read_started.send(()).unwrap();
-                read_finished
-                    .send(core.reads.wait_admission(
-                        read_generation,
-                        Some(Instant::now() + Duration::from_secs(5)),
-                    ))
-                    .unwrap();
-            });
-            scope.spawn(move || {
-                started.send(()).unwrap();
-                finished
-                    .send(
-                        core.admission
-                            .reserve(1, || core.ensure_healthy())
-                            .map(drop),
-                    )
-                    .unwrap();
-            });
-            for _ in 0..4 {
-                starting.recv_timeout(Duration::from_secs(1)).unwrap();
-            }
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while core.admission.queued_waiters() != 1 {
-                assert!(Instant::now() < deadline, "admission waiter did not queue");
-                std::thread::yield_now();
-            }
-            core.begin_failure(&LocalDbError::new("injected waiter failure"));
-            core.finish_failure();
-            for _ in 0..4 {
-                assert!(
-                    finishing
-                        .recv_timeout(Duration::from_secs(1))
-                        .unwrap()
-                        .is_err()
-                );
-            }
-        });
-        assert_eq!(
-            core.sequencer.resolution(sequence),
-            Some(Resolution::Unknown)
-        );
-        core.release_sequence(sequence).unwrap();
-        assert_eq!(core.sequencer.reuse_next(), sequence);
-        assert_eq!(
-            core.sequencer
-                .slot(sequence)
-                .data
-                .lock()
-                .outcome
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .unwrap_err()
-                .uncertain_version,
-            Some(version)
-        );
-        drop(credit);
-        assert!(core.shutdown().is_err());
-    }
-
-    /// Replaces the deleted PublicationTracker sparse test on the live
-    /// publisher: an independent later batch publishes past an unresolved
-    /// floor, the same-key chain waits as dependents, the installed view
-    /// excludes exactly the unpublished generations in [floor, upper] (an
-    /// ABORTED generation included), and no slot returns to the ring until the
-    /// floor passes every PUBLISHED and ABORTED generation.
-    #[test]
-    fn sparse_view_excludes_exactly_unpublished_and_floor_passes_resolved() {
-        use crate::distributed::codec::Mutation;
-        use crate::distributed::types::{BatchVersion, MutationVersion};
-        use crate::key_shape::KeySpace;
-        use std::time::{Duration, Instant};
-
-        let put = |key: u32, value: u8| Mutation::Put {
-            keyspace: KeySpace(0),
-            key: key.to_be_bytes().to_vec().into(),
-            value: vec![value; 32].into(),
-        };
-        let fixture = Fixture::new();
-        let mut database = fixture.open();
-        let core = Arc::clone(&database.core);
-        let version = |sequence| BatchVersion {
-            epoch: core.epoch,
-            sequence,
-        };
-        let held_client = Arc::clone(&core.clients[0].client);
-        let held = held_client.lock();
-        let gap = database
-            .submit(fixture.operation(0, 1), vec![put(0, 1)])
-            .unwrap();
-        let chained = database
-            .submit(fixture.operation(1, 2), vec![put(0, 2), put(1, 2)])
-            .unwrap();
-        let successor = database
-            .submit(fixture.operation(1, 3), vec![put(1, 3)])
-            .unwrap();
-        let failed = fixture.operation(3, 4);
-        core.test_hooks.lock().fail_prepared_operation = Some(failed);
-        assert!(database.submit(failed, vec![put(4, 4)]).is_err());
-        let independent = database
-            .submit(fixture.operation(2, 5), vec![put(3, 5)])
-            .unwrap();
-        assert_eq!(
-            [gap, chained, successor, independent].map(|version| version.sequence),
-            [0, 1, 2, 4]
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        for sequence in [1, 2, 4] {
-            while !core.publication_settled(sequence) {
-                core.ensure_healthy().unwrap();
-                assert!(
-                    Instant::now() < deadline,
-                    "owner receipts were not processed"
-                );
-                std::thread::yield_now();
-            }
-        }
-        // Owner 0 is held: the gap is READY in its queue, never durable.
-        assert_eq!(core.sequencer.resolution(0), Some(Resolution::Ready));
-        assert_eq!(core.sequencer.resolution(1), Some(Resolution::Durable));
-        assert_eq!(core.sequencer.resolution(2), Some(Resolution::Durable));
-        assert_eq!(core.sequencer.resolution(3), Some(Resolution::Aborted));
-        assert_eq!(core.sequencer.resolution(4), Some(Resolution::Published));
-        {
-            let publisher = core.publisher.lock();
-            assert_eq!(publisher.published_next, 0);
-            assert_eq!(publisher.dependents.get(&0), Some(&vec![1]));
-            assert_eq!(publisher.dependents.get(&1), Some(&vec![2]));
-        }
-        assert_eq!(
-            core.sequencer.reuse_next(),
-            0,
-            "no slot passes the unresolved floor"
-        );
-        assert_eq!(core.retained_slots(), 5);
-        assert_eq!(
-            database
-                .get(KeySpace(0), &3u32.to_be_bytes())
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            &[5; 32]
-        );
-        assert!(
-            database
-                .get(KeySpace(0), &0u32.to_be_bytes())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            database
-                .get(KeySpace(0), &1u32.to_be_bytes())
-                .unwrap()
-                .is_none()
-        );
-
-        drop(held);
-        database.drain().unwrap();
-        assert_eq!(core.published_next(), 5);
-        for sequence in [0, 1, 2, 4] {
-            assert!(core.is_published(version(sequence)));
-        }
-        core.wait_settled().unwrap();
-        assert_eq!(core.sequencer.reuse_next(), 5);
-        for (key, expected) in [(0u32, Some(2u8)), (1, Some(3)), (3, Some(5)), (4, None)] {
-            assert_eq!(
-                database
-                    .get(KeySpace(0), &key.to_be_bytes())
-                    .unwrap()
-                    .map(|value| value[0]),
-                expected
-            );
-        }
-        drop(core);
-        database.shutdown().unwrap();
-    }
-}
+mod tests;

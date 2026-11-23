@@ -4,6 +4,7 @@ use crate::distributed::durability::DurabilityTier;
 use crate::distributed::nvmeof::live_metrics::LiveNvmeMetrics;
 use crate::distributed::tcp::{LeasedSync, LiveClientConfig};
 use crate::distributed::test_bounds::PROGRESS_CAP;
+use std::fs;
 
 const LEASED_BOUNDARIES: &[&str] = &[
     "write_submitted_to_kernel",
@@ -14,16 +15,6 @@ const LEASED_BOUNDARIES: &[&str] = &[
     "leased_extent_switched",
     "publication_before",
     "publication_after",
-    "checkpoint_staging_before",
-    "checkpoint_staging_after",
-    "checkpoint_image_before",
-    "checkpoint_image_after",
-    "checkpoint_metadata_before",
-    "checkpoint_metadata_after",
-    "checkpoint_root_before",
-    "checkpoint_root_after",
-    "checkpoint_install_before",
-    "checkpoint_install_after",
 ];
 const FLUSH_BOUNDARIES: &[&str] = &["flush_submitted_to_kernel", "leased_flush_completed"];
 

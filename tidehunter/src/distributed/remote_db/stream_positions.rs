@@ -123,6 +123,20 @@ pub(super) fn seed_positions(
     for &partition in partitions {
         for &(generation, aborted) in retained {
             let (durable_end, complete) = match reported.get(&(partition, generation)) {
+                // An aborted reservation never acknowledged a write
+                // (`fencing_generations::retained_below`): bytes in its log are
+                // state this authority cannot explain. The open fails closed
+                // here, before any trim or deferral decision, and reads nothing
+                // beyond the tails the fence sweep already collected.
+                Some(tail) if aborted && tail.durable_end > 0 => {
+                    return Err(LocalDbError::with_kind(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "aborted fencing generation {generation} contains accepted WAL data \
+                             (owner {partition})"
+                        ),
+                    ));
+                }
                 Some(tail) => (tail.durable_end, tail.complete),
                 None if aborted => (0, true),
                 None => {

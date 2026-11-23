@@ -1383,6 +1383,9 @@ impl Drop for ConcurrentRemoteDatabase {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod trace_tests;
+
 /// Where one relocation copy landed: the member frame address and the CRC-32 of
 /// its payload, which the pass compares with the indexed CRC of the source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

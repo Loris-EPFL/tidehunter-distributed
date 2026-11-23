@@ -17,7 +17,6 @@ use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
 use crate::distributed::sui::Db;
 use crate::distributed::tcp::{LeasedSync, LiveClientConfig, TcpLimits, Transport};
-use crate::distributed::types::PhysicalValueAddress;
 use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
 use crate::{Decision, RelocationObservation, RelocationTestError};
 use std::net::TcpListener;
@@ -183,19 +182,13 @@ impl Fixture {
             tls,
             timeout: Duration::from_secs(60),
             max_admitted_batches: 8192,
-            max_index_bytes: 64 * 1024 * KIB as usize,
             max_pending_batches: 64,
             max_pending_bytes: 32 * 1024 * KIB as usize,
-            replay_limits: ReplayLimits {
-                max_batches: 65536,
-                max_encoded_bytes: 1024 * 1024 * KIB as usize,
-            },
             owner_append_occupancy: 16,
             pipelined_writes: true,
             leased_submit_redrain: true,
             read_cache_bytes: 0,
             read_memory_allowance_bytes: 128 * 1024 * KIB as usize,
-            scan_prefetch_pages: 1,
             read_lanes: Some(1),
             pin_read_lanes: false,
             max_pending_reads: 64,
@@ -292,18 +285,44 @@ fn write(db: &Arc<Db>, sequence: u64, keyspaces: &[KeySpace]) {
     batch.commit().unwrap();
 }
 
+/// Owner, generation and frame start of the batch that holds member 0 of
+/// `sequence`.
+///
+/// The relocation scan reports `batch.address.offset`, the frame start. A
+/// hybrid position names the member frame: `VersionPosition::member` adds the
+/// CRC header and the member's descriptor offset. The encoded batch starts with
+/// its fixed header (`codec::HEADER_LEN`) and the first member follows it, so
+/// member 0 has descriptor offset `HEADER_LEN`, not 0 (`encode_validated`
+/// takes each offset from `encoded.len()`). The frame start is the member
+/// offset minus the CRC header minus `HEADER_LEN`.
+#[derive(Clone, Copy)]
+struct BatchAddress {
+    partition: u32,
+    segment_generation: u64,
+    offset: u64,
+}
+
 /// The owner address of the batch that holds member 0 of `sequence`.
-fn address(db: &Db, keyspace: KeySpace, sequence: u64) -> PhysicalValueAddress {
-    db.remote_for_test()
-        .index_reference(keyspace, &key(sequence, 0), IndexReadCut::Latest)
+fn address(db: &Db, keyspace: KeySpace, sequence: u64) -> BatchAddress {
+    let table = db.remote_for_test().hybrid_table();
+    let member = table
+        .get(keyspace, &key(sequence, 0), table.current())
         .unwrap()
-        .unwrap()
-        .batch_address
+        .expect("the written batch is indexed");
+    assert_eq!(member.operation_index, 0, "member 0 was requested");
+    BatchAddress {
+        partition: member.address.partition,
+        segment_generation: member.address.segment_generation,
+        offset: member.address.offset
+            - crate::crc::CrcFrame::CRC_HEADER_LENGTH as u64
+            - crate::distributed::codec::HEADER_LEN as u64,
+    }
 }
 
 fn observe(db: &Db) -> RelocationObservation {
     db.start_relocation_for_test(Instant::now() + Duration::from_secs(120))
         .unwrap()
+        .0
 }
 
 /// `(keyspace, sequence, member, decision)` of each callback, in order.
@@ -370,6 +389,9 @@ fn callbacks_follow_global_version_order_across_owners_and_end_at_first_stop() {
         // Member 0 in the later-visited keyspace, member 1 in the earlier.
         write(&db, sequence, &[b, a]);
     }
+    // Paper 3.1/4.4: the pass scans the durable processed prefix; make the
+    // writes durable before it runs.
+    db.flush().unwrap();
     let partitions: Vec<u32> = (0..WRITES)
         .map(|sequence| address(&db, b, sequence).partition)
         .collect();
@@ -438,6 +460,12 @@ fn stop_case(writes: u64, choose: impl FnOnce(&[u64]) -> Option<u64>) -> StopCas
         .collect();
     let stop = choose(&offsets);
     policy.set(stop.map(|sequence| (sequence, 1)), 1);
+    // Paper 3.1: the owner fsync runs in the background, so a committed batch
+    // is readable before it is durable. A relocation pass scans the processed
+    // prefix `Q` = `min(durable cut, index-applied cut)` (paper 4.4: relocation
+    // reclaims processed bytes only), so the fixture makes every write durable
+    // before the observed pass.
+    db.flush().unwrap();
     let observation = observe(&db);
     StopCase {
         fixture,
@@ -531,10 +559,17 @@ fn stop_semantics_follow_the_native_whole_file_gate() {
     }
 }
 
-/// A crash after the relocation capture is adopted and live (Exact marks and
-/// raised callback start durable) but before cleanup and physical pruning:
-/// reopen keeps the removals and the new start, and the next pass starts at
-/// the file the Stop is in, without calling the filters for older files.
+/// A crash after the relocation capture is durable (the hybrid region store
+/// wrote the dropped entries and the manifest raised the callback start) but
+/// before physical pruning: reopen keeps the removals and the new start, and
+/// the next pass starts at the file the Stop is in, without calling the
+/// filters for older files.
+///
+/// The crash is injected at the prune boundary of the pass
+/// (`relocation_prune_interruption`), the hybrid analogue of the removed Exact
+/// checkpoint interruption: the observed pass returns the error instead of
+/// retiring files. A production pass fail-stops the authority through
+/// `background_relocation_pass`; the observed slot only reports the error.
 #[test]
 fn crash_after_start_persist_before_prune_keeps_removals_and_start() {
     const WRITES: u64 = 130;
@@ -556,12 +591,11 @@ fn crash_after_start_persist_before_prune_keeps_removals_and_start() {
         .write_core()
         .test_hooks
         .lock()
-        .checkpoint_interruption = Some(3);
+        .relocation_prune_interruption = true;
     assert!(matches!(
         db.start_relocation_for_test(Instant::now() + Duration::from_secs(120)),
         Err(RelocationTestError::Native(_))
     ));
-    assert!(db.remote_for_test().ensure_healthy().is_err());
     // No physical pruning ran.
     assert!(fixture.wal_file_exists(0, generation, 0));
     drop(db);
@@ -758,10 +792,10 @@ fn assert_state(
 /// after the pass and after a reopen of both arms. Byte positions differ by
 /// WAL format, so terminals and uppers are checked per arm, not across.
 ///
-/// `copied_survivors` is an implementation difference, not compared: native
-/// copies Keep rows below its target to the WAL head, while R1 never copies
-/// and keeps those rows' files (R2 evacuation is separate). R1 reports 0;
-/// native reports exactly its Keep rows below the target.
+/// `copied_survivors` is compared per arm: both copy every Keep row below
+/// its own target, and byte positions differ by WAL format. Native writes a
+/// relocated batch to the WAL head; the leased pass writes the copy to the
+/// serving generation and re-points the entry (module doc step 4).
 #[test]
 fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
     const WRITES: u64 = 130;
@@ -781,6 +815,10 @@ fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
                     write(db, sequence, &[a, a]);
                 }
             }
+            // Paper 3.1/4.4: the leased pass scans the durable processed
+            // prefix; native applies the index synchronously, the leased owner
+            // fsync runs in the background.
+            leased.flush().unwrap();
             native
                 .native()
                 .unwrap()
@@ -828,6 +866,12 @@ fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
                 .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
                 .filter(|&(sequence, member)| native_position(&native, a, sequence, member) < FILE)
                 .count() as u64;
+            // Byte positions differ by WAL format, so each arm copies the Keep
+            // rows below ITS OWN file target; the counts are checked per arm.
+            let leased_copies = (remove_below..stop)
+                .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
+                .filter(|&(sequence, _)| leased_offset(sequence) < FILE)
+                .count() as u64;
             let leased_pass = observe(&leased);
             let native_pass = observe(&native);
             assert_eq!(leased_pass.gate, crate::RelocationGate::DidWork, "{case}");
@@ -865,7 +909,7 @@ fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
                 );
                 assert_eq!(stream.rounded_target, FILE, "{case} {arm}");
             }
-            assert_eq!(leased_pass.copied_survivors, 0, "{case}");
+            assert_eq!(leased_pass.copied_survivors, leased_copies, "{case}");
             assert_eq!(native_pass.copied_survivors, native_copies, "{case}");
             if decisions == Decisions::KeepAfterRemoves {
                 assert!(native_copies > 0, "{case}: the case must copy on native");
@@ -905,6 +949,8 @@ fn observed_pass_slot_is_busy_while_occupied() {
     for sequence in 0..4 {
         write(&db, sequence, &[a, a]);
     }
+    // Paper 3.1/4.4: the pass scans the durable processed prefix.
+    db.flush().unwrap();
     let (entered, waiting) = mpsc::sync_channel(1);
     let (resume, gate) = mpsc::sync_channel(1);
     *policy.pause.lock() = Some((entered, gate));
@@ -925,6 +971,76 @@ fn observed_pass_slot_is_busy_while_occupied() {
     assert_eq!(observation.callbacks.len(), 8);
     // The coalesced start ran or is queued; a new named pass is admitted.
     assert_eq!(observe(&db).callbacks.len(), 8);
+    db.wait_for_background_threads_to_finish().unwrap();
+    drop(fixture);
+}
+
+/// Rewrites both members of `sequence` with a value that still decodes as
+/// `(sequence, member)` but carries `marker` in its filler bytes.
+fn rewrite(db: &Arc<Db>, keyspace: KeySpace, sequence: u64, marker: u8) {
+    let mut batch = db.write_batch();
+    for member in 0..2u8 {
+        let mut value = value(sequence, member);
+        value[9] = marker;
+        batch.write(keyspace, key(sequence, member), value);
+    }
+    batch.commit().unwrap();
+}
+
+/// A write admitted after the scan cut and before the unread drop survives
+/// it: the drop is bounded by each stream's terminal, which the scan froze at
+/// or below the durable end, so the newer position lies above it (paper 4.4:
+/// relocation reclaims processed bytes). The scanned `Remove` rows below the
+/// terminal are gone; the rewrite keeps its value.
+#[test]
+fn a_rewrite_after_the_scan_cut_survives_the_unread_drop() {
+    const WRITES: u64 = 130;
+    const MARKER: u8 = 0xA5;
+    let policy = Policy::new();
+    let fixture = Fixture::new(1, shape(&policy, &["a"]));
+    let db = fixture.open();
+    let a = db.ks("a");
+    for sequence in 0..WRITES {
+        write(&db, sequence, &[a, a]);
+    }
+    let offsets: Vec<u64> = (0..WRITES)
+        .map(|sequence| address(&db, a, sequence).offset)
+        .collect();
+    let stop = first_in_second_file(&offsets);
+    // RemoveOnly up to the Stop: every scanned record before it is Remove and
+    // the Stop member ends the scan before any Keep is seen, so the pass takes
+    // the unread-drop path.
+    policy.set(Some((stop, 1)), stop);
+    db.flush().unwrap();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (resume, gate) = mpsc::sync_channel(1);
+    *policy.pause.lock() = Some((entered, gate));
+    let pass = {
+        let db = Arc::clone(&db);
+        thread::spawn(move || observe(&db))
+    };
+    waiting.recv_timeout(Duration::from_secs(60)).unwrap();
+    // Sequence 0 was already scanned as Remove; the rewrite lands above the
+    // frozen scan cut while the pass is parked at its first filter call.
+    rewrite(&db, a, 0, MARKER);
+    resume.send(()).unwrap();
+    let observation = pass.join().unwrap();
+    assert_eq!(observation.gate, crate::RelocationGate::DidWork);
+    // The scanned Remove rows below the terminal are dropped...
+    assert!(!exists(&db, a, 1, 0), "a scanned Remove row survives");
+    assert!(!exists(&db, a, 1, 1), "a scanned Remove row survives");
+    // ...and the rewrite above the scan cut keeps its value.
+    let read = db
+        .get(a, &key(0, 0))
+        .unwrap()
+        .expect("the rewrite is readable");
+    let mut expected = value(0, 0);
+    expected[9] = MARKER;
+    assert_eq!(
+        read.as_ref(),
+        expected.as_slice(),
+        "the rewrite was dropped"
+    );
     db.wait_for_background_threads_to_finish().unwrap();
     drop(fixture);
 }

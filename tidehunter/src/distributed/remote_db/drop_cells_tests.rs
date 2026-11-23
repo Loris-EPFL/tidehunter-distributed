@@ -9,7 +9,6 @@ use super::pipeline_tests::Fixture;
 use super::tests::{fail_stop_without_checkpoint, recovery_metrics, reopen_result};
 use super::*;
 use crate::cell::CellId;
-use crate::distributed::native_index::drop_mask_charge;
 use crate::distributed::sui::Db;
 use crate::key_shape::{KeyIndexing, KeyShapeBuilder, KeyType};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -389,7 +388,7 @@ fn remote_drops_match_native_digests_before_and_after_restart() {
 }
 
 #[test]
-fn drop_evicts_cached_values_and_historical_reads_keep_old_rows() {
+fn drop_evicts_cached_values_and_a_pinned_cut_sees_only_surviving_rows() {
     let fixture = Fixture::new_with_shape(128, uniform_shape());
     let db = open(&fixture);
     let ks = db.ks("root");
@@ -410,12 +409,16 @@ fn drop_evicts_cached_values_and_historical_reads_keep_old_rows() {
         after.entries + (after.evictions - cache.evictions) as usize,
         cache.entries
     );
-    // A pinned historical cut still reads (and may refill) the old rows.
+    // `DropCells` is destructive and index-only, as in native (`drop_cells_in_range`):
+    // the Exact index kept the old rows readable at an older cut, the hybrid
+    // does not, and iterators are live, not point-in-time (owner-accepted
+    // weakening, BOARD C25). A cut pinned before the drop sees only the
+    // surviving rows.
     let old: Vec<_> = checkpoint
         .iterator(ks)
         .map(|row| row.unwrap().0.to_vec())
         .collect();
-    assert_eq!(old.len(), 16);
+    assert_eq!(old.len(), 8, "a pinned cut still lists dropped rows");
     // Current reads never see them, refilled or not.
     for n in 0..16 {
         assert_eq!(
@@ -511,6 +514,7 @@ fn reopen_recovers_drops_in_both_tiers_and_checkpoint_orderings() {
                 for n in 0..32 {
                     let expected = if matches!(ordering, CheckpointOrder::DropPutThenCheckpoint)
                         && tier_key(n) == rewritten
+                        && reopen == 0
                     {
                         Some(vec![2; 8])
                     } else if dropped(n) {
@@ -526,13 +530,17 @@ fn reopen_recovers_drops_in_both_tiers_and_checkpoint_orderings() {
                         "{case} reopen {reopen} key {n}"
                     );
                 }
-                // The acknowledged range retries to its original version.
-                assert_eq!(
-                    db.core
-                        .write_drop_cells(drop_operation, mutation.clone())
-                        .unwrap(),
-                    version,
-                    "{case} reopen {reopen}"
+                // OWNER decision (BOARD 2026-11-20, decision 2): the retry window
+                // is empty after a restart, so the retried range is a new write
+                // in the new epoch, not the original version. It drops the
+                // rewritten key again, which the next reopen shows.
+                let retried = db
+                    .core
+                    .write_drop_cells(drop_operation, mutation.clone())
+                    .unwrap();
+                assert!(
+                    retried.epoch > version.epoch,
+                    "{case} reopen {reopen}: {retried:?} vs {version:?}"
                 );
                 fail_stop_without_checkpoint(db);
             }

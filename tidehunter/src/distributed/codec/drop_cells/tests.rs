@@ -313,7 +313,9 @@ fn checksum_digest_and_version_mismatches_are_rejected() {
     as_range[8..10].copy_from_slice(&DROP_CELLS_FORMAT_VERSION.to_be_bytes());
     redigest(&mut as_range);
     assert!(decode(as_range).is_err());
-    for unknown in [2u16, 5, u16::MAX] {
+    // Format 5 is the relocated-copy format (`RELOCATED_FORMAT_VERSION`) and
+    // decodes through its own checks, so the unknown versions are 2 and 6+.
+    for unknown in [2u16, 6, u16::MAX] {
         let mut format = batch.encoded().to_vec();
         format[8..10].copy_from_slice(&unknown.to_be_bytes());
         redigest(&mut format);

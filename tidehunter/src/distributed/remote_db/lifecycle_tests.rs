@@ -1,6 +1,11 @@
 //! Deterministic lifecycle cuts over real five-node authenticated WAL storage.
 //! These are recovery/retention regressions, not performance measurements.
 //! Every case opens the leased live fixture, so the module needs nvmeof.
+//!
+//! The Exact checkpoint lifecycle cases (start/progress/adopt a checkpoint,
+//! index-byte pressure, resident identities) are gone with the Exact index;
+//! their hybrid counterparts live in `hybrid/snapshot_tests.rs` (snapshot
+//! stages and crash cuts) and `hybrid/replay_tests.rs`.
 
 use super::pipeline_tests::Fixture;
 use super::*;
@@ -21,703 +26,6 @@ fn put_key(key: u32, value: u8) -> Mutation {
     }
 }
 
-/// End of the frame that holds `version` in its owner WAL. A leased owner
-/// learns frame positions at adoption, so a position proof names this end
-/// instead of relying on an owner-appended frontier.
-fn written_end(db: &RemoteDatabase, version: BatchVersion) -> u64 {
-    let address = db
-        .core
-        .durable_receipt(version.sequence)
-        .unwrap()
-        .appended()
-        .address();
-    address.offset + u64::from(address.len)
-}
-
-#[test]
-fn public_diagnostic_controls_wait_for_checkpoint_without_consuming_proof() {
-    #[cfg(all(target_os = "linux", feature = "test-utils"))]
-    let cases = 4;
-    #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
-    let cases = 2;
-    for case in 0..cases {
-        let fixture = Fixture::new();
-        let mut db = fixture.open();
-        let version = db
-            .write_batch(fixture.operation(0, 73), vec![put(1)])
-            .unwrap();
-        let through = written_end(&db, version);
-        let (entered, release) = fixture.nodes[0].pause_inventory();
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        let (reply, proof) = mpsc::sync_channel(1);
-        db.core.clients[0]
-            .send(Command::CheckpointPosition(
-                db.epoch(),
-                db.epoch(),
-                through,
-                reply,
-            ))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !db.core.clients[0].client.lock().checkpoint_pending() {
-            if Instant::now() >= deadline {
-                drop(release);
-                panic!("checkpoint control was not submitted");
-            }
-            thread::yield_now();
-        }
-        let (started, starting) = mpsc::sync_channel(1);
-        let (finished, result) = mpsc::sync_channel(1);
-        let owner = thread::spawn(move || {
-            let _ = started.send(());
-            let outcome = match case {
-                0 => db.storage_stats().map(|_| ()),
-                1 => db.connection_profiles(true, true).map(|_| ()),
-                #[cfg(all(target_os = "linux", feature = "test-utils"))]
-                2 => db.read_evidence_for_benchmark(false).map(|_| ()),
-                #[cfg(all(target_os = "linux", feature = "test-utils"))]
-                3 => db.process_resources_for_benchmark().map(|_| ()),
-                _ => unreachable!(),
-            };
-            let _ = finished.send((db, outcome));
-        });
-        starting.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = result.recv_timeout(Duration::from_millis(100));
-        release.send(()).unwrap();
-        let proof = proof.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert!(proof.durable_end > 0);
-        let completed = match early {
-            Ok(result) => Ok(result),
-            Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
-            Err(error) => Err(error),
-        };
-        let (mut db, outcome) = match completed {
-            Ok(result) => result,
-            Err(error) => {
-                std::mem::forget(fixture);
-                panic!("diagnostic control did not complete: {error}");
-            }
-        };
-        owner.join().unwrap();
-        outcome.unwrap();
-        if case == 1 {
-            db.connection_profiles(false, false).unwrap();
-        }
-        db.shutdown().unwrap();
-    }
-}
-
-#[test]
-fn write_behind_pending_checkpoint_is_durable_and_recoverable() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 74), vec![put(1)])
-        .unwrap();
-    let (entered, release) = fixture.nodes[0].pause_inventory();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    db.core.start_checkpoint().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !db.core.clients[0].client.lock().checkpoint_pending() {
-        if Instant::now() >= deadline {
-            drop(release);
-            panic!("checkpoint control was not submitted");
-        }
-        thread::yield_now();
-    }
-    let operation = fixture.operation(0, 75);
-    let (started, starting) = mpsc::sync_channel(1);
-    let (finished, result) = mpsc::sync_channel(1);
-    let owner = thread::spawn(move || {
-        let _ = started.send(());
-        let outcome = db.write_batch(operation, vec![put(2)]);
-        let _ = finished.send((db, outcome));
-    });
-    starting.recv_timeout(Duration::from_secs(5)).unwrap();
-    release.send(()).unwrap();
-    let (db, outcome) = match result.recv_timeout(Duration::from_secs(5)) {
-        Ok(result) => result,
-        Err(error) => {
-            std::mem::forget(fixture);
-            panic!("nonpipelined write did not complete: {error}");
-        }
-    };
-    owner.join().unwrap();
-    let version = outcome.unwrap();
-    db.flush_index().unwrap();
-    db.shutdown().unwrap();
-    drop(db);
-    let mut reopened = fixture.open();
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(2)]).unwrap(),
-        version
-    );
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[cfg(all(target_os = "linux", feature = "test-utils"))]
-#[test]
-fn concurrent_eviction_waits_for_pending_checkpoint_control() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    let db = fixture.open();
-    let version = db
-        .write_batch(fixture.operation(0, 76), vec![put(1)])
-        .unwrap();
-    let through = written_end(&db, version);
-    let (entered, release) = fixture.nodes[0].pause_inventory();
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (reply, proof) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::CheckpointPosition(
-            db.epoch(),
-            db.epoch(),
-            through,
-            reply,
-        ))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !db.core.clients[0].client.lock().checkpoint_pending() {
-        if Instant::now() >= deadline {
-            drop(release);
-            panic!("checkpoint control was not submitted");
-        }
-        thread::yield_now();
-    }
-    let db = ConcurrentRemoteDatabase::new(db).unwrap();
-    let (started, starting) = mpsc::sync_channel(1);
-    let (finished, result) = mpsc::sync_channel(1);
-    let owner = thread::spawn(move || {
-        let _ = started.send(());
-        let outcome = db.evict_mapped_wal_for_benchmark();
-        let _ = finished.send((db, outcome));
-    });
-    starting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let early = result.recv_timeout(Duration::from_millis(100));
-    release.send(()).unwrap();
-    assert!(
-        proof
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-            .durable_end
-            > 0
-    );
-    let completed = match early {
-        Ok(result) => Ok(result),
-        Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
-        Err(error) => Err(error),
-    };
-    let (db, outcome) = match completed {
-        Ok(result) => result,
-        Err(error) => {
-            std::mem::forget(fixture);
-            panic!("concurrent eviction did not complete: {error}");
-        }
-    };
-    owner.join().unwrap();
-    assert_eq!(outcome.unwrap().len(), 5);
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn scalar_write_uses_worker_while_checkpoint_awaits_verification() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 71), vec![put(1)])
-        .unwrap();
-    let before = db.pipeline_stats().append_requests;
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_prefix_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let operation = fixture.operation(0, 72);
-    let (finished, result) = mpsc::sync_channel(1);
-    let owner = thread::spawn(move || {
-        let outcome = db.write_batch(operation, vec![put(2)]);
-        let append_requests = db.pipeline_stats().append_requests;
-        let _ = finished.send((db, outcome, append_requests));
-    });
-    let before_resume = result.recv_timeout(Duration::from_secs(5));
-    let _ = resume.send(());
-    let (db, outcome, append_requests) = match before_resume {
-        Ok(result) => result,
-        Err(error) => {
-            std::mem::forget(fixture);
-            panic!("scalar write did not finish before checkpoint verification: {error}");
-        }
-    };
-    owner.join().unwrap();
-    let version = outcome.unwrap();
-    // The scalar write formed exactly one worker group while the checkpoint
-    // was paused before verification.
-    assert_eq!(append_requests, before + 1);
-    db.shutdown().unwrap();
-    drop(db);
-    let reopened = fixture.open();
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(2)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn cancelled_checkpoint_reply_drains_before_worker_shutdown() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 51), vec![put(1)])
-        .unwrap();
-    let (reply, cancelled) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::CheckpointPosition(
-            db.epoch(),
-            db.epoch(),
-            0,
-            reply,
-        ))
-        .unwrap();
-    drop(cancelled);
-    let operation = fixture.operation(0, 52);
-    let version = db.write_batch(operation, vec![put(2)]).unwrap();
-    db.shutdown().unwrap();
-    drop(db);
-    let reopened = fixture.open();
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(2)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn failed_shutdown_joins_checkpoint_before_worker_senders() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 54), vec![put(1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_prefix_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    db.core
-        .begin_failure(&LocalDbError::new("injected shutdown failure"));
-    let (finished, result) = mpsc::sync_channel(1);
-    let owner = thread::spawn(move || {
-        let result = db.shutdown();
-        let _ = finished.send(result);
-    });
-    let _ = resume.send(());
-    let shutdown = match result.recv_timeout(Duration::from_secs(5)) {
-        Ok(result) => result,
-        Err(error) => {
-            // A stuck owner may still hold node connections. Do not join it or
-            // block fixture teardown on the very deadlock this test detects.
-            std::mem::forget(fixture);
-            panic!("checkpoint shutdown did not complete: {error}");
-        }
-    };
-    owner.join().unwrap();
-    assert!(shutdown.is_err());
-}
-
-#[test]
-fn checkpoint_rejects_mismatched_position_proof_before_adoption() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    let operation = fixture.operation(0, 55);
-    let version = db.write_batch(operation, vec![put(1)]).unwrap();
-    let previous = db
-        .core
-        .publisher
-        .lock()
-        .manifest
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| (checkpoint.epoch, checkpoint.generation));
-    db.core.test_hooks.lock().corrupt_checkpoint_proof = true;
-    db.core.start_checkpoint().unwrap();
-    let error = db.core.progress_checkpoint(true).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("checkpoint position proof differs")
-    );
-    assert_eq!(
-        db.core
-            .publisher
-            .lock()
-            .manifest
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| (checkpoint.epoch, checkpoint.generation)),
-        previous
-    );
-    assert!(db.shutdown().is_err());
-    drop(db);
-    let reopened = fixture.open();
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(1)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn invalid_checkpoint_position_fails_without_adoption() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 53), vec![put(1)])
-        .unwrap();
-    let previous = db
-        .core
-        .publisher
-        .lock()
-        .manifest
-        .checkpoint
-        .as_ref()
-        .map(|checkpoint| (checkpoint.epoch, checkpoint.generation));
-    let (reply, pending) = mpsc::sync_channel(1);
-    db.core.clients[0]
-        .send(Command::CheckpointPosition(
-            db.epoch(),
-            db.epoch(),
-            u64::MAX,
-            reply,
-        ))
-        .unwrap();
-    assert!(
-        pending
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .is_err()
-    );
-    assert!(
-        db.core
-            .concurrent_failure
-            .load(std::sync::atomic::Ordering::Acquire)
-    );
-    assert_eq!(
-        db.core
-            .publisher
-            .lock()
-            .manifest
-            .checkpoint
-            .as_ref()
-            .map(|checkpoint| (checkpoint.epoch, checkpoint.generation)),
-        previous
-    );
-    assert!(db.shutdown().is_err());
-}
-
-#[test]
-fn checkpoint_over_gap_and_lost_response_replay_sparse_ack_and_retry_identity() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let baseline = fixture.operation(4, 30);
-    db.write_batch(baseline, vec![put_key(0, 1)]).unwrap();
-    let connection = Arc::clone(&db.core.clients[0].client);
-    let held = connection.lock();
-    let suffix_connection = Arc::clone(&db.core.clients[1].client);
-    let suffix_held = suffix_connection.lock();
-    let gap = fixture.operation(0, 31);
-    let suffix = fixture.operation(1, 32);
-    let gap_version = db.submit(gap, vec![put_key(1, 2)]).unwrap();
-    let suffix_version = db.submit(suffix, vec![put_key(2, 3)]).unwrap();
-    let other_version = db
-        .submit(fixture.operation(1, 33), vec![put_key(3, 4)])
-        .unwrap();
-    drop(suffix_held);
-    super::pipeline_tests::complete_owner(
-        &db,
-        1,
-        &[suffix_version.sequence, other_version.sequence],
-    );
-    let sparse_published = db.core.is_published(suffix_version);
-    let gap_published = db.core.is_published(gap_version);
-    let suffix_value = db.get(KeySpace(0), &2u32.to_be_bytes());
-    let retry = db.submit(suffix, vec![put_key(2, 3)]);
-    // Canonical encoded bytes of the three batches after the baseline: the
-    // unpublished gap still holds its payload; published members are measured
-    // from their receipts (frame length minus the 8-byte trailer).
-    let receipt_bytes = |sequence| {
-        (db.core
-            .durable_receipt(sequence)
-            .unwrap()
-            .appended()
-            .address()
-            .len
-            - 8) as usize
-    };
-    let retained_bytes = db.core.pending_encoded_len(gap_version.sequence).unwrap()
-        + receipt_bytes(suffix_version.sequence)
-        + receipt_bytes(other_version.sequence);
-    let checkpoint_started = db.core.start_checkpoint();
-    drop(held);
-    assert!(sparse_published);
-    assert!(!gap_published);
-    assert_eq!(suffix_value.unwrap().unwrap().as_ref(), &[3; 32]);
-    assert_eq!(retry.unwrap(), suffix_version);
-    checkpoint_started.unwrap();
-    db.core.progress_checkpoint(true).unwrap();
-    // The released gap publishes on its worker; the cut stays the baseline.
-    db.drain().unwrap();
-    {
-        let publisher = db.core.publisher.lock();
-        assert_eq!(publisher.checkpoint_tail_batches, 3);
-        assert_eq!(publisher.checkpoint_tail_bytes, retained_bytes);
-    }
-    let charges = db.core.admission.charges();
-    assert_eq!(charges.replay_batches, 3);
-    assert_eq!(charges.replay_bytes, retained_bytes);
-
-    // The response loss happens after the stable image was adopted. Recovery
-    // must merge both its acknowledged sparse suffix and this uncertain WAL.
-    // The owner-2 frame reaches its WAL file but its completion reports EIO:
-    // the outcome is unknown to the authority, as for a lost reply.
-    db.core.clients[2]
-        .client
-        .lock()
-        .leased_test_fail_write(-libc::EIO);
-    let uncertain = fixture.operation(2, 34);
-    let uncertain_version = db.submit(uncertain, vec![put_key(4, 5)]).unwrap();
-    assert!(db.drain().is_err());
-    assert!(db.core.ensure_healthy().is_err());
-    drop(db);
-    // Client clones keep the live connection registry (and its lock) alive.
-    drop((connection, suffix_connection));
-
-    let mut reopened = fixture.open();
-    for (key, expected) in [(2u32, 3u8), (3, 4), (4, 5)] {
-        assert_eq!(
-            reopened
-                .get(KeySpace(0), &key.to_be_bytes())
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            &[expected; 32]
-        );
-    }
-    assert_eq!(
-        reopened.submit(suffix, vec![put_key(2, 3)]).unwrap(),
-        suffix_version
-    );
-    assert_eq!(
-        reopened.submit(uncertain, vec![put_key(4, 5)]).unwrap(),
-        uncertain_version
-    );
-    assert!(reopened.submit(suffix, vec![put_key(2, 9)]).is_err());
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    // Queueing is immediate now. Hold the actual owner before enqueue so the
-    // missing batch still has no WAL effect at the simulated coordinator crash.
-    let connection = Arc::clone(&db.core.clients[0].client);
-    let held = connection.lock();
-    let suffix_connection = Arc::clone(&db.core.clients[1].client);
-    let suffix_held = suffix_connection.lock();
-    let missing = fixture.operation(0, 40);
-    let acknowledged = fixture.operation(1, 41);
-    let missing_version = db.submit(missing, vec![put_key(1, 1)]).unwrap();
-    let acknowledged_version = db.submit(acknowledged, vec![put_key(2, 2)]).unwrap();
-    let other_version = db
-        .submit(fixture.operation(1, 42), vec![put_key(3, 3)])
-        .unwrap();
-    drop(suffix_held);
-    super::pipeline_tests::complete_owner(
-        &db,
-        1,
-        &[acknowledged_version.sequence, other_version.sequence],
-    );
-    assert!(!db.core.is_published(missing_version));
-    assert!(db.core.is_published(acknowledged_version));
-    assert_eq!(
-        db.core.clients[0].queue.snapshot(),
-        (1, 2, vec![(1, missing_version.sequence, 1)]),
-    );
-    assert_eq!(held.append_flights_in_flight(), 0);
-    // Simulate abrupt authority loss with the accepted batch still in its
-    // owner queue and no transport submission. begin_failure stores the
-    // shared worker failure flag before the owner client is released.
-    db.core
-        .begin_failure(&LocalDbError::new("injected coordinator loss"));
-    drop(held);
-    drop(db);
-    // Client clones keep the live connection registry (and its lock) alive.
-    drop((connection, suffix_connection));
-
-    let mut reopened = fixture.open();
-    assert!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &2u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &3u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[3; 32]
-    );
-    assert_eq!(
-        reopened.submit(acknowledged, vec![put_key(2, 2)]).unwrap(),
-        acknowledged_version
-    );
-    // An unacknowledged absent batch can be admitted in the new epoch; its
-    // original sequence must not be reused as though the old write succeeded.
-    let retry = reopened.write_batch(missing, vec![put_key(1, 1)]).unwrap();
-    assert!(retry.epoch > missing_version.epoch);
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn acknowledged_suffix_survives_every_background_checkpoint_adoption_stage() {
-    for stage in 0..=8 {
-        let fixture = Fixture::new();
-        let mut db = fixture.open();
-        let first = fixture.operation(0, 1);
-        let captured = fixture.operation(0, 2);
-        let suffix = fixture.operation(0, 3);
-        let first_version = db.write_batch(first, vec![put(1)]).unwrap();
-        db.flush_index().unwrap();
-        let captured_version = db.write_batch(captured, vec![put(2)]).unwrap();
-        let (entered, waiting) = mpsc::sync_channel(1);
-        let (resume, gate) = mpsc::sync_channel(1);
-        {
-            let mut hooks = db.core.test_hooks.lock();
-            hooks.checkpoint_pause = Some((entered, gate));
-            hooks.checkpoint_interruption = Some(stage);
-        }
-        db.core.start_checkpoint().unwrap();
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        // This is the same physical stream as the frozen prefix. Its later
-        // append must not invalidate the earlier exact-prefix checkpoint proof.
-        let suffix_version = db.write_batch(suffix, vec![put(3)]).unwrap();
-        assert_eq!(
-            db.authority_write_stats()
-                .background_checkpoint_suffix_batches,
-            1
-        );
-        assert_eq!(
-            db.get(KeySpace(0), &1u32.to_be_bytes())
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            &[3; 32]
-        );
-        resume.send(()).unwrap();
-        assert!(db.core.progress_checkpoint(true).is_err());
-        drop(db);
-
-        let mut reopened = fixture.open();
-        assert_eq!(
-            reopened
-                .get(KeySpace(0), &1u32.to_be_bytes())
-                .unwrap()
-                .unwrap()
-                .as_ref(),
-            &[3; 32]
-        );
-        assert_eq!(
-            reopened.write_batch(first, vec![put(1)]).unwrap(),
-            first_version
-        );
-        assert_eq!(
-            reopened.write_batch(captured, vec![put(2)]).unwrap(),
-            captured_version
-        );
-        assert_eq!(
-            reopened.write_batch(suffix, vec![put(3)]).unwrap(),
-            suffix_version
-        );
-        assert!(reopened.write_batch(first, vec![put(9)]).is_err());
-        reopened.validate_cached_read().unwrap();
-    }
-}
-
-#[test]
-fn failed_staging_intent_fences_serving_without_authorizing_outputs() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let staged = db
-        .core
-        .publisher
-        .lock()
-        .manifest
-        .checkpoint_staging
-        .as_ref()
-        .unwrap()
-        .names();
-
-    // Persistence is blocked before the intent reaches disk. Owner WAL progress
-    // remains available, but no output can be written without the intent.
-    db.write_batch(fixture.operation(1, 2), vec![put(2)])
-        .unwrap();
-    let pending = db.core.path.join(format!(".{MANIFEST}.pending"));
-    fs::create_dir(&pending).unwrap();
-    resume.send(()).unwrap();
-    assert!(db.core.progress_checkpoint(true).is_err());
-    assert!(db.core.ensure_healthy().is_err());
-    assert!(db.ensure_healthy().is_err());
-
-    let persisted: AuthorityManifest = read_metadata(&db.core.path.join(MANIFEST)).unwrap();
-    assert!(persisted.checkpoint_staging.is_none());
-    assert!(persisted.checkpoint_obsolete.is_none());
-    assert!(persisted.checkpoint.is_none());
-    for name in staged {
-        assert!(!db.core.path.join(name).exists());
-    }
-
-    fs::remove_dir(pending).unwrap();
-    drop(db);
-    let mut reopened = fixture.open();
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-}
-
-/// Completed write bookkeeping is bounded by the fixed WAL-replay retry
-/// window, the only history since R3: `recent` keeps at most
-/// `WAL_REPLAY_WINDOW_BATCHES` receipts and identities follow it, so the
-/// resident charge stays within the window's static byte bound across
-/// lifetime history, capacity pressure and reopens. (On-disk receipt history,
-/// removed by R3, paged identities out instead.) The plateau once the window
-/// is full is `completed_owner_metadata_plateaus_once_the_retry_window_is_full`.
 #[test]
 fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
     let fixture = Fixture::new_with_capacity(8);
@@ -725,8 +33,9 @@ fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
     let mut original_version = None;
     let mut next = 100u64;
     for _ in 0..3 {
-        let db = fixture.open();
+        let mut db = fixture.open();
         let bound = db.core.metadata_history_bound();
+        let mut epoch_retry = None;
         for _ in 0..4 {
             for _ in 0..16 {
                 let operation = fixture.operation((next % 5) as u32, next);
@@ -739,47 +48,49 @@ fn completed_owner_metadata_is_bounded_across_lifetime_capacity_and_reopens() {
                 db.core.wait_settled().unwrap();
                 assert_eq!(db.core.retained_slots(), 0);
                 assert_eq!(db.core.unresolved_slots(), 0);
-                assert!(
-                    db.core.publisher.lock().known.len() <= fixture.config.max_admitted_batches
-                );
             }
             db.flush_index().unwrap();
-            assert!(
-                db.core.publisher.lock().known.is_empty(),
-                "completed outcomes must page out after durable adoption"
-            );
             assert!(db.core.publisher.lock().recent.len() <= WAL_REPLAY_WINDOW_BATCHES);
             let charge = db.metadata_history_bytes();
             assert!(
                 charge <= bound,
                 "resident completed bookkeeping {charge} exceeds the retry-window bound {bound}"
             );
-            // Every write so far is inside the retry window.
-            assert_eq!(
-                db.write_batch(original, vec![put(100)]).unwrap(),
-                original_version.unwrap()
-            );
+            // Within one epoch the retry window answers with the recorded
+            // version and writes nothing. A reopen empties it (OWNER decision,
+            // BOARD 2026-11-20, decision 2), so the first retry of an earlier
+            // epoch's identity is a new write under the new epoch and carries
+            // its value; later retries in that epoch return that first
+            // retry's version and write nothing.
+            let before_row = db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
+            let recorded = original_version.unwrap();
+            let retried = db.write_batch(original, vec![put(100)]).unwrap();
+            // `write_batch` returns once the batch is readable; the drain keeps
+            // the read below from racing later publication.
+            db.drain().unwrap();
+            let after_row = db.get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
+            if retried.epoch == recorded.epoch {
+                assert_eq!(retried, recorded);
+                assert_eq!(after_row, before_row);
+            } else if let Some(first) = epoch_retry {
+                assert_eq!(retried, first, "an in-epoch retry changed its version");
+                assert_eq!(after_row, before_row);
+            } else {
+                assert!(retried.epoch > recorded.epoch);
+                assert_eq!(after_row, Some(vec![100; 32].into()));
+                epoch_retry = Some(retried);
+            }
         }
         db.shutdown().unwrap();
     }
 }
 
 /// Faithful plateau of the retry window: past `WAL_REPLAY_WINDOW_BATCHES`
-/// batches the retained bookkeeping stops growing. After each flush, once the
-/// window is full, `recent` and the identity table hold exactly the window
-/// (every write is checkpointed, so no Active or Suffix identity remains), and
-/// the resident charge stays within the static bound of that window, which
-/// does not depend on lifetime history. The charge itself is hash-table slot
-/// capacity: with a constant entry count it still moves up and down by a few
-/// percent as identity shards rehash around their per-shard counts (a
-/// RandomState spread), so a byte-for-byte comparison between windows would
-/// not be deterministic. Measured on 256 identity shards with 4,096 entries
-/// constant after the window filled, identity bytes at successive flushes
-/// were 526320, 556080, 580160, 586960, 594000, 594720, 598240, 608320,
-/// 610640, 597760, 598720, 614320; the publisher parts stayed constant (known
-/// capacity 224, recent 4,096) and dependencies were empty. Ignored in the
-/// normal suite for its length (three windows of writes); the gate's
-/// ignored-test stage runs it.
+/// batches the retained retry bookkeeping stops growing. After each flush,
+/// once the window is full, `recent` holds exactly the window, and the
+/// resident charge stays within the static bound of that window, which does
+/// not depend on lifetime history. Ignored in the normal suite for its length
+/// (three windows of writes); the gate's ignored-test stage runs it.
 #[test]
 #[ignore = "writes past the 4,096-batch retry window; run by the gate's ignored-test stage"]
 fn completed_owner_metadata_plateaus_once_the_retry_window_is_full() {
@@ -816,14 +127,8 @@ fn completed_owner_metadata_plateaus_once_the_retry_window_is_full() {
         );
         if written >= window {
             assert_eq!(recent, WAL_REPLAY_WINDOW_BATCHES, "after {written} writes");
-            assert_eq!(
-                db.core.resident_identities(),
-                WAL_REPLAY_WINDOW_BATCHES,
-                "after {written} writes"
-            );
         } else {
             assert_eq!(recent as u64, written);
-            assert_eq!(db.core.resident_identities() as u64, written);
         }
         // The newest write is inside the window: its retry keeps its version.
         let (operation, value, version) = last.unwrap();
@@ -833,379 +138,6 @@ fn completed_owner_metadata_plateaus_once_the_retry_window_is_full() {
         );
     }
     db.shutdown().unwrap();
-}
-
-/// Reserve one grant through the real caller Admission path. A blocked
-/// checkpoint-bound dimension requests a checkpoint with no lock held.
-fn reserve_pressure(
-    core: &Arc<write_core::core::WriteCore>,
-    grant: concurrent::WriteGrant,
-    block: bool,
-) -> Result<concurrent::WriteCredit, LocalDbError> {
-    core.admission.reserve_grant(
-        grant,
-        block,
-        || core.ensure_writable(),
-        |_| core.request_checkpoint(),
-    )
-}
-
-fn index_grant(index_bytes: usize) -> concurrent::WriteGrant {
-    concurrent::WriteGrant {
-        requests: 1,
-        index_bytes,
-        ..concurrent::WriteGrant::default()
-    }
-}
-
-#[test]
-fn index_pressure_waits_for_existing_capture_before_rejecting_live_residency() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(1)])
-        .unwrap();
-
-    let resident = db.index_stats().charged_metadata_bytes;
-    let additional_bytes = db
-        .core
-        .config
-        .max_index_bytes
-        .checked_sub(resident)
-        .unwrap()
-        .checked_add(1)
-        .unwrap();
-    assert!(db.core.index.check_capacity(additional_bytes).is_err());
-
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let generation = db.core.publisher.lock().snapshot_generation;
-    let release = std::thread::spawn(move || resume.send(()).unwrap());
-
-    // The blocked index grant is granted by the existing capture's adoption.
-    let credit = reserve_pressure(&db.core, index_grant(additional_bytes), true).unwrap();
-    release.join().unwrap();
-    db.core.progress_checkpoint(true).unwrap();
-
-    assert_eq!(db.core.publisher.lock().snapshot_generation, generation);
-    assert!(db.core.publisher.lock().background_checkpoint.is_none());
-    db.core.index.check_capacity(additional_bytes).unwrap();
-    drop(credit);
-}
-
-#[test]
-fn drained_partition_pressure_does_not_wait_for_an_unrelated_capture() {
-    let mut fixture = Fixture::new_with_capacity(1);
-    fixture.config.max_admitted_batches = 4;
-    fixture.config.max_pending_batches = 4;
-    let mut db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-
-    let connection = Arc::clone(&db.core.clients[1].client);
-    let held = connection.lock();
-    db.submit(fixture.operation(1, 2), vec![put(2)]).unwrap();
-    let partition_grant = || {
-        let mut grant = concurrent::WriteGrant {
-            requests: 1,
-            ..concurrent::WriteGrant::default()
-        };
-        grant.add_partition(1, 1).unwrap();
-        grant
-    };
-    let initially_full = reserve_pressure(&db.core, partition_grant(), false).is_err();
-    let (finished, completion) = mpsc::sync_channel(1);
-    let core = Arc::clone(&db.core);
-    let owner = thread::spawn(move || {
-        let result = reserve_pressure(&core, partition_grant(), true);
-        finished.send(result.is_ok()).unwrap();
-        result.map(drop)
-    });
-    drop(held);
-    // The channel bounds a dependency deadlock, not a device-latency target.
-    let observed = completion.recv_timeout(Duration::from_secs(5));
-    resume.send(()).unwrap();
-    let result = owner.join().unwrap();
-    assert!(initially_full);
-    assert!(observed.unwrap());
-    result.unwrap();
-    assert_eq!(
-        db.get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-    db.flush_index().unwrap();
-}
-
-#[test]
-fn adopted_capture_releases_identity_pressure_without_waiting_for_another_cut() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut suffix = None;
-    for sequence in 1..fixture.config.max_admitted_batches {
-        let operation = fixture.operation((sequence % 5) as u32, sequence as u64 + 1);
-        let version = db.write_batch(operation, vec![put(2)]).unwrap();
-        suffix = Some((operation, version));
-    }
-    let identity_grant = || concurrent::WriteGrant {
-        requests: 1,
-        identities: 1,
-        replay_batches: 1,
-        replay_bytes: fixture.config.storage.batch_limits.max_encoded_bytes,
-        ..concurrent::WriteGrant::default()
-    };
-    assert!(reserve_pressure(&db.core, identity_grant(), false).is_err());
-    let (next_entered, _next_waiting) = mpsc::sync_channel(1);
-    let (next_resume, next_gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((next_entered, next_gate));
-    let (finished, completion) = mpsc::sync_channel(1);
-    let core = Arc::clone(&db.core);
-    let grant = identity_grant();
-    let owner = thread::spawn(move || {
-        let result = reserve_pressure(&core, grant, true);
-        finished.send(result.is_ok()).unwrap();
-        result.map(drop)
-    });
-    resume.send(()).unwrap();
-    // An unnecessary full catch-up would now depend on next_resume.
-    let observed = completion.recv_timeout(Duration::from_secs(5));
-    // Sampled before next_resume: a successor capture cannot have adopted.
-    let tail = db.core.publisher.lock().checkpoint_tail_batches;
-    next_resume.send(()).unwrap();
-    let result = owner.join().unwrap();
-    assert!(observed.unwrap());
-    result.unwrap();
-    assert_eq!(tail, fixture.config.max_admitted_batches - 1);
-    db.core
-        .begin_failure(&LocalDbError::new("injected crash before reopen"));
-    drop(db);
-    let mut reopened = fixture.open();
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-    let (operation, version) = suffix.unwrap();
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(2)]).unwrap(),
-        version
-    );
-}
-
-#[test]
-fn remaining_index_pressure_requires_one_new_capture_after_the_existing_cut() {
-    remaining_index_pressure_case(false);
-}
-
-/// The blocked caller queues and requests a checkpoint while the existing
-/// capture is still paused, so that request starts nothing. Adopting the
-/// existing capture frees too little and grants nobody; only the checkpoint
-/// thread's wake of the FIFO head lets the caller request the successor
-/// capture. Without that wake the caller sleeps to its admission deadline.
-#[test]
-fn checkpoint_finish_wakes_index_blocked_caller_to_request_successor_capture() {
-    remaining_index_pressure_case(true);
-}
-
-fn remaining_index_pressure_case(parked_before_resume: bool) {
-    let mut fixture = Fixture::new();
-    let db = fixture.open();
-    let mutations = |value| {
-        (1u32..=3)
-            .map(|key| Mutation::Put {
-                keyspace: KeySpace(0),
-                key: key.to_be_bytes().to_vec().into(),
-                value: vec![value; 32].into(),
-            })
-            .collect::<Vec<_>>()
-    };
-    db.write_batch(fixture.operation(0, 1), mutations(0))
-        .unwrap();
-    db.flush_index().unwrap();
-    let resident_directory = db.index_stats().charged_metadata_bytes;
-    let incoming = CompleteBatch::new(
-        &fixture.shape,
-        BatchId {
-            database: fixture.config.storage.database,
-            operation: fixture.operation(2, 4),
-        },
-        BatchVersion {
-            epoch: db.epoch(),
-            sequence: db.core.next_sequence(),
-        },
-        mutations(3),
-        fixture.config.storage.batch_limits,
-    )
-    .unwrap();
-    let additional_bytes = db.core.index.estimated_batch_bytes(&incoming).unwrap();
-    db.shutdown().unwrap();
-    drop(db);
-    fixture.config.max_index_bytes = resident_directory.checked_add(additional_bytes).unwrap();
-    // Open reserves the publisher's standing sparse-view budget (two views of
-    // max_pending_batches - 1 exclusions) against this same byte limit,
-    // independently of residency; this tight limit cannot hold it at the
-    // fixture's 64. These writes are sequential, so one pending batch makes
-    // that budget zero and leaves the residency bound exactly this tight.
-    fixture.config.max_pending_batches = 1;
-    let mut db = fixture.open();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.write_batch(fixture.operation(0, 2), vec![put(1)])
-        .unwrap();
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    db.write_batch(fixture.operation(1, 3), vec![put(2)])
-        .unwrap();
-    let generation = db.core.publisher.lock().snapshot_generation;
-    assert!(reserve_pressure(&db.core, index_grant(additional_bytes), false).is_err());
-    // The existing capture predates the second write; only one new capture
-    // after its cut frees the remaining index residency.
-    let credit = if parked_before_resume {
-        let (requested, request_seen) = mpsc::sync_channel(1);
-        let (finished, outcome) = mpsc::sync_channel(1);
-        let core = Arc::clone(&db.core);
-        let caller = thread::spawn(move || {
-            let result = core.admission.reserve_grant(
-                index_grant(additional_bytes),
-                true,
-                || core.ensure_writable(),
-                |_| {
-                    let result = core.request_checkpoint();
-                    // Queued before this callback; a wake that precedes the
-                    // park is kept by the thread's unpark token.
-                    let _ = requested.try_send(());
-                    result
-                },
-            );
-            let _ = finished.send(result.is_ok());
-            result
-        });
-        request_seen.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(db.core.publisher.lock().snapshot_generation, generation);
-        resume.send(()).unwrap();
-        // The channel bounds a lost wake (30 s admission deadline), not a
-        // device-latency target.
-        let observed = outcome.recv_timeout(Duration::from_secs(10));
-        assert_eq!(
-            observed,
-            Ok(true),
-            "checkpoint finish left the caller parked"
-        );
-        caller.join().unwrap().unwrap()
-    } else {
-        resume.send(()).unwrap();
-        reserve_pressure(&db.core, index_grant(additional_bytes), true).unwrap()
-    };
-    db.core.progress_checkpoint(true).unwrap();
-    assert_eq!(db.core.publisher.lock().snapshot_generation, generation + 1);
-    assert!(db.core.publisher.lock().background_checkpoint.is_none());
-    db.core.index.check_capacity(additional_bytes).unwrap();
-    drop(credit);
-    assert_eq!(
-        db.get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[2; 32]
-    );
-    db.flush_index().unwrap();
-}
-
-/// The standing sparse-view budget is reserved once at open. A max_index_bytes
-/// that cannot hold it fails open before serving, with a clear error and no
-/// effect on recoverable state.
-#[test]
-fn open_fails_cleanly_when_index_bytes_cannot_hold_standing_view_budget() {
-    let mut fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(7)])
-        .unwrap();
-    // No view is installed and no capture runs: the transient charge is
-    // exactly the standing budget, unchanged by the write.
-    let stats = db.index_stats();
-    let budget = stats.transient_metadata_bytes;
-    assert!(budget > 0);
-    db.shutdown().unwrap();
-    drop(db);
-    fixture.config.max_index_bytes = budget - 1;
-    assert!(fixture.config.max_index_bytes >= stats.charged_metadata_bytes);
-    let open = |config: &RemoteDatabaseConfig| {
-        RemoteDatabase::open_local_live_fixture(
-            &fixture.temp.path().join("authority"),
-            &fixture.shape,
-            config.clone(),
-        )
-    };
-    let error = open(&fixture.config)
-        .err()
-        .expect("open must reserve the standing view budget");
-    assert!(
-        error
-            .to_string()
-            .contains("cannot hold the standing sparse publication view budget"),
-        "{error}"
-    );
-    fixture.config.max_index_bytes = budget;
-    let mut reopened = open(&fixture.config).unwrap();
-    assert_eq!(reopened.index_stats().transient_metadata_bytes, budget);
-    assert_eq!(
-        reopened
-            .get(KeySpace(0), &1u32.to_be_bytes())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[7; 32]
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn unchanged_flush_waits_for_captured_cut_and_then_covers_its_acknowledged_suffix() {
-    let fixture = Fixture::new();
-    let db = fixture.open();
-    db.write_batch(fixture.operation(0, 1), vec![put(1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    db.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    db.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    db.write_batch(fixture.operation(1, 2), vec![put(2)])
-        .unwrap();
-    resume.send(()).unwrap();
-    db.flush_index().unwrap();
-    {
-        let publisher = db.core.publisher.lock();
-        assert_eq!(publisher.checkpoint_tail_batches, 0);
-        assert_eq!(publisher.checkpoint_tail_bytes, 0);
-        assert!(publisher.background_checkpoint.is_none());
-        assert!(publisher.known.is_empty());
-    }
-    db.core
-        .begin_failure(&LocalDbError::new("injected crash before reopen"));
-    drop(db);
-    let reopened = fixture.open();
-    assert_eq!(reopened.recovery_stats().tail_batches, 0);
 }
 
 #[test]
@@ -1245,8 +177,11 @@ fn skewed_submit_window_spills_one_partition_without_lifetime_rejection() {
     db.shutdown().unwrap();
     drop(db);
     let reopened = fixture.open();
+    // Accepted weakening: a reopen empties the retry window, so each retry of
+    // an earlier-epoch operation is re-applied under the new epoch.
     for ((operation, mutations), version) in writes.into_iter().zip(versions) {
-        assert_eq!(reopened.write_batch(operation, mutations).unwrap(), version);
+        let retried = reopened.write_batch(operation, mutations).unwrap();
+        assert!(retried.epoch > version.epoch);
     }
     reopened.validate_cached_read().unwrap();
 }
@@ -1302,16 +237,226 @@ fn publication_failure_fences_and_recovers_dispatched_successor_group() {
 
     let mut reopened = fixture.open();
     assert_eq!(reopened.recovery_stats().tail_batches, 5);
+    // Accepted weakening: the reopened retry window is empty, so every retry is
+    // re-applied under the new epoch. Key 1 still ends at the last value.
     for (operation, value, version) in identities {
-        assert_eq!(
-            reopened.submit(operation, vec![put(value)]).unwrap(),
-            version
-        );
+        let retried = reopened.submit(operation, vec![put(value)]).unwrap();
+        assert!(retried.epoch > version.epoch);
     }
     assert_eq!(
         reopened.get(KeySpace(0), &1u32.to_be_bytes()).unwrap(),
         Some(vec![3; 32].into())
     );
-    assert_eq!(reopened.stats().admitted_batches, 0);
+    // Accepted weakening: all five retries above were re-applied and admitted
+    // because the reopened retry window is empty.
+    assert_eq!(reopened.stats().admitted_batches, 5);
+    reopened.shutdown().unwrap();
+}
+
+/// A disjoint later batch publishes and survives a crash while an earlier
+/// batch never reached the owner WAL: the published receipts replay, the
+/// missing batch is absent, and its retry takes a new epoch.
+#[test]
+fn sparse_ack_survives_crash_when_earlier_disjoint_batch_never_reached_wal() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    // Queueing is immediate now. Hold the actual owner before enqueue so the
+    // missing batch still has no WAL effect at the simulated coordinator crash.
+    let connection = Arc::clone(&db.core.clients[0].client);
+    let held = connection.lock();
+    let suffix_connection = Arc::clone(&db.core.clients[1].client);
+    let suffix_held = suffix_connection.lock();
+    let missing = fixture.operation(0, 40);
+    let acknowledged = fixture.operation(1, 41);
+    let missing_version = db.submit(missing, vec![put_key(1, 1)]).unwrap();
+    let acknowledged_version = db.submit(acknowledged, vec![put_key(2, 2)]).unwrap();
+    let other_version = db
+        .submit(fixture.operation(1, 42), vec![put_key(3, 3)])
+        .unwrap();
+    drop(suffix_held);
+    super::pipeline_tests::complete_owner(
+        &db,
+        1,
+        &[acknowledged_version.sequence, other_version.sequence],
+    );
+    assert!(!db.core.is_published(missing_version));
+    assert!(db.core.is_published(acknowledged_version));
+    assert_eq!(
+        db.core.clients[0].queue.snapshot(),
+        (1, 2, vec![(1, missing_version.sequence, 1)]),
+    );
+    assert_eq!(held.leased_flights_in_flight(), 0);
+    // Simulate abrupt authority loss with the accepted batch still in its
+    // owner queue and no transport submission. begin_failure stores the
+    // shared worker failure flag before the owner client is released.
+    db.core
+        .begin_failure(&LocalDbError::new("injected coordinator loss"));
+    drop(held);
+    drop(db);
+    // Client clones keep the live connection registry (and its lock) alive.
+    drop((connection, suffix_connection));
+
+    let mut reopened = fixture.open();
+    assert!(
+        reopened
+            .get(KeySpace(0), &1u32.to_be_bytes())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &2u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &3u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[3; 32]
+    );
+    // Accepted weakening: the reopened retry window is empty, so the retry of a
+    // published batch is re-applied under the new epoch; its value stays.
+    let retried = reopened.submit(acknowledged, vec![put_key(2, 2)]).unwrap();
+    assert!(retried.epoch > acknowledged_version.epoch);
+    assert_eq!(
+        reopened
+            .get(KeySpace(0), &2u32.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        &[2; 32]
+    );
+    // An unacknowledged absent batch can be admitted in the new epoch; its
+    // original sequence must not be reused as though the old write succeeded.
+    let retry = reopened.write_batch(missing, vec![put_key(1, 1)]).unwrap();
+    assert!(retry.epoch > missing_version.epoch);
+    reopened.shutdown().unwrap();
+}
+
+/// A diagnostic control cannot pass a control that is parked in its owner
+/// worker: the worker dispatches controls in FIFO order. The parked control
+/// signals that it is in flight and blocks on the test's gate, so "still
+/// pending" is an observed state, not a timing bound.
+#[test]
+fn public_diagnostic_controls_wait_for_pending_control() {
+    #[cfg(all(target_os = "linux", feature = "test-utils"))]
+    let cases = 4;
+    #[cfg(not(all(target_os = "linux", feature = "test-utils")))]
+    let cases = 2;
+    for case in 0..cases {
+        let fixture = Fixture::new();
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 73), vec![put(1)])
+            .unwrap();
+        // Park owner 0's worker: the control runs at dispatch, signals that it
+        // is in flight, then waits for the gate.
+        let (entered, in_flight) = mpsc::sync_channel(1);
+        let (gate, release) = mpsc::sync_channel(1);
+        db.core.clients[0]
+            .send(Command::Control(Box::new(move |_client| {
+                let _ = entered.send(());
+                let _ = release.recv();
+            })))
+            .unwrap();
+        in_flight.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (started, starting) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let owner = thread::spawn(move || {
+            let _ = started.send(());
+            let outcome = match case {
+                0 => db.storage_stats().map(|_| ()),
+                1 => db.connection_profiles(true, true).map(|_| ()),
+                #[cfg(all(target_os = "linux", feature = "test-utils"))]
+                2 => db.read_evidence_for_benchmark(false).map(|_| ()),
+                #[cfg(all(target_os = "linux", feature = "test-utils"))]
+                3 => db.process_resources_for_benchmark().map(|_| ()),
+                _ => unreachable!(),
+            };
+            let _ = finished.send((db, outcome));
+        });
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The parked control is in flight and the gate is closed, so the
+        // worker cannot have dispatched the diagnostic control.
+        assert!(
+            result.try_recv().is_err(),
+            "a later diagnostic control passed the parked control (case {case})"
+        );
+        gate.send(()).unwrap();
+        let (mut db, outcome) = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the diagnostic control completes once the parked control returns");
+        owner.join().unwrap();
+        outcome.unwrap();
+        if case == 1 {
+            db.connection_profiles(false, false).unwrap();
+        }
+        db.shutdown().unwrap();
+    }
+}
+
+/// Mapped-WAL eviction is a control on every owner worker, so it waits behind
+/// a control already parked there; the gate makes the wait an observed state.
+#[cfg(all(target_os = "linux", feature = "test-utils"))]
+#[test]
+fn concurrent_eviction_waits_for_pending_control() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 76), vec![put(1)])
+        .unwrap();
+    let (entered, in_flight) = mpsc::sync_channel(1);
+    let (gate, release) = mpsc::sync_channel(1);
+    db.core.clients[0]
+        .send(Command::Control(Box::new(move |_client| {
+            let _ = entered.send(());
+            let _ = release.recv();
+        })))
+        .unwrap();
+    in_flight.recv_timeout(Duration::from_secs(5)).unwrap();
+    let db = ConcurrentRemoteDatabase::new(db).unwrap();
+    let (started, starting) = mpsc::sync_channel(1);
+    let (finished, result) = mpsc::sync_channel(1);
+    let owner = thread::spawn(move || {
+        let _ = started.send(());
+        let outcome = db.evict_mapped_wal_for_benchmark();
+        let _ = finished.send((db, outcome));
+    });
+    starting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        result.try_recv().is_err(),
+        "mapped-WAL eviction passed the parked owner control"
+    );
+    gate.send(()).unwrap();
+    let (db, outcome) = result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("eviction completes once the parked control returns");
+    owner.join().unwrap();
+    assert_eq!(outcome.unwrap().len(), 5);
+    db.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_control_reply_drains_before_worker_shutdown() {
+    let fixture = Fixture::new();
+    let db = fixture.open();
+    db.write_batch(fixture.operation(0, 51), vec![put(1)])
+        .unwrap();
+    let (reply, cancelled) = mpsc::sync_channel(1);
+    db.core.clients[0].send(Command::Stats(reply)).unwrap();
+    drop(cancelled);
+    let operation = fixture.operation(0, 52);
+    let version = db.write_batch(operation, vec![put(2)]).unwrap();
+    db.shutdown().unwrap();
+    drop(db);
+    let reopened = fixture.open();
+    // Accepted weakening: the reopened retry window is empty, so the retry is
+    // re-applied under the new epoch.
+    let retried = reopened.write_batch(operation, vec![put(2)]).unwrap();
+    assert!(retried.epoch > version.epoch);
     reopened.shutdown().unwrap();
 }

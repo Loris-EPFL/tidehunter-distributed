@@ -13,7 +13,7 @@ fn put(value: u8) -> Mutation {
 }
 
 #[test]
-fn clean_reopen_recovers_retry_identity() {
+fn clean_reopen_treats_a_retry_as_a_new_write_in_the_new_epoch() {
     let fixture = Fixture::new();
     let mut db = fixture.open();
     let operation = fixture.operation(0, 1);
@@ -27,10 +27,15 @@ fn clean_reopen_recovers_retry_identity() {
 
     let mut db = fixture.open();
     assert_eq!(db.epoch(), 2);
-    assert_eq!(db.write_batch(operation, vec![put(9)]).unwrap(), first);
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write in the new
+    // epoch. A different value proves the retry was applied.
+    let retried = db.write_batch(operation, vec![put(10)]).unwrap();
+    assert_eq!(retried.epoch, 2, "{retried:?} vs {first:?}");
+    assert_ne!(retried, first);
     assert_eq!(
         db.get(KeySpace(0), &7u32.to_be_bytes()).unwrap(),
-        Some(vec![9; 32].into())
+        Some(vec![10; 32].into())
     );
     db.write_batch(fixture.operation(4, 2), vec![put(11)])
         .unwrap();

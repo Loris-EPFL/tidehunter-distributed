@@ -835,6 +835,8 @@ pub struct WriteProfileSnapshot {
 /// overwrite does not change what this view reads.
 pub struct ReadCheckpoint {
     database: [u8; 16],
+    /// The serving epoch of the open that took the view.
+    epoch: u64,
     cut: BatchVersion,
     _latch: CutLatch,
 }
@@ -1886,6 +1888,7 @@ impl RemoteDatabase {
         let (cut, latch) = self.core.table.pin_checkpoint();
         Ok(ReadCheckpoint {
             database: self.core.config.storage.database,
+            epoch: self.core.epoch,
             cut,
             _latch: latch,
         })
@@ -1899,6 +1902,13 @@ impl RemoteDatabase {
     ) -> Result<Option<Bytes>, LocalDbError> {
         if checkpoint.database != self.core.config.storage.database {
             return Err(LocalDbError::new("checkpoint belongs to another database"));
+        }
+        // The latch pins the table of the open that took the view: after a
+        // reopen it pins nothing here, and the cut names old-epoch versions.
+        if checkpoint.epoch != self.core.epoch {
+            return Err(LocalDbError::new(
+                "checkpoint belongs to an earlier open of this database",
+            ));
         }
         self.get_at_cut(ks, key, checkpoint.cut)
     }
@@ -2636,6 +2646,8 @@ fn receive<T>(pending: Pending<T>) -> Result<T, LocalDbError> {
         .map_err(|_| LocalDbError::new("TCP worker lost request outcome"))?
 }
 
+#[cfg(test)]
+mod sui_adapter_tests;
 #[cfg(test)]
 mod tests;
 

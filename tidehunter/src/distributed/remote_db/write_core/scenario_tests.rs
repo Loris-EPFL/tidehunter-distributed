@@ -5,6 +5,7 @@
 //! by a hook until the caller has returned.
 
 mod crash_cut;
+mod readable;
 
 use super::core::WriteCore;
 use super::sequencer::Resolution;
@@ -35,6 +36,11 @@ fn gate() -> (Hook, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     ((entered, resumed), entering, resume)
 }
 
+/// Runs `run` on a thread and returns its result channel. The thread drops its
+/// `Arc` before it sends the result: a test that has received the result and
+/// drops its own handle then holds the last reference, so the native database
+/// lock is released before the test reopens the fixture (a clone dropped after
+/// the send would race that reopen with `EAGAIN` on the lock).
 fn spawn<T: Send + 'static>(
     core: &Arc<WriteCore>,
     run: impl FnOnce(&Arc<WriteCore>) -> T + Send + 'static,
@@ -42,7 +48,9 @@ fn spawn<T: Send + 'static>(
     let core = Arc::clone(core);
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let _ = sender.send(run(&core));
+        let result = run(&core);
+        drop(core);
+        let _ = sender.send(result);
     });
     receiver
 }
@@ -137,14 +145,25 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
         core.publisher.lock().dependents.get(&0).map(Vec::as_slice),
         Some(&[1u64][..])
     );
-    // Sequence 2 is independent and publishes beyond the unresolved floor.
-    let independent = core
-        .write(fixture.operation(2, 3), vec![put(9, 9)], None)
-        .unwrap();
-    assert_eq!(independent, version(&core, 2));
-    assert!(core.is_published(independent));
+    // Sequence 2 is independent and publishes beyond the unresolved floor. Its
+    // writer is acknowledged only once the published prefix covers it (Ok means
+    // readable), so the call parks in the prefix wait until the aborted head
+    // resolves. The signal comes from the wait itself, after the batch published.
+    let (waiting_hook, waiting) = mpsc::sync_channel(1);
+    core.test_hooks.lock().drain_wait_entered = Some(waiting_hook);
+    let independent = spawn_write(&core, fixture.operation(2, 3), vec![put(9, 9)]);
+    waiting.recv_timeout(WAIT).unwrap();
+    assert!(core.is_published(version(&core, 2)));
     assert_eq!(core.published_next(), 0);
-    assert_eq!(value(&mut db, 9), Some(vec![9; 32]));
+    assert!(
+        matches!(independent.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "the write was acknowledged below an unresolved floor"
+    );
+    // Deviation (M) from native (PARITY.md, "Read visibility past an unresolved
+    // prefix"): reads resolve at the publication cut, which stops at the
+    // unresolved floor, so the batch published beyond it is invisible and its
+    // writer is not yet acknowledged.
+    assert_eq!(value(&mut db, 9), None);
     assert_eq!(value(&mut db, 1), None);
     // The allocated head has neither resolved nor released: no slot returns.
     assert_eq!(core.sequencer.reuse_next(), 0);
@@ -162,6 +181,12 @@ fn aborted_floor_slot_is_crossed_and_its_dependent_publishes() {
         second.recv_timeout(WAIT).unwrap().unwrap(),
         version(&core, 1)
     );
+    assert_eq!(
+        independent.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, 2)
+    );
+    // Read-your-writes: the acknowledged write is readable as soon as it returns.
+    assert_eq!(value(&mut db, 9), Some(vec![9; 32]));
     core.wait_settled().unwrap();
     assert_eq!(core.sequencer.resolution(0), Some(Resolution::Aborted));
     assert_eq!(core.sequencer.resolution(1), Some(Resolution::Published));
@@ -221,10 +246,14 @@ fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
     // Sequences 2 and 3 publish and release; every slot grant is now held.
     for seed in 2..CAPACITY {
         assert_eq!(
-            core.write(fixture.operation(0, seed), vec![put(seed as u32, 1)], None)
+            core.submit(fixture.operation(0, seed), vec![put(seed as u32, 1)])
                 .unwrap(),
             version(&core, seed)
         );
+        // `submit`: an acknowledged write would wait for the held floor below.
+        wait_for("batch published beyond the held floor", || {
+            core.publication_settled(seed)
+        });
     }
     let stale_receipt = core.durable_receipt(2).unwrap();
     assert_eq!(core.sequencer.reuse_next(), 0);
@@ -245,11 +274,12 @@ fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
         unreleased.recv_timeout(WAIT).unwrap().unwrap(),
         version(&core, 0)
     );
-    // Only sequence 0's slot returned; the parked writer reuses it.
-    assert_eq!(
-        blocked.recv_timeout(WAIT).unwrap().unwrap(),
-        version(&core, CAPACITY)
-    );
+    // Only sequence 0's slot returned; the parked writer reuses it. Its
+    // acknowledgement waits for the held prefix (sequence 1), so the reuse is
+    // observed from the sequencer; the result follows the publication below.
+    wait_for("parked writer reused sequence 0's slot", || {
+        core.sequencer.generation(0) == Some(CAPACITY)
+    });
     assert_eq!(core.sequencer.reuse_next(), 1);
     assert_eq!(core.sequencer.generation(0), Some(CAPACITY));
     assert_eq!(core.sequencer.generation(1), Some(1));
@@ -260,6 +290,11 @@ fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
 
     resume_publish.send(()).unwrap();
     core.wait_settled().unwrap();
+    // The parked writer's acknowledgement waited for sequence 1's publication.
+    assert_eq!(
+        blocked.recv_timeout(WAIT).unwrap().unwrap(),
+        version(&core, CAPACITY)
+    );
     assert_eq!(core.published_next(), CAPACITY + 1);
     assert_eq!(core.sequencer.reuse_next(), CAPACITY + 1);
 
@@ -397,15 +432,17 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
     assert_eq!(core.in_flight.len(), 1);
     for seed in 1..CAPACITY {
         assert_eq!(
-            core.write(
+            core.submit(
                 fixture.operation(1, 10 + seed),
-                vec![put(10 + seed as u32, 1)],
-                None
+                vec![put(10 + seed as u32, 1)]
             )
             .unwrap(),
             version(&core, seed)
         );
     }
+    wait_for("later batches published beyond the unresolved head", || {
+        (1..CAPACITY).all(|seed| core.publication_settled(seed))
+    });
     assert_eq!(core.published_next(), 0);
     assert_eq!(core.sequencer.reuse_next(), 0);
     assert_capacity_rejected(&core, fixture.operation(1, 20), 20);
@@ -494,6 +531,59 @@ fn concurrent_first_writes_of_one_id_allocate_once() {
     );
     assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
     assert_eq!(value(&mut db, 2), Some(vec![1; 32]));
+    drop(core);
+    db.flush_index().unwrap();
+    db.shutdown().unwrap();
+}
+
+/// A retry of an admitted but unpublished id answers with its recorded
+/// version through `submit` and `submit_many`, allocates nothing and charges
+/// no slot, and a changed payload is still refused (the tip contract,
+/// `plan.identity.is_some()` at c97de76b). A retry that allocated a second
+/// generation would apply a stale value over a later write of the same key.
+#[test]
+fn retry_of_an_unpublished_id_returns_its_version_without_allocating() {
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    let operation = fixture.operation(0, 1);
+    let batch = vec![put(1, 1)];
+    // The publisher is held before it publishes, so the id stays in flight.
+    let (hook, publishing, resume_publish) = gate();
+    core.test_hooks.lock().before_publish = Some(hook);
+    let original = core.submit(operation, batch.clone()).unwrap();
+    publishing.recv_timeout(WAIT).unwrap();
+    assert_eq!(core.in_flight.len(), 1, "the id is admitted, not published");
+    let slots = core.admission.charges().slots;
+    let admitted = db.stats().admitted_batches;
+    assert_eq!(core.submit(operation, batch.clone()).unwrap(), original);
+    assert_eq!(
+        core.submit_many(&[(operation, batch.clone())]).unwrap(),
+        vec![original]
+    );
+    assert_eq!(core.next_sequence(), 1, "a retry allocates no sequence");
+    assert_eq!(core.in_flight.len(), 1);
+    assert_eq!(
+        core.admission.charges().slots,
+        slots,
+        "a retry charges no slot"
+    );
+    assert_eq!(db.stats().admitted_batches, admitted);
+    let error = core.submit(operation, vec![put(1, 9)]).unwrap_err();
+    assert!(
+        error.message().contains("retry changed original batch"),
+        "{error}"
+    );
+    assert_eq!(core.next_sequence(), 1, "a refused retry allocates nothing");
+    resume_publish.send(()).unwrap();
+    core.wait_settled().unwrap();
+    assert_eq!(core.next_sequence(), 1);
+    assert_eq!(core.in_flight.len(), 0);
+    assert_eq!(
+        core.lookup_receipt(operation).unwrap().unwrap().version,
+        original
+    );
+    assert_eq!(value(&mut db, 1), Some(vec![1; 32]));
     drop(core);
     db.flush_index().unwrap();
     db.shutdown().unwrap();
@@ -723,13 +813,16 @@ fn sequence_zero_flush_checkpoint_and_publication_wait() {
     assert_eq!(core.published_next(), 1);
     core.wait_settled().unwrap();
     {
-        // The snapshot that the flush took must record the published batch: the
-        // retry window is what recovery restores, and there is no Exact tail.
-        let mut publisher = core.publisher.lock();
-        let state = publisher.checkpoint_state();
-        assert_eq!(state.recent.len(), 1);
+        // The live window holds the published batch (the in-epoch dedupe of its
+        // id); it is not persisted, so a reopen starts with an empty window.
+        let publisher = core.publisher.lock();
+        assert_eq!(publisher.recent.len(), 1);
         assert_eq!(
-            state.recent.iter().next().map(|receipt| receipt.version),
+            publisher
+                .recent
+                .iter()
+                .next()
+                .map(|receipt| receipt.version),
             Some(original)
         );
     }
@@ -740,10 +833,26 @@ fn sequence_zero_flush_checkpoint_and_publication_wait() {
     drop(db);
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. The
+    // published receipt is not restored: the retry takes a version in the new
+    // epoch, starting again at sequence 0. It carries another value, so the
+    // read proves it was applied; a repeat inside this epoch adds nothing.
+    let retried = reopened.write_batch(operation, vec![put(1, 9)]).unwrap();
     assert_eq!(
-        reopened.write_batch(operation, vec![put(1, 1)]).unwrap(),
-        original
+        retried,
+        BatchVersion {
+            epoch: original.epoch + 1,
+            sequence: 0,
+        }
     );
+    assert_eq!(
+        reopened.write_batch(operation, vec![put(1, 9)]).unwrap(),
+        retried,
+        "an in-epoch retry returns the first retry's version"
+    );
+    assert_eq!(reopened.stats().admitted_batches, 1);
+    assert_eq!(value(&mut reopened, 1), Some(vec![9; 32]));
     reopened.shutdown().unwrap();
 }
 
@@ -860,21 +969,48 @@ fn uncertain_append_fail_stops_with_unknown_everywhere() {
     drop(core);
     drop(db);
     let mut reopened = fixture.open();
-    assert_eq!(
-        reopened
-            .write_batch(uncertain_operation, vec![put(3, 3)])
-            .unwrap(),
-        uncertain
-    );
-    assert_eq!(
-        reopened
-            .write_batch(held_operation, vec![put(2, 2)])
-            .unwrap(),
-        held_version
-    );
+    // Replay recovers the durable frames of both unknown outcomes.
     for key in 1..=3u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
     }
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. Neither
+    // old-epoch version comes back; both retries take fresh sequences in the
+    // next epoch, in call order, and each is admitted once.
+    let next_epoch = uncertain.epoch + 1;
+    // The retries carry other values, so the reads prove they were applied.
+    assert_eq!(
+        reopened
+            .write_batch(uncertain_operation, vec![put(3, 13)])
+            .unwrap(),
+        BatchVersion {
+            epoch: next_epoch,
+            sequence: 0,
+        }
+    );
+    assert_eq!(
+        reopened
+            .write_batch(uncertain_operation, vec![put(3, 13)])
+            .unwrap(),
+        BatchVersion {
+            epoch: next_epoch,
+            sequence: 0,
+        },
+        "an in-epoch retry returns the first retry's version"
+    );
+    assert_eq!(
+        reopened
+            .write_batch(held_operation, vec![put(2, 12)])
+            .unwrap(),
+        BatchVersion {
+            epoch: next_epoch,
+            sequence: 1,
+        }
+    );
+    assert_eq!(reopened.stats().admitted_batches, 2);
+    assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
+    assert_eq!(value(&mut reopened, 2), Some(vec![12; 32]));
+    assert_eq!(value(&mut reopened, 3), Some(vec![13; 32]));
     reopened.shutdown().unwrap();
 }
 
@@ -1008,45 +1144,58 @@ fn publication_failure_with_appended_successor_group_recovers_it_once() {
         }
         assert_eq!(core.published_next(), 1);
         let epoch = core.epoch;
-        let original = |sequence| BatchVersion { epoch, sequence };
         drop(core);
         drop(db);
         // A client clone keeps the live connection registry (and its lock) alive.
         drop(connection);
 
         let mut reopened = fixture.open();
-        // The acknowledged batch and both owner-0 groups, each exactly once:
-        // a duplicate version or a lost receipt would fail recovery.
+        // The acknowledged batch and both owner-0 groups are replayed, each
+        // exactly once: a frame replayed twice or skipped changes this count.
         assert_eq!(reopened.recovery_stats().tail_batches, 5);
-        for ((operation, value, _), receipt) in callers.iter().zip(&receipts) {
-            let recovered = reopened
-                .core
-                .lookup_receipt(*operation)
-                .unwrap()
-                .unwrap_or_else(|| panic!("recovered window lost {operation:?}"));
-            assert_eq!(recovered.version, original(u64::from(*value)));
-            if let Some(receipt) = receipt {
-                // The recovered batch is the one whose receipt was accepted.
-                assert_eq!(recovered.digest, receipt.appended().digest());
-            }
-        }
-        assert_eq!(
-            reopened
-                .write_batch(acknowledged, vec![put(2, 50)])
-                .unwrap(),
-            original(0)
-        );
-        for (operation, value, _) in callers {
-            assert_eq!(
-                reopened
-                    .write_batch(operation, vec![put(1, value)])
-                    .unwrap(),
-                original(u64::from(value))
-            );
-        }
-        assert_eq!(reopened.stats().admitted_batches, 0);
         assert_eq!(value(&mut reopened, 1), Some(vec![4; 32]));
         assert_eq!(value(&mut reopened, 2), Some(vec![50; 32]));
+        // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is
+        // empty after a restart, so a retry after the reopen is a new write.
+        // Replay restores no receipt, and every retry takes a fresh sequence in
+        // the next epoch, in call order.
+        let next = |sequence| BatchVersion {
+            epoch: epoch + 1,
+            sequence,
+        };
+        for (operation, _, _) in &callers {
+            assert!(reopened.core.lookup_receipt(*operation).unwrap().is_none());
+        }
+        // The retry carries another value, so the read proves it was applied.
+        assert_eq!(
+            reopened
+                .write_batch(acknowledged, vec![put(2, 51)])
+                .unwrap(),
+            next(0)
+        );
+        assert_eq!(
+            reopened
+                .write_batch(acknowledged, vec![put(2, 51)])
+                .unwrap(),
+            next(0),
+            "an in-epoch retry returns the first retry's version"
+        );
+        for (operation, written, _) in callers {
+            assert_eq!(
+                reopened
+                    .write_batch(operation, vec![put(1, written)])
+                    .unwrap(),
+                next(u64::from(written))
+            );
+            // The retry is applied again: it overwrites the later value.
+            assert_eq!(
+                value(&mut reopened, 1),
+                Some(vec![written; 32]),
+                "retry {written} must be applied as a new write"
+            );
+        }
+        assert_eq!(reopened.stats().admitted_batches, 5);
+        assert_eq!(value(&mut reopened, 2), Some(vec![51; 32]));
         reopened.shutdown().unwrap();
     }
 }
@@ -1127,10 +1276,14 @@ fn flush_waits_only_for_writes_allocated_before_it() {
     first_publishing.recv_timeout(WAIT).unwrap();
     // Sequence 1 on owner 1 publishes beyond the held floor.
     assert_eq!(
-        core.write(fixture.operation(1, 2), vec![put(2, 2)], None)
+        // `submit`: an acknowledged write would wait for the held floor below.
+        core.submit(fixture.operation(1, 2), vec![put(2, 2)])
             .unwrap(),
         version(&core, 1)
     );
+    wait_for("sequence 1 published beyond the held floor", || {
+        core.publication_settled(1)
+    });
     assert_eq!(core.published_next(), 0);
     // The drain snapshots next = 2 and waits.
     let (entered, draining) = mpsc::sync_channel(1);

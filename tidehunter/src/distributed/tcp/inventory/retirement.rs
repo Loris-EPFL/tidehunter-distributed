@@ -302,6 +302,37 @@ impl NodeInventory {
         Ok(())
     }
 
+    /// Test-only: make the retirement revoke step report one victim file as
+    /// not revoked, as if its binding were already gone (the R1 contract then
+    /// emits no target step for it). The revoke itself still runs, so the log
+    /// never holds a live file without a binding. Returns whether the file had
+    /// a live binding.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn skip_retirement_revoke_report_for_test(
+        &mut self,
+        epoch: u64,
+        file: u64,
+    ) -> bool {
+        if !self.live_bindings.contains_key(&(epoch, file)) {
+            return false;
+        }
+        self.retirement_revoke_report_skips
+            .push((epoch, file * self.config.partition.wal_file_bytes));
+        true
+    }
+
+    /// See `skip_retirement_revoke_report_for_test`. `start` is a byte offset,
+    /// as the retirement pages use.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn retirement_revoke_report_is_skipped(
+        &self,
+        epoch: u64,
+        start: u64,
+    ) -> bool {
+        self.retirement_revoke_report_skips
+            .contains(&(epoch, start))
+    }
+
     #[cfg(test)]
     fn record_victim_pins(&self, log: &PartitionLog, epoch: u64, files: &[u64]) {
         use crate::distributed::storage::BusyCause;
@@ -347,6 +378,60 @@ impl NodeInventory {
         }
         let file = log.live_allocator_file().map_err(TcpError::component)?;
         Ok(self.live_bindings.contains_key(&(epoch, file)))
+    }
+}
+
+/// Revoke-side helper of the retirement paths above. A separate impl block
+/// keeps it out of the baselined `inventory.rs`; only this module calls it.
+impl NodeInventory {
+    /// Revoke the live bindings of `files` in `epoch`. Returns `(start,
+    /// device, inode)` of every binding actually revoked; a file without a
+    /// binding (never exported, evicted, or revoked by an earlier attempt) is
+    /// absent from the result.
+    fn revoke_live_files<H: InventoryAccess>(
+        inventory: &mut H,
+        target: &mut LiveTarget,
+        epoch: u64,
+        files: &[u64],
+    ) -> Result<Vec<(u64, u64, u64)>, TcpError> {
+        let bytes = inventory.config.partition.wal_file_bytes;
+        let retired = |(binding_epoch, file): &(u64, u64)| {
+            *binding_epoch == epoch && files.contains(&(file * bytes))
+        };
+        let keys: Vec<_> = inventory
+            .live_bindings
+            .keys()
+            .copied()
+            .filter(&retired)
+            .collect();
+        let claimed: Vec<_> = keys
+            .iter()
+            .filter_map(|key| inventory.live_bindings.remove_entry(key))
+            .collect();
+        let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
+        if let Err(error) = result {
+            inventory.live_bindings.extend(claimed);
+            return Err(error);
+        }
+        inventory.idle_history_exports.retain(|key| !retired(key));
+        let revoked: Vec<(u64, u64, u64)> = claimed
+            .iter()
+            .map(|((_, file), (segment, _, _))| (file * bytes, segment.device, segment.inode))
+            .collect();
+        // Test-only: report chosen victims as not revoked, as if their binding
+        // were already gone. Only this result feeds the R1 target steps, and
+        // the revoke itself ran, so no live file is left without a binding
+        // beyond the pass that unlinks it (the invariant `OpenLiveExports`
+        // relies on).
+        #[cfg(test)]
+        let revoked = {
+            let mut revoked = revoked;
+            revoked.retain(|(start, _, _)| {
+                !inventory.retirement_revoke_report_is_skipped(epoch, *start)
+            });
+            revoked
+        };
+        Ok(revoked)
     }
 }
 

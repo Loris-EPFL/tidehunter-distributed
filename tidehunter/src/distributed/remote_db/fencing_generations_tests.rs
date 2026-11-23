@@ -18,6 +18,7 @@ use super::*;
 use crate::distributed::codec::Mutation;
 use crate::distributed::tcp::OwnerTrimCrash;
 use crate::key_shape::KeyType;
+use std::fs;
 
 struct Harness {
     fixture: Fixture,
@@ -503,9 +504,13 @@ fn aborted_generation_with_accepted_data_fails_closed() {
     manifest.generations[0].state = GenerationState::Aborted;
     persist_manifest(&harness.root, &manifest, CoordinatorIoCategory::Open).unwrap();
     let error = harness.open().err().unwrap();
-    assert_eq!(
-        error.to_string(),
-        "aborted fencing generation 1 contains accepted WAL data"
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+    // The error names the generation and the owner that holds the data.
+    assert!(
+        error
+            .to_string()
+            .starts_with("aborted fencing generation 1 contains accepted WAL data (owner "),
+        "{error}"
     );
 }
 

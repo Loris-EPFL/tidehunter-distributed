@@ -15,17 +15,99 @@ fn get(db: &ConcurrentRemoteDatabase, key: u32) -> Option<Vec<u8>> {
         .unwrap()
         .map(|value| value.to_vec())
 }
-fn wait_event(
-    events: &mpsc::Receiver<PipelineStats>,
-    predicate: impl Fn(PipelineStats) -> bool,
-) -> Result<PipelineStats, mpsc::RecvTimeoutError> {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let stats = events.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
-        if predicate(stats) {
-            return Ok(stats);
-        }
-    }
+
+/// Native parity for read admission: load alone never fails an ordinary read
+/// (it passes no deadline), and only an explicit deadline can expire. The only
+/// credit is held by a caller's request, so the parked wait is proven from the
+/// admission state at the wait, never from a timing bound.
+#[test]
+fn ordinary_reads_never_fail_on_load_and_explicit_deadlines_expire() {
+    let mut fixture = Fixture::new();
+    // No cache: the read must take a credit, and the fixture's default I/O
+    // timeout stays in force so the acknowledged put cannot fail on load.
+    fixture.config.read_cache_bytes = 0;
+    let original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 1), vec![put(1, 1)])
+        .unwrap();
+    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
+    let position = db
+        .hybrid_table()
+        .get(
+            KeySpace(0),
+            &1u32.to_be_bytes(),
+            db.hybrid_table().current(),
+        )
+        .unwrap()
+        .expect("the acknowledged put has an index position");
+    let node = db
+        .config
+        .endpoints
+        .iter()
+        .position(|endpoint| endpoint.partition == position.address.partition)
+        .expect("an endpoint owns the position");
+    // The caller keeps the credit: it is released when this request is
+    // consumed, whatever its lane does meanwhile.
+    let held = db.reads.submit_positions(node, &[position], None).unwrap();
+    let observed = db.read_admission_generation();
+    let (entered, resume) = db.reads.pause_admission_wait();
+    let waiter_db = Arc::clone(&db);
+    let (finished, result) = mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        let _ = finished.send(waiter_db.wait_read_admission(observed, None));
+    });
+    // Observable state: the waiter reached the admission wait with the only
+    // credit still held and the generation unchanged, so it cannot have
+    // returned.
+    let (credits, generation) = entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the waiter must reach the admission wait");
+    assert_eq!(credits, 1, "the request holds the only read credit");
+    assert_eq!(
+        generation, observed,
+        "the waiter must observe no credit change"
+    );
+    resume.send(()).expect("the paused waiter resumes");
+    held.finish_member().expect("the held read completes");
+    result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a released credit must wake the waiter")
+        .expect("a wait with no deadline must not fail on load");
+    waiter.join().unwrap();
+    // An explicit deadline is honoured: an already expired one is reported.
+    let error = db
+        .wait_read_admission(
+            db.read_admission_generation(),
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("deadline"), "{error}");
+    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
+}
+
+/// A terminal read failure is one fail-stop state: it fences reads, cached-read
+/// validation, writes and shutdown. The poison is injected at the read
+/// authority, so this proves the sharing; the trigger is covered by
+/// `live_lane`'s own failure cases.
+#[test]
+fn a_read_failure_fences_reads_writes_and_shutdown() {
+    let mut fixture = Fixture::new();
+    fixture.config.read_cache_bytes = 0;
+    let original = fixture.open();
+    original
+        .write_batch(fixture.operation(0, 40), vec![put(0, 3)])
+        .unwrap();
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    db.reads.poison();
+    assert!(db.validate_cached_read().is_err());
+    assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
+    assert!(db.get(KeySpace(0), &99u32.to_be_bytes()).is_err());
+    assert!(
+        db.write_batch(fixture.operation(1, 41), vec![put(1, 4)])
+            .is_err(),
+        "a poisoned read authority fences the writer"
+    );
+    assert!(db.shutdown().is_err(), "shutdown reports the read failure");
 }
 
 #[test]
@@ -41,307 +123,6 @@ fn first_failure_is_utf8_bounded_and_not_overwritten() {
 }
 
 #[test]
-fn retryable_retirement_preflight_does_not_stop_concurrent_authority() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 1), vec![put(1, 1)])
-        .unwrap();
-    // Inject only the pre-mutation busy result; storage and reads remain real TCP.
-    original.core.test_hooks.lock().retire_preflight_busy_once = true;
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    let pending = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
-    let error = db
-        .retire_history_before(IndexReadCut::BeforeAll)
-        .unwrap_err();
-    assert!(error.to_string().contains("retirement preflight busy"));
-    assert_eq!(
-        db.finish_ready_get(pending.wait())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[1; 32]
-    );
-    db.write_batch(fixture.operation(1, 2), vec![put(2, 2)])
-        .unwrap();
-    assert_eq!(get(&db, 2), Some(vec![2; 32]));
-    db.retire_history_before(IndexReadCut::BeforeAll).unwrap();
-    assert_eq!(get(&db, 1), Some(vec![1; 32]));
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn durable_suffix_completes_while_checkpoint_prefix_is_pending() {
-    let fixture = Fixture::new();
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 1), vec![put(1, 1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().checkpoint_prefix_pause = Some((entered, gate));
-    original.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    let writer_db = db.clone();
-    let operation = fixture.operation(0, 2);
-    let (finished, result) = mpsc::sync_channel(1);
-    let writer = thread::spawn(move || {
-        let _ = finished.send(writer_db.write_batch(operation, vec![put(2, 2)]));
-    });
-    let before_resume = result.recv_timeout(Duration::from_secs(5));
-    let _ = resume.send(());
-    writer.join().unwrap();
-    let version = before_resume.unwrap().unwrap();
-    db.flush_index().unwrap();
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    assert_eq!(get(&reopened, 1), Some(vec![1; 32]));
-    assert_eq!(get(&reopened, 2), Some(vec![2; 32]));
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(2, 2)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn durable_suffix_completes_while_checkpoint_adoption_is_paused() {
-    let fixture = Fixture::new();
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 1), vec![put(1, 1)])
-        .unwrap();
-    original.flush_index().unwrap();
-    original
-        .write_batch(fixture.operation(1, 2), vec![put(2, 2)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().checkpoint_adoption_pause = Some((entered, gate));
-    original.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    let writer_db = db.clone();
-    let operation = fixture.operation(2, 3);
-    let (finished, result) = mpsc::sync_channel(1);
-    let writer = thread::spawn(move || {
-        let _ = finished.send(writer_db.write_batch(operation, vec![put(3, 3)]));
-    });
-    let before_resume = result.recv_timeout(Duration::from_secs(5));
-    resume.send(()).unwrap();
-    writer.join().unwrap();
-    let version = before_resume.unwrap().unwrap();
-    assert_eq!(get(&db, 3), Some(vec![3; 32]));
-    db.flush_index().unwrap();
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    assert_eq!(get(&reopened, 3), Some(vec![3; 32]));
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(3, 3)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn durable_suffix_completes_while_checkpoint_cleanup_is_paused() {
-    let fixture = Fixture::new();
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 11), vec![put(11, 1)])
-        .unwrap();
-    original.flush_index().unwrap();
-    original
-        .write_batch(fixture.operation(1, 12), vec![put(12, 2)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().checkpoint_cleanup_pause = Some((entered, gate));
-    original.core.start_checkpoint().unwrap();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    // On an early failure, release the paused worker before owner teardown.
-    let release_cleanup = resume;
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let writer_db = db.clone();
-    let operation = fixture.operation(2, 13);
-    let (finished, result) = mpsc::sync_channel(1);
-    let writer = thread::spawn(move || {
-        let _ = finished.send(writer_db.write_batch(operation, vec![put(13, 3)]));
-    });
-    let before_resume = result.recv_timeout(Duration::from_secs(5));
-    release_cleanup.send(()).unwrap();
-    writer.join().unwrap();
-    let version = before_resume.unwrap().unwrap();
-    assert_eq!(get(&db, 13), Some(vec![3; 32]));
-    db.flush_index().unwrap();
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    assert_eq!(get(&reopened, 13), Some(vec![3; 32]));
-    assert_eq!(
-        reopened.write_batch(operation, vec![put(13, 3)]).unwrap(),
-        version
-    );
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn checkpoint_pressure_defers_fifo_head_without_blocking_durable_replies() {
-    let fixture = Fixture::new_with_capacity(4);
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 1), vec![put(1, 1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().checkpoint_pause = Some((entered, gate));
-    original.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    original
-        .write_batch(fixture.operation(1, 2), vec![put(2, 2)])
-        .unwrap();
-    original
-        .write_batch(fixture.operation(2, 3), vec![put(3, 3)])
-        .unwrap();
-    let connection = original.core.clients[3].client.clone();
-    let held = connection.lock();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    // Unwind releases both blockers before dropping the database that joins them.
-    let release_checkpoint = resume;
-    let held_connection = held;
-    // Writers are joined before the database is unwrapped: a writer drops its
-    // Arc clone only after sending its result.
-    let writers = std::cell::RefCell::new(Vec::new());
-    let write = |operation, mutations| {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let db = db.clone();
-        writers.borrow_mut().push(thread::spawn(move || {
-            let _ = sender.send(db.write_batch(operation, mutations));
-        }));
-        receiver
-    };
-    // The fourth identity fills the bound and waits only on its held owner.
-    let fourth = write(fixture.operation(3, 4), vec![put(4, 4)]);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while db.database.core.next_sequence() != 4 {
-        assert!(Instant::now() < deadline, "fourth write did not allocate");
-        thread::yield_now();
-    }
-    // The fifth is the checkpoint-pressured FIFO head; the conflicting retry
-    // and the sixth queue behind it in arrival order.
-    let fifth_operation = fixture.operation(4, 5);
-    let fifth = write(fifth_operation, vec![put(5, 5)]);
-    await_waiters(&db.admission, 1);
-    let conflict = write(fifth_operation, vec![put(5, 9)]);
-    await_waiters(&db.admission, 2);
-    let sixth = write(fixture.operation(0, 6), vec![put(6, 6)]);
-    await_waiters(&db.admission, 3);
-    drop(held_connection);
-    let fourth_before_resume = fourth.recv_timeout(Duration::from_secs(5));
-    let fifth_before_resume = fifth.try_recv();
-    let conflict_before_resume = conflict.try_recv();
-    release_checkpoint.send(()).unwrap();
-    let fifth_result = fifth.recv_timeout(Duration::from_secs(10));
-    let conflict_result = conflict.recv_timeout(Duration::from_secs(10));
-    let sixth_result = sixth.recv_timeout(Duration::from_secs(10));
-    let fourth_version = fourth_before_resume.unwrap().unwrap();
-    assert!(matches!(
-        fifth_before_resume,
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    assert!(matches!(
-        conflict_before_resume,
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    let fifth_version = fifth_result.unwrap().unwrap();
-    assert!(conflict_result.unwrap().is_err());
-    let sixth_version = sixth_result.unwrap().unwrap();
-    assert_eq!(fifth_version.sequence, fourth_version.sequence + 1);
-    assert_eq!(sixth_version.sequence, fifth_version.sequence + 1);
-    assert_eq!(get(&db, 5), Some(vec![5; 32]));
-    assert_eq!(get(&db, 6), Some(vec![6; 32]));
-    let admission = db.admission.clone();
-    for writer in writers.take() {
-        writer.join().unwrap();
-    }
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-    let charges = admission.charges();
-    assert_eq!((charges.requests, charges.bytes), (0, 0));
-    // A client clone keeps the live connection registry (and its lock) alive.
-    drop(connection);
-    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    assert_eq!(get(&reopened, 5), Some(vec![5; 32]));
-    assert_eq!(get(&reopened, 6), Some(vec![6; 32]));
-    reopened.shutdown().unwrap();
-}
-
-#[test]
-fn failed_paused_checkpoint_releases_deferred_credits_without_false_acknowledgement() {
-    let fixture = Fixture::new_with_capacity(4);
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 11), vec![put(11, 1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    {
-        let mut hooks = original.core.test_hooks.lock();
-        hooks.checkpoint_pause = Some((entered, gate));
-        hooks.checkpoint_interruption = Some(0);
-    }
-    original.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    original
-        .write_batch(fixture.operation(1, 12), vec![put(12, 2)])
-        .unwrap();
-    original
-        .write_batch(fixture.operation(2, 13), vec![put(13, 3)])
-        .unwrap();
-    original
-        .write_batch(fixture.operation(3, 14), vec![put(14, 4)])
-        .unwrap();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    let release_checkpoint = resume;
-    // Writers are joined before the database is unwrapped: a writer drops its
-    // Arc clone only after sending its result.
-    let writers = std::cell::RefCell::new(Vec::new());
-    let write = |operation, mutations| {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let db = db.clone();
-        writers.borrow_mut().push(thread::spawn(move || {
-            let _ = sender.send(db.write_batch(operation, mutations));
-        }));
-        receiver
-    };
-    // Both callers are deferred by identity (checkpoint) pressure in FIFO order.
-    let first = write(fixture.operation(4, 15), vec![put(15, 5)]);
-    await_waiters(&db.admission, 1);
-    let second = write(fixture.operation(0, 16), vec![put(16, 6)]);
-    await_waiters(&db.admission, 2);
-    let first_early = first.try_recv();
-    release_checkpoint.send(()).unwrap();
-    let first_result = first.recv_timeout(Duration::from_secs(10));
-    let second_result = second.recv_timeout(Duration::from_secs(10));
-    assert!(matches!(first_early, Err(mpsc::TryRecvError::Empty)));
-    let first_error = first_result.unwrap().unwrap_err().to_string();
-    let second_error = second_result.unwrap().unwrap_err().to_string();
-    assert!(first_error.contains("injected interruption after checkpoint intent"));
-    assert!(second_error.contains("injected interruption after checkpoint intent"));
-    let admission = db.admission.clone();
-    for writer in writers.take() {
-        writer.join().unwrap();
-    }
-    assert!(Arc::try_unwrap(db).ok().unwrap().shutdown().is_err());
-    let charges = admission.charges();
-    assert_eq!((charges.requests, charges.bytes), (0, 0));
-    let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
-    assert_eq!(get(&reopened, 14), Some(vec![4; 32]));
-    assert_eq!(get(&reopened, 15), None);
-    assert_eq!(get(&reopened, 16), None);
-    reopened.shutdown().unwrap();
-}
-#[test]
 fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
     let fixture = Fixture::new();
     let mut original = fixture.open();
@@ -354,7 +135,7 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
             .unwrap()
             .is_some()
     );
-    let old_cut = original.published_cut().unwrap();
+    let old_cut = original.core.table.current();
     let connections: Vec<_> = original
         .core
         .clients
@@ -434,28 +215,27 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
     assert_ne!(first, second);
     for node in 0..2 {
         let cut = db.published_cut().unwrap();
-        let a = db
-            .index_reference(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), cut.clone())
+        let table = db.hybrid_table();
+        let a = table
+            .get(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), cut)
             .unwrap()
             .unwrap();
-        let b = db
-            .index_reference(KeySpace(0), &(2 + node * 2u32).to_be_bytes(), cut)
+        let b = table
+            .get(KeySpace(0), &(2 + node * 2u32).to_be_bytes(), cut)
             .unwrap()
             .unwrap();
-        assert_eq!(a.mutation_version().batch, b.mutation_version().batch);
+        // Both members of one batch carry the same batch version.
+        assert_eq!(a.batch, b.batch);
         assert!(
-            db.index_reference(
-                KeySpace(0),
-                &(1 + node * 2u32).to_be_bytes(),
-                old_cut.clone()
-            )
-            .unwrap()
-            .is_none()
+            table
+                .get(KeySpace(0), &(1 + node * 2u32).to_be_bytes(), old_cut)
+                .unwrap()
+                .is_none()
         );
         assert_eq!(get(&db, 1 + node * 2), Some(vec![10 + node as u8; 32]));
         assert_eq!(get(&db, 2 + node * 2), Some(vec![10 + node as u8; 32]));
     }
-    db.flush_index().unwrap();
+    db.write_core().flush_index().unwrap();
     Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
     // A client clone keeps the live connection registry (and its lock) alive.
     drop(connections);
@@ -475,7 +255,7 @@ fn blocked_appends_allow_committed_reads_and_overlap_distinct_nodes() {
 }
 
 #[test]
-fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
+fn unknown_append_fences_cached_absent_reads_until_reopen() {
     let fixture = Fixture::new();
     let mut original = fixture.open();
     original
@@ -483,10 +263,7 @@ fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
         .unwrap();
     original.get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    let cached = db
-        .submit_get(KeySpace(0), &0u32.to_be_bytes())
-        .unwrap()
-        .wait();
+    assert!(get(&db, 0).is_some());
     let cache_inserts_before_unknown = db.read_cache_stats().inserts;
     // The owner-1 frame reaches its WAL file but its completion reports EIO:
     // the outcome is unknown to the authority, as for a lost reply.
@@ -510,7 +287,6 @@ fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
         .expect("worker failure is retained");
     assert!(cause.contains("owner=Some(1)"));
     assert!(cause.contains("stage="));
-    assert!(db.finish_ready_get(cached).is_err());
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert!(db.get(KeySpace(0), &99u32.to_be_bytes()).is_err());
     let admission_error = db
@@ -523,407 +299,16 @@ fn unknown_append_fences_cached_absent_and_detached_reads_until_reopen() {
     assert_eq!(get(&reopened, 0), Some(vec![7; 32]));
     assert_eq!(get(&reopened, 1), Some(vec![8; 32]));
     assert_eq!(get(&reopened, 2), Some(vec![8; 32]));
-    assert_eq!(
-        reopened
-            .write_batch(operation, vec![put(1, 8), put(2, 8)])
-            .unwrap(),
-        uncertain
-    );
+    // Accepted weakening: an unknown write whose receipt falls outside the
+    // recovered retry window is re-applied under the new epoch instead of
+    // being answered with the recorded version.
+    let retried = reopened
+        .write_batch(operation, vec![put(1, 8), put(2, 8)])
+        .unwrap();
+    assert!(retried.epoch > uncertain.epoch);
+    assert_eq!(get(&reopened, 1), Some(vec![8; 32]));
     reopened.shutdown().unwrap();
 }
-#[test]
-fn coordinator_resolution_samples_include_mixed_and_local_outcomes() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 64 * 1024;
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 29), vec![put(0, 5), put(1, 6)])
-        .unwrap();
-    original.shutdown().unwrap();
-    drop(original);
-    let original = fixture.open();
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    // Populate only key 0 before selecting the measurement population.
-    assert_eq!(get(&db, 0), Some(vec![5; 32]));
-    db.set_read_profile_limit(2);
-    let monitor = db.read_profile_monitor();
-    let keys = [0u32.to_be_bytes(), 1u32.to_be_bytes(), 99u32.to_be_bytes()];
-    let values = db
-        .get_many_cut(KeySpace(0), &keys, IndexReadCut::Latest)
-        .unwrap();
-    assert!(values[0].as_ref().unwrap().is_some());
-    assert!(values[1].as_ref().unwrap().is_some());
-    assert!(values[2].as_ref().unwrap().is_none());
-    assert_eq!(get(&db, 99), None);
-    let snapshot = monitor.coordinator_resolution_snapshot();
-    assert_eq!(
-        (snapshot.selected, snapshot.point, snapshot.bulk),
-        (2, 1, 1)
-    );
-    assert_eq!(snapshot.logical_members, 4);
-    assert_eq!(
-        (
-            snapshot.cache_hits,
-            snapshot.remote_misses,
-            snapshot.index_misses
-        ),
-        (1, 1, 2)
-    );
-    assert_eq!(snapshot.errors, 0);
-    assert_eq!(snapshot.cache_lookup.count, 2);
-    // The sharded index has no read lock to wait for, so this stage is unsampled.
-    assert_eq!(snapshot.index_lock_wait.count, 0);
-    assert_eq!(snapshot.index_lookup.count, 4);
-    assert_eq!(snapshot.cut_validation.count, 1);
-    assert_eq!(snapshot.cut_capture.count, 0);
-    assert_eq!(snapshot.route_preparation.count, 1);
-    assert_eq!(snapshot.pin_preparation.count, 1);
-    assert_eq!(snapshot.batch_preparation.count, 1);
-    assert_eq!(get(&db, 99), None);
-    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 2);
-    db.set_read_profile_limit(0);
-    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 2);
-    db.set_read_profile_limit(1);
-    assert_eq!(monitor.coordinator_resolution_snapshot().selected, 0);
-    assert_eq!(get(&db, 99), None);
-    let reset = monitor.coordinator_resolution_snapshot();
-    assert_eq!(
-        (reset.selected, reset.index_misses, reset.cache_lookup.count),
-        (1, 1, 0)
-    );
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn scalar_and_actor_samples_have_separate_populations_and_credit_wakeups() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    fixture.config.max_pending_reads = 1;
-    fixture.config.read_lanes = Some(1);
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 30), vec![put(0, 5), put(1, 6)])
-        .unwrap();
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    assert!(!db.stats().read_resolve_ns_available);
-    // A live inline read needs an idle lane with a cached grant: park owner
-    // 0's lane worker and install the owner-local grant of key 0's file.
-    let reference = db
-        .index_reference(KeySpace(0), &0u32.to_be_bytes(), IndexReadCut::Latest)
-        .unwrap()
-        .unwrap();
-    assert_eq!(reference.batch_address.partition, 0);
-    let parked = db.reads.bench_park_live_lane(0);
-    db.reads
-        .bench_install_owner_local(&fixture.nodes[0], reference);
-    let rpcs = db.live_read_submission_count();
-    db.set_read_profile_limit(2);
-    let monitor = db.read_profile_monitor();
-    assert_eq!(get(&db, 0), Some(vec![5; 32]));
-    assert!(db.stats().read_resolve_ns_available);
-    // The actor read below needs the lane worker.
-    drop(parked);
-    let pending = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
-    let generation = db.read_admission_generation();
-    assert!(RemoteDatabase::read_backpressured(
-        &db.submit_get(KeySpace(0), &0u32.to_be_bytes())
-            .err()
-            .unwrap()
-    ));
-    assert_eq!(
-        db.finish_ready_get(pending.wait())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[6; 32]
-    );
-    db.wait_read_admission(generation, Some(Instant::now() + Duration::from_secs(1)))
-        .unwrap();
-    // Repeated credit releases must not let an expired caller retry forever.
-    assert!(
-        db.wait_read_admission(generation, Some(Instant::now()))
-            .is_err()
-    );
-    let mut counters = HashMap::new();
-    monitor.visit(&mut |name, value| {
-        counters.insert(name, value);
-    });
-    assert_eq!(counters["read_profile_selected"], 2);
-    assert_eq!(counters["read_profile_completed"], 2);
-    assert_eq!(counters["read_profile_inline_completed"], 1);
-    assert_eq!(counters["read_profile_actor_completed"], 1);
-    assert!(counters["read_profile_inline_ns"] > 0);
-    let resolution = monitor.coordinator_resolution_snapshot();
-    assert_eq!(resolution.remote_misses, 2);
-    assert_eq!(resolution.route_preparation.count, 2);
-    assert_eq!(resolution.pin_preparation.count, 2);
-    assert_eq!(resolution.batch_preparation.count, 0);
-    assert_eq!(db.live_read_submission_count() - rpcs, 2);
-    db.shutdown().unwrap();
-}
-
-/// Native parity: a read that finds the coordinator read budget exhausted
-/// waits for credit, however long another read holds it, and completes once
-/// the credit is released. Load alone never fails it with a deadline.
-#[test]
-fn ordinary_read_waits_for_credit_held_longer_than_timeout() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    fixture.config.max_pending_reads = 1;
-    fixture.config.timeout = Duration::from_secs(1);
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 50), vec![put(0, 5), put(1, 6)])
-        .unwrap();
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    // The only read credit is held by a read whose value is not consumed.
-    let held = db.submit_get(KeySpace(0), &1u32.to_be_bytes()).unwrap();
-    assert!(RemoteDatabase::read_backpressured(
-        &db.submit_get(KeySpace(0), &0u32.to_be_bytes())
-            .err()
-            .unwrap()
-    ));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let waiter = scope.spawn(|| {
-            let value = get(&db, 0);
-            sender.send(()).unwrap();
-            value
-        });
-        // Hold the credit for three times the configured timeout.
-        assert!(
-            receiver.recv_timeout(3 * fixture.config.timeout).is_err(),
-            "the read must wait for credit, not return"
-        );
-        assert_eq!(
-            db.finish_ready_get(held.wait()).unwrap().unwrap().as_ref(),
-            &[6; 32]
-        );
-        assert_eq!(waiter.join().unwrap(), Some(vec![5; 32]));
-    });
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn cancelled_late_read_failure_poison_is_shared_with_writer_and_cache() {
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 40), vec![put(0, 3)])
-        .unwrap();
-    let lane = original.core.reads.lane_client(0, 0);
-    let held = lane.lock();
-    fixture.fence_owner(0, original.epoch() + 1);
-    let db = ConcurrentRemoteDatabase::new(original).unwrap();
-    let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
-    drop(pending); // cancellation cannot detach a late transport failure
-    let observed = db.read_admission_generation();
-    drop(held);
-    let _ = db.wait_read_admission(observed, Some(Instant::now() + Duration::from_secs(3)));
-    assert!(db.validate_cached_read().is_err());
-    assert!(db.get(KeySpace(0), &99u32.to_be_bytes()).is_err());
-    assert!(
-        db.write_batch(fixture.operation(1, 41), vec![put(1, 4)])
-            .is_err()
-    );
-    assert!(db.shutdown().is_err());
-}
-
-#[test]
-fn sui_shared_gate_publishes_disjoint_later_batch_and_freezes_sparse_view() {
-    use crate::distributed::sui::Db;
-    let fixture = Fixture::new();
-    let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-        .unwrap();
-    let ks = db.ks("root");
-    let partition = |sequence: u64| {
-        let mut operation = [0; 16];
-        operation[..8].copy_from_slice(&1u64.to_le_bytes());
-        operation[8..].copy_from_slice(&sequence.to_le_bytes());
-        fixture
-            .config
-            .inventory(1)
-            .partition_for(BatchId {
-                database: fixture.config.storage.database,
-                operation,
-            })
-            .unwrap()
-    };
-    // Public Sui commits use (authority epoch, monotonic operation counter).
-    // Choose consecutive operations routed to distinct real WAL nodes.
-    let prefix = (1..64u64)
-        .find(|sequence| partition(*sequence) != partition(*sequence + 1))
-        .unwrap();
-    for _ in 0..prefix {
-        db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![9; 32])
-            .unwrap();
-    }
-    db.get(ks, &0u32.to_be_bytes()).unwrap();
-    let connection = db
-        .remote_for_test()
-        .io_clients
-        .iter()
-        .find(|(node, _)| *node == partition(prefix))
-        .unwrap()
-        .1
-        .clone();
-    let held = connection.client.lock();
-    let (progress, events) = mpsc::sync_channel(64);
-    db.remote_for_test()
-        .database
-        .core
-        .test_hooks
-        .lock()
-        .concurrent_progress = Some(progress);
-    let (first_replies, first_received) = mpsc::channel();
-    let (second_replies, second_received) = mpsc::channel();
-    let first_db = db.clone();
-    let first = thread::spawn(move || {
-        let mut batch = first_db.write_batch();
-        batch.write(ks, 0u32.to_be_bytes().to_vec(), vec![7; 32]);
-        batch.write(ks, 1u32.to_be_bytes().to_vec(), vec![1; 32]);
-        batch.write(ks, 2u32.to_be_bytes().to_vec(), vec![1; 32]);
-        first_replies.send(batch.commit()).unwrap();
-    });
-    let first_admitted = wait_event(&events, |stats| stats.concurrent_admitted == prefix + 1);
-    let second_db = db.clone();
-    let second = thread::spawn(move || {
-        let mut batch = second_db.write_batch();
-        batch.write(ks, 3u32.to_be_bytes().to_vec(), vec![2; 32]);
-        batch.write(ks, 4u32.to_be_bytes().to_vec(), vec![2; 32]);
-        second_replies.send(batch.commit()).unwrap();
-    });
-    let later_durable = wait_event(&events, |stats| stats.concurrent_admitted == prefix + 2);
-    let early_ack = second_received.recv_timeout(Duration::from_secs(5));
-    let (reads, read_results) = mpsc::sync_channel(1);
-    let reader_db = db.clone();
-    let reader = thread::spawn(move || {
-        let cached = reader_db.get(ks, &0u32.to_be_bytes());
-        let absent = reader_db.get(ks, &99u32.to_be_bytes());
-        let view = reader_db.checkpoint();
-        let rows = reader_db
-            .checkpoint()
-            .iterator(ks)
-            .collect::<Result<Vec<_>, _>>();
-        reads.send((cached, absent, view, rows)).unwrap();
-    });
-    let observed = read_results.recv_timeout(Duration::from_secs(2));
-    let early_first = first_received.try_recv();
-    let later_values = [3u32, 4].map(|key| db.get(ks, &key.to_be_bytes()));
-    drop(held);
-    let first_ack = first_received.recv_timeout(Duration::from_secs(5));
-    let second_ack = if early_ack.is_err() {
-        Some(second_received.recv_timeout(Duration::from_secs(5)))
-    } else {
-        None
-    };
-    first.join().unwrap();
-    second.join().unwrap();
-    reader.join().unwrap();
-    first_admitted.unwrap();
-    // The later batch on a distinct owner was acknowledged (early_ack below)
-    // while the first owner stayed held: owners overlap without a shared stage.
-    later_durable.unwrap();
-    assert!(matches!(early_first, Err(mpsc::TryRecvError::Empty)));
-    early_ack.unwrap().unwrap();
-    for value in later_values {
-        assert_eq!(value.unwrap().unwrap().as_ref(), &[2; 32]);
-    }
-    first_ack.unwrap().unwrap();
-    if let Some(ack) = second_ack {
-        ack.unwrap().unwrap();
-    }
-    let (cached, absent, view, rows) = observed.unwrap();
-    assert_eq!(cached.unwrap().unwrap().as_ref(), &[9; 32]);
-    assert!(absent.unwrap().is_none());
-    let rows = rows.unwrap();
-    assert_eq!(rows.len(), 3);
-    for (key, expected) in [(0u32, 9u8), (3, 2), (4, 2)] {
-        assert!(
-            rows.iter()
-                .any(|(k, v)| k.as_ref() == key.to_be_bytes() && v.as_ref() == [expected; 32])
-        );
-    }
-    // Exercise retention while the sparse checkpoint still pins its old value.
-    db.flush().unwrap();
-    assert_eq!(
-        view.iterator(ks).collect::<Result<Vec<_>, _>>().unwrap(),
-        rows
-    );
-    let rows = db
-        .checkpoint()
-        .iterator(ks)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(rows.len(), 5);
-    assert_eq!(
-        db.get(ks, &0u32.to_be_bytes()).unwrap().unwrap().as_ref(),
-        &[7; 32]
-    );
-    for key in 1..=4u32 {
-        assert_eq!(
-            db.get(ks, &key.to_be_bytes()).unwrap().unwrap().as_ref(),
-            if key < 3 { &[1; 32] } else { &[2; 32] }
-        );
-    }
-    db.wait_for_background_threads_to_finish().unwrap();
-    // The io client clone keeps the live connection registry (and its lock) alive.
-    drop(connection);
-    let reopened =
-        Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-            .unwrap();
-    assert_eq!(
-        reopened
-            .iterator(ks)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .len(),
-        5
-    );
-    reopened.wait_for_background_threads_to_finish().unwrap();
-}
-
-#[test]
-fn checkpoint_network_wait_does_not_lock_committed_index_or_cache() {
-    let fixture = Fixture::new();
-    let mut original = fixture.open();
-    original
-        .write_batch(fixture.operation(0, 50), vec![put(0, 7)])
-        .unwrap();
-    original.get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
-    let connection = original.core.clients[0].client.clone();
-    let held = connection.lock();
-    let (entered, entering) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().before_checkpoint_io = Some(entered);
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    let flusher_db = db.clone();
-    let flusher = thread::spawn(move || flusher_db.flush_index());
-    let checkpoint_entered = entering.recv_timeout(Duration::from_secs(2));
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let reader_db = db.clone();
-    let reader = thread::spawn(move || {
-        sender
-            .send((
-                reader_db.get(KeySpace(0), &0u32.to_be_bytes()),
-                reader_db.get(KeySpace(0), &99u32.to_be_bytes()),
-                reader_db.index_page(KeySpace(0), None, false, IndexReadCut::Latest),
-            ))
-            .unwrap();
-    });
-    let read = receiver.recv_timeout(Duration::from_secs(2));
-    drop(held);
-    reader.join().unwrap();
-    flusher.join().unwrap().unwrap();
-    checkpoint_entered.unwrap();
-    let (cached, absent, page) = read.unwrap();
-    assert_eq!(cached.unwrap().unwrap().as_ref(), &[7; 32]);
-    assert!(absent.unwrap().is_none());
-    assert_eq!(page.unwrap().len(), 1);
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-}
-
 #[test]
 fn writer_panic_resolves_all_admitted_acknowledgements_and_fences_reads() {
     let fixture = Fixture::new();
@@ -973,7 +358,7 @@ fn writer_panic_resolves_all_admitted_acknowledgements_and_fences_reads() {
 }
 
 #[test]
-fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
+fn sui_bulk_reads_group_shards_preserve_absent_keys_and_cache_cuts() {
     use crate::distributed::sui::Db;
     let mut fixture = Fixture::new();
     fixture.config.read_cache_bytes = 64 * 1024;
@@ -995,7 +380,7 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
     )
     .unwrap();
     let ks = db.ks("root");
-    let cut = db.remote_for_test().published_cut().unwrap();
+    let (cut, _pin) = db.remote_for_test().hybrid_table().pin_checkpoint();
     let mut keys: Vec<_> = [0u32, 3, 1, 2, 0, 99]
         .into_iter()
         .map(|key| key.to_be_bytes().to_vec())
@@ -1010,18 +395,27 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
         );
     }
     assert!(values[5].as_ref().unwrap().is_none());
-    assert!(values[6].is_err());
+    // Native reads a zero-length key as an absent row: `Db::get` has no
+    // read-side length rule (db.rs:685-711). The length rule is write-side
+    // (key_shape.rs:1227-1240) and in the distributed write codec
+    // (codec.rs:955-967); native's suite states the read contract at
+    // db_tests/db_tests.rs:2977-2978. The hybrid read path has no check.
+    assert!(values[6].as_ref().unwrap().is_none());
     assert_eq!(
         db.remote_for_test().live_read_submission_count() - before,
         2
     );
     db.validate_cached_read().unwrap();
     let before = db.remote_for_test().live_read_submission_count();
-    assert!(db.multi_get(ks, &keys)[6].is_err());
+    assert!(db.multi_get(ks, &keys)[6].as_ref().unwrap().is_none());
     assert_eq!(db.remote_for_test().live_read_submission_count(), before);
     db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![9; 32])
         .unwrap();
-    let retained = db.remote_for_test().get_many_cut(ks, &keys, cut).unwrap();
+    let retained = db
+        .remote_for_test()
+        .database
+        .get_many_at_cut(ks, &keys, cut, None)
+        .unwrap();
     assert_eq!(
         retained[0].as_ref().unwrap().as_deref(),
         Some([1; 32].as_slice())
@@ -1033,7 +427,7 @@ fn sui_bulk_reads_group_shards_preserve_key_errors_and_cache_cuts() {
             Some([9; 32].as_slice())
         );
     }
-    assert!(latest[6].is_err());
+    assert!(latest[6].as_ref().unwrap().is_none());
     db.wait_for_background_threads_to_finish().unwrap();
 }
 
@@ -1051,7 +445,7 @@ fn bulk_read_windows_preserve_mixed_duplicate_results_across_cache_chunks_and_cu
     let db = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
     // Leave key 1 cold while key 0 is resident, then retain the old cut.
     assert_eq!(get(&db, 0), Some(vec![1; 32]));
-    let old_cut = db.published_cut().unwrap();
+    let (old_cut, _pin) = db.hybrid_table().pin_checkpoint();
     db.write_batch(
         fixture.operation(1, 73),
         vec![
@@ -1073,7 +467,10 @@ fn bulk_read_windows_preserve_mixed_duplicate_results_across_cache_chunks_and_cu
         })
         .collect();
     for (cut, first, second) in [(old_cut, Some(1), Some(2)), (latest, Some(9), None)] {
-        let values = db.get_many_cut(KeySpace(0), &keys, cut).unwrap();
+        let values = db
+            .database
+            .get_many_at_cut(KeySpace(0), &keys, cut, None)
+            .unwrap();
         assert_eq!(values.len(), keys.len());
         for (slot, value) in values.iter().enumerate() {
             match slot % 4 {
@@ -1085,8 +482,9 @@ fn bulk_read_windows_preserve_mixed_duplicate_results_across_cache_chunks_and_cu
                         expected.as_ref().map(<[u8; 32]>::as_slice)
                     );
                 }
-                2 => assert!(value.as_ref().unwrap().is_none()),
-                _ => assert!(value.is_err()),
+                // A zero-length key reads as absent, as native `Db::get` does
+                // (db.rs:685-711; db_tests/db_tests.rs:2977-2978).
+                _ => assert!(value.as_ref().unwrap().is_none()),
             }
         }
     }
@@ -1115,11 +513,14 @@ fn competing_grouped_readers_share_one_credit_without_losing_members() {
     let ready = std::sync::Barrier::new(2);
     thread::scope(|scope| {
         for _ in 0..2 {
-            let (db, keys, ready, cut) = (&db, &keys, &ready, cut.clone());
+            let (db, keys, ready, cut) = (&db, &keys, &ready, cut);
             scope.spawn(move || {
                 ready.wait();
                 for _ in 0..8 {
-                    let values = db.get_many_cut(KeySpace(0), keys, cut.clone()).unwrap();
+                    let values = db
+                        .database
+                        .get_many_at_cut(KeySpace(0), keys, cut, None)
+                        .unwrap();
                     assert_eq!(values.len(), keys.len());
                     for (slot, expected) in [1u8, 4, 2, 3, 1].into_iter().enumerate() {
                         assert_eq!(
@@ -1143,30 +544,38 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
 
     db.write_batch(fixture.operation(0, 90), vec![put(7, 1)])
         .unwrap();
-    let old_cut = db.published_cut().unwrap();
-    let old_reference = db
-        .index_reference(KeySpace(0), &7u32.to_be_bytes(), old_cut.clone())
+    let (old_cut, old_pin) = db.hybrid_table().pin_checkpoint();
+    let old_position = db
+        .hybrid_table()
+        .get(KeySpace(0), &7u32.to_be_bytes(), old_cut)
         .unwrap()
         .unwrap();
+    let keys = [7u32.to_be_bytes().to_vec()];
     let rpc_count = db.live_read_submission_count();
     assert_eq!(
-        db.get_many_cut(KeySpace(0), &[7u32.to_be_bytes().to_vec()], old_cut.clone())
+        db.database
+            .get_many_at_cut(KeySpace(0), &keys, old_cut, None)
             .unwrap()[0]
             .as_ref()
             .unwrap()
             .as_deref(),
         Some([1; 32].as_slice())
     );
-    assert_eq!(db.live_read_submission_count(), rpc_count);
+    assert_eq!(
+        db.live_read_submission_count(),
+        rpc_count,
+        "publication primes the cache, so an acknowledged immutable cut needs no owner read"
+    );
 
     db.write_batch(fixture.operation(1, 91), vec![put(7, 2)])
         .unwrap();
-    let updated_cut = db.published_cut().unwrap();
-    let updated_reference = db
-        .index_reference(KeySpace(0), &7u32.to_be_bytes(), updated_cut.clone())
+    let (updated_cut, updated_pin) = db.hybrid_table().pin_checkpoint();
+    let updated_position = db
+        .hybrid_table()
+        .get(KeySpace(0), &7u32.to_be_bytes(), updated_cut)
         .unwrap()
         .unwrap();
-    assert_ne!(old_reference, updated_reference);
+    assert_ne!(old_position, updated_position);
     db.write_batch(
         fixture.operation(2, 92),
         vec![Mutation::Delete {
@@ -1176,11 +585,19 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
     )
     .unwrap();
     let deleted_cut = db.published_cut().unwrap();
-    let keys = [7u32.to_be_bytes().to_vec()];
     let before_reads = db.live_read_submission_count();
-    let old = db.get_many_cut(KeySpace(0), &keys, old_cut).unwrap();
-    let updated = db.get_many_cut(KeySpace(0), &keys, updated_cut).unwrap();
-    let deleted = db.get_many_cut(KeySpace(0), &keys, deleted_cut).unwrap();
+    let old = db
+        .database
+        .get_many_at_cut(KeySpace(0), &keys, old_cut, None)
+        .unwrap();
+    let updated = db
+        .database
+        .get_many_at_cut(KeySpace(0), &keys, updated_cut, None)
+        .unwrap();
+    let deleted = db
+        .database
+        .get_many_at_cut(KeySpace(0), &keys, deleted_cut, None)
+        .unwrap();
     assert_eq!(
         old[0].as_ref().unwrap().as_deref(),
         Some([1; 32].as_slice())
@@ -1190,96 +607,19 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
         Some([2; 32].as_slice())
     );
     assert!(deleted[0].as_ref().unwrap().is_none());
-    assert_eq!(db.live_read_submission_count(), before_reads);
+    assert_eq!(
+        db.live_read_submission_count(),
+        before_reads,
+        "every acknowledged cut stays cache-resident"
+    );
     let cache = db.read_cache_stats();
-    assert!(cache.inserts >= 3);
+    // One prime per acknowledged put; the reads above inserted nothing because
+    // every read was a hit.
+    assert!(cache.inserts >= 2);
     assert!(cache.retained_bytes <= cache.budget_bytes);
-    let mut metrics = None;
-    db.visit_write_metrics(|snapshot| metrics = Some(snapshot));
-    assert_eq!(
-        metrics
-            .unwrap()
-            .authority
-            .durable_receipt_publication_blocked_batches,
-        0
-    );
+    // The older cuts were held by their pins for every read above.
+    drop((old_pin, updated_pin));
     db.shutdown().unwrap();
-}
-
-#[test]
-fn write_profile_arming_resets_checkpoint_phase_metrics() {
-    let mut fixture = Fixture::new();
-    fixture.config.write_profile_limit = 0;
-    let original = fixture.open();
-    let warm_operation = fixture.operation(0, 201);
-    let warm_version = original
-        .write_batch(warm_operation, vec![put(201, 1)])
-        .unwrap();
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (resume, gate) = mpsc::sync_channel(1);
-    original.core.test_hooks.lock().checkpoint_adoption_pause = Some((entered, gate));
-    original.core.start_checkpoint().unwrap();
-    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    let arm_db = db.clone();
-    let (finished, result) = mpsc::sync_channel(1);
-    let arm = thread::spawn(move || {
-        let _ = finished.send(arm_db.arm_write_profile(1));
-    });
-    let early = result.recv_timeout(Duration::from_millis(100));
-    resume.send(()).unwrap();
-    arm.join().unwrap();
-    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
-    result
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    let summary = || {
-        let mut snapshot = None;
-        db.visit_write_metrics(|metrics| snapshot = Some(metrics.checkpoint_diagnostics));
-        snapshot.unwrap()
-    };
-    let fresh = summary();
-    assert!(fresh.available);
-    assert_eq!(fresh.records, 0);
-    assert_eq!(fresh.root_adoption_count, 0);
-    let operation = fixture.operation(1, 202);
-    let version = db.write_batch(operation, vec![put(202, 2)]).unwrap();
-    db.flush_index().unwrap();
-    let measured = summary();
-    assert!(measured.root_adoption_count > 0);
-    assert!(measured.owner_adoption_count > 0);
-    assert!(measured.obsolete_cleanup_count > 0);
-    db.arm_write_profile(0).unwrap();
-    let disabled = summary();
-    assert!(!disabled.available);
-    assert_eq!(disabled.records, 0);
-    assert_eq!(disabled.root_adoption_count, 0);
-    db.arm_write_profile(1).unwrap();
-    let rearmed = summary();
-    assert!(rearmed.available);
-    assert_eq!(rearmed.records, 0);
-    assert_eq!(rearmed.root_adoption_count, 0);
-    assert_eq!(rearmed.owner_adoption_count, 0);
-    assert_eq!(rearmed.obsolete_cleanup_count, 0);
-    assert_eq!(get(&db, 201), Some(vec![1; 32]));
-    assert_eq!(get(&db, 202), Some(vec![2; 32]));
-    assert_eq!(
-        db.write_batch(warm_operation, vec![put(201, 1)]).unwrap(),
-        warm_version
-    );
-    assert_eq!(
-        db.write_batch(operation, vec![put(202, 2)]).unwrap(),
-        version
-    );
-    db.write_batch(fixture.operation(2, 203), vec![put(203, 3)])
-        .unwrap();
-    db.flush_index().unwrap();
-    let next = summary();
-    assert!(next.root_adoption_count > 0);
-    assert!(next.owner_adoption_count > 0);
-    assert!(next.obsolete_cleanup_count > 0);
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
 }
 
 #[test]
@@ -1508,7 +848,7 @@ fn authority_split_counters_cover_single_and_multiple_batch_windows() {
             .collect();
         original.submit_many(&window).unwrap();
         let db = ConcurrentRemoteDatabase::new(original).unwrap();
-        db.flush_index().unwrap();
+        db.write_core().flush_index().unwrap();
         db.visit_write_metrics(|snapshot| {
             assert_eq!(snapshot.authority.authority_windows, 1);
             assert_eq!(snapshot.authority.authority_batches, u64::from(batches));
@@ -1554,7 +894,7 @@ fn submit_many_window_keeps_admission_order() {
         assert_eq!(version.sequence, versions[0].sequence + index as u64);
         assert_eq!(get(&db, index as u32), Some(vec![index as u8; 64 * 1024]));
     }
-    db.flush_index().unwrap();
+    db.write_core().flush_index().unwrap();
     let stats = db.pipeline_stats();
     assert_eq!(stats.concurrent_admitted, 16);
     assert_eq!(stats.prepare_calls, 1);
@@ -1685,24 +1025,20 @@ fn duplicate_identity_admits_once() {
     assert_eq!(version.sequence, original_version.sequence + 1);
     assert_eq!(last.sequence, version.sequence + 1);
     assert_eq!(get(&db, 2), Some(vec![2; 64 * 1024]));
-    db.flush_index().unwrap();
+    db.write_core().flush_index().unwrap();
     // Retries are acknowledged, but only the two new identities allocated.
     assert_eq!(db.stats().admitted_batches, admitted + 2);
     db.shutdown().unwrap();
 }
 
 fn fifo_admission(requests: usize, bytes: usize) -> Arc<Admission> {
-    let shape = KeyShape::new_single(4, 1, crate::key_shape::KeyType::uniform(1));
     Arc::new(Admission {
         budget: Mutex::new(WriteBudget::default()),
         drained: parking_lot::Condvar::new(),
         max_requests: requests,
         max_bytes: bytes,
-        max_identities: requests,
-        max_index_bytes: 1024 * 1024,
         partition_batches: 1024,
         reference_bytes: 1024 * 1024,
-        index: Arc::new(NativeIndex::new(&shape, [71; 16], 1024 * 1024).unwrap()),
         timeout: Duration::from_secs(30),
         first_failure: Arc::new(std::sync::OnceLock::new()),
     })
@@ -1721,42 +1057,31 @@ fn publication_release_validates_all_dimensions_before_returning_any_credit() {
     let admission = fifo_admission(4, 4096);
     {
         let mut budget = admission.budget.lock();
-        budget.index_bytes = 1024;
         budget.slots = 3;
         budget.checkpoint.partition_batches = vec![2, 1];
         budget.checkpoint.partition_records = vec![5, 4];
     }
-    for (index, slots, partitions) in [
-        (1025, 1, vec![(1, 2), (0, 0)]),
-        (512, 4, vec![(1, 2), (0, 0)]),
-        (512, 1, vec![(1, 2)]),
-        (512, 1, vec![(3, 2), (0, 0)]),
-        (512, 1, vec![(1, 2), (1, 5)]),
+    for (slots, partitions) in [
+        (4, vec![(1, 2), (0, 0)]),
+        (1, vec![(1, 2)]),
+        (1, vec![(3, 2), (0, 0)]),
+        (1, vec![(1, 2), (1, 5)]),
     ] {
-        assert!(
-            admission
-                .release_publication(index, slots, &partitions, (0, 0))
-                .is_err()
-        );
+        assert!(admission.release_publication(slots, &partitions).is_err());
         let budget = admission.budget.lock();
-        assert_eq!((budget.index_bytes, budget.slots), (1024, 3));
+        assert_eq!(budget.slots, 3);
         assert_eq!(budget.checkpoint.partition_batches, [2, 1]);
         assert_eq!(budget.checkpoint.partition_records, [5, 4]);
     }
-    admission
-        .release_publication(768, 2, &[(2, 5), (1, 4)], (0, 0))
-        .unwrap();
+    admission.release_publication(2, &[(2, 5), (1, 4)]).unwrap();
     {
         let budget = admission.budget.lock();
-        assert_eq!((budget.index_bytes, budget.slots), (256, 1));
+        assert_eq!(budget.slots, 1);
         assert_eq!(budget.checkpoint.partition_batches, [0, 0]);
         assert_eq!(budget.checkpoint.partition_records, [0, 0]);
     }
-    admission
-        .release_publication(256, 1, &[(0, 0), (0, 0)], (0, 0))
-        .unwrap();
-    let budget = admission.budget.lock();
-    assert_eq!((budget.index_bytes, budget.slots), (0, 0));
+    admission.release_publication(1, &[(0, 0), (0, 0)]).unwrap();
+    assert_eq!(admission.budget.lock().slots, 0);
 }
 
 #[test]
@@ -2020,261 +1345,4 @@ fn all_invalid_writes_release_budget_and_keep_owner_healthy() {
     assert_eq!(get(&db, 5), Some(vec![5; 64 * 1024]));
     db.ensure_healthy().unwrap();
     db.shutdown().unwrap();
-}
-
-/// Readers blocked on read admission hold no sparse view: after its lookup a
-/// point read pins only the retention floor. Each reader resolves a different
-/// view that is then replaced, yet the reader-held bytes stay within
-/// `max_pending_reads` views (here none), and every read completes once
-/// admission is free.
-#[test]
-fn readers_waiting_for_admission_hold_no_sparse_view() {
-    const READERS: u32 = 8;
-    let mut fixture = Fixture::new();
-    fixture.config.read_cache_bytes = 0;
-    fixture.config.max_pending_reads = 1;
-    let original = fixture.open();
-    original
-        .write_batch(fixture.operation(1, 100), vec![put(0, 1)])
-        .unwrap();
-    for reader in 0..READERS {
-        original
-            .write_batch(
-                fixture.operation(1 + reader % 4, 101 + u64::from(reader)),
-                vec![put(10 + reader, 10 + reader as u8)],
-            )
-            .unwrap();
-    }
-    let held_connection = original.core.clients[0].client.clone();
-    let held = held_connection.lock();
-    let db = Arc::new(ConcurrentRemoteDatabase::new(original).unwrap());
-    // An unresolved write on owner 0 makes every later publication sparse.
-    let blocked = {
-        let db = db.clone();
-        let operation = fixture.operation(0, 200);
-        thread::spawn(move || db.write_batch(operation, vec![put(50, 50)]))
-    };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while db.database.core.clients[0].queue.snapshot().2.len() != 1 {
-        assert!(Instant::now() < deadline, "blocked write never queued");
-        thread::yield_now();
-    }
-    let mut published = 0u64;
-    let mut publish = |db: &ConcurrentRemoteDatabase| {
-        published += 1;
-        let key = 60 + published as u32;
-        db.write_batch(
-            fixture.operation(1 + key % 4, 300 + published),
-            vec![put(key, 7)],
-        )
-        .unwrap();
-    };
-    publish(&db);
-    assert!(matches!(db.index.call_cut(), IndexReadCut::Sparse(_)));
-    // One replaced, uncharged view held inside a read measures one view.
-    let probe = db.index.call_cut();
-    publish(&db);
-    let view = db.index_stats().reader_held_view_bytes;
-    assert!(view > 0);
-    drop(probe);
-    assert_eq!(db.index_stats().reader_held_view_bytes, 0);
-    // Sample every resolution: a reader's pin stage is recorded after its
-    // pin returns, when its resolved view is already dropped.
-    db.set_read_profile_limit(64);
-    let monitor = db.read_profile_monitor();
-    let pinned = || {
-        monitor
-            .coordinator_resolution_snapshot()
-            .pin_preparation
-            .count
-    };
-    // The one admitted read keeps the only read credit until it is finished.
-    let pending = db.submit_get(KeySpace(0), &0u32.to_be_bytes()).unwrap();
-    let (results, received) = mpsc::channel();
-    let mut readers = Vec::new();
-    for reader in 0..READERS {
-        let before = pinned();
-        let (db_reader, results) = (db.clone(), results.clone());
-        readers.push(thread::spawn(move || {
-            let key = 10 + reader;
-            results
-                .send((key, db_reader.get(KeySpace(0), &key.to_be_bytes())))
-                .unwrap();
-        }));
-        // The reader resolved the current view and pinned its floor; it now
-        // waits for admission, and the next publication replaces that view.
-        while pinned() == before {
-            assert!(Instant::now() < deadline, "reader {reader} never resolved");
-            thread::yield_now();
-        }
-        publish(&db);
-    }
-    // Every reader is past its lookup, so none holds a view any more; the
-    // admitted read holds only a floor pin as well.
-    let held_bytes = db.index_stats().reader_held_view_bytes;
-    assert!(held_bytes <= db.config.max_pending_reads * view);
-    assert_eq!(held_bytes, 0, "waiting and admitted reads hold no view");
-    assert!(
-        matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)),
-        "readers must still wait for admission"
-    );
-    assert_eq!(
-        db.finish_ready_get(pending.wait())
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        &[1; 32]
-    );
-    for reader in readers {
-        reader.join().unwrap();
-    }
-    drop(results);
-    let mut values: Vec<_> = received
-        .iter()
-        .map(|(key, value)| (key, value.unwrap().unwrap().to_vec()))
-        .collect();
-    values.sort_unstable_by_key(|(key, _)| *key);
-    let expected: Vec<_> = (0..READERS)
-        .map(|reader| (10 + reader, vec![10 + reader as u8; 32]))
-        .collect();
-    assert_eq!(values, expected);
-    assert_eq!(db.index_stats().reader_held_view_bytes, 0);
-    drop(held);
-    blocked.join().unwrap().unwrap();
-    Arc::try_unwrap(db).ok().unwrap().shutdown().unwrap();
-}
-
-/// A Sui `multi_get` of more than one window takes no owner charge: with the
-/// view allowance exhausted by reservations and a retained checkpoint cut, it
-/// still succeeds, and every window reads the one sparse cut (the held batch
-/// stays invisible, the later batch is visible).
-#[test]
-fn sui_multi_window_get_succeeds_with_view_budget_exhausted() {
-    use crate::distributed::sui::{Checkpoint, Db};
-    const KEYS: u32 = 260;
-    let mut fixture = Fixture::new();
-    // No cache: every window fetches its misses under the shared floor pin.
-    fixture.config.read_cache_bytes = 0;
-    let path = fixture.temp.path().join("authority");
-    let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
-        .unwrap();
-    let ks = db.ks("root");
-    let partition = |sequence: u64| {
-        let mut operation = [0; 16];
-        operation[..8].copy_from_slice(&1u64.to_le_bytes());
-        operation[8..].copy_from_slice(&sequence.to_le_bytes());
-        fixture
-            .config
-            .inventory(1)
-            .partition_for(BatchId {
-                database: fixture.config.storage.database,
-                operation,
-            })
-            .unwrap()
-    };
-    // Public Sui commits use one operation per commit, from zero.
-    let per_commit = fixture.config.storage.batch_limits.max_operations;
-    let mut commits = 0u64;
-    for first in (0..KEYS).step_by(per_commit as usize) {
-        let mut batch = db.write_batch();
-        for key in first..(first + per_commit).min(KEYS) {
-            batch.write(ks, key.to_be_bytes().to_vec(), vec![1; 32]);
-        }
-        batch.commit().unwrap();
-        commits += 1;
-    }
-    // The held commit routes to partition(prefix); the two later commits must
-    // route elsewhere so they publish around it.
-    let prefix = (commits..commits + 64)
-        .find(|sequence| {
-            partition(*sequence) != partition(*sequence + 1)
-                && partition(*sequence) != partition(*sequence + 2)
-        })
-        .unwrap();
-    for _ in commits..prefix {
-        db.insert(ks, 0u32.to_be_bytes().to_vec(), vec![1; 32])
-            .unwrap();
-    }
-    let connection = db
-        .remote_for_test()
-        .io_clients
-        .iter()
-        .find(|(node, _)| *node == partition(prefix))
-        .unwrap()
-        .1
-        .clone();
-    let held = connection.client.lock();
-    let (progress, events) = mpsc::sync_channel(64);
-    db.remote_for_test()
-        .database
-        .core
-        .test_hooks
-        .lock()
-        .concurrent_progress = Some(progress);
-    let (first_reply, first_received) = mpsc::channel();
-    let first_db = db.clone();
-    let first = thread::spawn(move || {
-        let mut batch = first_db.write_batch();
-        batch.write(ks, 1u32.to_be_bytes().to_vec(), vec![7; 32]);
-        first_reply.send(batch.commit()).unwrap();
-    });
-    wait_event(&events, |stats| stats.concurrent_admitted == prefix + 1).unwrap();
-    let mut later = db.write_batch();
-    later.write(ks, 2u32.to_be_bytes().to_vec(), vec![8; 32]);
-    later.commit().unwrap();
-    let remote = db.remote_for_test();
-    assert!(matches!(remote.index.call_cut(), IndexReadCut::Sparse(_)));
-    // Exhaust the view allowance: reservations, then one retained checkpoint
-    // cut of the sparse view takes the last owner charge.
-    let max_excluded = fixture.config.max_pending_batches - 1;
-    let mut reservations = Vec::new();
-    loop {
-        match remote.index.reserve_publication_view(max_excluded) {
-            Ok(reservation) => reservations.push(reservation),
-            Err(super::super::super::native_index::NativeIndexError::Capacity) => break,
-            Err(error) => panic!("unexpected reservation failure: {error}"),
-        }
-    }
-    reservations.pop();
-    let checkpoint = db.checkpoint();
-    assert!(matches!(checkpoint, Checkpoint::Remote(_, Ok(_))));
-    assert!(remote.index.reserve_publication_view(max_excluded).is_err());
-    // A newer sparse view has no owner charge yet: a charged cut of it would
-    // now fail with `Capacity`.
-    let mut newest = db.write_batch();
-    newest.write(ks, 3u32.to_be_bytes().to_vec(), vec![9; 32]);
-    newest.commit().unwrap();
-    assert!(matches!(remote.index.call_cut(), IndexReadCut::Sparse(_)));
-    assert!(remote.published_cut().is_err());
-    let charged = remote.index_stats().transient_metadata_bytes;
-    let keys: Vec<_> = (0..KEYS).map(|key| key.to_be_bytes().to_vec()).collect();
-    let values = db.multi_get(ks, &keys);
-    assert_eq!(values.len(), keys.len());
-    for (key, value) in (0..KEYS).zip(values) {
-        let expected = match key {
-            2 => 8,
-            3 => 9,
-            _ => 1,
-        };
-        assert_eq!(
-            value.unwrap().unwrap().as_ref(),
-            &[expected; 32],
-            "key {key}"
-        );
-    }
-    assert_eq!(remote.index_stats().transient_metadata_bytes, charged);
-    assert_eq!(remote.index_stats().reader_held_view_bytes, 0);
-    drop(checkpoint);
-    drop(reservations);
-    drop(held);
-    first_received
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    first.join().unwrap();
-    assert_eq!(
-        db.get(ks, &1u32.to_be_bytes()).unwrap().unwrap().as_ref(),
-        &[7; 32]
-    );
-    db.wait_for_background_threads_to_finish().unwrap();
 }

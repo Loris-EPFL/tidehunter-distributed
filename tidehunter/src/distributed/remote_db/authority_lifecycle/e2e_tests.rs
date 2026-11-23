@@ -17,6 +17,7 @@ use super::{
 };
 use crate::distributed::tcp::host_identity;
 use crate::key_shape::KeyType;
+use std::fs;
 use std::io;
 
 fn fixture() -> Fixture {

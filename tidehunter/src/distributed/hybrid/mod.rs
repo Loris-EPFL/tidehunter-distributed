@@ -32,7 +32,7 @@ pub(crate) mod table;
 pub use config::HybridIndexConfig;
 
 pub(crate) mod replay;
-mod snapshot;
+pub(crate) mod snapshot;
 
 pub(crate) use snapshot::{SnapshotConfig, StoredSnapshot, spawn_snapshot_thread};
 

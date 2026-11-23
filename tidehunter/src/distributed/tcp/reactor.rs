@@ -1252,10 +1252,6 @@ impl Client {
             || self.reactor.position.is_some()
     }
     #[cfg(test)]
-    pub(crate) fn checkpoint_pending(&self) -> bool {
-        self.reactor.control.is_some() || self.reactor.position.is_some()
-    }
-    #[cfg(test)]
     pub(crate) fn checkpoint_control_pending(&self) -> bool {
         self.reactor.control.is_some()
     }

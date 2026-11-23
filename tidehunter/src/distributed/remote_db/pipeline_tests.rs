@@ -18,10 +18,13 @@ use crate::distributed::tcp::{
     LiveClientConfig, LiveTargetPool, NodeConfig, OwnerHost, OwnerHostConfig, StorageNode,
     TcpError, TcpLimits,
 };
+use crate::index::index_format::IndexIterCaches;
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "shared_tls_tests.rs"]
+mod shared_tls;
 #[path = "../../../examples/support/tls_material.rs"]
 mod tls_material;
 
@@ -85,16 +88,13 @@ pub(super) fn coordinator_config(
         // This is a bounded liveness guard, not a latency assertion.
         timeout: Duration::from_secs(30),
         max_admitted_batches: max_batches,
-        max_index_bytes: 1024 * 1024,
         max_pending_batches: 64,
         max_pending_bytes: 1024 * 1024,
-        replay_limits: Default::default(),
         owner_append_occupancy: DEFAULT_OWNER_APPEND_OCCUPANCY,
         pipelined_writes: true,
         leased_submit_redrain: true,
         read_cache_bytes: 64 * 1024,
         read_memory_allowance_bytes: 512 * 1024 * 1024,
-        scan_prefetch_pages: 2,
         read_lanes: Some(2),
         pin_read_lanes: false,
         max_pending_reads: 256,
@@ -236,8 +236,7 @@ impl Fixture {
     ) -> Self {
         assert!((1..=16).contains(&owner_count));
         let tier = DurabilityTier::Native;
-        let certs = tls_material::TestCertificates::generate(&temp.path().join("tls"), owner_count)
-            .unwrap();
+        let certs = shared_tls::certificates(&temp.path().join("tls"), owner_count).unwrap();
         let mut config = coordinator_config(
             owner_count,
             max_batches,
@@ -460,6 +459,88 @@ fn value(db: &mut RemoteDatabase, key: u32) -> Option<Vec<u8>> {
         .map(|v| v.to_vec())
 }
 
+/// A cut above every version of every epoch: the index holds only published
+/// batches, so a lookup at it answers "what is indexed now", including a batch
+/// the publication cut has not yet covered.
+pub(super) fn newest_cut() -> BatchVersion {
+    BatchVersion {
+        epoch: u64::MAX,
+        sequence: u64::MAX,
+    }
+}
+
+/// Every row of `ks` visible at the publication cut, as `(full key, value)`:
+/// a native-style index walk whose entries are resolved through the value
+/// path, with tombstones (and entries the owner no longer holds) skipped, as
+/// the Sui iterator's `next_entry` does.
+pub(super) fn live_rows(db: &RemoteDatabase, ks: KeySpace) -> Vec<(Bytes, Bytes)> {
+    let table = &db.core.table;
+    let cut = table.current();
+    let mut caches = IndexIterCaches::new();
+    let mut cell = table.ks_desc(ks).first_cell();
+    let mut previous = None;
+    let mut rows = Vec::new();
+    while let Some(entry) = table
+        .next_entry(ks, cell, previous, &None, false, &mut caches, Some(cut))
+        .unwrap()
+    {
+        let key = entry.key.clone();
+        let row = db
+            .reader
+            .read_entry_with_resolve(ks, &key, entry.value, || table.get(ks, &key, cut))
+            .unwrap();
+        rows.extend(row);
+        cell = entry
+            .cell
+            .expect("an index entry names the cell it was found in");
+        previous = Some(entry.key);
+    }
+    rows
+}
+
+/// Every index entry of `ks` at `cut` in walk order: `(reduced key, position)`,
+/// the index level of the Sui iterator without any value fetch.
+pub(super) fn index_entries(
+    table: &HybridTable,
+    ks: KeySpace,
+    cut: BatchVersion,
+) -> Vec<(Bytes, VersionPosition)> {
+    let mut caches = IndexIterCaches::new();
+    let mut cell = table.ks_desc(ks).first_cell();
+    let mut previous = None;
+    let mut entries = Vec::new();
+    while let Some(entry) = table
+        .next_entry(ks, cell, previous, &None, false, &mut caches, Some(cut))
+        .unwrap()
+    {
+        cell = entry
+            .cell
+            .expect("an index entry names the cell it was found in");
+        previous = Some(entry.key.clone());
+        entries.push((entry.key, entry.value));
+    }
+    entries
+}
+
+/// The value of `key` visible at `cut`, resolved through the production value
+/// path: the index names a position at the cut, the reader fetches the member
+/// (tombstones and absent keys read as `None`).
+pub(super) fn read_at_cut(
+    db: &ConcurrentRemoteDatabase,
+    ks: KeySpace,
+    key: &[u8],
+    cut: BatchVersion,
+) -> Result<Option<Bytes>, LocalDbError> {
+    let table = db.hybrid_table();
+    let Some(position) = table.get(ks, key, cut)? else {
+        return Ok(None);
+    };
+    let row = db
+        .value_reader()
+        .read_entry_with_resolve(ks, key, position, || table.get(ks, key, cut))?;
+    Ok(row.map(|(_, value)| value))
+}
+
 /// Wait until the owner worker has processed every expected receipt under
 /// writer→publisher: published, or durable and parked behind an unresolved
 /// predecessor. Workers publish on their own thread; there is no authority
@@ -659,11 +740,10 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     }
     assert_eq!(before.3, 0);
     // Callers returned their request/byte credit at submit; each allocated
-    // generation keeps its slot, index and partition charges until published.
+    // generation keeps its slot and partition charges until published.
     assert_eq!((before.4.requests, before.4.bytes), (0, 0));
     assert_eq!(before.4.slots, 32);
     assert_eq!(before.4.partition_batches, 32);
-    assert!(before.4.index_bytes > 0);
     // Owner populations are 7,7,6,6,6; max_batches=2 yields exactly
     // 4+4+3+3+3=17 WorkerItems, including the two one-member tails.
     for owner in 0..5 {
@@ -682,10 +762,7 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     settle(&db);
     assert_eq!(db.core.published_next(), 32);
     let charges = db.core.admission.charges();
-    assert_eq!(
-        (charges.slots, charges.bytes, charges.index_bytes),
-        (0, 0, 0)
-    );
+    assert_eq!((charges.slots, charges.bytes), (0, 0));
     for key in 0..32u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
@@ -729,7 +806,7 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     assert_eq!(db.stats().admitted_batches, admissions);
     db.drain().unwrap();
     assert_eq!(value(&mut db, 0), Some(vec![99; 32]));
-    assert_eq!(db.scan(KeySpace(0)).unwrap().len(), 31);
+    assert_eq!(live_rows(&db, KeySpace(0)).len(), 31);
     db.shutdown().unwrap();
     drop(db);
     // Client clones keep the live connection registry (and its lock) alive.
@@ -741,231 +818,13 @@ fn full_groups_dispatch_before_drain_on_five_nodes_and_recover_exact_state() {
     for key in 2..32u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
     }
-    assert_eq!(
-        reopened.submit(*operation, vec![mutation.clone()]).unwrap(),
-        *version
-    );
-    assert_eq!(reopened.stats().admitted_batches, 0);
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so this retry is a new write in a later epoch. The value stays.
+    let retried = reopened.submit(*operation, vec![mutation.clone()]).unwrap();
+    assert!(retried.epoch > version.epoch);
+    assert_eq!(reopened.stats().admitted_batches, 1);
+    assert_eq!(value(&mut reopened, 0), Some(vec![99; 32]));
     reopened.shutdown().unwrap();
-}
-
-/// Writes take no sparse-view quota: the publisher's standing budget, reserved
-/// at open, covers every view install. With all remaining view quota taken
-/// and a full window in flight, reserved view bytes stay constant and every
-/// sparse replacement under writer → publisher still succeeds.
-#[test]
-fn full_window_in_flight_takes_no_view_quota_and_sparse_replacements_never_fail() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let mut reservations = Vec::new();
-    loop {
-        match db.core.index.reserve_publication_view(1) {
-            Ok(reservation) => reservations.push(reservation),
-            Err(super::super::native_index::NativeIndexError::Capacity) => break,
-            Err(error) => panic!("unexpected reservation failure: {error}"),
-        }
-    }
-    let reserved = db.core.index.stats().transient_metadata_bytes;
-    let held_connection = Arc::clone(&db.core.clients[0].client);
-    let held = held_connection.lock();
-    let window = db.core.config.max_pending_batches - 1;
-    let first = db
-        .submit(fixture.operation(0, 1000), vec![put(1000, 1)])
-        .unwrap();
-    let mut later = Vec::with_capacity(window - 1);
-    let mut reader_view = None;
-    for n in 1..window as u64 {
-        let owner = 1 + (n % 4) as u32;
-        let key = 1000 + n as u32;
-        let version = db
-            .submit(fixture.operation(owner, 1000 + n), vec![put(key, n as u8)])
-            .unwrap();
-        later.push(version.sequence);
-        assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
-        if n == window as u64 / 2 {
-            settle_publication(&db, &later);
-            // A reader-held replaced view keeps only its floor pin.
-            reader_view = Some(db.core.index.call_cut());
-        }
-    }
-    settle_publication(&db, &later);
-    for &sequence in &later {
-        assert!(db.core.is_published(BatchVersion {
-            epoch: db.epoch(),
-            sequence,
-        }));
-    }
-    assert!(!db.core.is_published(first));
-    assert!(matches!(reader_view, Some(IndexReadCut::Sparse(_))));
-    assert!(matches!(db.core.index.call_cut(), IndexReadCut::Sparse(_)));
-    assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
-    assert!(db.core.ensure_healthy().is_ok());
-    drop(held);
-    db.drain().unwrap();
-    assert!(matches!(db.core.index.call_cut(), IndexReadCut::At(_)));
-    drop(reader_view);
-    assert_eq!(db.core.index.stats().transient_metadata_bytes, reserved);
-    assert_eq!(value(&mut db, 1000), Some(vec![1; 32]));
-    assert_eq!(
-        value(&mut db, 1000 + window as u32 - 1),
-        Some(vec![(window - 1) as u8; 32])
-    );
-    drop(reservations);
-    db.shutdown().unwrap();
-}
-
-/// Public cuts retained across successive sparse publications take owner
-/// charges from the index view allowance. When it is full, `published_cut`
-/// fails with the index capacity error while writes keep publishing, and
-/// dropping the cuts releases each charge exactly once.
-#[test]
-fn retained_published_cuts_are_charged_and_only_the_reader_fails_when_full() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    let transient = |db: &RemoteDatabase| db.core.index.stats().transient_metadata_bytes;
-    // Every sparse view of this publisher has max_pending_batches - 1
-    // exclusion capacity, so one owner charge equals one such reservation.
-    // Fill the allowance, then free room for exactly three owner charges.
-    let max_excluded = db.core.config.max_pending_batches - 1;
-    let mut reservations = Vec::new();
-    loop {
-        match db.core.index.reserve_publication_view(max_excluded) {
-            Ok(reservation) => reservations.push(reservation),
-            Err(super::super::native_index::NativeIndexError::Capacity) => break,
-            Err(error) => panic!("unexpected reservation failure: {error}"),
-        }
-    }
-    assert!(reservations.len() >= 3);
-    let full = transient(&db);
-    reservations.truncate(reservations.len() - 3);
-    let base = transient(&db);
-    let view = (full - base) / 3;
-    let held_connection = Arc::clone(&db.core.clients[0].client);
-    let held = held_connection.lock();
-    let first = db
-        .submit(fixture.operation(0, 2000), vec![put(2000, 1)])
-        .unwrap();
-    let mut later = Vec::new();
-    let mut write = |db: &mut RemoteDatabase, n: u64| {
-        let owner = 1 + (n % 4) as u32;
-        let version = db
-            .submit(
-                fixture.operation(owner, 2000 + n),
-                vec![put(2000 + n as u32, n as u8)],
-            )
-            .unwrap();
-        later.push(version.sequence);
-        settle_publication(db, &later);
-    };
-    let mut cuts = Vec::new();
-    for n in 1..=3 {
-        write(&mut db, n);
-        let cut = db.published_cut().unwrap();
-        assert!(matches!(cut, IndexReadCut::Sparse(_)));
-        cuts.push(cut);
-        assert_eq!(transient(&db), base + cuts.len() * view);
-        assert_eq!(db.core.index.stats().reader_held_view_bytes, 0);
-    }
-    write(&mut db, 4);
-    let error = db.published_cut().unwrap_err();
-    assert!(error.message().contains("capacity exceeded"), "{error}");
-    assert_eq!(error.uncertain_version, None);
-    // Writes keep publishing after the reader-side failure.
-    for n in 5..=8 {
-        write(&mut db, n);
-    }
-    for &sequence in &later {
-        assert!(db.core.is_published(BatchVersion {
-            epoch: db.epoch(),
-            sequence,
-        }));
-    }
-    assert!(!db.core.is_published(first));
-    assert!(db.core.ensure_healthy().is_ok());
-    assert_eq!(transient(&db), base + 3 * view);
-    // A clone keeps the shared charge; the last reference releases it once.
-    let clone = cuts[0].clone();
-    drop(cuts.remove(0));
-    assert_eq!(transient(&db), base + 3 * view);
-    drop(clone);
-    assert_eq!(transient(&db), base + 2 * view);
-    drop(cuts);
-    assert_eq!(transient(&db), base);
-    drop(held);
-    db.drain().unwrap();
-    assert!(matches!(db.core.index.call_cut(), IndexReadCut::At(_)));
-    assert_eq!(value(&mut db, 2000), Some(vec![1; 32]));
-    assert_eq!(value(&mut db, 2008), Some(vec![8; 32]));
-    drop(reservations);
-    db.shutdown().unwrap();
-}
-
-#[test]
-fn active_checkpoint_capture_and_sparse_publication_have_separate_budgets() {
-    let fixture = Fixture::new();
-    let mut db = fixture.open();
-    db.write_batch(fixture.operation(2, 50), vec![put(50, 50)])
-        .unwrap();
-    let max_excluded = db.core.config.max_pending_batches - 1;
-    let mut reservations = Vec::new();
-    loop {
-        match db.core.index.reserve_publication_view(max_excluded) {
-            Ok(reservation) => reservations.push(reservation),
-            Err(super::super::native_index::NativeIndexError::Capacity) => break,
-            Err(error) => panic!("unexpected reservation failure: {error}"),
-        }
-    }
-    assert!(reservations.len() >= 3);
-    let before_capture = db.core.index.stats().transient_metadata_bytes;
-    let capture = db
-        .core
-        .index
-        .writer()
-        .prepare_image(IndexReadCut::Latest)
-        .unwrap();
-    assert!(db.core.index.stats().transient_metadata_bytes > before_capture);
-    for _ in 0..3 {
-        drop(reservations.pop().unwrap());
-    }
-
-    let blocked = Arc::clone(&db.core.clients[0].client);
-    let guard = blocked.lock();
-    let later_connection = Arc::clone(&db.core.clients[1].client);
-    let later_guard = later_connection.lock();
-    let first = db
-        .submit(fixture.operation(0, 51), vec![put(51, 51)])
-        .unwrap();
-    let later = db
-        .submit(fixture.operation(1, 52), vec![put(52, 52)])
-        .unwrap();
-    db.submit(fixture.operation(1, 53), vec![put(53, 53)])
-        .unwrap();
-    drop(later_guard);
-    assert_eq!(
-        complete_owner(&db, 1, &[later.sequence, later.sequence + 1]),
-        vec![vec![later.sequence, later.sequence + 1]]
-    );
-    let first_published = db.core.is_published(first);
-    let later_published = db.core.is_published(later);
-    let later_value = value(&mut db, 52);
-    let first_value = value(&mut db, 51);
-    drop(guard);
-    assert!(!first_published);
-    assert!(later_published);
-    assert_eq!(later_value, Some(vec![52; 32]));
-    assert_eq!(first_value, None);
-    drop(reservations);
-    db.drain().unwrap();
-    assert_eq!(value(&mut db, 51), Some(vec![51; 32]));
-    drop(capture);
-    assert!(
-        db.core
-            .index
-            .writer()
-            .cleanup_failed_capture_step(32)
-            .unwrap()
-    );
-    db.shutdown().unwrap();
 }
 
 #[test]
@@ -1081,16 +940,17 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
     let next = db.core.next_sequence();
     let healthy = db.core.ensure_healthy().is_ok();
     drop(guard);
-    // Published batches return their index charge; their slots stay behind
-    // the unresolved prefix, so the bounded window remains fully charged.
+    // Published batches return their slot charge once the unresolved prefix
+    // advances, so the bounded window stays fully charged until then.
     assert_eq!(credits.slots, 4);
-    assert!(credits.index_bytes > 0);
     assert_eq!(prefix, 0);
     assert_eq!(pending.slots, 4);
-    assert!(pending.index_bytes < credits.index_bytes);
     assert_eq!(retained, 4);
     assert_eq!(unpublished, 2);
-    assert_eq!(later_value.unwrap().unwrap().as_ref(), &[3; 32]);
+    // Deviation (M) from native: reads resolve at the publication cut, so the
+    // completed later batch is invisible until the blocked prefix publishes;
+    // its rows appear after `drain` below.
+    assert!(later_value.unwrap().is_none());
     assert_eq!(retry.unwrap(), version);
     assert!(conflicting_retry.is_err());
     assert!(excess.is_err());
@@ -1100,10 +960,7 @@ fn sparse_publication_retains_bounded_window_until_earlier_prefix_publishes() {
     settle(&db);
     assert_eq!(db.core.published_next(), 4);
     let charges = db.core.admission.charges();
-    assert_eq!(
-        (charges.bytes, charges.index_bytes, charges.slots),
-        (0, 0, 0)
-    );
+    assert_eq!((charges.bytes, charges.slots), (0, 0));
     assert_eq!(db.core.retained_slots(), 0);
     assert_eq!(db.core.unresolved_slots(), 0);
     assert_eq!(db.core.pending_dependencies(), 0);
@@ -1169,9 +1026,13 @@ fn conflicting_and_transitive_batches_wait_for_their_whole_predecessors() {
         assert!(!before.0 && !before.1 && !before.2);
         assert!(before.3.unwrap().is_none());
         assert!(before.4.unwrap().is_none());
-        assert_eq!(before.5.unwrap().unwrap().as_ref(), &[10; 32]);
-        assert_eq!(before.6.unwrap().unwrap().as_ref(), &[11; 32]);
+        // Deviation (M) from native: reads resolve at the publication cut, so
+        // the later batch is invisible until the blocked prefix publishes.
+        assert!(before.5.unwrap().is_none());
+        assert!(before.6.unwrap().is_none());
         db.drain().unwrap();
+        assert_eq!(value(&mut db, 10), Some(vec![10; 32]));
+        assert_eq!(value(&mut db, 11), Some(vec![11; 32]));
         assert_eq!(
             value(&mut db, 0),
             Some(vec![if transitive { 2 } else { 4 }; 32])
@@ -1225,8 +1086,14 @@ fn distinct_keys_with_same_native_reduction_cannot_publish_out_of_order() {
     let independent = db.get(KeySpace(0), &other_key);
     drop(held);
     assert!(!second_published);
-    assert_eq!(independent.unwrap().unwrap().as_ref(), &[3; 32]);
+    // Deviation (M) from native: reads resolve at the publication cut, so the
+    // later batch is invisible until the blocked prefix publishes.
+    assert!(independent.unwrap().is_none());
     db.drain().unwrap();
+    assert_eq!(
+        db.get(KeySpace(0), &other_key).unwrap().unwrap().as_ref(),
+        &[3; 32]
+    );
     assert_eq!(
         db.get(KeySpace(0), &second_key).unwrap().unwrap().as_ref(),
         &[2; 32]
@@ -1257,9 +1124,9 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
     assert!(db.drain().is_err());
     assert!(db.core.ensure_healthy().is_err());
     assert_eq!(db.core.published_next(), 2);
-    // UNKNOWN generations never return their slot or index charge.
+    // UNKNOWN generations never return their slot charge.
     let charges = db.core.admission.charges();
-    assert!(charges.slots > 0 && charges.index_bytes > 0);
+    assert!(charges.slots > 0);
     // A verified hot-cache record cannot let an unhealthy authority keep serving.
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
@@ -1274,11 +1141,26 @@ fn lost_append_response_blocks_cached_reads_and_reopen_recovers_uncertain_group(
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8 + 1; 32]));
     }
-    assert_eq!(
-        reopened.submit(operation, vec![put(2, 3)]).unwrap(),
-        version
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. The lost
+    // reply's version belongs to the old epoch; the retry takes a version in
+    // the new one and appends its frame once. A second retry inside this epoch
+    // is the in-epoch dedupe of one id and adds no second frame.
+    let retried = reopened.submit(operation, vec![put(2, 33)]).unwrap();
+    assert!(
+        retried.epoch > version.epoch,
+        "retry after reopen must take a new epoch: {retried:?} vs {version:?}"
     );
-    assert_eq!(reopened.stats().admitted_batches, 0);
+    assert_eq!(
+        reopened.submit(operation, vec![put(2, 33)]).unwrap(),
+        retried,
+        "an in-epoch retry returns the first retry's version"
+    );
+    reopened.drain().unwrap();
+    assert_eq!(reopened.stats().admitted_batches, 1);
+    assert_eq!(reopened.pipeline_stats().append_requests, 1);
+    // The retry carries another value (33), so the read proves it was applied.
+    assert_eq!(value(&mut reopened, 2), Some(vec![33; 32]));
     reopened.shutdown().unwrap();
 }
 
@@ -1349,8 +1231,13 @@ fn drain_refills_a_ready_node_while_the_first_logical_group_is_stalled() {
         2
     );
     assert_eq!(db.core.published_next(), 0);
+    // Deviation (M) from native: native applies each write to the index at
+    // insert time (db.rs:590-611, :655-670) and reads resolve directly
+    // (db.rs:685-711), so it has no asynchronously-published state. The hybrid
+    // resolves reads at the publication cut to keep prefix order, so these
+    // durable batches are invisible until the prefix publishes below.
     for key in 2..6u32 {
-        assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
+        assert_eq!(value(&mut db, key), None);
     }
     let (entered, entering) = mpsc::sync_channel(1);
     db.core.test_hooks.lock().drain_wait_entered = Some(entered);
@@ -1373,10 +1260,7 @@ fn drain_refills_a_ready_node_while_the_first_logical_group_is_stalled() {
     assert_eq!(db.core.published_next(), 6);
     settle(&db);
     let charges = db.core.admission.charges();
-    assert_eq!(
-        (charges.bytes, charges.slots, charges.index_bytes),
-        (0, 0, 0)
-    );
+    assert_eq!((charges.bytes, charges.slots), (0, 0));
     for key in 0..6u32 {
         assert_eq!(value(&mut db, key), Some(vec![key as u8; 32]));
     }
@@ -1404,10 +1288,7 @@ fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     assert_eq!(worker_bytes(&db, 0), 0);
     settle(&db);
     let charges = db.core.admission.charges();
-    assert_eq!(
-        (charges.bytes, charges.slots, charges.index_bytes),
-        (0, 0, 0)
-    );
+    assert_eq!((charges.bytes, charges.slots), (0, 0));
     assert_eq!(db.core.published_next(), 1);
     assert!(db.core.ensure_healthy().is_ok());
     drop(settled);
@@ -1440,7 +1321,7 @@ fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     // owner generation 1 into its failed frame.
     assert_eq!(db.core.clients[1].queue.snapshot(), (2, 2, vec![]));
     let charges = db.core.admission.charges();
-    assert!(charges.slots > 0 && charges.index_bytes > 0);
+    assert!(charges.slots > 0);
     let hits = db.read_cache_stats().hits;
     assert!(db.get(KeySpace(0), &0u32.to_be_bytes()).is_err());
     assert_eq!(db.read_cache_stats().hits, hits);
@@ -1453,18 +1334,30 @@ fn lone_worker_append_keeps_durability_and_unknown_response_recovery_rules() {
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 0), Some(vec![17; 32]));
     assert_eq!(value(&mut reopened, 1), Some(vec![231; 32]));
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. Each retry
+    // takes a version in the new epoch and appends its own frame; draining
+    // between them keeps the two frames in separate groups, so the append
+    // count shows one frame per retry. An in-epoch repeat adds nothing.
+    let retried = reopened.submit(first_operation, vec![put(0, 18)]).unwrap();
+    assert!(retried.epoch > first_version.epoch, "{retried:?}");
+    reopened.drain().unwrap();
+    assert_eq!(reopened.pipeline_stats().append_requests, 1);
     assert_eq!(
-        reopened.submit(first_operation, vec![put(0, 17)]).unwrap(),
-        first_version
+        reopened.submit(first_operation, vec![put(0, 18)]).unwrap(),
+        retried,
+        "an in-epoch retry returns the first retry's version"
     );
-    assert_eq!(
-        reopened
-            .submit(uncertain_operation, vec![put(1, 231)])
-            .unwrap(),
-        uncertain_version
-    );
-    assert_eq!(reopened.stats().admitted_batches, 0);
-    assert_eq!(reopened.pipeline_stats().append_requests, 0);
+    let retried = reopened
+        .submit(uncertain_operation, vec![put(1, 232)])
+        .unwrap();
+    assert!(retried.epoch > uncertain_version.epoch, "{retried:?}");
+    reopened.drain().unwrap();
+    assert_eq!(reopened.stats().admitted_batches, 2);
+    assert_eq!(reopened.pipeline_stats().append_requests, 2);
+    // The retries carry other values (18, 232), so the reads prove they applied.
+    assert_eq!(value(&mut reopened, 0), Some(vec![18; 32]));
+    assert_eq!(value(&mut reopened, 1), Some(vec![232; 32]));
     reopened.shutdown().unwrap();
 }
 
@@ -1486,6 +1379,9 @@ fn submit_many_preserves_order_retries_and_complete_recovery() {
         (last, vec![put(3, 10)]),
     ];
     let versions = db.submit_many(&window).unwrap();
+    // A retry of an admitted but unpublished operation returns its recorded
+    // version and allocates nothing; a duplicate id inside one window shares
+    // one allocation (the tip test at c97de76b expects the same sequences).
     assert_eq!(versions[0], known_version);
     assert_eq!(versions[2], active_version);
     assert_eq!(versions[1], versions[3]);
@@ -1503,10 +1399,37 @@ fn submit_many_preserves_order_retries_and_complete_recovery() {
     }
     db.shutdown().unwrap();
     drop(db);
-    let reopened = fixture.open();
-    assert_eq!(reopened.submit_many(&window).unwrap(), versions);
-    assert_eq!(reopened.stats().admitted_batches, 0);
-    assert_eq!(reopened.pipeline_stats().append_requests, 0);
+    let mut reopened = fixture.open();
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. All four
+    // distinct ids allocate afresh in the new epoch, in window order; the
+    // repeated id inside the window still shares one allocation, so the
+    // admitted count is four, not five.
+    let retry = vec![
+        (known, vec![put(0, 27)]),
+        (first, vec![put(2, 29)]),
+        (active, vec![put(1, 28)]),
+        (first, vec![put(2, 29)]),
+        (last, vec![put(3, 30)]),
+    ];
+    let retried = reopened.submit_many(&retry).unwrap();
+    assert!(
+        retried.iter().all(|v| v.epoch > versions[0].epoch),
+        "{retried:?} vs {versions:?}"
+    );
+    assert_eq!(
+        retried.iter().map(|v| v.sequence).collect::<Vec<_>>(),
+        [0, 1, 2, 1, 3]
+    );
+    assert_eq!(retried[1], retried[3]);
+    reopened.drain().unwrap();
+    assert_eq!(reopened.stats().admitted_batches, 4);
+    assert!(reopened.pipeline_stats().append_requests > 0);
+    // The retried values differ from the first epoch's (7..=10), so only a
+    // new write can show them.
+    for key in 0..4 {
+        assert_eq!(value(&mut reopened, key), Some(vec![key as u8 + 27; 32]));
+    }
     reopened.shutdown().unwrap();
 }
 
@@ -1593,8 +1516,13 @@ fn preparation_budget_and_lost_reply_keep_the_existing_failure_contract() {
     // A client clone keeps the live connection registry (and its lock) alive.
     drop(connection);
     let mut reopened = fixture.open();
-    assert_eq!(reopened.submit_many(&window).unwrap(), versions);
-    assert_eq!(reopened.stats().admitted_batches, 0);
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so both window entries are new writes in a later epoch.
+    let retried = reopened.submit_many(&window).unwrap();
+    for (retried, recorded) in retried.iter().zip(&versions) {
+        assert!(retried.epoch > recorded.epoch);
+    }
+    assert_eq!(reopened.stats().admitted_batches, 2);
     assert_eq!(value(&mut reopened, 0), Some(vec![41; 32]));
     assert_eq!(value(&mut reopened, 1), Some(vec![42; 32]));
     reopened.shutdown().unwrap();
@@ -1699,7 +1627,9 @@ fn paused_caller_does_not_stall_owner_progress_or_admit_invalid_chunk() {
         assert_eq!(version.sequence, u64::from(key));
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 32]));
     }
-    assert_eq!(reopened.stats().admitted_batches, 0);
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so all six retries above were new writes and admitted.
+    assert_eq!(reopened.stats().admitted_batches, 6);
     reopened.shutdown().unwrap();
 }
 
@@ -1785,8 +1715,8 @@ fn same_shard_window_appends_successor_before_prefix_is_durable() {
     );
     assert!((0..4u32).all(|key| {
         db.core
-            .index
-            .get(KeySpace(0), &key.to_be_bytes(), IndexReadCut::Latest)
+            .table
+            .get(KeySpace(0), &key.to_be_bytes(), newest_cut())
             .unwrap()
             .is_none()
     }));
@@ -1987,12 +1917,12 @@ fn large_groups_bypass_small_tail_window_but_respect_admission_cap() {
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8; 33 * 1024]));
         assert_eq!(value(&mut reopened, 100 + key), Some(vec![key as u8; 32]));
-        assert_eq!(
-            reopened
-                .submit(fixture.operation(0, u64::from(key)), mutations(key))
-                .unwrap(),
-            versions[key as usize]
-        );
+        // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is
+        // empty after a restart, so the retry is a new write in a later epoch.
+        let retried = reopened
+            .submit(fixture.operation(0, u64::from(key)), mutations(key))
+            .unwrap();
+        assert!(retried.epoch > versions[key as usize].epoch);
     }
     assert_eq!(value(&mut reopened, 4), None);
     assert_eq!(value(&mut reopened, 104), None);
@@ -2048,8 +1978,11 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
         vec![vec![11, 12, 13, 14]]
     );
     assert_eq!(db.core.published_next(), 0);
+    // Deviation (M) from native: reads resolve at the publication cut, so a
+    // durable batch behind the unresolved prefix is invisible (see
+    // `drain_refills_a_ready_node_while_the_first_logical_group_is_stalled`).
     for key in 0..4u32 {
-        assert_eq!(value(&mut db, 200 + key), Some(vec![key as u8; 32]));
+        assert_eq!(value(&mut db, 200 + key), None);
     }
     for key in 0..11u32 {
         assert_eq!(value(&mut db, key), None);
@@ -2065,16 +1998,18 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
     drop(held);
     entering.recv_timeout(Duration::from_secs(10)).unwrap();
     let visible_prefix = |db: &RemoteDatabase| {
-        let (cut, pin) = db.protected_published_cut().unwrap();
+        let (cut, pin) = db.core.table.pin_checkpoint();
         let visible: Vec<bool> = (0..11u32)
             .map(|key| {
-                let reference = |key: u32| {
-                    db.index_reference(KeySpace(0), &key.to_be_bytes(), cut.clone())
+                let indexed = |key: u32| {
+                    db.core
+                        .table
+                        .get(KeySpace(0), &key.to_be_bytes(), cut)
                         .unwrap()
                         .is_some()
                 };
-                let first = reference(key);
-                assert_eq!(first, reference(100 + key), "batch visible only whole");
+                let first = indexed(key);
+                assert_eq!(first, indexed(100 + key), "batch visible only whole");
                 first
             })
             .collect();
@@ -2145,13 +2080,59 @@ fn busy_owner_coalesces_staged_whole_batches_and_other_owner_progresses() {
                 ],
             )
             .unwrap();
-        assert_eq!(version, versions[key as usize]);
+        // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is
+        // empty after a restart, so the retry is a new write in a later epoch.
+        assert!(version.epoch > versions[key as usize].epoch);
     }
     assert_eq!(value(&mut reopened, 300), Some(vec![10; 32]));
     for key in 0..4u32 {
         assert_eq!(value(&mut reopened, 200 + key), Some(vec![key as u8; 32]));
     }
     reopened.shutdown().unwrap();
+}
+
+/// Read-your-writes on the acknowledged path. `submit` is enqueue-only
+/// (`remote_db.rs:1673-1680`), but `write_batch` returns only after the tier's
+/// acknowledgement and `drain` acknowledges the whole window, so an
+/// acknowledged row must be readable on the same handle with no further
+/// publication step.
+#[test]
+fn acknowledged_writes_are_visible_to_reads() {
+    for synchronous in [false, true] {
+        let fixture = if synchronous {
+            Fixture::new().synchronous()
+        } else {
+            Fixture::new()
+        };
+        let mut db = fixture.open();
+        db.write_batch(fixture.operation(0, 0), vec![put(0, 1)])
+            .unwrap();
+        assert_eq!(
+            value(&mut db, 0),
+            Some(vec![1; 32]),
+            "an acknowledged write is visible (synchronous: {synchronous})"
+        );
+        // A second acknowledged write joins the first: the publication prefix
+        // has advanced over both, and both stay readable.
+        db.write_batch(fixture.operation(1, 1), vec![put(1, 2)])
+            .unwrap();
+        for (key, byte) in [(0u32, 1u8), (1, 2)] {
+            assert_eq!(
+                value(&mut db, key),
+                Some(vec![byte; 32]),
+                "acknowledged row {key} is visible (synchronous: {synchronous})"
+            );
+        }
+        // `drain` acknowledges an enqueued window.
+        db.submit(fixture.operation(2, 2), vec![put(2, 3)]).unwrap();
+        db.drain().unwrap();
+        assert_eq!(
+            value(&mut db, 2),
+            Some(vec![3; 32]),
+            "a drained write is visible (synchronous: {synchronous})"
+        );
+        db.shutdown().unwrap();
+    }
 }
 
 #[test]

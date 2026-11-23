@@ -6,6 +6,11 @@
 //! process conflict exactly like two processes. They are separate from, and
 //! always taken before, the target's native `DbLock`.
 //!
+//! A process that forks while it holds a guard shares the lock with the child
+//! until the child calls `exec` (`O_CLOEXEC` closes the descriptor only
+//! there), so a concurrent opener of the same path can see a conflict in that
+//! window.
+//!
 //! - Open holds the guard through manifest/open setup only. A serving parent
 //!   therefore never blocks a nested child's open, while a child's open in
 //!   progress (shared on the parent) excludes the parent's drop (exclusive

@@ -1147,20 +1147,19 @@ impl StorageNode {
         events.log().finish().map_err(TcpError::component)
     }
 
-    /// Test-only: revoke one file's live binding (as an eviction or an
-    /// earlier retirement attempt would), emitting no event.
+    /// Test-only: make the retirement revoke step report one victim file as
+    /// not revoked, so its R1 file carries no `target_io_drained` /
+    /// `target_removed` (the victim without a binding case). The revoke itself
+    /// still runs. Returns whether the file had a live binding.
     #[cfg(test)]
-    pub(crate) fn revoke_file_binding_for_test(
+    pub(crate) fn skip_retirement_revoke_report_for_test(
         &self,
         generation: u64,
-        start: u64,
-    ) -> Result<usize, TcpError> {
-        NodeInventory::revoke_file_binding_for_test(
-            &self.inventory,
-            &self.control_context.lifecycle,
-            generation,
-            start,
-        )
+        file: u64,
+    ) -> bool {
+        self.inventory
+            .lock()
+            .skip_retirement_revoke_report_for_test(generation, file)
     }
 
     /// Test-only: stop the file preparers after their current step (see
@@ -1242,23 +1241,6 @@ impl StorageNode {
             .active(epoch)
             .map_err(TcpError::component)?;
         Ok(log.pause_next_persist())
-    }
-    #[cfg(test)]
-    pub(crate) fn pause_inventory(
-        &self,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
-    ) {
-        let inventory = self.inventory.clone();
-        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
-        let (release, resumed) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _guard = inventory.lock();
-            let _ = entered.send(());
-            let _ = resumed.recv();
-        });
-        (waiting, release)
     }
     #[cfg(test)]
     pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {

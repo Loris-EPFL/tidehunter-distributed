@@ -170,10 +170,15 @@ fn retry_after_a_second_failure_is_the_typed_evicted_error() {
         error.message()
     );
     // Both causes stay in the message; the kind is fixed so callers do not have
-    // to match prose.
-    assert!(error.message().contains("not in this WAL log"));
+    // to match prose. The first cause is the one `retired()` builds: the retry
+    // classifies by kind (`member_read_is_retired`), so the wording is the
+    // fixture's own, not the owner's.
+    assert!(error.message().contains("member file is gone"));
     assert!(error.message().contains("generation is not served"));
-    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    // `Other`, not `NotFound`: `NotFound` is the value path's retry marker
+    // (`member_read_is_retired`), and a typed eviction is terminal
+    // (`LocalDbError::evicted_during_read`).
+    assert_eq!(error.kind(), io::ErrorKind::Other);
 }
 
 #[test]

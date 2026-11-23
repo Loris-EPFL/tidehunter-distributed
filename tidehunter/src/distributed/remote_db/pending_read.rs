@@ -712,6 +712,11 @@ type ReactorPause = Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>;
 
 type UnreleasedLiveGrant = (Arc<Mutex<Client>>, u64, Vec<[u8; 16]>);
 
+/// Test pause at the admission wait: reports the observed credit count and
+/// generation, then waits for the resume signal.
+#[cfg(test)]
+type AdmissionWaitPause = (mpsc::SyncSender<(usize, u64)>, mpsc::Receiver<()>);
+
 struct State {
     failed: AtomicBool,
     first_failure: Arc<std::sync::OnceLock<super::FirstFailure>>,
@@ -725,6 +730,10 @@ struct State {
     admission_paused: AtomicBool,
     admission_generation: AtomicU64,
     admission_changed: parking_lot::Condvar,
+    /// Test-only one-shot pause at the admission wait, reporting the credit
+    /// count and generation the waiter observed under the retained lock.
+    #[cfg(test)]
+    admission_wait_pause: Mutex<Option<AdmissionWaitPause>>,
     #[cfg(test)]
     wake_pending: Box<[AtomicBool]>,
     // Fixed flight signals, weak slots and exact-reference index are reserved from pending bytes.
@@ -1556,6 +1565,8 @@ impl ReadService {
             admission_generation: AtomicU64::new(0),
             admission_changed: parking_lot::Condvar::new(),
             #[cfg(test)]
+            admission_wait_pause: Mutex::new(None),
+            #[cfg(test)]
             wake_pending: (0..config.endpoints.len())
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
@@ -1797,6 +1808,23 @@ impl ReadService {
     pub(super) fn lane_client(&self, node: usize, lane: usize) -> Arc<Mutex<Client>> {
         self.lanes.read()[node][lane].client.clone()
     }
+    /// Live read submissions so far, inline and lane alike.
+    #[cfg(test)]
+    pub(super) fn live_read_submissions_for_test(&self) -> u64 {
+        self.state.live_read_submissions.load(Ordering::Relaxed)
+    }
+    /// Park the next admission wait before it blocks. Returns (entered,
+    /// resume): the waiter reports the credit count and generation it observed
+    /// under the retained lock, then blocks until `resume` is sent. One shot.
+    #[cfg(test)]
+    pub(super) fn pause_admission_wait(
+        &self,
+    ) -> (mpsc::Receiver<(usize, u64)>, mpsc::SyncSender<()>) {
+        let (entered, parked) = mpsc::sync_channel(1);
+        let (resume, released) = mpsc::sync_channel(1);
+        *self.state.admission_wait_pause.lock() = Some((entered, released));
+        (parked, resume)
+    }
     pub(super) fn profiles(
         &self,
         enabled: bool,
@@ -1891,6 +1919,14 @@ impl ReadService {
             }
             if self.admission_generation() != observed {
                 return Ok(());
+            }
+            // One-shot test pause: the waiter has checked the state under the
+            // retained lock and is about to block, so the caller can observe
+            // the parked wait instead of sampling a timing bound.
+            #[cfg(test)]
+            if let Some((entered, resume)) = self.state.admission_wait_pause.lock().take() {
+                let _ = entered.send((retained.0, self.admission_generation()));
+                let _ = resume.recv();
             }
             match deadline {
                 Some(deadline) => {
@@ -2222,3 +2258,6 @@ impl Drop for ReadService {
 }
 
 mod concurrent;
+
+#[cfg(test)]
+mod lane_tests;

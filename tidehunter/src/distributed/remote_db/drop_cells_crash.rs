@@ -7,12 +7,14 @@
 //! oracle checks it unchanged. The crash cut is the first named boundary
 //! after a quiescent acknowledged prefix (see `write_model`). Recovery
 //! replays the WAL, retries every acknowledged identity (the range through
-//! `drop_cells`) and must keep the original receipts. This is a process-crash
+//! `drop_cells`); each retry is a new write in the new epoch that applies
+//! exactly its edits. This is a process-crash
 //! test with owner page cache intact, like the rest of the write model.
 
 use super::*;
 use crate::cell::CellId;
 use crate::distributed::test_bounds::CHILD_RUN_CAP;
+use std::fs;
 
 const DROP_CHILD: &str =
     "distributed::remote_db::model_check_tests::drop_cells_crash::drop_cells_crash_child";
@@ -93,7 +95,6 @@ fn fixture(directory: &Path, case: &DropCase) -> Fixture {
         2,
         |config| {
             config.storage.batch_limits.max_operations = 57;
-            config.max_index_bytes = 16 * 1024 * 1024;
             config.read_cache_bytes = 64 * 1024;
             leased::configure(config, case.leased);
         },
@@ -167,7 +168,7 @@ fn write_stage(directory: &Path, case: &DropCase) {
     for id in 0..DROP {
         call(&db, &recorder, case, &operations, &plan, id);
     }
-    db.flush_index().unwrap();
+    db.force_rebuild_index().unwrap();
     observe(&db, &recorder);
     db.flush_durable().unwrap();
     leased::quiesce(&clients);
@@ -178,13 +179,13 @@ fn write_stage(directory: &Path, case: &DropCase) {
             call(&db, &recorder, case, &operations, &plan, DROP + 1);
             observe(&db, &recorder);
             db.flush_durable().unwrap();
-            db.flush_index().unwrap();
+            db.force_rebuild_index().unwrap();
             call(&db, &recorder, case, &operations, &plan, DROP + 2);
             call(&db, &recorder, case, &operations, &plan, DROP + 3);
         }
         DropOrder::CheckpointThenDrop => {
             call(&db, &recorder, case, &operations, &plan, DROP + 2);
-            db.flush_index().unwrap();
+            db.force_rebuild_index().unwrap();
             call(&db, &recorder, case, &operations, &plan, DROP);
             call(&db, &recorder, case, &operations, &plan, DROP + 1);
             observe(&db, &recorder);
@@ -195,7 +196,7 @@ fn write_stage(directory: &Path, case: &DropCase) {
         call(&db, &recorder, case, &operations, &plan, id);
     }
     db.flush_durable().unwrap();
-    db.flush_index().unwrap();
+    db.force_rebuild_index().unwrap();
     observe(&db, &recorder);
     std::process::exit(0);
 }
@@ -232,36 +233,60 @@ fn recover_stage(directory: &Path) {
         serde_json::to_vec(&discard).unwrap(),
     )
     .unwrap();
+    let epoch = db.epoch();
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
     let values = snapshot(&db);
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. Each
+    // retried identity (the range through `drop_cells`) takes a version in the
+    // new epoch, never its original receipt, and re-applies its edits; the
+    // expected state is the recovered state with the retried edits applied in
+    // retry order. A second retry of the same identity inside this epoch
+    // returns the first retry's receipt and applies nothing.
     let calls = history(directory, values.clone());
     let mut retried = HashSet::new();
+    let mut expected = values.clone();
     for call in &calls {
         if let Action::Write { operation, edits } = &call.action
             && let Some(receipt) = &call.receipt
             && !discard.is_some_and(|discard| discard.covers(receipt))
             && retried.insert(*operation)
         {
-            let retry = if *operation == DROP {
-                drop_range(&db, restart.operations[*operation])
-            } else {
-                db.write_batch(
-                    restart.operations[*operation],
-                    mutations(edits, case.value_bytes()),
-                )
-                .unwrap()
+            let retry_once = || {
+                if *operation == DROP {
+                    drop_range(&db, restart.operations[*operation])
+                } else {
+                    db.write_batch(
+                        restart.operations[*operation],
+                        mutations(edits, case.value_bytes()),
+                    )
+                    .unwrap()
+                }
             };
+            let new_receipt = retry_once();
             assert_eq!(
-                &format!("{retry:?}"),
+                new_receipt.epoch, epoch,
+                "a retry after recovery is a new write in the new epoch operation={operation}"
+            );
+            assert_ne!(
+                &format!("{new_receipt:?}"),
                 receipt,
-                "retry changed receipt after recovery operation={operation}"
+                "retry returned the pre-restart receipt operation={operation}"
+            );
+            for edit in edits {
+                expected[edit.key] = edit.value;
+            }
+            assert_eq!(
+                retry_once(),
+                new_receipt,
+                "in-epoch retry changed receipt operation={operation}"
             );
         }
     }
     assert_eq!(
         snapshot(&db),
-        values,
-        "recovered retry changed visible state"
+        expected,
+        "a retry after recovery must apply exactly its edits"
     );
     fs::write(
         directory.join("recovered.json"),
@@ -460,7 +485,6 @@ fn drop_cells_leased_crash_cuts() {
             (DropOrder::DropThenCheckpoint, "leased_frame_completed"),
             (DropOrder::DropThenCheckpoint, "leased_adoption_completed"),
             (DropOrder::DropThenCheckpoint, "publication_after"),
-            (DropOrder::DropThenCheckpoint, "checkpoint_root_after"),
             (DropOrder::CheckpointThenDrop, "publication_before"),
         ] {
             run(&leased_case(profile, order, boundary));

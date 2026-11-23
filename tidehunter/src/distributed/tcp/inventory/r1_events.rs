@@ -68,23 +68,6 @@ impl NodeInventory {
         guard.r1_events = Some(events);
         Ok(())
     }
-
-    /// Test-only: revoke the live binding of one file through the same path
-    /// an idle-export eviction or an earlier retirement attempt uses, without
-    /// any event. Returns how many bindings it revoked.
-    #[cfg(test)]
-    pub(in crate::distributed::tcp) fn revoke_file_binding_for_test(
-        inventory: &Mutex<NodeInventory>,
-        lifecycle: &Mutex<LifecycleSlot>,
-        generation: u64,
-        start: u64,
-    ) -> Result<usize, TcpError> {
-        let mut slot = lifecycle.lock();
-        let mut guard = inventory.lock();
-        let target = live_target(&guard, &mut slot)?
-            .ok_or_else(|| TcpError::new("no live target configured"))?;
-        Ok(Self::revoke_live_files(&mut guard, target, generation, &[start])?.len())
-    }
 }
 
 impl OwnerR1Events {

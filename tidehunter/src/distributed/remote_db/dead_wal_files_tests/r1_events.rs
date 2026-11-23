@@ -102,8 +102,8 @@ fn r1_events_order_a_retirement_across_a_crash_before_unlink() {
     let case = fixture.root.path().join("case");
     let config = events_config(&case);
     let db = fixture.open();
-    let generation = db.epoch();
-    db.core.r1_events.enable(&db.core, &config).unwrap();
+    let generation = db.epoch;
+    db.enable_r1_events(&config).unwrap();
     fixture.node().enable_r1_events(&config).unwrap();
     churn(&db, 0, INITIAL_WRITES);
     let mut written = INITIAL_WRITES;
@@ -130,7 +130,7 @@ fn r1_events_order_a_retirement_across_a_crash_before_unlink() {
     // Both pre-crash handles are dropped without `finish`.
     let db = fixture.crash(db);
     fixture.node().enable_r1_events(&config).unwrap();
-    assert_eq!(logical_state(&db, fixture.node()), model(written));
+    assert_eq!(logical_state(&db), model(written));
     assert!(!fixture.wal_files(generation).contains(&0));
     fixture.node().finish_r1_events().unwrap();
     db.shutdown().unwrap();
@@ -203,7 +203,7 @@ fn r1_events_order_a_retirement_across_a_crash_before_unlink() {
         follows(drained, claim, &coordinator.header);
         assert_eq!(
             drained["payload"]["basis"],
-            "no_reference_index_pins_to_terminal_cqe"
+            "owner_revoke_and_drain_before_unlink"
         );
         assert_eq!(claim["attempt_id"], drained["attempt_id"]);
         assert_eq!(claim["inode"], seal["inode"]);
@@ -271,45 +271,48 @@ fn r1_events_order_a_retirement_across_a_crash_before_unlink() {
     );
 }
 
-/// A victim whose live binding is already gone (evicted, or revoked by an
-/// earlier attempt) gets no `target_io_drained`/`target_removed`: the owner
-/// certifies only the bindings its retirement call actually revoked. The
-/// other steps of the file still appear, in order and linked.
+/// A victim whose retirement revoke step finds nothing to revoke gets no
+/// `target_io_drained`/`target_removed`: the owner certifies only the bindings
+/// its retirement call actually revoked. The other steps of the file still
+/// appear, in order and linked. The test hook makes the revoke report one
+/// victim as not revoked; the revoke itself runs, so the log never holds a
+/// live file without a binding (the invariant `OpenLiveExports` relies on).
 #[test]
 fn r1_events_skip_target_steps_for_a_victim_without_a_binding() {
     let fixture = Fixture::new(DurabilityTier::Native);
     let case = fixture.root.path().join("case");
     let config = events_config(&case);
     let db = fixture.open();
-    let generation = db.epoch();
-    db.core.r1_events.enable(&db.core, &config).unwrap();
+    let generation = db.epoch;
+    db.enable_r1_events(&config).unwrap();
     fixture.node().enable_r1_events(&config).unwrap();
     churn(&db, 0, INITIAL_WRITES);
     let mut written = INITIAL_WRITES;
-    let mut revoked = 0;
+    let mut skipped = 0;
     for _ in 0..ROUNDS {
         churn(&db, written, ROUND_WRITES);
         written += ROUND_WRITES;
-        // Drop file 0's binding just before each pass, so the pass that
-        // retires it finds no binding to revoke.
+        // Make the pass that retires file 0 report its revoke step as
+        // nothing: the victim-without-a-binding case, with the binding kept.
         if fixture.wal_files(generation).contains(&0) {
-            revoked += fixture
-                .node()
-                .revoke_file_binding_for_test(generation, 0)
-                .unwrap();
+            skipped += usize::from(
+                fixture
+                    .node()
+                    .skip_retirement_revoke_report_for_test(generation, 0),
+            );
         }
         retire(&db).unwrap();
         if !fixture.wal_files(generation).contains(&0) {
             break;
         }
     }
-    assert!(revoked >= 1, "file 0 never had a live binding to drop");
+    assert!(skipped >= 1, "file 0 never had a live binding to keep");
     assert!(
         !fixture.wal_files(generation).contains(&0),
         "file 0 not retired"
     );
     fixture.node().finish_r1_events().unwrap();
-    db.core.r1_events.finish().unwrap();
+    db.finish_r1_events().unwrap();
     db.shutdown().unwrap();
 
     let owner_files = stream_files(&case, "owner_O");

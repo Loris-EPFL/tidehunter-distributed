@@ -29,7 +29,10 @@
 //!    entry below its own stream's target is copied to the serving generation
 //!    at the head, then re-pointed by compare-and-set on its exact expected
 //!    position (never `insert`: equal order would be dropped, I4b). A filtered
-//!    keyspace's non-kept entry below the target is dropped. A copy keeps the
+//!    keyspace with no kept record below the terminal drops its non-kept
+//!    entries below the TERMINAL unread (native's `!keep_seen` branch); with a
+//!    kept record it drops them below the target only, so entries from the
+//!    target to the terminal stay until a later pass. A copy keeps the
 //!    logical version and operation index of the position it re-points and
 //!    gets a new address and payload CRC, so the winner never changes by
 //!    version.
@@ -272,20 +275,29 @@ impl ConcurrentRemoteDatabase {
         let (cut, streams) = self.freeze_relocation_scan()?;
         let file = core.config.storage.wal_file_bytes;
         let pct = core.config.index.relocation_max_reclaim_pct;
-        let empty = |streams: Vec<StreamReport>| RelocationReport {
-            gate: RelocationGate::NoWork,
-            streams,
-            callbacks: Vec::new(),
-            copied_survivors: 0,
-            rejected_survivors: 0,
-            scan_cut: BatchVersion::NONE,
-            stored_target: None,
-            stored_forced: false,
-            promotion_cut: None,
-            deferred: false,
-        };
+        // Native reports the callbacks its filters produced even when the
+        // pass has no whole file before a target and reclaims nothing
+        // (`relocation/mod.rs`: the observed callbacks are pushed before the
+        // `target_position < wal_file_size + min_wal_position` early return
+        // leaves the gate at `NoWork`). The scan is paid for either way, so a
+        // `NoWork` report carries it too.
+        let empty =
+            |streams: Vec<StreamReport>, callbacks: Vec<CallbackRecord>, scan_cut: BatchVersion| {
+                RelocationReport {
+                    gate: RelocationGate::NoWork,
+                    streams,
+                    callbacks,
+                    copied_survivors: 0,
+                    rejected_survivors: 0,
+                    scan_cut,
+                    stored_target: None,
+                    stored_forced: false,
+                    promotion_cut: None,
+                    deferred: false,
+                }
+            };
         let Some(q) = cut else {
-            return Ok(empty(Vec::new()));
+            return Ok(empty(Vec::new(), Vec::new(), BatchVersion::NONE));
         };
         let mut cursors: Vec<Cursor> = streams
             .into_iter()
@@ -428,10 +440,44 @@ impl ConcurrentRemoteDatabase {
         });
         if targets.is_empty() {
             // Native: the filters were called, nothing else happens.
-            return Ok(empty(reports));
+            return Ok(empty(reports, callbacks, q));
         }
+        // Native's unread-drop bound: a filtered keyspace with no kept record
+        // below the terminal drops its entries below the TERMINAL
+        // (`relocation/mod.rs`: "drop its index entries below the terminal
+        // unread", `LastProcessed::new(terminal_position)`), not below the
+        // rounded target. Entries between the target and the terminal stay on
+        // the kept path only, where their files are not reclaimed either.
+        //
+        // Safety of the bound: `relocation_apply` compares an entry with the
+        // terminal of its OWN `(partition, generation)` stream only, never
+        // with another stream's terminal and never with a global offset. Each
+        // terminal is at or below the durable end the scan read, and the scan
+        // cut `Q` was frozen under `last_processed` (paper 4.4: relocation
+        // reclaims processed bytes). A write admitted after the scan gets a
+        // position above `Q`, so it lies above its stream's terminal and is
+        // never dropped by this pass.
+        // Only the streams that qualified above can drop: a stream with no
+        // whole file before its target reclaims nothing, and native's early
+        // return leaves its entries alone (`relocation/mod.rs`, the
+        // `target_position < wal_file_size + min_wal_position` return).
+        let targeted: BTreeSet<(u32, u64)> = targets
+            .iter()
+            .map(|&(partition, generation, _)| (partition, generation))
+            .collect();
+        let drop_targets: Vec<(u32, u64, u64)> = reports
+            .iter()
+            .filter(|stream| targeted.contains(&(stream.partition, stream.fencing_generation)))
+            .map(|stream| {
+                (
+                    stream.partition,
+                    stream.fencing_generation,
+                    stream.terminal_position,
+                )
+            })
+            .collect();
         let (copied, rejected, blocked) =
-            self.relocate_cells(q, &targets, &kept, &kept_seen, cancel)?;
+            self.relocate_cells(q, &targets, &drop_targets, &kept, &kept_seen, cancel)?;
         // A survivor this pass could not verify or copy keeps its stream's
         // start where it was: advancing it would let retirement reclaim bytes
         // that still hold a live value. The copy of that key is not applied.
@@ -506,6 +552,14 @@ impl ConcurrentRemoteDatabase {
         // Starts rise monotonically; a crash before this repeats the pass and
         // never retires a file the start does not cover.
         core.adopt_callback_starts(&callback_starts)?;
+        // Test hook: the crash boundary after the durable capture (the region
+        // store above and the adopted starts) and before any pruning. The
+        // pass fails with every side effect up to it in place, the way a
+        // process crash there leaves the files.
+        #[cfg(test)]
+        if std::mem::take(&mut core.test_hooks.lock().relocation_prune_interruption) {
+            return Err(LocalDbError::new("injected relocation prune interruption"));
+        }
         // Retirement under the advanced watermark.
         {
             let _retirement = core.retirement.lock();
@@ -526,7 +580,8 @@ impl ConcurrentRemoteDatabase {
     }
 
     /// Copy and re-point every `Keep` entry below its own stream's target,
-    /// then drop every non-kept entry below the target of a filtered keyspace.
+    /// then drop every non-kept entry below the drop bound of a filtered
+    /// keyspace (the terminal when nothing was kept, the target otherwise).
     /// No exclusive gate and no write barrier: entries at or above their
     /// target are untouched, and a concurrent write above `Q` keeps its
     /// version because a re-point never changes a version.
@@ -538,6 +593,7 @@ impl ConcurrentRemoteDatabase {
         &self,
         q: BatchVersion,
         targets: &[(u32, u64, u64)],
+        drop_targets: &[(u32, u64, u64)],
         kept: &HashSet<KeptKey>,
         kept_seen: &[bool],
         cancel: &AtomicBool,
@@ -556,7 +612,8 @@ impl ConcurrentRemoteDatabase {
             }
             let filtered = descriptor.relocation_filter().is_some();
             // Every record of this keyspace below the terminal scanned as
-            // `Remove`: drop its entries below the target unread.
+            // `Remove`: drop its entries below the terminal unread, as native
+            // does.
             let drop_all = filtered && !kept_seen[keyspace.as_usize()];
             let mut cell = descriptor.first_cell();
             loop {
@@ -571,7 +628,7 @@ impl ConcurrentRemoteDatabase {
                         keyspace,
                         &cell,
                         None,
-                        &live_targets,
+                        drop_targets,
                         true,
                     )?;
                 } else {
@@ -702,7 +759,7 @@ impl ConcurrentRemoteDatabase {
 
     /// Write one chunk of copies to the serving generation, then re-point the
     /// expected positions. `last` is set for the cell's final chunk, which also
-    /// drops the non-kept entries below the target of a filtered keyspace.
+    /// drops the non-kept entries below the drop bound of a filtered keyspace.
     /// The copy is written before the compare-and-set, so a crash leaves either
     /// the old position (copy unreferenced) or the new one.
     #[allow(

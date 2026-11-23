@@ -318,6 +318,11 @@ pub struct NodeInventory {
             bool,
         ),
     >,
+    /// Test-only `(epoch, start)` victims whose retirement revoke step reports
+    /// nothing revoked, as if their binding were already gone. The revoke
+    /// itself runs: a live file without a binding breaks `OpenLiveExports`.
+    #[cfg(test)]
+    retirement_revoke_report_skips: Vec<(u64, u64)>,
     // Least recently released first; only unpinned readonly bindings enter.
     idle_history_exports: std::collections::VecDeque<(u64, u64)>,
     pub(super) live_pins: BTreeMap<
@@ -659,6 +664,8 @@ impl NodeInventory {
             retired_prewrite_files: 0,
             inline_exports: LiveInlineExportStats::default(),
             live_bindings: BTreeMap::new(),
+            #[cfg(test)]
+            retirement_revoke_report_skips: Vec::new(),
             idle_history_exports: std::collections::VecDeque::new(),
             live_pins: BTreeMap::new(),
             live_export_pins: BTreeMap::new(),
@@ -1159,42 +1166,6 @@ impl NodeInventory {
         }
         result
     }
-    /// Revoke the live bindings of `files` in `epoch`. Returns `(start,
-    /// device, inode)` of every binding actually revoked; a file without a
-    /// binding (never exported, evicted, or revoked by an earlier attempt) is
-    /// absent from the result.
-    fn revoke_live_files<H: InventoryAccess>(
-        inventory: &mut H,
-        target: &mut LiveTarget,
-        epoch: u64,
-        files: &[u64],
-    ) -> Result<Vec<(u64, u64, u64)>, TcpError> {
-        let bytes = inventory.config.partition.wal_file_bytes;
-        let retired = |(binding_epoch, file): &(u64, u64)| {
-            *binding_epoch == epoch && files.contains(&(file * bytes))
-        };
-        let keys: Vec<_> = inventory
-            .live_bindings
-            .keys()
-            .copied()
-            .filter(&retired)
-            .collect();
-        let claimed: Vec<_> = keys
-            .iter()
-            .filter_map(|key| inventory.live_bindings.remove_entry(key))
-            .collect();
-        let result = inventory.released(|| revoke_bindings(target, claimed.iter().map(|(_, b)| b)));
-        if let Err(error) = result {
-            inventory.live_bindings.extend(claimed);
-            return Err(error);
-        }
-        inventory.idle_history_exports.retain(|key| !retired(key));
-        Ok(claimed
-            .iter()
-            .map(|((_, file), (segment, _, _))| (file * bytes, segment.device, segment.inode))
-            .collect())
-    }
-
     pub(super) fn acquire_live_export_pin(
         &mut self,
         epoch: u64,

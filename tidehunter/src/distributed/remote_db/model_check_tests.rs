@@ -15,6 +15,7 @@ use crate::failpoints::write_model;
 use crate::key_shape::KeyType;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::Barrier;
@@ -283,28 +284,25 @@ fn workload(case: &Case) -> Vec<Vec<Edit>> {
 }
 
 /// Capture one protected cut, then compare all point reads AND the entire index
-/// page to it. Independent scalar latest reads cannot prove batch atomicity.
+/// walk to it. Independent scalar latest reads cannot prove batch atomicity.
 fn snapshot(db: &ConcurrentRemoteDatabase) -> Vec<Option<u64>> {
-    let (cut, _pin) = db.protected_published_cut().unwrap();
-    let page = db
-        .index_page(KeySpace(0), None, false, cut.clone())
-        .unwrap();
+    let table = db.hybrid_table();
+    let (cut, _pin) = table.pin_checkpoint();
+    let page: Vec<_> = pipeline_tests::index_entries(table, KeySpace(0), cut)
+        .into_iter()
+        .filter(|(_, position)| position.is_valid())
+        .collect();
     let mut values = Vec::with_capacity(KEYS);
     for key in 0..KEYS {
         let bytes = key_bytes(key);
-        let reference = db
-            .index_reference(KeySpace(0), &bytes, cut.clone())
-            .unwrap();
-        let value = {
-            let pending = db.submit_get_cut(KeySpace(0), &bytes, cut.clone()).unwrap();
-            db.finish_ready_get(pending.wait()).unwrap()
-        };
-        assert_eq!(reference.is_some(), value.is_some(), "index/read key={key}");
+        let indexed = table.get(KeySpace(0), &bytes, cut).unwrap();
+        let value = pipeline_tests::read_at_cut(db, KeySpace(0), &bytes, cut).unwrap();
+        assert_eq!(indexed.is_some(), value.is_some(), "index/read key={key}");
         assert_eq!(
             page.iter()
-                .filter(|(indexed, _)| indexed.as_ref() == bytes)
+                .filter(|(entry, _)| entry.as_ref() == bytes)
                 .count(),
-            usize::from(reference.is_some()),
+            usize::from(indexed.is_some()),
             "index page key={key}"
         );
         values.push(value.map(|value| {
@@ -355,7 +353,6 @@ fn write_child(directory: &Path, case: &Case) {
         2,
         |config| {
             config.storage.batch_limits.max_operations = 57;
-            config.max_index_bytes = 16 * 1024 * 1024;
             config.read_cache_bytes = 0;
             leased::configure(config, case.leased);
         },
@@ -412,7 +409,7 @@ fn write_child(directory: &Path, case: &Case) {
     let db = ConcurrentRemoteDatabase::new(original).unwrap();
     let recorder = Recorder::open(&directory.join("history.jsonl"));
     write_call(&db, &recorder, case, &operations, &plan, baseline);
-    db.flush_index().unwrap();
+    db.force_rebuild_index().unwrap();
     write_model::arm(
         &directory.join("boundaries.txt"),
         case.boundary.clone(),
@@ -490,7 +487,7 @@ fn write_child(directory: &Path, case: &Case) {
         }
     }
     db.flush_durable().unwrap();
-    db.flush_index().unwrap();
+    db.force_rebuild_index().unwrap();
     observe(&db, &recorder);
     leased::verify_counts(case.leased, &live_metrics.unwrap(), directory);
     std::process::exit(0);
@@ -545,39 +542,63 @@ fn recover_child(directory: &Path) {
         serde_json::to_vec(&discard).unwrap(),
     )
     .unwrap();
+    let epoch = db.epoch();
     let db = ConcurrentRemoteDatabase::new(db).unwrap();
     let values = snapshot(&db);
-    // Retry every externally acknowledged identity after a real owner restart.
-    // Such retries must return their original receipt without overwriting newer
-    // values. Pending identities are deliberately not retried before the oracle.
-    // Neither are acknowledged identities the durable cut discarded: recovery
-    // removed them, so a retry would be a new write (the parent checks that the
-    // cut allowed each discard).
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. Retry every
+    // externally acknowledged identity after a real owner restart: each retry
+    // takes a version in the new epoch (never the original receipt) and
+    // re-applies its edits, so the expected state is the recovered state with
+    // the retried edits applied in retry order. A second retry of the same
+    // identity inside this epoch returns the first retry's receipt and applies
+    // nothing. Pending identities are deliberately not retried before the
+    // oracle. Neither are acknowledged identities the durable cut discarded:
+    // recovery removed them, so a retry would be a new write (the parent
+    // checks that the cut allowed each discard).
     let calls = history(directory, values.clone());
     let mut retried = HashSet::new();
+    let mut expected = values.clone();
     for call in &calls {
         if let Action::Write { operation, edits } = &call.action
             && let Some(receipt) = &call.receipt
             && !discard.is_some_and(|discard| discard.covers(receipt))
             && retried.insert(*operation)
         {
-            let receipt = db
+            let new_receipt = db
                 .write_batch(
                     restart.operations[*operation],
                     mutations(edits, case.value_bytes()),
                 )
                 .unwrap();
             assert_eq!(
-                &format!("{receipt:?}"),
-                call.receipt.as_ref().unwrap(),
-                "retry changed receipt after recovery operation={operation}"
+                new_receipt.epoch, epoch,
+                "a retry after recovery is a new write in the new epoch operation={operation}"
+            );
+            assert_ne!(
+                &format!("{new_receipt:?}"),
+                receipt,
+                "retry returned the pre-restart receipt operation={operation}"
+            );
+            for edit in edits {
+                expected[edit.key] = edit.value;
+            }
+            let again = db
+                .write_batch(
+                    restart.operations[*operation],
+                    mutations(edits, case.value_bytes()),
+                )
+                .unwrap();
+            assert_eq!(
+                again, new_receipt,
+                "in-epoch retry changed receipt operation={operation}"
             );
         }
     }
     assert_eq!(
         snapshot(&db),
-        values,
-        "recovered retry changed visible state"
+        expected,
+        "a retry after recovery must apply exactly its edits"
     );
     fs::write(
         directory.join("recovered.json"),

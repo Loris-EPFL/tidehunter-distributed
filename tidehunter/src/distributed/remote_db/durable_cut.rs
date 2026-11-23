@@ -786,6 +786,13 @@ impl DurableCut {
     /// `renudge` (a failed poll re-arms itself, but a poll that raced the first
     /// request could have consumed it before the copy was receipted).
     ///
+    /// The persisted cut is stored, and this wait woken, before the actor
+    /// advances the table's durable cut (`CutSet::set_durable`). The table's
+    /// durable cut can therefore lag the return of this call; the re-point
+    /// safety rests on the persisted record, which this wait observes. Tests
+    /// that need the table's cut wait for the persist event, which the actor
+    /// sends after the advance.
+    ///
     /// # Errors
     /// `timeout` elapsed first. Nothing is rolled back; the caller skips its
     /// re-points and the next pass retries.

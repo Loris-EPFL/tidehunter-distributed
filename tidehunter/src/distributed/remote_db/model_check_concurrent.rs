@@ -56,7 +56,12 @@ fn write_model_concurrent_bounded() {
         (1, false, 4, ""),
         (16, true, 0, ""),
         (2, true, 4, "publication_before"),
-        (4, false, 0, "checkpoint_root_after"),
+        // The Exact-era checkpoint root boundary no longer exists: the hybrid
+        // snapshot emits no model boundary. Snapshot-install crash coverage
+        // lives in `hybrid/snapshot.rs` (`SnapshotBoundary::{AfterFlush,
+        // AfterIndexSync, AfterDurableTarget, AfterDrain}`) and its tests in
+        // `hybrid/snapshot_tests.rs`; this case keeps a write-path cut.
+        (4, false, 0, "publication_after"),
     ] {
         run_case(&Case {
             boundary: boundary.into(),
@@ -148,7 +153,6 @@ fn fixture() -> Fixture {
         2,
         |config| {
             config.storage.batch_limits.max_operations = 32;
-            config.max_index_bytes = 16 * 1024 * 1024;
         },
         |_| {},
     )
@@ -292,16 +296,26 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
         )
         .is_err()
     );
-    db.flush_index().unwrap();
+    // The plain index flush the production wrapper exposes, not a relocation pass.
+    db.write_core().flush_index().unwrap();
     db.shutdown().unwrap();
     // A client clone keeps the live connection registry (and its lock) alive.
     drop(writer);
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. It takes a
+    // version in the new epoch and carries the old payload, so it overwrites
+    // the newer value 2 of key 0 with 1; a second retry inside this epoch
+    // returns the new version and applies nothing.
+    let retried = reopened
+        .write_batch(operation, mutations(&edits, 8))
+        .unwrap();
+    assert!(retried.epoch > first.epoch, "{retried:?} vs {first:?}");
     assert_eq!(
         reopened
             .write_batch(operation, mutations(&edits, 8))
             .unwrap(),
-        first
+        retried
     );
     assert_eq!(
         reopened
@@ -309,7 +323,7 @@ fn write_model_retry_during_flight_after_publication_and_flush_in_flight() {
             .unwrap()
             .unwrap()
             .as_ref(),
-        2u64.to_le_bytes()
+        1u64.to_le_bytes()
     );
     reopened.shutdown().unwrap();
 }
@@ -348,14 +362,36 @@ fn write_model_uncertain_append_fail_stops_and_recovers_identity() {
     assert!(db.get(KeySpace(0), &key_bytes(0)).is_err());
     assert!(db.published_cut().is_err());
     assert!(db.flush_durable().is_err());
-    assert!(db.flush_index().is_err());
+    assert!(db.write_core().flush_index().is_err());
     assert!(db.shutdown().is_err());
     let reopened = ConcurrentRemoteDatabase::new(fixture.open()).unwrap();
+    // Replay recovers the unknown outcome's frame before any retry.
+    for key in 0..2 {
+        assert_eq!(
+            reopened
+                .get(KeySpace(0), &key_bytes(key))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            7u64.to_le_bytes()
+        );
+    }
+    // OWNER decision (BOARD 2026-11-20, decision 2): the retry window is empty
+    // after a restart, so a retry after the reopen is a new write. It takes a
+    // version in the new epoch; a second retry inside this epoch returns that
+    // version and allocates nothing.
+    let retried = reopened
+        .write_batch(operation, mutations(&edits, 8))
+        .unwrap();
+    assert!(
+        retried.epoch > uncertain.epoch,
+        "{retried:?} vs {uncertain:?}"
+    );
     assert_eq!(
         reopened
             .write_batch(operation, mutations(&edits, 8))
             .unwrap(),
-        uncertain
+        retried
     );
     for key in 0..2 {
         assert_eq!(
@@ -384,7 +420,6 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
         1,
         |config| {
             config.storage.batch_limits.max_operations = 57;
-            config.max_index_bytes = 16 * 1024 * 1024;
             config.timeout = Duration::from_secs(5);
             leased::configure(config, leased::profile(4));
             // Publication can cache an acknowledged frame before owner adoption.
@@ -413,12 +448,7 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
     // fresh lane would wait for the paused close below until its deadline.
     // Warm the only lane with a key the second batch does not write.
     {
-        let (cut, _pin) = db.protected_published_cut().unwrap();
-        let warm = db
-            .submit_get_cut(KeySpace(0), &key_bytes(0), cut)
-            .and_then(|pending| db.finish_ready_get(pending.wait()))
-            .unwrap()
-            .unwrap();
+        let warm = db.get(KeySpace(0), &key_bytes(0)).unwrap().unwrap();
         assert_eq!(warm.as_ref(), 1u64.to_le_bytes().repeat(512));
     }
     let (entered, release) = log.pause_live(LivePausePoint::CloseSuffix);
@@ -440,9 +470,11 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
         let paused = entered.recv_timeout(Duration::from_secs(5));
         let acknowledged = result.recv_timeout(Duration::from_secs(5));
         let read = if acknowledged.as_ref().is_ok_and(|result| result.is_ok()) {
-            let (cut, _pin) = db.protected_published_cut().unwrap();
+            // The watermark sampled here covers the acknowledged frame.
+            let cut = db.hybrid_table().current();
             let reference = db
-                .index_reference(KeySpace(0), &key_bytes(32), cut.clone())
+                .hybrid_table()
+                .get(KeySpace(0), &key_bytes(32), cut)
                 .unwrap()
                 .unwrap();
             eprintln!(
@@ -454,12 +486,10 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
             // Checked after the release below: the value is acknowledged but
             // its frame is not adopted (the close that would adopt it is
             // paused before its scan), and the read takes the cold path.
-            let unadopted = reference.batch_address.offset + u64::from(reference.batch_address.len)
-                > log.appended_frontier();
+            let address = reference.address;
+            let unadopted = address.offset + u64::from(address.len) > log.appended_frontier();
             let before = db.read_cache_stats();
-            let value = db
-                .submit_get_cut(KeySpace(0), &key_bytes(32), cut)
-                .and_then(|pending| db.finish_ready_get(pending.wait()));
+            let value = db.get(KeySpace(0), &key_bytes(32));
             let after = db.read_cache_stats();
             Some((value, unadopted, before, after))
         } else {

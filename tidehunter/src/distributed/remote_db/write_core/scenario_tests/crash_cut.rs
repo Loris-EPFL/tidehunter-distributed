@@ -90,9 +90,11 @@ fn a_receipt_the_window_pushed_out_reapplies() {
 /// observe: allocated, not applied. Three assertions follow from that state, and
 /// the first two are the ones RustReview's re-review asked for:
 ///
-/// 1. the start a store would record is still the drained tail. Negative control:
-///    if the reservation published only the tail, `fronts()` would be the *end* of
-///    the unpublished frame and the assertion below fails with that value;
+/// 1. the start a store would record is the unpublished frame's start (the
+///    extent queue head), never below the drained tail, and at or below the
+///    member positions the index names after publication. Negative control: if
+///    the reservation published only the tail, `fronts()` would be the *end* of
+///    the unpublished frame, above its members, and the last assertion fails;
 /// 2. the batch is not in the index at all: at the table's publication watermark,
 ///    key 2 still resolves to `v1` and the new key 3 has no position. A *value*
 ///    read is not used while parked — owner 0's worker is the paused one, so it
@@ -149,10 +151,15 @@ fn an_allocated_but_unpublished_batch_stays_in_the_recorded_replay_window() {
     );
     entered.recv_timeout(WAIT).unwrap();
     assert_eq!(core.published_next(), 1, "nothing may publish while paused");
-    assert_eq!(
-        replay_start(&core, owner, partition),
-        stored,
-        "a store taken now would replay from the unpublished frame's end and lose it",
+    // The recorded start is the head of the extent queue: the start of the
+    // unpublished frame. That frame need not touch the drained tail (the leased
+    // writer starts it at its own offset), so the start can lie above `stored`.
+    // It must never fall below `stored`, and the member positions read below
+    // bound it from above.
+    let paused_start = replay_start(&core, owner, partition);
+    assert!(
+        paused_start >= stored,
+        "a store taken now must not replay below the drained tail: {paused_start} < {stored}"
     );
     // The index must not mention the batch: key 2 still resolves to `v1` and key 3
     // has no position at all. The probe goes to the table at its publication
@@ -194,11 +201,29 @@ fn an_allocated_but_unpublished_batch_stays_in_the_recorded_replay_window() {
     // Counter-control: publication makes the same two reads answer the new values.
     assert_eq!(value(&mut db, 2), Some(vec![22; 32]));
     assert_eq!(value(&mut db, 3), Some(vec![33; 32]));
+    // The replay start recorded while the batch was unpublished lies at or
+    // below the member frames the index now names: a store taken then would
+    // have replayed them. (Negative control: the end of the frame, which is
+    // where a front lost to an early drain would sit, is above both members.)
+    for key in [2u32, 3] {
+        let position = core
+            .table
+            .get(KeySpace(0), &key.to_be_bytes(), core.table.current())
+            .unwrap()
+            .expect("the published batch names a position");
+        assert!(
+            paused_start <= position.address.offset,
+            "key {key}: replay start {paused_start} is above its frame at {}",
+            position.address.offset
+        );
+    }
 
     // Crash: the durable image is all that is left, no shutdown checkpoint.
     core.test_hooks.lock().skip_shutdown_checkpoint = true;
     drop(core);
     db.shutdown().unwrap();
+    // The database lock is released only when the handle drops.
+    drop(db);
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 1), Some(vec![11; 32]));
     assert_eq!(value(&mut reopened, 2), Some(vec![22; 32]));

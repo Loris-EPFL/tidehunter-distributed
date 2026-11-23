@@ -1,13 +1,16 @@
 //! Opt-in workstation latency measurements; never hardware qualification.
-use super::pipeline_tests::trusted_owner_host_config;
+use super::pipeline_tests::{coordinator_config, newest_cut, trusted_owner_host_config};
 use super::*;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
+use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::nvmeof::live_metrics::{LiveNvmeCounts, LiveNvmeMetrics};
 use crate::distributed::tcp::{LeasedSync, LiveClientConfig, OwnerHost, StorageNode, Transport};
 use crate::key_shape::KeyType;
 use serde_json::{Value, json};
+use std::fs;
+use std::fs::File;
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::Command as Process;
@@ -70,17 +73,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(base: &Path, case: &str, tier: DurabilityTier) -> Self {
-        Self::with_limits(
-            base,
-            case,
-            tier,
-            128 * MIB as u64,
-            256 * MIB as u64,
-            ReplayLimits {
-                max_batches: 65536,
-                max_encoded_bytes: 1024 * MIB,
-            },
-        )
+        Self::with_limits(base, case, tier, 128 * MIB as u64, 256 * MIB as u64)
     }
 
     fn with_limits(
@@ -89,7 +82,6 @@ impl Fixture {
         tier: DurabilityTier,
         fragment_bytes: u64,
         wal_file_bytes: u64,
-        replay_limits: ReplayLimits,
     ) -> Self {
         let directory = tempdir::TempDir::new_in(base, case).unwrap();
         let root = directory.path();
@@ -101,46 +93,28 @@ impl Fixture {
             key: PathBuf::new(),
             server_name: "trusted-test-cluster".into(),
         };
-        let mut config = RemoteDatabaseConfig {
-            storage: LocalInventoryConfig {
-                database: [0; 16],
-                partitions: vec![0],
-                batch_limits: BatchLimits {
-                    max_operations: 32,
-                    max_encoded_bytes: 128 * 1024,
-                },
-                group_limits: GroupLimits {
-                    max_batches: 32,
-                    max_encoded_bytes: 2 * MIB,
-                },
-                fragment_bytes,
-                wal_file_bytes,
-                max_batches_per_partition: 8192,
-                max_reference_metadata_bytes: 64 * MIB,
-            },
-            endpoints: Vec::new(),
-            tls: tls.clone(),
-            timeout: Duration::from_secs(60),
-            max_admitted_batches: 8192,
-            max_index_bytes: 64 * MIB,
-            max_pending_batches: 64,
-            max_pending_bytes: 32 * MIB,
-            replay_limits,
-            owner_append_occupancy: 16,
-            pipelined_writes: true,
-            leased_submit_redrain: true,
-            read_cache_bytes: 0,
-            read_memory_allowance_bytes: 128 * MIB,
-            scan_prefetch_pages: 1,
-            read_lanes: Some(1),
-            pin_read_lanes: false,
-            max_pending_reads: 64,
-            max_pending_read_bytes: 16 * MIB,
-            write_profile_limit: 0,
-            live_nvme: live_config(tier),
-            durable_cut: Default::default(),
-            index: Default::default(),
+        let mut config = coordinator_config(1, 8192, 32, tls);
+        config.storage.batch_limits = BatchLimits {
+            max_operations: 32,
+            max_encoded_bytes: 128 * 1024,
         };
+        config.storage.group_limits = GroupLimits {
+            max_batches: 32,
+            max_encoded_bytes: 2 * MIB,
+        };
+        config.storage.fragment_bytes = fragment_bytes;
+        config.storage.wal_file_bytes = wal_file_bytes;
+        config.storage.max_reference_metadata_bytes = 64 * MIB;
+        config.timeout = Duration::from_secs(60);
+        config.max_pending_batches = 64;
+        config.max_pending_bytes = 32 * MIB;
+        config.owner_append_occupancy = 16;
+        config.read_cache_bytes = 0;
+        config.read_memory_allowance_bytes = 128 * MIB;
+        config.read_lanes = Some(1);
+        config.max_pending_reads = 64;
+        config.max_pending_read_bytes = 16 * MIB;
+        config.live_nvme = live_config(tier);
         let target_root = std::env::var_os("TH_TAIL_TARGET_DIR")
             .map(|path| tempdir::TempDir::new_in(path, "tail-target").unwrap());
         let target_path = target_root
@@ -160,16 +134,17 @@ impl Fixture {
         config.endpoints.push(RemoteEndpoint {
             partition: 0,
             address: listener.local_addr().unwrap().to_string(),
-            server_name: tls.server_name.clone(),
+            server_name: config.tls.server_name.clone(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let serving = Arc::clone(&host);
         let stopping = stop.clone();
+        let server_tls = config.tls.clone();
         let server = thread::spawn(move || {
             serving
                 .serve(
                     listener,
-                    tls,
+                    server_tls,
                     super::super::tcp::TcpLimits {
                         io_timeout: Duration::from_secs(60),
                         ..Default::default()
@@ -479,6 +454,18 @@ fn write_counters(
         };
     }
     counts["adoption_timing_semantics"] = json!("mean, no distribution");
+    // Per-partition grant profiles of the live target: the leased route keeps
+    // no other row-level view of grant state.
+    counts["grant_profiles"] = f.node().bench_live_grant_profiles();
+    // The live target's configfs tree can sit on another filesystem
+    // (`TH_TAIL_TARGET_DIR`), so every row states where it was placed. The
+    // guard that owns it is released with the fixture, after the host's
+    // open target files close.
+    counts["tail_target_dir"] = json!(
+        f.target_root
+            .as_ref()
+            .map_or(f.root.path(), |dir| dir.path())
+    );
     counts
 }
 
@@ -587,7 +574,7 @@ fn save_raw(output: &Path, case: &str, samples: &[u64]) {
         writeln!(file, "{index},{ns}").unwrap();
     }
 }
-fn profile(db: &RemoteDatabase) -> Value {
+fn profile(db: &ConcurrentRemoteDatabase) -> Value {
     let mut fields = serde_json::Map::new();
     db.read_profile_monitor().visit(&mut |name, value| {
         fields.insert(name.into(), json!(value));
@@ -619,24 +606,26 @@ fn value_delta(after: &Value, before: &Value) -> Value {
 /// existing read-lane clients for the local live route in place, on the same
 /// epoch and dataset.
 fn configure_reads(
-    db: &RemoteDatabase,
+    db: &ConcurrentRemoteDatabase,
     fixture: &Fixture,
-    reference: ValueRecordReference,
+    reference: VersionPosition,
     inline_reads: bool,
 ) {
     // Release every cached live grant and owner pin, as the removed rebuild's
     // stop did; the returned admission pause resumes on drop.
-    drop(db.core.reads.pause_live_for_retirement().unwrap());
-    db.core.reads.set_inline_reads_for_test(inline_reads);
-    for node in 0..db.core.config.endpoints.len() {
-        for lane in 0..db.core.config.effective_read_lanes() {
-            let client = db.core.reads.lane_client(node, lane);
+    drop(db.write_core().reads.pause_live_for_retirement().unwrap());
+    db.write_core()
+        .reads
+        .set_inline_reads_for_test(inline_reads);
+    for node in 0..db.write_core().config.endpoints.len() {
+        for lane in 0..db.write_core().config.effective_read_lanes() {
+            let client = db.write_core().reads.lane_client(node, lane);
             let mut client = client.lock();
             super::super::tcp::live_read::tests::configure_local_client(&mut client);
             client.set_live_metrics(fixture.live.clone()).unwrap();
         }
     }
-    db.core
+    db.write_core()
         .reads
         .bench_install_owner_local(fixture.node(), reference);
 }
@@ -645,23 +634,25 @@ fn leased_settled_dataset_matches_inline_and_worker_lanes_in_both_tiers() {
     let root = tempdir::TempDir::new("leased-read-routes").unwrap();
     for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
         let fixture = Fixture::new(root.path(), tier.as_str(), tier);
-        let mut db = fixture.open("C");
+        let db = ConcurrentRemoteDatabase::new(fixture.open("C")).unwrap();
         let value: Bytes = vec![0x5a; 1024].into();
         for sequence in 0..8 {
             db.write_batch(operation(sequence), vec![put(sequence, &value)])
                 .unwrap();
         }
-        db.flush_index().unwrap();
+        db.write_core().flush_index().unwrap();
         let reference = db
-            .index_reference(KeySpace(0), &key(0), IndexReadCut::Latest)
+            .write_core()
+            .table
+            .get(KeySpace(0), &key(0), newest_cut())
             .unwrap()
-            .unwrap();
+            .expect("the written key is indexed");
         for inline_reads in [true, false] {
             configure_reads(&db, &fixture, reference, inline_reads);
             db.set_read_profile_limit(32);
-            let parked = inline_reads.then(|| db.core.reads.bench_park_live_lane(0));
+            let parked = inline_reads.then(|| db.write_core().reads.bench_park_live_lane(0));
             if inline_reads {
-                db.core
+                db.write_core()
                     .reads
                     .bench_install_owner_local(fixture.node(), reference);
             }
@@ -709,7 +700,7 @@ fn leased_settled_dataset_matches_inline_and_worker_lanes_in_both_tiers() {
 
 fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize]) -> Vec<Row> {
     let fixture = Fixture::new(base, "reads", DurabilityTier::Native);
-    let mut db = fixture.open("C");
+    let db = ConcurrentRemoteDatabase::new(fixture.open("C")).unwrap();
     let value: Bytes = vec![0x5a; 1024].into();
     for sequence in 0..4096 {
         db.write_batch(operation(sequence), vec![put(sequence, &value)])
@@ -720,11 +711,13 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
         (4096..4128).map(|n| put(n, &value)).collect(),
     )
     .unwrap();
-    db.flush_index().unwrap();
+    db.write_core().flush_index().unwrap();
     let reference = db
-        .index_reference(KeySpace(0), &key(0), IndexReadCut::Latest)
+        .write_core()
+        .table
+        .get(KeySpace(0), &key(0), newest_cut())
         .unwrap()
-        .unwrap();
+        .expect("the written key is indexed");
     configure_reads(&db, &fixture, reference, true);
     let keys: Vec<_> = (0..4096).map(key).collect();
     let batch_keys: Vec<_> = (4096..4128).map(key).collect();
@@ -744,9 +737,9 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
             }
             let before_case = process_snapshot();
             configure_reads(&db, &fixture, reference, arm == "R1");
-            let parked = (arm == "R1").then(|| db.core.reads.bench_park_live_lane(0));
+            let parked = (arm == "R1").then(|| db.write_core().reads.bench_park_live_lane(0));
             if parked.is_some() {
-                db.core
+                db.write_core()
                     .reads
                     .bench_install_owner_local(fixture.node(), reference);
             }
@@ -809,7 +802,11 @@ fn run_reads(base: &Path, output: &Path, arms: &[String], repetitions: &[usize])
             let actual = db.get_many(KeySpace(0), &batch_keys).unwrap();
             samples.push(start.elapsed().as_nanos() as u64);
             assert_eq!(actual.len(), 32);
-            assert!(actual.iter().all(|v| v.as_ref() == Some(&value)));
+            assert!(
+                actual
+                    .iter()
+                    .all(|v| v.as_ref().is_ok_and(|v| v.as_ref() == Some(&value)))
+            );
         }
         let elapsed = began.elapsed();
         let mut counters = delta(fixture.live.snapshot().counts, before);
@@ -1179,215 +1176,6 @@ fn live_bench_closed_loop() {
 }
 
 #[test]
-#[ignore = "explicit workstation checkpoint-tail comparison"]
-fn leased_checkpoint_tail_workstation() {
-    let setting = |name: &str, default: usize| {
-        std::env::var(name)
-            .map(|value| value.parse::<usize>().unwrap())
-            .unwrap_or(default)
-    };
-    let calls = setting("TH_TAIL_CALLS", 4096);
-    let fragment_bytes = setting("TH_TAIL_FRAGMENT_BYTES", 8 * MIB);
-    let wal_file_bytes = setting("TH_TAIL_WAL_FILE_BYTES", 256 * MIB);
-    let leased_write_window = match std::env::var("TH_TAIL_LEASED_WINDOW").as_deref() {
-        Err(_) | Ok("none") => None,
-        Ok(value) => Some(
-            value
-                .parse::<usize>()
-                .expect("invalid TH_TAIL_LEASED_WINDOW"),
-        ),
-    };
-    let replay_max_batches = setting("TH_TAIL_REPLAY_MAX_BATCHES", 256);
-    let replay_max_bytes = setting("TH_TAIL_REPLAY_MAX_BYTES", 16 * MIB);
-    let default_geometry = calls == 4096
-        && fragment_bytes == 8 * MIB
-        && wal_file_bytes == 256 * MIB
-        && replay_max_batches == 256
-        && replay_max_bytes == 16 * MIB;
-    let timeline_output = std::env::var_os("TH_TAIL_TIMELINE_DIR").map(PathBuf::from);
-    let owner_events = std::env::var_os("TH_TAIL_OWNER_EVENTS").is_some_and(|value| value == "1");
-    let _capture =
-        owner_events.then(|| crate::distributed::owner_events::OWNER_EVENTS_TEST_LOCK.lock());
-    if owner_events {
-        crate::distributed::owner_events::enable(65_536);
-    }
-    let base = tempdir::TempDir::new("leased-checkpoint-tail").unwrap();
-    let value: Bytes = vec![0x5a; 65536].into();
-    for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
-        let mut fixture = Fixture::with_limits(
-            base.path(),
-            "tail",
-            tier,
-            fragment_bytes as u64,
-            wal_file_bytes as u64,
-            ReplayLimits {
-                max_batches: replay_max_batches,
-                max_encoded_bytes: replay_max_bytes,
-            },
-        );
-        fixture.config.owner_append_occupancy = fixture
-            .config
-            .owner_append_occupancy
-            .max(leased_write_window.unwrap_or(1));
-        fixture.config.live_nvme.leased_write_window = leased_write_window;
-        let leased_write_window_bound = fixture
-            .config
-            .live_nvme
-            .max_inflight_requests
-            .min(fixture.config.effective_owner_append_occupancy());
-        let db = ConcurrentRemoteDatabase::new(fixture.open("C-buf")).unwrap();
-        let (samples, elapsed) = if timeline_output.is_some() {
-            db.arm_write_timeline(calls, 1).unwrap();
-            let gate = Barrier::new(17);
-            thread::scope(|scope| {
-                let handles: Vec<_> = (0..16)
-                    .map(|writer| {
-                        let db = &db;
-                        let gate = &gate;
-                        let value = &value;
-                        scope.spawn(move || {
-                            let mut samples = Vec::with_capacity(calls.div_ceil(16));
-                            gate.wait();
-                            for sequence in (writer..calls).step_by(16) {
-                                let mutations = vec![put(sequence, value)];
-                                let operation = operation(sequence);
-                                let began = Instant::now();
-                                let sample = db.write_timeline.begin(sequence as u64).unwrap();
-                                db.write_timeline.operation(sample, operation);
-                                db.write_batch_traced(operation, mutations, Some(sample))
-                                    .unwrap();
-                                db.write_timeline.complete(sample, None);
-                                samples.push(began.elapsed().as_nanos() as u64);
-                            }
-                            samples
-                        })
-                    })
-                    .collect();
-                let began = Instant::now();
-                gate.wait();
-                let samples = handles
-                    .into_iter()
-                    .flat_map(|handle| handle.join().unwrap())
-                    .collect();
-                (samples, began.elapsed())
-            })
-        } else {
-            write_phase(&db, 16, 0, calls, &value)
-        };
-        let counts = fixture.live.snapshot().counts;
-        assert!(counts.max_leased_in_flight > 0);
-        assert!(
-            counts.max_leased_in_flight
-                <= leased_write_window.unwrap_or(leased_write_window_bound) as u64
-        );
-        if leased_write_window == Some(1) {
-            assert_eq!(counts.max_leased_in_flight, 1);
-        }
-        let manifest: AuthorityManifest =
-            read_metadata(&fixture.root.path().join("authority").join(MANIFEST)).unwrap();
-        let checkpoints = manifest
-            .checkpoint
-            .map_or(0, |checkpoint| checkpoint.generation);
-        if default_geometry {
-            assert!(
-                checkpoints >= 3,
-                "must cross at least three committed checkpoints"
-            );
-            assert!(
-                counts.extent_switch_samples >= 2,
-                "must cross at least two extent boundaries"
-            );
-        }
-        let mut checkpoint_started = 0;
-        let mut completed_checkpoint_lifetime_ns = 0;
-        db.visit_write_metrics(|metrics| {
-            checkpoint_started = metrics.authority.checkpoint_count;
-            completed_checkpoint_lifetime_ns = metrics.authority.background_checkpoint_ns;
-        });
-        let slow = samples.iter().filter(|ns| **ns >= 5_000_000).count();
-        let maximum = samples.iter().max().copied().unwrap();
-        let mut sorted = samples.clone();
-        sorted.sort_unstable();
-        let quantile = |p: usize, scale: usize| sorted[(p * sorted.len()).div_ceil(scale) - 1];
-        if let Some(output) = &timeline_output {
-            let result = output.join(tier.to_string()).join("result");
-            fs::create_dir_all(&result).unwrap();
-            let export = db
-                .finish_write_timeline_until(Instant::now() + Duration::from_secs(60))
-                .unwrap();
-            fs::write(
-                result.join("write-timeline.json"),
-                serde_json::to_vec(&json!({
-                    "schema_version": 2,
-                    "available": true,
-                    "status": "complete",
-                    "timeline": export,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
-        let preparation = fixture.node().log_for_test(1).live_file_preparation_stats();
-        println!(
-            "checkpoint_tail_workstation {}",
-            json!({
-                "tier": tier.to_string(), "calls": samples.len(), "writers": 16, "value_bytes": 65536,
-                "slow_calls_ge_5ms": slow, "max_api_ns": maximum, "elapsed_ns": elapsed.as_nanos(),
-                "checkpoints": checkpoints, "extent_switches": counts.extent_switch_samples,
-                "extent_switch_waits": counts.extent_switch_waits,
-                "leased_write_window": leased_write_window,
-                "max_leased_in_flight": counts.max_leased_in_flight,
-                "live_files_prepared": preparation.live_files_prepared,
-                "live_files_published": preparation.live_files_published,
-                "live_leased_write_window": leased_write_window,
-                "live_leased_write_window_bound": leased_write_window_bound,
-                "live_file_prepare_failures": preparation.live_file_prepare_failures,
-                "grant_profiles": fixture.node().bench_live_grant_profiles(),
-                "live_file_diagnostics": fixture.node().log_for_test(1).live_test_diagnostics(),
-                "adoption": fixture.node().log_for_test(1).live_test_diagnostics().adoption,
-                "target_dir": fixture.target_root.as_ref().map_or(fixture.root.path(), |directory| directory.path()),
-                "checkpoint_started": checkpoint_started,
-                "completed_checkpoint_lifetime_ns": completed_checkpoint_lifetime_ns,
-                "timeline_enabled": timeline_output.is_some(),
-                "fragment_bytes": fragment_bytes, "wal_file_bytes": wal_file_bytes,
-                "replay_max_batches": replay_max_batches, "replay_max_bytes": replay_max_bytes,
-                "p50_ns": quantile(50, 100), "p99_ns": quantile(99, 100),
-                "p999_ns": quantile(999, 1000),
-                "largest_five_ns": sorted.iter().rev().take(5).copied().collect::<Vec<_>>(),
-                "api_ns": samples,
-                "scope": "workstation local-file io_uring; not remote hardware performance"
-            })
-        );
-        // Verify the coordinator index against the real owner's final WAL after
-        // an explicit barrier, without asking a workstation for a fabrics device.
-        db.flush_durable().unwrap();
-        let log = fixture.node().log_for_test(1);
-        for sequence in 0..calls {
-            let reference = db
-                .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
-                .unwrap()
-                .unwrap();
-            assert_eq!(log.read_record(&reference).unwrap(), put(sequence, &value));
-        }
-        db.shutdown().unwrap();
-        drop(log);
-        drop(fixture);
-        if owner_events && let Some(output) = &timeline_output {
-            let output = output.join(tier.to_string()).join("owner-events");
-            fs::create_dir_all(&output).unwrap();
-            crate::distributed::owner_events::drain_json(&output.join("node-0.json")).unwrap();
-        }
-    }
-    let data_path = base.path().to_owned();
-    drop(base);
-    assert!(!data_path.exists(), "workstation fixture data remains");
-    println!(
-        "checkpoint_tail_workstation_cleanup {}",
-        data_path.display()
-    );
-}
-
-#[test]
 #[ignore = "explicit four-owner small-put contention diagnosis; not hardware evidence"]
 fn small_put_multiowner_workstation() {
     let calls = std::env::var("TH_SMALL_PUT_CALLS")
@@ -1407,17 +1195,12 @@ fn small_put_multiowner_workstation() {
             |config| {
                 config.max_pending_batches = 128;
                 config.max_pending_bytes = 64 * MIB;
-                config.max_index_bytes = 256 * MIB;
                 config.read_cache_bytes = 0;
                 config.storage.batch_limits.max_encoded_bytes = 128 * 1024;
                 config.storage.group_limits.max_encoded_bytes = 2 * MIB;
                 config.storage.fragment_bytes = 128 * MIB as u64;
                 config.storage.wal_file_bytes = 256 * MIB as u64;
                 config.storage.max_reference_metadata_bytes = 64 * MIB;
-                config.replay_limits = ReplayLimits {
-                    max_batches: calls + 4096,
-                    max_encoded_bytes: 256 * MIB,
-                };
                 let mut live = live_config(DurabilityTier::Synchronous);
                 live.leased_write_window = None;
                 live.leased_sync = LeasedSync::GroupFlush;
@@ -1535,16 +1318,10 @@ fn small_put_multiowner_workstation() {
         );
         db.flush_durable().unwrap();
         for sequence in 0..calls {
-            let reference = db
-                .index_reference(KeySpace(0), &key(sequence), IndexReadCut::Latest)
-                .unwrap()
-                .unwrap();
             assert_eq!(
-                fixture.nodes[reference.batch_address.partition as usize]
-                    .log_for_test(1)
-                    .read_record(&reference)
-                    .unwrap(),
-                put(sequence, &value),
+                db.get(KeySpace(0), &key(sequence)).unwrap().as_ref(),
+                Some(&value),
+                "the coordinator index serves the owner's final bytes for key {sequence}"
             );
         }
         db.shutdown().unwrap();
@@ -1766,7 +1543,6 @@ fn overhead_case(
         |config| {
             config.max_pending_batches = 128;
             config.max_pending_bytes = 64 * MIB;
-            config.max_index_bytes = 512 * MIB;
             config.max_admitted_batches = calls + 8192;
             config.owner_append_occupancy = 8;
             config.read_cache_bytes = 0;
@@ -1776,10 +1552,6 @@ fn overhead_case(
             config.storage.fragment_bytes = 128 * MIB as u64;
             config.storage.wal_file_bytes = 256 * MIB as u64;
             config.storage.max_reference_metadata_bytes = 64 * MIB;
-            config.replay_limits = ReplayLimits {
-                max_batches: 4096,
-                max_encoded_bytes: 256 * MIB,
-            };
             let mut live = live_config(tier);
             live.leased_write_window = None;
             live.leased_sync = LeasedSync::GroupFlush;
