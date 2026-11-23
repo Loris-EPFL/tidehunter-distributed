@@ -29,34 +29,38 @@
 //! cell's row lock exactly once (compare: the per-record path takes the row
 //! lock for every WAL record). Per-cell entries are sorted, deduped, and
 //! converted to the flat buffer format in one shot.
+//!
+//! `P` is the value position (native: [`WalPosition`]): the same accumulator
+//! serves native replay over WAL offsets and a batch-version replay over
+//! version positions, with no other change.
 
 use crate::CellId;
-use crate::WalPosition;
 use crate::index::index_table::IndexWalPosition;
 use crate::key_shape::{KeyShape, KeySpace, KeyType};
+use crate::wal::position::{IndexEntryKind, IndexPosition, WalPosition};
 use minibytes::Bytes;
 use std::collections::HashMap;
 
 /// Per-cell accumulator. Entries are pushed in WAL order; overwrite
-/// resolution is deferred to `apply` time via sort + dedup. The first WAL
+/// resolution is deferred to `apply` time via sort + dedup. The first value
 /// position for the cell (used by `mark_dirty` to anchor `last_processed`)
 /// is implicit in `entries[0]`.
-pub(crate) type CellReplayBuffer = Vec<(Bytes, IndexWalPosition)>;
+pub(crate) type CellReplayBuffer<P = WalPosition> = Vec<(Bytes, IndexWalPosition<P>)>;
 
 /// Per-keyspace storage. Variant chosen at construction time based on the
 /// key shape — see module doc.
-enum KsReplayBuffer {
-    Integer(Vec<CellReplayBuffer>),
-    Bytes(HashMap<CellId, CellReplayBuffer>),
+enum KsReplayBuffer<P: IndexPosition = WalPosition> {
+    Integer(Vec<CellReplayBuffer<P>>),
+    Bytes(HashMap<CellId, CellReplayBuffer<P>>),
 }
 
 /// Replay-wide accumulator. Outer slot indexed by keyspace; per-keyspace
 /// storage dispatches on key shape (Uniform → Vec, PrefixedUniform → HashMap).
-pub(crate) struct ReplayBuffer {
-    by_ks: Vec<KsReplayBuffer>,
+pub(crate) struct ReplayBuffer<P: IndexPosition = WalPosition> {
+    by_ks: Vec<KsReplayBuffer<P>>,
 }
 
-impl ReplayBuffer {
+impl<P: IndexPosition> ReplayBuffer<P> {
     pub(crate) fn new(key_shape: &KeyShape) -> Self {
         let by_ks = key_shape
             .iter_ks()
@@ -73,20 +77,20 @@ impl ReplayBuffer {
         Self { by_ks }
     }
 
-    pub(crate) fn insert(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: WalPosition) {
+    pub(crate) fn insert(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: P) {
         // Detach: a zero-copy slice would pin its backing buffer (a
         // multi-MB decompressed `CompressedBatch` body, or a WAL mmap
         // region) for the rest of replay.
         self.cell_mut(ks, cell)
-            .push((key.into_owned(), IndexWalPosition::new_modified(position)));
+            .push((key.into_owned(), P::tag(position, IndexEntryKind::Modified)));
     }
 
-    pub(crate) fn remove(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: WalPosition) {
+    pub(crate) fn remove(&mut self, ks: KeySpace, cell: CellId, key: Bytes, position: P) {
         self.cell_mut(ks, cell)
-            .push((key.into_owned(), IndexWalPosition::new_removed(position)));
+            .push((key.into_owned(), P::tag(position, IndexEntryKind::Removed)));
     }
 
-    fn cell_mut(&mut self, ks: KeySpace, cell: CellId) -> &mut CellReplayBuffer {
+    fn cell_mut(&mut self, ks: KeySpace, cell: CellId) -> &mut CellReplayBuffer<P> {
         match (&mut self.by_ks[ks.index()], cell) {
             (KsReplayBuffer::Integer(vec), CellId::Integer(idx)) => &mut vec[idx],
             (KsReplayBuffer::Bytes(map), cell @ CellId::Bytes(_)) => map.entry(cell).or_default(),
@@ -124,7 +128,7 @@ impl ReplayBuffer {
     /// discover there's no work. Returns a flat `Vec<(CellId, CellReplayBuffer)>`
     /// regardless of underlying storage variant — apply code can group by
     /// mutex shard uniformly.
-    pub(crate) fn take_ks(&mut self, ks_idx: usize) -> Vec<(CellId, CellReplayBuffer)> {
+    pub(crate) fn take_ks(&mut self, ks_idx: usize) -> Vec<(CellId, CellReplayBuffer<P>)> {
         // Replace the variant with an empty Bytes-style placeholder; subsequent
         // accesses for this ks are not expected (apply drains each ks once).
         let placeholder = KsReplayBuffer::Bytes(HashMap::new());

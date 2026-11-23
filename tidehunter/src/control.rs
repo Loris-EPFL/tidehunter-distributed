@@ -4,7 +4,7 @@ use crate::key_shape::KeyShape;
 use crate::large_table::SnapshotEntryData;
 use crate::metrics::Metrics;
 use crate::wal::layout::WalLayout;
-use crate::wal::position::WalFileId;
+use crate::wal::position::{IndexCut, LastProcessed, WalFileId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -28,19 +28,28 @@ use std::path::{Path, PathBuf};
 ///   V1 layout is `last_position: u64`, which would only take the value
 ///   `u64::MAX` in a pathological/corrupt file — never in a real database.
 ///
-/// Writers always emit V3; readers detect the sentinel and fall back to V2
-/// or V1 parsing + one-way migration as needed.
+/// Writers always emit their instantiation's version; readers detect the
+/// sentinel and accept only that version (plus, for the native instantiation,
+/// the legacy V2/V1 layouts it can migrate).
 const CONTROL_REGION_V2_SENTINEL: u64 = u64::MAX;
 const CONTROL_REGION_V2_VERSION: u32 = 2;
 const CONTROL_REGION_V3_VERSION: u32 = 3;
 const CONTROL_REGION_V2_HEADER_LEN: usize = 12;
 
+/// Named refusal message for the index-format gate (plan I9): the control
+/// region on disk was written by a different index instantiation — a native
+/// byte cut and a hybrid batch version are not interchangeable, so either side
+/// refuses the other's file instead of reinterpreting it.
+pub(crate) const CONTROL_REGION_VERSION_MISMATCH: &str = "control region version mismatch";
+
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(bound = "C: IndexCut")]
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
-pub struct ControlRegion {
-    /// 0 when wal is empty or nothing has been processed
-    last_position: u64,
-    snapshot: LargeTableContainer<SnapshotEntryData>,
+pub struct ControlRegion<C: IndexCut = LastProcessed> {
+    /// The durable index frontier: natively `LastProcessed(0)` when the WAL is
+    /// empty or nothing has been processed; the hybrid keeps its batch version.
+    last_position: C,
+    snapshot: LargeTableContainer<SnapshotEntryData<C>>,
     /// Keyspace names in canonical id order — used to verify that the
     /// canonical shape resolved at open matches the one this snapshot was
     /// written with, and to recover the canonical order for databases that
@@ -49,9 +58,9 @@ pub struct ControlRegion {
     keyspace_names: Vec<String>,
 }
 
-pub(crate) struct ControlRegionStore {
+pub(crate) struct ControlRegionStore<C: IndexCut = LastProcessed> {
     path: PathBuf,
-    last_position: u64,
+    last_position: C,
     /// Test hook run after the rename and before the directory sync.
     #[cfg(test)]
     after_rename_hook: Option<Box<dyn Fn() + Send>>,
@@ -130,7 +139,7 @@ impl RelocateFiles {
     }
 }
 
-impl ControlRegion {
+impl<C: IndexCut> ControlRegion<C> {
     pub fn new_empty(key_shape: &KeyShape) -> Self {
         let snapshot =
             LargeTableContainer::new_from_key_shape(key_shape, SnapshotEntryData::empty());
@@ -139,15 +148,15 @@ impl ControlRegion {
             .map(|ks| ks.name().to_string())
             .collect();
         Self {
-            last_position: 0,
+            last_position: C::NONE,
             snapshot,
             keyspace_names,
         }
     }
 
     pub fn new(
-        snapshot: LargeTableContainer<SnapshotEntryData>,
-        last_position: u64,
+        snapshot: LargeTableContainer<SnapshotEntryData<C>>,
+        last_position: C,
         key_shape: &KeyShape,
     ) -> Self {
         let keyspace_names = key_shape
@@ -174,46 +183,78 @@ impl ControlRegion {
     #[doc(hidden)] // Used by tools/tideconsole for control region inspection
     pub fn read(path: &Path, key_shape: &KeyShape) -> io::Result<Self> {
         let bytes = fs::read(path)?;
-        let mut control_region = Self::deserialize_any_version(&bytes)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let mut control_region = Self::deserialize_any_version(&bytes)?;
         control_region.populate_keyspace_names_if_empty(key_shape);
         control_region.verify_shape(key_shape);
         control_region.extend_snapshot_if_needed(key_shape);
         Ok(control_region)
     }
 
-    /// Deserializes a control region from bytes, transparently handling
-    /// V1 (pre-levels), V2 (pre-sharding `IndexLevels`), and V3 (current)
-    /// formats.
+    /// Deserializes a control region from bytes written by *this*
+    /// instantiation, transparently handling V1 (pre-levels) and V2
+    /// (pre-sharding `IndexLevels`) formats for the native cut.
     ///
     /// V1 control regions are migrated on read: each single-position cell
     /// becomes a one-level `IndexLevels`. V2 control regions are migrated
     /// on read: each cell's `IndexLevels` is rebuilt with an empty shard
     /// btree. The migration is one-way — the next successful `store`
-    /// rewrites the file in V3 format.
-    fn deserialize_any_version(bytes: &[u8]) -> Result<Self, bincode::Error> {
+    /// rewrites the file in the current format.
+    ///
+    /// A file written by another instantiation (a native V3 file read by a
+    /// batch-version instantiation, or the reverse) is refused with
+    /// [`CONTROL_REGION_VERSION_MISMATCH`] instead of being reinterpreted:
+    /// the payload's frontier type is part of the format.
+    fn deserialize_any_version(bytes: &[u8]) -> io::Result<Self> {
+        let invalid = |e: bincode::Error| io::Error::new(ErrorKind::InvalidData, e);
         if bytes.len() >= CONTROL_REGION_V2_HEADER_LEN {
-            let sentinel = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let sentinel = u64::from_le_bytes(
+                bytes[..8]
+                    .try_into()
+                    .expect("slice length checked against the header length"),
+            );
             if sentinel == CONTROL_REGION_V2_SENTINEL {
-                let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                let version = u32::from_le_bytes(
+                    bytes[8..12]
+                        .try_into()
+                        .expect("slice length checked against the header length"),
+                );
                 let payload = &bytes[CONTROL_REGION_V2_HEADER_LEN..];
-                return match version {
-                    CONTROL_REGION_V3_VERSION => bincode::deserialize::<ControlRegion>(payload),
-                    CONTROL_REGION_V2_VERSION => {
-                        let v2: legacy_v2::ControlRegionV2 = bincode::deserialize(payload)?;
-                        Ok(v2.migrate())
-                    }
-                    _ => panic!(
-                        "Unsupported control region version {version}; expected \
-                         {CONTROL_REGION_V3_VERSION} (or legacy {CONTROL_REGION_V2_VERSION}). \
-                         This binary is older than the database it is trying to open."
+                if version == C::CONTROL_REGION_VERSION {
+                    return bincode::deserialize::<ControlRegion<C>>(payload).map_err(invalid);
+                }
+                // The legacy native layouts carry a `u64` byte frontier, so
+                // only the native instantiation can migrate them.
+                if version == CONTROL_REGION_V2_VERSION
+                    && C::CONTROL_REGION_VERSION == CONTROL_REGION_V3_VERSION
+                {
+                    let v2: legacy_v2::ControlRegionV2 =
+                        bincode::deserialize(payload).map_err(invalid)?;
+                    return v2.migrate();
+                }
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "{CONTROL_REGION_VERSION_MISMATCH}: file has version {version}, this \
+                         build writes {}. This binary is older than the database it is trying to \
+                         open, or the database was written by a different index mode.",
+                        C::CONTROL_REGION_VERSION
                     ),
-                };
+                ));
             }
         }
-        // No sentinel ⇒ legacy V1 layout.
-        let v1: legacy_v1::ControlRegionV1 = bincode::deserialize(bytes)?;
-        Ok(v1.migrate())
+        // No sentinel ⇒ legacy V1 layout, which only the native cut can read.
+        if C::CONTROL_REGION_VERSION != CONTROL_REGION_V3_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "{CONTROL_REGION_VERSION_MISMATCH}: file has the legacy V1 layout, this build \
+                     writes version {}",
+                    C::CONTROL_REGION_VERSION
+                ),
+            ));
+        }
+        let v1: legacy_v1::ControlRegionV1 = bincode::deserialize(bytes).map_err(invalid)?;
+        v1.migrate()
     }
 
     /// Populates keyspace names from key_shape if they're empty (for old control regions)
@@ -229,8 +270,12 @@ impl ControlRegion {
         }
     }
 
-    /// Extends the snapshot to include new keyspaces if the key_shape has more keyspaces
-    fn extend_snapshot_if_needed(&mut self, key_shape: &KeyShape) {
+    /// Extends the snapshot to include new keyspaces if the key_shape has more keyspaces.
+    ///
+    /// Crate-visible for a reader on another instantiation: a control region
+    /// written before a keyspace was declared must grow the same way whichever
+    /// cut type reads it.
+    pub(crate) fn extend_snapshot_if_needed(&mut self, key_shape: &KeyShape) {
         let snapshot_len = self.snapshot.data.len();
         let num_ks = key_shape.num_ks();
 
@@ -250,7 +295,11 @@ impl ControlRegion {
     /// order to the canonical one before reading the control region, so a
     /// mismatch here means the canonical registry (shape file) and the
     /// control region have diverged — not a user-level reorder.
-    fn verify_shape(&self, key_shape: &KeyShape) {
+    ///
+    /// Crate-visible so a region reader on another instantiation (the hybrid
+    /// coordinator reading its own payload) reuses this one check instead of
+    /// carrying a second copy of the name list.
+    pub(crate) fn verify_shape(&self, key_shape: &KeyShape) {
         let snapshot_len = self.snapshot.data.len();
         let num_ks = key_shape.num_ks();
 
@@ -263,12 +312,13 @@ impl ControlRegion {
         }
 
         // Verify that existing keyspaces match by name in canonical order
+        let stored_names = self.keyspace_names();
         for (idx, ks_desc) in key_shape.iter_ks().enumerate().take(snapshot_len) {
             let current_name = ks_desc.name();
 
             // Check if we have stored keyspace names (backward compatibility: might be empty for old control regions)
-            if idx < self.keyspace_names.len() {
-                let stored_name = &self.keyspace_names[idx];
+            if idx < stored_names.len() {
+                let stored_name = &stored_names[idx];
                 if current_name != stored_name {
                     panic!(
                         "Keyspace mismatch at canonical position {idx}: control region has keyspace '{stored_name}', \
@@ -280,11 +330,18 @@ impl ControlRegion {
         }
     }
 
-    pub fn snapshot(&self) -> &LargeTableContainer<SnapshotEntryData> {
+    /// Canonical keyspace names this region was written with, in id order.
+    /// Crate-visible for the same reason as [`Self::verify_shape`]; its
+    /// in-slice caller is `verify_shape` itself.
+    pub(crate) fn keyspace_names(&self) -> &[String] {
+        &self.keyspace_names
+    }
+
+    pub fn snapshot(&self) -> &LargeTableContainer<SnapshotEntryData<C>> {
         &self.snapshot
     }
 
-    pub fn last_position(&self) -> u64 {
+    pub fn last_position(&self) -> C {
         self.last_position
     }
 
@@ -293,8 +350,8 @@ impl ControlRegion {
     }
 }
 
-impl ControlRegionStore {
-    pub fn new(path: PathBuf, control_region: &ControlRegion) -> Self {
+impl<C: IndexCut> ControlRegionStore<C> {
+    pub fn new(path: PathBuf, control_region: &ControlRegion<C>) -> Self {
         Self {
             path,
             last_position: control_region.last_position,
@@ -313,22 +370,22 @@ impl ControlRegionStore {
     /// only the previous control region references.
     pub fn store(
         &mut self,
-        snapshot: LargeTableContainer<SnapshotEntryData>,
-        last_position: u64,
+        snapshot: LargeTableContainer<SnapshotEntryData<C>>,
+        last_position: C,
         key_shape: &KeyShape,
         metrics: &Metrics,
     ) {
         assert!(
             last_position >= self.last_position,
-            "control region last_position regressed: new={last_position} < old={}",
+            "control region last_position regressed: new={last_position:?} < old={:?}",
             self.last_position,
         );
         let control_region = ControlRegion::new(snapshot, last_position, key_shape);
-        // V3 layout: sentinel + version + bincode payload. See the comment
-        // on `CONTROL_REGION_V2_SENTINEL` for the rationale.
+        // Versioned layout: sentinel + version + bincode payload. See the
+        // comment on `CONTROL_REGION_V2_SENTINEL` for the rationale.
         let mut serialized = Vec::with_capacity(CONTROL_REGION_V2_HEADER_LEN + 4 * 1024);
         serialized.extend_from_slice(&CONTROL_REGION_V2_SENTINEL.to_le_bytes());
-        serialized.extend_from_slice(&CONTROL_REGION_V3_VERSION.to_le_bytes());
+        serialized.extend_from_slice(&C::CONTROL_REGION_VERSION.to_le_bytes());
         bincode::serialize_into(&mut serialized, &control_region)
             .expect("Failed to serialize control region");
         let temp_file = self.path.with_extension(".bak");
@@ -386,7 +443,7 @@ impl ControlRegionStore {
         &self.path
     }
 
-    pub fn last_position(&self) -> u64 {
+    pub fn last_position(&self) -> C {
         self.last_position
     }
 }
@@ -399,15 +456,16 @@ impl ControlRegionStore {
 /// auto-sharding shards (empty for cells that haven't split). The migration
 /// rebuilds each cell's `IndexLevels` with `shards = BTreeMap::new()`.
 mod legacy_v2 {
-    use super::ControlRegion;
+    use super::{CONTROL_REGION_VERSION_MISMATCH, ControlRegion};
     use crate::cell::CellId;
     use crate::container::LargeTableContainer;
     use crate::index::levels::{INLINE_LEVELS, IndexLevels};
     use crate::large_table::SnapshotEntryData;
-    use crate::wal::position::{LastProcessed, WalPosition};
+    use crate::wal::position::{IndexCut, LastProcessed, WalPosition};
     use serde::{Deserialize, Serialize};
     use smallvec::SmallVec;
     use std::collections::BTreeMap;
+    use std::io;
 
     /// Exact on-disk layout of `IndexLevels` prior to the auto-sharding
     /// schema change. Mirrors the V2 wire format so bincode reads cleanly.
@@ -431,8 +489,22 @@ mod legacy_v2 {
     }
 
     impl SnapshotEntryDataV2 {
-        fn migrate(self) -> SnapshotEntryData {
-            SnapshotEntryData::from_levels(self.levels.migrate(), self.last_processed)
+        fn migrate<C: IndexCut>(self) -> io::Result<SnapshotEntryData<C>> {
+            let last_processed = C::from_byte_position(self.last_processed.byte_position())
+                .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{CONTROL_REGION_VERSION_MISMATCH}: the V2 layout stores a byte frontier, \
+                         this build writes version {}",
+                        C::CONTROL_REGION_VERSION
+                    ),
+                )
+            })?;
+            Ok(SnapshotEntryData::from_levels(
+                self.levels.migrate(),
+                last_processed,
+            ))
         }
     }
 
@@ -448,23 +520,31 @@ mod legacy_v2 {
     }
 
     impl ControlRegionV2 {
-        pub(super) fn migrate(self) -> ControlRegion {
-            let data: Vec<BTreeMap<CellId, SnapshotEntryData>> = self
-                .snapshot
-                .data
-                .into_iter()
-                .map(|ks_map| {
-                    ks_map
-                        .into_iter()
-                        .map(|(cell, entry)| (cell, entry.migrate()))
-                        .collect()
-                })
-                .collect();
-            ControlRegion {
-                last_position: self.last_position,
+        pub(super) fn migrate<C: IndexCut>(self) -> io::Result<ControlRegion<C>> {
+            let last_position = C::from_byte_position(self.last_position).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{CONTROL_REGION_VERSION_MISMATCH}: the V2 layout stores a byte frontier, \
+                         this build writes version {}",
+                        C::CONTROL_REGION_VERSION
+                    ),
+                )
+            })?;
+            let mut data: Vec<BTreeMap<CellId, SnapshotEntryData<C>>> =
+                Vec::with_capacity(self.snapshot.data.len());
+            for ks_map in self.snapshot.data {
+                let mut migrated = BTreeMap::new();
+                for (cell, entry) in ks_map {
+                    migrated.insert(cell, entry.migrate::<C>()?);
+                }
+                data.push(migrated);
+            }
+            Ok(ControlRegion {
+                last_position,
                 snapshot: LargeTableContainer { data },
                 keyspace_names: self.keyspace_names,
-            }
+            })
         }
     }
 }
@@ -477,14 +557,15 @@ mod legacy_v2 {
 /// `INLINE_LEVELS`). The migration maps every valid single position to a
 /// one-element level list; `WalPosition::INVALID` maps to an empty list.
 mod legacy_v1 {
-    use super::ControlRegion;
+    use super::{CONTROL_REGION_VERSION_MISMATCH, ControlRegion};
     use crate::cell::CellId;
     use crate::container::LargeTableContainer;
     use crate::index::levels::IndexLevels;
     use crate::large_table::SnapshotEntryData;
-    use crate::wal::position::{LastProcessed, WalPosition};
+    use crate::wal::position::{IndexCut, LastProcessed, WalPosition};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+    use std::io;
 
     /// Exact on-disk layout of `SnapshotEntryData` prior to the two-level
     /// LSM schema change. Field names and ordering must stay in sync with
@@ -496,11 +577,22 @@ mod legacy_v1 {
     }
 
     impl SnapshotEntryDataV1 {
-        fn migrate(self) -> SnapshotEntryData {
-            SnapshotEntryData::from_levels(
+        fn migrate<C: IndexCut>(self) -> io::Result<SnapshotEntryData<C>> {
+            let last_processed = C::from_byte_position(self.last_processed.byte_position())
+                .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{CONTROL_REGION_VERSION_MISMATCH}: the V1 layout stores a byte frontier, \
+                         this build writes version {}",
+                        C::CONTROL_REGION_VERSION
+                    ),
+                )
+            })?;
+            Ok(SnapshotEntryData::from_levels(
                 IndexLevels::from_legacy_position(self.position),
-                self.last_processed,
-            )
+                last_processed,
+            ))
         }
     }
 
@@ -516,23 +608,31 @@ mod legacy_v1 {
     }
 
     impl ControlRegionV1 {
-        pub(super) fn migrate(self) -> ControlRegion {
-            let data: Vec<BTreeMap<CellId, SnapshotEntryData>> = self
-                .snapshot
-                .data
-                .into_iter()
-                .map(|ks_map| {
-                    ks_map
-                        .into_iter()
-                        .map(|(cell, entry)| (cell, entry.migrate()))
-                        .collect()
-                })
-                .collect();
-            ControlRegion {
-                last_position: self.last_position,
+        pub(super) fn migrate<C: IndexCut>(self) -> io::Result<ControlRegion<C>> {
+            let last_position = C::from_byte_position(self.last_position).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{CONTROL_REGION_VERSION_MISMATCH}: the V1 layout stores a byte frontier, \
+                         this build writes version {}",
+                        C::CONTROL_REGION_VERSION
+                    ),
+                )
+            })?;
+            let mut data: Vec<BTreeMap<CellId, SnapshotEntryData<C>>> =
+                Vec::with_capacity(self.snapshot.data.len());
+            for ks_map in self.snapshot.data {
+                let mut migrated = BTreeMap::new();
+                for (cell, entry) in ks_map {
+                    migrated.insert(cell, entry.migrate::<C>()?);
+                }
+                data.push(migrated);
+            }
+            Ok(ControlRegion {
+                last_position,
                 snapshot: LargeTableContainer { data },
                 keyspace_names: self.keyspace_names,
-            }
+            })
         }
     }
 }
@@ -589,13 +689,13 @@ mod tests {
                 LastProcessed::new_test(43),
             ),
         );
-        cr.last_position = 100;
+        cr.last_position = LastProcessed::new_test(100);
 
         let mut store = ControlRegionStore::new(path.clone(), &cr);
         store.store(cr.snapshot, cr.last_position, &shape, &Metrics::new());
 
-        let read_cr = ControlRegion::read(&path, &shape).unwrap();
-        assert_eq!(read_cr.last_position, 100);
+        let read_cr = ControlRegion::<LastProcessed>::read(&path, &shape).unwrap();
+        assert_eq!(read_cr.last_position, LastProcessed::new_test(100));
         let entry0 = read_cr.snapshot.data[0]
             .get(&CellId::Integer(0))
             .expect("cell 0 exists");
@@ -667,8 +767,8 @@ mod tests {
         bytes.extend_from_slice(&payload);
         std::fs::write(&path, &bytes).unwrap();
 
-        let read_cr = ControlRegion::read(&path, &shape).unwrap();
-        assert_eq!(read_cr.last_position, 77);
+        let read_cr = ControlRegion::<LastProcessed>::read(&path, &shape).unwrap();
+        assert_eq!(read_cr.last_position, LastProcessed::new_test(77));
         let cell0 = read_cr.snapshot.data[0]
             .get(&CellId::Integer(0))
             .expect("cell 0 present");
@@ -726,8 +826,8 @@ mod tests {
         let bytes = bincode::serialize(&v1).unwrap();
         std::fs::write(&path, &bytes).unwrap();
 
-        let read_cr = ControlRegion::read(&path, &shape).unwrap();
-        assert_eq!(read_cr.last_position, 55);
+        let read_cr = ControlRegion::<LastProcessed>::read(&path, &shape).unwrap();
+        assert_eq!(read_cr.last_position, LastProcessed::new_test(55));
 
         let cell0 = read_cr.snapshot.data[0]
             .get(&CellId::Integer(0))
@@ -739,6 +839,78 @@ mod tests {
             .get(&CellId::Integer(1))
             .expect("cell 1 present");
         assert!(cell1.levels.is_empty(), "INVALID ⇒ empty level list");
+    }
+
+    /// Test-only cut that reports the hybrid control-region version. Proves the
+    /// reader refuses a foreign version *before* parsing, without pulling the
+    /// distributed crate into native tests.
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
+    struct VersionFourCut(u64);
+
+    impl IndexCut for VersionFourCut {
+        const NONE: Self = Self(0);
+        const CONTROL_REGION_VERSION: u32 = 4;
+
+        fn saturating_lag(self, later: Self) -> u64 {
+            later.0.saturating_sub(self.0)
+        }
+
+        fn byte_position(self) -> u64 {
+            0
+        }
+    }
+
+    /// Writes a control region in the native V3 format at `path`.
+    fn write_v3_region(path: &Path, shape: &KeyShape) {
+        let snapshot = LargeTableContainer::new_from_key_shape(shape, SnapshotEntryData::empty());
+        let mut store = ControlRegionStore::<LastProcessed>::new(
+            path.to_path_buf(),
+            &ControlRegion::new_empty(shape),
+        );
+        store.store(snapshot, LastProcessed::new_test(9), shape, &Metrics::new());
+    }
+
+    /// I9, one direction: a batch-version instantiation must refuse a native
+    /// V3 file instead of reading the `u64` frontier as a batch version.
+    #[test]
+    fn version_four_instantiation_refuses_v3_region() {
+        let dir = tempdir::TempDir::new("cr_refuse_v3").unwrap();
+        let path = dir.path().join("cr");
+        let shape = tiny_shape();
+        write_v3_region(&path, &shape);
+
+        let err = ControlRegion::<VersionFourCut>::read(&path, &shape)
+            .expect_err("a V4 instantiation must refuse a V3 file");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(CONTROL_REGION_VERSION_MISMATCH),
+            "expected the named I9 refusal, got: {err}"
+        );
+        assert!(err.to_string().contains("version 3"), "got: {err}");
+    }
+
+    /// I9, other direction: the native instantiation must refuse a V4 file.
+    #[test]
+    fn native_instantiation_refuses_v4_region() {
+        let dir = tempdir::TempDir::new("cr_refuse_v4").unwrap();
+        let path = dir.path().join("cr");
+        let shape = tiny_shape();
+
+        // A V4 header with an empty payload: the version check must fire before
+        // any attempt to deserialize it as a native payload.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONTROL_REGION_V2_SENTINEL.to_le_bytes());
+        bytes.extend_from_slice(&VersionFourCut::CONTROL_REGION_VERSION.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = ControlRegion::<LastProcessed>::read(&path, &shape)
+            .expect_err("the native instantiation must refuse a V4 file");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(CONTROL_REGION_VERSION_MISMATCH),
+            "expected the named I9 refusal, got: {err}"
+        );
+        assert!(err.to_string().contains("version 4"), "got: {err}");
     }
 
     #[test]

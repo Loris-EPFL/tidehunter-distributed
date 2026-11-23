@@ -9,6 +9,8 @@ pub mod layout;
 mod mapper;
 pub mod position;
 mod syncer;
+#[cfg(test)]
+pub(crate) mod test_position;
 pub(crate) mod tracker;
 pub(crate) mod tracking_mmap;
 

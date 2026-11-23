@@ -51,7 +51,7 @@ mod latch;
 // todo remove re-export
 pub use minibytes;
 
-pub use index::index_table::IndexWalPosition;
+pub use index::index_table::TaggedWalPosition as IndexWalPosition;
 pub use relocation::{Decision, RelocationStrategy, compute_target_position_from_ratio};
 #[cfg(feature = "test_methods")]
 pub use relocation::{

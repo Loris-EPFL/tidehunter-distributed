@@ -249,7 +249,9 @@ impl IndexBenchmark {
                                 rng.fill(&mut key[..]);
 
                                 // Look up the key
-                                index_format.lookup_unloaded(&ks_desc, reader, &key, metrics);
+                                index_format.lookup_unloaded::<WalPosition>(
+                                    &ks_desc, reader, &key, metrics,
+                                );
                             }
 
                             durations.push(start.elapsed());

@@ -3702,7 +3702,7 @@ fn test_sparse_gc_reopen_with_dead_window() {
 #[test]
 fn test_control_region_directory_sync_precedes_index_file_deletion() {
     use crate::control::ControlRegion;
-    use crate::wal::position::WalFileId;
+    use crate::wal::position::{LastProcessed, WalFileId};
     use std::collections::BTreeSet;
 
     const NUM_KEYS: u32 = 128;
@@ -3749,12 +3749,13 @@ fn test_control_region_directory_sync_precedes_index_file_deletion() {
     let ks = db.ks("bulk");
     let layout = db.indexes.layout().clone();
     let previous_root = std::fs::read(&cr_path).unwrap();
-    let previous_files: BTreeSet<WalFileId> = ControlRegion::read(&cr_path, &key_shape)
-        .unwrap()
-        .snapshot()
-        .iter_valid_val_positions()
-        .map(|position| layout.locate_file(position.offset()))
-        .collect();
+    let previous_files: BTreeSet<WalFileId> =
+        ControlRegion::<LastProcessed>::read(&cr_path, &key_shape)
+            .unwrap()
+            .snapshot()
+            .iter_valid_val_positions()
+            .map(|position| layout.locate_file(position.offset()))
+            .collect();
     assert!(
         !previous_files.is_empty(),
         "the previous control region references no index file"

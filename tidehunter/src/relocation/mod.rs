@@ -6,7 +6,7 @@ use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
 use crate::relocation::watermark::RelocationWatermarks;
 use crate::wal::WalError;
-use crate::wal::position::LastProcessed;
+use crate::wal::position::{IndexCut, LastProcessed};
 pub use cell_reference::CellReference;
 use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -284,7 +284,10 @@ impl RelocationDriver {
 
         let gc_watermark = std::cmp::min(
             watermarks.gc_watermark(),
-            db.control_region_store.lock().last_position(),
+            db.control_region_store
+                .lock()
+                .last_position()
+                .byte_position(),
         );
 
         db.wal_writer.gc(gc_watermark)?;
@@ -454,7 +457,10 @@ impl RelocationDriver {
         db.rebuild_control_region_from(target_position)?;
         db.wal_writer.gc(std::cmp::min(
             target_position,
-            db.control_region_store.lock().last_position(),
+            db.control_region_store
+                .lock()
+                .last_position()
+                .byte_position(),
         ))?;
         Ok(())
     }
@@ -603,7 +609,7 @@ impl RelocationDriver {
                     &cell.cell_id,
                     db.as_ref(),
                     None,
-                    Some(terminal_position),
+                    Some(LastProcessed::new(terminal_position)),
                 )?;
                 continue;
             }
@@ -674,7 +680,7 @@ impl RelocationDriver {
                     &cell.cell_id,
                     db.as_ref(),
                     None,
-                    Some(target_position),
+                    Some(LastProcessed::new(target_position)),
                 )?;
             }
         }

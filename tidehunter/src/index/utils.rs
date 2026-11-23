@@ -1,15 +1,15 @@
 use crate::index::index_format::Direction;
-use crate::wal::position::WalPosition;
+use crate::wal::position::IndexPosition;
 use minibytes::Bytes;
 use std::cmp::Ordering;
 
 /// Represents the possible outcomes when looking for the next entry
 #[derive(Debug, PartialEq)]
-pub enum NextEntryResult {
+pub enum NextEntryResult<P> {
     /// No entry was found
     NotFound,
     /// A valid entry was found with its key and position
-    Found(Bytes, WalPosition),
+    Found(Bytes, P),
     /// A deleted entry was found that should be skipped
     SkipDeleted(Bytes),
 }
@@ -25,14 +25,17 @@ pub enum NextEntryResult {
 ///
 /// - `NotFound`: every source was `None`.
 /// - `Found(k, v)`: winning candidate has a valid position.
-/// - `SkipDeleted(k)`: winning candidate is a tombstone (`WalPosition::INVALID`).
+/// - `SkipDeleted(k)`: winning candidate is a tombstone (`P::INVALID`).
 ///   Callers advance `prev_key` past `k` and retry — the winning source's
 ///   tombstone shadows any lower-priority hits at the same key.
-pub fn merge_levels_next_entry<I>(candidates: I, direction: Direction) -> NextEntryResult
+pub fn merge_levels_next_entry<P: IndexPosition, I>(
+    candidates: I,
+    direction: Direction,
+) -> NextEntryResult<P>
 where
-    I: IntoIterator<Item = Option<(Bytes, WalPosition)>>,
+    I: IntoIterator<Item = Option<(Bytes, P)>>,
 {
-    let mut winner: Option<(Bytes, WalPosition)> = None;
+    let mut winner: Option<(Bytes, P)> = None;
     for candidate in candidates {
         let Some((key, pos)) = candidate else {
             continue;
@@ -68,6 +71,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::position::WalPosition;
 
     fn k(bytes: &[u8]) -> Bytes {
         Bytes::from(bytes.to_vec())
@@ -76,8 +80,8 @@ mod tests {
     #[test]
     fn merge_all_none() {
         assert_eq!(
-            merge_levels_next_entry(vec![None, None, None], Direction::Forward),
-            NextEntryResult::NotFound
+            merge_levels_next_entry::<WalPosition, _>(vec![None, None, None], Direction::Forward,),
+            NextEntryResult::<WalPosition>::NotFound
         );
     }
 

@@ -11,7 +11,7 @@ use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
 use crate::decompress_cache::{CacheOutcome, DecompressCache};
-use crate::flusher::IndexFlusher;
+use crate::flusher::{FlusherHost, IndexFlusher};
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
@@ -27,7 +27,7 @@ use crate::state_snapshot;
 #[cfg(feature = "experimental-distributed")]
 pub use crate::wal::ValueWalPersistenceProfile;
 use crate::wal::layout::WalKind;
-use crate::wal::position::{LastProcessed, WalFileId, WalPosition};
+use crate::wal::position::{IndexCut, LastProcessed, WalFileId, WalPosition};
 use crate::wal::tracker::WalGuard;
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
 use bytes::{Buf, BufMut, BytesMut};
@@ -193,13 +193,17 @@ impl Db {
             background_health.clone(),
         );
         let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
-        let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position())?;
+        // The native cut is a value-WAL byte offset; this is the value-WAL
+        // replay start, so read it back as the offset itself rather than
+        // through the byte-cadence mapping.
+        let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position().as_u64())?;
         let wal_writer = crate::wal_replay::replay_wal(
             &contexts,
             &large_table,
             &key_shape,
             wal_iterator,
             &metrics,
+            wal.as_ref(),
         )?;
         let last_index_position = control_region.last_index_wal_position();
         // Restore the mapped window over the fragments holding live index
@@ -1097,7 +1101,10 @@ impl Db {
             .relocation_written_bytes
             .inc_by(size_bytes as u64);
         let positions = self.write_relocated_batch_into_wal(&prepared_writes)?;
-        let mut updates = RelocationUpdates::new(last_processed);
+        // `last_processed` is captured as the value-WAL byte frontier, which is
+        // exactly `LastProcessed` natively; the hybrid cut is built at its own
+        // call site instead of reusing this batch type.
+        let mut updates = RelocationUpdates::new(LastProcessed::new(last_processed));
         for (pos, key) in positions.into_iter().zip(keys.into_iter()) {
             let reduced_key = context.ks_config.reduced_key_bytes(key);
             updates.add(reduced_key, pos);
@@ -1726,7 +1733,7 @@ impl Db {
             &self.metrics,
         );
         self.index_writer.delete_files(to_delete)?;
-        Ok(snapshot.replay_from)
+        Ok(snapshot.replay_from.as_u64())
     }
 
     fn write_index(&self, ks: KeySpace, index: &IndexTable) -> DbResult<WalPosition> {
@@ -2027,8 +2034,8 @@ impl Db {
     #[cfg(feature = "test-utils")]
     pub fn test_get_replay_from(&self) -> u64 {
         let path = self.control_region_store.lock().path().clone();
-        let cr = ControlRegion::read_or_create(&path, &self.key_shape);
-        cr.last_position()
+        let cr: ControlRegion = ControlRegion::read_or_create(&path, &self.key_shape);
+        cr.last_position().as_u64()
     }
 
     /// Drains every cell's BTreeMap into its flat buffer, bypassing
@@ -2110,6 +2117,7 @@ impl Drop for Db {
 }
 
 impl Loader for Wal {
+    type Position = WalPosition;
     type Error = DbError;
 
     fn load(&self, ks: &KeySpaceDesc, position: WalPosition) -> DbResult<IndexTable> {
@@ -2133,24 +2141,33 @@ impl Loader for Wal {
         false
     }
 
-    fn flush(&self, _ks: KeySpace, _data: &IndexTable) -> DbResult<WalPosition> {
+    fn flush(&self, _ks: KeySpace, _data: &IndexTable<Self::Position>) -> DbResult<WalPosition> {
         unimplemented!()
     }
 
-    fn last_processed_wal_position(&self) -> LastProcessed {
+    fn last_processed(&self) -> LastProcessed {
         unimplemented!()
     }
 
-    fn current_wal_position(&self) -> u64 {
+    fn current(&self) -> LastProcessed {
         unimplemented!()
     }
 
-    fn min_wal_position(&self) -> u64 {
-        self.min_wal_position()
+    fn min_position(&self) -> LastProcessed {
+        LastProcessed::new(self.min_wal_position())
+    }
+
+    fn current_position(&self) -> WalPosition {
+        unimplemented!()
+    }
+
+    fn flushed_at_bytes(&self, cut: LastProcessed) -> u64 {
+        cut.byte_position()
     }
 }
 
 impl Loader for Db {
+    type Position = WalPosition;
     type Error = DbError;
 
     fn load(&self, ks: &KeySpaceDesc, position: WalPosition) -> DbResult<IndexTable> {
@@ -2176,20 +2193,59 @@ impl Loader for Db {
         true
     }
 
-    fn flush(&self, ks: KeySpace, data: &IndexTable) -> DbResult<WalPosition> {
+    fn flush(&self, ks: KeySpace, data: &IndexTable<Self::Position>) -> DbResult<WalPosition> {
         self.write_index(ks, data)
     }
 
-    fn last_processed_wal_position(&self) -> LastProcessed {
+    fn last_processed(&self) -> LastProcessed {
         self.wal_writer.last_processed()
     }
 
-    fn current_wal_position(&self) -> u64 {
-        self.wal_writer.position()
+    fn current(&self) -> LastProcessed {
+        LastProcessed::new(self.wal_writer.position())
     }
 
-    fn min_wal_position(&self) -> u64 {
-        self.wal.min_wal_position()
+    fn min_position(&self) -> LastProcessed {
+        LastProcessed::new(self.wal.min_wal_position())
+    }
+
+    fn current_position(&self) -> WalPosition {
+        // A valid position at the current tail. Callers need only that it
+        // orders after every indexed position, which `max(1)` guarantees on
+        // an empty WAL.
+        WalPosition::new(self.wal_writer.position().max(1), 1)
+    }
+
+    fn flushed_at_bytes(&self, cut: LastProcessed) -> u64 {
+        cut.byte_position()
+    }
+}
+
+impl FlusherHost<WalPosition> for Db {
+    fn update_flushed_index(
+        &self,
+        ks: KeySpace,
+        cell: CellId,
+        original: Arc<IndexTable<WalPosition>>,
+        new_levels: IndexLevels,
+    ) {
+        Db::update_flushed_index(self, ks, cell, original, new_levels)
+    }
+
+    fn update_relocated_index(&self, ks: KeySpace, cell: CellId, new_levels: IndexLevels) {
+        Db::update_relocated_index(self, ks, cell, new_levels)
+    }
+
+    fn ks_context(&self, ks: KeySpace) -> &KsContext {
+        Db::ks_context(self, ks)
+    }
+
+    fn before_flush_completion(&self) {
+        self.large_table.fp.fp_flush_before_completion();
+    }
+
+    fn background_health(&self) -> Arc<crate::background_health::BackgroundHealth> {
+        Arc::clone(&self.background_health)
     }
 }
 
@@ -2414,6 +2470,36 @@ mod multi_flusher_tests {
                 assert!(value.is_some());
                 assert_eq!(value.unwrap().as_ref(), format!("value{}", i).as_bytes());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod loader_cadence_tests {
+    use super::*;
+    use crate::key_shape::{KeyShapeBuilder, KeyType};
+    use tempdir::TempDir;
+
+    /// Natively the byte cadence of a cut is the cut's own byte position, for
+    /// both loaders (the live `Db` and the replay-time `Wal`): the cadence is
+    /// compared against byte thresholds (`snapshot_written_bytes`), so any
+    /// other mapping would shift every snapshot and unload decision.
+    #[test]
+    fn native_flushed_at_bytes_is_the_cuts_byte_position() {
+        let dir = TempDir::new("native_flushed_at_bytes").unwrap();
+        let mut builder = KeyShapeBuilder::new();
+        builder.add_key_space("test", 8, 16, KeyType::uniform(16));
+        let db = Db::open(
+            dir.path(),
+            builder.build(),
+            Arc::new(Config::small()),
+            Metrics::new(),
+        )
+        .unwrap();
+        for offset in [0, 1, 4096, u64::MAX >> 1] {
+            let cut = LastProcessed::new(offset);
+            assert_eq!(db.flushed_at_bytes(cut), offset);
+            assert_eq!(db.wal.flushed_at_bytes(cut), offset);
         }
     }
 }

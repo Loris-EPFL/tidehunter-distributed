@@ -8,7 +8,7 @@ use super::index_format::{Direction, IndexFormat, IndexIterCache};
 use crate::index::index_format::{PREFIX_LENGTH, binary_search};
 use crate::key_shape::CELL_PREFIX_LENGTH;
 use crate::metrics::Metrics;
-use crate::wal::position::WalPosition;
+use crate::wal::position::{IndexPosition, WalPosition};
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
 const DEFAULT_WINDOW_SIZE: usize = 800;
@@ -127,15 +127,15 @@ impl UniformLookupIndex {
         (new_from_offset, new_to_offset)
     }
 
-    fn next_entry_unloaded_no_prev(
+    fn next_entry_unloaded_no_prev<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
         direction: Direction,
         metrics: &Metrics,
-    ) -> Option<(Bytes, WalPosition)> {
-        let element_size = ks.require_index_element_size();
+    ) -> Option<(Bytes, P)> {
         let key_size = ks.require_index_key_size("uniform lookup index");
+        let element_size = key_size + P::LENGTH;
         let file_length = reader.len();
 
         // Read a window from the beginning or end of the file
@@ -174,36 +174,36 @@ impl UniformLookupIndex {
         let entry_start = pos * element_size;
         let key = buffer.slice(entry_start..entry_start + key_size);
         let value_bytes = &buffer[entry_start + key_size..entry_start + element_size];
-        let pos = WalPosition::from_slice(value_bytes);
+        let pos = P::read_blob_exact(value_bytes);
 
         Some((key, pos))
     }
 }
 
 impl IndexFormat for UniformLookupIndex {
-    fn serialize_index(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
-        let element_size = ks.require_index_element_size();
-        let capacity = element_size * table.len();
+    fn serialize_index<P: IndexPosition>(&self, table: &IndexTable<P>, ks: &KeySpaceDesc) -> Bytes {
+        let key_size = ks.require_index_key_size("uniform lookup index");
+        let capacity = (key_size + P::LENGTH) * table.len();
         let mut out = BytesMut::with_capacity(capacity);
         table.serialize_index_entries(ks, &mut out);
         out.to_vec().into()
     }
 
-    fn deserialize_index(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
-        IndexTable::deserialize_index_entries(ks, b)
+    fn deserialize_index<P: IndexPosition>(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable<P> {
+        IndexTable::<P>::deserialize_index_entries(ks, b)
     }
 
-    fn lookup_unloaded(
+    fn lookup_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
         key: &[u8],
         metrics: &Metrics,
-    ) -> Option<WalPosition> {
+    ) -> Option<P> {
         // todo simplify this function
         // compute cell and prefix
-        let element_size = ks.require_index_element_size();
         let key_size = ks.require_index_key_size("uniform lookup index");
+        let element_size = key_size + P::LENGTH;
         assert_eq!(key.len(), key_size);
         let cell = ks.cell_id(key);
         let cell_prefix_range = ks.index_prefix_range(&cell);
@@ -261,13 +261,13 @@ impl IndexFormat for UniformLookupIndex {
             }
 
             // Use the extracted binary search function
-            let (_, _, result) = binary_search(&buffer, key, element_size, key_size, metrics);
+            let (_, _, result) = binary_search::<P>(&buffer, key, element_size, key_size, metrics);
             metrics.lookup_iterations.observe(iterations as f64);
             return result;
         }
     }
 
-    fn next_entry_unloaded(
+    fn next_entry_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
@@ -276,9 +276,9 @@ impl IndexFormat for UniformLookupIndex {
         metrics: &Metrics,
         position: WalPosition,
         cache: &mut Option<IndexIterCache>,
-    ) -> Option<(Bytes, WalPosition)> {
-        let element_size = ks.require_index_element_size();
+    ) -> Option<(Bytes, P)> {
         let key_size = ks.require_index_key_size("uniform lookup index");
+        let element_size = key_size + P::LENGTH;
         let file_length = reader.len();
 
         // Invalidate stale cache (flush detected between calls).
@@ -293,7 +293,7 @@ impl IndexFormat for UniformLookupIndex {
         // will populate the cache then.
         let Some(prev_key) = prev else {
             *cache = None;
-            return self.next_entry_unloaded_no_prev(ks, reader, direction, metrics);
+            return self.next_entry_unloaded_no_prev::<P>(ks, reader, direction, metrics);
         };
 
         assert_eq!(prev_key.len(), key_size);
@@ -352,8 +352,13 @@ impl IndexFormat for UniformLookupIndex {
                         }
                     } else {
                         // --- Binary search fallback (non-sequential access) ---
-                        let (found_pos, insertion_point, _) =
-                            binary_search(cached_buf, prev_key, element_size, key_size, metrics);
+                        let (found_pos, insertion_point, _) = binary_search::<P>(
+                            cached_buf,
+                            prev_key,
+                            element_size,
+                            key_size,
+                            metrics,
+                        );
 
                         match direction {
                             Direction::Forward => {
@@ -398,7 +403,7 @@ impl IndexFormat for UniformLookupIndex {
                         let key = cached_buf.slice(entry_start..entry_start + key_size);
                         let value_bytes =
                             &cached_buf[entry_start + key_size..entry_start + element_size];
-                        let pos = WalPosition::from_slice(value_bytes);
+                        let pos = P::read_blob_exact(value_bytes);
                         // Update last_returned_pos so next call uses O(1).
                         if let Some(IndexIterCache::UniformLookup {
                             last_returned_pos, ..
@@ -467,7 +472,7 @@ impl IndexFormat for UniformLookupIndex {
             }
 
             let (found_pos, insertion_point, _) =
-                binary_search(&buffer, prev_key, element_size, key_size, metrics);
+                binary_search::<P>(&buffer, prev_key, element_size, key_size, metrics);
 
             let next_pos = match direction {
                 Direction::Forward => {
@@ -532,7 +537,7 @@ impl IndexFormat for UniformLookupIndex {
             let entry_start = next_pos * element_size;
             let key = buffer.slice(entry_start..entry_start + key_size);
             let value_bytes = &buffer[entry_start + key_size..entry_start + element_size];
-            let pos = WalPosition::from_slice(value_bytes);
+            let pos = P::read_blob_exact(value_bytes);
 
             metrics.lookup_iterations.observe(iterations as f64);
             return Some((key, pos));
@@ -615,7 +620,8 @@ mod test {
         //
         // For demonstration, we'll do it directly:
         let key_40 = 40_u64.to_be_bytes();
-        let found = index_format.lookup_unloaded(ks, &mock_reader, &key_40, &metrics);
+        let found =
+            index_format.lookup_unloaded::<WalPosition>(ks, &mock_reader, &key_40, &metrics);
         assert_eq!(
             found,
             Some(WalPosition::test_value(40)),
@@ -624,7 +630,8 @@ mod test {
 
         // 7) Similarly, check key=50 (which is the last in the chunk)
         let key_50 = 50_u64.to_be_bytes();
-        let found_50 = index_format.lookup_unloaded(ks, &mock_reader, &key_50, &metrics);
+        let found_50 =
+            index_format.lookup_unloaded::<WalPosition>(ks, &mock_reader, &key_50, &metrics);
         assert_eq!(
             found_50,
             Some(WalPosition::test_value(50)),
@@ -633,7 +640,8 @@ mod test {
 
         // 8) Also confirm a missing key (key=45) isn't found in that partial chunk
         let key_45 = 45_u64.to_be_bytes();
-        let missing = index_format.lookup_unloaded(ks, &mock_reader, &key_45, &metrics);
+        let missing =
+            index_format.lookup_unloaded::<WalPosition>(ks, &mock_reader, &key_45, &metrics);
         assert_eq!(missing, None, "Key=45 should not be found");
     }
 
@@ -684,7 +692,8 @@ mod test {
 
             // do the lookup
             let key_bytes = key.to_be_bytes();
-            let found = index_format.lookup_unloaded(ks, &reader, &key_bytes, &metrics);
+            let found =
+                index_format.lookup_unloaded::<WalPosition>(ks, &reader, &key_bytes, &metrics);
 
             // confirm correctness, though you can skip if you only care about stats
             assert_eq!(
@@ -798,15 +807,16 @@ mod test {
 
         // 5) Make sure we can look up short_key1, short_key2, short_key3
         //    without panicking or indexing out of range
-        let found1 = single_hop.lookup_unloaded(ks, &reader, &key1, &metrics);
+        let found1 = single_hop.lookup_unloaded::<WalPosition>(ks, &reader, &key1, &metrics);
         assert_eq!(found1, Some(WalPosition::test_value(1001)));
 
-        let found2 = single_hop.lookup_unloaded(ks, &reader, &key2, &metrics);
+        let found2 = single_hop.lookup_unloaded::<WalPosition>(ks, &reader, &key2, &metrics);
         assert_eq!(found2, Some(WalPosition::test_value(1002)));
 
         // 6) Also ensure that a random short key that doesn't exist returns None
         let not_inserted = Bytes::from(vec![7, 8, 9, 10]);
-        let found4 = single_hop.lookup_unloaded(ks, &reader, &not_inserted, &metrics);
+        let found4 =
+            single_hop.lookup_unloaded::<WalPosition>(ks, &reader, &not_inserted, &metrics);
         assert_eq!(found4, None, "Key {not_inserted:?} unexpectedly found");
     }
 
@@ -863,15 +873,15 @@ mod test {
             crate::lookup::FileRange::new(FileReader::new(Arc::new(file), false), 0..file_len);
 
         // 7) Use lookup_unloaded to find each key
-        // let found1 = index_impl.lookup_unloaded(ks, &file_range, &key1);
+        // let found1 = index_impl.lookup_unloaded::<WalPosition>(ks, &file_range, &key1);
         // assert_eq!(found1, Some(WalPosition::test_value(100)));
 
-        let found2 = index_impl.lookup_unloaded(ks, &file_range, &key2, &metrics);
+        let found2 = index_impl.lookup_unloaded::<WalPosition>(ks, &file_range, &key2, &metrics);
         assert_eq!(found2, Some(WalPosition::test_value(200)));
 
         // 8) Confirm non-existent key returns None
         let key3 = Bytes::from(vec![99, 99, 99, 99]);
-        let found3 = index_impl.lookup_unloaded(ks, &file_range, &key3, &metrics);
+        let found3 = index_impl.lookup_unloaded::<WalPosition>(ks, &file_range, &key3, &metrics);
         assert_eq!(found3, None);
     }
 
@@ -894,15 +904,24 @@ mod test {
         assert!(!bytes.is_empty());
 
         // 3) Make sure we can find that exact key
-        assert_eq!(Some(walpos), pi.lookup_unloaded(ks, &bytes, &key, &metrics));
+        assert_eq!(
+            Some(walpos),
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &key, &metrics)
+        );
 
         // 4) Try smaller key
         let smaller_key = Bytes::from(vec![0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &smaller_key, &metrics));
+        assert_eq!(
+            None,
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &smaller_key, &metrics)
+        );
 
         // 5) Try bigger key
         let bigger_key = Bytes::from(vec![255, 255, 255, 255, 255, 255, 255, 255]);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &bigger_key, &metrics));
+        assert_eq!(
+            None,
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &bigger_key, &metrics)
+        );
     }
 
     #[test]
@@ -1005,16 +1024,24 @@ mod test {
 
         // Test the newly extracted function directly
         // Test forward direction (should return first entry)
-        let result =
-            index_format.next_entry_unloaded_no_prev(ks, &reader, Direction::Forward, &metrics);
+        let result = index_format.next_entry_unloaded_no_prev::<WalPosition>(
+            ks,
+            &reader,
+            Direction::Forward,
+            &metrics,
+        );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
         assert_eq!(key, 10_u64.to_be_bytes());
         assert_eq!(pos, WalPosition::test_value(1));
 
         // Test backward direction (should return last entry)
-        let result =
-            index_format.next_entry_unloaded_no_prev(ks, &reader, Direction::Backward, &metrics);
+        let result = index_format.next_entry_unloaded_no_prev::<WalPosition>(
+            ks,
+            &reader,
+            Direction::Backward,
+            &metrics,
+        );
         assert!(result.is_some());
         let (key, pos) = result.unwrap();
         assert_eq!(key, 50_u64.to_be_bytes());

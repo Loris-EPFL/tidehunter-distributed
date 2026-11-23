@@ -10,7 +10,9 @@ use crate::key_shape::KeySpaceDesc;
 use crate::primitives::cursor::SliceCursor;
 use crate::primitives::slice_buf::SliceBuf;
 use crate::primitives::var_int::{MAX_U16_VARINT, deserialize_u16_varint, serialize_u16_varint};
-use crate::wal::position::{HasOffset, LastProcessed, WalPosition};
+#[cfg(test)]
+use crate::wal::position::LastProcessed;
+use crate::wal::position::{HasOffset, IndexPosition, WalPosition};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
 use smallvec::smallvec;
@@ -21,28 +23,47 @@ use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::ops::Bound;
 
+pub(crate) use crate::wal::position::IndexEntryKind;
+
+/// The native kind-bearing position: a value-WAL position plus the entry kind.
+/// This is `<WalPosition as IndexPosition>::Tagged`, so `IndexTable::<WalPosition>`
+/// keeps its historical 16 B per-slot layout (see the size assertion below).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaggedWalPosition {
+    pub(super) offset: u64,
+    pub(super) len: u32,
+    pub(super) kind: IndexEntryKind,
+}
+
+/// The kind-bearing position an index instantiation stores: `P::Tagged`
+/// (native: [`TaggedWalPosition`]).
+///
+/// No `P: IndexPosition` bound: rustc does not enforce bounds on type aliases
+/// (they fire the warn-by-default `type_alias_bounds` lint, which is fatal under
+/// `-D warnings`), and the projection requires it at every use site anyway.
+pub(crate) type IndexWalPosition<P = WalPosition> = <P as IndexPosition>::Tagged;
+
 /// The `data` write buffer: one entry per key, mapping the key to its ordered
 /// positions. A `BTreeMap` (vs. a flat `BTreeSet<(key, position)>`) lets the
 /// hot insert path reach a key with a single tree descent via `entry`, stores
 /// each key once, and makes `data.len()` the unique-key count the rest of the
 /// impl assumes. The shared inline version vector keeps the common single-write
-/// case allocation-free and orders native entries by `IndexWalPosition`.
-pub(super) type DataOverlay = crate::index::versioned_overlay::Overlay<IndexWalPosition>;
+/// case allocation-free and orders entries by their position.
+pub(super) type DataOverlay<P = WalPosition> =
+    crate::index::versioned_overlay::Overlay<IndexWalPosition<P>>;
 
-#[derive(Default, Clone, Debug)]
 #[doc(hidden)]
-pub struct IndexTable {
+pub struct IndexTable<P: IndexPosition = WalPosition> {
     /// Write buffer: new entries land here before the next `promote_to_flat` call.
-    /// `promote_to_flat` drains only entries whose WAL offset is below the
-    /// supplied `last_processed`; unprocessed (in-flight) entries remain here
-    /// until a later promote observes a high enough `last_processed`.
+    /// `promote_to_flat` drains only entries below the supplied cut;
+    /// unprocessed (in-flight) entries remain here until a later promote
+    /// observes a high enough cut.
     ///
     /// Stored as a `BTreeMap<key, positions>` so multiple positions for the
-    /// same key may coexist (the `positions` vec, ascending by
-    /// `IndexWalPosition`). Observable semantics treat the entry with the
-    /// largest `IndexWalPosition` — the last vec element — as the live value
-    /// for that key.
-    data: DataOverlay,
+    /// same key may coexist (the `positions` vec, ascending by tagged
+    /// position). Observable semantics treat the entry with the largest tagged
+    /// position — the last vec element — as the live value for that key.
+    data: DataOverlay<P>,
     /// Sum of unique key lengths currently in `data` (each key counted once,
     /// regardless of how many positions exist for it). Maintained
     /// incrementally where cheap, recomputed via `recount_data_stats`
@@ -54,31 +75,26 @@ pub struct IndexTable {
     dirty_count: usize,
     /// Primary storage for all entries in compact binary format.
     ///
-    /// Two formats depending on whether the key space uses fixed-length keys:
-    /// - Variable-length: `[count: u32][offsets: u32*count][key_len: u16][key][wal_offset: u64][encoded_len: u32]*`
-    /// - Fixed-length:    `[key (n)][wal_offset: u64][encoded_len: u32]*`
-    ///
-    /// `encoded_len` packs the entry kind into the top 2 bits of the length field
-    /// (bits 31-30: 0=Clean, 1=Modified, 2=Removed; bits 29-0: actual frame length).
-    /// This is valid because WAL frame sizes are always < 1 GiB (2^30), as asserted
-    /// in `Wal::multi_write`.
+    /// Two formats depending on whether the key space uses fixed-length keys
+    /// (see `flat.rs`); each row carries the key followed by `P::LENGTH` bytes
+    /// written by `IndexPosition::write_flat`. The native instantiation keeps
+    /// the historical `[wal_offset: u64][encoded_len: u32]` row unchanged.
     ///
     /// Stores Clean, Modified, and Removed entries. Entries in `data` (the write
     /// buffer) take priority over entries in `flat` for the same key.
     ///
     /// **Invariant: flat never holds an in-flight entry**, which is what
     /// `has_unprocessed` and `retain_unprocessed` rely on to treat it as fully
-    /// processed against any caller-supplied `last_processed`. Each of its
-    /// writers maintains this independently:
-    /// - `promote_to_flat` admits only entries with WAL `offset` strictly
-    ///   below the promote's `last_processed` threshold (monotonically
-    ///   non-decreasing across promotes).
+    /// processed against any caller-supplied cut. Each of its writers maintains
+    /// this independently:
+    /// - `promote_to_flat` admits only entries strictly below the promote's
+    ///   cut (monotonically non-decreasing across promotes).
     /// - `merge_dirty` → `fold_dirty_flat` folds a disk-loaded blob's flat
     ///   into this buffer — never into `data`. A blob carries no in-flight
     ///   entries: the flusher filters the merged table with `retain_processed`
     ///   before serializing, and the blob entries that can still sit at or
     ///   above a caller's frontier — relocated copies re-pointed to WAL-tail
-    ///   offsets and `INVALID`-sentinel tombstones — are durable in the blob
+    ///   positions and `INVALID`-sentinel tombstones — are durable in the blob
     ///   itself, so treating them as processed is sound.
     /// - WAL replay (`from_sorted_entries`) builds flat from replayed
     ///   entries, all below the post-replay frontier any later caller can
@@ -95,40 +111,45 @@ pub struct IndexTable {
     key_size: Option<usize>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IndexWalPosition {
-    pub(super) offset: u64,
-    pub(super) len: u32,
-    pub(super) kind: IndexEntryKind,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug, PartialOrd, Ord)]
-pub(super) enum IndexEntryKind {
-    Clean,
-    Modified,
-    Removed,
-}
-
-impl IndexEntryKind {
-    pub(super) fn to_u8(self) -> u8 {
-        match self {
-            IndexEntryKind::Clean => 0,
-            IndexEntryKind::Modified => 1,
-            IndexEntryKind::Removed => 2,
-        }
-    }
-
-    pub(super) fn from_u8(b: u8) -> Self {
-        match b {
-            1 => IndexEntryKind::Modified,
-            2 => IndexEntryKind::Removed,
-            _ => IndexEntryKind::Clean,
+impl<P: IndexPosition> Default for IndexTable<P> {
+    fn default() -> Self {
+        Self {
+            data: Default::default(),
+            key_bytes: 0,
+            dirty_count: 0,
+            flat: Bytes::default(),
+            key_size: None,
         }
     }
 }
 
-// Compile time check to ensure IndexWalPosition consumes the same amount of memory as WalPosition
-const _: [u8; size_of::<WalPosition>()] = [0u8; size_of::<IndexWalPosition>()];
+impl<P: IndexPosition> Clone for IndexTable<P> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            key_bytes: self.key_bytes,
+            dirty_count: self.dirty_count,
+            flat: self.flat.clone(),
+            key_size: self.key_size,
+        }
+    }
+}
+
+impl<P: IndexPosition> std::fmt::Debug for IndexTable<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexTable")
+            .field("data", &self.data)
+            .field("key_bytes", &self.key_bytes)
+            .field("dirty_count", &self.dirty_count)
+            .field("flat_len", &self.flat.len())
+            .field("key_size", &self.key_size)
+            .finish()
+    }
+}
+
+// Compile time check: the native tagged position keeps its historical size,
+// which is what makes `LargeTable::<WalPosition>` layout-identical to the base.
+const _: [u8; 16] = [0u8; size_of::<TaggedWalPosition>()];
 
 /// Adjust `dirty_count` when an entry transitions between clean and dirty states.
 /// Takes a direct reference to the counter to avoid borrow conflicts when `self.data` is held.
@@ -140,30 +161,43 @@ fn adjust_dirty_count(dirty_count: &mut usize, was_dirty: bool, is_dirty: bool) 
     }
 }
 
-/// Iterate one entry per key — the key and its latest (largest IWP) position.
+/// Iterate one entry per key — the key and its latest (largest) position.
 /// Each key's `positions` vec is kept ascending, so the latest is its last
 /// element. Keys are yielded in ascending order (`BTreeMap` iteration).
-pub(super) fn data_latest_per_key(
-    data: &DataOverlay,
-) -> impl Iterator<Item = (&Bytes, &IndexWalPosition)> + '_ {
+pub(super) fn data_latest_per_key<P: IndexPosition>(
+    data: &DataOverlay<P>,
+) -> impl Iterator<Item = (&Bytes, &IndexWalPosition<P>)> + '_ {
     data.iter()
         .map(|(k, positions)| (k, positions.last().expect("data positions are never empty")))
+}
+
+/// The tagged entry a disk tombstone decodes to.
+///
+/// Comparing a position to `P::INVALID` cannot recognise a disk tombstone: the
+/// native `from_disk` keeps the sentinel offset but rewrites its length word,
+/// so the decoded position differs from `P::INVALID` field-wise while still
+/// naming the sentinel. `from_disk_position(P::INVALID)` is that decoded form
+/// for every instantiation. Debug/test assertions only: it names a value, it
+/// is not on a production path.
+#[inline]
+fn disk_tombstone<P: IndexPosition>() -> IndexWalPosition<P> {
+    P::from_disk_position(P::INVALID)
 }
 
 // ---------------------------------------------------------------------------
 // IndexTable implementation
 // ---------------------------------------------------------------------------
 
-impl IndexTable {
-    pub fn insert(&mut self, k: Bytes, v: WalPosition) -> Option<WalPosition> {
-        self.checked_insert(k, IndexWalPosition::new_modified(v))
+impl<P: IndexPosition> IndexTable<P> {
+    pub fn insert(&mut self, k: Bytes, v: P) -> Option<P> {
+        self.checked_insert(k, P::tag(v, IndexEntryKind::Modified))
     }
 
-    pub fn remove(&mut self, k: Bytes, v: WalPosition) -> Option<WalPosition> {
-        self.checked_insert(k, IndexWalPosition::new_removed(v))
+    pub fn remove(&mut self, k: Bytes, v: P) -> Option<P> {
+        self.checked_insert(k, P::tag(v, IndexEntryKind::Removed))
     }
 
-    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition) -> Option<WalPosition> {
+    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition<P>) -> Option<P> {
         let k = k.into_owned();
         // Only update index entry if new entry has higher wal position then the previous entry
         // See test_concurrent_single_value_update for details how this is tested
@@ -179,28 +213,32 @@ impl IndexTable {
             && let Some(existing) = self.flat_binary_search(&k)
         {
             assert!(
-                existing.offset < v.offset,
+                P::tagged_position(existing).precedes(P::tagged_position(v)),
                 "Index WAL position must be increasing (flat)"
             );
         }
 
         match self.data.entry(k) {
             Entry::Occupied(mut oc) => {
-                // `positions` is non-empty and ascending by IWP, so the latest
-                // is its last element and the new (strictly greater) position
-                // appends in order.
+                // `positions` is non-empty and ascending by tagged position, so
+                // the latest is its last element and the new (strictly greater)
+                // position appends in order.
                 let prev = *oc.get().last().unwrap();
                 assert!(
-                    prev.offset < v.offset,
+                    P::tagged_position(prev).precedes(P::tagged_position(v)),
                     "Index WAL position must be increasing"
                 );
-                adjust_dirty_count(&mut self.dirty_count, !prev.is_clean(), !v.is_clean());
+                adjust_dirty_count(
+                    &mut self.dirty_count,
+                    !P::tagged_is_clean(prev),
+                    !P::tagged_is_clean(v),
+                );
                 oc.get_mut().push(v);
-                Some(prev.into_wal_position())
+                Some(P::tagged_into_position(prev))
             }
             Entry::Vacant(va) => {
                 self.key_bytes += va.key().len();
-                adjust_dirty_count(&mut self.dirty_count, false, !v.is_clean());
+                adjust_dirty_count(&mut self.dirty_count, false, !P::tagged_is_clean(v));
                 va.insert(smallvec![v]);
                 None
             }
@@ -252,12 +290,16 @@ impl IndexTable {
                 #[cfg(any(debug_assertions, feature = "test_methods"))]
                 if promote_to_clean
                     && let Some(found) = self.data_get_latest(k)
-                    && found.offset > v.offset
+                    && P::tagged_position(*v).precedes(P::tagged_position(found))
                 {
-                    panic!("found.offset {} > v.offset {}", found.offset, v.offset);
+                    panic!(
+                        "found.position {:?} > v.position {:?}",
+                        P::tagged_position(found),
+                        P::tagged_position(*v)
+                    );
                 }
-                let incoming = if promote_to_clean && !v.is_removed() {
-                    v.as_clean_modified()
+                let incoming = if promote_to_clean && !P::tagged_is_removed(*v) {
+                    P::tagged_as_clean_modified(*v)
                 } else {
                     *v
                 };
@@ -278,8 +320,8 @@ impl IndexTable {
         let flat_dirty = if !dirty.flat.is_empty() {
             self.fold_dirty_flat(dirty, promote_to_clean)
         } else {
-            FlatIter::new(&self.flat, self.key_size)
-                .filter(|(_, v)| !v.is_clean())
+            FlatIter::<P>::new(&self.flat, self.key_size)
+                .filter(|(_, v)| !P::tagged_is_clean(*v))
                 .count()
         };
 
@@ -289,7 +331,7 @@ impl IndexTable {
         let mut data_dirty = 0usize;
         for (k, v) in self.data_iter_latest() {
             key_bytes += k.len();
-            if !v.is_clean() {
+            if !P::tagged_is_clean(*v) {
                 data_dirty += 1;
             }
         }
@@ -327,22 +369,23 @@ impl IndexTable {
         // promotes to a var-len `flat` (`key_size = None`) even in a fixed-size
         // keyspace, while a disk-loaded base is fixed. Keys are length-consistent
         // for a keyspace, so `build_flat_bytes` re-encodes them either way.
-        let demote = |iwp: IndexWalPosition| {
-            if promote_to_clean && !iwp.is_removed() {
-                iwp.as_clean_modified()
+        let demote = |iwp: IndexWalPosition<P>| {
+            if promote_to_clean && !P::tagged_is_removed(iwp) {
+                P::tagged_as_clean_modified(iwp)
             } else {
                 iwp
             }
         };
 
         let self_flat = std::mem::take(&mut self.flat);
-        let mut self_it = FlatIter::new(&self_flat, self.key_size).peekable();
-        let mut dirty_it = FlatIter::new(&dirty.flat, dirty.key_size).peekable();
+        let mut self_it = FlatIter::<P>::new(&self_flat, self.key_size).peekable();
+        let mut dirty_it = FlatIter::<P>::new(&dirty.flat, dirty.key_size).peekable();
         // Upper bound on the merged entry count (O(1) flat_count each); sizing
         // up front avoids the reallocation growth of an unbounded push loop.
-        let cap = flat_count(&self_flat, self.key_size) + flat_count(&dirty.flat, dirty.key_size);
-        let mut merged: Vec<(Bytes, IndexWalPosition)> = Vec::with_capacity(cap);
-        let mut keys_from_dirty: Vec<(Bytes, IndexWalPosition)> = Vec::new();
+        let cap = flat_count::<P>(&self_flat, self.key_size)
+            + flat_count::<P>(&dirty.flat, dirty.key_size);
+        let mut merged: Vec<(Bytes, IndexWalPosition<P>)> = Vec::with_capacity(cap);
+        let mut keys_from_dirty: Vec<(Bytes, IndexWalPosition<P>)> = Vec::new();
 
         loop {
             let ord = match (self_it.peek(), dirty_it.peek()) {
@@ -372,17 +415,19 @@ impl IndexTable {
                         // Overlay is freshest; keep self.flat's entry beneath it.
                         merged.push((self_flat.slice_to_bytes(sk), sv));
                     } else {
-                        // Caller contract: `dirty` is the fresher side. Offsets
-                        // are comparable unless either side is a disk tombstone
-                        // (`INVALID` sentinel offset, meaningless for ordering).
+                        // Caller contract: `dirty` is the fresher side. A disk
+                        // tombstone carries the sentinel instead of a write
+                        // position, so it is not comparable; see
+                        // [`disk_tombstone`]. An in-memory delete keeps its real
+                        // write position and is still ordered.
                         debug_assert!(
-                            sv.offset == WalPosition::INVALID.offset()
-                                || dv.offset == WalPosition::INVALID.offset()
-                                || dv.offset >= sv.offset,
-                            "fold_dirty_flat: dirty.flat entry at offset {} is older than \
-                             self.flat entry at offset {} for the same key",
-                            dv.offset,
-                            sv.offset
+                            sv == disk_tombstone::<P>()
+                                || dv == disk_tombstone::<P>()
+                                || !P::tagged_position(dv).precedes(P::tagged_position(sv)),
+                            "fold_dirty_flat: dirty.flat entry at {:?} is older than \
+                             self.flat entry at {:?} for the same key",
+                            P::tagged_position(dv),
+                            P::tagged_position(sv)
                         );
                         let key = dirty.flat.slice_to_bytes(dk);
                         keys_from_dirty.push((key.clone(), dv));
@@ -399,14 +444,18 @@ impl IndexTable {
                 for e in &stale {
                     // Caller contract: any same-key `self.data` position is older
                     // than the dirty.flat value shadowing it — dropping a newer
-                    // one here would lose a write. (A tombstone winner sits at the
-                    // INVALID sentinel offset u64::MAX, trivially satisfying this.)
+                    // one here would lose a write. A disk tombstone winner is the
+                    // exception: it carries the sentinel instead of a write
+                    // position, so there is nothing to order it against (see
+                    // [`disk_tombstone`]); a sentinel that happens to sort below
+                    // a real position would otherwise fail a legitimate merge.
                     debug_assert!(
-                        e.offset <= winner.offset,
-                        "fold_dirty_flat: dropping self.data position at offset {} newer than \
-                         the dirty.flat value at offset {} that shadows it",
-                        e.offset,
-                        winner.offset
+                        winner == disk_tombstone::<P>()
+                            || !P::tagged_position(winner).precedes(P::tagged_position(*e)),
+                        "fold_dirty_flat: dropping self.data position at {:?} newer than \
+                         the dirty.flat value at {:?} that shadows it",
+                        P::tagged_position(*e),
+                        P::tagged_position(winner)
                     );
                 }
             }
@@ -414,8 +463,11 @@ impl IndexTable {
 
         // Tally the rebuilt flat's dirty entries here (cheap — over the decoded
         // tuples) so the caller need not re-decode `self.flat`.
-        let flat_dirty = merged.iter().filter(|(_, v)| !v.is_clean()).count();
-        self.flat = build_flat_bytes(merged, self.key_size);
+        let flat_dirty = merged
+            .iter()
+            .filter(|(_, v)| !P::tagged_is_clean(*v))
+            .count();
+        self.flat = build_flat_bytes::<P>(merged, self.key_size);
         flat_dirty
     }
 
@@ -426,11 +478,21 @@ impl IndexTable {
     ///
     /// Runs under the cell's row mutex at flush completion: one linear pass
     /// over the overlay plus, if a promote raced the flush, one `flat` rebuild.
-    pub fn unmerge_flushed(&mut self, original: &Self, last_processed: LastProcessed) {
+    ///
+    /// Identity here is **logical**: a flushed entry is matched to the live one
+    /// by `tagged_update_position` equality, which for a position whose `==`
+    /// ignores its address (an identity apart from the stored address) does not
+    /// see a changed address. That is correct only because in-place re-points
+    /// of positions a cell already holds (a relocation or compaction pass) are
+    /// serialised with flushes: they take the cell's row lock through
+    /// `LargeTable::lock_cell_waiting_for_flush`, so no re-point can land
+    /// between a flush snapshot and this completion. A re-point applied while a
+    /// flush is in flight would be unmerged as "already flushed" and lost.
+    pub fn unmerge_flushed(&mut self, original: &Self, cut: P::Cut) {
         // Walk original.data; remove matching entries from self.data. Entries
         // that promote_flat_job moved into self.flat since the snapshot are
         // recorded for the flat-rebuild pass below.
-        let mut pending_flat: HashMap<Bytes, IndexWalPosition> = HashMap::new();
+        let mut pending_flat: HashMap<Bytes, IndexWalPosition<P>> = HashMap::new();
         for (k, orig_positions) in original.data.iter() {
             // Per-key offsets must ascend strictly (unique): the
             // `processed_prefix` partition boundary and the cursor walk below
@@ -448,7 +510,7 @@ impl IndexTable {
             );
             // Entries at/above the frontier may have in-flight operations and
             // are not unmerged.
-            let processed = Self::processed_prefix(orig_positions, last_processed);
+            let processed = Self::processed_prefix(orig_positions, cut);
             if processed.is_empty() {
                 continue;
             }
@@ -470,15 +532,17 @@ impl IndexTable {
             // and wrongly identify distinct tombstones). Originals with no
             // live match were promoted into flat; route the newest of them to
             // the flat rebuild (flat holds one entry per key).
-            let mut last_unmatched: Option<IndexWalPosition> = None;
+            let mut last_unmatched: Option<IndexWalPosition<P>> = None;
             let mut oi = 0;
             live.retain(|sv| {
-                while oi < processed.len() && processed[oi].offset < sv.offset {
+                while oi < processed.len()
+                    && P::tagged_position(processed[oi]).precedes(P::tagged_position(*sv))
+                {
                     last_unmatched = Some(processed[oi]);
                     oi += 1;
                 }
                 if oi < processed.len()
-                    && processed[oi].into_update_position() == sv.into_update_position()
+                    && P::tagged_update_position(processed[oi]) == P::tagged_update_position(*sv)
                 {
                     oi += 1;
                     false
@@ -503,9 +567,9 @@ impl IndexTable {
             let orig_flat_bytes = original.flat.clone();
             let self_flat_bytes = std::mem::take(&mut self.flat);
             // Peekable iterator over original flat avoids a full Vec allocation.
-            let mut orig_it = FlatIter::new(&orig_flat_bytes, original.key_size).peekable();
-            let mut kept: Vec<(Bytes, IndexWalPosition)> = Vec::new();
-            for (sk, s_iwp) in FlatIter::new(&self_flat_bytes, self.key_size) {
+            let mut orig_it = FlatIter::<P>::new(&orig_flat_bytes, original.key_size).peekable();
+            let mut kept: Vec<(Bytes, IndexWalPosition<P>)> = Vec::new();
+            for (sk, s_iwp) in FlatIter::<P>::new(&self_flat_bytes, self.key_size) {
                 // Advance orig_it past entries with keys smaller than sk.
                 while orig_it.peek().map(|(ok, _)| *ok < sk).unwrap_or(false) {
                     orig_it.next();
@@ -517,21 +581,23 @@ impl IndexTable {
                 // so two distinct Removed entries don't compare equal.
                 let remove_by_flat = if orig_it.peek().map(|(ok, _)| *ok == sk).unwrap_or(false) {
                     let (_, o_iwp) = orig_it.next().unwrap();
-                    s_iwp.into_update_position() == o_iwp.into_update_position()
+                    P::tagged_update_position(s_iwp) == P::tagged_update_position(o_iwp)
                 } else {
                     false
                 };
                 let remove_by_data = !remove_by_flat
                     && pending_flat
                         .get(sk)
-                        .map(|o_iwp| s_iwp.into_update_position() == o_iwp.into_update_position())
+                        .map(|o_iwp| {
+                            P::tagged_update_position(s_iwp) == P::tagged_update_position(*o_iwp)
+                        })
                         .unwrap_or(false);
                 if !remove_by_flat && !remove_by_data {
                     // Zero-copy: sk is a subslice of self_flat_bytes.
                     kept.push((self_flat_bytes.slice_to_bytes(sk), s_iwp));
                 }
             }
-            self.flat = build_flat_bytes(kept, self.key_size);
+            self.flat = build_flat_bytes::<P>(kept, self.key_size);
         }
         let (kb, dc) = self.recount_stats();
         self.key_bytes = kb;
@@ -551,7 +617,7 @@ impl IndexTable {
     /// recomputed after.
     fn retain<F>(&mut self, f: F)
     where
-        F: FnMut(&Bytes, &IndexWalPosition) -> bool,
+        F: FnMut(&Bytes, &IndexWalPosition<P>) -> bool,
     {
         self.drop_data_keys(f);
         let (kb, dc) = self.recount_stats();
@@ -566,7 +632,7 @@ impl IndexTable {
     /// side (see `promote_to_flat_inner`).
     fn drop_data_keys<F>(&mut self, mut f: F)
     where
-        F: FnMut(&Bytes, &IndexWalPosition) -> bool,
+        F: FnMut(&Bytes, &IndexWalPosition<P>) -> bool,
     {
         // Keep a key (and thus all its positions) iff its latest IWP passes `f`.
         self.data
@@ -583,29 +649,28 @@ impl IndexTable {
     /// depends on caller context.
     fn retain_flat<F>(&mut self, mut keep: F)
     where
-        F: FnMut(&[u8], IndexWalPosition) -> Option<IndexWalPosition>,
+        F: FnMut(&[u8], IndexWalPosition<P>) -> Option<IndexWalPosition<P>>,
     {
         if self.flat.is_empty() {
             return;
         }
         let old_flat = std::mem::take(&mut self.flat);
-        let kept: Vec<(Bytes, IndexWalPosition)> = FlatIter::new(&old_flat, self.key_size)
+        let kept: Vec<(Bytes, IndexWalPosition<P>)> = FlatIter::<P>::new(&old_flat, self.key_size)
             .filter_map(|(k, iwp)| {
                 keep(k, iwp).map(|new_iwp| (old_flat.slice_to_bytes(k), new_iwp))
             })
             .collect();
-        self.flat = build_flat_bytes(kept, self.key_size);
+        self.flat = build_flat_bytes::<P>(kept, self.key_size);
     }
 
-    pub fn get(&self, k: &[u8]) -> Option<WalPosition> {
+    pub fn get(&self, k: &[u8]) -> Option<P> {
         // `data` (write buffer) takes priority over `flat` — its latest entry
         // for `k` shadows any flat entry for the same key.
         if let Some(p) = self.data_get_latest(k) {
-            return Some(p.into_wal_position());
+            return Some(P::tagged_into_position(p));
         }
         // Fall through to the flat array.
-        self.flat_binary_search(k)
-            .map(|iwp| iwp.into_wal_position())
+        self.flat_binary_search(k).map(P::tagged_into_position)
     }
 
     /// Checkpoint read: like [`Self::get`], but only considers index positions
@@ -627,22 +692,20 @@ impl IndexTable {
     /// value newer than the frontier ever reaches flat. (Relocated copies in
     /// flat can sit at offsets `>= last_processed`, but they hold the
     /// as-of-frontier value, so reading them unfiltered is still correct.)
-    pub fn get_at(&self, k: &[u8], last_processed: LastProcessed) -> Option<WalPosition> {
-        if let Some(p) = self.data_get_latest_processed(k, last_processed) {
-            return Some(p.into_wal_position());
+    pub fn get_at(&self, k: &[u8], cut: P::Cut) -> Option<P> {
+        if let Some(p) = self.data_get_latest_processed(k, cut) {
+            return Some(P::tagged_into_position(p));
         }
-        self.flat_binary_search(k)
-            .map(|iwp| iwp.into_wal_position())
+        self.flat_binary_search(k).map(P::tagged_into_position)
     }
 
-    /// Similar to `get`, but returns the WAL position of the update operation for both
+    /// Similar to `get`, but returns the position of the update operation for both
     /// inserts and deletes.
-    pub fn get_update_position(&self, k: &Bytes) -> Option<WalPosition> {
+    pub fn get_update_position(&self, k: &Bytes) -> Option<P> {
         if let Some(p) = self.data_get_latest(k) {
-            return Some(p.into_update_position());
+            return Some(P::tagged_update_position(p));
         }
-        self.flat_binary_search(k)
-            .map(|iwp| iwp.into_update_position())
+        self.flat_binary_search(k).map(P::tagged_update_position)
     }
 
     /// If prev is None returns first entry.
@@ -652,7 +715,7 @@ impl IndexTable {
     /// Returns tuple of a key, value.
     ///
     /// This works even if prev is set to Some(k), but the value at k does not exist (for ex. was deleted).
-    pub fn next_entry(&self, prev: Option<Bytes>, reverse: bool) -> Option<(Bytes, WalPosition)> {
+    pub fn next_entry(&self, prev: Option<Bytes>, reverse: bool) -> Option<(Bytes, P)> {
         self.next_entry_directional(prev.as_deref(), Direction::from_bool(reverse))
     }
 
@@ -673,8 +736,8 @@ impl IndexTable {
         &self,
         prev: Option<&[u8]>,
         direction: Direction,
-    ) -> Option<(Bytes, WalPosition)> {
-        let data_cand: Option<(&Bytes, &IndexWalPosition)> = match direction {
+    ) -> Option<(Bytes, P)> {
+        let data_cand: Option<(&Bytes, &IndexWalPosition<P>)> = match direction {
             Direction::Forward => self.data_next_forward(prev),
             Direction::Backward => self.data_next_reverse(prev),
         };
@@ -686,7 +749,7 @@ impl IndexTable {
 
         match (data_cand, flat_cand) {
             (None, None) => None,
-            (Some((bk, bv)), None) => Some((bk.clone(), bv.into_wal_position())),
+            (Some((bk, bv)), None) => Some((bk.clone(), P::tagged_into_position(*bv))),
             (None, Some((fk, fv))) => Some((fk, fv)),
             (Some((bk, bv)), Some((fk, fv))) => {
                 let cmp = bk.as_ref().cmp(fk.as_ref());
@@ -696,7 +759,7 @@ impl IndexTable {
                     Direction::Backward => cmp != Ordering::Less,
                 };
                 if data_wins {
-                    Some((bk.clone(), bv.into_wal_position()))
+                    Some((bk.clone(), P::tagged_into_position(*bv)))
                 } else {
                     Some((fk, fv))
                 }
@@ -715,13 +778,9 @@ impl IndexTable {
         &self,
         prev: Option<Bytes>,
         reverse: bool,
-        last_processed: LastProcessed,
-    ) -> Option<(Bytes, WalPosition)> {
-        self.next_entry_directional_at(
-            prev.as_deref(),
-            Direction::from_bool(reverse),
-            last_processed,
-        )
+        cut: P::Cut,
+    ) -> Option<(Bytes, P)> {
+        self.next_entry_directional_at(prev.as_deref(), Direction::from_bool(reverse), cut)
     }
 
     /// As-of-`last_processed` counterpart of [`Self::next_entry_directional`].
@@ -739,11 +798,11 @@ impl IndexTable {
         &self,
         prev: Option<&[u8]>,
         direction: Direction,
-        last_processed: LastProcessed,
-    ) -> Option<(Bytes, WalPosition)> {
-        let data_cand: Option<(Bytes, IndexWalPosition)> = match direction {
-            Direction::Forward => self.data_next_forward_at(prev, last_processed),
-            Direction::Backward => self.data_next_reverse_at(prev, last_processed),
+        cut: P::Cut,
+    ) -> Option<(Bytes, P)> {
+        let data_cand: Option<(Bytes, IndexWalPosition<P>)> = match direction {
+            Direction::Forward => self.data_next_forward_at(prev, cut),
+            Direction::Backward => self.data_next_reverse_at(prev, cut),
         };
 
         let flat_cand = match direction {
@@ -753,7 +812,7 @@ impl IndexTable {
 
         match (data_cand, flat_cand) {
             (None, None) => None,
-            (Some((bk, bv)), None) => Some((bk, bv.into_wal_position())),
+            (Some((bk, bv)), None) => Some((bk, P::tagged_into_position(bv))),
             (None, Some((fk, fv))) => Some((fk, fv)),
             (Some((bk, bv)), Some((fk, fv))) => {
                 let cmp = bk.as_ref().cmp(fk.as_ref());
@@ -763,7 +822,7 @@ impl IndexTable {
                     Direction::Backward => cmp != Ordering::Less,
                 };
                 if data_wins {
-                    Some((bk, bv.into_wal_position()))
+                    Some((bk, P::tagged_into_position(bv)))
                 } else {
                     Some((fk, fv))
                 }
@@ -789,14 +848,14 @@ impl IndexTable {
         self.data.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (Bytes, P)> + '_ {
         self.iter_inner(false)
     }
 
-    /// Same as `iter()` but yields tombstones as `(key, WalPosition::INVALID)`
+    /// Same as `iter()` but yields tombstones as `(key, P::INVALID)`
     /// instead of skipping them. Used by serializers that want to persist
     /// tombstones on disk (two-level LSM L0 over L1).
-    pub fn iter_with_tombstones(&self) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
+    pub fn iter_with_tombstones(&self) -> impl Iterator<Item = (Bytes, P)> + '_ {
         self.iter_inner(true)
     }
 
@@ -811,9 +870,9 @@ impl IndexTable {
     /// keys are `Bytes` clones (owner refcount bump). No per-entry heap copy of
     /// the key bytes is made, and the equal-key case folds the shadowing in
     /// directly rather than via a separate `data_contains_key` membership probe.
-    fn iter_combined(&self) -> impl Iterator<Item = (Bytes, IndexWalPosition)> + '_ {
+    fn iter_combined(&self) -> impl Iterator<Item = (Bytes, IndexWalPosition<P>)> + '_ {
         let flat = &self.flat;
-        let mut flat_it = FlatIter::new(flat, self.key_size).peekable();
+        let mut flat_it = FlatIter::<P>::new(flat, self.key_size).peekable();
         let mut data_it = self.data_iter_latest().peekable();
         std::iter::from_fn(move || {
             // Resolve to an owned `Ordering` first so the peek borrows end
@@ -846,19 +905,16 @@ impl IndexTable {
         })
     }
 
-    fn iter_inner(
-        &self,
-        include_tombstones: bool,
-    ) -> impl Iterator<Item = (Bytes, WalPosition)> + '_ {
+    fn iter_inner(&self, include_tombstones: bool) -> impl Iterator<Item = (Bytes, P)> + '_ {
         self.iter_combined().filter_map(move |(k, iwp)| {
-            let pos = iwp.into_wal_position();
+            let pos = P::tagged_into_position(iwp);
             (include_tombstones || pos.is_valid()).then_some((k, pos))
         })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = Bytes> + '_ {
         self.iter_combined()
-            .filter(|(_, iwp)| !iwp.is_removed())
+            .filter(|(_, iwp)| !P::tagged_is_removed(*iwp))
             .map(|(k, _)| k)
     }
 
@@ -883,10 +939,10 @@ impl IndexTable {
         if self.flat.is_empty() {
             // Fast path: only data entries (one per unique key, latest position).
             for (key, value) in self.data_iter_latest() {
-                let pos = if value.is_removed() {
-                    WalPosition::INVALID
+                let pos = if P::tagged_is_removed(*value) {
+                    P::INVALID
                 } else {
-                    value.into_update_position()
+                    P::tagged_update_position(*value)
                 };
                 self.write_key_val(ks, out, visitor, key, pos);
             }
@@ -897,11 +953,11 @@ impl IndexTable {
         let flat = &self.flat[..];
 
         // Keep a single stateful FlatIter alive for O(N) sequential traversal.
-        let mut flat_iter = FlatIter::new(flat, self.key_size);
-        let mut cur_flat: Option<(Vec<u8>, IndexWalPosition)> =
+        let mut flat_iter = FlatIter::<P>::new(flat, self.key_size);
+        let mut cur_flat: Option<(Vec<u8>, IndexWalPosition<P>)> =
             flat_iter.next().map(|(k, iwp)| (k.to_vec(), iwp));
         let mut data_it = self.data_iter_latest();
-        let mut cur_data: Option<(&Bytes, &IndexWalPosition)> = data_it.next();
+        let mut cur_data: Option<(&Bytes, &IndexWalPosition<P>)> = data_it.next();
 
         loop {
             let cmp = match (&cur_flat, cur_data) {
@@ -928,10 +984,10 @@ impl IndexTable {
                 }
             };
 
-            let pos = if iwp.is_removed() {
-                WalPosition::INVALID
+            let pos = if P::tagged_is_removed(iwp) {
+                P::INVALID
             } else {
-                iwp.into_update_position()
+                P::tagged_update_position(iwp)
             };
             self.write_key_val(ks, out, visitor, &key, pos);
 
@@ -950,7 +1006,7 @@ impl IndexTable {
         out: &mut BytesMut,
         visitor: &mut impl IndexSerializationVisitor,
         key: &[u8],
-        pos: WalPosition,
+        pos: P,
     ) {
         visitor.add_key(key, out.len());
         if let Some(expected_size) = ks.index_key_size() {
@@ -974,7 +1030,7 @@ impl IndexTable {
             serialize_u16_varint(key.len() as u16, out);
         }
         out.put_slice(key);
-        pos.write_to_buf(out);
+        pos.write_blob(out);
     }
 
     // -------------------------------------------------------------------------
@@ -983,50 +1039,47 @@ impl IndexTable {
     // The on-disk variable-length key section format written by
     // LookupHeaderIndex is identical to the in-memory flat buffer format used
     // by IndexTable.  These thin wrappers expose the flat-buffer primitives
-    // (which return/accept IndexWalPosition) as a WalPosition-based API that
-    // lookup_header.rs can use without touching IndexWalPosition internals.
+    // (which return/accept IndexWalPosition<P>) as a WalPosition-based API that
+    // lookup_header.rs can use without touching IndexWalPosition<P> internals.
     // -------------------------------------------------------------------------
 
     /// Returns the number of entries in a variable-length flat section.
     pub(super) fn flat_varlen_count(buffer: &[u8]) -> usize {
-        flat_count(buffer, None)
+        flat_count::<P>(buffer, None)
     }
 
-    /// Returns the key slice and WAL position for the entry at `idx`. O(1) via the offset table.
-    pub(super) fn flat_varlen_entry_at(buffer: &[u8], idx: usize) -> (&[u8], WalPosition) {
-        let (key, iwp) = flat_entry_at(buffer, None, idx);
-        (key, iwp.into_update_position())
+    /// Returns the key slice and position for the entry at `idx`. O(1) via the offset table.
+    pub(super) fn flat_varlen_entry_at(buffer: &[u8], idx: usize) -> (&[u8], P) {
+        let (key, iwp) = flat_entry_at::<P>(buffer, None, idx);
+        (key, P::tagged_update_position(iwp))
     }
 
     /// Lower bound: smallest index `i` where `buffer[i].key >= key`.
     pub(super) fn flat_varlen_lower_bound(buffer: &[u8], key: &[u8]) -> usize {
-        flat_lower_bound(buffer, None, key)
+        flat_lower_bound::<P>(buffer, None, key)
     }
 
     /// Binary-search a variable-length flat section for `key`.
-    /// Returns the WAL position if found, None otherwise.
-    pub(super) fn flat_varlen_lookup(buffer: &[u8], key: &[u8]) -> Option<WalPosition> {
-        let idx = flat_lower_bound(buffer, None, key);
-        if idx >= flat_count(buffer, None) {
+    /// Returns the position if found, None otherwise.
+    pub(super) fn flat_varlen_lookup(buffer: &[u8], key: &[u8]) -> Option<P> {
+        let idx = flat_lower_bound::<P>(buffer, None, key);
+        if idx >= flat_count::<P>(buffer, None) {
             return None;
         }
-        let (found_key, iwp) = flat_entry_at(buffer, None, idx);
-        (found_key == key).then(|| iwp.into_update_position())
+        let (found_key, iwp) = flat_entry_at::<P>(buffer, None, idx);
+        (found_key == key).then(|| P::tagged_update_position(iwp))
     }
 
-    /// Append `(key, WalPosition)` pairs as a variable-length flat section into `out`.
-    /// `WalPosition::INVALID` entries are written as tombstones (when the caller
+    /// Append `(key, position)` pairs as a variable-length flat section into `out`.
+    /// `P::INVALID` entries are written as tombstones (when the caller
     /// wants to preserve them); otherwise all entries are stored as clean.
     /// Writes directly into the caller's buffer, avoiding a separate allocation.
-    pub(super) fn append_flat_varlen_section(
-        entries: Vec<(Bytes, WalPosition)>,
-        out: &mut BytesMut,
-    ) {
-        let iwp_entries: Vec<(Bytes, IndexWalPosition)> = entries
+    pub(super) fn append_flat_varlen_section(entries: Vec<(Bytes, P)>, out: &mut BytesMut) {
+        let iwp_entries: Vec<(Bytes, IndexWalPosition<P>)> = entries
             .into_iter()
-            .map(|(k, pos)| (k, IndexWalPosition::from_disk(pos)))
+            .map(|(k, pos)| (k, P::from_disk_position(pos)))
             .collect();
-        append_flat_varlen(&iwp_entries, out);
+        append_flat_varlen::<P>(&iwp_entries, out);
     }
 
     /// Constructs a flat-backed IndexTable by wrapping a pre-built varlen flat
@@ -1051,9 +1104,12 @@ impl IndexTable {
     /// into a HashMap, then converts them in bulk via a single sort + flat
     /// build. `data` is empty; `key_size` is `None` (varlen flat), matching
     /// what `promote_to_flat` produces from a default IndexTable.
-    pub(crate) fn from_sorted_entries(entries: Vec<(Bytes, IndexWalPosition)>) -> Self {
-        let dirty_count = entries.iter().filter(|(_, iwp)| !iwp.is_clean()).count();
-        let flat = build_flat_bytes(entries, None);
+    pub(crate) fn from_sorted_entries(entries: Vec<(Bytes, IndexWalPosition<P>)>) -> Self {
+        let dirty_count = entries
+            .iter()
+            .filter(|(_, iwp)| !P::tagged_is_clean(*iwp))
+            .count();
+        let flat = build_flat_bytes::<P>(entries, None);
         IndexTable {
             data: BTreeMap::new(),
             key_bytes: 0,
@@ -1087,7 +1143,7 @@ impl IndexTable {
     }
 
     fn deserialize_fixed_size(key_size: usize, bytes: Bytes) -> Self {
-        let elem_size = key_size + WalPosition::LENGTH;
+        let elem_size = key_size + P::LENGTH;
         assert_eq!(
             bytes.len() % elem_size,
             0,
@@ -1097,10 +1153,10 @@ impl IndexTable {
         );
 
         // Single pass: validate sortedness + detect on-disk tombstones.
-        // On-disk tombstones carry `offset = u64::MAX`; the flat encoding of a
-        // tombstone uses `encoded_len = 0x8000_0000` (kind=Removed packed into
-        // the top 2 bits over `len = 0`), so the two layouts differ and we
-        // must fall back to the decode-and-rebuild path in that case.
+        // An on-disk tombstone is the `P::INVALID` sentinel; its flat encoding
+        // differs from the on-disk one (native: `encoded_len = u32::MAX` on
+        // disk vs `0x8000_0000` in flat), so we fall back to the
+        // decode-and-rebuild path when one is present.
         let mut has_tombstone = false;
         let mut prev_key: Option<&[u8]> = None;
         for chunk in bytes.chunks_exact(elem_size) {
@@ -1115,13 +1171,16 @@ impl IndexTable {
                 }
             }
             prev_key = Some(key);
-            let offset = u64::from_be_bytes(chunk[key_size..key_size + 8].try_into().unwrap());
-            if offset == u64::MAX {
+            let mut row = &chunk[key_size..];
+            let position = P::read_blob(&mut row);
+            if !position.is_valid() {
                 has_tombstone = true;
             }
         }
 
         if !has_tombstone {
+            #[cfg(test)]
+            ZERO_COPY_LOADS.with(|loads| loads.set(loads.get() + 1));
             return IndexTable {
                 data: BTreeMap::new(),
                 key_bytes: 0,
@@ -1131,18 +1190,18 @@ impl IndexTable {
             };
         }
 
-        // Slow path: blob contains tombstones whose on-disk encoding
-        // (`encoded_len = u32::MAX`) differs from the flat encoding
-        // (`0x8000_0000`). Decode per-entry and rebuild via build_flat_bytes.
+        // Slow path: blob contains tombstones whose on-disk encoding differs
+        // from the flat encoding. Decode per-entry and rebuild via
+        // build_flat_bytes.
         let mut sb = SliceBuf::new(bytes);
-        let mut entries: Vec<(Bytes, IndexWalPosition)> =
+        let mut entries: Vec<(Bytes, IndexWalPosition<P>)> =
             Vec::with_capacity(sb.remaining() / elem_size);
         while sb.has_remaining() {
             let key = sb.slice_n(key_size);
-            let value = WalPosition::read_from_buf(&mut sb);
-            entries.push((key, IndexWalPosition::from_disk(value)));
+            let value = P::read_blob(&mut sb);
+            entries.push((key, P::from_disk_position(value)));
         }
-        let flat = build_flat_bytes(entries, Some(key_size));
+        let flat = build_flat_bytes::<P>(entries, Some(key_size));
         IndexTable {
             data: BTreeMap::new(),
             key_bytes: 0,
@@ -1154,12 +1213,12 @@ impl IndexTable {
 
     fn deserialize_varlen(bytes: Bytes) -> Self {
         let mut bytes = SliceBuf::new(bytes);
-        let mut entries: Vec<(Bytes, IndexWalPosition)> = Vec::new();
+        let mut entries: Vec<(Bytes, IndexWalPosition<P>)> = Vec::new();
         while bytes.has_remaining() {
             let key_len = deserialize_u16_varint(&mut bytes);
             let key = bytes.slice_n(key_len as usize);
-            let value = WalPosition::read_from_buf(&mut bytes);
-            let iwp = IndexWalPosition::from_disk(value);
+            let value = P::read_blob(&mut bytes);
+            let iwp = P::from_disk_position(value);
             if let Some((prev_key, _)) = entries.last() {
                 match prev_key.as_ref().cmp(key.as_ref()) {
                     Ordering::Less => {}
@@ -1171,7 +1230,7 @@ impl IndexTable {
             }
             entries.push((key, iwp));
         }
-        let flat = build_flat_bytes(entries, None);
+        let flat = build_flat_bytes::<P>(entries, None);
         IndexTable {
             data: BTreeMap::new(),
             key_bytes: 0,
@@ -1221,14 +1280,14 @@ impl IndexTable {
         // logical "view" only ever exposed the latest, and clean_self is the
         // resting point where we settle to one entry per key.
         let mut tombstoned: HashSet<Bytes> = HashSet::new();
-        let mut new_data: DataOverlay = BTreeMap::new();
-        for (k, v) in data_latest_per_key(&self.data) {
-            match v.kind {
+        let mut new_data: DataOverlay<P> = BTreeMap::new();
+        for (k, v) in data_latest_per_key::<P>(&self.data) {
+            match P::kind(*v) {
                 IndexEntryKind::Clean => {
                     new_data.insert(k.clone(), smallvec![*v]);
                 }
                 IndexEntryKind::Modified => {
-                    new_data.insert(k.clone(), smallvec![v.as_clean_modified()]);
+                    new_data.insert(k.clone(), smallvec![P::tagged_as_clean_modified(*v)]);
                 }
                 IndexEntryKind::Removed => {
                     tombstoned.insert(k.clone());
@@ -1239,10 +1298,10 @@ impl IndexTable {
 
         // Rebuild flat: convert Modified→Clean, drop Removed (in flat or shadowed by data).
         self.retain_flat(|k, mut iwp| {
-            if iwp.is_removed() || tombstoned.contains(k) {
+            if P::tagged_is_removed(iwp) || tombstoned.contains(k) {
                 None
             } else {
-                iwp.kind = IndexEntryKind::Clean;
+                iwp = P::with_kind(iwp, IndexEntryKind::Clean);
                 Some(iwp)
             }
         });
@@ -1254,57 +1313,53 @@ impl IndexTable {
         debug_assert_eq!(self.dirty_count, 0);
     }
 
-    /// Retain only unprocessed entries (those with WAL offset >= last_processed).
+    /// Retain only unprocessed entries (those not below the cut).
     ///
     /// By the `flat` field invariant (no in-flight entries, see its doc),
     /// `flat` is cleared unconditionally. The BTreeMap still holds entries on
     /// both sides of the boundary and is filtered.
-    pub fn retain_unprocessed(&mut self, last_processed: LastProcessed) {
+    pub fn retain_unprocessed(&mut self, cut: P::Cut) {
         self.flat = Bytes::default();
-        self.retain(|_, v| !last_processed.is_processed(v));
+        self.retain(|_, v| !P::tagged_position(*v).below(cut));
     }
 
     /// Returns true if this index table has any unprocessed entries.
     ///
     /// Only the data set (write buffer) needs to be checked: by the `flat`
     /// field invariant (no in-flight entries, see its doc), flat contributes
-    /// no unprocessed entries against any caller-supplied `last_processed`.
-    pub fn has_unprocessed(&self, last_processed: LastProcessed) -> bool {
+    /// no unprocessed entries against any caller-supplied cut.
+    pub fn has_unprocessed(&self, cut: P::Cut) -> bool {
         self.data
             .values()
             .flatten()
-            .any(|v| !last_processed.is_processed(v))
+            .any(|v| !P::tagged_position(*v).below(cut))
     }
 
-    /// Retain only entries with offset >= last_processed. Applied to both flat and data.
+    /// Retain only entries at or above the cut. Applied to both flat and data.
     /// `retain_flat` runs first so `retain`'s internal recount sees the final flat.
-    pub fn retain_above_position(&mut self, last_processed: u64) {
-        self.retain_flat(|_, iwp| (iwp.offset >= last_processed).then_some(iwp));
-        self.retain(|_, v| v.offset >= last_processed);
+    pub fn retain_above_position(&mut self, cut: P::Cut) {
+        self.retain_flat(|_, iwp| (!P::tagged_position(iwp).below(cut)).then_some(iwp));
+        self.retain(|_, v| !P::tagged_position(*v).below(cut));
     }
 
-    /// Turns every live entry with offset < `position` into a tombstone at its
-    /// own position. Existing tombstones and entries at or above `position`
-    /// stay. Returns whether any entry changed. Used over a deeper level,
-    /// where dropping the entry would expose an older version of its key.
-    pub fn tombstone_below_position(&mut self, position: u64) -> bool {
-        let tombstone = |iwp: IndexWalPosition| IndexWalPosition {
-            kind: IndexEntryKind::Removed,
-            ..iwp
-        };
+    /// Turns every live entry below `cut` into a tombstone at its own position.
+    /// Existing tombstones and entries at or above `cut` stay. Returns whether
+    /// any entry changed. Used over a deeper level, where dropping the entry
+    /// would expose an older version of its key.
+    pub fn tombstone_below_position(&mut self, cut: P::Cut) -> bool {
         let mut changed = false;
         self.retain_flat(|_, iwp| {
-            if iwp.offset < position && !iwp.is_removed() {
+            if P::tagged_position(iwp).below(cut) && !P::tagged_is_removed(iwp) {
                 changed = true;
-                Some(tombstone(iwp))
+                Some(P::with_kind(iwp, IndexEntryKind::Removed))
             } else {
                 Some(iwp)
             }
         });
         for positions in self.data.values_mut() {
             let latest = *positions.last().expect("data positions are never empty");
-            if latest.offset < position && !latest.is_removed() {
-                *positions = smallvec![tombstone(latest)];
+            if P::tagged_position(latest).below(cut) && !P::tagged_is_removed(latest) {
+                *positions = smallvec![P::with_kind(latest, IndexEntryKind::Removed)];
                 changed = true;
             }
         }
@@ -1335,7 +1390,7 @@ impl IndexTable {
         // Collect all valid unique keys from both flat and data in sorted order.
         let all_keys: Vec<Bytes> = self
             .iter_combined()
-            .filter(|(_, iwp)| !iwp.is_removed())
+            .filter(|(_, iwp)| !P::tagged_is_removed(*iwp))
             .map(|(k, _)| k)
             .collect();
 
@@ -1351,13 +1406,13 @@ impl IndexTable {
         // retained, every position for the key is dropped — preventing an
         // older Removed tuple from surviving as an orphan shadow.
         self.retain_flat(|k, iwp| {
-            if iwp.is_removed() || to_retain.contains(k) {
+            if P::tagged_is_removed(iwp) || to_retain.contains(k) {
                 Some(iwp)
             } else {
                 None
             }
         });
-        self.retain(|k, v| v.is_removed() || to_retain.contains(k));
+        self.retain(|k, v| P::tagged_is_removed(*v) || to_retain.contains(k));
     }
 
     /// Drop every post-frontier overlay position (offset `>= last_processed`)
@@ -1372,32 +1427,38 @@ impl IndexTable {
     /// merge parks an as-of value at a WAL-tail offset (`>= last_processed`) in
     /// flat that re-filtering would wrongly drop. It is per position, not per
     /// key — a key may carry both a below- and a post-frontier write.
-    pub fn retain_processed(&mut self, last_processed: LastProcessed) {
-        // The offset filter is only sound because `data` holds exclusively
-        // genuine WAL-offset writes. Disk-derived entries (notably tombstones,
-        // stored with the INVALID sentinel offset u64::MAX) live in `flat` and
-        // are never lifted here — see `merge_dirty`. Were such an entry present
-        // its sentinel offset would read as "post-frontier" and be dropped,
-        // resurrecting the value it shadows.
+    pub fn retain_processed(&mut self, cut: P::Cut) {
+        // The frontier filter is only sound because `data` holds exclusively
+        // genuine WAL writes. Disk-derived entries (notably tombstones, stored
+        // at the INVALID sentinel position) live in `flat` and are never lifted
+        // here — see `merge_dirty`. Were such an entry present its sentinel
+        // position would read as "post-frontier" and be dropped, resurrecting
+        // the value it shadows.
         //
         // The assert below cannot catch every violation: `apply_update` lifts
-        // re-pointed relocated copies into `data` at genuine WAL-tail offsets
-        // (>= the frontier), which this filter would also wrongly drop. That is
-        // an ordering requirement on the flush path — this filter must run
-        // before `RelocationUpdates::apply`, never after (see `flusher.rs`).
+        // re-pointed relocated copies into `data` at genuine WAL-tail positions
+        // (not below the frontier), which this filter would also wrongly drop.
+        // That is an ordering requirement on the flush path — this filter must
+        // run before `RelocationUpdates::apply`, never after (see `flusher.rs`).
+        //
+        // The disk tombstone is recognised as the tagged form
+        // [`disk_tombstone`] names, not by `P::INVALID`: the native `from_disk`
+        // normalises the sentinel's length word. A `Removed` kind alone proves
+        // nothing here — an in-memory delete carries a genuine write position
+        // and belongs in `data`.
         debug_assert!(
             self.data
                 .values()
                 .flatten()
-                .all(|v| v.offset() != WalPosition::INVALID.offset()),
-            "disk-origin (INVALID-offset) entry found in data overlay — \
+                .all(|v| *v != disk_tombstone::<P>() && P::tagged_position(*v).is_valid()),
+            "disk-origin (INVALID-position) entry found in data overlay — \
              violates the invariant that disk entries live only in flat"
         );
         // Per position, not per key — a key may carry both a below- and a
         // post-frontier write; drop only the post-frontier ones, then drop any
         // key left with no positions.
         self.data.retain(|_, positions| {
-            positions.retain(|v| last_processed.is_processed(v));
+            positions.retain(|v| P::tagged_position(*v).below(cut));
             !positions.is_empty()
         });
         let (kb, dc) = self.recount_stats();
@@ -1419,14 +1480,14 @@ impl IndexTable {
     /// `as_of` is disk-loaded (flat-only). Post-frontier tuples are re-inserted
     /// raw, bypassing `checked_insert`'s increasing-offset assertion — a relocated
     /// flat copy can transiently sit above a post-frontier write for the same key.
-    pub fn rebase_on_as_of(&mut self, as_of: IndexTable, last_processed: LastProcessed) {
-        let post_frontier: Vec<(Bytes, IndexWalPosition)> = self
+    pub fn rebase_on_as_of(&mut self, as_of: IndexTable<P>, cut: P::Cut) {
+        let post_frontier: Vec<(Bytes, IndexWalPosition<P>)> = self
             .data
             .iter()
             .flat_map(|(k, positions)| {
                 positions
                     .iter()
-                    .filter(|v| !last_processed.is_processed(*v))
+                    .filter(|v| !P::tagged_position(**v).below(cut))
                     .map(move |v| (k.clone(), *v))
             })
             .collect();
@@ -1444,12 +1505,16 @@ impl IndexTable {
     /// Apply given update function to a value with a given key.
     /// If the key does not exist, this function completes without calling the update function.
     /// Operates on the latest position for the key.
-    pub fn apply_update(&mut self, key: &[u8], update: impl FnOnce(&mut IndexWalPosition)) {
+    pub fn apply_update(&mut self, key: &[u8], update: impl FnOnce(&mut IndexWalPosition<P>)) {
         if let Some(latest) = self.data_get_latest(key) {
-            let was_dirty = !latest.is_clean();
+            let was_dirty = !P::tagged_is_clean(latest);
             let mut new_iwp = latest;
             update(&mut new_iwp);
-            adjust_dirty_count(&mut self.dirty_count, was_dirty, !new_iwp.is_clean());
+            adjust_dirty_count(
+                &mut self.dirty_count,
+                was_dirty,
+                !P::tagged_is_clean(new_iwp),
+            );
             // Replace the latest position (the vec's last element) with the
             // updated one, keeping the vec ordered. The update re-points to a
             // fresh, strictly-greater WAL offset, so `new_iwp` always inserts as
@@ -1482,11 +1547,11 @@ impl IndexTable {
             // never rewrites), violating the invariant that disk entries live
             // only in flat. Lifting an unchanged entry is a no-op for reads
             // anyway — the data copy would just duplicate the flat value.
-            if iwp == original {
+            if P::tagged_same_physical(iwp, original) {
                 return;
             }
-            let was_dirty = !original.is_clean();
-            adjust_dirty_count(&mut self.dirty_count, was_dirty, !iwp.is_clean());
+            let was_dirty = !P::tagged_is_clean(original);
+            adjust_dirty_count(&mut self.dirty_count, was_dirty, !P::tagged_is_clean(iwp));
             let key_bytes = Bytes::from(key.to_vec());
             self.key_bytes += key_bytes.len();
             // The key is absent from `data` (we reached the flat branch), so the
@@ -1540,18 +1605,18 @@ impl IndexTable {
     /// Whether [`Self::promote_to_flat`] would drain this table. Lets
     /// `promote_flat_job` skip the deep clone of tables a promote would leave
     /// unchanged.
-    pub fn should_promote_to_flat(&self, last_processed: LastProcessed) -> bool {
-        self.should_promote(Self::PROMOTE_THRESHOLD, last_processed)
+    pub fn should_promote_to_flat(&self, cut: P::Cut) -> bool {
+        self.should_promote(Self::PROMOTE_THRESHOLD, cut)
     }
 
     /// The promote trigger: unique-key count above `key_threshold`, or a
     /// drainable position backlog above `PROMOTE_POSITIONS_THRESHOLD`. The
     /// backlog scan only runs under the key threshold, so it stays short.
-    fn should_promote(&self, key_threshold: usize, last_processed: LastProcessed) -> bool {
+    fn should_promote(&self, key_threshold: usize, cut: P::Cut) -> bool {
         if self.data_unique_key_count() > key_threshold {
             return true;
         }
-        self.drainable_position_count(last_processed) > Self::PROMOTE_POSITIONS_THRESHOLD
+        self.drainable_position_count(cut) > Self::PROMOTE_POSITIONS_THRESHOLD
     }
 
     /// Positions a promote would drain from `data`: a key with an in-flight
@@ -1562,12 +1627,12 @@ impl IndexTable {
     /// position on both sides (`merge_walk`'s data filter in flat.rs,
     /// `drop_data_keys` in `promote_to_flat_unconditionally`); counting
     /// per-position would fire promotes that drain less than counted.
-    fn drainable_position_count(&self, last_processed: LastProcessed) -> usize {
+    fn drainable_position_count(&self, cut: P::Cut) -> usize {
         self.data
             .values()
             .filter(|positions| {
                 let latest = positions.last().expect("data positions are never empty");
-                last_processed.is_processed(latest)
+                P::tagged_position(*latest).below(cut)
             })
             .map(|positions| positions.len())
             .sum()
@@ -1579,8 +1644,8 @@ impl IndexTable {
     /// flat; unprocessed ones stay in the BTree. This is the promote-side
     /// enforcement of the unprocessed-write retention invariant — see the
     /// `crate::checkpoint` module docs.
-    pub fn promote_to_flat(&mut self, last_processed: LastProcessed) -> bool {
-        self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD, last_processed)
+    pub fn promote_to_flat(&mut self, cut: P::Cut) -> bool {
+        self.promote_to_flat_inner(Self::PROMOTE_THRESHOLD, cut)
     }
 
     /// Test-only variant that bypasses `PROMOTE_THRESHOLD` but still respects
@@ -1591,18 +1656,18 @@ impl IndexTable {
     /// `promote_flat_job` uses in production. Callers must capture
     /// `last_processed` the same way prod does (see `promote_flat_job`).
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn promote_to_flat_force(&mut self, last_processed: LastProcessed) -> bool {
-        self.promote_to_flat_inner(0, last_processed)
+    pub fn promote_to_flat_force(&mut self, cut: P::Cut) -> bool {
+        self.promote_to_flat_inner(0, cut)
     }
 
-    fn promote_to_flat_inner(&mut self, threshold: usize, last_processed: LastProcessed) -> bool {
+    fn promote_to_flat_inner(&mut self, threshold: usize, cut: P::Cut) -> bool {
         // Cheap cap (see `should_promote`). When the key trigger fires but
         // every latest entry is unprocessed, the drain is a no-op (rare; not
         // worth a separate scan).
-        if !self.should_promote(threshold, last_processed) {
+        if !self.should_promote(threshold, cut) {
             return false;
         }
-        self.promote_to_flat_unconditionally(last_processed);
+        self.promote_to_flat_unconditionally(cut);
         true
     }
 
@@ -1610,9 +1675,9 @@ impl IndexTable {
     /// [`Self::should_promote_to_flat`] on the same content and frontier.
     /// Calling it when nothing is drainable is sound but rebuilds `flat` for
     /// no gain.
-    pub fn promote_to_flat_unconditionally(&mut self, last_processed: LastProcessed) {
+    pub fn promote_to_flat_unconditionally(&mut self, cut: P::Cut) {
         let (new_flat, flat_dirty) =
-            merge_into_flat(&self.flat, self.key_size, &self.data, last_processed);
+            merge_into_flat::<P>(&self.flat, self.key_size, &self.data, cut);
         self.flat = new_flat;
         // Per-key: if the latest entry was promoted (its offset < last_processed),
         // discard ALL positions for that key from data. Otherwise (latest is
@@ -1621,7 +1686,7 @@ impl IndexTable {
         // `merge_into_flat` already returned `flat_dirty` for the new flat, so
         // recount only the data side rather than re-scanning the (now larger)
         // flat via the full `retain`/`recount_stats` path.
-        self.drop_data_keys(|_, v| !last_processed.is_processed(v));
+        self.drop_data_keys(|_, v| !P::tagged_position(*v).below(cut));
         let (data_key_bytes, data_dirty) = self.recount_data_stats();
         self.key_bytes = data_key_bytes;
         self.dirty_count = flat_dirty + data_dirty;
@@ -1636,10 +1701,10 @@ impl IndexTable {
     // rest of the impl assumes read that last element.
     // ---------------------------------------------------------------------------
 
-    /// Latest `IndexWalPosition` recorded in `data` for `key`, or `None` if no
+    /// Latest `IndexWalPosition<P>` recorded in `data` for `key`, or `None` if no
     /// position exists for that key. Single map descent; `Bytes: Borrow<[u8]>`
     /// means the borrowed-slice lookup needs no key allocation.
-    fn data_get_latest(&self, key: &[u8]) -> Option<IndexWalPosition> {
+    fn data_get_latest(&self, key: &[u8]) -> Option<IndexWalPosition<P>> {
         self.data
             .get(key)
             .map(|positions| *positions.last().expect("data positions are never empty"))
@@ -1650,7 +1715,7 @@ impl IndexTable {
     /// key's entry if absent. Used by merge/rebase paths where the incoming
     /// position is not guaranteed to be the largest for the key (the hot insert
     /// path appends directly in `checked_insert`).
-    fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition) {
+    fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition<P>) {
         let positions = self.data.entry(key).or_default();
         crate::index::versioned_overlay::insert_unique_by(positions, iwp, Ord::cmp);
     }
@@ -1659,12 +1724,9 @@ impl IndexTable {
     /// `last_processed`: positions ascend by `(offset, ..)` and
     /// `is_processed` depends only on `offset`, so processed positions
     /// always form a prefix.
-    fn processed_prefix(
-        positions: &[IndexWalPosition],
-        last_processed: LastProcessed,
-    ) -> &[IndexWalPosition] {
+    fn processed_prefix(positions: &[IndexWalPosition<P>], cut: P::Cut) -> &[IndexWalPosition<P>] {
         crate::index::versioned_overlay::matching_prefix(positions, |v| {
-            last_processed.is_processed(v)
+            P::tagged_position(*v).below(cut)
         })
     }
 
@@ -1673,23 +1735,19 @@ impl IndexTable {
     /// overlay; `unmerge_flushed` asserts it where a violation would
     /// silently corrupt its walk.
     #[cfg(any(debug_assertions, feature = "test_methods"))]
-    fn offsets_strictly_ascending(positions: &[IndexWalPosition]) -> bool {
-        positions.windows(2).all(|w| w[0].offset < w[1].offset)
+    fn offsets_strictly_ascending(positions: &[IndexWalPosition<P>]) -> bool {
+        positions
+            .windows(2)
+            .all(|w| P::tagged_position(w[0]).precedes(P::tagged_position(w[1])))
     }
 
-    /// Latest `IndexWalPosition` recorded in `data` for `key` that is processed
+    /// Latest `IndexWalPosition<P>` recorded in `data` for `key` that is processed
     /// relative to `last_processed` (offset < `last_processed`), or `None` if
     /// the key has no processed position there.
-    fn data_get_latest_processed(
-        &self,
-        key: &[u8],
-        last_processed: LastProcessed,
-    ) -> Option<IndexWalPosition> {
-        self.data.get(key).and_then(|positions| {
-            Self::processed_prefix(positions, last_processed)
-                .last()
-                .copied()
-        })
+    fn data_get_latest_processed(&self, key: &[u8], cut: P::Cut) -> Option<IndexWalPosition<P>> {
+        self.data
+            .get(key)
+            .and_then(|positions| Self::processed_prefix(positions, cut).last().copied())
     }
 
     fn data_contains_key(&self, key: &[u8]) -> bool {
@@ -1697,8 +1755,8 @@ impl IndexTable {
     }
 
     /// Iterator over `data` yielding one entry per unique key (the latest).
-    fn data_iter_latest(&self) -> impl Iterator<Item = (&Bytes, &IndexWalPosition)> + '_ {
-        data_latest_per_key(&self.data)
+    fn data_iter_latest(&self) -> impl Iterator<Item = (&Bytes, &IndexWalPosition<P>)> + '_ {
+        data_latest_per_key::<P>(&self.data)
     }
 
     /// Count of unique keys present in `data` (one map entry per key).
@@ -1708,8 +1766,8 @@ impl IndexTable {
 
     /// Forward iteration on `data`: smallest key strictly greater than
     /// `prev` (or smallest key if `prev` is `None`), with that key's
-    /// *latest* `IndexWalPosition` (its last, largest position).
-    fn data_next_forward(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition)> {
+    /// *latest* `IndexWalPosition<P>` (its last, largest position).
+    fn data_next_forward(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition<P>)> {
         let start = match prev {
             Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
@@ -1722,8 +1780,8 @@ impl IndexTable {
 
     /// Backward iteration on `data`: largest key strictly less than `prev`
     /// (or largest key if `prev` is `None`), with that key's *latest*
-    /// `IndexWalPosition`.
-    fn data_next_reverse(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition)> {
+    /// `IndexWalPosition<P>`.
+    fn data_next_reverse(&self, prev: Option<&[u8]>) -> Option<(&Bytes, &IndexWalPosition<P>)> {
         let end = match prev {
             Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
@@ -1736,7 +1794,7 @@ impl IndexTable {
 
     /// As-of-`last_processed` forward step over `data`: the smallest key
     /// strictly greater than `prev` that has at least one processed position,
-    /// paired with that key's latest processed `IndexWalPosition`. Keys whose
+    /// paired with that key's latest processed `IndexWalPosition<P>`. Keys whose
     /// positions all postdate the frontier are skipped over.
     ///
     /// Positions ascend by `(offset, ..)`, so scanning a key's list from the
@@ -1744,8 +1802,8 @@ impl IndexTable {
     fn data_next_forward_at(
         &self,
         prev: Option<&[u8]>,
-        last_processed: LastProcessed,
-    ) -> Option<(Bytes, IndexWalPosition)> {
+        cut: P::Cut,
+    ) -> Option<(Bytes, IndexWalPosition<P>)> {
         let start = match prev {
             Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
@@ -1756,7 +1814,7 @@ impl IndexTable {
                 positions
                     .iter()
                     .rev()
-                    .find(|v| last_processed.is_processed(*v))
+                    .find(|v| P::tagged_position(**v).below(cut))
                     .map(|v| (key.clone(), *v))
             })
     }
@@ -1765,8 +1823,8 @@ impl IndexTable {
     fn data_next_reverse_at(
         &self,
         prev: Option<&[u8]>,
-        last_processed: LastProcessed,
-    ) -> Option<(Bytes, IndexWalPosition)> {
+        cut: P::Cut,
+    ) -> Option<(Bytes, IndexWalPosition<P>)> {
         let end = match prev {
             Some(p) => Bound::Excluded(p),
             None => Bound::Unbounded,
@@ -1778,7 +1836,7 @@ impl IndexTable {
                 positions
                     .iter()
                     .rev()
-                    .find(|v| last_processed.is_processed(*v))
+                    .find(|v| P::tagged_position(**v).below(cut))
                     .map(|v| (key.clone(), *v))
             })
     }
@@ -1788,8 +1846,8 @@ impl IndexTable {
     /// positions it carries. Used after bulk mutations that touch both
     /// `flat` and `data` in ways too complex to track inline.
     fn recount_stats(&self) -> (usize, usize) {
-        let flat_dirty = FlatIter::new(&self.flat, self.key_size)
-            .filter(|(_, iwp)| !iwp.is_clean())
+        let flat_dirty = FlatIter::<P>::new(&self.flat, self.key_size)
+            .filter(|(_, iwp)| !P::tagged_is_clean(*iwp))
             .count();
         let (key_bytes, data_dirty) = self.recount_data_stats();
         (key_bytes, flat_dirty + data_dirty)
@@ -1805,7 +1863,7 @@ impl IndexTable {
         let mut data_dirty = 0usize;
         for (k, v) in self.data_iter_latest() {
             key_bytes += k.len();
-            if !v.is_clean() {
+            if !P::tagged_is_clean(*v) {
                 data_dirty += 1;
             }
         }
@@ -1817,56 +1875,63 @@ impl IndexTable {
     // ---------------------------------------------------------------------------
 
     fn flat_len(&self) -> usize {
-        flat_count(&self.flat, self.key_size)
+        flat_count::<P>(&self.flat, self.key_size)
     }
 
     /// Binary search the flat array for an exact key match.
-    fn flat_binary_search(&self, key: &[u8]) -> Option<IndexWalPosition> {
+    fn flat_binary_search(&self, key: &[u8]) -> Option<IndexWalPosition<P>> {
         if self.flat.is_empty() {
             return None;
         }
         let flat = &self.flat[..];
-        let idx = flat_lower_bound(flat, self.key_size, key);
-        if idx >= flat_count(flat, self.key_size) {
+        let idx = flat_lower_bound::<P>(flat, self.key_size, key);
+        if idx >= flat_count::<P>(flat, self.key_size) {
             return None;
         }
-        let (found_key, iwp) = flat_entry_at(flat, self.key_size, idx);
+        let (found_key, iwp) = flat_entry_at::<P>(flat, self.key_size, idx);
         if found_key == key { Some(iwp) } else { None }
     }
 
     /// Return the first flat entry with key strictly greater than `prev`
     /// (or the first entry at all when `prev` is `None`).
     /// Returns `WalPosition` (INVALID for Removed entries).
-    fn flat_next_forward(&self, prev: Option<&[u8]>) -> Option<(Bytes, WalPosition)> {
+    // `#[inline(never)]` on both `flat_next_*`: in the pre-generic crate they
+    // were separate functions behind `next_entry_at`. As generics, a downstream
+    // crate instantiates only `next_entry_at`, which would otherwise inline
+    // both and their binary searches into one frame (without the attribute, the
+    // linked bench exe had 8 `div` in `next_entry_at` where base has 0).
+    #[inline(never)]
+    fn flat_next_forward(&self, prev: Option<&[u8]>) -> Option<(Bytes, P)> {
         if self.flat.is_empty() {
             return None;
         }
         let flat = &self.flat[..];
         let idx = match prev {
-            Some(p) => flat_upper_bound(flat, self.key_size, p),
+            Some(p) => flat_upper_bound::<P>(flat, self.key_size, p),
             None => 0,
         };
-        if idx >= flat_count(flat, self.key_size) {
+        if idx >= flat_count::<P>(flat, self.key_size) {
             return None;
         }
-        let (key_slice, iwp) = flat_entry_at(flat, self.key_size, idx);
+        let (key_slice, iwp) = flat_entry_at::<P>(flat, self.key_size, idx);
         let key_start = key_slice.as_ptr() as usize - flat.as_ptr() as usize;
         let key_bytes = self.flat.slice(key_start..key_start + key_slice.len());
-        Some((key_bytes, iwp.into_wal_position()))
+        Some((key_bytes, P::tagged_into_position(iwp)))
     }
 
     /// Return the last flat entry with key strictly less than `prev`
     /// (or the last entry at all when `prev` is `None`).
-    /// Returns `WalPosition` (INVALID for Removed entries).
-    fn flat_next_reverse(&self, prev: Option<&[u8]>) -> Option<(Bytes, WalPosition)> {
+    /// Returns the position (INVALID for Removed entries).
+    #[inline(never)]
+    fn flat_next_reverse(&self, prev: Option<&[u8]>) -> Option<(Bytes, P)> {
         if self.flat.is_empty() {
             return None;
         }
         let flat = &self.flat[..];
-        let count = flat_count(flat, self.key_size);
+        let count = flat_count::<P>(flat, self.key_size);
         let idx = match prev {
             Some(p) => {
-                let lb = flat_lower_bound(flat, self.key_size, p);
+                let lb = flat_lower_bound::<P>(flat, self.key_size, p);
                 if lb == 0 {
                     return None;
                 }
@@ -1879,10 +1944,10 @@ impl IndexTable {
                 count - 1
             }
         };
-        let (key_slice, iwp) = flat_entry_at(flat, self.key_size, idx);
+        let (key_slice, iwp) = flat_entry_at::<P>(flat, self.key_size, idx);
         let key_start = key_slice.as_ptr() as usize - flat.as_ptr() as usize;
         let key_bytes = self.flat.slice(key_start..key_start + key_slice.len());
-        Some((key_bytes, iwp.into_wal_position()))
+        Some((key_bytes, P::tagged_into_position(iwp)))
     }
 
     /// Test helper: rewrite every `Modified` position in `data` to `Clean`.
@@ -1890,8 +1955,8 @@ impl IndexTable {
     fn demote_data_modified_to_clean(&mut self) {
         for positions in self.data.values_mut() {
             for v in positions.iter_mut() {
-                if v.kind == IndexEntryKind::Modified {
-                    *v = v.as_clean_modified();
+                if P::kind(*v) == IndexEntryKind::Modified {
+                    *v = P::tagged_as_clean_modified(*v);
                 }
             }
         }
@@ -1901,21 +1966,36 @@ impl IndexTable {
     }
 
     #[cfg(test)]
-    pub fn into_data(self) -> BTreeMap<Bytes, WalPosition> {
+    pub fn into_data(self) -> BTreeMap<Bytes, P> {
         // Flat entries have lower priority; data entries override them. Each
         // data key's latest position (its last) is the live value.
-        let mut result: BTreeMap<Bytes, WalPosition> = FlatIter::new(&self.flat, self.key_size)
-            .map(|(k, iwp)| (Bytes::from(k.to_vec()), iwp.into_wal_position()))
+        let mut result: BTreeMap<Bytes, P> = FlatIter::<P>::new(&self.flat, self.key_size)
+            .map(|(k, iwp)| (Bytes::from(k.to_vec()), P::tagged_into_position(iwp)))
             .collect();
         for (k, positions) in self.data {
             let latest = positions.last().expect("data positions are never empty");
-            result.insert(k, latest.into_wal_position());
+            result.insert(k, P::tagged_into_position(*latest));
         }
         result
     }
 }
 
-impl IndexWalPosition {
+impl TaggedWalPosition {
+    #[inline]
+    pub(crate) fn from_parts(offset: u64, len: u32, kind: IndexEntryKind) -> Self {
+        Self { offset, len, kind }
+    }
+
+    #[inline]
+    pub(crate) fn kind(self) -> IndexEntryKind {
+        self.kind
+    }
+
+    #[inline]
+    pub(crate) fn with_kind(self, kind: IndexEntryKind) -> Self {
+        Self { kind, ..self }
+    }
+
     fn new_clean(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
@@ -1925,6 +2005,7 @@ impl IndexWalPosition {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_modified(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
@@ -1934,6 +2015,7 @@ impl IndexWalPosition {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_removed(w: WalPosition) -> Self {
         debug_assert_ne!(w, WalPosition::INVALID);
         Self {
@@ -1943,7 +2025,7 @@ impl IndexWalPosition {
         }
     }
 
-    /// Constructs an IndexWalPosition from a WAL position read off disk.
+    /// Constructs an IndexWalPosition<P> from a WAL position read off disk.
     /// `WalPosition::INVALID` is the on-disk marker for a tombstone; any other
     /// position is treated as a clean entry.
     ///
@@ -1954,7 +2036,7 @@ impl IndexWalPosition {
     /// two bits of `encoded_len` without colliding with the real len bits
     /// (see `encode_kind_in_len` — it requires `len < 2^30`; the on-disk
     /// tombstone sentinel uses `len = u32::MAX`, which would violate that).
-    fn from_disk(w: WalPosition) -> Self {
+    pub(crate) fn from_disk(w: WalPosition) -> Self {
         if w == WalPosition::INVALID {
             Self {
                 offset: w.offset(),
@@ -1966,9 +2048,15 @@ impl IndexWalPosition {
         }
     }
 
+    pub fn replace_wal_position(&mut self, position: WalPosition) {
+        self.offset = position.offset();
+        self.len = position.frame_len_u32();
+    }
+
     /// If the index position is clean or modified, return the corresponding wal position.
     /// If the index wal position is removed, returns WalPosition::INVALID.
-    fn into_wal_position(self) -> WalPosition {
+    #[inline]
+    pub(crate) fn into_wal_position(self) -> WalPosition {
         match self.kind {
             IndexEntryKind::Clean | IndexEntryKind::Modified => {
                 WalPosition::new(self.offset, self.len)
@@ -1977,12 +2065,7 @@ impl IndexWalPosition {
         }
     }
 
-    pub fn replace_wal_position(&mut self, position: WalPosition) {
-        self.offset = position.offset();
-        self.len = position.frame_len_u32();
-    }
-
-    fn into_update_position(self) -> WalPosition {
+    pub(crate) fn into_update_position(self) -> WalPosition {
         WalPosition::new(self.offset, self.len)
     }
 
@@ -2011,7 +2094,7 @@ impl IndexWalPosition {
     }
 }
 
-impl HasOffset for IndexWalPosition {
+impl HasOffset for TaggedWalPosition {
     fn offset(&self) -> u64 {
         self.offset
     }
@@ -2023,6 +2106,21 @@ pub trait IndexSerializationVisitor {
 
 impl IndexSerializationVisitor for () {
     fn add_key(&mut self, _key: &[u8], _offset: usize) {}
+}
+
+// Test hook: counts the fixed-size blobs a thread handed to `flat` without a
+// rebuild (the zero-copy shortcut of `deserialize_fixed_size`). The shortcut is
+// valid only for a position type whose blob row is its clean flat row, so a
+// test needs to observe whether it was taken. Compiled out of non-test builds.
+#[cfg(test)]
+thread_local! {
+    static ZERO_COPY_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread's count of zero-copy fixed-size loads (test hook).
+#[cfg(test)]
+pub(crate) fn zero_copy_loads_for_test() -> u64 {
+    ZERO_COPY_LOADS.with(std::cell::Cell::get)
 }
 
 /// An iterator for the old (pre-flat-buffer) varint-encoded variable-length key format.
@@ -2058,6 +2156,12 @@ impl<'a> Iterator for VariableLenKeyIndexIterator<'a> {
 }
 
 #[cfg(test)]
+mod logical_tests;
+
+#[cfg(test)]
+mod merge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::flat::{decode_kind_from_len, encode_kind_in_len};
     use super::*;
@@ -2087,7 +2191,7 @@ mod tests {
             (vec![].into(), iwp(25)),
         ]);
         let key_bytes: usize = data.keys().map(|k| k.len()).sum();
-        let index = IndexTable {
+        let index: IndexTable = IndexTable {
             data,
             key_bytes,
             flat: Default::default(),
@@ -2110,8 +2214,8 @@ mod tests {
         assert_eq!((13 + 16, u8ref(&[2, 5]), wp(23)), iterator.next().unwrap());
     }
 
-    fn iwp(n: u64) -> IndexWalPosition {
-        IndexWalPosition::new_clean(wp(n))
+    fn iwp(n: u64) -> TaggedWalPosition {
+        TaggedWalPosition::new_clean(wp(n))
     }
     fn wp(n: u64) -> WalPosition {
         WalPosition::new(n, 15)
@@ -2120,7 +2224,7 @@ mod tests {
     /// Build a `data` overlay from `(key, position)` tuples, grouping positions
     /// by key and keeping each key's list ascending — the in-memory shape the
     /// production write path maintains.
-    fn data_overlay(entries: impl IntoIterator<Item = (Bytes, IndexWalPosition)>) -> DataOverlay {
+    fn data_overlay(entries: impl IntoIterator<Item = (Bytes, TaggedWalPosition)>) -> DataOverlay {
         let mut map: DataOverlay = BTreeMap::new();
         for (k, v) in entries {
             map.entry(k).or_default().push(v);
@@ -2298,7 +2402,7 @@ mod tests {
 
         // Grow the backlog past PROMOTE_POSITIONS_THRESHOLD total positions,
         // tallying inserts directly rather than via the function under test.
-        while (offset - 1) as usize <= IndexTable::PROMOTE_POSITIONS_THRESHOLD {
+        while (offset - 1) as usize <= IndexTable::<WalPosition>::PROMOTE_POSITIONS_THRESHOLD {
             insert_round(&mut table, &keys, &mut offset);
         }
         let frontier = LastProcessed::new_test(offset);
@@ -2331,7 +2435,7 @@ mod tests {
         let inflight: Bytes = vec![2].into();
         let mut table = IndexTable::default();
         let mut offset = 1u64;
-        for _ in 0..=IndexTable::PROMOTE_POSITIONS_THRESHOLD {
+        for _ in 0..=IndexTable::<WalPosition>::PROMOTE_POSITIONS_THRESHOLD {
             table.insert(hot.clone(), WalPosition::test_value(offset));
             offset += 1;
         }
@@ -2341,7 +2445,7 @@ mod tests {
         // `hot` backlog alone trips the position trigger.
         assert_eq!(
             table.drainable_position_count(frontier),
-            IndexTable::PROMOTE_POSITIONS_THRESHOLD + 1
+            IndexTable::<WalPosition>::PROMOTE_POSITIONS_THRESHOLD + 1
         );
         assert!(table.should_promote(PROD_KEY_THRESHOLD, frontier));
         assert!(table.promote_to_flat_inner(PROD_KEY_THRESHOLD, frontier));
@@ -2427,7 +2531,7 @@ mod tests {
 
         // Retain only entries with offset > 250
         let len_before = index.len();
-        index.retain_above_position(250);
+        index.retain_above_position(LastProcessed::new(250));
         let len_after = index.len();
         assert_eq!(len_before - len_after, 2); // Removed 2 entries
 
@@ -2451,14 +2555,17 @@ mod tests {
         index.insert(vec![4].into(), WalPosition::test_value(400));
         index.insert(vec![6].into(), WalPosition::test_value(210));
 
-        assert!(index.tombstone_below_position(250));
+        assert!(index.tombstone_below_position(LastProcessed::new(250)));
         assert_eq!(index.len(), 6, "no key is dropped");
         for key in [1, 2, 5, 6] {
             assert_eq!(index.get(&[key]), Some(WalPosition::INVALID), "key {key}");
         }
         assert_eq!(index.get(&[3]), Some(WalPosition::test_value(300)));
         assert_eq!(index.get(&[4]), Some(WalPosition::test_value(400)));
-        assert!(!index.tombstone_below_position(250), "already hidden");
+        assert!(
+            !index.tombstone_below_position(LastProcessed::new(250)),
+            "already hidden"
+        );
     }
 
     #[test]
@@ -3055,7 +3162,7 @@ mod tests {
         // Regression: a tombstone round-tripped through serialize/deserialize
         // must decode back as a tombstone, not as a bogus live pointer.
         //
-        // Pre-fix: `IndexWalPosition::from_disk(INVALID)` produced
+        // Pre-fix: `IndexWalPosition<P>::from_disk(INVALID)` produced
         // `len = u32::MAX`, and `encode_kind_in_len(u32::MAX, Removed=2)`
         // collided with the kind bits (top 2 bits of the encoded len were
         // both already set by len), so decode yielded kind byte 3 — which
@@ -3088,6 +3195,40 @@ mod tests {
             Some(WalPosition::INVALID),
             "tombstone failed to round-trip through serialize/deserialize"
         );
+    }
+
+    /// The zero-copy shortcut of `deserialize_fixed_size` is taken for a clean
+    /// fixed-size blob and not when the blob holds a tombstone (whose blob row
+    /// differs from its flat row, so it takes the decode-and-rebuild path).
+    #[test]
+    fn fixed_size_blob_load_is_zero_copy_only_without_tombstones() {
+        let shape = KeyShape::new_single_config_indexing(
+            KeyIndexing::fixed(1),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(KeySpace::first());
+        let load = |table: &IndexTable| {
+            let mut buf = BytesMut::new();
+            table.serialize_index_entries(ks, &mut buf);
+            IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()))
+        };
+
+        let mut clean = IndexTable::default();
+        clean.insert(vec![1].into(), WalPosition::test_value(10));
+        clean.insert(vec![2].into(), WalPosition::test_value(20));
+        let before = zero_copy_loads_for_test();
+        let loaded = load(&clean);
+        assert_eq!(zero_copy_loads_for_test(), before + 1);
+        assert_eq!(loaded.get(&[1]), Some(WalPosition::test_value(10)));
+
+        let mut with_tombstone = clean.clone();
+        with_tombstone.remove(vec![2].into(), WalPosition::test_value(25));
+        let before = zero_copy_loads_for_test();
+        let loaded = load(&with_tombstone);
+        assert_eq!(zero_copy_loads_for_test(), before, "tombstones rebuild");
+        assert_eq!(loaded.get(&[2]), Some(WalPosition::INVALID));
     }
 
     #[test]
@@ -3396,20 +3537,20 @@ mod tests {
     use super::flat::merge_into_flat;
 
     /// Decode a flat buffer back to a Vec for assertion-friendly comparison.
-    fn decode_flat(flat: &Bytes, key_size: Option<usize>) -> Vec<(Vec<u8>, IndexWalPosition)> {
-        FlatIter::new(flat, key_size)
+    fn decode_flat(flat: &Bytes, key_size: Option<usize>) -> Vec<(Vec<u8>, TaggedWalPosition)> {
+        FlatIter::<WalPosition>::new(flat, key_size)
             .map(|(k, iwp)| (k.to_vec(), iwp))
             .collect()
     }
 
-    fn iwp_modified(n: u64) -> IndexWalPosition {
-        IndexWalPosition::new_modified(WalPosition::test_value(n))
+    fn iwp_modified(n: u64) -> TaggedWalPosition {
+        TaggedWalPosition::new_modified(WalPosition::test_value(n))
     }
-    fn iwp_clean(n: u64) -> IndexWalPosition {
-        IndexWalPosition::new_clean(WalPosition::test_value(n))
+    fn iwp_clean(n: u64) -> TaggedWalPosition {
+        TaggedWalPosition::new_clean(WalPosition::test_value(n))
     }
-    fn iwp_removed(n: u64) -> IndexWalPosition {
-        IndexWalPosition::new_removed(WalPosition::test_value(n))
+    fn iwp_removed(n: u64) -> TaggedWalPosition {
+        TaggedWalPosition::new_removed(WalPosition::test_value(n))
     }
 
     #[test]
@@ -3421,7 +3562,8 @@ mod tests {
             (vec![9].into(), iwp_modified(3)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, None);
         assert_eq!(
@@ -3447,9 +3589,10 @@ mod tests {
         table.insert(vec![3].into(), WalPosition::test_value(3));
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
-        let btree: DataOverlay = DataOverlay::new();
+        let btree: DataOverlay = DataOverlay::<WalPosition>::new();
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // All three flat entries are Modified.
         assert_eq!(dirty, 3);
         // Output equals input bytes (same entries, same order, same encoding).
@@ -3471,7 +3614,8 @@ mod tests {
             (vec![2].into(), iwp_modified(2)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // 3 emitted entries, all dirty (Modified).
         assert_eq!(dirty, 3);
         let entries = decode_flat(&new_flat, None);
@@ -3505,7 +3649,8 @@ mod tests {
             (vec![8].into(), iwp_clean(8)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // 3 flat dirty (Modified) + 0 btree dirty (Clean) = 3.
         assert_eq!(dirty, 3);
         let keys: Vec<Vec<u8>> = decode_flat(&new_flat, None)
@@ -3528,7 +3673,8 @@ mod tests {
         let flat = table.flat.clone();
         let btree: DataOverlay = data_overlay([(vec![1].into(), iwp_removed(10))]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // Modified [2] from flat + Removed [1] from btree = 2 dirty.
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, None);
@@ -3560,10 +3706,10 @@ mod tests {
         assert_eq!(pre[0].1.kind, IndexEntryKind::Removed);
 
         // Merge with empty btree — Removed must round-trip unchanged.
-        let (new_flat, dirty) = merge_into_flat(
+        let (new_flat, dirty) = merge_into_flat::<WalPosition>(
             &flat,
             None,
-            &DataOverlay::new(),
+            &DataOverlay::<WalPosition>::new(),
             LastProcessed::new(u64::MAX),
         );
         assert_eq!(dirty, 2); // Modified + Removed both dirty.
@@ -3589,7 +3735,8 @@ mod tests {
         let flat = table.flat.clone();
 
         let btree: DataOverlay = data_overlay([(vec![1].into(), iwp_modified(20))]);
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert_eq!(dirty, 1);
         let entries = decode_flat(&new_flat, None);
         assert_eq!(entries.len(), 1);
@@ -3609,10 +3756,10 @@ mod tests {
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let (new_flat, dirty) = merge_into_flat(
+        let (new_flat, dirty) = merge_into_flat::<WalPosition>(
             &flat,
             Some(4),
-            &DataOverlay::new(),
+            &DataOverlay::<WalPosition>::new(),
             LastProcessed::new(u64::MAX),
         );
         assert_eq!(dirty, 2);
@@ -3629,8 +3776,9 @@ mod tests {
     #[test]
     fn test_merge_into_flat_empty_inputs() {
         let flat = Bytes::default();
-        let btree: DataOverlay = DataOverlay::new();
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let btree: DataOverlay = DataOverlay::<WalPosition>::new();
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         assert!(new_flat.is_empty());
         assert_eq!(dirty, 0);
     }
@@ -3651,7 +3799,7 @@ mod tests {
             data_overlay([(k4(10), iwp_modified(100)), (k4(20), iwp_modified(20))]);
 
         let (new_flat, dirty) =
-            merge_into_flat(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
+            merge_into_flat::<WalPosition>(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
         // 2 btree Modified + 0 flat dirty (clean) = 2.
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, Some(4));
@@ -3677,7 +3825,7 @@ mod tests {
         ]);
 
         let (new_flat, dirty) =
-            merge_into_flat(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
+            merge_into_flat::<WalPosition>(&flat, Some(4), &btree, LastProcessed::new(u64::MAX));
         // Modified + Removed = 2 dirty (Clean is not dirty).
         assert_eq!(dirty, 2);
         let entries = decode_flat(&new_flat, Some(4));
@@ -3697,10 +3845,10 @@ mod tests {
         table.promote_to_flat(LastProcessed::new(u64::MAX));
         let flat = table.flat.clone();
 
-        let (new_flat, dirty) = merge_into_flat(
+        let (new_flat, dirty) = merge_into_flat::<WalPosition>(
             &flat,
             Some(4),
-            &DataOverlay::new(),
+            &DataOverlay::<WalPosition>::new(),
             LastProcessed::new(u64::MAX),
         );
         // Both flat entries are Modified.
@@ -3732,7 +3880,8 @@ mod tests {
             (vec![4].into(), iwp_clean(4)),
         ]);
 
-        let (new_flat, dirty) = merge_into_flat(&flat, None, &data, LastProcessed::new(u64::MAX));
+        let (new_flat, dirty) =
+            merge_into_flat::<WalPosition>(&flat, None, &data, LastProcessed::new(u64::MAX));
         // Emitted: [1]=Clean, [2]=Modified(btree-overrides), [3]=Removed, [4]=Clean.
         // Dirty: Modified + Removed = 2.
         assert_eq!(dirty, 2);
@@ -3756,7 +3905,8 @@ mod tests {
             (vec![7, 8, 9, 10, 11].into(), iwp_modified(4)),
         ]);
 
-        let (new_flat, _) = merge_into_flat(&flat, None, &btree, LastProcessed::new(u64::MAX));
+        let (new_flat, _) =
+            merge_into_flat::<WalPosition>(&flat, None, &btree, LastProcessed::new(u64::MAX));
         // header: 4 + 4*4 = 20
         // entries: (14+1) + (14+2) + (14+3) + (14+5) = 15+16+17+19 = 67
         assert_eq!(new_flat.len(), 20 + 67);
@@ -3765,7 +3915,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Multi-position-per-key behaviour
     //
-    // The `data` map holds several `IndexWalPosition` values per key (the key's
+    // The `data` map holds several `IndexWalPosition<P>` values per key (the key's
     // ordered position list). Observers must dedupe to the latest IWP per key
     // (the list's last element — the largest under derived `(offset, len, kind)`
     // ordering, where `Removed > Modified > Clean`). The tests below exercise

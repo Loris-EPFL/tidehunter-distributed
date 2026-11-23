@@ -2,6 +2,7 @@ use super::util::format_bytes;
 use super::{DbHandle, resolve_ks};
 use rhai::{Dynamic, Engine, EvalAltResult, Map};
 use tidehunter::CellId;
+use tidehunter::LastProcessed;
 use tidehunter::WalKind;
 use tidehunter::control::ControlRegion;
 use tidehunter::db::CONTROL_REGION_FILE;
@@ -80,7 +81,7 @@ pub(crate) fn register(engine: &mut Engine) {
             };
 
             let control_path = db_path.join(CONTROL_REGION_FILE);
-            let cr = ControlRegion::read(&control_path, &key_shape).map_err(
+            let cr = ControlRegion::<LastProcessed>::read(&control_path, &key_shape).map_err(
                 |e| -> Box<EvalAltResult> { format!("Failed to read control region: {e}").into() },
             )?;
 
@@ -155,7 +156,7 @@ pub(crate) fn register(engine: &mut Engine) {
             let mut map = Map::new();
             map.insert(
                 "last_position".into(),
-                Dynamic::from(cr.last_position() as i64),
+                Dynamic::from(cr.last_position().as_u64() as i64),
             );
             map.insert("keyspaces".into(), Dynamic::from(ks_array));
             Ok(Dynamic::from(map))
@@ -218,7 +219,7 @@ pub(crate) fn register(engine: &mut Engine) {
 
             // Load CR and collect valid index positions for this keyspace
             let control_path = db_path.join(CONTROL_REGION_FILE);
-            let cr = ControlRegion::read(&control_path, &key_shape).map_err(
+            let cr = ControlRegion::<LastProcessed>::read(&control_path, &key_shape).map_err(
                 |e| -> Box<EvalAltResult> { format!("Failed to read control region: {e}").into() },
             )?;
             let snapshot = cr.snapshot();
@@ -261,7 +262,7 @@ pub(crate) fn register(engine: &mut Engine) {
                         if let WalEntry::Index(_, index_bytes) = entry {
                             let index_table = ks_desc
                                 .index_format()
-                                .deserialize_index(ks_desc, index_bytes);
+                                .deserialize_index::<tidehunter::WalPosition>(ks_desc, index_bytes);
                             for (_, wal_pos) in index_table.iter() {
                                 payload_sizes.push(wal_pos.payload_len());
                             }
@@ -334,9 +335,9 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
     };
 
     let control_path = db_path.join(CONTROL_REGION_FILE);
-    let cr = ControlRegion::read(&control_path, &key_shape).map_err(|e| -> Box<EvalAltResult> {
-        format!("Failed to read control region: {e}").into()
-    })?;
+    let cr = ControlRegion::<LastProcessed>::read(&control_path, &key_shape).map_err(
+        |e| -> Box<EvalAltResult> { format!("Failed to read control region: {e}").into() },
+    )?;
     let snapshot = cr.snapshot();
 
     // Collect all valid positions: (offset, frame_len, ks_idx, level_idx).
@@ -391,7 +392,10 @@ fn cr_stats_impl(h: &mut DbHandle, lowest_n: usize) -> Result<(), Box<EvalAltRes
 
     print("Control Region Stats");
     print("====================");
-    print(&format!("  Last WAL position : {:#x}", cr.last_position()));
+    print(&format!(
+        "  Last WAL position : {:#x}",
+        cr.last_position().as_u64()
+    ));
     print(&format!("  Valid level blobs : {}", all_positions.len()));
     if sharded_cells > 0 {
         print(&format!(

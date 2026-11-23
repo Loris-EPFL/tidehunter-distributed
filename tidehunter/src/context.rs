@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::GetResult;
 use crate::metrics::{MetricHistogram, MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
-use crate::wal::position::WalPosition;
 use std::array;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -276,7 +275,7 @@ impl KsContext {
         self.ks_config.index_key_size()
     }
 
-    pub fn report_lookup_result(&self, v: Option<WalPosition>, source: LookupSource) -> GetResult {
+    pub fn report_lookup_result<P>(&self, v: Option<P>, source: LookupSource) -> GetResult<P> {
         let result = if v.is_some() {
             LookupResult::Found
         } else {

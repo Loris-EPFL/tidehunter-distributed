@@ -422,7 +422,9 @@ pub(crate) fn register(engine: &mut Engine) {
             };
 
             let ks_desc = key_shape.ks(KeySpace::new(ks_id.as_u8()));
-            let index_table = ks_desc.index_format().deserialize_index(ks_desc, bytes);
+            let index_table = ks_desc
+                .index_format()
+                .deserialize_index::<tidehunter::WalPosition>(ks_desc, bytes);
 
             let result: rhai::Array = index_table
                 .iter()

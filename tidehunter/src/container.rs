@@ -1,7 +1,7 @@
 use crate::cell::CellId;
 use crate::key_shape::{KeyShape, KeySpaceDesc, KeyType};
 use crate::large_table::SnapshotEntryData;
-use crate::wal::position::WalPosition;
+use crate::wal::position::{IndexCut, WalPosition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -52,10 +52,12 @@ impl<T> LargeTableContainer<T> {
     }
 }
 
-impl LargeTableContainer<SnapshotEntryData> {
+impl<C: IndexCut> LargeTableContainer<SnapshotEntryData<C>> {
     /// Iterates every on-disk index-blob position across every cell, in
     /// keyspace-then-cell order. Level-generic: a multi-level cell yields
     /// one position per level.
+    ///
+    /// These are **index-WAL** positions, not value positions `P`.
     pub fn iter_valid_val_positions(&self) -> impl Iterator<Item = WalPosition> + '_ {
         self.iter_cells().flat_map(|entry| entry.levels().iter())
     }

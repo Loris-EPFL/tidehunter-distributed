@@ -4,7 +4,6 @@ use crate::index::index_format::IndexFormatType;
 use crate::math;
 use crate::math::{downscale_u32, starting_u32, starting_u64};
 use crate::relocation::RelocationFilter;
-use crate::wal::position::WalPosition;
 use blake2::Digest;
 use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -389,11 +388,6 @@ impl KeySpaceDesc {
         self.key_indexing().index_key_size()
     }
 
-    pub(crate) fn index_key_element_size(&self) -> Option<(usize, usize)> {
-        self.index_key_size()
-            .map(|key_size| (key_size, self.index_element_size().unwrap()))
-    }
-
     /// Returns index key size if index key size is fixed.
     /// Panics for variable length keys with a message including the provided reason.
     pub(crate) fn require_index_key_size(&self, reason: &'static str) -> usize {
@@ -405,31 +399,6 @@ impl KeySpaceDesc {
             )
         };
         key_size
-    }
-
-    /// Returns index element size if index key size is fixed, None for variable length keys
-    pub(crate) fn index_element_size(&self) -> Option<usize> {
-        self.index_key_size().map(|i| i + WalPosition::LENGTH)
-    }
-
-    /// Returns index element size if index key size is fixed.
-    /// Panics for variable length keys.
-    pub(crate) fn require_index_element_size(&self) -> usize {
-        let Some(element_size) = self.index_element_size() else {
-            panic!(
-                "Ks {} uses uniform index that requires key length known ahead of time",
-                self.name()
-            )
-        };
-        element_size
-    }
-
-    /// Returns imprecise element size that can be used for buffer capacity calculation.
-    /// This method uses known key size for key spaces with fixed key size.
-    /// For key spaces with variable length keys,
-    /// we use the best effort estimate of 64 bytes for index element size.
-    pub(crate) fn index_element_size_for_capacity(&self) -> usize {
-        self.index_element_size().unwrap_or(64)
     }
 
     /// Returns u32 prefix

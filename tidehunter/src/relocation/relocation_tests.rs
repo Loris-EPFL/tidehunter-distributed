@@ -1349,7 +1349,7 @@ fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
 
     // Dispatch the force-relocate through the production flusher, exactly as
     // the snapshot pass does for a clean cell in low-occupancy files.
-    let last_processed = db.last_processed_wal_position();
+    let last_processed = Loader::last_processed(db.as_ref());
     db.large_table
         .with_entry_for_test(context, &cell.cell_id, |entry| {
             let layout = db.config.wal_layout(WalKind::Index);
@@ -1360,7 +1360,12 @@ fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
                 .map(|p| layout.locate_file(p.offset()))
                 .collect();
             let relocate_files = RelocateFiles::new(files, db.config.wal_layout(WalKind::Index));
-            entry.request_force_relocate(&db.large_table.flusher, last_processed, &relocate_files);
+            entry.request_force_relocate(
+                &db.large_table.flusher,
+                last_processed,
+                Loader::flushed_at_bytes(db.as_ref(), last_processed),
+                &relocate_files,
+            );
         });
 
     // The racing write: lands while the paused flusher holds the completion.

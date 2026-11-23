@@ -32,17 +32,19 @@ use crate::compressed_batch::{InnerIter, decompress_wal_entry};
 use crate::context::KsContextVec;
 use crate::db::{DbResult, WalEntry};
 use crate::key_shape::KeyShape;
-use crate::large_table::LargeTable;
+use crate::large_table::{LargeTable, Loader};
 use crate::metrics::Metrics;
 use crate::replay_buffer::ReplayBuffer;
+use crate::wal::position::WalPosition;
 use crate::wal::{WalError, WalIterator, WalWriter};
 
-pub(crate) fn replay_wal(
+pub(crate) fn replay_wal<L: Loader<Position = WalPosition> + Sync>(
     contexts: &KsContextVec,
     large_table: &LargeTable,
     key_shape: &KeyShape,
     mut wal_iterator: WalIterator,
     metrics: &Metrics,
+    loader: &L,
 ) -> DbResult<WalWriter> {
     let mut buffer = ReplayBuffer::new(key_shape);
     // Number of records still expected inside the currently-open
@@ -51,12 +53,12 @@ pub(crate) fn replay_wal(
     // WAL offset of the BatchStart frame. `Some(_)` only while a batch
     // is open; serves both as the `into_writer` rewind argument and as
     // the apply-time cutoff if replay terminates with a partial batch.
-    let mut batch_start_position: Option<u64> = None;
+    let mut batch_start_position: Option<WalPosition> = None;
 
     let writer = loop {
         let entry = wal_iterator.next();
         if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
-            break wal_iterator.into_writer(batch_start_position);
+            break wal_iterator.into_writer(batch_start_position.map(|position| position.offset()));
         }
         let (position, raw_entry) = entry?;
         let entry = WalEntry::from_bytes(raw_entry);
@@ -140,7 +142,7 @@ pub(crate) fn replay_wal(
                     size > 0,
                     "WalEntry::BatchStart(0) at {position:?} — writer invariant violated"
                 );
-                batch_start_position = Some(position.offset());
+                batch_start_position = Some(position);
                 batch_remaining = size;
             }
             WalEntry::DropCells(ks, from_cell, to_cell) => {
@@ -193,9 +195,7 @@ pub(crate) fn replay_wal(
     };
     // If replay ended mid-batch, anything we already buffered at or after
     // `batch_start_position` is from an incomplete batch and must be
-    // discarded. `None` (= complete or no batch) maps to `u64::MAX` =
-    // "keep everything".
-    let cutoff = batch_start_position.unwrap_or(u64::MAX);
-    large_table.apply_replay_buffer(buffer, cutoff);
+    // discarded. `None` (= complete or no batch) keeps everything.
+    large_table.apply_replay_buffer(buffer, batch_start_position, loader);
     Ok(writer)
 }

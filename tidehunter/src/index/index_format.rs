@@ -9,7 +9,7 @@ use super::levels::INLINE_LEVELS;
 use super::lookup_header::LookupHeaderIndex;
 use super::uniform_lookup::UniformLookupIndex;
 use crate::metrics::{Metrics, TimerExt};
-use crate::wal::position::WalPosition;
+use crate::wal::position::{IndexPosition, WalPosition};
 use crate::{index::index_table::IndexTable, key_shape::KeySpaceDesc, lookup::RandomRead};
 
 /// Per-iterator cache for on-disk index reads.
@@ -90,24 +90,24 @@ pub const PREFIX_LENGTH: usize = 8; // prefix of key used to estimate position i
 
 pub trait IndexFormat {
     /// Serialize `table` as an on-disk index blob. Any `Removed` entries in
-    /// `table` are persisted as tombstones (INVALID WalPosition). Callers that
-    /// want to strip tombstones (deepest LSM level) should call
+    /// `table` are persisted as tombstones (the `P::INVALID` position). Callers
+    /// that want to strip tombstones (deepest LSM level) should call
     /// `IndexTable::clean_self` first.
-    fn serialize_index(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes;
-    fn deserialize_index(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable;
-    fn lookup_unloaded(
+    fn serialize_index<P: IndexPosition>(&self, table: &IndexTable<P>, ks: &KeySpaceDesc) -> Bytes;
+    fn deserialize_index<P: IndexPosition>(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable<P>;
+    fn lookup_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
         key: &[u8],
         metrics: &Metrics,
-    ) -> Option<WalPosition>;
+    ) -> Option<P>;
 
     /// Find the next entry in the index after the given key in the specified direction.
     /// If prev is None, returns the first entry in forward direction or last entry in backward direction.
     ///
-    /// `position` is the WAL position of the on-disk index snapshot; it is
-    /// stored in the cache and used to detect staleness if a flush occurs
+    /// `position` is the index-WAL position of the on-disk index snapshot; it
+    /// is stored in the cache and used to detect staleness if a flush occurs
     /// between calls.
     ///
     /// `cache` is an in/out parameter that carries a data buffer across calls.
@@ -115,7 +115,7 @@ pub trait IndexFormat {
     /// On a cache miss the implementation reads from disk and updates `cache`.
     /// Callers must set `*cache = None` when moving to a different cell.
     #[allow(clippy::too_many_arguments)]
-    fn next_entry_unloaded(
+    fn next_entry_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
@@ -124,11 +124,15 @@ pub trait IndexFormat {
         metrics: &Metrics,
         position: WalPosition,
         cache: &mut Option<IndexIterCache>,
-    ) -> Option<(Bytes, WalPosition)>;
+    ) -> Option<(Bytes, P)>;
 
     #[cfg(any(test, feature = "test_methods"))]
     /// Test method that cleans index before serializing.
-    fn clean_serialize_index(&self, table: &mut IndexTable, ks: &KeySpaceDesc) -> Bytes {
+    fn clean_serialize_index<P: IndexPosition>(
+        &self,
+        table: &mut IndexTable<P>,
+        ks: &KeySpaceDesc,
+    ) -> Bytes {
         table.clean_self();
         self.serialize_index(table, ks)
     }
@@ -142,34 +146,34 @@ pub enum IndexFormatType {
 }
 
 impl IndexFormat for IndexFormatType {
-    fn serialize_index(&self, table: &IndexTable, ks: &KeySpaceDesc) -> Bytes {
+    fn serialize_index<P: IndexPosition>(&self, table: &IndexTable<P>, ks: &KeySpaceDesc) -> Bytes {
         match self {
             IndexFormatType::Header => LookupHeaderIndex.serialize_index(table, ks),
             IndexFormatType::Uniform(index) => index.serialize_index(table, ks),
         }
     }
 
-    fn deserialize_index(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable {
+    fn deserialize_index<P: IndexPosition>(&self, ks: &KeySpaceDesc, b: Bytes) -> IndexTable<P> {
         match self {
             IndexFormatType::Header => LookupHeaderIndex.deserialize_index(ks, b),
             IndexFormatType::Uniform(index) => index.deserialize_index(ks, b),
         }
     }
 
-    fn lookup_unloaded(
+    fn lookup_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
         key: &[u8],
         metrics: &Metrics,
-    ) -> Option<WalPosition> {
+    ) -> Option<P> {
         match self {
             IndexFormatType::Header => LookupHeaderIndex.lookup_unloaded(ks, reader, key, metrics),
             IndexFormatType::Uniform(index) => index.lookup_unloaded(ks, reader, key, metrics),
         }
     }
 
-    fn next_entry_unloaded(
+    fn next_entry_unloaded<P: IndexPosition>(
         &self,
         ks: &KeySpaceDesc,
         reader: &impl RandomRead,
@@ -178,7 +182,7 @@ impl IndexFormat for IndexFormatType {
         metrics: &Metrics,
         position: WalPosition,
         cache: &mut Option<IndexIterCache>,
-    ) -> Option<(Bytes, WalPosition)> {
+    ) -> Option<(Bytes, P)> {
         match self {
             IndexFormatType::Header => LookupHeaderIndex
                 .next_entry_unloaded(ks, reader, prev, direction, metrics, position, cache),
@@ -227,13 +231,13 @@ impl Direction {
 /// * `(found_pos, insertion_point, position)` where:
 ///   - `insertion_point` is where the key would be inserted
 ///   - `position` is Some(WalPosition) if key is found, None otherwise
-pub fn binary_search(
+pub fn binary_search<P: IndexPosition>(
     buffer: &[u8],
     key: &[u8],
     element_size: usize,
     key_size: usize,
     metrics: &Metrics,
-) -> (Option<usize>, usize, Option<WalPosition>) {
+) -> (Option<usize>, usize, Option<P>) {
     if buffer.is_empty() {
         return (None, 0, None);
     }
@@ -269,7 +273,7 @@ pub fn binary_search(
     let position = found_pos.map(|pos| {
         let entry_start = pos * element_size;
         let pos_slice = &buffer[(entry_start + key_size)..(entry_start + element_size)];
-        WalPosition::from_slice(pos_slice)
+        P::read_blob_exact(pos_slice)
     });
 
     (found_pos, left, position)
@@ -336,40 +340,46 @@ pub mod test {
         let shape = KeyShape::new_single(16, 8, KeyType::uniform(8));
         let ks = KeySpace::first();
         let ks = shape.ks(ks);
-        let mut index = IndexTable::default();
+        let mut index = IndexTable::<WalPosition>::default();
         index.insert(k128(1), w(5));
         index.insert(k128(5), w(10));
 
         let bytes = pi.clean_serialize_index(&mut index, ks);
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(0), &metrics));
+        assert_eq!(
+            None,
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(0), &metrics)
+        );
         assert_eq!(
             Some(w(5)),
-            pi.lookup_unloaded(ks, &bytes, &k128(1), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(1), &metrics)
         );
         assert_eq!(
             Some(w(10)),
-            pi.lookup_unloaded(ks, &bytes, &k128(5), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(5), &metrics)
         );
-        assert_eq!(None, pi.lookup_unloaded(ks, &bytes, &k128(10), &metrics));
-        let mut index = IndexTable::default();
+        assert_eq!(
+            None,
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(10), &metrics)
+        );
+        let mut index = IndexTable::<WalPosition>::default();
         index.insert(k128(u128::MAX), w(15));
         index.insert(k128(u128::MAX - 5), w(25));
         let bytes = pi.clean_serialize_index(&mut index, ks);
         assert_eq!(
             Some(w(15)),
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(u128::MAX), &metrics)
         );
         assert_eq!(
             Some(w(25)),
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 5), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(u128::MAX - 5), &metrics)
         );
         assert_eq!(
             None,
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 1), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(u128::MAX - 1), &metrics)
         );
         assert_eq!(
             None,
-            pi.lookup_unloaded(ks, &bytes, &k128(u128::MAX - 100), &metrics)
+            pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k128(u128::MAX - 100), &metrics)
         );
     }
 
@@ -380,7 +390,7 @@ pub mod test {
         let shape = KeyShape::new_single(4, M, KeyType::uniform(P));
         let ks = KeySpace::first();
         let ks = shape.ks(ks);
-        let mut index = IndexTable::default();
+        let mut index = IndexTable::<WalPosition>::default();
         let mut rng = ThreadRng::default();
         let target_bucket = rng.gen_range(0..((M * P) as u32));
         let bucket_size = (MAX_U32_PLUS_ONE / ((M * P) as u64)) as u32;
@@ -402,7 +412,7 @@ pub mod test {
         let bytes = pi.clean_serialize_index(&mut index, ks);
         let data = index.into_data();
         for (key, expected_value) in &data {
-            let value = pi.lookup_unloaded(ks, &bytes, key, &metrics);
+            let value = pi.lookup_unloaded::<WalPosition>(ks, &bytes, key, &metrics);
             assert_eq!(Some(*expected_value), value);
         }
         for _ in 0..ITERATIONS {
@@ -410,7 +420,7 @@ pub mod test {
             if data.contains_key(&k32(key)) {
                 continue; // skip keys that are in the index
             }
-            let value = pi.lookup_unloaded(ks, &bytes, &k32(key), &metrics);
+            let value = pi.lookup_unloaded::<WalPosition>(ks, &bytes, &k32(key), &metrics);
             assert!(value.is_none());
         }
     }
@@ -440,7 +450,7 @@ pub mod test {
 
         // Test key found - first key
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &keys[0], element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &keys[0], element_size, key_size, &metrics);
         assert_eq!(found_pos, Some(0));
         assert_eq!(insertion_point, 0);
         assert!(position.is_some());
@@ -448,7 +458,7 @@ pub mod test {
 
         // Test key found - middle key
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &keys[2], element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &keys[2], element_size, key_size, &metrics);
         assert_eq!(found_pos, Some(2));
         assert_eq!(insertion_point, 2);
         assert!(position.is_some());
@@ -457,7 +467,7 @@ pub mod test {
         // Test key not found - should find insertion point
         let missing_key = vec![3, 4, 5, 6]; // Between keys[0] and keys[1]
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &missing_key, element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &missing_key, element_size, key_size, &metrics);
         assert_eq!(found_pos, None);
         assert_eq!(insertion_point, 1); // Would be inserted at position 1
         assert!(position.is_none());
@@ -465,7 +475,7 @@ pub mod test {
         // Test key smaller than all keys
         let smaller_key = vec![0, 0, 0, 0];
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &smaller_key, element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &smaller_key, element_size, key_size, &metrics);
         assert_eq!(found_pos, None);
         assert_eq!(insertion_point, 0); // Would be inserted at the beginning
         assert!(position.is_none());
@@ -473,7 +483,7 @@ pub mod test {
         // Test key larger than all keys
         let larger_key = vec![255, 255, 255, 255];
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &larger_key, element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &larger_key, element_size, key_size, &metrics);
         assert_eq!(found_pos, None);
         assert_eq!(insertion_point, 4); // Would be inserted after the last element
         assert!(position.is_none());
@@ -481,7 +491,7 @@ pub mod test {
         // Test with metrics
         let metrics = Metrics::new();
         let (found_pos, insertion_point, position) =
-            binary_search(&buffer, &keys[3], element_size, key_size, &metrics);
+            binary_search::<WalPosition>(&buffer, &keys[3], element_size, key_size, &metrics);
         assert_eq!(found_pos, Some(3));
         assert_eq!(insertion_point, 3);
         assert!(position.is_some());
@@ -512,7 +522,7 @@ pub mod test {
         let ks = shape.ks(ks_id);
 
         // Create an index with sorted entries
-        let mut table = IndexTable::default();
+        let mut table = IndexTable::<WalPosition>::default();
         for i in 1..6u64 {
             let key = (i * 10).to_be_bytes().to_vec();
             table.insert(Bytes::from(key), WalPosition::test_value(i));
@@ -525,7 +535,7 @@ pub mod test {
         let dummy_pos = WalPosition::test_value(0);
 
         // Test forward iteration with no previous key (should return first entry)
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             None,
@@ -540,7 +550,7 @@ pub mod test {
         assert_eq!(pos, WalPosition::test_value(1));
 
         // Test backward iteration with no previous key (should return last entry)
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             None,
@@ -556,7 +566,7 @@ pub mod test {
 
         // Test forward iteration from a specific key (should return next entry)
         let prev_key = 20_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -572,7 +582,7 @@ pub mod test {
 
         // Test backward iteration from a specific key (should return previous entry)
         let prev_key = 40_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -588,7 +598,7 @@ pub mod test {
 
         // Test edge case: next from last entry (should return None)
         let prev_key = 50_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -601,7 +611,7 @@ pub mod test {
 
         // Test edge case: previous from first entry (should return None)
         let prev_key = 10_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -614,7 +624,7 @@ pub mod test {
 
         // Test with a key that doesn't exist (should return the next entry in sequence)
         let prev_key = 15_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -630,7 +640,7 @@ pub mod test {
 
         // Test with a key that doesn't exist (should return the previous entry in sequence)
         let prev_key = 35_u64.to_be_bytes();
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             Some(&prev_key),
@@ -653,7 +663,7 @@ pub mod test {
         let ks = shape.ks(ks_id);
 
         // Create an empty index
-        let table = IndexTable::default();
+        let table = IndexTable::<WalPosition>::default();
 
         // Convert the table to bytes
         let serialized = index_format.serialize_index(&table, ks);
@@ -661,7 +671,7 @@ pub mod test {
         let dummy_pos = WalPosition::test_value(0);
 
         // Test with empty index should return None
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             None,
@@ -672,7 +682,7 @@ pub mod test {
         );
         assert!(result.is_none());
 
-        let result = index_format.next_entry_unloaded(
+        let result = index_format.next_entry_unloaded::<WalPosition>(
             ks,
             &reader,
             None,
