@@ -1157,13 +1157,29 @@ impl<P: IndexPosition> LargeTable<P> {
     /// `f` returns `(result, changed)`. `Ok(None)` means there is nothing to
     /// update and `f` did not run: the cell does not exist, or it has never held
     /// an entry (an empty cell). The cell is never created.
+    ///
+    /// `f` also receives the entry's current [`IndexLevels`], read under the
+    /// same cell lock, so an update that must reach entries the in-memory table
+    /// does not hold can load the L1 blob or the shard blobs first. The
+    /// distributed hybrid uses this for relocation: a post-promote
+    /// `[INVALID, L1]` cell, or a sharded cell, holds no entry for such a key in
+    /// the in-memory table, so a compare-and-set over `f`'s table alone would
+    /// silently skip it. Native `flusher.rs` `handle_command` pre-loads those
+    /// rows for the same reason before `RelocationUpdates::apply`.
+    ///
+    /// `f` may load index blobs under the cell lock. That matches the native
+    /// relocation path, which loads them under the same row lock
+    /// (`sync_flush_for_relocation` -> `sync_flush` -> `handle_command`), and
+    /// [`Self::maybe_load`] already loads the L0 blob there. Loading before the
+    /// lock is not equivalent: a concurrent promote can replace the levels
+    /// between the load and the update.
     #[cfg(feature = "experimental-distributed")]
     pub(crate) fn update_cell_index<L: Loader<Position = P>, R>(
         &self,
         context: &KsContext,
         cell: &CellId,
         loader: &L,
-        f: impl FnOnce(&mut IndexTable<P>) -> (R, bool),
+        f: impl FnOnce(&mut IndexTable<P>, &IndexLevels) -> Result<(R, bool), L::Error>,
     ) -> Result<Option<R>, CellUpdateError<L::Error>> {
         let mut row = self
             .lock_cell_waiting_for_flush(context, cell)
@@ -2634,7 +2650,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
     fn update_index<L: Loader<Position = P>, R>(
         &mut self,
         loader: &L,
-        f: impl FnOnce(&mut IndexTable<P>) -> (R, bool),
+        f: impl FnOnce(&mut IndexTable<P>, &IndexLevels) -> Result<(R, bool), L::Error>,
     ) -> Result<Option<R>, L::Error> {
         debug_assert!(!self.state.is_empty(), "update_index on an empty entry");
         // `unmerge_flushed` identifies flushed entries logically, so a mutation
@@ -2644,7 +2660,9 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             "update_index while an async flush is in flight"
         );
         self.maybe_load(loader)?;
-        let (result, changed) = f(self.data.make_mut());
+        // Disjoint fields: `data` is the table `f` mutates, `levels` is the
+        // read-only description of the blobs below it.
+        let (result, changed) = f(self.data.make_mut(), &self.levels)?;
         if changed {
             self.state.mark_dirty();
         }

@@ -802,6 +802,16 @@ impl TableInner {
     ///
     /// A stale expectation is skipped, never forced. The cell is only marked for
     /// flush when something changed; the next covering store persists it.
+    ///
+    /// Returns the expectations the compare-and-set did not apply, each with the
+    /// version of the entry that shadowed it. Such a position is still what a
+    /// read cut at or below that version resolves, so a retirement must keep the
+    /// file that holds it (`relocation_pass`). The vec is complete: every listed
+    /// expectation is either applied or in the vec. Before the compare-and-set
+    /// the cell's on-disk L1/shard rows are pre-loaded when a listed key is not
+    /// in the in-memory table, so a post-promote `[INVALID, L1]` or sharded cell
+    /// is re-pointed instead of skipped (native `flusher.rs` `handle_command`
+    /// pre-loads them before `RelocationUpdates::apply` for the same reason).
     pub(crate) fn relocation_apply(
         &self,
         ks: KeySpace,
@@ -809,7 +819,7 @@ impl TableInner {
         updates: Option<&[(Bytes, VersionPosition, VersionPosition)]>,
         targets: &[(u32, u64, u64)],
         drop_removed: bool,
-    ) -> Result<(), LocalDbError> {
+    ) -> Result<Vec<(VersionPosition, BatchVersion)>, LocalDbError> {
         self.check_background_health()?;
         let below_target = |position: VersionPosition| {
             let address = position.address;
@@ -822,9 +832,36 @@ impl TableInner {
         let updates = updates.unwrap_or_default();
         let listed: HashSet<&[u8]> = updates.iter().map(|(key, ..)| key.as_ref()).collect();
         let context = self.contexts.ks_context(ks);
+        let loader = self.loader.as_ref();
         self.table
-            .update_cell_index(context, cell, self.loader.as_ref(), |index| {
+            .update_cell_index(context, cell, loader, |index, levels| {
+                // Pre-load: `apply_update` sees only the in-memory table, so a
+                // key that lives only in L1 (the common post-promote
+                // `[INVALID, L1]` cell) or in an L1 shard is invisible to it.
+                // Without this the compare-and-set would report nothing and the
+                // stale position would outlive the file a retirement reclaims.
+                // Loaded only when such a key exists, so a fully loaded cell
+                // pays no blob read.
+                if updates
+                    .iter()
+                    .any(|(key, ..)| index.get_update_position(key).is_none())
+                {
+                    let mut merged = match levels.l1() {
+                        Some(position) => loader.load(&context.ks_config, position)?,
+                        None => IndexTable::<VersionPosition>::default(),
+                    };
+                    for shard in levels.shards().values() {
+                        merged.merge_dirty_and_clean(
+                            &loader.load(&context.ks_config, shard.position)?,
+                        );
+                    }
+                    // The live table is the fresher side: its L0 rows and its
+                    // overlay win over a level entry for the same key.
+                    merged.merge_dirty_no_clean(index);
+                    *index = merged;
+                }
                 let mut changed = false;
+                let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
                 for (key, expected, new) in updates {
                     index.apply_update(key, |tagged| {
                         let (current, kind) = VersionPosition::untag(*tagged);
@@ -834,6 +871,12 @@ impl TableInner {
                         {
                             *tagged = new.tag(kind);
                             changed = true;
+                        } else if below_target(*expected) {
+                            // The entry the pass copied is no longer the cell's
+                            // latest one, so the compare-and-set cannot carry the
+                            // re-point: a read cut at or below the shadowing
+                            // version still resolves the old position.
+                            shadowed.push((*expected, current.batch));
                         }
                     });
                 }
@@ -852,9 +895,9 @@ impl TableInner {
                         });
                     }
                 }
-                ((), changed)
+                Ok((shadowed, changed))
             })
-            .map(|_| ())
+            .map(Option::unwrap_or_default)
             .map_err(|error| match error {
                 CellUpdateError::Background(error) => db_error("relocation apply", error),
                 CellUpdateError::Loader(error) => error,

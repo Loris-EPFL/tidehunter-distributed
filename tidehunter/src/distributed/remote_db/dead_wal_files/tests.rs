@@ -11,9 +11,17 @@
 use super::super::pipeline_tests::Fixture;
 use super::super::tests::checkpoint_put;
 use super::*;
+use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::types::BatchVersion;
 use crate::wal::position::IndexCut;
 use std::sync::Arc;
+
+/// An empty relocation shadow witness: these tests exercise the watermark and
+/// latch terms, not the shadow cap (`dead_wal_files_tests.rs` and
+/// `relocation_promoted_l1_tests.rs` cover that end to end).
+fn no_witness() -> RetirementGate {
+    RetirementGate::default()
+}
 
 /// A database with one acknowledged write and a stored control region that
 /// names the serving stream.
@@ -35,7 +43,7 @@ fn stored() -> (Fixture, super::super::RemoteDatabase) {
 #[test]
 fn a_stream_with_proof_gets_a_watermark() {
     let (_fixture, db) = stored();
-    let snapshot = take_snapshot(&db.core);
+    let snapshot = take_snapshot(&db.core, &mut no_witness());
     assert!(
         !snapshot.watermark.is_empty(),
         "a stream with a position and a stored front is covered"
@@ -56,7 +64,7 @@ fn a_stream_without_a_position_gets_no_watermark() {
         .checkpoint_state()
         .positions
         .clear();
-    let snapshot = take_snapshot(&db.core);
+    let snapshot = take_snapshot(&db.core, &mut no_witness());
     assert!(
         snapshot.watermark.is_empty() && snapshot.durable_end.is_empty(),
         "no position is no proof: nothing may be proven dead"
@@ -66,19 +74,25 @@ fn a_stream_without_a_position_gets_no_watermark() {
 #[test]
 fn a_reader_latch_below_the_stored_cut_defers_every_stream() {
     let (_fixture, db) = stored();
-    assert!(!take_snapshot(&db.core).watermark.is_empty());
+    assert!(
+        !take_snapshot(&db.core, &mut no_witness())
+            .watermark
+            .is_empty()
+    );
     // A reader pinned below the stored cut still needs older versions that the
     // relocation pass never copied.
     let latch = db.core.table.pin_cut(<BatchVersion as IndexCut>::NONE);
     assert!(db.core.table.cuts().lowest_held() < Some(db.core.table.stored_cut()));
-    let held = take_snapshot(&db.core);
+    let held = take_snapshot(&db.core, &mut no_witness());
     assert!(
         held.watermark.is_empty(),
         "no stream retires while a latch is below the stored cut"
     );
     drop(latch);
     assert!(
-        !take_snapshot(&db.core).watermark.is_empty(),
+        !take_snapshot(&db.core, &mut no_witness())
+            .watermark
+            .is_empty(),
         "the next pass after the latch drops proceeds"
     );
 }
@@ -122,7 +136,7 @@ fn a_held_checkpoint_across_stores_and_retirement_passes_never_trips_the_cap() {
             db.core.table.stored_cut() <= held,
             "the held checkpoint clamps every store"
         );
-        drop(take_snapshot(&db.core));
+        drop(take_snapshot(&db.core, &mut no_witness()));
         assert_eq!(
             caps(&db),
             0,
@@ -131,7 +145,7 @@ fn a_held_checkpoint_across_stores_and_retirement_passes_never_trips_the_cap() {
     }
     drop(latch);
     db.flush_index().expect("store after the latch drops");
-    drop(take_snapshot(&db.core));
+    drop(take_snapshot(&db.core, &mut no_witness()));
     assert_eq!(caps(&db), 0);
 }
 
@@ -158,7 +172,8 @@ fn the_none_window_fires_the_cap_once_and_the_next_pass_proceeds() {
         db.core.table.set_after_pin_sample(Box::new(move || {
             // Once: the hook stays installed for later passes.
             if !fired.swap(true, Ordering::AcqRel) {
-                *in_window.lock() = Some(take_snapshot(&core).watermark.is_empty());
+                *in_window.lock() =
+                    Some(take_snapshot(&core, &mut no_witness()).watermark.is_empty());
             }
         }));
     }
@@ -181,7 +196,9 @@ fn the_none_window_fires_the_cap_once_and_the_next_pass_proceeds() {
     );
     assert_eq!(caps(&db), 1, "exactly one cap");
     assert!(
-        !take_snapshot(&db.core).watermark.is_empty(),
+        !take_snapshot(&db.core, &mut no_witness())
+            .watermark
+            .is_empty(),
         "the next pass proceeds"
     );
     assert_eq!(caps(&db), 1, "and is not capped");
@@ -222,7 +239,9 @@ fn a_stale_q_relocation_latch_below_a_store_caps_retirement_until_it_drops() {
     let latch = db.core.table.pin_cut(q);
     assert_eq!(caps(&db), 0);
     assert!(
-        take_snapshot(&db.core).watermark.is_empty(),
+        take_snapshot(&db.core, &mut no_witness())
+            .watermark
+            .is_empty(),
         "a latch below the stored cut defers every stream"
     );
     assert_eq!(caps(&db), 1);
@@ -233,7 +252,9 @@ fn a_stale_q_relocation_latch_below_a_store_caps_retirement_until_it_drops() {
     );
     drop(latch);
     assert!(
-        !take_snapshot(&db.core).watermark.is_empty(),
+        !take_snapshot(&db.core, &mut no_witness())
+            .watermark
+            .is_empty(),
         "the next pass after the drop proceeds"
     );
     assert_eq!(caps(&db), 1);
@@ -421,7 +442,7 @@ fn a_generation_closed_before_any_region_store_gets_no_watermark_and_raises_no_a
         fronts.iter().all(|front| front.generation != first),
         "premise: no region names generation {first}: {fronts:?}"
     );
-    let snapshot = take_snapshot(&db.core);
+    let snapshot = take_snapshot(&db.core, &mut no_witness());
     eprintln!(
         "snapshot: watermark {:?} durable_end {:?}",
         snapshot.watermark, snapshot.durable_end
@@ -474,7 +495,7 @@ fn after_the_first_store_every_retained_generation_has_a_watermark() {
         fronts.iter().any(|front| front.generation == db.epoch()),
         "premise: the stored region names the serving generation: {fronts:?}"
     );
-    let snapshot = take_snapshot(&db.core);
+    let snapshot = take_snapshot(&db.core, &mut no_witness());
     eprintln!(
         "after the first store: fronts {fronts:?} watermark {:?}",
         snapshot.watermark
@@ -483,5 +504,103 @@ fn after_the_first_store_every_retained_generation_has_a_watermark() {
         snapshot.watermark.contains_key(&(partition, first)),
         "generation {first} has a row, hence a watermark: {:?}",
         snapshot.watermark
+    );
+}
+
+/// The retained witness keeps, per stream, the lowest floor and the highest
+/// shadowing version, and every retirement decision re-reads it: a later pass
+/// with no new merge still caps, and pruning happens only when no held cut can
+/// name the position any more.
+///
+/// This is the later-pass coverage at the decision boundary: the end-to-end
+/// pass in `dead_wal_files_tests::a_no_work_pass_keeps_the_shadow_cap` and the
+/// two-stream pass in `relocation_witness_tests.rs` cover the same rule through
+/// a real database.
+#[test]
+fn the_witness_merges_per_stream_survives_passes_and_prunes_when_covered() {
+    let file = 1024 * 1024u64;
+    let version = |epoch: u64, sequence: u64| BatchVersion { epoch, sequence };
+    let position =
+        |partition: u32, generation: u64, offset: u64, batch: BatchVersion| VersionPosition {
+            batch,
+            operation_index: 0,
+            payload_crc: 7,
+            address: crate::distributed::types::PhysicalValueAddress {
+                partition,
+                segment_generation: generation,
+                offset,
+                len: 64,
+            },
+        };
+    let mut gate = RetirementGate::default();
+    gate.merge(&[
+        (
+            position(3, 1, 2 * file + 100, version(9, 40)),
+            version(9, 80),
+        ),
+        (position(3, 1, file + 100, version(9, 40)), version(9, 60)),
+        (position(3, 2, 4096, version(9, 30)), version(9, 50)),
+        // An older generation's position: a serving-epoch latch is above it.
+        (position(4, 7, 512, version(6, 5)), version(6, 500)),
+    ]);
+
+    // Under a latch at the lower shadowing version both streams are capped at
+    // their own file: 0 for stream (3, 2). The lowest floor wins over the higher
+    // one merged for stream (3, 1).
+    let caps = gate.caps(Some(version(9, 50)), version(9, 99), file);
+    assert_eq!(
+        caps.get(&(3, 1)),
+        Some(&file),
+        "the merged floor {file} of stream (3, 1) survives, not the 2-file floor: {caps:?}"
+    );
+    assert_eq!(
+        caps.get(&(3, 2)),
+        Some(&0),
+        "stream (3, 2) keeps its own floor: {caps:?}"
+    );
+    assert!(
+        !caps.contains_key(&(4, 7)),
+        "a serving-epoch latch is above an older generation's position: {caps:?}"
+    );
+
+    // No new merge, a higher latch: the decision repeats with the same witness.
+    // A latch at 70 is still at or below stream (3, 1)'s HIGHEST shadowing
+    // version (80, not the 60 merged later), so that stream stays capped;
+    // stream (3, 2) (shadowing 50) is pruned, because its old position is no
+    // longer reachable through that cut.
+    let higher = gate.caps(Some(version(9, 70)), version(9, 99), file);
+    assert_eq!(
+        higher.get(&(3, 1)),
+        Some(&file),
+        "the highest shadowing version 80, not 60, decides the cap: {higher:?}"
+    );
+    assert!(
+        !higher.contains_key(&(3, 2)),
+        "a latch above 50 cannot name stream (3, 2)'s old position: {higher:?}"
+    );
+
+    // A latch above the highest shadowing version needs no cap, and the entry is
+    // dropped for good.
+    assert!(
+        gate.caps(Some(version(9, 81)), version(9, 99), file)
+            .is_empty(),
+        "no held cut can name a position below an entry at 80"
+    );
+    assert!(
+        gate.caps(None, version(9, 99), file).is_empty(),
+        "the pruned stream is not resurrected"
+    );
+
+    // Without a latch, publication decides: an uncovered shadowing version is
+    // capped and a covered one is not.
+    gate.merge(&[(position(5, 1, file, version(9, 95)), version(9, 95))]);
+    assert_eq!(
+        gate.caps(None, version(9, 95), file).get(&(5, 1)),
+        Some(&file),
+        "a shadowing version at the published cut is not covered yet"
+    );
+    assert!(
+        gate.caps(None, version(9, 96), file).is_empty(),
+        "a covered shadowing version cannot be named by a latch created later"
     );
 }

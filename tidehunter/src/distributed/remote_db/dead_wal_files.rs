@@ -31,7 +31,10 @@
 //! therefore never passes a cut a read can still use. `take_snapshot` adds the
 //! explicit cap (no stream retires while a latch is below the stored cut: a
 //! stale relocation latch or the transient NONE latch of `pin_checkpoint`) and
-//! counts it as `retirement_latch_caps`.
+//! counts it as `retirement_latch_caps`. A position the relocation pass copied
+//! but could not re-point is capped per stream from the pass's own witness (the
+//! file below the lowest position a held read cut can still name) and counted as
+//! `retirement_pin_caps` / `retirement_pin_streams`.
 //!
 //! Nothing here is fatal for the authority: a failed or refused request made
 //! no coordinator state change, and the next pass re-pages the owner.
@@ -40,10 +43,13 @@ use super::file_inventory::{
     FileInventoryReply, FileUseState, MAX_FILE_INVENTORY_PAGE, OwnerSpan, WalFileObservation,
     span_budget_end,
 };
+use super::relocation::shadow_needs_cap;
 use super::write_core::core::WriteCore;
 use super::{Client, LocalDbError};
+use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::storage::{RetireProof, RetirementWitness, WalInode};
 use crate::distributed::tcp::checkpoint::RetirementResult;
+use crate::distributed::types::BatchVersion;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
@@ -67,6 +73,97 @@ struct StreamWatermark {
     callback_from: u64,
 }
 
+/// One stream's shadowed as-of position that a held read cut can still name.
+#[derive(Clone, Copy, Debug)]
+struct ShadowWitness {
+    /// Lowest owner WAL offset of a position whose re-point did not land.
+    floor: u64,
+    /// Highest version of a cell entry that shadowed such a re-point.
+    shadowing: BatchVersion,
+}
+
+/// The relocation shadow witness kept between passes.
+///
+/// A relocation pass copies the as-of value of an overwritten key but cannot
+/// re-point the cell, because the cell's latest entry is a newer version. A
+/// read cut at or below that newer version still resolves the old position, so
+/// the file that holds it must not be retired while such a cut can exist. The
+/// pass that copied the position is not necessarily the pass that retires its
+/// file: a later pass can have no target for this stream (another stream's work
+/// is what makes it run retirement) and then produces no shadowed expectation
+/// at all. The witness therefore lives here, is merged on every pass and is
+/// re-evaluated on every retirement (`take_snapshot`; paper 4.4: the GC
+/// watermark tracks the oldest position that may still be referenced).
+///
+/// Shared state without a new lock: it lives inside the existing
+/// `WriteCore::retirement` mutex, which already serialises retirement and
+/// callback-start adoption, and every merge and every retirement decision runs
+/// in that one critical section. It is never persisted: a latch exists only in
+/// memory, and after a reopen every cut is in the new generation and above
+/// every old version, so no new latch can name an old position.
+///
+/// Bound: one entry per `(partition, fencing generation)` stream whose
+/// re-point was shadowed, so at most the retained stream bound
+/// (`region::MAX_REGION_STREAMS`). An entry is dropped as soon as no read cut
+/// can name its shadowing version and that version is published.
+#[derive(Default)]
+pub(in crate::distributed::remote_db) struct RetirementGate {
+    shadows: BTreeMap<(u32, u64), ShadowWitness>,
+}
+
+impl RetirementGate {
+    /// Merges one pass's shadowed expectations: per stream the lowest floor
+    /// and the highest shadowing version. Conservative: the highest shadowing
+    /// version decides whether any latch can still name the lowest position,
+    /// so a cap can outlive the pass that needed it but never lapses early.
+    /// `O(shadowed)` time and memory, bounded by the stream bound.
+    pub(in crate::distributed::remote_db) fn merge(
+        &mut self,
+        shadowed: &[(VersionPosition, BatchVersion)],
+    ) {
+        for &(position, shadowing) in shadowed {
+            let address = position.address;
+            let witness = self
+                .shadows
+                .entry((address.partition, address.segment_generation))
+                .or_insert(ShadowWitness {
+                    floor: address.offset,
+                    shadowing,
+                });
+            witness.floor = witness.floor.min(address.offset);
+            witness.shadowing = witness.shadowing.max(shadowing);
+        }
+        debug_assert!(
+            self.shadows.len() <= crate::distributed::hybrid::region::MAX_REGION_STREAMS,
+            "retirement witness grew past the control-region stream bound"
+        );
+    }
+
+    /// Drops every witness no held read cut can still name, then returns the
+    /// file-aligned cap of the rest: the file that holds the lowest referenced
+    /// position and every file above it stay.
+    ///
+    /// `published` must be read before `held`: the SeqCst Dekker pair at
+    /// `CutLatches::publish_min` / `min_held` (loader.rs) makes a racing pin
+    /// either visible in `held` or sampled at or above `published`.
+    fn caps(
+        &mut self,
+        held: Option<BatchVersion>,
+        published: BatchVersion,
+        file: u64,
+    ) -> BTreeMap<(u32, u64), u64> {
+        self.shadows
+            .retain(|_, witness| shadow_needs_cap(held, published, witness.shadowing));
+        self.shadows
+            .iter()
+            .map(|(&stream, witness)| {
+                let floor = witness.floor;
+                (stream, floor - floor % file)
+            })
+            .collect()
+    }
+}
+
 /// Frozen per-pass evidence: one watermark per retained stream plus the
 /// Version B cut of the serving generation.
 struct Snapshot {
@@ -88,13 +185,14 @@ struct Snapshot {
 }
 
 /// Retire every dead sealed file of every retained stream. The caller holds
-/// `core.retirement`; no other coordinator lock is held across a page, an RPC
-/// or an unlink. Every early `Ok(())` below is a deferral that made no
-/// decision; the next pass retries.
+/// `core.retirement` (as `gate`); no other coordinator lock is held across a
+/// page, an RPC or an unlink. Every early `Ok(())` below is a deferral that made
+/// no decision; the next pass retries.
 pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     core: &WriteCore,
+    gate: &mut RetirementGate,
 ) -> Result<(), LocalDbError> {
-    let snapshot = take_snapshot(core);
+    let snapshot = take_snapshot(core, gate);
     let tls_config = core
         .config
         .tls
@@ -161,7 +259,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     Ok(())
 }
 
-fn take_snapshot(core: &WriteCore) -> Snapshot {
+fn take_snapshot(core: &WriteCore, gate: &mut RetirementGate) -> Snapshot {
     // Two guards of the deleted Exact design are replaced, not lost:
     // `install_seq`/the installed-cut bound existed to freeze one image while
     // walking its references, and `referenced_files` existed because a file
@@ -258,6 +356,39 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
                 callback_from,
             },
         );
+    }
+    // A read cut no pass satisfied: the stream's end drops to the file below
+    // the lowest position such a cut can still name, so no victim holds a byte
+    // it resolves. The witness is re-evaluated on every retirement, whatever
+    // this pass targeted: a pass whose own stream had no target still runs this
+    // decision for every retained stream (a cap that only existed on the pass
+    // that copied the position lapses exactly when another stream's work makes
+    // retirement run). Read the publication floor first and the latch mirror
+    // second: the SeqCst Dekker pair at `CutLatches::publish_min` / `min_held`
+    // (loader.rs) makes a racing pin either appear in the latch read or sample
+    // a cut at or above the floor. The pass's store already waited for the
+    // publisher critical section that inserted each shadowing entry
+    // (`publisher.rs` `publish_durable` advances the published front in that
+    // section, `WriteCore::older_streams` takes the same lock), so a covered
+    // shadowing version cannot be named by a latch created later.
+    let published = core.table.current();
+    let held = core.table.cuts().lowest_held();
+    let caps = gate.caps(held, published, core.config.storage.wal_file_bytes);
+    let mut pinned_streams = 0u64;
+    for (key, cap) in &caps {
+        let Some(stream) = watermark.get_mut(key) else {
+            continue;
+        };
+        if *cap < stream.end {
+            stream.end = *cap;
+            pinned_streams = pinned_streams.saturating_add(1);
+        }
+    }
+    if pinned_streams != 0 {
+        // Relaxed: diagnostic counts; nothing is ordered against them.
+        core.retirement_pin_caps.fetch_add(1, Ordering::Relaxed);
+        core.retirement_pin_streams
+            .fetch_add(pinned_streams, Ordering::Relaxed);
     }
     let persisted_cut_next = match core.durable_cut.get() {
         None => None,

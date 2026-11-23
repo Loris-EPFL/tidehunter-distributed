@@ -16,7 +16,7 @@ tidehunter/src/distributed/remote_db/pending_read.rs 2247
 tidehunter/src/distributed/remote_db/pipeline_tests.rs 2153
 tidehunter/src/distributed/storage.rs 4768
 tidehunter/src/distributed/storage/tests.rs 2074
-tidehunter/src/distributed/sui.rs 2021
+tidehunter/src/distributed/sui.rs 2017
 tidehunter/src/distributed/tcp.rs 2283
 tidehunter/src/distributed/tcp/control.rs 2281
 tidehunter/src/distributed/tcp/control_tests.rs 2542

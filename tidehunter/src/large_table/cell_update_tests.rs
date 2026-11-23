@@ -140,8 +140,12 @@ impl Fixture {
         &self,
         f: impl FnOnce(&mut IndexTable) -> (R, bool),
     ) -> Result<Option<R>, CellUpdateError<DbError>> {
-        self.table
-            .update_cell_index(self.context(), &self.cell(), &self.loader, f)
+        self.table.update_cell_index(
+            self.context(),
+            &self.cell(),
+            &self.loader,
+            |index, _levels| Ok(f(index)),
+        )
     }
 }
 
@@ -162,9 +166,9 @@ fn empty_cell_is_absent_and_is_not_touched() {
     let cell = context.ks_config.cell_id(&key(1));
     let mut ran = false;
     let result = table
-        .update_cell_index(context, &cell, &loader, |_| {
+        .update_cell_index(context, &cell, &loader, |_, _levels| {
             ran = true;
-            ((), true)
+            Ok(((), true))
         })
         .expect("an absent cell is not an error");
     assert!(result.is_none());
@@ -473,9 +477,9 @@ fn repoint_during_an_in_flight_flush_waits_for_it_and_survives_its_completion() 
     let (context, cell) = (flight.context(), flight.cell());
     thread::scope(|scope| {
         let updater = scope.spawn(|| {
-            let result = table.update_cell_index(context, &cell, loader, |index| {
+            let result = table.update_cell_index(context, &cell, loader, |index, _levels| {
                 repoint_key(index, 777);
-                ((), true)
+                Ok(((), true))
             });
             applied.store(true, Ordering::SeqCst);
             result
@@ -559,9 +563,9 @@ fn update_index_asserts_no_flush_is_pending() {
     flight
         .table
         .with_entry_for_test(flight.context(), &flight.cell(), |entry| {
-            entry.update_index(&flight.loader, |index| {
+            entry.update_index(&flight.loader, |index, _levels| {
                 repoint_key(index, 777);
-                ((), true)
+                Ok(((), true))
             })
         })
         .expect("the assertion fires before the loader is asked");

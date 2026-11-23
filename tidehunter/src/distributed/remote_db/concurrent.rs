@@ -1134,6 +1134,32 @@ impl ConcurrentRemoteDatabase {
             .load(Ordering::Relaxed)
     }
 
+    /// Retirement passes whose per-stream watermark a shadowed relocation
+    /// re-point capped; exported as the `retirement_pin_caps` gauge.
+    pub(crate) fn retirement_pin_caps(&self) -> u64 {
+        self.write_core()
+            .retirement_pin_caps
+            .load(Ordering::Relaxed)
+    }
+
+    /// Stream watermarks lowered by that cap, summed over passes; exported as
+    /// the `retirement_pin_streams` gauge.
+    pub(crate) fn retirement_pin_streams(&self) -> u64 {
+        self.write_core()
+            .retirement_pin_streams
+            .load(Ordering::Relaxed)
+    }
+
+    /// Exports the retirement gauges through the caller's sink: the latch
+    /// deferrals, the two shadow-witness caps and the streams a pass found
+    /// without a stored row.
+    pub(crate) fn visit_retirement_gauges(&self, set: &mut impl FnMut(&'static str, u64)) {
+        set("retirement_latch_caps", self.retirement_latch_caps());
+        set("retirement_pin_caps", self.retirement_pin_caps());
+        set("retirement_pin_streams", self.retirement_pin_streams());
+        set("retirement_missing_rows", self.retirement_missing_rows());
+    }
+
     /// Seeded start streams a retirement pass found with no row in the region
     /// this process stored (summed over passes); exported as the
     /// `retirement_missing_rows` gauge. Zero unless an invariant broke.

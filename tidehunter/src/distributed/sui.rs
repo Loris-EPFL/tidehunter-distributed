@@ -977,11 +977,7 @@ impl Db {
                 "relocation_copy_deferrals",
                 remote.db.relocation_copy_deferrals(),
             );
-            set("retirement_latch_caps", remote.db.retirement_latch_caps());
-            set(
-                "retirement_missing_rows",
-                remote.db.retirement_missing_rows(),
-            );
+            remote.db.visit_retirement_gauges(&mut set);
             set(
                 "retirement_busy_replies",
                 remote.db.retirement_busy_replies(),
