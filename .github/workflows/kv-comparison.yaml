@@ -176,7 +176,7 @@ jobs:
           python3 -B -m unittest discover -s .github/scripts -p 'test_replay_ci.py'
       - name: Test the comparison crate with actual adapter features
         # 7m14s at 31d4845; the mainnet replay suites (native, distributed, RESP) exceed 10 minutes.
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: cargo test --locked -p kv-research --features tikv,cassandra,foundationdb,valkey-tcp,garnet,kvrocks
       # This build must stay the last cargo step before the campaign below:
       # `cargo test` builds the integration tests' `CARGO_BIN_EXE_kv-research`
