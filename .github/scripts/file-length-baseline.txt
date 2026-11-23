@@ -14,7 +14,7 @@ tidehunter/src/distributed/remote_db.rs 2702
 tidehunter/src/distributed/remote_db/live_bench_tests.rs 1828
 tidehunter/src/distributed/remote_db/pending_read.rs 2263
 tidehunter/src/distributed/remote_db/pipeline_tests.rs 2153
-tidehunter/src/distributed/remote_db/read_cache.rs 2049
+tidehunter/src/distributed/remote_db/read_cache.rs 2030
 tidehunter/src/distributed/storage.rs 4799
 tidehunter/src/distributed/storage/tests.rs 2074
 tidehunter/src/distributed/sui.rs 2059

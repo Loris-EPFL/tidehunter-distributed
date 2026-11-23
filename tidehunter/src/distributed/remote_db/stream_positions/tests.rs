@@ -83,6 +83,30 @@ fn the_seed_never_exceeds_the_stream_bound() {
     );
 }
 
+/// The seed enforces the same bound as an invariant (the reservation already
+/// refused an over-bound table), so its message must not claim what is only
+/// true of the reservation path ("No generation was reserved", operator advice).
+#[test]
+fn the_seed_path_reports_the_short_invariant_and_the_reservation_the_operator_message() {
+    let retained: Vec<(u64, bool)> = (1..=(MAX_REGION_STREAMS as u64 / 2))
+        .map(|generation| (generation, true))
+        .collect();
+    let seed = seed_positions(&[0, 1], &retained, &[]).expect_err("over the bound");
+    let seed = seed.to_string();
+    assert!(seed.contains("exceed the"), "{seed}");
+    assert!(
+        !seed.contains("No generation was reserved") && !seed.contains("in-band"),
+        "the seed path never reserved anything and gives no operator advice: {seed}"
+    );
+    let reservation = check_stream_bound(2, retained.len()).expect_err("over the bound");
+    assert!(
+        reservation
+            .to_string()
+            .contains("No generation was reserved"),
+        "{reservation}"
+    );
+}
+
 #[test]
 fn a_seeded_aborted_generation_is_retirable_and_an_unseeded_one_is_not() {
     // The owner's ledger proves an aborted generation empty: trim-eligible.
@@ -157,4 +181,42 @@ fn recorded_extents_only_grow() {
     assert_eq!(positions[&(0, 4)].durable_end, 12288);
     assert_eq!(positions[&(0, 4)].last_offset, Some(8192));
     assert!(positions[&(0, 4)].complete);
+}
+
+#[test]
+fn a_reservation_at_the_bound_is_accepted_and_one_past_it_is_refused() {
+    // owners x (retained + 1) <= bound: 2 owners, 2,047 retained generations.
+    check_stream_bound(2, MAX_REGION_STREAMS / 2 - 1).expect("exactly at the bound");
+    check_stream_bound(MAX_REGION_STREAMS, 0).expect("one generation across the bound owners");
+    let error = check_stream_bound(2, MAX_REGION_STREAMS / 2).expect_err("one past");
+    let text = error.to_string();
+    // The operator-facing error names the owners, the retained count, the bound,
+    // says nothing was reserved and that there is no in-band recovery.
+    for part in [
+        "2 owners",
+        &format!("{} retained fencing generations", MAX_REGION_STREAMS / 2),
+        &MAX_REGION_STREAMS.to_string(),
+        "No generation was reserved",
+        "no in-band recovery",
+        "retained_stream_pressure",
+        "offline fenced trim tool (not built)",
+    ] {
+        assert!(text.contains(part), "missing {part:?}: {text}");
+    }
+    assert!(
+        !text.contains("let relocation retire"),
+        "no advice that cannot work after a refusal: {text}"
+    );
+    // Saturation never wraps into acceptance.
+    assert!(check_stream_bound(usize::MAX, usize::MAX).is_err());
+}
+
+#[test]
+fn soft_pressure_starts_at_75_percent_of_the_bound_and_not_before() {
+    let soft = MAX_REGION_STREAMS * SOFT_PRESSURE_PERCENT / 100;
+    assert_eq!(soft, 3072);
+    assert!(!StreamPressure::new(0).is_soft());
+    assert!(!StreamPressure::new(soft - 1).is_soft());
+    assert!(StreamPressure::new(soft).is_soft());
+    assert!(StreamPressure::new(MAX_REGION_STREAMS).is_soft());
 }

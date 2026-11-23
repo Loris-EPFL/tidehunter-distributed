@@ -2,7 +2,8 @@
 
 use super::{
     HybridControlRegion, HybridRegionStore, MAX_CONTROL_REGION_BYTES, MAX_REGION_STREAMS,
-    StreamFront, max_flushed_at, max_region_cells, snapshot_due, stale_threshold,
+    OlderStream, StreamFront, max_flushed_at, max_region_cells, older_replay_from, snapshot_due,
+    stale_threshold,
 };
 use crate::cell::CellId;
 use crate::container::LargeTableContainer;
@@ -346,4 +347,111 @@ fn an_oversized_region_file_is_rejected_before_reading() {
         .expect("sparse len");
     let error = HybridRegionStore::read(&path).expect_err("too large");
     assert!(error.to_string().contains("above the"), "{error}");
+}
+
+/// F2, open side: `HybridRegionStore::store` refuses an over-bound region, so a
+/// file that names more than [`MAX_REGION_STREAMS`] streams can only be
+/// hand-crafted (a different binary, a corrupted disk). The table must refuse
+/// it at open with the stream-bound error, before it trusts any replay front,
+/// and must leave the file untouched.
+///
+/// Negative control (mutation run): remove the `validate_bounds` call after
+/// `HybridRegionStore::open` in `HybridTable::open_with_partitions` and the open
+/// succeeds.
+#[test]
+fn a_hand_crafted_over_bound_region_file_is_refused_when_the_table_opens() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::hybrid::config::HybridIndexConfig;
+    use crate::distributed::hybrid::loader::CutSources;
+    use crate::distributed::hybrid::table::HybridTable;
+    use crate::metrics::Metrics;
+
+    let dir = tempdir::TempDir::new("hybrid-region-over-bound-open").expect("temp dir");
+    let path = dir.path().join(CONTROL_REGION_FILE);
+    let mut over = region_with_streams(MAX_REGION_STREAMS + 1);
+    over.cell_bytes = BTreeMap::new();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&super::SENTINEL.to_le_bytes());
+    bytes.extend_from_slice(&<BatchVersion as IndexCut>::CONTROL_REGION_VERSION.to_le_bytes());
+    bincode::serialize_into(&mut bytes, &over).expect("serialize the crafted region");
+    fs::write(&path, &bytes).expect("write the crafted region");
+
+    let opened = HybridTable::open(
+        dir.path(),
+        Arc::new(shape()),
+        &HybridIndexConfig::default(),
+        CutSources::new(2, DurabilityTier::Native),
+        Metrics::new(),
+    );
+    let error = match opened {
+        Ok(_) => panic!("an over-bound region must not open"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("owner streams"), "{error}");
+    assert_eq!(
+        fs::read(&path).expect("the file is still there"),
+        bytes,
+        "a refused open rewrites nothing"
+    );
+}
+
+/// The cover rule of an older generation's row, at every boundary (pure
+/// function `older_replay_from`). Rows: (previous row, store cut, stream,
+/// expected row and "end unknown").
+///
+/// Negative controls (mutation runs): `cut.epoch > generation` replaced by `>=`
+/// makes the `{1, MAX}` row jump to the end; a `None` end that returns 0 instead
+/// of `previous` fails the 100 row. `previous.max(end)` replaced by `end` is an
+/// equivalent mutant while the debug assertion below holds (a row above its end
+/// panics instead of returning), so it has no control here.
+#[test]
+fn an_older_row_follows_the_cover_rule_at_every_boundary() {
+    let stream = |generation, durable_end| OlderStream {
+        partition: 0,
+        generation,
+        durable_end,
+    };
+    for (previous, cut, stream, expected) in [
+        // The cut reaches {k + 1, 0} exactly: generation k is covered.
+        (0, v(2, 0), stream(1, Some(500)), (500, false)),
+        // One version below {k + 1, 0}: still inside generation k, carry.
+        (0, v(1, u64::MAX), stream(1, Some(500)), (0, false)),
+        // A cut far above covers too.
+        (0, v(9, 9), stream(1, Some(500)), (500, false)),
+        // The row never moves back below the cover (the carried row stays).
+        (700, v(1, 5), stream(1, Some(500)), (700, false)),
+        // A row already at the end stays there once covered.
+        (500, v(3, 5), stream(1, Some(500)), (500, false)),
+        // A carried row below the end advances to it once covered.
+        (100, v(2, 0), stream(1, Some(500)), (500, false)),
+        (100, v(1, 5), stream(1, Some(500)), (100, false)),
+        // An unknown end carries the previous row and reports itself.
+        (100, v(9, 9), stream(1, None), (100, true)),
+        (0, v(0, 0), stream(1, None), (0, true)),
+        // An end of zero (an empty stream) is covered like any other.
+        (0, v(2, 0), stream(1, Some(0)), (0, false)),
+    ] {
+        assert_eq!(
+            older_replay_from(previous, cut, &stream),
+            expected,
+            "previous {previous}, cut {cut:?}, stream {stream:?}"
+        );
+    }
+}
+
+/// A covered older stream whose carried row lies ABOVE its durable end is an
+/// unreachable state (the open replays from the row and refuses a start above
+/// the owner's end): the A'4b debug assertion names it.
+///
+/// Negative control (mutation run `TH_MUT=older_no_assert`): remove the assert;
+/// this test then sees `max` return 700 and no panic.
+#[test]
+#[should_panic(expected = "is above its durable end")]
+fn a_covered_older_row_above_its_end_is_refused_by_the_assertion() {
+    let stream = OlderStream {
+        partition: 0,
+        generation: 1,
+        durable_end: Some(500),
+    };
+    assert_eq!(older_replay_from(700, v(2, 0), &stream), (700, false));
 }

@@ -36,7 +36,7 @@ tidehunter/src/distributed/remote_db/model_check_leased.rs 0 2
 tidehunter/src/distributed/remote_db/pending_read.rs 0 1
 tidehunter/src/distributed/remote_db/pending_read/live_lane.rs 1 1
 tidehunter/src/distributed/remote_db/pending_read/read_trace.rs 1 4
-tidehunter/src/distributed/remote_db/read_cache.rs 1 28
+tidehunter/src/distributed/remote_db/read_cache.rs 1 27
 tidehunter/src/distributed/remote_db/write_core/completion.rs 1 1
 tidehunter/src/distributed/remote_db/write_core/dependencies.rs 1 1
 tidehunter/src/distributed/remote_db/write_core/owner_queue.rs 1 3

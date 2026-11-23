@@ -207,6 +207,35 @@ fn a_discontinuous_owner_bounds_the_skip_at_its_recorded_sync() {
     }
 }
 
+/// B24: the skip over the missing 5 keeps the acknowledged 6 iff the recorded
+/// synced end (exclusive) of the discontinuous owner is at or above 6, i.e. the
+/// gap `[5, 6)` lies below it. The table asserts limit - 2, limit - 1, limit and
+/// limit + 1 around 6 for every discontinuity kind (the existing test above
+/// covers 5 and 6 for one value of the bound only through its own loop).
+///
+/// Negative control (mutation run of production code): `version.sequence <=
+/// open.bound` -> `<` in `RecoveryPlan::keep`.
+#[test]
+fn the_skip_bound_is_inclusive_at_the_sequence_after_the_gap() {
+    for discontinuity in [
+        fence(1, OTHER_INCARNATION, true),
+        fence(1, INCARNATION, false),
+    ] {
+        let fenced = [fence(0, INCARNATION, true), discontinuity];
+        for (synced, keeps_six) in [(4, false), (5, false), (6, true), (7, true)] {
+            let mut plan = continuity_plan(synced, &fenced);
+            assert_eq!(plan.continuity_bound, Some(synced));
+            let kept = replay(&mut plan);
+            let expected: &[u64] = if keeps_six {
+                &[0, 1, 2, 3, 4, 6, 7]
+            } else {
+                &[0, 1, 2, 3, 4]
+            };
+            assert_eq!(kept, expected, "{discontinuity:?} synced={synced}");
+        }
+    }
+}
+
 /// Without evidence for an owner the bound is 0: Extend stops at the first gap.
 #[test]
 fn missing_continuity_evidence_stops_at_the_first_gap() {

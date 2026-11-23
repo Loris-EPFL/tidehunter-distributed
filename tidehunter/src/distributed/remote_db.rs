@@ -2689,3 +2689,9 @@ mod lifecycle_tests;
 mod model_check_tests;
 #[cfg(test)]
 mod wal_replay_tests;
+
+#[cfg(test)]
+mod open_tests;
+
+#[cfg(test)]
+mod stream_bound_tests;

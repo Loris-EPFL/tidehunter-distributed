@@ -540,3 +540,6 @@ fn victims(
     }
     Ok(proofs)
 }
+
+#[cfg(test)]
+mod tests;

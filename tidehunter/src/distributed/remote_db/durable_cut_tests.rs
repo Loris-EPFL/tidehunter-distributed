@@ -119,16 +119,32 @@ fn extend_keeps_the_surviving_run_after_a_coordinator_crash() {
         [1, 2, 3].map(|key| value(&mut db, key)),
         [Some(1), Some(2), Some(3)]
     );
-    // The acknowledged identity is still known after recovery.
+    // OWNER-ACCEPTED WEAKENING (remote_db.rs `recent: ReceiptWindow::new()`):
+    // the retry window is empty after every open, so a retry of an
+    // acknowledged operation is applied again as a new batch at the new epoch
+    // (the old design answered it with the original version {1, 2}). The put
+    // is idempotent: key 3 still reads 3, and keys 1 and 2 are unchanged.
     let retried = db
         .write_batch(fixture.operation(0, 3), vec![put(3, 3)])
         .unwrap();
     assert_eq!(
         retried,
         BatchVersion {
-            epoch: 1,
-            sequence: 2
-        }
+            epoch: db.epoch(),
+            sequence: 0
+        },
+        "the retry is re-applied at the new epoch"
+    );
+    assert_eq!(db.epoch(), 2);
+    // The new epoch's window must still deduplicate the operation it just
+    // published, even though the prior epoch's window was not recovered.
+    let repeated = db
+        .write_batch(fixture.operation(0, 3), vec![put(3, 3)])
+        .expect("retry in the new epoch");
+    assert_eq!(repeated, retried, "the new epoch retains its own receipt");
+    assert_eq!(
+        [1, 2, 3].map(|key| value(&mut db, key)),
+        [Some(1), Some(2), Some(3)]
     );
 }
 
@@ -307,19 +323,52 @@ fn truncation_survives_every_later_crash() {
     assert!(error.message().contains("after cut record"), "{error}");
     let manifest: AuthorityManifest = read_metadata(&root.join(MANIFEST)).unwrap();
     assert_eq!(manifest.generations[1].state, GenerationState::Reserved);
-    let mut db = fixture.open();
-    assert_eq!(db.epoch(), 3);
-    assert_eq!(db.recovery_stats().cut_discarded_batches, 1);
-    assert_eq!(value(&mut db, 3), None);
-    crash(db);
-    let mut db = fixture.open();
-    assert!(db.durable_cut_stats().enabled);
-    // Epoch 3 checkpointed its recovered tail, so epoch 1 is not replayed again.
-    assert_eq!(db.recovery_stats().cut_discarded_batches, 0);
-    assert_eq!(
-        [1, 2, 3].map(|key| value(&mut db, key)),
-        [Some(1), None, None]
-    );
+    // Every later open replays the older generation again: the hybrid open
+    // writes no checkpoint after replay (native opens the same way, from the
+    // last control-region snapshot), so the persisted cut record is the only
+    // thing that keeps the discarded batch out. Re-replay is allowed and
+    // `cut_discarded_batches` may repeat (bounded by the one discarded batch);
+    // resurrection is not: the discarded v2 (key 3) and the aborted version
+    // (key 2) read as absent on every reopen, and the kept key reads its bytes.
+    for open_number in 1..=3u64 {
+        let mut db = fixture.open();
+        assert!(db.durable_cut_stats().enabled);
+        let reopened = [1u32, 2, 3].map(|key| {
+            db.get(KeySpace(0), &key.to_be_bytes())
+                .expect("read recovered key")
+                .map(|bytes| bytes.to_vec())
+        });
+        let stats = db.recovery_stats();
+        if open_number == 1 {
+            // The interrupted open reserved epoch 2: this open is epoch 3 and
+            // is the one that actually discards the acknowledged v2.
+            assert_eq!(db.epoch(), 3);
+            assert_eq!(stats.cut_discarded_batches, 1);
+        }
+        eprintln!(
+            "truncation open {open_number}: epoch {} values {reopened:?} discarded {} extended {} \
+             recovered_cut {:?} stored_cut {:?}",
+            db.epoch(),
+            stats.cut_discarded_batches,
+            stats.cut_extended_batches,
+            stats.recovered_cut,
+            db.core.table.stored_cut()
+        );
+        assert_eq!(
+            reopened,
+            [Some(vec![1; 16]), None, None],
+            "open {open_number}: the discarded tail was re-applied"
+        );
+        assert!(
+            stats.cut_discarded_batches <= 1,
+            "open {open_number}: {stats:?}"
+        );
+        if open_number < 3 {
+            crash(db);
+        } else {
+            db.shutdown().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -394,4 +443,114 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
     assert_eq!(stats.persisted_next, 2);
     assert!(stats.reports > warm.reports);
     db.shutdown().unwrap();
+}
+
+/// Native opt-in sharding is preserved by the hybrid. A small L0 entry limit
+/// forces promotion without filling the fragment. Both modes reopen through
+/// real owners and return the exact values, including after another promotion.
+#[test]
+fn native_sharding_option_controls_hybrid_promotion_and_reopen() {
+    for (threshold, expect_shards) in [(None, false), (Some(2048), true)] {
+        let fixture = Fixture::new_with_root(
+            tempdir::TempDir::new("sharding-option").expect("fixture root"),
+            1,
+            512,
+            KeyShape::new_single(4, 1, KeyType::uniform(1)),
+            2,
+            |_| {},
+            |_| {},
+        );
+        let native = crate::config::Config {
+            frag_size: 65536,
+            wal_file_size: 65536,
+            l0_max_entries: Some(8),
+            snapshot_unload_threshold: 0,
+            index_auto_shard_threshold: threshold,
+            ..crate::config::Config::default()
+        };
+        let config = fixture.config.clone().with_native_index(&native);
+        let open = || {
+            crate::distributed::sui::Db::open_remote_local_fixture(
+                &fixture.authority(),
+                fixture.shape.clone(),
+                config.clone(),
+            )
+            .expect("open Sui adapter")
+        };
+        let db = open();
+        let ks = db.ks("root");
+        let shard_count = |db: &crate::distributed::sui::Db| {
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            db.remote_for_test()
+                .write_core()
+                .table
+                .large_table()
+                .each_entry(|entry| {
+                    let levels = entry.levels();
+                    if levels.is_sharded() {
+                        count.store(levels.shards().len(), std::sync::atomic::Ordering::Relaxed);
+                    } else if !expect_shards {
+                        assert!(
+                            levels.l1().is_some(),
+                            "None must retain one promoted L1 blob"
+                        );
+                    }
+                });
+            count.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let mut first_count = 0;
+        for key in 1u32..=200 {
+            let mut batch = db.write_batch();
+            batch.write(ks, key.to_be_bytes().to_vec(), vec![(key % 251) as u8; 16]);
+            batch.commit().expect("write");
+            if key % 10 == 0 {
+                db.remote_for_test()
+                    .write_core()
+                    .flush_durable()
+                    .expect("certify writes");
+                db.remote_for_test()
+                    .write_core()
+                    .flush_index()
+                    .expect("flush index");
+            }
+            if key == 100 {
+                first_count = shard_count(&db);
+                if expect_shards {
+                    assert!(first_count > 1, "first promotion must produce shards");
+                } else {
+                    assert_eq!(first_count, 0, "None keeps a single L1");
+                }
+            }
+        }
+        let final_count = shard_count(&db);
+        if expect_shards {
+            assert!(final_count >= first_count, "re-promotion lost shards");
+        } else {
+            assert_eq!(final_count, 0, "None keeps a single L1");
+        }
+        for key in 1u32..=200 {
+            let actual = db.get(ks, &key.to_be_bytes()).expect("read before reopen");
+            assert_eq!(
+                actual.as_deref(),
+                Some(&[(key % 251) as u8; 16][..]),
+                "key {key}"
+            );
+        }
+        db.wait_for_background_threads_to_finish()
+            .expect("shutdown");
+        let reopened = open();
+        let ks = reopened.ks("root");
+        assert_eq!(shard_count(&reopened), final_count, "reopen retains levels");
+        for key in 1u32..=200 {
+            let actual = reopened.get(ks, &key.to_be_bytes()).expect("read");
+            assert_eq!(
+                actual.as_deref(),
+                Some(&[(key % 251) as u8; 16][..]),
+                "key {key}"
+            );
+        }
+        reopened
+            .wait_for_background_threads_to_finish()
+            .expect("shutdown");
+    }
 }

@@ -174,3 +174,20 @@ fn native_default_is_the_native_config_default_not_suis_values() {
     );
     config.validate().expect("native defaults are valid");
 }
+
+#[test]
+fn native_auto_sharding_option_passes_through_unchanged() {
+    for threshold in [None, Some(4096)] {
+        let native = Config {
+            index_auto_shard_threshold: threshold,
+            ..Config::default()
+        };
+        let hybrid = HybridIndexConfig::from_native(&native);
+        assert_eq!(hybrid.index_auto_shard_threshold, threshold);
+        assert_eq!(
+            hybrid.to_native_config().index_auto_shard_threshold,
+            threshold
+        );
+        hybrid.validate().expect("native threshold is valid");
+    }
+}

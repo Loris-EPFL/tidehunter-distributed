@@ -501,3 +501,85 @@ fn anchor_cut_is_bounded_by_the_loader_unlike_the_native_first_frontier() {
         crate::wal::position::LastProcessed::new(30)
     );
 }
+
+/// The row layout written out by hand, independent of `write_flat`: kind in the
+/// top two bits of the first word (0 for an on-disk row), then epoch, sequence,
+/// payload CRC, partition, segment generation, offset and length, all big
+/// endian, 48 bytes.
+fn literal_row(position: &VersionPosition) -> Vec<u8> {
+    let mut row = Vec::with_capacity(48);
+    row.extend_from_slice(&position.operation_index.to_be_bytes());
+    row.extend_from_slice(&position.batch.epoch.to_be_bytes());
+    row.extend_from_slice(&position.batch.sequence.to_be_bytes());
+    row.extend_from_slice(&position.payload_crc.to_be_bytes());
+    row.extend_from_slice(&position.address.partition.to_be_bytes());
+    row.extend_from_slice(&position.address.segment_generation.to_be_bytes());
+    row.extend_from_slice(&position.address.offset.to_be_bytes());
+    row.extend_from_slice(&position.address.len.to_be_bytes());
+    row
+}
+
+/// Differential test for the one blob-as-flat shortcut
+/// (`IndexTable::deserialize_fixed_size`): for random positions, including
+/// `operation_index` 0 and `OPERATION_MASK`, payload CRC 0 and `u32::MAX`, and
+/// every width of the other fields, `write_blob` must equal `write_flat(0)` byte
+/// for byte AND the hand-written literal layout (so a reordered field fails even
+/// if both writers were changed together), and both readers must return the
+/// same position.
+///
+/// Negative control (mutation run): swap two `put_*` calls in `write_flat`
+/// (kind word and epoch) or give `write_blob` its own field order and the
+/// literal comparison fails.
+#[test]
+fn random_positions_encode_identically_as_blob_and_clean_flat_rows() {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(0x5eed_b10b);
+    let operations = [0, 1, super::OPERATION_MASK - 1, super::OPERATION_MASK];
+    let crcs = [0, 1, u32::MAX - 1, u32::MAX];
+    let mut cases = Vec::new();
+    // The edges first: every operation index against every CRC.
+    for operation_index in operations {
+        for payload_crc in crcs {
+            cases.push((operation_index, payload_crc));
+        }
+    }
+    // Then random pairs in range.
+    for _ in 0..2_000 {
+        cases.push((rng.gen_range(0..=super::OPERATION_MASK), rng.r#gen::<u32>()));
+    }
+    for (operation_index, payload_crc) in cases {
+        let original = VersionPosition {
+            batch: batch(rng.r#gen::<u64>(), rng.r#gen::<u64>()),
+            operation_index,
+            payload_crc,
+            address: address(
+                rng.r#gen::<u32>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u32>(),
+            ),
+        };
+        let mut blob = BytesMut::with_capacity(48);
+        original.write_blob(&mut blob);
+        let mut flat = BytesMut::with_capacity(48);
+        original.write_flat(0, &mut flat);
+        assert_eq!(blob.len(), 48);
+        assert_eq!(blob, flat, "blob != clean flat for {original:?}");
+        assert_eq!(
+            &blob[..],
+            &literal_row(&original)[..],
+            "layout differs from the literal row for {original:?}"
+        );
+        let from_blob = VersionPosition::read_blob(&mut blob.clone().freeze());
+        let (from_flat, kind) = VersionPosition::read_flat(&mut flat.freeze());
+        assert_eq!(kind, 0);
+        // Field by field: logical `==` ignores the address and the CRC.
+        for decoded in [from_blob, from_flat] {
+            assert_eq!(decoded.batch, original.batch);
+            assert_eq!(decoded.operation_index, original.operation_index);
+            assert_eq!(decoded.payload_crc, original.payload_crc);
+            assert_eq!(decoded.address, original.address);
+        }
+    }
+}

@@ -2026,24 +2026,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod entry_charge_tests {
-    use super::*;
-
-    /// Pins the sizes the hand computation relies on; the compiler verifies them.
-    #[test]
-    fn the_charge_floor_keeps_fixed_slot_metadata_within_the_8_percent_budget() {
-        eprintln!(
-            "Entry={} FIXED_SLOT={} COMPUTED_MIN={} BUDGET_FLOOR={} MIN_ENTRY_CHARGE={} Bytes={}",
-            size_of::<Entry>(),
-            FIXED_SLOT_BYTES,
-            COMPUTED_MIN_ENTRY_CHARGE,
-            BUDGET_MIN_ENTRY_CHARGE,
-            MIN_ENTRY_CHARGE,
-            size_of::<Bytes>(),
-        );
-        assert!(MIN_ENTRY_CHARGE >= COMPUTED_MIN_ENTRY_CHARGE);
-        assert!(MIN_ENTRY_CHARGE >= BUDGET_MIN_ENTRY_CHARGE);
-        // metadata / (metadata + data) <= 8 %, in integers.
-        assert!(FIXED_SLOT_BYTES * 100 <= (FIXED_SLOT_BYTES + MIN_ENTRY_CHARGE) * 8);
-    }
-}
+#[path = "read_cache/entry_charge_tests.rs"]
+mod entry_charge_tests;
