@@ -13,6 +13,16 @@ import distributed_mainnet_ci as distributed
 import kernel_nvme_tcp_ci as kernel
 
 
+def write_cleanup_state(state, proof, prewrite=None, before=None):
+    """Write the inventory receipt and the proof files that cleanup reads."""
+    kernel.dump(state / "before.json", {} if before is None else before)
+    for name, value in (("proof", proof), ("proof-prewrite", prewrite)):
+        if value is None:
+            continue
+        (state / name).mkdir()
+        kernel.dump(state / name / "proof.json", value)
+
+
 class ReplayCITests(unittest.TestCase):
     def test_campaign_replay_is_opt_in(self):
         for flag, expected in (([], False), (["--mainnet-replay-resp"], True)):
@@ -334,6 +344,93 @@ class ReplayCITests(unittest.TestCase):
                 self.assertEqual(kernel.run(argparse.Namespace(state=state, binary=binary)), 1)
                 run.assert_called_once()
                 self.assertFalse(json.loads((state / "prewrite-result.json").read_text())["attempted"])
+
+
+    def test_cleanup_accepts_an_incomplete_proof_with_a_clean_teardown(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            write_cleanup_state(state, {"complete": False, "cleanup_complete": True,
+                                        "fixture_removed": True,
+                                        "errors": ["admission benchmark failed"]})
+            with patch.object(kernel, "inventory", return_value={}):
+                self.assertEqual(kernel.cleanup(argparse.Namespace(state=state)), 0)
+            cleanup = json.loads((state / "cleanup.json").read_text())
+            self.assertEqual(cleanup, {"complete": True, "defects": [],
+                                       "inventory_restored": True})
+
+    def test_cleanup_rejects_teardown_defects_only(self):
+        import argparse
+        for proof, defect in (
+                ({"complete": True, "cleanup_complete": False, "fixture_removed": True,
+                  "errors": []}, "proof proof cleanup_complete is not true"),
+                ({"complete": False, "cleanup_complete": True, "fixture_removed": False,
+                  "errors": ["admission benchmark failed"]},
+                 "proof proof fixture_removed is not true")):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                write_cleanup_state(state, proof)
+                with patch.object(kernel, "inventory", return_value={}):
+                    with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
+                        kernel.cleanup(argparse.Namespace(state=state))
+                cleanup = json.loads((state / "cleanup.json").read_text())
+                self.assertFalse(cleanup["complete"])
+                self.assertEqual(cleanup["defects"], [defect])
+
+    def test_cleanup_rejects_a_missing_proof(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            write_cleanup_state(state, None)
+            with patch.object(kernel, "inventory", return_value={}):
+                with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
+                    kernel.cleanup(argparse.Namespace(state=state))
+            cleanup = json.loads((state / "cleanup.json").read_text())
+            self.assertFalse(cleanup["complete"])
+            self.assertTrue(cleanup["defects"][0].startswith("proof proof missing"))
+
+    def test_cleanup_uses_teardown_evidence_for_the_prewrite_pass(self):
+        import argparse
+        clean = {"complete": True, "cleanup_complete": True,
+                 "fixture_removed": True, "errors": []}
+        incomplete = {"complete": False, "cleanup_complete": True,
+                      "fixture_removed": True, "errors": ["admission benchmark failed"]}
+        for prewrite, complete in ((incomplete, True), (dict(clean, fixture_removed=False), False)):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                write_cleanup_state(state, clean, prewrite)
+                with patch.object(kernel, "inventory", return_value={}):
+                    if complete:
+                        self.assertEqual(kernel.cleanup(argparse.Namespace(state=state)), 0)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed"):
+                            kernel.cleanup(argparse.Namespace(state=state))
+                recorded = json.loads((state / "prewrite-cleanup.json").read_text())
+                self.assertEqual(recorded, {"complete": complete})
+
+    def test_run_still_rejects_an_incomplete_proof_with_a_clean_teardown(self):
+        import argparse
+        import local_multiowner_check
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            binary = state / "binary"
+            binary.touch()
+            def proof():
+                output = Path(sys.argv[sys.argv.index("--output") + 1])
+                output.mkdir()
+                kernel.dump(output / "proof.json", {
+                    "complete": False, "cleanup_complete": True,
+                    "fixture_removed": True, "errors": []})
+                return 0
+            with patch.object(kernel, "inventory", return_value={}), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(sys, "argv", ["test"]), \
+                    patch.object(local_multiowner_check, "main", side_effect=proof):
+                self.assertEqual(kernel.run(argparse.Namespace(state=state, binary=binary)), 1)
+                prewrite = json.loads((state / "prewrite-result.json").read_text())
+                self.assertFalse(prewrite["attempted"])
+                self.assertEqual(prewrite["defect"], "proof proof complete is not true")
+                self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
 
 
 if __name__ == "__main__":

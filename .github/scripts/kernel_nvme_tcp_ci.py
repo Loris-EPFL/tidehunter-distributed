@@ -31,21 +31,45 @@ def inventory():
             "controllers": controllers}
 
 
-def proof_defect(state, name):
-    """Return the reason a proof is unclean, or None when it is clean."""
+def read_proof(state, name):
+    """Return (proof, None) or (None, reason) for one proof file."""
     path = state / name / "proof.json"
     try:
         proof = json.loads(path.read_text())
     except (OSError, ValueError) as error:
-        return f"{name} proof missing or unreadable: {error}"
+        return None, f"{name} proof missing or unreadable: {error}"
     if not isinstance(proof, dict):
-        return f"{name} proof is not a JSON object"
+        return None, f"{name} proof is not a JSON object"
+    return proof, None
+
+
+def proof_defect(state, name):
+    """Return the reason a proof is unclean, or None when it is clean."""
+    proof, defect = read_proof(state, name)
+    if defect is not None:
+        return defect
     for key in ("complete", "cleanup_complete", "fixture_removed"):
         if proof.get(key) is not True:
             return f"{name} proof {key} is not true"
     errors = proof.get("errors")
     if not isinstance(errors, list) or errors:
         return f"{name} proof errors is not an empty list"
+    return None
+
+
+def teardown_defect(state, name):
+    """Return the reason a proof's teardown is unconfirmed, or None when it is clean.
+
+    The gating run() also requires `complete` and an empty `errors` list. The
+    advisory cleanup action owns teardown only, so an admission or benchmark
+    failure must not appear as a cleanup defect.
+    """
+    proof, defect = read_proof(state, name)
+    if defect is not None:
+        return defect
+    for key in ("cleanup_complete", "fixture_removed"):
+        if proof.get(key) is not True:
+            return f"{name} proof {key} is not true"
     return None
 
 
@@ -151,14 +175,18 @@ def qualify(args):
 
 
 def cleanup(args):
-    """Require the proof's finally cleanup and independently restored inventories."""
+    """Confirm the proofs' teardown and the independently restored inventories.
+
+    Only teardown evidence gates this advisory action. A benchmark or admission
+    failure is the run step's verdict, not a cleanup defect.
+    """
     before = json.loads((args.state / "before.json").read_text())
     after = inventory()
     dump(args.state / "cleanup-inventory.json", after)
-    defects = [proof_defect(args.state, "proof")]
+    defects = [teardown_defect(args.state, "proof")]
     prewrite_path = args.state / "proof-prewrite"
     if prewrite_path.exists():
-        prewrite_defect = proof_defect(args.state, "proof-prewrite")
+        prewrite_defect = teardown_defect(args.state, "proof-prewrite")
         defects.append(prewrite_defect)
         dump(args.state / "prewrite-cleanup.json", {"complete": prewrite_defect is None})
     defects = [defect for defect in defects if defect is not None]
