@@ -3,11 +3,11 @@
 //! authority epoch (protocol 37).
 //!
 //! A lease grant is memory work: the cell takes no I/O and never holds its
-//! lock across a configfs, file or controller call. The reactor renews leases
-//! inline, so an exclusive control that holds the control queue cannot delay a
-//! renewal (see `reactor::renew_inline`). When a granted lease passes its
-//! expiry plus [`OWNER_MARGIN`], the watchdog thread marks the cell lapsed and
-//! write-protects the epoch's exports; no write is accepted afterwards.
+//! lock across a configfs, file or controller call. The reactor decodes a
+//! renewal and answers it on the queued-response path, before the control
+//! queue, so an exclusive control cannot delay it. When a granted lease passes
+//! its expiry plus [`OWNER_MARGIN`], the watchdog thread marks the cell lapsed
+//! and write-protects the epoch's exports; no write is accepted afterwards.
 
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
