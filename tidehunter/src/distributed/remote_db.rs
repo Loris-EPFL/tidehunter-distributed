@@ -2657,6 +2657,13 @@ mod dead_wal_files_tests;
 mod leased_tests;
 #[cfg(test)]
 mod live_bench_tests;
+
+#[cfg(test)]
+mod copy_durable_pass_tests;
+
+#[cfg(test)]
+mod relocation_copy_cas_tests;
+
 #[cfg(test)]
 mod relocation_tests;
 

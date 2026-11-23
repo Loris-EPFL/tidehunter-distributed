@@ -77,6 +77,10 @@ fn namespaces(owner: &leased_tests::Fixture) -> (u64, u64) {
 /// Client and owner data deadline of the request held past it.
 const HELD_DATA_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The bound a test gives one pool operation (acquire or shutdown). It only
+/// ends a failed wait; no premise rests on this duration.
+const OP_WAIT: Duration = Duration::from_secs(5);
+
 /// Runs `request` on a second listener and client whose data deadline is
 /// `HELD_DATA_TIMEOUT`, so fixture setup (10 s deadline) cannot trip it. The
 /// first target-registry save of the export the request creates waits behind a
@@ -401,7 +405,7 @@ impl HistoryPool {
             &config.host_nqn,
             config.host_id,
             crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadOnly,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + OP_WAIT,
             self.client
                 .export_pin_request(2, &self.location.segment, proof),
         )
@@ -491,7 +495,7 @@ fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
             &config.host_nqn,
             config.host_id,
             crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadOnly,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + OP_WAIT,
             client.export_pin_request(2, &location.segment, binding),
         )
         .unwrap()
@@ -521,32 +525,92 @@ fn capacity_eviction_releases_only_disconnected_entry_and_drop_releases_last() {
     assert!(pinned_files().is_empty());
 }
 
+/// A'6: an older sealed generation whose victim file is pinned by an idle
+/// read-lane connection answers the typed `Busy` (no durable decision, nothing
+/// revoked), counted in `busy_retirements`. The premise of the first
+/// version of this test was the opposite: the sealed path answered an error
+/// ("live connection pins must drain before retirement") for any pin, so it
+/// asserted `is_err()` on the reply. After A'6 the reply is `Ok(Retired(Busy))`
+/// and the same request through the client, which first evicts its own idle
+/// controllers of the victim, completes.
+///
+/// Negative control (mutation run): put the old `return Err(...)` back in place
+/// of the `Busy` return in `NodeInventory::retire_wal_files`: the first
+/// request fails with the error and the typed-reply assertion fails.
 #[test]
 fn retirement_refuses_pinned_export_then_targeted_eviction_allows_retirement_and_shutdown() {
+    use crate::distributed::storage::RetirementOutcome;
     let mut fixture = HistoryPool::new();
-    assert!(
+    assert_eq!(
+        fixture.pin_count(),
+        1,
+        "premise: an idle controller pins the victim file"
+    );
+    assert_eq!(
         fixture
             .owner
             .node
-            .handle(
-                Request::RetireWalFiles {
-                    authority_epoch: 2,
-                    epoch: 1,
-                    files: vec![crate::distributed::storage::RetireProof {
-                        file_start: 0,
-                        inode: None,
-                        seal_generation: None,
-                    }],
-                    witness: None,
-                },
-                TcpLimits::default()
-            )
-            .is_err()
+            .inventory
+            .lock()
+            .file_maintenance
+            .busy_retirements,
+        0
     );
-    assert!(fixture.location.segment.path.exists());
+    let binding = || {
+        fixture.owner.node.with_live_target(|target| {
+            let file = target
+                .sealed_file(&fixture.location.segment.path)
+                .expect("read sealed file marker")
+                .expect("premise: the victim has a sealed file marker");
+            target.binding_for_file(&file)
+        })
+    };
     assert_eq!(
-        fixture.owner.node.inventory.lock().live_export_pins.len(),
-        1
+        binding(),
+        Some(fixture.location.binding.clone()),
+        "premise: the binding exists"
+    );
+    let reply = fixture
+        .owner
+        .node
+        .handle(
+            Request::RetireWalFiles {
+                authority_epoch: 2,
+                epoch: 1,
+                files: vec![crate::distributed::storage::RetireProof {
+                    file_start: 0,
+                    inode: None,
+                    seal_generation: None,
+                }],
+                witness: None,
+            },
+            TcpLimits::default(),
+        )
+        .expect("a pinned victim is answered, not failed");
+    assert!(
+        matches!(reply, Response::Retired(RetirementOutcome::Busy)),
+        "the reply to a pinned victim is the typed Busy"
+    );
+    assert_eq!(
+        fixture
+            .owner
+            .node
+            .inventory
+            .lock()
+            .file_maintenance
+            .busy_retirements,
+        1,
+        "the Busy reply is counted"
+    );
+    assert!(
+        fixture.location.segment.path.exists(),
+        "nothing was unlinked"
+    );
+    assert_eq!(fixture.pin_count(), 1, "nothing was revoked");
+    assert_eq!(
+        binding(),
+        Some(fixture.location.binding.clone()),
+        "Busy leaves the binding intact"
     );
     fixture.client.retire_wal_files(2, 1, vec![0]).unwrap();
     assert!(!fixture.location.segment.path.exists());
@@ -559,9 +623,89 @@ fn retirement_refuses_pinned_export_then_targeted_eviction_allows_retirement_and
             .live_export_pins
             .is_empty()
     );
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
+}
+
+/// A failure after target revocation but before root installation rolls back
+/// read admission. The owner can export and serve the same bytes again.
+#[test]
+fn a_pre_root_failure_after_revoke_reopens_the_victim() {
+    let mut fixture = HistoryPool::new();
+    let path = fixture.location.segment.path.clone();
+    let original = fs::read(&path).expect("read original victim");
+    assert!(!original.is_empty(), "premise: the victim contains bytes");
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
+    assert_eq!(
+        fixture.pin_count(),
+        0,
+        "premise: the idle controller was released"
+    );
+    // The export binding is what the revoke clears: present before, gone at the
+    // injected failure (which fires after the revoke and before any root
+    // install), present again after the rollback.
+    let binding = || {
+        fixture.owner.node.with_live_target(|target| {
+            let file = target
+                .sealed_file(&fixture.location.segment.path)
+                .expect("read sealed file marker")
+                .expect("premise: the victim has a sealed file marker");
+            target.binding_for_file(&file)
+        })
+    };
+    assert_eq!(
+        binding(),
+        Some(fixture.location.binding.clone()),
+        "premise: the export exists"
+    );
+    let log = fixture.owner.node.sealed_log_for_test(1);
+    log.fail_next_sealed_before_root();
+    let error = fixture
+        .owner
+        .node
+        .handle(
+            Request::RetireWalFiles {
+                authority_epoch: 2,
+                epoch: 1,
+                files: vec![crate::distributed::storage::RetireProof {
+                    file_start: 0,
+                    inode: None,
+                    seal_generation: None,
+                }],
+                witness: None,
+            },
+            TcpLimits::default(),
+        )
+        .err()
+        .expect("the injected pre-root failure is returned");
+    assert!(
+        error
+            .to_string()
+            .contains("injected failure after revoke before root"),
+        "premise: the post-revoke failure fired: {error}"
+    );
+    assert_ne!(
+        binding(),
+        Some(fixture.location.binding.clone()),
+        "premise: the target export was revoked before the injected root failure"
+    );
+    drop(log);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        original,
+        "the victim bytes remain intact"
+    );
+    let locations = fixture
+        .client
+        .resolve_live_records(2, &[fixture.location.member])
+        .unwrap();
+    assert_eq!(locations.entries.len(), 1, "a new record lease succeeds");
+    assert_eq!(
+        fs::read(&locations.entries[0].segment.path).unwrap(),
+        original
+    );
     fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
+        .client
+        .release_live_epoch_pin(2, locations.epoch_pin_token)
         .unwrap();
 }
 
@@ -586,10 +730,7 @@ fn busy_retirement_is_typed_and_direct_refusal_keeps_controller_until_released()
         RetirementResult::Completed,
     );
     assert!(!fixture.location.segment.path.exists());
-    fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
 }
 
 #[test]
@@ -626,10 +767,7 @@ fn only_a_token_cleared_by_its_fence_has_idempotent_release() {
             })
             .is_err()
     );
-    fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
 }
 
 #[test]
@@ -658,16 +796,12 @@ fn confirmed_pin_acquire_rejection_does_not_quarantine_pool_capacity() {
         fixture.owner.node.inventory.lock().live_export_pins.len(),
         2
     );
-    pool.shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    pool.shutdown(Instant::now() + OP_WAIT).unwrap();
     assert_eq!(
         fixture.owner.node.inventory.lock().live_export_pins.len(),
         1
     );
-    fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
 }
 
 #[test]
@@ -699,9 +833,7 @@ fn lost_pin_acquire_reply_quarantines_capacity_until_fence() {
             .is_err()
     );
     assert_eq!(
-        pool.shutdown(Instant::now() + Duration::from_secs(5))
-            .unwrap_err()
-            .kind(),
+        pool.shutdown(Instant::now() + OP_WAIT).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     fixture.client.fence_to(3).unwrap();
@@ -714,10 +846,7 @@ fn lost_pin_acquire_reply_quarantines_capacity_until_fence() {
             .live_export_pins
             .is_empty()
     );
-    fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
 }
 
 #[test]
@@ -748,24 +877,19 @@ fn idle_connection_pins_do_not_delay_poison_publication_and_drain_after_disconne
             .live_export_pins
             .is_empty()
     );
-    fixture
-        .pool
-        .shutdown(Instant::now() + Duration::from_secs(5))
-        .unwrap();
+    fixture.pool.shutdown(Instant::now() + OP_WAIT).unwrap();
 }
 
 /// A leased owner with one batch written into generation 1 and fenced up to
 /// authority `through` (at least 2). Returns the owner, a coordinator client at
-/// that authority, generation 1's log (taken before the fences, because
-/// `active` only reaches the current epoch) and the member's address.
-fn sealed_member(
-    through: u64,
-) -> (
-    leased_tests::Fixture,
-    Client,
-    Arc<crate::distributed::storage::PartitionLog>,
-    PhysicalValueAddress,
-) {
+/// that authority and the member's address.
+///
+/// No handle of generation 1's log survives into the fences: `fence_to` refuses
+/// ("old live stream still has outstanding handles; reopen required",
+/// `inventory.rs`) while a test holds one. The receipt is read from a handle
+/// that is dropped before the first fence; a test that needs generation 1's log
+/// afterwards takes the sealed stream's log with [`sealed_log`].
+fn sealed_member(through: u64) -> (leased_tests::Fixture, Client, PhysicalValueAddress) {
     let owner = leased_tests::Fixture::single_partition(DurabilityTier::Native, 16384);
     let mut client = owner.writer();
     let first = client.lease_live_extent(1).unwrap();
@@ -780,14 +904,27 @@ fn sealed_member(
     let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
     let next = close_next(&mut client, &first, &frame);
     close_next(&mut client, &next, &[]);
-    let log = owner.node.log_for_test(1);
-    let receipt = log.receipt_page(0, 1).unwrap()[0];
+    let receipt = owner.node.log_for_test(1).receipt_page(0, 1).unwrap()[0];
     let reference = batch.record_reference(receipt.address(), 0).unwrap();
     let member = member_address_of_reference(&reference).unwrap();
     for epoch in 2..=through {
         client.fence_to(epoch).unwrap();
     }
-    (owner, client, log, member)
+    (owner, client, member)
+}
+
+/// Generation 1's log after the fences: the sealed stream the retirement
+/// requests of authority `authority_epoch` address.
+fn sealed_log(
+    owner: &leased_tests::Fixture,
+    authority_epoch: u64,
+) -> Arc<crate::distributed::storage::PartitionLog> {
+    owner
+        .node
+        .inventory
+        .lock()
+        .retirement_log(authority_epoch, 1)
+        .expect("generation 1 is a sealed epoch")
 }
 
 /// The hard condition of the S8 retry: the owner's `NotFound` for a retired
@@ -799,7 +936,7 @@ fn a_retired_member_reaches_the_client_as_not_found_and_the_retry_fires_once() {
     use crate::distributed::hybrid::read::retry_once;
     use crate::distributed::remote_db::pending_read::transport_error;
     use crate::distributed::storage::{LocalDbError, StorageError};
-    let (owner, mut client, log, member) = sealed_member(2);
+    let (owner, mut client, member) = sealed_member(2);
     let version = owner.batch(0).version();
     // Control: before retirement the address resolves, to the member it names.
     let located = client.resolve_live_records(2, &[member]).unwrap();
@@ -809,8 +946,9 @@ fn a_retired_member_reaches_the_client_as_not_found_and_the_retry_fires_once() {
         .unwrap();
     client.retire_wal_files(2, 1, vec![0]).unwrap();
     // Producer: the owner's resolve of the retired member is `Io(NotFound)`, not
-    // a lookup failure in the reader snapshot (generation 1's log is still held).
-    let produced = log
+    // a lookup failure in the reader snapshot (generation 1's sealed log is
+    // still held by the inventory).
+    let produced = sealed_log(&owner, 2)
         .resolve_live_member(member)
         .err()
         .expect("a retired member must not resolve");
@@ -884,7 +1022,7 @@ fn a_foreign_partition_member_is_invalid_data_and_never_retried() {
     use crate::distributed::hybrid::read::retry_once;
     use crate::distributed::remote_db::pending_read::transport_error;
     use crate::distributed::storage::LocalDbError;
-    let (owner, mut client, _log, member) = sealed_member(2);
+    let (owner, mut client, member) = sealed_member(2);
     let version = owner.batch(0).version();
     let foreign = PhysicalValueAddress {
         partition: member.partition + 1,
@@ -922,7 +1060,7 @@ fn a_foreign_partition_member_is_invalid_data_and_never_retried() {
 fn a_relocated_position_resolves_against_its_address_generation() {
     use crate::distributed::hybrid::position::VersionPosition;
     use crate::distributed::types::BatchVersion;
-    let (_owner, mut client, _log, member) = sealed_member(3);
+    let (_owner, mut client, member) = sealed_member(3);
     // Batch epoch 0 is older than the address generation 1 that holds the bytes.
     let relocated = VersionPosition::from_member(
         BatchVersion {
@@ -970,7 +1108,7 @@ fn a_relocated_position_resolves_against_its_address_generation() {
 /// reader snapshot before any lease is published, whatever address it names.
 #[test]
 fn a_fenced_coordinator_cannot_resolve_members() {
-    let (owner, mut client, _log, member) = sealed_member(3);
+    let (owner, mut client, member) = sealed_member(3);
     let error = owner
         .node
         .handle(
@@ -989,4 +1127,134 @@ fn a_fenced_coordinator_cannot_resolve_members() {
     client
         .release_live_epoch_pin(3, located.epoch_pin_token)
         .unwrap();
+}
+
+/// A'6 (b), (d): the owner's sealed retirement checks only the pins on its
+/// victim files. Generation 1 has files 0 and 1; the member lives in file 0 and
+/// `resolve_live_records` holds a record lease on it (the owner-level API, no
+/// coordinator hook). Retiring file 1 is not blocked by that pin; retiring
+/// file 0 answers the typed `Busy`, counted once in `busy_retirements`, with
+/// nothing unlinked and the lease still held; after the lease is released the
+/// same request completes and the counter stays at one.
+///
+/// Negative control (mutation run): put the old guard back at the top of
+/// `NodeInventory::retire_wal_files` (`if !inventory.live_pins.is_empty()` return an
+/// error before `victims_pinned`): the request for file 1 fails with an error.
+#[test]
+fn a_record_lease_on_a_victim_defers_the_sealed_retirement_and_a_pin_elsewhere_does_not() {
+    use crate::distributed::storage::{RetireProof, RetirementOutcome};
+    let (owner, mut client, member) = sealed_member(2);
+    let bytes = owner.config.partition.wal_file_bytes;
+    assert!(member.offset < bytes, "premise: the member is in file 0");
+    let located = client.resolve_live_records(2, &[member]).unwrap();
+    let file_zero = located.entries[0].segment.path.clone();
+    let file_one = file_zero.with_file_name(format!("wal_{:016x}", 1));
+    assert!(
+        file_zero.exists() && file_one.exists(),
+        "premise: both files of generation 1 exist"
+    );
+    assert_eq!(
+        owner.node.inventory.lock().live_pins.len(),
+        1,
+        "premise: one record lease"
+    );
+    let retire = |file: u64| {
+        owner
+            .node
+            .handle(
+                Request::RetireWalFiles {
+                    authority_epoch: 2,
+                    epoch: 1,
+                    files: vec![RetireProof {
+                        file_start: file * bytes,
+                        inode: None,
+                        seal_generation: None,
+                    }],
+                    witness: None,
+                },
+                TcpLimits::default(),
+            )
+            .expect("a retirement request is answered")
+    };
+    // A pin on file 0 never blocks the retirement of file 1.
+    let elsewhere = retire(1);
+    assert!(
+        matches!(elsewhere, Response::Retired(RetirementOutcome::Completed)),
+        "a pin on another file blocked the retirement"
+    );
+    assert!(!file_one.exists(), "file 1 was retired");
+    assert_eq!(
+        owner
+            .node
+            .inventory
+            .lock()
+            .file_maintenance
+            .busy_retirements,
+        0
+    );
+    // The victim's own pin defers: typed Busy, counted, nothing revoked.
+    let pinned = retire(0);
+    assert!(
+        matches!(pinned, Response::Retired(RetirementOutcome::Busy)),
+        "a record lease on the victim must answer Busy"
+    );
+    assert_eq!(
+        owner
+            .node
+            .inventory
+            .lock()
+            .file_maintenance
+            .busy_retirements,
+        1
+    );
+    assert!(file_zero.exists(), "the pinned victim was not unlinked");
+    assert_eq!(
+        owner.node.inventory.lock().live_pins.len(),
+        1,
+        "the lease is still held"
+    );
+    // Retry after the pin drops.
+    client
+        .release_live_epoch_pin(2, located.epoch_pin_token)
+        .unwrap();
+    let retried = retire(0);
+    assert!(
+        matches!(retried, Response::Retired(RetirementOutcome::Completed)),
+        "the retry after the pin dropped must complete"
+    );
+    assert!(!file_zero.exists(), "file 0 was retired");
+    assert_eq!(
+        owner
+            .node
+            .inventory
+            .lock()
+            .file_maintenance
+            .busy_retirements,
+        1,
+        "a completed request does not count as Busy"
+    );
+}
+
+/// The pins an owner holds right now, as `(source epoch, file index)`: record
+/// leases first, connection pins second. For engine-level tests that need to
+/// name who holds a victim file (the inventory is private to `tcp`).
+pub(crate) type OwnerPins = (Vec<(u64, u64)>, Vec<(u64, u64)>);
+
+pub(crate) fn owner_pins(node: &StorageNode) -> OwnerPins {
+    let inventory = node.inventory.lock();
+    let records = inventory
+        .live_pins
+        .values()
+        .flat_map(|(_, leases)| {
+            leases
+                .iter()
+                .map(|lease| (lease.segment.epoch, lease.segment.file_index))
+        })
+        .collect();
+    let connections = inventory
+        .live_export_pins
+        .values()
+        .map(|(_, pin)| *pin)
+        .collect();
+    (records, connections)
 }
