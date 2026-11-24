@@ -213,8 +213,15 @@ fn callback_starts_reject_a_misaligned_or_unretained_stream() {
     );
 }
 
+/// A pass with no Stop and no record at or above the scan cut: native reaches
+/// `EndOfWal` and leaves its terminal at zero, so the pass reclaims nothing.
+/// The clean tail is the D23 rule for a sealed stream below a Stop, not a
+/// fallback terminal (the extras branch restores it as D27).
+///
+/// Negative control (mutation run): drop the `no_stop` gate; this fixture
+/// reports the clean tail `4 * FILE + 4096` and the pass reclaims four files.
 #[test]
-fn no_stop_reclaims_up_to_the_clean_tail() {
+fn no_stop_and_nothing_above_the_cut_has_no_terminal() {
     let cursors = vec![cursor(
         scan(0, 0, 1, 0, 4 * FILE + 4096),
         0,
@@ -226,8 +233,11 @@ fn no_stop_reclaims_up_to_the_clean_tail() {
         },
     )];
     let reports = stream_reports(&cursors, None, FILE, 100, 1).unwrap();
-    assert_eq!(reports[0].terminal_position, 4 * FILE + 4096);
-    assert_eq!(reports[0].rounded_target, 4 * FILE);
+    assert_eq!(
+        reports[0].terminal_position, 0,
+        "no Stop and nothing at or above the cut: native stops at EndOfWal"
+    );
+    assert_eq!(reports[0].rounded_target, 0);
 }
 
 #[test]
@@ -271,12 +281,60 @@ fn a_partial_file_never_becomes_a_target() {
             sequence: 0,
         },
     )];
-    // Terminal below one whole file past the origin: target rounds to lo.
+    // The scan stopped at a record at or above the cut below one whole file
+    // past the origin: the terminal rounds to the start of the file, and the
+    // pass has no whole file to reclaim.
     let mut cursors = cursors;
     cursors[0].upper = Some(FILE - 4096);
+    cursors[0].above_cut = true;
     let reports = stream_reports(&cursors, None, FILE, 100, 1).unwrap();
     assert_eq!(reports[0].terminal_position, FILE - 4096);
     assert_eq!(reports[0].rounded_target, 0);
+}
+
+/// Native's scan test is `position.offset() >= upper_limit`: the batch AT the
+/// cut is the first unprocessed one and stops the scan at its frame offset.
+/// The hybrid scan stops at `version >= q` too (the cut is exclusive), so
+/// exactly one unprocessed batch at `q`, with nothing above it, still gives
+/// the pass a non-zero terminal.
+///
+/// Negative control (mutation run): a strict `version > q` scan reads that
+/// batch as processed, finds nothing above it and leaves the terminal at zero.
+#[test]
+fn one_unprocessed_batch_at_the_cut_gives_the_pass_a_terminal() {
+    let q = BatchVersion {
+        epoch: 2,
+        sequence: 40,
+    };
+    let below = BatchVersion {
+        epoch: 2,
+        sequence: 39,
+    };
+    assert!(at_or_above_cut(q, q), "the batch at the cut is unprocessed");
+    assert!(
+        !at_or_above_cut(below, q),
+        "the last processed batch lies below the cut"
+    );
+    let offset = 3 * FILE + 4096;
+    let at_cut = || {
+        let mut stopped = cursor(scan(0, 0, 2, 0, 8 * FILE), 0, Some(offset), None, q);
+        stopped.above_cut = true;
+        stopped
+    };
+    let reports = stream_reports(&[at_cut()], None, FILE, 100, 2).unwrap();
+    assert_eq!(
+        reports[0].terminal_position, offset,
+        "the batch at the cut is the terminal, as native's at-or-above test gives"
+    );
+    assert_eq!(reports[0].rounded_target, 3 * FILE);
+    let mut reached_end = at_cut();
+    reached_end.above_cut = false;
+    reached_end.upper = Some(8 * FILE);
+    let reports = stream_reports(&[reached_end], None, FILE, 100, 2).unwrap();
+    assert_eq!(
+        reports[0].terminal_position, 0,
+        "without a batch at or above the cut the terminal stays zero"
+    );
 }
 
 fn version(sequence: u64) -> BatchVersion {
@@ -344,14 +402,21 @@ fn a_forced_store_is_bounded_by_its_flush_frontier_not_its_cut() {
 const SEALED: u64 = 1;
 const SERVING: u64 = 2;
 
+/// Report of the sealed stream of a two-generation fixture. `above_cut` marks
+/// a scan that stopped at a record at or above the cut; `stop` names the
+/// merged scan's first Stop. Either one turns off the no-stop gate, so a
+/// sealed stream below it ends at its clean tail.
 fn sealed_reports(
     end: u64,
     upper: Option<u64>,
+    above_cut: bool,
     stop: Option<(usize, BatchVersion, u64)>,
     pct: u8,
 ) -> StreamReport {
+    let mut sealed = cursor(scan(0, 0, SEALED, 0, end), 0, upper, None, version(0));
+    sealed.above_cut = above_cut;
     let cursors = vec![
-        cursor(scan(0, 0, SEALED, 0, end), 0, upper, None, version(0)),
+        sealed,
         cursor(scan(0, 0, SERVING, 0, FILE), 0, None, None, version(0)),
     ];
     stream_reports(&cursors, stop, FILE, pct, SERVING)
@@ -359,15 +424,20 @@ fn sealed_reports(
         .remove(0)
 }
 
+/// A sealed stream below the serving generation's Stop ends at its clean tail
+/// (D23) and rounds up to the end of its last file. Bytes between the stream
+/// end and that file end hold no frame.
 #[test]
 fn a_sealed_clean_tail_rounds_up_to_the_end_of_its_last_file() {
+    // The Stop is in the serving stream, above every sealed byte.
+    let stop = Some((1, version(7), FILE / 2));
     for (end, expected) in [
         (4 * FILE + 4096, 5 * FILE),
         (4 * FILE + 1, 5 * FILE),
         (5 * FILE - 1, 5 * FILE),
         (4 * FILE, 4 * FILE),
     ] {
-        let report = sealed_reports(end, None, None, 100);
+        let report = sealed_reports(end, None, false, stop, 100);
         assert_eq!(report.rounded_target, expected, "stream end {end}");
         assert_eq!(report.rounded_target % FILE, 0, "aligned, stream end {end}");
         assert!(
@@ -379,7 +449,7 @@ fn a_sealed_clean_tail_rounds_up_to_the_end_of_its_last_file() {
 
 #[test]
 fn a_sealed_stream_the_scan_did_not_finish_rounds_down() {
-    let report = sealed_reports(4 * FILE + 4096, Some(2 * FILE + 4096), None, 100);
+    let report = sealed_reports(4 * FILE + 4096, Some(2 * FILE + 4096), true, None, 100);
     assert_eq!(report.processed_upper, 2 * FILE + 4096);
     assert_eq!(report.stream_end, 4 * FILE + 4096);
     assert_eq!(report.rounded_target, 2 * FILE);
@@ -387,10 +457,24 @@ fn a_sealed_stream_the_scan_did_not_finish_rounds_down() {
 
 #[test]
 fn a_sealed_stream_with_a_stop_or_a_budget_cut_rounds_down() {
-    let stopped = sealed_reports(8 * FILE, None, Some((0, version(7), 3 * FILE + 4096)), 100);
+    let stopped = sealed_reports(
+        8 * FILE,
+        None,
+        false,
+        Some((0, version(7), 3 * FILE + 4096)),
+        100,
+    );
     assert_eq!(stopped.terminal_position, 3 * FILE + 4096);
     assert_eq!(stopped.rounded_target, 3 * FILE);
-    let budgeted = sealed_reports(10 * FILE + 4096, None, None, 10);
+    // The Stop sits in the serving stream, so the sealed stream asks for its
+    // clean tail and only the percentage budget cuts it.
+    let budgeted = sealed_reports(
+        10 * FILE + 4096,
+        None,
+        false,
+        Some((1, version(7), FILE / 2)),
+        10,
+    );
     // 10 % of the 11 files and 4 KiB the owner holds is 1.1 files, rounded down
     // to one whole file.
     assert_eq!(
@@ -400,8 +484,8 @@ fn a_sealed_stream_with_a_stop_or_a_budget_cut_rounds_down() {
 }
 
 /// The serving stream's tail may still grow, so it is never rounded up even
-/// when nothing cuts it: its scan reached its end, no Stop precedes it and the
-/// budget covers the whole span (an older sealed stream sits beside it).
+/// when the pass has a terminal: its scan reached its end, the Stop lies in an
+/// older stream and the budget covers the whole span.
 #[test]
 fn a_serving_stream_tail_is_never_rounded_up() {
     let end = 4 * FILE + 4096;
@@ -417,7 +501,13 @@ fn a_serving_stream_tail_is_never_rounded_up() {
         ),
         cursor(scan(0, 0, SERVING, 0, end), 0, None, None, version(0)),
     ];
-    let reports = stream_reports(&cursors, None, FILE, 100, SERVING).unwrap();
+    let stop = Some((0, version(7), FILE / 2));
+    let reports = stream_reports(&cursors, stop, FILE, 100, SERVING).unwrap();
+    assert_eq!(
+        reports[0].terminal_position,
+        FILE / 2,
+        "premise: the Stop is the older stream's terminal"
+    );
     let serving = &reports[1];
     assert_eq!(
         (
@@ -426,7 +516,7 @@ fn a_serving_stream_tail_is_never_rounded_up() {
             serving.terminal_position
         ),
         (end, end, end),
-        "premise: the serving scan reached its end with no Stop"
+        "premise: the serving scan reached its end"
     );
     assert_eq!(serving.rounded_target, 4 * FILE);
 }
