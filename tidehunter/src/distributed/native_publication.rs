@@ -262,6 +262,10 @@ fn published_members<'a, E>(
                 descriptor,
                 route.payload_crc,
             ),
+            value: match mutation {
+                Mutation::Put { value, .. } => Some(value),
+                Mutation::Delete { .. } | Mutation::DropCells { .. } => None,
+            },
         });
     }
     Ok(members)

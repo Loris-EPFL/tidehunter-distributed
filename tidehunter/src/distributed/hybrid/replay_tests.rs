@@ -25,6 +25,7 @@ use crate::distributed::types::{
 };
 use crate::key_shape::{KeyShape, KeyType};
 use crate::wal_replay::{ReplayFrame, ReplaySource};
+use minibytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -944,6 +945,7 @@ fn published_put(
                 key: &key,
                 kind: RecordKind::Put,
                 position,
+                value: Some(&Bytes::from_static(b"value")),
             }],
             64,
         )

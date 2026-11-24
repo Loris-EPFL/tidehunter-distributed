@@ -17,6 +17,7 @@
 
 use crate::db::decode_record_frame;
 use crate::distributed::hybrid::position::VersionPosition;
+use crate::distributed::hybrid::table::ResolvedValue;
 use crate::distributed::remote_db::pending_read::{
     ReadBatch, ReadRequest, ReadService, admission_error,
 };
@@ -199,51 +200,66 @@ impl ValueReader {
     /// and `DbCheckpoint` reads through it); native's checkpoint docs say the
     /// view does not hold WAL files. A live read keeps the typed eviction,
     /// because only a held cut can name a frame retirement has passed.
+    ///
+    /// The re-resolve may instead find the key resident in the native per-cell
+    /// value LRU (a newer write of the same key fills it at publication), and
+    /// that value is the answer: the `get_checkpoint` guard that yields it is
+    /// exactly the guarantee that the key is unchanged since the requested cut.
     pub(crate) fn read_with_resolve(
         &self,
         ks: KeySpace,
         indexed_key: &[u8],
         position: VersionPosition,
-        resolve: impl FnOnce() -> Result<Option<VersionPosition>, LocalDbError>,
+        resolve: impl FnOnce() -> Result<Option<ResolvedValue>, LocalDbError>,
         latched: bool,
     ) -> Result<Option<Bytes>, LocalDbError> {
-        let result = self.resolve_retrying(position, resolve, |at| {
-            self.read_position(ks, indexed_key, at)
-        });
+        let result = self.resolve_retrying(
+            position,
+            resolve,
+            |at| self.read_position(ks, indexed_key, at),
+            |_full_key, value| Ok(Some(value)),
+        );
         latched_absent(result, latched)
     }
 
     /// Like [`Self::read_with_resolve`], but returns the member's **full key** with
-    /// its value and leaves the value cache alone.
+    /// its value.
     ///
     /// A native iterator yields the full key, while the index holds only the
     /// reduced one (`Reduction`/`Hash` keyspaces), so the scan needs the key the
-    /// member itself carries. The cache stores values only, and a scan neither
-    /// needs nor should seed it, exactly as native checkpoint reads do not.
-    /// The same CRC and key-binding checks, retry policy and decode-failure
-    /// counter apply; `Ok(None)` means a tombstone or an entry the re-resolve
-    /// found gone.
+    /// member itself carries; a resident value carries the key it was stored
+    /// under. The same CRC and key-binding checks, retry policy and
+    /// decode-failure counter apply; `Ok(None)` means a tombstone or an entry the
+    /// re-resolve found gone.
     pub(crate) fn read_entry_with_resolve(
         &self,
         ks: KeySpace,
         indexed_key: &[u8],
         position: VersionPosition,
-        resolve: impl FnOnce() -> Result<Option<VersionPosition>, LocalDbError>,
+        resolve: impl FnOnce() -> Result<Option<ResolvedValue>, LocalDbError>,
         latched: bool,
     ) -> Result<Option<(Bytes, Bytes)>, LocalDbError> {
-        let result = self.resolve_retrying(position, resolve, |at| {
-            self.read_entry_position(ks, indexed_key, at)
-        });
+        let result = self.resolve_retrying(
+            position,
+            resolve,
+            |at| self.read_entry_position(ks, indexed_key, at),
+            |full_key, value| Ok(Some((full_key, value))),
+        );
         latched_absent(result, latched)
     }
 
     /// The one retry policy of the value path: read, and on a retired-member
     /// failure re-resolve exactly once and read again.
+    ///
+    /// `resident` converts a re-resolve that the native value LRU answered: the
+    /// value is already in hand, so no owner is contacted. Both readers keep
+    /// their own return shape (value only, or key and value).
     fn resolve_retrying<T>(
         &self,
         position: VersionPosition,
-        resolve: impl FnOnce() -> Result<Option<VersionPosition>, LocalDbError>,
+        resolve: impl FnOnce() -> Result<Option<ResolvedValue>, LocalDbError>,
         read: impl Fn(VersionPosition) -> Result<Option<T>, LocalDbError>,
+        resident: impl FnOnce(Bytes, Bytes) -> Result<Option<T>, LocalDbError>,
     ) -> Result<Option<T>, LocalDbError> {
         let first = read(position);
         retry_once(
@@ -252,13 +268,16 @@ impl ValueReader {
             // Poison carries its own cause and must not be masked by a retry.
             || self.lanes.ensure_healthy(),
             || match resolve()? {
+                Some(ResolvedValue::Resident { full_key, value }) => resident(full_key, value),
                 // The index returned the same physical member, so the fetch would
                 // fail again for the same reason: report the eviction instead of
                 // spending a second round trip.
-                Some(resolved) if resolved.same_physical(&position) => Err(LocalDbError::new(
-                    "re-resolve returned the same physical member",
-                )),
-                Some(resolved) => read(resolved),
+                Some(ResolvedValue::Position(resolved)) if resolved.same_physical(&position) => {
+                    Err(LocalDbError::new(
+                        "re-resolve returned the same physical member",
+                    ))
+                }
+                Some(ResolvedValue::Position(resolved)) => read(resolved),
                 None => Ok(None),
             },
         )

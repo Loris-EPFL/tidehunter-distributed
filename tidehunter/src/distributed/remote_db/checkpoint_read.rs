@@ -51,9 +51,15 @@ impl RemoteDatabase {
                 "checkpoint belongs to an earlier open of this database",
             ));
         }
+        // A checkpoint read never refills the native per-cell LRU: it may see a
+        // value older than the live one, and seeding the LRU with it would serve
+        // that value to a later live read (native `DbCheckpoint::get` makes the
+        // same choice). The LRU is still consulted, under native's guard that a
+        // key unchanged since the cut is resident with its as-of value.
+        //
         // A frame a pass reclaimed answers absent, as native answers for an
         // unreachable position. The live read keeps its typed eviction.
-        match self.get_at_cut(ks, key, checkpoint.cut) {
+        match self.get_at_cut(ks, key, checkpoint.cut, false) {
             Err(error) if error.is_evicted_during_read() => Ok(None),
             other => other,
         }

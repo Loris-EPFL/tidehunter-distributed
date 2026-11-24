@@ -28,7 +28,10 @@ fn index_entries(
             .cell
             .expect("an index entry names the cell it was found in");
         previous = Some(entry.key.clone());
-        entries.push((entry.key, entry.value));
+        let ResolvedValue::Position(position) = entry.value else {
+            panic!("a latched walk answered from the value cache");
+        };
+        entries.push((entry.key, position));
     }
     entries
 }

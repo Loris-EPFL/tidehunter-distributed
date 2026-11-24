@@ -8,7 +8,9 @@
 //! two unchanged and replaces the third with the remote value WAL: a
 //! [`VersionPosition`] names its member frame on its owner, so the index can be
 //! read, flushed, relocated and snapshotted by exactly the native code while
-//! the values stay on the owners.
+//! the values are stored on the owners. A keyspace that sets `value_cache_size`
+//! also keeps the native per-cell LRU here: it is a bounded copy, filled at
+//! publication and by a live read, never the store of record.
 //!
 //! Four substitutions, and nothing else:
 //!
@@ -76,15 +78,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock, mpsc};
-
-/// The value a `put` is indexed with.
-///
-/// The coordinator never holds a published value: it forwarded the member to
-/// its owner before publication, and the native per-cell LRU is refused at open
-/// ([`require_owner_resident_values`]). Native `insert` takes `&Bytes` only to
-/// fill that LRU, so the empty value is the faithful argument.
-static NO_RESIDENT_VALUE: LazyLock<Bytes> = LazyLock::new(Bytes::new);
+use std::sync::{Arc, OnceLock, mpsc};
 
 /// One published member: what the write path inserts, and where its value is.
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +91,24 @@ pub(crate) struct PublishedMutation<'a> {
     pub(crate) kind: RecordKind,
     /// The member frame, including its own 8-byte CRC header (plan §3.1).
     pub(crate) position: VersionPosition,
+    /// The value this put wrote. It fills the native per-cell LRU exactly as
+    /// native `Db::insert` does, so a later read of the key needs no owner round
+    /// trip. `None` for a `Delete`; a `Put` without it is refused, because an
+    /// empty resident value would be served as data.
+    pub(crate) value: Option<&'a Bytes>,
+}
+
+/// What the index answers for a key: a member position to fetch, or a value the
+/// native per-cell LRU already holds.
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedValue {
+    /// The member frame, which the value path fetches from its owner.
+    Position(VersionPosition),
+    /// A resident value with the full key it was stored under. A `Reduction`
+    /// keyspace compares that key before serving it (native
+    /// `need_check_index_key`); every other indexing stored the key it was asked
+    /// for.
+    Resident { full_key: Bytes, value: Bytes },
 }
 
 /// The coordinator's index: native `LargeTable` + `IndexFlusher` + index WAL.
@@ -197,7 +209,6 @@ impl HybridTable {
         partitions: &[u32],
     ) -> Result<Self, LocalDbError> {
         config.validate()?;
-        require_owner_resident_values(&shape)?;
         let native_config = Arc::new(config.to_native_config());
         let health = Arc::new(BackgroundHealth::default());
         let index_wal = Wal::open_with_background_health(
@@ -676,32 +687,82 @@ impl TableInner {
     /// A cut is exclusive: it must be above the version being read. A delete is
     /// answered by the index itself, which collapses a removed entry to
     /// `INVALID`, so a returned position is always a live put.
+    ///
+    /// A keyspace with a value cache (`value_cache_size`) can answer from the
+    /// native per-cell LRU instead of a position; callers that read values use
+    /// [`Self::get_value`], which carries both answers. This method is for the
+    /// index-position callers of the test suites and the benchmark evidence
+    /// hooks, and reports the LRU answer as an error rather than a wrong
+    /// position.
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn get(
         &self,
         ks: KeySpace,
         key: &[u8],
         cut: BatchVersion,
     ) -> Result<Option<VersionPosition>, LocalDbError> {
+        match self.get_value(ks, key, cut)? {
+            Some(ResolvedValue::Position(position)) => Ok(Some(position)),
+            Some(ResolvedValue::Resident { .. }) => Err(LocalDbError::new(format!(
+                "hybrid index answered from the value cache; {} needs the member position",
+                self.ks_desc(ks).name()
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// What the index answers for `key` as of `cut`: a position to fetch, or the
+    /// value already resident in the native per-cell LRU.
+    ///
+    /// The LRU is the native [`LargeTable`] cache, unchanged: it is filled at
+    /// publication and by the read refill, bounded per cell by the keyspace's
+    /// `value_cache_size`, and consulted by `LargeTable::get_checkpoint` only
+    /// when the key's as-of position is also its latest. `value_cache_size = 0`
+    /// allocates no LRU, so this always returns a position.
+    pub(crate) fn get_value(
+        &self,
+        ks: KeySpace,
+        key: &[u8],
+        cut: BatchVersion,
+    ) -> Result<Option<ResolvedValue>, LocalDbError> {
         let context = self.contexts.ks_context(ks);
         let reduced = context.ks_config.reduce_key(key);
         match self
             .table
             .get_checkpoint(context, reduced.as_ref(), cut, self.loader.as_ref())?
         {
-            GetResult::WalPosition(position) => Ok(position.is_valid().then_some(position)),
+            GetResult::WalPosition(position) => Ok(position
+                .is_valid()
+                .then_some(ResolvedValue::Position(position))),
             GetResult::NotFound => Ok(None),
-            // `require_owner_resident_values` refuses a value cache at open.
-            GetResult::Value(..) => Err(LocalDbError::new(
-                "hybrid index returned a locally cached value; the value lives on its owner",
-            )),
+            GetResult::Value(full_key, value) => {
+                Ok(Some(ResolvedValue::Resident { full_key, value }))
+            }
         }
+    }
+
+    /// Installs a value the coordinator just fetched from its owner into the
+    /// native per-cell LRU, exactly as native `Db::get` does after a WAL record
+    /// read.
+    ///
+    /// `reduced` is the index key the LRU is keyed by; `full_key` is the key the
+    /// member carries, which a reducing keyspace compares before serving it.
+    /// A keyspace without a value cache has no LRU and this is a no-op, as in
+    /// native `LargeTable::update_lru`.
+    pub(crate) fn refill_value(&self, ks: KeySpace, reduced: Bytes, full_key: Bytes, value: Bytes) {
+        let context = self.contexts.ks_context(ks);
+        self.table.update_lru(context, reduced, full_key, value);
     }
 
     /// The next index entry of a cell, as of `cut` when one is given.
     ///
-    /// Index level only: the caller resolves the position through the value path
+    /// Index level only: the caller resolves a position through the value path
     /// and advances past an entry its owner no longer holds, exactly as native
-    /// `Db::next_entry` does after a failed record read.
+    /// `Db::next_entry` does after a failed record read. An unlatched live walk
+    /// (`cut: None`) also consults the native per-cell value LRU, as native
+    /// `Db::next_entry` does, and yields the resident value instead of a
+    /// position; a latched walk (`cut: Some`) never consults it, as native
+    /// `DbCheckpoint::next_entry` never does.
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors native `LargeTable::next_entry`, which takes the same list plus the loader"
@@ -715,7 +776,7 @@ impl TableInner {
         reverse: bool,
         cache: &mut IndexIterCaches,
         cut: Option<BatchVersion>,
-    ) -> Result<Option<IteratorResult<VersionPosition>>, LocalDbError> {
+    ) -> Result<Option<IteratorResult<ResolvedValue>>, LocalDbError> {
         let context = self.contexts.ks_context(ks);
         let Some(result) = self.table.next_entry(
             context,
@@ -730,19 +791,20 @@ impl TableInner {
         else {
             return Ok(None);
         };
-        match result.value {
-            GetResult::WalPosition(position) => Ok(Some(IteratorResult {
-                cell: result.cell,
-                key: result.key,
-                value: position,
-            })),
-            GetResult::Value(..) => Err(LocalDbError::new(
-                "hybrid index returned a locally cached value; the value lives on its owner",
-            )),
-            GetResult::NotFound => Err(LocalDbError::new(
-                "native index walk returned an entry without a position",
-            )),
-        }
+        let value = match result.value {
+            GetResult::WalPosition(position) => ResolvedValue::Position(position),
+            GetResult::Value(full_key, value) => ResolvedValue::Resident { full_key, value },
+            GetResult::NotFound => {
+                return Err(LocalDbError::new(
+                    "native index walk returned an entry without a position",
+                ));
+            }
+        };
+        Ok(Some(IteratorResult {
+            cell: result.cell,
+            key: result.key,
+            value,
+        }))
     }
 
     /// The next cell of a keyspace, in walk order.
@@ -958,34 +1020,7 @@ impl TableInner {
                     }
                 }
                 if drop_entries {
-                    // Native's relocation cutoff retains only entries at or
-                    // above it (`IndexTable::retain_above_position`), so a key
-                    // whose live positions all sit below the cutoff leaves no
-                    // entry behind at any read cut. The hybrid keeps one
-                    // tombstone per dropped key so a deeper level cannot
-                    // resurface it, and drops the key's older versions: leaving
-                    // them would let a read cut below the latest version still
-                    // resolve one, a property native does not have. They cannot
-                    // be removed one at a time (`apply_update` sees only the
-                    // latest), so the key is removed and its tombstone
-                    // re-inserted at the dropped live position.
-                    let doomed: Vec<(Bytes, VersionPosition)> = index
-                        .iter()
-                        .filter(|(_, position)| below_target(*position))
-                        .collect();
-                    if !doomed.is_empty() {
-                        let dropped: HashSet<&[u8]> =
-                            doomed.iter().map(|(key, _)| key.as_ref()).collect();
-                        index.compact_with(|keys| {
-                            keys.filter(|key| !dropped.contains(key.as_ref()))
-                                .cloned()
-                                .collect()
-                        });
-                        for (key, position) in doomed {
-                            index.remove(key, position);
-                        }
-                        changed = true;
-                    }
+                    drop_index_rows_preserving_resident_values(index, &below_target, &mut changed);
                 }
                 Ok(((), changed))
             })
@@ -1023,29 +1058,50 @@ impl TableInner {
     /// Publication calls this once per batch under its own ordering, and a reader
     /// may only ask at a cut the applied front has reached, so no reader observes
     /// a partially inserted batch even though members land one at a time.
+    ///
+    /// A `Put` carries the value the batch wrote, so the native per-cell LRU is
+    /// filled at the visibility point and only there: a batch that never
+    /// published (an uncertain or aborted write) never reaches this call and
+    /// leaves no resident value behind.
     pub(crate) fn insert_published(
         &self,
         mutations: &[PublishedMutation<'_>],
         value_bytes: u64,
     ) -> Result<(), LocalDbError> {
         self.check_background_health()?;
+        // Refuse a construction bug before the first member lands: a half
+        // inserted batch would be visible at the applied cut.
+        if let Some(missing) = mutations
+            .iter()
+            .find(|mutation| mutation.kind == RecordKind::Put && mutation.value.is_none())
+        {
+            return Err(LocalDbError::new(format!(
+                "published put of keyspace {} carries no resident value",
+                self.contexts.ks_context(missing.keyspace).name()
+            )));
+        }
         self.cuts.add_bytes(value_bytes);
         for mutation in mutations {
             let context = self.contexts.ks_context(mutation.keyspace);
             let key = Bytes::copy_from_slice(mutation.key);
             let reduced = context.ks_config.reduced_key_bytes(key.clone());
-            match mutation.kind {
-                RecordKind::Put => self.table.insert(
+            match (mutation.kind, mutation.value) {
+                (RecordKind::Put, Some(value)) => self.table.insert(
                     context,
                     reduced,
                     key,
                     mutation.position,
-                    &NO_RESIDENT_VALUE,
+                    value,
                     self.loader.as_ref(),
                 )?,
-                RecordKind::Delete => {
+                (RecordKind::Put, None) => {
+                    // Checked above; the arm keeps the match total without a
+                    // panic if the two ever disagree.
+                    return Err(LocalDbError::new("published put carries no resident value"));
+                }
+                (RecordKind::Delete, _) => {
                     self.table
-                        .remove(context, reduced, mutation.position, self.loader.as_ref())?
+                        .remove(context, reduced, mutation.position, self.loader.as_ref())?;
                 }
             }
         }
@@ -1101,22 +1157,49 @@ impl TableInner {
     }
 }
 
-/// A hybrid database never keeps the value it publishes.
+/// Drops every version of each key a relocation filter pruned below its target,
+/// leaving one `Removed` tombstone per dropped key.
 ///
-/// Native `Db::insert` fills the per-cell value LRU from the value it just
-/// wrote. The coordinator does not hold the value after publication, so a
-/// keyspace with a value cache would answer empty values from that LRU. Sui sets
-/// `value_cache_size = 0`; anything else is refused at open rather than silently
-/// returning empty bytes.
-fn require_owner_resident_values(shape: &KeyShape) -> Result<(), LocalDbError> {
-    match shape.iter_ks().find(|ks| ks.value_cache_size().is_some()) {
-        Some(ks) => Err(LocalDbError::new(format!(
-            "hybrid index requires value_cache_size = 0 for keyspace {}; values live on their \
-             owners",
-            ks.name()
-        ))),
-        None => Ok(()),
+/// Native's relocation cutoff retains only entries at or above it
+/// (`IndexTable::retain_above_position`), so a key whose live positions all sit
+/// below the cutoff leaves no entry behind at any read cut. The hybrid keeps one
+/// tombstone per dropped key so a deeper level cannot resurface it, and drops
+/// the key's older versions: leaving them would let a read cut below the latest
+/// version still resolve one, a property native does not have. They cannot be
+/// removed one at a time (`apply_update` sees only the latest), so the key is
+/// removed and its tombstone re-inserted at the dropped live position.
+///
+/// The per-cell value LRU is deliberately left alone, and this helper is the one
+/// place that rule lives. Native prunes index rows on a relocation cutoff
+/// (`IndexTable::retain_above_position`) and never touches the value LRU, because
+/// a read resolves the key's entry first: a `Removed` position is not valid at
+/// any cut, so `LargeTable::get_checkpoint` answers not-found before it consults
+/// the LRU. The other native rule is a dropped *cell*: `drop_cells_in_range`
+/// clears the cell together with its LRU, which [`TableInner::drop_cells`]
+/// inherits unchanged. A rebase that adds a drop path must route it through one
+/// of these two helpers rather than inventing its own cache invalidation.
+fn drop_index_rows_preserving_resident_values(
+    index: &mut IndexTable<VersionPosition>,
+    below_target: &impl Fn(VersionPosition) -> bool,
+    changed: &mut bool,
+) {
+    let doomed: Vec<(Bytes, VersionPosition)> = index
+        .iter()
+        .filter(|(_, position)| below_target(*position))
+        .collect();
+    if doomed.is_empty() {
+        return;
     }
+    let dropped: HashSet<&[u8]> = doomed.iter().map(|(key, _)| key.as_ref()).collect();
+    index.compact_with(|keys| {
+        keys.filter(|key| !dropped.contains(key.as_ref()))
+            .cloned()
+            .collect()
+    });
+    for (key, position) in doomed {
+        index.remove(key, position);
+    }
+    *changed = true;
 }
 
 /// An all-empty snapshot container for a directory without a control region.

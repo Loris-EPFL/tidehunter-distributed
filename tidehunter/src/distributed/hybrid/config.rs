@@ -10,9 +10,13 @@
 //! counter instead of a local WAL offset (plan §5, invariant I2b).
 //!
 //! Per-keyspace [`crate::key_shape::KeySpaceConfig`] is honored unchanged:
-//! Sui already sets `value_cache_size` to 0 (values live on the owners), and
-//! the native per-cell LRU is populated at publication beside the distributed
-//! read cache. There is no shape rewrite.
+//! Sui sets `value_cache_size` on its hot keyspaces (1000 by default), and the
+//! hybrid runs the native per-cell LRU as it is. The LRU is filled at
+//! publication with the value the batch wrote, refilled by a live read that
+//! fetched the value from its owner (native `Db::get`'s refill), and invalidated
+//! by the native paths (a remove pops, a dropped cell clears). A read that hits
+//! it needs no owner round trip; a checkpoint read consults it under native's
+//! as-of guard and never refills. There is no shape rewrite.
 //!
 //! Two native rows describe value-batch compression. The leased route carries
 //! whole owner frames, not native compressed batches, so the request is

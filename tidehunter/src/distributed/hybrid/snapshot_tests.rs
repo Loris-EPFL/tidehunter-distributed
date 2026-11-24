@@ -19,6 +19,7 @@ use crate::distributed::durability::DurabilityTier;
 use crate::distributed::types::{BatchVersion, PhysicalValueAddress, RecordKind};
 use crate::key_shape::{KeyShape, KeyType};
 use crate::metrics::Metrics;
+use minibytes::Bytes;
 use std::sync::Arc;
 
 /// Every test below covers an index-only table (`HybridTable::snapshot` does the
@@ -173,6 +174,7 @@ impl Fixture {
                     key: &key,
                     kind: RecordKind::Put,
                     position,
+                    value: Some(&Bytes::from_static(b"value")),
                 }],
                 64,
             )

@@ -80,10 +80,18 @@ The coordinator resolves a key through the native index to a position. A
 position is 48 bytes: batch version, operation index, member CRC-32 and the
 physical address of the member frame (`hybrid/position.rs`). Order and equality
 of positions use the logical part only; every compare-and-swap uses the
-physical part. The value reader (`hybrid/read.rs`) checks the coordinator
-value cache first (`remote_db/read_cache.rs`). On a miss it fetches the member
-frame and nothing else. The fetch uses a bounded live read lane
-(`remote_db/pending_read.rs`). The lane obtains an authenticated owner
+physical part. When the keyspace sets `value_cache_size`, the index answers
+from the native per-cell value LRU before it names a position, and a resident
+answer costs no owner request. Publication fills that LRU with the value the
+batch wrote, so the first read of a hot key after its write costs no owner
+request. A live read that fetched a member from its owner refills the LRU; a
+remove pops it and a dropped cell clears it. A latched read consults it only
+when the key is unchanged since its cut, and never refills it (native
+`DbCheckpoint::get`). A live iterator consults it as native `Db::next_entry`
+does; a latched iterator does not. Otherwise the value reader (`hybrid/read.rs`)
+checks the coordinator value cache (`remote_db/read_cache.rs`). On a miss it
+fetches the member frame and nothing else. The fetch uses a bounded live read
+lane (`remote_db/pending_read.rs`). The lane obtains an authenticated owner
 mapping, opens the verified namespace and issues aligned block reads through
 the buffered live kernel target. The reader checks the CRC-32, decodes the
 native entry and caches the value bytes. The current extent and historical

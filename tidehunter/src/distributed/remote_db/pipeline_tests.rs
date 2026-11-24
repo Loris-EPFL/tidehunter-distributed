@@ -486,10 +486,23 @@ pub(super) fn live_rows(db: &RemoteDatabase, ks: KeySpace) -> Vec<(Bytes, Bytes)
         .unwrap()
     {
         let key = entry.key.clone();
-        let row = db
-            .reader
-            .read_entry_with_resolve(ks, &key, entry.value, || table.get(ks, &key, cut), true)
-            .unwrap();
+        let row = match entry.value {
+            // The walk is latched, and a latched walk never consults the value
+            // LRU; a resident answer would be a regression of that native rule.
+            ResolvedValue::Resident { .. } => {
+                panic!("a latched walk answered from the value cache")
+            }
+            ResolvedValue::Position(position) => db
+                .reader
+                .read_entry_with_resolve(
+                    ks,
+                    &key,
+                    position,
+                    || Ok(table.get(ks, &key, cut)?.map(ResolvedValue::Position)),
+                    true,
+                )
+                .unwrap(),
+        };
         rows.extend(row);
         cell = entry
             .cell
@@ -518,7 +531,10 @@ pub(super) fn index_entries(
             .cell
             .expect("an index entry names the cell it was found in");
         previous = Some(entry.key.clone());
-        entries.push((entry.key, entry.value));
+        let ResolvedValue::Position(position) = entry.value else {
+            panic!("a latched walk answered from the value cache");
+        };
+        entries.push((entry.key, position));
     }
     entries
 }
@@ -537,7 +553,7 @@ pub(super) fn read_at_cut(
         return Ok(None);
     };
     let reader = db.value_reader();
-    let resolve = || table.get(ks, key, cut);
+    let resolve = || Ok(table.get(ks, key, cut)?.map(ResolvedValue::Position));
     let row = reader.read_entry_with_resolve(ks, key, position, resolve, true)?;
     Ok(row.map(|(_, value)| value))
 }

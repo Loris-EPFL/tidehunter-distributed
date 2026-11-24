@@ -21,7 +21,7 @@ use super::hybrid::position::VersionPosition;
 use super::hybrid::read::ValueReader;
 use super::hybrid::region::StreamFront;
 use super::hybrid::replay::{ReplayTransport, replay_into};
-use super::hybrid::table::HybridTable;
+use super::hybrid::table::{HybridTable, ResolvedValue};
 use super::native_publication::NativePublicationRouting;
 use super::reference_directory::ReferenceDirectory;
 use super::storage::{
@@ -1730,58 +1730,101 @@ impl RemoteDatabase {
         self.core.write(operation, mutations, None)
     }
 
-    /// The value of `key` at `cut`, given the position the index named for it.
+    /// The value of `key` at `cut`, given what the index names for it.
     ///
     /// The value path takes the *indexed* (reduced) key: it binds the member it
     /// decodes to that key. A `Reduction` keyspace indexes only a slice of the
     /// key, so another full key can share the index entry; native's `get` then
     /// compares the full key, and so does this (`need_check_index_key`), through
-    /// the entry read that returns the member's own key and bypasses the value
-    /// cache, which is keyed by position and would answer for the wrong key.
+    /// the entry read that returns the member's own key and bypasses the
+    /// position-keyed reader cache, which would answer for the wrong key.
     ///
+    /// `refill` installs a fetched value into the native per-cell LRU, exactly
+    /// what native `Db::get` does and native `DbCheckpoint::get` does not, so a
+    /// latched or checkpoint read passes `false`. A resident answer needs no
+    /// refill: it came from that LRU, under native's guarantee that a key
+    /// unchanged since `cut` is served from it. A keyspace without a value cache
+    /// has no LRU to fill, and the refill then costs nothing.
     pub(super) fn read_value(
         &self,
         ks: KeySpace,
         key: &[u8],
         cut: BatchVersion,
-        position: VersionPosition,
+        resolved: ResolvedValue,
+        refill: bool,
     ) -> Result<Option<Bytes>, LocalDbError> {
         let table = &self.core.table;
         let descriptor = table.ks_desc(ks);
         let reduced = descriptor.reduce_key(key);
+        let position = match resolved {
+            ResolvedValue::Position(position) => position,
+            ResolvedValue::Resident { full_key, value } => {
+                return Ok(
+                    (!descriptor.need_check_index_key() || full_key.as_ref() == key)
+                        .then_some(value),
+                );
+            }
+        };
+        let refill = refill && descriptor.value_cache_size().is_some();
         let at = reduced.as_ref();
         let reader = &self.reader;
-        let resolve = || table.get(ks, key, cut);
+        let resolve = || table.get_value(ks, key, cut);
         if descriptor.need_check_index_key() {
             let entry = reader.read_entry_with_resolve(ks, at, position, resolve, false)?;
-            Ok(entry.and_then(|(full, value)| (full.as_ref() == key).then_some(value)))
-        } else {
-            reader.read_with_resolve(ks, at, position, resolve, false)
+            let Some((full_key, value)) = entry else {
+                return Ok(None);
+            };
+            // A `Reduction` keyspace's index entry is only a slice of the key:
+            // the member's own key is the one that binds the value.
+            if full_key.as_ref() != key {
+                return Ok(None);
+            }
+            if refill {
+                // The member's own key is the key the value is stored under, and
+                // it is the one the read just bound the value to.
+                table.refill_value(ks, reduced.into_owned().into(), full_key, value.clone());
+            }
+            return Ok(Some(value));
         }
+        let value = reader.read_with_resolve(ks, at, position, resolve, false)?;
+        if refill && let Some(value) = &value {
+            table.refill_value(
+                ks,
+                reduced.into_owned().into(),
+                Bytes::copy_from_slice(key),
+                value.clone(),
+            );
+        }
+        Ok(value)
     }
 
-    /// One key: an index lookup at `cut`, then the owner read of the member
-    /// frame the position names. The owner may retire the file between the two,
-    /// so the value path re-resolves exactly once (see `ValueReader`).
+    /// One key: an index lookup at `cut`, then either the value the native
+    /// per-cell LRU holds or the owner read of the member frame the position
+    /// names. The owner may retire the file between the two, so the value path
+    /// re-resolves exactly once (see `ValueReader`).
+    ///
+    /// `refill` is the caller's statement that this is a live read which may
+    /// seed the LRU (see [`Self::read_value`]); a checkpoint view passes `false`.
     pub(super) fn get_at_cut(
         &self,
         ks: KeySpace,
         key: &[u8],
         cut: BatchVersion,
+        refill: bool,
     ) -> Result<Option<Bytes>, LocalDbError> {
         self.ensure_healthy()?;
         let resolve_started = Instant::now();
-        let position = self.core.table.get(ks, key, cut)?;
+        let resolved = self.core.table.get_value(ks, key, cut)?;
         // Relaxed: diagnostic time only, never publication authority.
         self.core.read_resolve_ns.fetch_add(
             elapsed(resolve_started),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let Some(position) = position else {
+        let Some(resolved) = resolved else {
             return Ok(None);
         };
         let fetch_started = Instant::now();
-        let value = self.read_value(ks, key, cut, position);
+        let value = self.read_value(ks, key, cut, resolved, refill);
         self.core
             .value_read_ns
             .fetch_add(elapsed(fetch_started), std::sync::atomic::Ordering::Relaxed);
@@ -1791,7 +1834,8 @@ impl RemoteDatabase {
 
     /// Presence at `cut`. A keyspace whose index key is a reduction of the full
     /// key needs the member's own key to decide; every other keyspace is answered
-    /// by the index alone, with no owner round trip.
+    /// by the index alone, with no owner round trip. A resident value is the
+    /// answer without any round trip, exactly as native `exists` reads its LRU.
     pub(super) fn exists_at_cut(
         &self,
         ks: KeySpace,
@@ -1800,28 +1844,32 @@ impl RemoteDatabase {
     ) -> Result<bool, LocalDbError> {
         self.ensure_healthy()?;
         let started = Instant::now();
-        let position = self.core.table.get(ks, key, cut)?;
+        let resolved = self.core.table.get_value(ks, key, cut)?;
         self.core
             .read_resolve_ns
             .fetch_add(elapsed(started), std::sync::atomic::Ordering::Relaxed);
-        let Some(position) = position else {
+        let Some(resolved) = resolved else {
             return Ok(false);
         };
         if !self.core.table.ks_desc(ks).need_check_index_key() {
             return Ok(true);
         }
-        Ok(self.read_value(ks, key, cut, position)?.is_some())
+        // Native `exists` never refills the LRU: presence is not a value read.
+        Ok(self.read_value(ks, key, cut, resolved, false)?.is_some())
     }
 
     /// Any number of keys at one cut, fetched in pages of the value reader's
     /// bound. An invalid key fails only its own slot; a failed owner page fails
-    /// the call.
+    /// the call. A resident value is answered without any owner contact, and a
+    /// fetched one refills the native per-cell LRU only when `refill` says this
+    /// is a live read (see [`Self::read_value`]); a latched view passes `false`.
     pub(super) fn get_many_at_cut<K: AsRef<[u8]>>(
         &self,
         ks: KeySpace,
         keys: &[K],
         cut: BatchVersion,
         trace: Option<&pending_read::ReadTraceCallGuard>,
+        refill: bool,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
         /// Rows one `ValueReader::read_many` call may hold.
         const PAGE_KEYS: usize = 256;
@@ -1838,11 +1886,24 @@ impl RemoteDatabase {
             let mut slots = Vec::with_capacity(page.len());
             for key in page {
                 let key = key.as_ref();
-                match table.get(ks, key, cut) {
-                    Ok(Some(position)) if descriptor.need_check_index_key() => {
-                        results.push(self.read_value(ks, key, cut, position));
+                match table.get_value(ks, key, cut) {
+                    Ok(Some(ResolvedValue::Resident { full_key, value })) => {
+                        results.push(Ok((!descriptor.need_check_index_key()
+                            || full_key.as_ref() == key)
+                            .then_some(value)));
                     }
-                    Ok(Some(position)) => {
+                    Ok(Some(ResolvedValue::Position(position)))
+                        if descriptor.need_check_index_key() =>
+                    {
+                        results.push(self.read_value(
+                            ks,
+                            key,
+                            cut,
+                            ResolvedValue::Position(position),
+                            refill,
+                        ));
+                    }
+                    Ok(Some(ResolvedValue::Position(position))) => {
                         slots.push(results.len());
                         rows.push((
                             Bytes::copy_from_slice(descriptor.reduce_key(key).as_ref()),
@@ -1869,7 +1930,16 @@ impl RemoteDatabase {
             self.core
                 .value_read_ns
                 .fetch_add(elapsed(fetch_started), std::sync::atomic::Ordering::Relaxed);
-            for (slot, value) in slots.into_iter().zip(values) {
+            let refill = refill && descriptor.value_cache_size().is_some();
+            for ((slot, (reduced, _)), value) in slots.into_iter().zip(&rows).zip(values) {
+                if refill && let Some(value) = &value {
+                    table.refill_value(
+                        ks,
+                        reduced.clone(),
+                        Bytes::copy_from_slice(keys[slot].as_ref()),
+                        value.clone(),
+                    );
+                }
                 results[slot] = Ok(value);
             }
         }
@@ -1877,12 +1947,15 @@ impl RemoteDatabase {
         Ok(results)
     }
 
+    /// The live read: a scalar lookup at the current cut, which may fill the
+    /// native per-cell LRU from the member it fetched.
     pub fn get(&mut self, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>, LocalDbError> {
-        self.get_at_cut(ks, key, self.core.table.current())
+        self.get_at_cut(ks, key, self.core.table.current(), true)
     }
 
     /// The scalar read with its two stage clocks. Benchmark callers must keep
-    /// these samples separate from ordinary gets.
+    /// these samples separate from ordinary gets. A resident value reports its
+    /// index time only: it fetched nothing.
     pub fn get_profiled(
         &mut self,
         ks: KeySpace,
@@ -1891,12 +1964,13 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let cut = self.core.table.current();
         let started = Instant::now();
-        let position = self.core.table.get(ks, key, cut)?;
+        let resolved = self.core.table.get_value(ks, key, cut)?;
         let index_ns = elapsed(started);
         let hits = self.reader.cache_hits();
         let started = Instant::now();
-        let value = match position {
-            Some(position) => self.read_value(ks, key, cut, position)?,
+        let remote = matches!(resolved, Some(ResolvedValue::Position(_)));
+        let value = match resolved {
+            Some(resolved) => self.read_value(ks, key, cut, resolved, true)?,
             None => None,
         };
         self.ensure_healthy()?;
@@ -1904,8 +1978,7 @@ impl RemoteDatabase {
             index_ns,
             wait_ns: elapsed(started),
             cache_hits: self.reader.cache_hits() - hits,
-            cache_misses: u64::from(position.is_some())
-                .saturating_sub(self.reader.cache_hits() - hits),
+            cache_misses: u64::from(remote).saturating_sub(self.reader.cache_hits() - hits),
             ..RemoteReadProfile::default()
         };
         Ok((value, profile))
@@ -1916,7 +1989,7 @@ impl RemoteDatabase {
         ks: KeySpace,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Bytes>>, LocalDbError> {
-        self.get_many_at_cut(ks, keys, self.core.table.current(), None)?
+        self.get_many_at_cut(ks, keys, self.core.table.current(), None, true)?
             .into_iter()
             .collect()
     }
@@ -2634,3 +2707,6 @@ mod open_tests;
 
 #[cfg(test)]
 mod stream_bound_tests;
+
+#[cfg(test)]
+mod value_cache_tests;

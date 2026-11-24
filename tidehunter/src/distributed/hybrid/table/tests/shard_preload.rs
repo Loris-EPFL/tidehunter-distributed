@@ -140,6 +140,7 @@ impl ShardedFixture {
                         key: &key,
                         kind: RecordKind::Put,
                         position: position(u64::from(seed), initial_offset(seed)),
+                        value: Some(&Bytes::from_static(b"fixture value")),
                     }],
                     64,
                 )
@@ -313,6 +314,7 @@ fn sharded_cell_relocation_caches_shards_for_unsorted_updates_and_skips_l0_and_o
                 key: &overwrite_key,
                 kind: RecordKind::Put,
                 position: position(overwrite_seq, 90_000),
+                value: Some(&Bytes::from_static(b"fixture value")),
             }],
             64,
         )

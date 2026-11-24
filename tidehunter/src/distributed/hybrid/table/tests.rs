@@ -1,7 +1,8 @@
 //! Table-level behaviour that needs no owner: the index half of put → get →
 //! reopen, cut visibility, tombstones, the monotone stored target and the
 //! relocation clamp. Owner drain and value reads are covered where an owner
-//! exists (the leased fixture tests).
+//! exists (the leased fixture tests); the native value cache is covered by
+//! [`value_cache`].
 
 use super::{HybridTable, PublishedMutation, RelocationApply};
 use crate::db::WalEntry;
@@ -15,7 +16,7 @@ use crate::distributed::types::{
 };
 use crate::index::index_format::{HEADER_SIZE, IndexFormat};
 use crate::index::index_table::IndexTable;
-use crate::key_shape::{KeyShape, KeyShapeBuilder, KeySpace, KeySpaceConfig, KeyType};
+use crate::key_shape::{KeyShape, KeyShapeBuilder, KeySpace, KeyType};
 use crate::large_table::Loader;
 use crate::metrics::Metrics;
 use crate::wal::PreparedWalWrite;
@@ -28,6 +29,7 @@ mod anchor;
 mod boundary;
 mod layout;
 mod shard_preload;
+mod value_cache;
 
 fn shape() -> Arc<KeyShape> {
     Arc::new(KeyShape::new_single(4, 1, KeyType::uniform(1)))
@@ -117,6 +119,8 @@ impl Fixture {
                     key: &[key; 4],
                     kind,
                     position: position(sequence, offset),
+                    value: (kind == RecordKind::Put)
+                        .then_some(&Bytes::from_static(b"fixture value")),
                 }],
                 64,
             )
@@ -601,30 +605,6 @@ fn the_fixture_member_address_is_the_member_frame() {
     assert_eq!(member.offset, 144, "128 + 8 (CRC header) + 8 (descriptor)");
     assert_eq!(member.len, 24, "the descriptor length, not the batch's 64");
     assert_eq!((member.partition, member.segment_generation), (0, 1));
-}
-
-#[test]
-fn a_value_cache_is_refused_because_values_live_on_their_owners() {
-    let dir = tempdir::TempDir::new("hybrid-table-cache").expect("scratch directory");
-    let cached = Arc::new(KeyShape::new_single_config(
-        4,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_value_cache_size(16),
-    ));
-    let error = HybridTable::open(
-        dir.path(),
-        cached,
-        &HybridIndexConfig::default(),
-        CutSources::new(1, DurabilityTier::Native),
-        Metrics::new(),
-    )
-    .err()
-    .expect("a keyspace with a value cache cannot be hybrid");
-    assert!(
-        error.to_string().contains("value_cache_size = 0"),
-        "{error}"
-    );
 }
 
 #[test]

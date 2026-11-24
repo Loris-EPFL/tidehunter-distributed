@@ -16,6 +16,7 @@ use crate::distributed::codec::RecordKind;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::hybrid::loader::CutSources;
 use crate::distributed::hybrid::table::PublishedMutation;
+use minibytes::Bytes;
 
 #[test]
 fn v5_then_v4_in_one_cell_survives_a_snapshot_a_drop_and_a_reopen() {
@@ -29,6 +30,7 @@ fn v5_then_v4_in_one_cell_survives_a_snapshot_a_drop_and_a_reopen() {
                     key: &[key; 4],
                     kind: RecordKind::Put,
                     position: position(sequence, offset),
+                    value: Some(&Bytes::from_static(b"fixture value")),
                 }],
                 64,
             )

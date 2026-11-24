@@ -36,7 +36,8 @@ impl ConcurrentRemoteDatabase {
     /// # Errors
     /// Returns key, admission, authority, transport, or value-integrity errors.
     pub fn get(&self, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>, LocalDbError> {
-        self.database.get_at_cut(ks, key, self.table.current())
+        self.database
+            .get_at_cut(ks, key, self.table.current(), true)
     }
 
     /// Opens a call-level read trace (`None` when tracing is off); the caller
@@ -91,6 +92,6 @@ impl ConcurrentRemoteDatabase {
         trace: Option<&ReadTraceCallGuard>,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
         self.database
-            .get_many_at_cut(ks, keys, self.table.current(), trace)
+            .get_many_at_cut(ks, keys, self.table.current(), trace, true)
     }
 }

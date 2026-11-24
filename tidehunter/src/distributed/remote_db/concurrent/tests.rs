@@ -428,7 +428,7 @@ fn sui_bulk_reads_group_shards_preserve_absent_keys_and_cache_cuts() {
     let retained = db
         .remote_for_test()
         .database
-        .get_many_at_cut(ks, &keys, cut, None)
+        .get_many_at_cut(ks, &keys, cut, None, false)
         .unwrap();
     assert_eq!(
         retained[0].as_ref().unwrap().as_deref(),
@@ -483,7 +483,7 @@ fn bulk_read_windows_preserve_mixed_duplicate_results_across_cache_chunks_and_cu
     for (cut, first, second) in [(old_cut, Some(1), Some(2)), (latest, Some(9), None)] {
         let values = db
             .database
-            .get_many_at_cut(KeySpace(0), &keys, cut, None)
+            .get_many_at_cut(KeySpace(0), &keys, cut, None, false)
             .unwrap();
         assert_eq!(values.len(), keys.len());
         for (slot, value) in values.iter().enumerate() {
@@ -533,7 +533,7 @@ fn competing_grouped_readers_share_one_credit_without_losing_members() {
                 for _ in 0..8 {
                     let values = db
                         .database
-                        .get_many_at_cut(KeySpace(0), keys, cut, None)
+                        .get_many_at_cut(KeySpace(0), keys, cut, None, false)
                         .unwrap();
                     assert_eq!(values.len(), keys.len());
                     for (slot, expected) in [1u8, 4, 2, 3, 1].into_iter().enumerate() {
@@ -568,7 +568,7 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
     let rpc_count = db.live_read_submission_count();
     assert_eq!(
         db.database
-            .get_many_at_cut(KeySpace(0), &keys, old_cut, None)
+            .get_many_at_cut(KeySpace(0), &keys, old_cut, None, false)
             .unwrap()[0]
             .as_ref()
             .unwrap()
@@ -602,15 +602,15 @@ fn acknowledged_writes_prime_bounded_cache_for_immutable_cuts() {
     let before_reads = db.live_read_submission_count();
     let old = db
         .database
-        .get_many_at_cut(KeySpace(0), &keys, old_cut, None)
+        .get_many_at_cut(KeySpace(0), &keys, old_cut, None, false)
         .unwrap();
     let updated = db
         .database
-        .get_many_at_cut(KeySpace(0), &keys, updated_cut, None)
+        .get_many_at_cut(KeySpace(0), &keys, updated_cut, None, false)
         .unwrap();
     let deleted = db
         .database
-        .get_many_at_cut(KeySpace(0), &keys, deleted_cut, None)
+        .get_many_at_cut(KeySpace(0), &keys, deleted_cut, None, false)
         .unwrap();
     assert_eq!(
         old[0].as_ref().unwrap().as_deref(),
