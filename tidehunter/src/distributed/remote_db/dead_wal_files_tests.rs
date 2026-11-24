@@ -16,6 +16,7 @@
 //! the CI kernel job's to prove.
 use super::pipeline_tests::{open_live_fixture_host, trusted_owner_host_config};
 use super::*;
+use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::group::GroupLimits;
@@ -24,7 +25,7 @@ use crate::distributed::storage::CrashCut;
 use crate::distributed::tcp::{
     LeasedSync, LiveClientConfig, OwnerHostConfig, StorageNode, TcpLimits, Transport,
 };
-use crate::key_shape::KeyType;
+use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
 use std::fs;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +141,40 @@ fn restore(image: &Path, live: &Path) {
     }
 }
 
+/// The data keyspace of the fixture, plus a filtered keyspace that carries
+/// the scan's Stop.
+///
+/// A pass with no Stop and no record at or above the scan cut does nothing, as
+/// native's scan at `EndOfWal` does: no copy, no cutoff and no retirement.
+/// Native's WAL-relocation tests always supply a Stop filter for that reason.
+fn shape() -> KeyShape {
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space_config("root", 32, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    builder.add_key_space_config(
+        "stop",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], _: &[u8]| Decision::StopRelocation),
+    );
+    builder.build()
+}
+
+/// Appends the scan's Stop in the serving generation above the data set.
+/// One marker suffices: it stays above every later write, and the pass never
+/// needs to reclaim past it.
+fn stop_marker(db: &ConcurrentRemoteDatabase) {
+    db.write_batch(
+        0x5354_4f50_0000_0000_0000_0000_0000_0001u128.to_le_bytes(),
+        vec![Mutation::Put {
+            keyspace: KeySpace(1),
+            key: b"stop-mkr".to_vec().into(),
+            value: vec![1; 64].into(),
+        }],
+    )
+    .unwrap();
+}
+
 impl Drop for Owner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -163,7 +198,7 @@ struct Fixture {
 impl Fixture {
     fn new(tier: DurabilityTier) -> Self {
         let root = tempdir::TempDir::new("r1-dead-wal-files").unwrap();
-        let shape = KeyShape::new_single(32, 1, KeyType::uniform(1));
+        let shape = shape();
         let tls = TlsFiles {
             transport: Transport::TcpTrusted,
             ca: PathBuf::new(),
@@ -501,6 +536,9 @@ fn dead_sealed_serving_file_is_unlinked_while_writes_continue() {
         let db = fixture.open();
         let generation = db.epoch;
         churn(&db, 0, INITIAL_WRITES);
+        // The Stop above the initial data gives the passes a terminal: the
+        // writer's later appends stay above it and are never scanned.
+        stop_marker(&db);
         let mut written = INITIAL_WRITES;
         let mut retired_while_writing = None;
         for _ in 0..ROUNDS {
@@ -878,6 +916,8 @@ fn writes_roll_into_a_later_file_while_a_retirement_is_parked_before_unlink() {
         let log = fixture.node().source_log_for_test(generation, generation);
         let (entered, resume) = log.pause_before_unlink();
         churn(&db, 0, INITIAL_WRITES);
+        // The Stop above the initial data gives the passes a terminal.
+        stop_marker(&db);
         let mut written = INITIAL_WRITES;
         let mut parked = false;
         for _ in 0..ROUNDS {
