@@ -427,18 +427,100 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-${{ runner.arch }}-kv-rust-1.90-${{ hashFiles('Cargo.lock') }}
+      - name: Resolve native package versions
+        id: native-packages
+        # Same cache as the qualification job. The index fetch is small; the key
+        # hashes package names and resolved versions only, because `apt-cache
+        # policy` also prints region-specific mirror URLs and would make the key
+        # unstable across runners.
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          sudo timeout 180 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          apt-cache policy build-essential pkg-config clang libclang-dev cmake protobuf-compiler \
+            libssl-dev libfontconfig1-dev ca-certificates openssl bzip2 python3-venv \
+            libibverbs-dev librdmacm-dev \
+            | awk '/^[^ ]/ {package=$1} /^ +(Installed|Candidate):/ {print package, $1, $2}' \
+            > "$RUNNER_TEMP/native-package-candidates.txt"
+          key="$(sha256sum < "$RUNNER_TEMP/native-package-candidates.txt" | cut -c1-16)"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore cached native package archives
+        id: native-archive-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ubuntu-24.04-apt-${{ github.job }}-${{ steps.native-packages.outputs.key }}
+          # `github.job` keeps this job's key separate, so its first run starts
+          # cold. Fall back to the qualification snapshot; apt ignores an archive
+          # whose version does not match the candidate it needs.
+          restore-keys: ubuntu-24.04-apt-qualification-
       - name: Install build packages
+        id: native-install
         timeout-minutes: 8
         # Packages follow the replay-stores job; libibverbs-dev and librdmacm-dev
         # provide the rdma-core headers that libvalkey_rdma and the shim include.
+        # Retry-free: the restored archives serve the 28.8 MB libclang-18-dev
+        # download that stalled this step on a slow mirror.
         run: |
           set -euo pipefail
-          sudo timeout 180 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update
-          sudo env DEBIAN_FRONTEND=noninteractive timeout 300 apt-get \
-            -o Acquire::Retries=2 -o Acquire::http::Timeout=30 \
-            install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev \
-            protobuf-compiler libssl-dev libfontconfig1-dev ca-certificates openssl bzip2 \
-            python3-venv libibverbs-dev librdmacm-dev
+          archives="$RUNNER_TEMP/apt-archives"
+          mkdir -p "$archives/partial"
+          # Root writes the archives dir; hand it back even when apt fails so
+          # the cache tarball never reads a root-owned partial/ or lock.
+          cleanup() {
+            sudo rm -f "$archives/lock" 2>/dev/null || true
+            sudo rm -rf "$archives/partial" 2>/dev/null || true
+            sudo chown -R "$(id -u):$(id -g)" "$archives" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          packages=(build-essential pkg-config libssl-dev libfontconfig1-dev ca-certificates \
+            openssl bzip2 python3-venv protobuf-compiler libibverbs-dev librdmacm-dev)
+          if ! command -v clang >/dev/null; then packages+=(clang); fi
+          if ! command -v cmake >/dev/null; then packages+=(cmake); fi
+          # Bindgen loads the C shared library plus the Clang resource headers;
+          # both must be present before libclang-dev can be skipped.
+          libclang_found=0
+          for library in "${LIBCLANG_PATH:-/usr/lib}"/libclang.so* \
+                         "${LIBCLANG_PATH:-/usr/lib}"/libclang-[0-9]*.so* \
+                         /usr/lib/llvm-*/lib/libclang.so* \
+                         /usr/lib/llvm-*/lib/libclang-[0-9]*.so* \
+                         /usr/lib/*-linux-gnu/libclang.so* \
+                         /usr/lib/*-linux-gnu/libclang-[0-9]*.so*; do
+            if [[ -f $library && -r $library ]]; then
+              # Globs do not expand inside [[ ]]; iterate explicitly.
+              for header in "$(dirname "$library")"/clang/*/include/stddef.h; do
+                if [[ -f $header ]]; then
+                  libclang_found=1
+                  echo "LIBCLANG_PATH=$(dirname "$library")" >> "$GITHUB_ENV"
+                  break 2
+                fi
+              done
+            fi
+          done
+          if [[ $libclang_found == 0 ]]; then packages+=(libclang-dev); fi
+          missing=()
+          for package in "${packages[@]}"; do
+            if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii'; then
+              missing+=("$package")
+            fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            sudo env DEBIAN_FRONTEND=noninteractive timeout 300 apt-get \
+              -o Acquire::Retries=0 -o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25 \
+              -o Dir::Cache::archives="$archives" \
+              -o APT::Keep-Downloaded-Packages=1 \
+              install -y --no-install-recommends "${missing[@]}"
+          else
+            echo "Native prerequisites already installed on the runner image."
+          fi
+      - name: Save cached native package archives
+        # Only a successful install is cached: a key holds a complete snapshot,
+        # so a failed run can never pin a partial set under the final key.
+        if: steps.native-install.outcome == 'success' && steps.native-archive-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ubuntu-24.04-apt-${{ github.job }}-${{ steps.native-packages.outputs.key }}
       - name: Prepare isolated Python dependencies
         timeout-minutes: 5
         run: |
