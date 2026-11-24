@@ -4,8 +4,10 @@
 Usage: python3 -B .github/scripts/lint_stack.py --base <commit> --tip <commit>
 
 A stacked PR merges one commit at a time, so a lint failure at any tip breaks
-the series. This runner checks out each commit between the base (exclusive)
-and the tip (inclusive) in one temporary worktree. It runs the same
+the series. This runner checks out each first-parent commit between the base
+(exclusive) and the tip (inclusive) in one temporary worktree. Commits that a
+merge brings in through its other parents never become a branch tip, so they
+are not checked; an upstream merge is checked at the merge commit. It runs the same
 `checks.py lint` profile that the Lint job runs. The worktree path does not
 change, so Cargo reuses its artifacts between tips. The run stops at the
 first failing tip and prints that commit.
@@ -35,7 +37,7 @@ def commits(root, base, tip):
     if ancestor.returncode != 0:
         raise RuntimeError(f"base {base} is not an ancestor of tip {tip}: "
                            + (ancestor.stderr.strip() or f"git exit {ancestor.returncode}"))
-    listed = git(root, "rev-list", "--reverse", f"{base}..{tip}")
+    listed = git(root, "rev-list", "--reverse", "--first-parent", f"{base}..{tip}")
     if listed.returncode != 0:
         raise RuntimeError(listed.stderr.strip() or f"git rev-list failed: {listed.returncode}")
     return listed.stdout.split()
