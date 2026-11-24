@@ -104,6 +104,8 @@ pub struct LiveTargetManager {
     configfs_hook: std::sync::Mutex<Option<ConfigfsHook>>,
     #[cfg(test)]
     configfs_steps: std::cell::Cell<usize>,
+    #[cfg(test)]
+    commission_groups: std::cell::Cell<u64>,
 }
 
 fn invalid(s: &'static str) -> io::Error {
@@ -449,6 +451,8 @@ impl LiveTargetManager {
             configfs_hook: std::sync::Mutex::new(configfs_hook),
             #[cfg(test)]
             configfs_steps: std::cell::Cell::new(0),
+            #[cfg(test)]
+            commission_groups: std::cell::Cell::new(0),
         };
         // Disconnect local controllers of a previous process before any
         // namespace is drained or removed.
@@ -809,7 +813,7 @@ impl LiveTargetManager {
                 .join(nqn);
             self.link_if_absent(&private_link, &sub)?;
             if !self.fixture {
-                self.commission(&binding)?;
+                self.commission(&[&binding])?;
                 self.stats.readonly_commission_successes =
                     self.stats.readonly_commission_successes.saturating_add(1);
             }
@@ -829,15 +833,19 @@ impl LiveTargetManager {
         Ok(binding)
     }
 
-    /// Commission one namespace read-only through the private host and port.
-    /// The namespace must already be enabled and linked privately.
-    fn commission(&mut self, binding: &LiveTargetBinding) -> io::Result<()> {
+    /// Commission every binding of one subsystem through one controller. All
+    /// namespace devices are resolved and write-protected before the single
+    /// disconnect, so a namespace scan cannot outlive the controller removal.
+    fn commission(&mut self, bindings: &[&LiveTargetBinding]) -> io::Result<()> {
+        let first = bindings
+            .first()
+            .ok_or_else(|| invalid("empty commissioning group"))?;
         let local = LiveConnectTarget {
-            nqn: binding.nqn.clone(),
-            uuid: binding.uuid,
-            nsid: binding.nsid,
-            bytes: binding.bytes,
-            block_size: binding.block_size,
+            nqn: first.nqn.clone(),
+            uuid: first.uuid,
+            nsid: first.nsid,
+            bytes: first.bytes,
+            block_size: first.block_size,
             address: "127.0.0.1".to_owned(),
             service: self.config.commissioning_service,
             transport: NvmeofTransport::Tcp,
@@ -845,7 +853,7 @@ impl LiveTargetManager {
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         let host_nqn = self.commissioning_host();
-        let (mut controller, namespace) = self
+        let (mut controller, _namespace) = self
             .commissioning
             .as_mut()
             .ok_or_else(|| invalid("missing commissioning registry"))?
@@ -856,14 +864,9 @@ impl LiveTargetManager {
                 LiveNamespaceAccess::ReadWrite,
                 deadline,
             )?;
-        drop(namespace);
-        let checked = controller
-            .set_read_only(binding.nsid, deadline)
-            .and_then(|()| {
-                controller
-                    .resolve_verified(LiveNamespaceAccess::ReadOnly, deadline)
-                    .map(drop)
-            });
+        let checked = bindings.iter().try_for_each(|binding| {
+            controller.set_read_only_member(binding.nsid, binding.uuid, deadline)
+        });
         let disconnect = controller.disconnect(Instant::now() + Duration::from_secs(20));
         checked?;
         disconnect
@@ -907,18 +910,25 @@ impl LiveTargetManager {
                 .join("subsystems")
                 .join(nqn);
             self.link_if_absent(&private_link, &sub)?;
+            #[cfg(test)]
+            self.commission_groups
+                .set(self.commission_groups.get().saturating_add(1));
             let mut failure = None;
-            for binding in group {
-                let step = if self.fixture {
-                    self.put(
+            if self.fixture {
+                for binding in group {
+                    if let Err(error) = self.put(
                         &sub.join(format!("namespaces/{}", binding.nsid))
                             .join("write_protect"),
                         "1",
-                    )
-                } else {
-                    let started = Instant::now();
-                    let result = self.commission(binding);
-                    if result.is_ok() {
+                    ) {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            } else {
+                let started = Instant::now();
+                match self.commission(group) {
+                    Ok(()) => {
                         self.stats.write_protect_successes =
                             self.stats.write_protect_successes.saturating_add(1);
                         self.stats.write_protect_time_ns =
@@ -926,11 +936,7 @@ impl LiveTargetManager {
                                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                             );
                     }
-                    result
-                };
-                if let Err(error) = step {
-                    failure = Some(error);
-                    break;
+                    Err(error) => failure = Some(error),
                 }
             }
             self.remove_link(&private_link)?;

@@ -296,6 +296,22 @@ fn registry_excludes_duplicate_intents_and_holds_lock() {
 }
 
 #[test]
+fn udev_settle_treats_absence_as_idle_and_honors_the_deadline() {
+    let temp = tempdir::TempDir::new("udev-queue").unwrap();
+    let queue = temp.path().join("queue");
+    wait_for_udev_idle_at(&queue, Instant::now() + PROGRESS_CAP)
+        .expect("a host without a udev queue is already idle");
+    std::fs::write(&queue, b"").unwrap();
+    let error = wait_for_udev_idle_at(&queue, Instant::now() + Duration::from_millis(20))
+        .expect_err("a busy udev queue must reach its deadline");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::TimedOut,
+        "a busy queue reports the deadline, not success"
+    );
+}
+
+#[test]
 fn retirement_does_not_touch_missing_or_replaced_original() {
     let temp = tempdir::TempDir::new("controller-retire").unwrap();
     let path = temp.path().join("controller");

@@ -508,6 +508,21 @@ impl LiveController {
         if nsid != self.resolver.target.nsid {
             return Err(invalid("namespace id mismatch"));
         }
+        self.set_read_only_checked(nsid, deadline)
+    }
+    /// Write-protect another namespace of the same subsystem. The resolver
+    /// proves the member belongs to this controller before the admin command.
+    pub(super) fn set_read_only_member(
+        &mut self,
+        nsid: u32,
+        uuid: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.resolver
+            .resolve_namespace(nsid, uuid, LiveNamespaceAccess::ReadOnly, deadline)?;
+        self.set_read_only_checked(nsid, deadline)
+    }
+    fn set_read_only_checked(&mut self, nsid: u32, deadline: Instant) -> io::Result<()> {
         let controller_path = Path::new("/dev").join(&self.resolver.name);
         let file = wait_for_device(
             "open controller admin device",
@@ -592,7 +607,12 @@ impl LiveController {
         let result = retire_locked(
             &mut locks,
             self.deletion == DeletionState::NotStarted,
-            || resolver.lock_owned_disks(deadline),
+            || {
+                // A namespace change can leave a probe reading block 0 after
+                // the admin command returned. Let udev finish before locking.
+                wait_for_udev_idle(deadline)?;
+                resolver.lock_owned_disks(deadline)
+            },
             || self.delete_owned(deadline),
         );
         self.teardown_locks = locks;

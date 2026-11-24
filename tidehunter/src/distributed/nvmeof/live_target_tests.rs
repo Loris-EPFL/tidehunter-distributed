@@ -600,6 +600,42 @@ fn write_protect_keeps_namespace_and_marks_readonly() {
 }
 
 #[test]
+fn write_protect_commissions_one_controller_per_subsystem() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let first = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let second = manager
+        .export_permanent(&f.name(1), f.extra_wal("wal-1"), false)
+        .unwrap();
+    assert_eq!(
+        first.nqn, second.nqn,
+        "the two files must share one permanent export subsystem"
+    );
+    let nqn = second.nqn.clone();
+    manager.write_protect(&[first, second]).unwrap();
+    assert_eq!(
+        manager.commission_groups.get(),
+        1,
+        "one commissioning controller serves every namespace of the subsystem"
+    );
+    for nsid in [1, 2] {
+        let path = f
+            .configfs
+            .join("subsystems")
+            .join(&nqn)
+            .join(format!("namespaces/{nsid}/write_protect"));
+        assert_eq!(
+            attribute(&path).unwrap(),
+            "1",
+            "namespace {nsid} is write-protected"
+        );
+    }
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn inode_reuse_on_different_wal_path_does_not_match_marker() {
     let f = Fixture::new();
     let mut manager = f.open().unwrap();
