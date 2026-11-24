@@ -94,11 +94,10 @@ impl Client {
                 #[cfg(any(test, feature = "test-utils"))]
                 if self.live_write_local_fixture {
                     // Use the real namespace I/O and CRC checks without a kernel target.
-                    pool.cache_local_namespace(
+                    pool.cache_local_shared_namespace(
                         &target,
                         &config.host_nqn,
                         config.host_id,
-                        access,
                         &first.segment.path,
                     )
                     .map_err(TcpError::component)?;
@@ -121,7 +120,9 @@ impl Client {
                     )
                     .map(|(lease, acquisition, _)| (lease, acquisition))
                     .map_err(TcpError::component)?;
-                let namespace = lease.open_namespace().map_err(TcpError::component)?;
+                let (namespace, observed) = lease
+                    .namespace(target.nsid, target.uuid, access, deadline)
+                    .map_err(TcpError::component)?;
                 drop(setup);
                 if let Some(counters) = &self.live_counters
                     && matches!(acquisition, LivePoolAcquisition::Connected)
@@ -129,7 +130,6 @@ impl Client {
                     counters.record_namespace_connect();
                 }
                 if let Some(metrics) = &self.live_metrics {
-                    let observed = lease.binding();
                     metrics.record_route(LiveRouteEvidence {
                         transport: observed.transport,
                         address: binding.address.clone(),
@@ -267,7 +267,10 @@ impl Client {
                             LiveTimingStage::NamespaceSetup,
                         );
                         io = LiveIo::new(
-                            lease.open_namespace().map_err(TcpError::component)?,
+                            lease
+                                .namespace(target.nsid, target.uuid, access, deadline)
+                                .map_err(TcpError::component)?
+                                .0,
                             config.max_inflight_requests,
                             config.max_inflight_bytes,
                             false,

@@ -1360,7 +1360,8 @@ impl LiveReadCache {
         if client.live_write_local_fixture
             && let GrantScope::File(location) = &scope
         {
-            pool.register_local_target(&target.nqn, target.nsid, location.segment.path.clone());
+            pool.register_local_target(&target, access, location.segment.path.clone())
+                .map_err(failed_io)?;
         }
         let setup = LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
         let acquisition = if shared {
@@ -1400,14 +1401,9 @@ impl LiveReadCache {
                 failed_io(error)
             }
         })?;
-        let (namespace, opened) = if shared {
-            let (namespace, opened) = lease
-                .namespace(target.nsid, target.uuid, access, connect_deadline)
-                .map_err(failed_io)?;
-            (namespace, Some(opened))
-        } else {
-            (Arc::new(lease.open_namespace().map_err(failed_io)?), None)
-        };
+        let (namespace, opened) = lease
+            .namespace(target.nsid, target.uuid, access, connect_deadline)
+            .map_err(failed_io)?;
         drop(setup);
         if let Some(counters) = &client.live_counters {
             let ns = |d: Duration| d.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -1424,7 +1420,7 @@ impl LiveReadCache {
         if let Some(metrics) = &client.live_metrics {
             // A shared controller serves every member of its subsystem: name
             // the member this grant opened, not the one used to connect.
-            let observed = opened.as_ref().unwrap_or_else(|| lease.binding());
+            let observed = &opened;
             metrics.record_route(LiveRouteEvidence {
                 transport: observed.transport,
                 address: target.address.clone(),

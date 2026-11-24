@@ -21,11 +21,12 @@ fn local_resolver(dir: &std::path::Path) -> Arc<LiveNamespaceResolver> {
 }
 
 #[test]
-fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_namespace_identity() {
+fn strict_and_shared_acquisitions_share_one_subsystem_controller() {
+    const HOST: &str = "nqn.2026-01.test:host";
     let dir = tempdir::TempDir::new("live-pool-shared").unwrap();
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
-    let target = ready_shared_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
+    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
     let mut other = target.clone();
     other.nsid = 2;
     other.uuid = [3; 16];
@@ -33,48 +34,158 @@ fn shared_acquisition_uses_subsystem_identity_but_strict_acquisition_keeps_names
     let (first, how, _) = pool
         .acquire_shared(
             &target,
-            "nqn.2026-01.test:host",
+            HOST,
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
             deadline,
         )
         .unwrap();
-    assert_eq!(how, LivePoolAcquisition::Reused);
+    assert_eq!(
+        how,
+        LivePoolAcquisition::Reused,
+        "shared acquisition reuses the cached subsystem controller"
+    );
+    // A permanent export shares one subsystem NQN across many namespaces, so
+    // a strict file acquisition reuses that subsystem controller.
     let (second, how, _) = pool
-        .acquire_shared(
+        .acquire_file(
             &other,
-            "nqn.2026-01.test:host",
+            HOST,
             [2; 16],
             LiveNamespaceAccess::ReadShared,
             deadline,
+            (0, 1, 1),
         )
         .unwrap();
-    assert_eq!(how, LivePoolAcquisition::Reused);
-    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        how,
+        LivePoolAcquisition::Reused,
+        "a file grant of the same subsystem reuses its controller"
+    );
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "both acquisitions must share one lease"
+    );
+    assert_eq!(
+        pool.state.lock().unwrap().entries.len(),
+        1,
+        "one controller per subsystem NQN"
+    );
     drop((first, second));
     pool.shutdown(deadline).unwrap();
+}
 
-    let registry = LiveConnectionRegistry::open(&dir.path().join("strict")).unwrap();
-    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
-    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:strict");
-    // A permanent export shares one subsystem NQN across many namespaces, so
-    // a strict acquisition is keyed by namespace and never reuses another.
+fn fixture_target(nqn: &str, nsid: u32, uuid: [u8; 16], bytes: u64) -> LiveConnectTarget {
+    LiveConnectTarget {
+        nqn: nqn.into(),
+        uuid,
+        nsid,
+        bytes,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: Default::default(),
+    }
+}
+
+/// A sealed subsystem spans two namespace exports. Every acquisition must
+/// reuse its one controller and resolve each member through that lease.
+fn acquire_two_sealed_namespaces(
+    pool: &LiveControllerPool,
+    host: &str,
+    first: &LiveConnectTarget,
+    second: &LiveConnectTarget,
+    first_path: &std::path::Path,
+    second_path: &std::path::Path,
+) {
+    let deadline = Instant::now() + PROGRESS_CAP;
+    pool.cache_local_shared_namespace(first, host, [2; 16], first_path)
+        .unwrap();
+    pool.cache_local_shared_namespace(second, host, [2; 16], second_path)
+        .unwrap();
+    let (one, _, _) = pool
+        .acquire_file(
+            first,
+            host,
+            [2; 16],
+            LiveNamespaceAccess::ReadOnly,
+            deadline,
+            (0, 1, 0),
+        )
+        .unwrap();
+    let (two, _, _) = pool
+        .acquire_file(
+            second,
+            host,
+            [2; 16],
+            LiveNamespaceAccess::ReadOnly,
+            deadline,
+            (0, 1, 1),
+        )
+        .unwrap();
     assert!(
-        pool.state
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&(target.nqn.clone(), target.nsid))
+        Arc::ptr_eq(&one, &two),
+        "the second namespace must reuse the subsystem controller"
     );
-    assert!(
-        !pool
-            .state
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&(target.nqn.clone(), 2))
+    assert_eq!(
+        pool.state.lock().unwrap().entries.len(),
+        1,
+        "one controller for the subsystem"
     );
+    let (_, first_binding) = one
+        .namespace(
+            first.nsid,
+            first.uuid,
+            LiveNamespaceAccess::ReadOnly,
+            deadline,
+        )
+        .unwrap();
+    let (_, second_binding) = one
+        .namespace(
+            second.nsid,
+            second.uuid,
+            LiveNamespaceAccess::ReadOnly,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(
+        first_binding.namespace_path, first_path,
+        "namespace {} resolved its own export",
+        first.nsid
+    );
+    assert_eq!(
+        second_binding.namespace_path, second_path,
+        "namespace {} resolved its own export",
+        second.nsid
+    );
+    drop((one, two));
     pool.shutdown(deadline).unwrap();
+}
+
+#[test]
+fn reopen_of_a_sealed_subsystem_with_two_namespaces_connects_one_controller() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    const NQN: &str = "nqn.2026-01.test:sealed";
+    const BYTES: u64 = 8192;
+    let dir = tempdir::TempDir::new("live-pool-reopen").unwrap();
+    let first_path = dir.path().join("wal-0");
+    let second_path = dir.path().join("wal-1");
+    for path in [&first_path, &second_path] {
+        std::fs::File::create(path).unwrap().set_len(BYTES).unwrap();
+    }
+    let first = fixture_target(NQN, 1, [1; 16], BYTES);
+    let second = fixture_target(NQN, 2, [3; 16], BYTES);
+    {
+        let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+        let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+        acquire_two_sealed_namespaces(&pool, HOST, &first, &second, &first_path, &second_path);
+    }
+    // Graceful close removed the controller. The reopen reuses the sealed
+    // subsystem NQN and still needs exactly one controller for both members.
+    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    acquire_two_sealed_namespaces(&pool, HOST, &first, &second, &first_path, &second_path);
 }
 
 #[test]
@@ -93,18 +204,21 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         transport: NvmeofTransport::Tcp,
         geometry: Default::default(),
     };
-    let identity = Identity {
+    let mut identity = Identity {
         target: target.clone(),
         host_nqn: "nqn.2026-01.test:host".into(),
         host_id: [2; 16],
         access: LiveNamespaceAccess::ReadWrite,
         file: None,
     };
+    // The pool keys a subsystem, not one of its members.
+    identity.target.nsid = 0;
+    identity.target.uuid = [0; 16];
     pool.state
         .lock()
         .unwrap()
         .entries
-        .insert((target.nqn.clone(), target.nsid), Entry::Pending(identity));
+        .insert(target.nqn.clone(), Entry::Pending(identity));
     let mut other = target.clone();
     other.nqn = "nqn.2026-01.test:two".into();
     let deadline = Instant::now() + PROGRESS_CAP;
@@ -115,7 +229,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         Err(e) if e.kind() == io::ErrorKind::InvalidData
     ));
     assert!(matches!(
-        pool.get_or_connect(&target, "nqn.2026-01.test:host", [2; 16], LiveNamespaceAccess::ReadOnly, deadline),
+        pool.get_or_connect(&target, "nqn.2026-01.test:other-host", [2; 16], LiveNamespaceAccess::ReadOnly, deadline),
         Err(e) if e.kind() == io::ErrorKind::InvalidData
     ));
     assert!(
@@ -126,7 +240,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .lock()
         .unwrap()
         .entries
-        .insert((target.nqn.clone(), target.nsid), Entry::Quarantined);
+        .insert(target.nqn.clone(), Entry::Quarantined);
     assert!(
         matches!(pool.get_or_connect(&other, "nqn.2026-01.test:host", [2;16], LiveNamespaceAccess::ReadWrite, deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     );
@@ -146,11 +260,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         .is_err()
     );
     assert!(matches!(
-        pool.state
-            .lock()
-            .unwrap()
-            .entries
-            .get(&(target.nqn.clone(), target.nsid)),
+        pool.state.lock().unwrap().entries.get(&target.nqn),
         Some(Entry::Quarantined)
     ));
     assert!(matches!(pool.shutdown(deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
@@ -222,15 +332,17 @@ fn ready_idle(pool: &LiveControllerPool, dir: &std::path::Path, nqn: &str) -> Li
         namespaces: Mutex::new(HashMap::new()),
         local_fixture: false,
     });
-    let identity = Identity {
+    let mut identity = Identity {
         target: target.clone(),
         host_nqn: "nqn.2026-01.test:host".into(),
         host_id: [2; 16],
         access: LiveNamespaceAccess::ReadWrite,
         file: None,
     };
+    identity.target.nsid = 0;
+    identity.target.uuid = [0; 16];
     pool.state.lock().unwrap().entries.insert(
-        (nqn.to_owned(), target.nsid),
+        nqn.to_owned(),
         Entry::Ready {
             identity,
             lease,
@@ -241,68 +353,59 @@ fn ready_idle(pool: &LiveControllerPool, dir: &std::path::Path, nqn: &str) -> Li
     target
 }
 
-/// Cache one idle shared subsystem lease under the namespace-zero key.
-fn ready_shared_idle(
-    pool: &LiveControllerPool,
-    directory: &std::path::Path,
-    nqn: &str,
-) -> LiveConnectTarget {
-    let mut target = ready_idle(pool, directory, nqn);
-    let key = (target.nqn.clone(), target.nsid);
-    let mut state = pool.state.lock().unwrap();
-    let mut entry = state
-        .entries
-        .remove(&key)
-        .expect("fixture controller present");
-    if let Entry::Ready { identity, .. } = &mut entry {
-        identity.target.nsid = 0;
-        identity.target.uuid = [0; 16];
-    }
-    state.entries.insert((target.nqn.clone(), 0), entry);
-    drop(state);
-    target.nsid = 0;
-    target.uuid = [0; 16];
-    target
-}
-
 #[test]
-fn eviction_ignores_a_busy_controller_of_another_file_in_the_subsystem() {
+fn eviction_defers_a_busy_subsystem_controller_and_retires_it_idle() {
     let dir = tempdir::TempDir::new("live-pool-exact-evict").unwrap();
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:evict");
+    let deadline = Instant::now() + PROGRESS_CAP;
     let (held, how, _) = pool
         .acquire(
             &target,
             "nqn.2026-01.test:host",
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
-            Instant::now() + PROGRESS_CAP,
+            deadline,
         )
         .unwrap();
     assert_eq!(how, LivePoolAcquisition::Reused);
     {
         let mut state = pool.state.lock().unwrap();
-        if let Some(Entry::Ready { identity, .. }) =
-            state.entries.get_mut(&(target.nqn.clone(), target.nsid))
-        {
-            // This controller serves file 1; the retirement victim is file 2.
-            identity.file = Some((0, 1, 1));
+        if let Some(Entry::Ready { identity, .. }) = state.entries.get_mut(&target.nqn) {
+            // This controller serves subsystem 0.
+            identity.file = Some((0, 1, 0));
         }
     }
-    let result = pool
-        .evict_files(0, 1, 4096, &[2 * 4096], Instant::now() + PROGRESS_CAP)
-        .unwrap();
-    assert_eq!(result, RetirementResult::Completed);
+    // A victim in another subsystem leaves the controller cached.
+    assert_eq!(
+        pool.evict_files(0, 1, 4096, &[1024 * 4096], deadline)
+            .unwrap(),
+        RetirementResult::Completed
+    );
     assert!(
-        pool.state
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&(target.nqn.clone(), target.nsid))
+        pool.state.lock().unwrap().entries.contains_key(&target.nqn),
+        "an unrelated subsystem keeps its controller"
+    );
+    // Its own victim defers while an external lease keeps it busy.
+    assert_eq!(
+        pool.evict_files(0, 1, 4096, &[0], deadline).unwrap(),
+        RetirementResult::Busy
+    );
+    assert!(
+        pool.state.lock().unwrap().entries.contains_key(&target.nqn),
+        "a busy controller stays cached"
     );
     drop(held);
-    pool.shutdown(Instant::now() + PROGRESS_CAP).unwrap();
+    assert_eq!(
+        pool.evict_files(0, 1, 4096, &[0], deadline).unwrap(),
+        RetirementResult::Completed
+    );
+    assert!(
+        !pool.state.lock().unwrap().entries.contains_key(&target.nqn),
+        "an idle controller of the victim subsystem is retired"
+    );
+    pool.shutdown(deadline).unwrap();
 }
 
 #[test]
@@ -312,7 +415,7 @@ fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:one");
     let deadline = Instant::now() + PROGRESS_CAP;
-    let key = (target.nqn.clone(), target.nsid);
+    let key = target.nqn.clone();
 
     let mut state = pool.state.lock().unwrap();
     let controller = LiveControllerPool::begin_close(&mut state, &key).unwrap();
@@ -365,7 +468,7 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
     let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:two");
-    let key = (target.nqn.clone(), target.nsid);
+    let key = target.nqn.clone();
     let deleted = AtomicBool::new(false);
     let mut state = pool.state.lock().unwrap();
     let controller = LiveControllerPool::begin_close(&mut state, &key).unwrap();
