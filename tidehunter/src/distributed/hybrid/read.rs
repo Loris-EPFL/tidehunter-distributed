@@ -29,6 +29,8 @@ use minibytes::Bytes;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -139,6 +141,10 @@ pub(crate) struct ValueReader {
     hits: AtomicU64,
     misses: AtomicU64,
     decode_failures: AtomicU64,
+    /// Test-only failure of every batched fetch: 0 none, 1 `NotFound`, 2 any
+    /// other kind. Relaxed: a knob set by the test thread between operations.
+    #[cfg(test)]
+    read_many_fault: AtomicU8,
 }
 
 impl ValueReader {
@@ -158,7 +164,22 @@ impl ValueReader {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             decode_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            read_many_fault: AtomicU8::new(0),
         }
+    }
+
+    /// Arm or clear a test-only failure of every [`Self::read_many`] call.
+    /// `NotFound` is the retired-member kind the per-slot batch re-reads; any
+    /// other kind is terminal. Tests only.
+    #[cfg(test)]
+    pub(crate) fn set_read_many_fault_for_test(&self, kind: Option<io::ErrorKind>) {
+        let code = match kind {
+            None => 0,
+            Some(io::ErrorKind::NotFound) => 1,
+            Some(_) => 2,
+        };
+        self.read_many_fault.store(code, Ordering::Relaxed);
     }
 
     /// Resolve the value stored for `position`.
@@ -403,6 +424,22 @@ impl ValueReader {
             return Err(LocalDbError::new(
                 "value page exceeds the bounded read page size",
             ));
+        }
+        #[cfg(test)]
+        match self.read_many_fault.load(Ordering::Relaxed) {
+            0 => {}
+            1 => {
+                return Err(LocalDbError::with_kind(
+                    io::ErrorKind::NotFound,
+                    "test-injected batched fetch failure",
+                ));
+            }
+            _ => {
+                return Err(LocalDbError::with_kind(
+                    io::ErrorKind::PermissionDenied,
+                    "test-injected batched fetch failure",
+                ));
+            }
         }
         let mut values: Vec<Option<Bytes>> = vec![None; rows.len()];
         let mut remote: Vec<Option<VersionPosition>> = vec![None; rows.len()];
