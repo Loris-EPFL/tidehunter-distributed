@@ -1068,10 +1068,9 @@ impl LiveTargetManager {
                     self.remove_link(&allowed.join(name))?;
                 }
             }
-            let namespaces = sub.join("namespaces");
-            if fs::symlink_metadata(self.full(&namespaces)?).is_ok() {
-                self.remove_dir(&namespaces)?;
-            }
+            // `namespaces` and `allowed_hosts` are configfs default groups: the
+            // kernel refuses to remove them (EPERM) and deletes them with the
+            // subsystem directory.
             if fs::symlink_metadata(self.full(&sub)?).is_ok() {
                 self.remove_dir(&sub)?;
             }

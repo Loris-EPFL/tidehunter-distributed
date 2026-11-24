@@ -222,10 +222,7 @@ impl LiveTargetManager {
             for entry in configfs_entries(&self.full(&sub.join("namespaces"))?)? {
                 self.remove_dir(&sub.join("namespaces").join(entry.file_name()))?;
             }
-            let namespaces = sub.join("namespaces");
-            if fs::symlink_metadata(self.full(&namespaces)?).is_ok() {
-                self.remove_dir(&namespaces)?;
-            }
+            // The `namespaces` default group goes with the subsystem directory.
             if fs::symlink_metadata(self.full(sub)?).is_ok() {
                 self.remove_dir(sub)?;
             }
