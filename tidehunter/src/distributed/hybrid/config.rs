@@ -143,10 +143,15 @@ impl HybridIndexConfig {
         if self.relocation_max_reclaim_pct > 100 {
             return invalid("index relocation_max_reclaim_pct must be in 0..=100".to_owned());
         }
-        if let Some(threshold) = self.index_auto_shard_threshold {
-            // Same ceiling as native `Config::validate`: one serialized index
-            // blob must fit in a WAL fragment after framing and worst-case
-            // alignment.
+        if let Some(threshold) = self.index_auto_shard_threshold
+            && threshold != usize::MAX
+        {
+            // `Some(usize::MAX)` is native's "auto-sharding disabled" spelling
+            // (`Config::disable_index_auto_sharding`), so it has no ceiling.
+            //
+            // Same ceiling as native `Config::validate` otherwise: one
+            // serialized index blob must fit in a WAL fragment after framing
+            // and worst-case alignment.
             let alignment = if self.direct_io { 512 } else { 8 };
             let overhead = CrcFrame::CRC_HEADER_LENGTH + WalEntry::INDEX_PREFIX_SIZE + alignment;
             let max = self.frag_size.saturating_sub(overhead as u64);

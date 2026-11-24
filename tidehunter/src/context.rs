@@ -304,7 +304,7 @@ impl KsContext {
         self.inc_lookup_result(result, source);
         match v {
             None => GetResult::NotFound,
-            Some(w) => GetResult::WalPosition(w, None),
+            Some(w) => GetResult::WalPosition(w),
         }
     }
 }

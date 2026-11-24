@@ -632,6 +632,13 @@ impl Loader for HybridLoader {
         Ok(*guard.wal_position())
     }
 
+    /// The index-applied prefix, not `last_processed`: the latched cut can sit
+    /// below what the stored region already names, and a snapshot must not
+    /// lower its `replay_from` below that.
+    fn snapshot_replay_bound(&self) -> BatchVersion {
+        self.cuts.durable().min(self.cuts.applied())
+    }
+
     fn last_processed(&self) -> BatchVersion {
         compose_last_processed(
             self.cuts.durable(),

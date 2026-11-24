@@ -340,19 +340,24 @@ fn natively_a_lower_commit_cut_is_stored_as_before() {
     assert_eq!(fixture.last_processed(), LastProcessed::new(150));
 }
 
-/// Native anchored-`Empty` cell: `mark_dirty` anchors the cell at its first
-/// write `P` (offset 300) and a flush requested at `pending = 150 <= P` (an
-/// older write was still in flight) stores `pending`, the more conservative
-/// value, exactly as before. Snapshot `replay_from` then covers the write.
+/// Native anchored-`Empty` cell: `mark_dirty` anchors the cell at the
+/// minimum of its first write `P` (offset 300) and the tracker frontier read
+/// under the row lock (150), so the cell never sits above a write it applied.
+/// A flush requested at `pending = 150 <= P` (an older write was still in
+/// flight) then stores `pending`, the more conservative value. Snapshot
+/// `replay_from` covers the write either way. Negative control: anchoring at
+/// the write's own frontier would make the snapshot record `replay_from = 300`
+/// with the write at 300 unprocessed (`<` is strict), so a crash before its
+/// flush would lose it.
 #[test]
-fn natively_an_anchored_empty_cell_stores_the_request_cut_below_its_first_write() {
+fn natively_an_anchored_empty_cell_is_clamped_by_the_tracker_frontier() {
     let fixture = Fixture::new(MovingFrontierLoader::native());
     fixture.set_live(150);
     fixture.insert(1, WalPosition::test_value(300));
     assert_eq!(
         fixture.last_processed(),
-        LastProcessed::new(300),
-        "the first write anchors the Empty cell at its own frontier"
+        LastProcessed::new(150),
+        "the first write anchors the Empty cell at min(its frontier, the tracker frontier)"
     );
     let command = fixture.request(150);
     fixture.run_and_complete(&command, 150);

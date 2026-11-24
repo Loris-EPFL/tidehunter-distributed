@@ -482,6 +482,7 @@ pub(crate) fn handle_command<P: IndexPosition, L: Loader<Position = P>>(
     let l0_threshold = ctx.l0_max_entries();
     let over_threshold = !is_relocation && merged_l0.len() > l0_threshold;
 
+    let deeper_level_exists = existing_l1.is_some() || current_levels.is_sharded();
     let new_levels = if over_threshold {
         ctx.metrics
             .promote_total
@@ -502,12 +503,20 @@ pub(crate) fn handle_command<P: IndexPosition, L: Loader<Position = P>>(
             process_l1_blob(loader, ctx, &mut new_l1);
             write_promoted_l1(loader, ctx, command.ks, new_l1)
         }
+    } else if merged_l0.is_empty() && deeper_level_exists {
+        // An empty L0 shadows nothing, and a blob for it would only add a
+        // level for every lookup on this cell to probe until the next
+        // promote. Leave the cell on its deeper levels.
+        if current_levels.is_sharded() {
+            IndexLevels::sharded(current_levels.shards().clone())
+        } else {
+            IndexLevels::promoted(existing_l1.expect("deeper level below L0 is L1"))
+        }
     } else {
         run_compactor(ctx, &mut merged_l0);
         // If no deeper level exists, this L0 is the deepest — strip
         // tombstones. Otherwise (L1 or shards below) leave them in so
         // they shadow the level beneath.
-        let deeper_level_exists = existing_l1.is_some() || current_levels.is_sharded();
         if !deeper_level_exists {
             merged_l0.clean_self();
         }
@@ -533,8 +542,8 @@ pub(crate) fn handle_command<P: IndexPosition, L: Loader<Position = P>>(
 
     // Post-pass: any blob in `new_levels` whose position is still in
     // `relocate_positions` wasn't naturally rewritten by the merge/promote
-    // above (untouched re-sharding shards, or a stale L1 under the L0-write
-    // branch). Reflush those at fresh positions.
+    // above (untouched re-sharding shards, a stale L1 under the L0-write
+    // branch, or a flush that wrote no L0). Reflush those at fresh positions.
     let new_levels = match &command.flush_kind {
         FlushKind::Flush {
             relocate_positions, ..
@@ -1201,6 +1210,83 @@ mod tests {
     }
 
     #[test]
+    fn empty_flush_over_l1_writes_no_l0() {
+        // Nothing to flush above an L1 blob: no L0 blob is written and the
+        // cell keeps its `[INVALID, L1]` shape.
+        let ctx = make_ctx(false, 1024 * 1024);
+        let loader = RecordingLoader::new();
+        let l1_pos = WalPosition::new(500, 64);
+        loader.seed(l1_pos, build_dirty(&[(1, Some(1)), (2, Some(2))]));
+        let cmd = flush_command(
+            ctx.id(),
+            IndexTable::default(),
+            IndexLevels::promoted(l1_pos),
+        );
+
+        let (_orig, new_levels) =
+            handle_command(&loader, &cmd, &ctx, RelocationFlush::None).unwrap();
+
+        assert_eq!(new_levels.l0(), None);
+        assert_eq!(new_levels.l1(), Some(l1_pos));
+        assert_eq!(loader.flush_count(), 0);
+    }
+
+    #[test]
+    fn sharded_relocation_flush_with_nothing_in_l0_writes_no_l0() {
+        // Nothing dirty and no L0 blob: the flush rewrites only the shard
+        // holding the re-pointed key and leaves the cell without an L0 slot
+        // instead of writing an empty blob above the shards.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &[],
+            relocation_updates(LastProcessed::new(5_000), &[(250, 10_250)]),
+        );
+
+        assert!(new_levels.is_sharded());
+        assert_eq!(new_levels.l0(), None, "no blob for an empty L0");
+        assert_eq!(
+            new_levels.shards().get(&shard_key(1)).unwrap().position,
+            positions[0]
+        );
+        let b = new_levels.shards().get(&shard_key(200)).unwrap();
+        assert!(index_entries(&loader, b.position).contains(&(250, 10_250)));
+        // Only the rewritten shard.
+        assert_eq!(loader.flush_count(), 1);
+        assert_eq!(
+            ctx.metrics
+                .l1_shards_total
+                .with_label_values(&[ctx.name()])
+                .get(),
+            1,
+            "one shard blob written"
+        );
+    }
+
+    #[test]
+    fn sharded_relocation_flush_with_nothing_to_do_writes_nothing() {
+        // Nothing dirty, no L0 blob, and every update at or past the
+        // frontier: no blob is written and the levels are unchanged.
+        let ctx = make_ctx(true, 1024 * 1024);
+        let (loader, positions, new_levels) = sharded_relocation_flush(
+            &ctx,
+            &[],
+            relocation_updates(LastProcessed::new(5), &[(10, 10_010)]),
+        );
+
+        assert_eq!(new_levels.l0(), None);
+        assert_eq!(
+            new_levels.shards().get(&shard_key(1)).unwrap().position,
+            positions[0]
+        );
+        assert_eq!(
+            new_levels.shards().get(&shard_key(200)).unwrap().position,
+            positions[1]
+        );
+        assert_eq!(loader.flush_count(), 0);
+    }
+
+    #[test]
     fn auto_sharding_off_writes_single_l1_even_when_huge() {
         let ctx = make_ctx(false, 4096);
         let loader = RecordingLoader::new();
@@ -1337,6 +1423,34 @@ mod tests {
     /// Builds an `IndexTable` from an iterator of `(key, Option<pos>)`.
     /// `None` means tombstone (remove with a placeholder offset). Used to
     /// construct the dirty L0 overlay for re-sharding tests.
+    fn relocation_updates(frontier: LastProcessed, entries: &[(u64, u64)]) -> RelocationUpdates {
+        let mut updates = RelocationUpdates::new(frontier);
+        for (k, pos) in entries {
+            updates.add(
+                Bytes::from(k.to_be_bytes().to_vec()),
+                WalPosition::test_value(*pos),
+            );
+        }
+        updates
+    }
+
+    /// Runs a relocation flush over the two-shard cell A [1, 100], B [200, 300]
+    /// (position == key), with `dirty` as the overlay and `updates` routed by
+    /// the flusher. Returns the loader, the seeded shard positions and the
+    /// resulting levels.
+    fn sharded_relocation_flush(
+        ctx: &KsContext,
+        dirty: &[(u64, Option<u64>)],
+        updates: RelocationUpdates,
+    ) -> (RecordingLoader, Vec<WalPosition>, IndexLevels) {
+        let loader = RecordingLoader::new();
+        let (current_levels, positions) = seed_sharded_cell(&loader, &[(1, 100), (200, 300)]);
+        let cmd = flush_command(ctx.id(), build_dirty(dirty), current_levels);
+        let (_orig, new_levels) =
+            handle_command(&loader, &cmd, ctx, RelocationFlush::Updates(updates)).unwrap();
+        (loader, positions, new_levels)
+    }
+
     fn build_dirty(entries: &[(u64, Option<u64>)]) -> IndexTable {
         let mut t = IndexTable::default();
         for (k, p) in entries {

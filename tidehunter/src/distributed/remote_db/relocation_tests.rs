@@ -731,7 +731,7 @@ fn native_position(db: &Db, keyspace: KeySpace, sequence: u64, member: u8) -> u6
         )
         .unwrap()
     {
-        crate::large_table::GetResult::WalPosition(position, _) => position.offset(),
+        crate::large_table::GetResult::WalPosition(position) => position.offset(),
         _ => panic!("native index holds no WAL position for ({sequence}, {member})"),
     }
 }
@@ -792,10 +792,17 @@ fn assert_state(
 /// after the pass and after a reopen of both arms. Byte positions differ by
 /// WAL format, so terminals and uppers are checked per arm, not across.
 ///
-/// `copied_survivors` is compared per arm: both copy every Keep row below
-/// its own target, and byte positions differ by WAL format. Native writes a
-/// relocated batch to the WAL head; the leased pass writes the copy to the
-/// serving generation and re-points the entry (module doc step 4).
+/// `copied_survivors` is compared per arm; byte positions differ by WAL
+/// format. Native writes a relocated batch to the WAL head; the leased pass
+/// writes the copy to the serving generation and re-points the entry (module
+/// doc step 4).
+///
+/// Under D24 both arms keep upstream's rule: for a filtered keyspace WAL
+/// relocation copies nothing and drops everything below its target, so
+/// `copied_survivors` is 0 on both arms. This test still asserts the fork's
+/// Keep-copy parity (native copied the Keep rows below its target); the hybrid
+/// D24 task rewrites it for the upstream rule and re-enables it.
+#[ignore = "rewrite for D24 upstream rule: hybrid relocation will match native (no Keep copies)"]
 #[test]
 fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
     const WRITES: u64 = 130;

@@ -95,7 +95,7 @@ impl<P: IndexPosition> Fixture<P> {
             .get(context, &key.to_be_bytes(), &self.loader)
             .expect("the cadence loader cannot fail")
         {
-            GetResult::WalPosition(position, _) => Some(position),
+            GetResult::WalPosition(position) => Some(position),
             GetResult::NotFound => None,
             GetResult::Value(..) => unreachable!("replay never fills the value cache"),
         }

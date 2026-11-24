@@ -671,7 +671,7 @@ impl TableInner {
             .table
             .get_checkpoint(context, reduced.as_ref(), cut, self.loader.as_ref())?
         {
-            GetResult::WalPosition(position, _) => Ok(position.is_valid().then_some(position)),
+            GetResult::WalPosition(position) => Ok(position.is_valid().then_some(position)),
             GetResult::NotFound => Ok(None),
             // `require_owner_resident_values` refuses a value cache at open.
             GetResult::Value(..) => Err(LocalDbError::new(
@@ -714,7 +714,7 @@ impl TableInner {
             return Ok(None);
         };
         match result.value {
-            GetResult::WalPosition(position, _) => Ok(Some(IteratorResult {
+            GetResult::WalPosition(position) => Ok(Some(IteratorResult {
                 cell: result.cell,
                 key: result.key,
                 value: position,

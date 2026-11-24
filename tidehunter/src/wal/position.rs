@@ -418,17 +418,18 @@ pub trait IndexPosition:
     /// Keeps the invariant I(cell): `cell.last_processed` is at or below the
     /// version of every overlay entry the cell's blobs do not cover.
     ///
-    /// Native: `first.frontier()`, exactly as before, and `bound` is never
-    /// called. A version-carrying position whose cell receives writes in
-    /// durable-arrival order (a lower version can follow a higher one into the
-    /// same cell) overrides this with `min(first.frontier(), bound())`, so the
-    /// anchor never sits above a write still to be inserted. `bound` must be
-    /// read before the insert, under the row lock; the engine's bound is
-    /// monotone, so a later read could exceed an in-flight lower write.
+    /// Every instantiation takes that minimum. Native passes the tracker's
+    /// externally observed frontier, so a cell a batch anchored above a lower
+    /// op of the same batch is pulled back down (a batch drops its guards at
+    /// commit, before its ops are applied). A version-carrying engine passes
+    /// its contiguous index-applied cut for the same reason: a lower version
+    /// can follow a higher one into the same cell in durable-arrival order.
+    /// `bound` must be read before the insert, under the row lock; both bounds
+    /// are monotone, so a later read could exceed an in-flight lower write.
     #[inline]
     fn anchor_cut(first: Self, bound: impl FnOnce() -> Self::Cut) -> Self::Cut {
-        let _ = bound;
-        first.frontier()
+        let frontier = first.frontier();
+        std::cmp::min(frontier, bound())
     }
 }
 

@@ -3,7 +3,6 @@ use crate::config::Config;
 use crate::container::LargeTableContainer;
 use crate::context::{KsContext, LookupResult, LookupSource, ReadType, WalEntryKind};
 use crate::control::RelocateFiles;
-use crate::db::DbResult;
 use crate::flusher::{FlushKind, IndexFlushCommand, IndexFlusher, RelocationFlush, handle_command};
 use crate::index::index_format::{Direction, IndexFormat, IndexIterCaches};
 use crate::index::index_table::{IndexTable, WriteOrder};
@@ -137,10 +136,6 @@ pub struct LargeTableEntry<P: IndexPosition = WalPosition> {
     // (full_key, value). full_key is the original (non-reduced) WAL key; for
     // non-key-reduction keyspaces it equals the index key.
     value_lru: Option<LruCache<Bytes, (Bytes, Bytes)>>,
-    /// Identity of the cache-fill generation. An in-flight reader holds a
-    /// clone; mutations replace it only while readers still hold that clone.
-    /// This works for unloaded indexes without a second disk lookup.
-    value_cache_generation: Option<Arc<()>>,
     /// Last value added to the shared `loaded_key_bytes` gauge.
     /// Used to compute the delta on the next report so multiple cells
     /// can safely share one gauge via `.add()` instead of `.set()`.
@@ -201,7 +196,6 @@ struct WalkPlan<P: IndexPosition = WalPosition> {
     /// the shard for the advanced `prev_key`; unsharded cells can absorb
     /// the tombstone skip inside `execute_walk` (the plan stays valid).
     is_sharded: bool,
-    cache_refill: Option<CacheRefillToken>,
 }
 
 /// Outcome of one `execute_walk` step. `SkipDeleted` is only returned for
@@ -667,22 +661,12 @@ impl<P: IndexPosition> LargeTable<P> {
         reduced_key: Bytes,
         full_key: Bytes,
         value: Bytes,
-        cache_refill: Option<CacheRefillToken>,
     ) {
-        let Some(cache_refill) = cache_refill else {
-            return;
-        };
-        let (mut row, cell) = self.row(context, &reduced_key);
-        // Do not recreate a cell dropped while the value was being read.
-        let Some(entry) = row.try_entry_mut(&cell) else {
-            return;
-        };
-        // Committed batches may not have reached the overlay yet. Promote
-        // them before validating, just as the normal cache-hit path does.
-        entry.promote_pending();
-        if !entry.accepts_cache_refill(&cache_refill) {
+        if context.ks_config.value_cache_size().is_none() {
             return;
         }
+        let (mut row, cell) = self.row(context, &reduced_key);
+        let entry = self.entry_mut(&mut row, &cell);
         let Some(value_lru) = &mut entry.value_lru else {
             unreachable!()
         };
@@ -732,8 +716,7 @@ impl<P: IndexPosition> LargeTable<P> {
             && let Some(found) = entry.get(k)
         {
             return Ok(context
-                .report_lookup_result(found.is_valid().then_some(found), LookupSource::Cache)
-                .with_cache_refill(entry.cache_refill_token()));
+                .report_lookup_result(found.is_valid().then_some(found), LookupSource::Cache));
         }
         // Build the reader list while holding the mutex — otherwise a concurrent
         // relocation could delete the backing blob before we open it. The
@@ -751,13 +734,10 @@ impl<P: IndexPosition> LargeTable<P> {
         for pos in &level_positions {
             index_readers.push(loader.index_reader(*pos)?);
         }
-        let cache_refill = entry.cache_refill_token();
         // drop row to avoid holding mutex during IO
         drop(row);
 
-        Ok(self
-            .lookup_disk_levels(context, index_readers, k)
-            .with_cache_refill(cache_refill))
+        Ok(self.lookup_disk_levels(context, index_readers, k))
     }
 
     /// Walk the on-disk index levels (readers already opened under the row
@@ -1298,7 +1278,7 @@ impl<P: IndexPosition> LargeTable<P> {
     ) -> LargeTableSnapshot<P::Cut> {
         // Capture the frontier before iterating entries. It bounds the
         // minimum below; the empty-database case replays from it too.
-        let mut replay_from = loader.last_processed();
+        let mut replay_from = loader.snapshot_replay_bound();
         let mut data = Vec::with_capacity(self.table.len());
         for ks_table in self.table.iter() {
             let (ks_data, ks_replay_from) = self.ks_snapshot(ks_table, loader);
@@ -1425,9 +1405,9 @@ impl<P: IndexPosition> LargeTable<P> {
             // Phase 2 (no lock): k-way merge across the snapshot and the
             // on-disk readers. Disk I/O happens here without holding the row
             // mutex, so other cells in the same shard aren't blocked.
-            let walk_result = match &plan {
+            let walk_result = match plan {
                 Some(plan) => Self::execute_walk(
-                    plan,
+                    &plan,
                     &context.ks_config,
                     &context.metrics,
                     prev_key.clone(),
@@ -1440,7 +1420,6 @@ impl<P: IndexPosition> LargeTable<P> {
 
             match walk_result {
                 WalkOutcome::Found(key, val) => {
-                    let cache_refill = plan.as_ref().and_then(|plan| plan.cache_refill.clone());
                     // Phase 3: re-acquire the row lock briefly to consult the
                     // per-entry LRU. Skipped entirely when no LRU is configured.
                     // If the entry was removed between phases, fall back to a
@@ -1452,12 +1431,12 @@ impl<P: IndexPosition> LargeTable<P> {
                     {
                         let mut row = ks_table.lock(mutex_idx, &context.large_table_contention);
                         if let Some(entry) = row.try_entry_mut(&cell) {
-                            Self::lru_or_wal(entry, &key, val).with_cache_refill(cache_refill)
+                            Self::lru_or_wal(entry, &key, val)
                         } else {
-                            GetResult::<P>::WalPosition(val, None)
+                            GetResult::<P>::WalPosition(val)
                         }
                     } else {
-                        GetResult::<P>::WalPosition(val, None)
+                        GetResult::<P>::WalPosition(val)
                     };
                     return Ok(Some(IteratorResult {
                         cell: Some(cell),
@@ -1541,13 +1520,11 @@ impl<P: IndexPosition> LargeTable<P> {
         // the lock-released walk in Phase 2.
         let data = entry.data.clone_shared();
         let is_sharded = entry.levels.is_sharded();
-        let cache_refill = entry.cache_refill_token();
         Ok(Some(WalkPlan {
             data,
             level_positions,
             readers,
             is_sharded,
-            cache_refill,
         }))
     }
 
@@ -1623,7 +1600,7 @@ impl<P: IndexPosition> LargeTable<P> {
         {
             GetResult::<P>::Value(full_key.clone(), value.clone())
         } else {
-            GetResult::<P>::WalPosition(pos, None)
+            GetResult::<P>::WalPosition(pos)
         }
     }
 
@@ -1660,7 +1637,7 @@ impl<P: IndexPosition> LargeTable<P> {
                     let get_result = if let Some(entry) = row.try_entry_mut(cell) {
                         Self::lru_or_wal(entry, &key, val)
                     } else {
-                        GetResult::<P>::WalPosition(val, None)
+                        GetResult::<P>::WalPosition(val)
                     };
                     return Ok(Some((key, get_result)));
                 }
@@ -1737,7 +1714,7 @@ impl<P: IndexPosition> LargeTable<P> {
     /// (no user handle exists), so only internal machinery can touch it
     /// concurrently; any pending async flush per row is waited out before
     /// clearing, mirroring `drop_cells_in_range`.
-    pub(crate) fn drop_all_cells(&self, context: &KsContext) -> DbResult<()> {
+    pub(crate) fn drop_all_cells(&self, context: &KsContext) {
         let ks_table = self.ks_table(&context.ks_config);
         for mutex in ks_table.rows.mutexes() {
             loop {
@@ -1759,7 +1736,6 @@ impl<P: IndexPosition> LargeTable<P> {
         // but a destroyed keyspace is never iterated again — release the
         // memory.
         ks_table.cell_index.write().clear();
-        Ok(())
     }
 
     pub fn report_entries_state(&self) {
@@ -2101,6 +2077,19 @@ pub trait Loader {
     /// Returns the current tail frontier. Native: the WAL writer position.
     fn current(&self) -> <Self::Position as IndexPosition>::Cut;
 
+    /// The cut a snapshot may cap its `replay_from` at: a frontier read
+    /// before the walk that never falls during this instance's lifetime and
+    /// never sits below a write the walk cannot see (see [`LargeTable::snapshot`]).
+    ///
+    /// Native: the tracker's `last_processed`, which only grows. A versioned
+    /// engine whose `last_processed` is additionally capped by held reader
+    /// latches (which can sit below the stored cut) overrides this with its
+    /// contiguous index-applied prefix: lowering the cut would make the
+    /// stored control region regress.
+    fn snapshot_replay_bound(&self) -> <Self::Position as IndexPosition>::Cut {
+        self.last_processed()
+    }
+
     /// Returns the control-region frontier (the relocation floor).
     fn min_position(&self) -> <Self::Position as IndexPosition>::Cut;
 
@@ -2124,10 +2113,11 @@ pub trait Loader {
     /// It keeps the invariant I(cell): `cell.last_processed` is at or below the
     /// version of every overlay entry the cell's blobs do not cover.
     ///
-    /// Provided method, never `unreachable!()`: native positions never ask for
-    /// it (their `anchor_cut` ignores the bound) and test doubles inherit the
-    /// default `last_processed`. A version-carrying loader returns a plain
-    /// cut read (no lock) of its contiguous index-applied prefix.
+    /// Provided method, never `unreachable!()`: test doubles inherit the
+    /// default `last_processed`, native `Db` reads its tracker's frontier (the
+    /// same value `last_processed` returns), and a version-carrying loader
+    /// returns a plain cut read (no lock) of its contiguous index-applied
+    /// prefix.
     fn insert_anchor_bound(&self) -> <Self::Position as IndexPosition>::Cut {
         self.last_processed()
     }
@@ -2188,7 +2178,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
         bloom_filter: Option<BloomFilter>,
     ) -> Self {
         let value_lru = context.ks_config.value_cache_size().map(LruCache::new);
-        let value_cache_generation = value_lru.as_ref().map(|_| Arc::new(()));
         Self {
             context,
             cell,
@@ -2203,7 +2192,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             last_processed: P::Cut::NONE,
             flushed_at: 0,
             value_lru,
-            value_cache_generation,
             last_reported_key_bytes: 0,
             last_reported_flat_bytes: 0,
             last_reported_dirty_count: 0,
@@ -2239,29 +2227,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             entry_data.last_processed.byte_position(),
         );
         entry
-    }
-
-    fn cache_refill_token(&self) -> Option<CacheRefillToken> {
-        self.value_cache_generation
-            .as_ref()
-            .map(|generation| CacheRefillToken(generation.clone()))
-    }
-
-    fn accepts_cache_refill(&self, token: &CacheRefillToken) -> bool {
-        self.value_cache_generation
-            .as_ref()
-            .is_some_and(|generation| Arc::ptr_eq(generation, &token.0))
-    }
-
-    fn invalidate_cache_refills(&mut self) {
-        if let Some(generation) = &mut self.value_cache_generation
-            && Arc::strong_count(generation) > 1
-        {
-            // Every token is cloned while this same row lock is held. If no
-            // reader holds a token, replacing the identity is unnecessary.
-            // The old Arc stays alive with readers, avoiding reuse/ABA.
-            *generation = Arc::new(());
-        }
     }
 
     /// Advances the durable frontier, keeping the byte cadence (`flushed_at`)
@@ -2352,7 +2317,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
         flushed_at: impl FnOnce() -> u64,
         anchor_bound: impl FnOnce() -> P::Cut,
     ) {
-        self.invalidate_cache_refills();
         self.mark_dirty(v, flushed_at, anchor_bound);
         self.insert_bloom_filter(&k);
         if self.data.make_mut().insert(k.clone(), v) == WriteOrder::Stale {
@@ -2379,7 +2343,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
         flushed_at: impl FnOnce() -> u64,
         anchor_bound: impl FnOnce() -> P::Cut,
     ) {
-        self.invalidate_cache_refills();
         self.mark_dirty(v, flushed_at, anchor_bound);
         if self.data.make_mut().remove(k.clone(), v) == WriteOrder::Stale {
             // See `insert`.
@@ -2500,28 +2463,39 @@ impl<P: IndexPosition> LargeTableEntry<P> {
                 let (full_key, lru_value) =
                     split_lru_update(&committed_change.key, committed_change.lru_update);
                 // The pending (transaction) table has no loader to ask, so the
-                // write's own frontier is the cadence value: for the native
-                // position this is exactly what the live insert stores. Only
-                // native `Db::apply_pending_batch` fills the pending table; a
-                // version-carrying engine never calls it (it commits through
-                // `LargeTable::insert`/`remove` with its loader), so this
-                // fallback is not reachable for a cut with no byte meaning.
+                // cadence value is the write's own frontier: for the native
+                // position this is exactly what the live insert stores. The
+                // anchor bound is the tracker's externally observed frontier,
+                // read here under the row lock: a batch drops its guards at
+                // commit, so the frontier can pass these ops before they are
+                // applied, and anchoring at the write alone would sit the cell
+                // above a lower op of the same batch. A version-carrying
+                // engine never fills the pending table (it commits through
+                // `LargeTable::insert`/`remove` with its loader), and its cut
+                // has no byte position, so the bound falls back to the write's
+                // own frontier there.
                 let frontier = committed_change.value.frontier();
+                let bound =
+                    P::Cut::from_byte_position(self.context.last_processed_wal_position().as_u64())
+                        .unwrap_or(frontier);
                 self.insert(
                     committed_change.key,
                     committed_change.value,
                     full_key,
                     lru_value.as_ref(),
                     || frontier.byte_position(),
-                    || frontier,
+                    || bound,
                 );
             } else {
                 let frontier = committed_change.value.frontier();
+                let bound =
+                    P::Cut::from_byte_position(self.context.last_processed_wal_position().as_u64())
+                        .unwrap_or(frontier);
                 self.remove(
                     committed_change.key,
                     committed_change.value,
                     || frontier.byte_position(),
-                    || frontier,
+                    || bound,
                 );
             }
         }
@@ -3159,7 +3133,6 @@ impl<P: IndexPosition> LargeTableEntry<P> {
 
     /// Clears this entry, setting its state to Empty and dropping all data.
     pub(crate) fn clear(&mut self) {
-        self.invalidate_cache_refills();
         self.state = LargeTableEntryState::Empty;
         self.levels = IndexLevels::new();
         self.data = Default::default();
@@ -3307,29 +3280,16 @@ impl LargeTableEntryState {
     }
 }
 
-/// A cache miss's cell generation, captured before releasing the row lock.
-/// Delayed I/O may return an older value to its caller, but can only populate
-/// the shared cache if this generation still belongs to the current cell.
-#[derive(Debug, Clone)]
-pub struct CacheRefillToken(Arc<()>);
-
 #[derive(Debug)]
 pub enum GetResult<P = WalPosition> {
     /// LRU hit: `(full_key, value)`. `full_key` is the original (non-reduced) WAL
     /// key. For non-key-reduction keyspaces, `full_key == index_key`.
     Value(Bytes, Bytes),
-    WalPosition(P, Option<CacheRefillToken>),
+    WalPosition(P),
     NotFound,
 }
 
 impl<P: Copy> GetResult<P> {
-    fn with_cache_refill(self, token: Option<CacheRefillToken>) -> Self {
-        match self {
-            Self::WalPosition(position, _) => Self::WalPosition(position, token),
-            result => result,
-        }
-    }
-
     pub fn is_found(&self) -> bool {
         match self {
             GetResult::<P>::Value(..) => true,
@@ -3344,7 +3304,7 @@ impl<P: Copy> GetResult<P> {
         P: std::fmt::Debug,
     {
         match self {
-            GetResult::<P>::WalPosition(p, _) => p,
+            GetResult::<P>::WalPosition(p) => p,
             other => panic!("expected WalPosition, got {other:?}"),
         }
     }
@@ -3501,7 +3461,6 @@ pub(crate) struct LargeTableFailPoints(pub(crate) parking_lot::RwLock<LargeTable
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct LargeTableFailPointsInner {
-    pub fp_before_value_cache_refill: crate::failpoints::FailPoint,
     pub fp_insert_before_lock: crate::failpoints::FailPoint,
     pub fp_remove_before_lock: crate::failpoints::FailPoint,
     pub fp_lookup_after_lock_drop: crate::failpoints::FailPoint,
@@ -3526,7 +3485,6 @@ pub(crate) struct LargeTableFailPointsInner {
 
 #[cfg(not(test))]
 impl LargeTableFailPoints {
-    pub fn fp_before_value_cache_refill(&self) {}
     pub fn fp_insert_before_lock(&self) {}
     pub fn fp_remove_before_lock(&self) {}
 
@@ -3546,9 +3504,6 @@ impl LargeTableFailPoints {
 
 #[cfg(test)]
 impl LargeTableFailPoints {
-    pub fn fp_before_value_cache_refill(&self) {
-        self.0.read().fp_before_value_cache_refill.fp();
-    }
     pub fn fp_insert_before_lock(&self) {
         self.0.read().fp_insert_before_lock.fp();
     }

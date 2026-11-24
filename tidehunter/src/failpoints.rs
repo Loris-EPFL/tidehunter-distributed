@@ -20,6 +20,7 @@ impl Default for FailPoint {
 }
 
 impl FailPoint {
+    #[cfg(feature = "experimental-distributed")]
     pub fn from_fn(fp: impl Fn() + Send + Sync + 'static) -> Self {
         Self { fp: Box::new(fp) }
     }

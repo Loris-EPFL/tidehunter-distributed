@@ -2,7 +2,7 @@
 //! index (relocation / compaction of a versioned engine), not a write.
 
 use super::*;
-use crate::db::DbError;
+use crate::db::{DbError, DbResult};
 use crate::failpoints::FailPoint;
 use crate::flusher::{FlushKind, FlusherCommand};
 use crate::index::levels::IndexLevels;
@@ -477,7 +477,7 @@ fn repoint_during_an_in_flight_flush_waits_for_it_and_survives_its_completion() 
         Some(100),
         "the flush wrote the address it snapshotted"
     );
-    let GetResult::WalPosition(position, _) = flight
+    let GetResult::WalPosition(position) = flight
         .table
         .get(flight.context(), &key(1), &flight.loader)
         .expect("the loader cannot fail")

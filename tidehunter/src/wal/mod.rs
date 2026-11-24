@@ -65,7 +65,10 @@ pub struct Wal {
     #[cfg(feature = "experimental-distributed")]
     external_preparation: Arc<external::ExternalPreparation>,
     /// Files below this id hold only finished writes and are synced; see
-    /// `sync_files_through`.
+    /// `sync_files_through`. Read only when the distributed feature is on: the
+    /// coordinator's index snapshot persists the index WAL files it names; a
+    /// single-node `Db` syncs each WAL's current file instead.
+    #[cfg_attr(not(feature = "experimental-distributed"), allow(dead_code))]
     synced_below: AtomicU64,
 }
 
@@ -88,8 +91,6 @@ pub struct WalIterator {
     wal: Arc<Wal>,
     maps: WalMaps,
     map: Map,
-    /// Bytes covered by EOF when the current map was made, before its extension.
-    map_existing_bytes: usize,
     position: u64,
     skip_crc: bool,
     /// When false, the iterator does not populate `maps` (each fragment
@@ -940,14 +941,13 @@ impl Wal {
         self.maps.load().get(id).cloned()
     }
 
-    /// Resize to fit the map, returning EOF before this extension.
-    fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<u64> {
+    /// Resize to fit the map.
+    fn extend_to_map_id(layout: &WalLayout, file: &File, map_id: MapId) -> io::Result<()> {
         let end = Self::map_end_in_file(layout, map_id);
-        let len = file.metadata()?.len();
-        if len < end {
+        if file.metadata()?.len() < end {
             file.set_len(end)?;
         }
-        Ok(len)
+        Ok(())
     }
 
     /// Whether `file` is long enough to hold all of fragment `map_id`.
@@ -1034,6 +1034,11 @@ impl Wal {
     /// Every write below `complete_below` has finished, so files below it are
     /// never written again. A later call skips the files this call syncs below
     /// that id; the others it syncs again.
+    ///
+    /// Native `Db` syncs each WAL's current file (`fsync`); this is the
+    /// coordinator's index-snapshot path, hence the dead-code allowance in a
+    /// build without the distributed feature.
+    #[cfg_attr(not(feature = "experimental-distributed"), allow(dead_code))]
     pub(crate) fn sync_files_through(
         &self,
         last: position::WalFileId,
@@ -1241,7 +1246,7 @@ impl WalIterator {
         let mut maps = WalMaps::default();
         let (map_id, _) = wal.layout.locate(position);
         let files = wal.files.load();
-        let (map, map_existing_bytes) = Self::make_map(
+        let map = Self::make_map(
             &wal.layout,
             map_id,
             &files,
@@ -1256,7 +1261,6 @@ impl WalIterator {
             wal,
             position,
             map,
-            map_existing_bytes,
             skip_crc: false,
             for_writer,
         })
@@ -1288,7 +1292,7 @@ impl WalIterator {
         let (map_id, offset) = self.wal.layout.locate(self.position);
         if self.map.id != map_id {
             let files = self.wal.files.load();
-            let Some((map, map_existing_bytes)) = Self::make_map(
+            let Some(map) = Self::make_map(
                 &self.wal.layout,
                 map_id,
                 &files,
@@ -1301,7 +1305,6 @@ impl WalIterator {
                 return Err(WalError::EndOfWal);
             };
             self.map = map;
-            self.map_existing_bytes = map_existing_bytes;
         }
         if self.skip_crc {
             Ok(CrcFrame::read_unchecked_from_bytes(
@@ -1328,7 +1331,7 @@ impl WalIterator {
         wal_mmap_bytes: MetricIntGauge,
         for_writer: bool,
         retained: bool,
-    ) -> Result<Option<(Map, usize)>, WalError> {
+    ) -> Result<Option<Map>, WalError> {
         // Check if the file still exists before trying to extend it.
         // GC may have removed the file asynchronously (via the mapper thread)
         // between iterator steps.
@@ -1337,23 +1340,19 @@ impl WalIterator {
         };
         if retained {
             return WalMaps::create_retained_map(file, layout, map_id, wal_mmap_bytes)
-                .map(|map| {
-                    map.map(|map| {
-                        let existing_bytes = map.data.len();
-                        (map, existing_bytes)
-                    })
-                })
                 .map_err(WalError::from);
         }
-        let old_len = Wal::extend_to_map_id(layout, file, map_id)?;
-        let map = if for_writer {
-            maps.map(file, layout, map_id, wal_mmap_bytes).clone()
+        Wal::extend_to_map_id(layout, file, map_id)?;
+        if for_writer {
+            Ok(Some(maps.map(file, layout, map_id, wal_mmap_bytes).clone()))
         } else {
-            WalMaps::create_map(file, layout, map_id, wal_mmap_bytes)
-        };
-        let start = layout.offset_in_wal_file(layout.map_range(map_id).start);
-        let existing_bytes = old_len.saturating_sub(start).min(layout.frag_size) as usize;
-        Ok(Some((map, existing_bytes)))
+            Ok(Some(WalMaps::create_map(
+                file,
+                layout,
+                map_id,
+                wal_mmap_bytes,
+            )))
+        }
     }
 
     /// Restores the read window over historical fragments before this
@@ -1514,24 +1513,26 @@ impl WalIterator {
     /// doesn't exist; the writer that takes over from this iterator
     /// will create the file lazily via the mapper thread when its first
     /// write lands there.
-    fn clear_fragment_from_position(&self, position: u64) -> usize {
+    /// Zeroes the fragment suffix from `position` to the fragment end.
+    ///
+    /// A writer never resumes above the replay position it was created at, so
+    /// everything after it in the fragment is either a torn frame or space the
+    /// writer has not reached; clearing the whole suffix leaves zeros either
+    /// way and cannot resurrect a stale frame from an earlier generation.
+    fn clear_fragment_from_position(&self, position: u64) {
         let (map_id, offset) = self.wal.layout.locate(position);
         if map_id != self.map.id {
-            return 0;
+            return;
         }
 
-        // Only the suffix that existed at map time can contain stale frames.
-        // open_file may already have rounded EOF up; clearing those extra zero
-        // bytes is harmless. Never dirty the map's new sparse extension: after
-        // a crash before the first write, either the old length survives or the
-        // extension reads as zero, so replay still stops at the first zero header.
-        let bytes_to_zero = self.map_existing_bytes.saturating_sub(offset as usize);
+        let map_range = self.wal.layout.map_range(map_id);
+        let fragment_size = (map_range.end - map_range.start) as usize;
+        let bytes_to_zero = fragment_size - offset as usize;
 
         if bytes_to_zero > 0 {
             let buf = write_buf_at(&self.map.data, offset as usize, bytes_to_zero);
             buf.fill(0);
         }
-        bytes_to_zero
     }
 
     pub fn wal(&self) -> &Wal {
@@ -1656,19 +1657,27 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn writer_initialization_clears_only_bytes_before_extension() {
+    fn writer_initialization_clears_the_whole_fragment_suffix() {
         for old_len in [0, 512, 2048] {
             let dir = tempdir::TempDir::new("wal-zero-extension").unwrap();
             let layout = index_layout(4, 16 * 4096);
             let wal = Wal::open(dir.path(), layout, Metrics::new()).unwrap();
             wal.files.load().current_file().set_len(old_len).unwrap();
             let iterator = wal.wal_iterator_for_writer(0).unwrap();
-            assert_eq!(
-                iterator.clear_fragment_from_position(0),
-                usize::try_from(old_len.min(wal.layout.frag_size)).unwrap(),
-                "newly extended bytes must not receive zero-fill writes",
+            iterator.clear_fragment_from_position(0);
+            assert!(
+                iterator.map.data.iter().all(|byte| *byte == 0),
+                "the writer's fragment starts zeroed, extension included"
             );
-            assert!(iterator.map.data.iter().all(|byte| *byte == 0));
+            // A later start position clears only its own suffix up to the
+            // fragment end.
+            let position = wal.layout.frag_size / 2;
+            iterator.clear_fragment_from_position(position);
+            assert!(
+                iterator.map.data[position as usize..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
         }
     }
 
@@ -1740,7 +1749,8 @@ mod tests {
                 wal.wal_iterator_for_writer(position).unwrap()
             };
             assert_eq!(iterator.map.id, MapId(1));
-            assert_eq!(iterator.clear_fragment_from_position(position), 1024);
+            iterator.clear_fragment_from_position(position);
+            assert!(iterator.map.data.iter().all(|byte| *byte == 0));
             let writer = iterator.into_writer(None);
             writer
                 .write(&PreparedWalWrite::new(&vec![3; 8]))
@@ -1789,8 +1799,9 @@ mod tests {
             iterator.next().is_err(),
             "the extended WAL contains no frame"
         );
-        // These bytes existed before reopen; retain the old recovery clear.
-        assert_eq!(iterator.clear_fragment_from_position(0), 1024);
+        // Recovery clears the fragment suffix from the writer's start.
+        iterator.clear_fragment_from_position(0);
+        assert!(iterator.map.data.iter().all(|byte| *byte == 0));
         let writer = iterator.into_writer(None);
         let position = writer
             .write(&PreparedWalWrite::new(&vec![5; 100]))

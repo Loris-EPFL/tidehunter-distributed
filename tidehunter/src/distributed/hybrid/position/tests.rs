@@ -480,7 +480,7 @@ fn committed_cut_is_the_maximum_unlike_the_native_plain_store() {
 }
 
 #[test]
-fn anchor_cut_is_bounded_by_the_loader_unlike_the_native_first_frontier() {
+fn anchor_cut_is_bounded_by_the_loader_for_every_position_type() {
     let first = VersionPosition::batch_start(batch(3, 30), address(1, 2, 100, 64));
     assert_eq!(
         <VersionPosition as IndexPosition>::anchor_cut(first, || batch(3, 20)),
@@ -492,13 +492,22 @@ fn anchor_cut_is_bounded_by_the_loader_unlike_the_native_first_frontier() {
         batch(3, 30),
         "a bound above the first write leaves its own frontier"
     );
-    // Native: the first write's frontier, and the bound is never evaluated.
+    // Native takes the same minimum: a cell is never anchored above a write it
+    // applied, so the snapshot's `replay_from` stays at or below that write.
     let position = crate::wal::position::WalPosition::new(30, 10);
     assert_eq!(
         <crate::wal::position::WalPosition as IndexPosition>::anchor_cut(position, || {
-            unreachable!("the native anchor never reads the bound")
+            crate::wal::position::LastProcessed::new(20)
         }),
-        crate::wal::position::LastProcessed::new(30)
+        crate::wal::position::LastProcessed::new(20),
+        "a tracker frontier below the first write lowers the native anchor"
+    );
+    assert_eq!(
+        <crate::wal::position::WalPosition as IndexPosition>::anchor_cut(position, || {
+            crate::wal::position::LastProcessed::new(40)
+        }),
+        crate::wal::position::LastProcessed::new(30),
+        "a tracker frontier above the first write leaves its own frontier"
     );
 }
 
