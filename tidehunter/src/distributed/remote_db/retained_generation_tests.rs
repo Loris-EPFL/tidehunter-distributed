@@ -150,6 +150,12 @@ pub(super) fn key(sequence: u64) -> Vec<u8> {
 }
 
 /// Writes the data set and certifies it: every later unsynced byte is a copy.
+///
+/// No Stop is written here. This generation is sealed by the close, and a
+/// sealed stream that lies entirely below the Stop of the serving generation
+/// takes its clean tail (D23); a Stop inside its own data would cut it at a
+/// record and lose the round-up to its last file end. The Stop belongs to the
+/// serving generation ([`write_range`]).
 pub(super) fn fill(db: &Arc<Db>) -> KeySpace {
     let ks = db.ks("a");
     for sequence in 0..WRITES {
@@ -157,7 +163,6 @@ pub(super) fn fill(db: &Arc<Db>) -> KeySpace {
         batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
         batch.commit().expect("write");
     }
-    stop_marker(db);
     db.remote_for_test()
         .write_core()
         .flush_durable()
@@ -230,8 +235,9 @@ pub(super) fn write_range(db: &Arc<Db>, sequences: Range<u64>) {
         batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
         batch.commit().expect("write");
     }
-    // Each extension ends with its own Stop, so a later pass still has a target
-    // above the adopted start.
+    // Each extension ends with its own Stop in the serving generation: the
+    // sealed generations below it keep their clean tail, and a later pass
+    // still has a target above the adopted start.
     stop_marker(db);
 }
 
@@ -1040,6 +1046,9 @@ fn an_overwrite_during_a_durable_relocation_copy_survives_reopen() {
     fill(&db);
     db.wait_for_background_threads_to_finish().unwrap();
     let db = open(&fixture);
+    // The serving generation's Stop gives the pass a target, so it copies the
+    // sealed generation below its clean tail and reaches the pause hook below.
+    stop_marker(&db);
     let (entered, waiting) = std::sync::mpsc::sync_channel(1);
     let (resume, gate) = std::sync::mpsc::sync_channel(1);
     db.remote_for_test()
@@ -1409,6 +1418,11 @@ fn a_torn_same_fragment_tail_cannot_resurrect_after_generation_trim() {
         db.get(ks, &other).unwrap().is_none(),
         "no key of the torn two-operation batch is visible"
     );
+    // The Stop belongs to the serving generation, above the crashed stream:
+    // the sealed stream then ends at its clean tail (the adopted end of the
+    // scan) and rounds up to its last file end, which is what lets the trim
+    // reclaim the file that holds the torn frame.
+    stop_marker(&db);
     store(&db, "post-crash store", &[generation]);
     for _ in 0..4 {
         pass(&db);
