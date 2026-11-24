@@ -300,7 +300,9 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Leased Distributed needs ~73 minutes alone; 90 hit the wall under
+    # contention with every test passing.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       max-parallel: 3
