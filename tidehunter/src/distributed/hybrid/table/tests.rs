@@ -1280,3 +1280,42 @@ fn a_reopened_cell_loads_its_flushed_entries_through_the_loader() {
     );
     drop(latch);
 }
+
+/// D30: native's relocation cutoff (`retain_above_position`) leaves no entry
+/// for a key whose live positions all sit below it, so a read at any cut
+/// resolves the key absent. A vector that still held the older version would
+/// answer a cut between the two versions instead. The tombstone the drop
+/// installs still shadows a deeper level and does not hide a later write.
+#[test]
+fn a_dropped_key_resolves_absent_at_every_cut() {
+    let fixture = Fixture::new("hybrid-table-drop-whole-key");
+    fixture.publish(RecordKind::Put, 1, 2, 100);
+    fixture.publish(RecordKind::Put, 1, 4, 300);
+    fixture.table.advance_applied(version(5));
+    let ks = fixture.ks();
+    let cell = fixture.table.shape().ks(ks).cell_id(&[1; 4]);
+    assert_eq!(
+        fixture.get(1, version(3)).map(|found| found.address.offset),
+        Some(member_offset(100)),
+        "premise: a cut below the latest version resolves the older one",
+    );
+    fixture
+        .table
+        .relocation_apply(ks, &cell, None, &[(0, 1, 1000)], true)
+        .expect("drop every entry of the key below the target");
+    for cut in [version(3), version(5), version(9)] {
+        assert!(
+            fixture.get(1, cut).is_none(),
+            "cut {cut:?}: a dropped key has no entry at any cut",
+        );
+    }
+    fixture.publish(RecordKind::Put, 1, 10, 1000);
+    fixture.table.advance_applied(version(11));
+    assert_eq!(
+        fixture
+            .get(1, version(11))
+            .map(|found| found.address.offset),
+        Some(member_offset(1000)),
+        "the drop tombstone does not hide a later write",
+    );
+}

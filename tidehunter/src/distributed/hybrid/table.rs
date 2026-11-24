@@ -825,8 +825,10 @@ impl TableInner {
     ///   an `insert` (which compares equal on the logical identity and would be
     ///   dropped as stale).
     /// * Drop: with `drop_removed`, every live entry not listed and below its
-    ///   target becomes a tombstone at its own position: dropping it would
-    ///   expose an older level.
+    ///   target leaves the index at every read cut, as native's cutoff
+    ///   `retain_above_position` does. The key's other versions below its
+    ///   target go with it, and one tombstone at the dropped live position
+    ///   keeps a deeper level from resurfacing the key.
     ///
     /// A stale expectation is skipped, never forced. The cell is only marked for
     /// flush when something changed; the next covering store persists it.
@@ -1017,18 +1019,35 @@ impl TableInner {
                     }
                 }
                 if drop_removed {
-                    let doomed: Vec<Bytes> = index
+                    // Native's relocation cutoff retains only entries at or
+                    // above it (`IndexTable::retain_above_position`), so a key
+                    // whose live positions all sit below the cutoff leaves no
+                    // entry behind at any read cut. The hybrid keeps one
+                    // tombstone per dropped key so a deeper level cannot
+                    // resurface it, and drops the key's older versions: leaving
+                    // them would let a read cut below the latest version still
+                    // resolve one, a property native does not have. They cannot
+                    // be removed one at a time (`apply_update` sees only the
+                    // latest), so the key is removed and its tombstone
+                    // re-inserted at the dropped live position.
+                    let doomed: Vec<(Bytes, VersionPosition)> = index
                         .iter()
                         .filter(|(key, position)| {
                             !listed.contains(key.as_ref()) && below_target(*position)
                         })
-                        .map(|(key, _)| key)
                         .collect();
-                    for key in doomed {
-                        index.apply_update(&key, |tagged| {
-                            *tagged = VersionPosition::with_kind(*tagged, IndexEntryKind::Removed);
-                            changed = true;
+                    if !doomed.is_empty() {
+                        let dropped: HashSet<&[u8]> =
+                            doomed.iter().map(|(key, _)| key.as_ref()).collect();
+                        index.compact_with(|keys| {
+                            keys.filter(|key| !dropped.contains(key.as_ref()))
+                                .cloned()
+                                .collect()
                         });
+                        for (key, position) in doomed {
+                            index.remove(key, position);
+                        }
+                        changed = true;
                     }
                 }
                 Ok((shadowed, changed))
