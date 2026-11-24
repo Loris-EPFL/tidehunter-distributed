@@ -372,6 +372,80 @@ fn data_break_settles_owner_adopted_flights_without_their_cqes() {
     }
 }
 
+/// The episode budget bounds every step, not only the reconnect: a spent
+/// deadline refuses a probe, a declaration and a queue open, and a capped
+/// exchange restores the session timeout it borrowed.
+#[test]
+fn resume_budget_bounds_every_step_and_is_restored() {
+    use std::time::Duration;
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let session_timeout = client.timeout;
+    let connect_timeout = client
+        .live_config
+        .as_ref()
+        .expect("a configured writer")
+        .connect_timeout_ms;
+    let spent = Instant::now() - Duration::from_millis(1);
+    // A spent deadline refuses before the wire, and restores what it touched.
+    let error = client
+        .remaining_resume(spent)
+        .expect_err("a spent budget refuses the next step");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut,
+        "a spent budget is a typed timeout"
+    );
+    assert_eq!(
+        error.to_string(),
+        "live write resume budget expired",
+        "the refusal names the budget"
+    );
+    assert!(
+        client
+            .within_resume_budget(spent, |client| client.progress_session())
+            .is_err(),
+        "a spent budget never reaches an exchange"
+    );
+    assert_eq!(client.timeout, session_timeout, "the timeout is restored");
+    let leased = client
+        .live_leased
+        .current
+        .as_ref()
+        .map(|extent| extent.lease.clone());
+    assert!(
+        leased.is_none(),
+        "no extent exists before a lease, so the open guard is the only step"
+    );
+    // A live deadline caps the exchange and restores the session timeout.
+    let budget = Instant::now() + Duration::from_millis(100);
+    let capped = client
+        .within_resume_budget(budget, |client| Ok(client.timeout))
+        .expect("a live budget admits the step");
+    assert!(
+        capped <= Duration::from_millis(100),
+        "the exchange borrows at most the remaining budget, saw {capped:?}"
+    );
+    assert_eq!(client.timeout, session_timeout, "the timeout is restored");
+    let wide = Instant::now() + Duration::from_secs(60);
+    let unchanged = client
+        .within_resume_budget(wide, |client| Ok(client.timeout))
+        .expect("a wide budget admits the step");
+    assert_eq!(
+        unchanged, session_timeout,
+        "a budget wider than the session timeout changes nothing"
+    );
+    assert_eq!(
+        client
+            .live_config
+            .as_ref()
+            .expect("a configured writer")
+            .connect_timeout_ms,
+        connect_timeout,
+        "no open ran, so the connect timeout is untouched"
+    );
+}
+
 /// A different owner incarnation proves the in-memory adoption prefix is gone,
 /// so the resume refuses and the database fail-stops.
 #[test]
