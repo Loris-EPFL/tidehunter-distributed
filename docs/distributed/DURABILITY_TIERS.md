@@ -84,6 +84,16 @@ Neither tier provides cross-batch transactions or failover.
 
 Write resume (W1). A transient transport break on the leased write path is not a database failure. The coordinator keeps the frame bytes that it submitted and the owner did not adopt. The bound is two write windows, with a hard cap of 64 MiB for each owner worker. The coordinator reconnects the control session on the same authenticated route. It asks the owner how far each open extent is adopted. It rewrites only the missing frames in ascending offset order. Then it declares adoption again. It refuses in three cases: the owner reports a different incarnation, the lease has lapsed, or the owner is not recovery-clean. In each case the in-memory adoption prefix no longer describes the file. One budget bounds the whole episode: two of the write path's own I/O deadlines, capped by the coordinator lease's deadline. Every probe, declaration, queue open and rewritten frame runs inside it. The code rechecks the lease and the budget before the resume reports success. A deadline is a probe, not a verdict. The resume first keeps the live queue and grants the outstanding work one more window. It escalates to detaching the queue and rewriting only when that window passes with no completion at all. A failed namespace flush is classified by its errno. `EIO`/`ENOSPC`/`EFBIG`/`EINVAL` fail the database on the first report. A lost controller resumes like a lost write. A detached queue that the database's reaper cannot accept (capacity or stopped) is a fail-stop, not a break. The queue is parked for the shutdown drain instead of being dropped on the worker thread. The retained budget is admission backpressure. A submission above it is deferred, never queued. Counters: `resume_attempts`, `resume_rewrites`, `resume_frames`, `resume_refused`. A database that fail-stops with `owner <p> restarted` or `coordinator lease lapsed on owner partition <p>` needs a reopen. A database that fail-stops with `live_resume` twice in a row needs the link checked.
 
+## Runbook: permanent loss of one owner disk (RF1)
+
+Permanent loss of one owner disk under RF1 is equivalent to the loss of the disk of a single Tidehunter database. RF1 has one durable owner and no failover. No other owner holds a copy of the data on the lost disk. Do these steps:
+
+1. Stop the database.
+2. Restore the validator from a Sui snapshot.
+3. Reopen the database.
+
+Partial rebuild of one owner is not supported. Do not try to rebuild only the lost owner.
+
 ## Counters (`Frontier::stats`)
 
 Lag between appended and synced is unbounded by design under the native cadence. Monitor it. The lag counters are `lag_bytes`, `lag_batches`, `lag_age` now, and `peak_lag_*` at the start of any fsync.
