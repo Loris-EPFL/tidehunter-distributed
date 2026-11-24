@@ -19,6 +19,7 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::sync::Barrier;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "model_check_concurrent.rs"]
 mod concurrent_model;
@@ -845,13 +846,18 @@ fn child(directory: &Path, stage: &str) -> Output {
     }
 }
 
-/// Root of the retained write-model crash artifacts. The first case of a test
-/// process removes the root, so repeated failing runs cannot accumulate
-/// artifacts while the artifacts of the current run stay readable.
+/// Root of the retained write-model crash artifacts for this process. A unique
+/// path per process keeps concurrent test processes from deleting each other's
+/// trees; every failing case keeps its directory and the eprintln names it.
 fn artifacts_root() -> &'static std::path::Path {
     static ROOT: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
-        let root = std::env::temp_dir().join("tidehunter-write-model-artifacts");
-        let _ = fs::remove_dir_all(&root);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "tidehunter-write-model-artifacts-{}-{nanos}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("create the write-model artifact root");
         root
     });

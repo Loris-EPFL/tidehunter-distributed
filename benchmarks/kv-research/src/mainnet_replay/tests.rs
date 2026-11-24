@@ -2,9 +2,9 @@ use super::*;
 use crate::mainnet_trace::{OBJECTS, SCOPE};
 use tidehunter::minibytes::Bytes;
 
-/// Anti-hang cap; the run's deadline and recorded `timed_out` status are the signals (TST-9).
-const REPLAY_CAP: Duration = Duration::from_secs(120);
-
+/// Fixture slack over deadline+grace; anti-hang cap for the detached cleanup (TST-9).
+const SHUTDOWN_SLACK_SECS: u64 = 5;
+const CLEANUP_CAP: Duration = Duration::from_secs(120);
 fn trace() -> Trace {
     Trace::load(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -473,6 +473,9 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     cfg.limits.deadline_seconds = 2;
     cfg.limits.shutdown_grace_seconds = 1;
     let cfg_request_timeout_ms = cfg.execution.request_timeout_ms;
+    let run_bound = Duration::from_secs(
+        cfg.limits.deadline_seconds + cfg.limits.shutdown_grace_seconds + SHUTDOWN_SLACK_SECS,
+    );
     let trace = cfg.validate().unwrap();
     let prepared = Arc::new(prepare(&trace, 1).unwrap());
     let native = Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
@@ -496,15 +499,14 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     )
     .await;
     assert!(result.is_err());
-    // The blocked commit has a 1 s request timeout and the run a 2 s deadline:
-    // returning sooner would mean the request never reached its deadline.
+    // The blocked commit has a 1 s request timeout and the run a 2 s deadline.
     assert!(
         started.elapsed() >= Duration::from_millis(cfg_request_timeout_ms),
-        "the run returned before the blocked request timeout"
+        "returned before the request timeout"
     );
     assert!(
-        started.elapsed() < REPLAY_CAP,
-        "the run did not return within the anti-hang cap"
+        started.elapsed() < run_bound,
+        "exceeded deadline, grace and slack"
     );
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
@@ -526,8 +528,7 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     *mutex.lock().unwrap() = true;
     condvar.notify_all();
     // The detached call can finish, but the scheduler must never issue phase 8.
-    // Progress wait on the detached call dropping its handle (TST-9).
-    let cleanup_deadline = Instant::now() + REPLAY_CAP;
+    let cleanup_deadline = Instant::now() + CLEANUP_CAP;
     while Arc::strong_count(&native) > 1 && Instant::now() < cleanup_deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
