@@ -324,6 +324,10 @@ def check(profile, env):
             cargo(env, "clippy", "-p", "tidehunter", "--all-targets", *features, "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "tidehunter-fabric", "--all-targets", "--", "-D", "warnings")
         cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--", "-D", "warnings")
+        # op_replay is cfg(test-utils, linux). The default-feature pass above
+        # never compiles it, and only a feature-gated job would see a warning.
+        cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--features", "test-utils",
+              "--", "-D", "warnings")
         # The -p clippy runs above do not build every workspace member, for
         # example benchmarks/index_benchmark. The vendored third-party/minibytes
         # bench needs nightly #![feature(test)], so exclude it on stable.
