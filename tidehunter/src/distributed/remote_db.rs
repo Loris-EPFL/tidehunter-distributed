@@ -1752,9 +1752,8 @@ impl RemoteDatabase {
     /// `refill` installs a fetched value into the native per-cell LRU, exactly
     /// what native `Db::get` does and native `DbCheckpoint::get` does not, so a
     /// latched or checkpoint read passes `false`. A resident answer needs no
-    /// refill: it came from that LRU, under native's guarantee that a key
-    /// unchanged since `cut` is served from it. A keyspace without a value cache
-    /// has no LRU to fill, and the refill then costs nothing.
+    /// refill: it came from that LRU. A keyspace without a value cache has no
+    /// LRU to fill, and the refill then costs nothing.
     pub(super) fn read_value(
         &self,
         ks: KeySpace,
@@ -1808,10 +1807,10 @@ impl RemoteDatabase {
         Ok(value)
     }
 
-    /// One key: an index lookup at `cut`, then either the value the native
-    /// per-cell LRU holds or the owner read of the member frame the position
-    /// names. The owner may retire the file between the two, so the value path
-    /// re-resolves exactly once (see `ValueReader`).
+    /// One key: an index lookup, then either the value the native per-cell LRU
+    /// holds or the owner read of the member frame the position names. The owner
+    /// may retire the file between the two, so the value path re-resolves exactly
+    /// once (see `ValueReader`).
     ///
     /// `refill` is the caller's statement that this is a live read which may
     /// seed the LRU (see [`Self::read_value`]); a checkpoint view passes `false`.
@@ -1873,6 +1872,10 @@ impl RemoteDatabase {
     /// the call. A resident value is answered without any owner contact, and a
     /// fetched one refills the native per-cell LRU only when `refill` says this
     /// is a live read (see [`Self::read_value`]); a latched view passes `false`.
+    ///
+    /// Every key is resolved at the one sampled `cut`: a publication landing
+    /// mid-call must not let different slots observe different publication
+    /// points, and the batch has no per-key cut to fall back on.
     pub(super) fn get_many_at_cut<K: AsRef<[u8]>>(
         &self,
         ks: KeySpace,
@@ -1880,6 +1883,37 @@ impl RemoteDatabase {
         cut: BatchVersion,
         trace: Option<&pending_read::ReadTraceCallGuard>,
         refill: bool,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        self.get_many_with(ks, keys, cut, trace, refill, false)
+    }
+
+    /// The batch read of the Sui adapter at the current publication cut: the
+    /// keys are resolved at that one cut, a resident value answers inline, and
+    /// every miss is fetched in one batched owner read per owner. Native
+    /// `multi_get` runs one `Db::get` per key, so a retired member is retried
+    /// per slot (see [`Self::get_many_with`]).
+    pub(super) fn get_many_live<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        trace: Option<&pending_read::ReadTraceCallGuard>,
+    ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
+        self.get_many_with(ks, keys, self.core.table.current(), trace, true, true)
+    }
+
+    /// Both batch reads. `repair_retired` selects the retired-member contract of
+    /// a failed owner page: when set, every slot of the page is re-read through
+    /// the scalar path, which re-resolves its key exactly once, because the
+    /// batched fetch cannot attribute the failure to one slot. When clear, the
+    /// failed page fails the call.
+    fn get_many_with<K: AsRef<[u8]>>(
+        &self,
+        ks: KeySpace,
+        keys: &[K],
+        cut: BatchVersion,
+        trace: Option<&pending_read::ReadTraceCallGuard>,
+        refill: bool,
+        repair_retired: bool,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
         /// Rows one `ValueReader::read_many` call may hold.
         const PAGE_KEYS: usize = 256;
@@ -1936,22 +1970,47 @@ impl RemoteDatabase {
                 trace.event("value_fetch_started");
             }
             let fetch_started = Instant::now();
-            let values = self.reader.read_many(ks, &rows)?;
+            let fetched = match self.reader.read_many(ks, &rows) {
+                Ok(values) => {
+                    let refill = refill && descriptor.value_cache_size().is_some();
+                    for ((slot, (reduced, _)), value) in slots.into_iter().zip(&rows).zip(values) {
+                        if refill && let Some(value) = &value {
+                            table.refill_value(
+                                ks,
+                                reduced.clone(),
+                                Bytes::copy_from_slice(keys[slot].as_ref()),
+                                value.clone(),
+                            );
+                        }
+                        results[slot] = Ok(value);
+                    }
+                    Ok(())
+                }
+                // A retired owner file is the one failure the index can
+                // repair. The batched fetch cannot say which slot held the
+                // retired member, so the per-slot batch falls back to the
+                // scalar read for this page: that read re-resolves its key
+                // exactly once and answers per slot, like native `Db::get`.
+                // The strict batch keeps its contract (a failed page fails the
+                // call).
+                Err(error) if repair_retired && pending_read::member_read_is_retired(&error) => {
+                    for (slot, (_, position)) in slots.into_iter().zip(rows) {
+                        results[slot] = self.read_value(
+                            ks,
+                            keys[slot].as_ref(),
+                            cut,
+                            ResolvedValue::Position(position),
+                            refill,
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
             self.core
                 .value_read_ns
                 .fetch_add(elapsed(fetch_started), std::sync::atomic::Ordering::Relaxed);
-            let refill = refill && descriptor.value_cache_size().is_some();
-            for ((slot, (reduced, _)), value) in slots.into_iter().zip(&rows).zip(values) {
-                if refill && let Some(value) = &value {
-                    table.refill_value(
-                        ks,
-                        reduced.clone(),
-                        Bytes::copy_from_slice(keys[slot].as_ref()),
-                        value.clone(),
-                    );
-                }
-                results[slot] = Ok(value);
-            }
+            fetched?;
         }
         self.ensure_healthy()?;
         Ok(results)

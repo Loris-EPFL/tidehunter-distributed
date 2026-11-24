@@ -105,14 +105,19 @@ installed above the published prefix, so one read could return a batch before a
 lower version became visible and the total-order read contract would not hold.
 Consequently a read of a clean unloaded cell fetches the member from its owner
 even though the coordinator's LRU still holds the value: that owner round trip
-is the price of the ordering guarantee. A keyspace with a relocation filter is
-index-first: a filtered relocation marks dropped keys `Removed` while
-deliberately leaving their resident value, and only the index-first lookup
-answers not-found for them. A latched read consults the LRU only when the key is
-unchanged since its cut, and never refills it (native `DbCheckpoint::get`). A
-live iterator consults it as native `Db::next_entry` does; a latched iterator
-does not. Otherwise the value reader (`hybrid/read.rs`) checks the coordinator
-value cache (`remote_db/read_cache.rs`). On a miss it
+is the price of the ordering guarantee. A Sui batch read resolves every key at
+one sampled cut with the same lookup, serves a resident value inline, and
+fetches all misses in one batched owner read per owner; a retired member is
+retried per slot through the scalar path, which re-resolves its key exactly once,
+as native `Db::multi_get`'s per-key `Db::get` does. A keyspace with a relocation
+filter keeps the same cut-checked lookup: a filtered relocation marks dropped
+keys `Removed` while deliberately leaving their resident value, and only the
+index-first lookup answers not-found for them. A latched read consults the LRU
+only when the key is unchanged since its cut, and never refills it (native
+`DbCheckpoint::get`). A live iterator consults it as native `Db::next_entry`
+does; a latched iterator does not. Otherwise the value
+reader (`hybrid/read.rs`) checks the coordinator value cache
+(`remote_db/read_cache.rs`). On a miss it
 fetches the member frame and nothing else. The fetch uses a bounded live read
 lane (`remote_db/pending_read.rs`). The lane obtains an authenticated owner
 mapping, opens the verified namespace and issues aligned block reads through

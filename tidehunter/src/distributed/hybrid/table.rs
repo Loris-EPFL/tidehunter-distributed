@@ -745,14 +745,20 @@ impl TableInner {
         }
     }
 
-    /// What the index answers for `key` as of `cut`: a position to fetch, or the
-    /// value already resident in the native per-cell LRU.
+    /// What the index answers for `key` as of `cut`: a position to fetch, or
+    /// the value already resident in the native per-cell LRU.
     ///
     /// The LRU is the native [`LargeTable`] cache, unchanged: it is filled at
     /// publication and by the read refill, bounded per cell by the keyspace's
     /// `value_cache_size`, and consulted by `LargeTable::get_checkpoint` only
     /// when the key's as-of position is also its latest. `value_cache_size = 0`
-    /// allocates no LRU, so this always returns a position.
+    /// allocates no LRU, so a position is always returned.
+    ///
+    /// A read never resolves like native `Db::get`, which consults the LRU
+    /// before the cell's index state: that path also serves a value whose batch
+    /// sparse publication installed above the published prefix, and so could
+    /// answer later than a key the caller already saw. Every read therefore goes
+    /// through the cut-checked lookup, at the watermark a live read samples.
     pub(crate) fn get_value(
         &self,
         ks: KeySpace,

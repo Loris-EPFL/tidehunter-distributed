@@ -2,11 +2,15 @@
 //! enables with `value_cache_size`.
 //!
 //! These tests go through the real read path over fixture owners, so they cover
-//! what the index-level tests cannot: a resident value costs no owner round trip,
-//! a value fetched after a reopen refills the LRU, a checkpoint read serves the
-//! as-of value without seeding the LRU with it, a refused write leaves nothing
-//! resident, and a cached database answers exactly like an uncached one through a
-//! mixed workload and a reopen.
+//! what the index-level tests cannot: a resident value of a loaded cell costs no
+//! owner round trip, a value fetched after a reopen refills the LRU, a
+//! checkpoint read serves the as-of value without seeding the LRU with it, a
+//! refused write leaves nothing resident, and a cached database answers exactly
+//! like an uncached one through a mixed workload and a reopen.
+//!
+//! Every read is resolved at a sampled cut, so the LRU answers only while the
+//! key is unchanged since that cut and its cell is loaded; the resident value of
+//! an unloaded cell is never served (see `docs/distributed/ARCHITECTURE.md`).
 //!
 //! The scalar cases use the exclusive [`RemoteDatabase`], whose value reader
 //! counts identity-cache misses: a miss is exactly a read that fetches from an
@@ -18,10 +22,15 @@ use super::pipeline_tests::Fixture;
 use super::*;
 use crate::cell::CellId;
 use crate::distributed::codec::Mutation;
+use crate::distributed::hybrid::table::{RelocationApply, ResolvedValue};
 use crate::distributed::sui::Db;
+use crate::index::index_format::IndexIterCaches;
 use crate::key_shape::{KeyShape, KeySpaceConfig, KeyType};
+use crate::relocation::Decision;
 use minibytes::Bytes;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 4-byte keys over 16 uniform cells (one cell per 4-bit prefix), with a native
 /// per-cell value cache of `cache` entries. `cache = 0` is native's "no cache".
@@ -313,4 +322,420 @@ fn a_cached_and_an_uncached_database_answer_identically() {
         mixed_reads(&cached_reopened),
         "a second read of the reopened database is stable",
     );
+}
+
+/// The unloaded-cell gap, deliberately kept: after a flush folds the dirty
+/// overlay into a blob and unloads the cell, the coordinator's per-cell LRU
+/// still holds the published value, but the cut-checked lookup cannot consult
+/// it, so the scalar read fetches the member from its owner. Serving the LRU
+/// here would require native `Db::get` semantics, which also see a batch that
+/// sparse publication installed above the published prefix (see
+/// `docs/distributed/ARCHITECTURE.md`).
+#[test]
+fn an_unloaded_cell_reads_from_its_owner() {
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("remote-cache-unloaded").expect("scratch directory"),
+        2,
+        128,
+        cached_shape(16),
+        2,
+        // Every dirty cell is stale: the next snapshot pass flushes and unloads.
+        |config| config.index.snapshot_unload_threshold = 0,
+        |_| {},
+    );
+    let ks = KeySpace(0);
+    let mut db = fixture.open();
+    db.write_batch([1; 16], vec![put(&key(1), 1)])
+        .expect("write");
+    db.drain().expect("drain");
+    db.core.wait_settled().expect("settled");
+    // The durable-cut record of this fixture lags the published prefix; the
+    // native flush frontier is `min(durable, applied)`, so advance the durable
+    // front to the write to let one pass cover it (as the record itself would).
+    db.core.table.cuts().set_durable(db.core.table.current());
+
+    db.flush_index()
+        .expect("flush the dirty cell into an index blob");
+    let cell = fixture.shape.ks(ks).cell_id(&key(1));
+    assert_eq!(
+        db.core
+            .table
+            .large_table()
+            .entry_state_for_test(db.core.table.contexts().ks_context(ks), &cell,),
+        "Unloaded",
+        "premise: the flush unloaded the cell and kept its value LRU",
+    );
+
+    // Drop the derivative position cache so the read cannot answer from it.
+    db.clear_read_cache();
+    let before = owner_fetches(&db);
+    assert_eq!(
+        db.get(ks, &key(1)).unwrap().as_deref(),
+        Some(&[1u8; 8][..]),
+        "the read answers the value the unloaded cell's member holds",
+    );
+    assert_eq!(
+        owner_fetches(&db),
+        before + 1,
+        "the cut-checked read of an unloaded cell fetches its member",
+    );
+    assert!(db.exists(ks, &key(1)).unwrap(), "the key is present",);
+    assert_eq!(
+        owner_fetches(&db),
+        before + 1,
+        "exists is answered by the index alone, with no owner fetch",
+    );
+}
+
+/// The same shape with a relocation filter: a filter drop marks a key
+/// `Removed` while deliberately leaving its resident value, so only the
+/// index-first cut-checked lookup answers not-found for it.
+fn filtered_shape(cache: usize) -> KeyShape {
+    KeyShape::new_single_config(
+        4,
+        4,
+        KeyType::uniform(4),
+        KeySpaceConfig::new()
+            .with_value_cache_size(cache)
+            .with_relocation_filter(|_, _| Decision::Keep),
+    )
+}
+
+/// A batch whose keys all live in unloaded cells: the cut-checked lookup names
+/// each member position, so the batch fetches every miss in one batched owner
+/// read per owner. The derivative position cache is cleared first so no slot can
+/// answer from it.
+#[test]
+fn a_batch_of_unloaded_cells_fetches_each_owner_once() {
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("remote-cache-batch-unloaded").expect("scratch directory"),
+        2,
+        128,
+        cached_shape(16),
+        2,
+        // Every dirty cell is stale: the forced pass flushes and unloads.
+        |config| config.index.snapshot_unload_threshold = 0,
+        |_| {},
+    );
+    let ks = KeySpace(0);
+    let db = open(&fixture);
+    for cell in [1u32, 2] {
+        db.insert(ks, key(cell), vec![cell as u8; 8])
+            .expect("write");
+    }
+
+    let core = db.remote_for_test().write_core();
+    core.wait_settled().expect("settled");
+    let table = db.remote_for_test().hybrid_table();
+    // The fixture's durable-cut record lags the published prefix, and the
+    // native flush frontier is `min(durable, applied)`.
+    table.cuts().set_durable(table.current());
+    core.flush_index()
+        .expect("flush the dirty cell into an index blob");
+    for cell in [1u32, 2] {
+        let entry = fixture.shape.ks(ks).cell_id(&key(cell));
+        assert_eq!(
+            table
+                .large_table()
+                .entry_state_for_test(table.contexts().ks_context(ks), &entry),
+            "Unloaded",
+            "premise: the forced flush unloaded cell {cell} and kept its value LRU",
+        );
+    }
+
+    let remote = db.remote_for_test();
+    remote.cache.clear();
+    let cut = remote.published_cut().unwrap();
+    let keys = [key(1), key(2)];
+    let owners: BTreeSet<u32> = keys
+        .iter()
+        .map(|key| match table.get_value(ks, key, cut) {
+            Ok(Some(ResolvedValue::Position(position))) => position.address.partition,
+            other => panic!("premise: key {key:?} has an owner position, got {other:?}"),
+        })
+        .collect();
+    let submissions = remote.live_read_submission_count();
+    let fetches = remote.reader.cache_misses();
+    let values = db.multi_get(ks, &keys);
+    for (slot, cell) in [1u8, 2].into_iter().enumerate() {
+        assert_eq!(
+            values[slot].as_ref().unwrap().as_deref(),
+            Some([cell; 8].as_slice()),
+            "the value of the unloaded cell is fetched from its member",
+        );
+    }
+    assert_eq!(
+        remote.reader.cache_misses() - fetches,
+        keys.len() as u64,
+        "every unloaded cell needed one owner fetch",
+    );
+    assert_eq!(
+        remote.live_read_submission_count() - submissions,
+        owners.len() as u64,
+        "the misses went out as one batched read per owner",
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
+/// A mixed batch serves the resident value and fetches the misses in one
+/// batched owner read per owner. Both owners are covered, duplicate keys are
+/// folded into the same batch, and an absent key costs nothing.
+#[test]
+fn a_mixed_batch_fetches_each_owner_once_for_the_misses_only() {
+    let fixture = fixture("remote-cache-batch-mixed", cached_shape(16)).synchronous();
+    let ks = KeySpace(0);
+    let db = open(&fixture);
+    for cell in 0..4u32 {
+        db.insert(ks, key(cell), vec![cell as u8; 8])
+            .expect("write");
+    }
+    db.wait_for_background_threads_to_finish()
+        .expect("shut down before the reopen");
+    let db = open(&fixture);
+    // The reopen leaves the LRU and the derivative cache empty. Read one key so
+    // it is the only resident value; the other keys are misses.
+    assert_eq!(
+        db.get(ks, &key(0)).unwrap().as_deref(),
+        Some(&[0u8; 8][..]),
+        "the reopened value is fetched and refills the LRU",
+    );
+    let remote = db.remote_for_test();
+    remote.cache.clear();
+    let cut = remote.published_cut().unwrap();
+    let misses: Vec<Vec<u8>> = (1..4u32).map(key).collect();
+    let owners: BTreeSet<u32> = misses
+        .iter()
+        .map(|key| match remote.hybrid_table().get_value(ks, key, cut) {
+            Ok(Some(ResolvedValue::Position(position))) => position.address.partition,
+            other => panic!("premise: key {key:?} has an owner position, got {other:?}"),
+        })
+        .collect();
+    assert!(
+        owners.len() >= 2,
+        "premise: the misses span both owners, got {owners:?}",
+    );
+
+    let submissions = remote.live_read_submission_count();
+    let fetches = remote.reader.cache_misses();
+    let keys: Vec<Vec<u8>> = (0..4u32).map(key).chain(std::iter::once(key(9))).collect();
+    let values = db.multi_get(ks, &keys);
+    for (slot, cell) in (0..4u32).enumerate() {
+        assert_eq!(
+            values[slot].as_ref().unwrap().as_deref(),
+            Some([cell as u8; 8].as_slice()),
+            "slot {slot} is the value cell {cell} wrote",
+        );
+    }
+    assert!(
+        values[4].as_ref().unwrap().is_none(),
+        "an absent key answers not-found",
+    );
+    assert_eq!(
+        remote.reader.cache_misses() - fetches,
+        misses.len() as u64,
+        "only the misses touched an owner, the resident key did not",
+    );
+    assert_eq!(
+        remote.live_read_submission_count() - submissions,
+        owners.len() as u64,
+        "the misses went out as one batched read per owner",
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
+/// The live batch answers exactly what native `multi_get` answers for the same
+/// data, with the cache on and off. Native runs one `Db::get` per key, so the
+/// batch result is per-slot and order-preserving, duplicates included.
+#[test]
+fn a_batch_matches_native_multi_get_with_the_cache_on_and_off() {
+    /// Puts, an overwrite, a remove, then a batch with duplicates and an absent
+    /// key: the whole per-slot answer, formatted for comparison.
+    fn workload(db: &Arc<Db>) -> Vec<String> {
+        let ks = db.ks("root");
+        for cell in 0..4u32 {
+            db.insert(ks, key(cell), vec![cell as u8; 8]).expect("put");
+        }
+        db.insert(ks, key(1), vec![0xAA; 8]).expect("overwrite");
+        db.remove(ks, key(2)).expect("remove");
+        let keys: Vec<Vec<u8>> = [0u32, 1, 2, 3, 9, 1].into_iter().map(key).collect();
+        db.multi_get(ks, &keys)
+            .into_iter()
+            .map(|value| format!("{:?}", value.expect("multi_get")))
+            .collect()
+    }
+
+    let cached = fixture("remote-cache-batch-parity-on", cached_shape(16));
+    let uncached = fixture("remote-cache-batch-parity-off", cached_shape(0));
+    let cached_db = open(&cached);
+    let uncached_db = open(&uncached);
+    let native_dir = tempdir::TempDir::new("native-cache-batch-parity").expect("scratch directory");
+    let native = Db::open_native(
+        native_dir.path(),
+        cached_shape(0),
+        Arc::new(crate::config::Config::small()),
+        super::tests::recovery_metrics(),
+    )
+    .expect("open native");
+    let expected = workload(&native);
+    assert_eq!(
+        workload(&cached_db),
+        expected,
+        "the cache-on hybrid answers every batch slot like native multi_get",
+    );
+    assert_eq!(
+        workload(&uncached_db),
+        expected,
+        "the cache-off hybrid answers every batch slot like native multi_get",
+    );
+}
+
+/// Per-key live semantics of a batch: a slot never returns a state older than
+/// the newest one published when the call started. Keys are published with
+/// increasing values, then removed. A slot may observe a concurrent overwrite
+/// or the remove (the value it returns was visible when the call started), but
+/// a slot never rewinds, and a completed remove before the call answers
+/// not-found.
+#[test]
+fn a_concurrent_overwrite_and_remove_never_rewinds_a_batch_slot() {
+    const LAST: u64 = 64;
+    const READS: usize = 4_000;
+    let fixture = fixture("remote-cache-batch-race", cached_shape(16));
+    let ks = KeySpace(0);
+    let db = open(&fixture);
+    let raw = key(0);
+    db.insert(ks, raw.clone(), 0u64.to_be_bytes().to_vec())
+        .expect("seed");
+    let floor = AtomicU64::new(0);
+    let removed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let db = &db;
+        let raw = &raw;
+        let floor = &floor;
+        let removed = &removed;
+        let writer = scope.spawn(move || {
+            for sequence in 1..=LAST {
+                db.insert(ks, raw.clone(), sequence.to_be_bytes().to_vec())
+                    .expect("overwrite");
+                // The value is installed before the acknowledgement returns, so
+                // `floor` only names a value every later read can see.
+                floor.store(sequence, Ordering::Release);
+            }
+            db.remove(ks, raw.clone()).expect("remove");
+            removed.store(true, Ordering::Release);
+        });
+        let reader = scope.spawn(move || {
+            let mut last = 0u64;
+            for _ in 0..READS {
+                // Both facts are read before the call: a value at or above
+                // `floor` was published, and a set `removed` completed first.
+                let visible = floor.load(Ordering::Acquire);
+                let removed_before = removed.load(Ordering::Acquire);
+                let values = db.multi_get(ks, std::slice::from_ref(raw));
+                let slot = values
+                    .into_iter()
+                    .next()
+                    .expect("one slot")
+                    .expect("batch read");
+                if removed_before {
+                    assert!(
+                        slot.is_none(),
+                        "a remove completed before the batch, yet the slot held {slot:?}",
+                    );
+                }
+                let Some(value) = slot else {
+                    continue;
+                };
+                let seen = u64::from_be_bytes(
+                    value
+                        .as_ref()
+                        .try_into()
+                        .expect("the fixture publishes eight-byte values"),
+                );
+                assert!(
+                    seen >= visible,
+                    "a batch slot returned {seen} older than the value {visible} visible when the call started",
+                );
+                assert!(
+                    seen >= last,
+                    "batch slots regressed from {last} to {seen}",
+                );
+                last = seen;
+            }
+        });
+        writer.join().expect("the writer thread must not panic");
+        reader.join().expect("the reader thread must not panic");
+    });
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
+/// A relocation-filtered keyspace keeps the index-first cut-checked batch: a
+/// filter drop hides the key even though its value is still resident.
+#[test]
+fn a_filtered_keyspace_batch_stays_index_first() {
+    let fixture = fixture("remote-cache-batch-filtered", filtered_shape(16));
+    let ks = KeySpace(0);
+    let db = open(&fixture);
+    let raw = key(1);
+    db.insert(ks, raw.clone(), vec![7; 8]).expect("write");
+    assert_eq!(
+        db.multi_get(ks, std::slice::from_ref(&raw))[0]
+            .as_ref()
+            .unwrap()
+            .as_deref(),
+        Some(&[7u8; 8][..]),
+        "the published value is readable",
+    );
+
+    let table = db.remote_for_test().hybrid_table();
+    // A latched index walk never consults the value LRU, so it names the member
+    // position even though the published value is still resident.
+    let mut caches = IndexIterCaches::new();
+    let mut cell = table.ks_desc(ks).first_cell();
+    let mut previous = None;
+    let position = loop {
+        let entry = table
+            .next_entry(
+                ks,
+                cell,
+                previous,
+                &None,
+                false,
+                &mut caches,
+                Some(table.current()),
+            )
+            .expect("index walk")
+            .expect("the published key has an index entry");
+        cell = entry.cell.expect("an index entry names its cell");
+        if entry.key.as_ref() == raw.as_slice() {
+            match entry.value {
+                ResolvedValue::Position(position) => break position,
+                other => panic!("a latched walk answered from the value cache: {other:?}"),
+            }
+        }
+        previous = Some(entry.key);
+    };
+    let cell = table.shape().ks(ks).cell_id(&raw);
+    let target = [(
+        position.address.partition,
+        position.address.segment_generation,
+        position.address.offset + 1,
+    )];
+    table
+        .relocation_apply(ks, &cell, RelocationApply::Drop, &target)
+        .expect("filter drop");
+
+    let submissions = db.remote_for_test().live_read_submission_count();
+    assert!(
+        db.multi_get(ks, std::slice::from_ref(&raw))[0]
+            .as_ref()
+            .unwrap()
+            .is_none(),
+        "a filtered drop answers not-found before the resident value",
+    );
+    assert_eq!(
+        db.remote_for_test().live_read_submission_count(),
+        submissions,
+        "the filtered batch resolved at the index with no owner read",
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
 }
