@@ -184,6 +184,10 @@ pub struct LiveIo {
     /// a resume test proves where a rewrite landed.
     #[cfg(test)]
     submitted_writes: Vec<(u64, usize)>,
+    /// Per submitted write, whether it carried FUA. Test only: the resume must
+    /// resend a frame with the sync mode its original submission recorded.
+    #[cfg(test)]
+    submitted_data_sync: Vec<bool>,
     /// Errno of the latest completed namespace write when that write failed.
     /// A resume classifies a break from it, so it is recorded in production.
     last_write_errno: Option<i32>,
@@ -248,6 +252,8 @@ impl LiveIo {
             next_submit_result: None,
             #[cfg(test)]
             submitted_writes: Vec::new(),
+            #[cfg(test)]
+            submitted_data_sync: Vec::new(),
             last_write_errno: None,
             #[cfg(test)]
             held_ids: Vec::new(),
@@ -360,6 +366,12 @@ impl LiveIo {
     #[cfg(test)]
     pub(crate) fn submitted_writes(&self) -> &[(u64, usize)] {
         &self.submitted_writes
+    }
+
+    /// Whether each submitted write carried FUA, in submission order.
+    #[cfg(test)]
+    pub(crate) fn submitted_data_sync(&self) -> &[bool] {
+        &self.submitted_data_sync
     }
     pub fn stats(&self) -> LiveIoStats {
         self.stats.clone()
@@ -791,6 +803,8 @@ impl LiveIo {
             #[cfg(test)]
             if data.is_some() && !flush {
                 self.submitted_writes.push((offset, len));
+                self.submitted_data_sync
+                    .push(matches!(data, Some((_, LiveWriteSync::Data))));
             }
             prepared.push((
                 token,
@@ -1056,11 +1070,6 @@ impl LiveIo {
             if let (Some(trace), Some(queue)) = (&req.trace, self.trace_queue) {
                 trace.event_io("live_io_cqe_observed", queue, user_data);
             }
-            if write {
-                // A successful write clears the record, so the value always
-                // names the latest write's outcome and never an older failure.
-                self.last_write_errno = (result < 0).then_some(-result);
-            }
             #[cfg(test)]
             let result = if let Some(index) = self
                 .completion_results
@@ -1071,6 +1080,13 @@ impl LiveIo {
             } else {
                 self.next_completion_result.take().unwrap_or(result)
             };
+            if write {
+                // A successful write clears the record, so the value always
+                // names the latest write's outcome and never an older failure.
+                // Read after the test override, which stands in for the device's
+                // verdict; without it the production order is unchanged.
+                self.last_write_errno = (result < 0).then_some(-result);
+            }
             self.stats.completions += 1;
             if let Some(started) = submitted {
                 self.stats.submit_to_cq_ns += started.elapsed().as_nanos();

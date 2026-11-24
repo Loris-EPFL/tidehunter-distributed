@@ -397,6 +397,11 @@ pub(super) struct LeasedWriter {
     resuming: bool,
     /// Resumes without a frame submitted and adopted between them.
     resume_consecutive: u32,
+    /// A probe resume kept the surviving queue and granted the outstanding
+    /// work one more window, and no CQE has arrived since. A deadline that
+    /// expires while it is set proves the queue does not progress, so the next
+    /// resume detaches and rewrites instead of probing again (design 7.3).
+    probe_unhealed: bool,
     /// The last failure of this client came from a resume that refused or
     /// failed, so the worker names that stage instead of the operation's own.
     resume_failed: bool,
@@ -406,6 +411,9 @@ pub(super) struct LeasedWriter {
     next_write_result: Option<i32>,
     #[cfg(test)]
     next_submit_result: Option<i32>,
+    /// A raw CQE result that overrides the next group flush's completion.
+    #[cfg(test)]
+    next_flush_result: Option<i32>,
     #[cfg(test)]
     delay_write: bool,
     #[cfg(test)]
@@ -1325,17 +1333,14 @@ impl super::Client {
     }
 
     fn ensure_leased_queue(&mut self) -> Result<(), super::TcpError> {
-        let leased = self
-            .live_leased
-            .current
-            .as_ref()
-            .map(|extent| extent.lease.clone())
-            .ok_or_else(|| super::TcpError::new("live leased extent missing"))?;
-        if self
-            .live_writer
-            .as_ref()
-            .is_some_and(|w| w.matches(&leased.binding))
-        {
+        let bound = match self.live_leased.current.as_ref() {
+            Some(current) => self
+                .live_writer
+                .as_ref()
+                .is_some_and(|w| w.matches(&current.lease.binding)),
+            None => return Err(super::TcpError::new("live leased extent missing")),
+        };
+        if bound {
             return Ok(());
         }
         if self.live_writer.is_some() {
@@ -1353,7 +1358,17 @@ impl super::Client {
             self.live_leased.queue_rebound = true;
             self.drain_live_queue()?;
         }
-        self.open_leased_queue_with(&leased)
+        // Move the grant out for the open: the helper needs `&mut self` and a
+        // reference to the grant, which the borrow checker cannot split across
+        // a call. The move is free and a rebind is not the per-frame path.
+        let leased = self
+            .live_leased
+            .current
+            .take()
+            .ok_or_else(|| super::TcpError::new("live leased extent missing"))?;
+        let opened = self.open_leased_queue_with(&leased.lease);
+        self.live_leased.current = Some(leased);
+        opened
     }
 
     /// Open a write queue on `leased`'s binding. No flight deque precondition:
@@ -1570,10 +1585,14 @@ impl super::Client {
         )>,
     ) -> Result<(u64, Instant, Instant, bool), super::TcpError> {
         use crate::distributed::nvmeof::live_io::LiveWriteSync;
-        self.check_lease()?;
         self.ensure_leased_healthy()?;
         let mut attempt = 1u32;
         loop {
+            // Phase 2 self-fence: the lease is the authority on the right to
+            // write, and a resume consumes part of the window the first check
+            // ran in, so every attempt re-reads it. One `Acquire` load, and the
+            // loop runs once on the unresumed path.
+            self.check_lease()?;
             self.ensure_leased_queue()?;
             let config = self
                 .live_config
@@ -1631,6 +1650,9 @@ impl super::Client {
                 Err(error) => {
                     if attempt < resume::MAX_RESUME_ATTEMPTS && self.break_kind(&error).is_some() {
                         attempt += 1;
+                        // A failed submission lost the queue itself, so this
+                        // resume rewrites rather than probing.
+                        self.live_leased.probe_unhealed = false;
                         self.resume_after_break(BreakKind::Data)?;
                         continue;
                     }
@@ -1828,15 +1850,21 @@ impl super::Client {
         released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
         timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
     ) -> Result<(), super::TcpError> {
-        let mut attempt = 1u32;
+        let mut resumes = 0u32;
         loop {
             match self.progress_leased_flights_once(released, timeline) {
-                Err(error)
-                    if attempt < resume::MAX_RESUME_ATTEMPTS
-                        && self.break_kind(&error).is_some() =>
-                {
-                    attempt += 1;
-                    let kind = self.break_kind(&error).unwrap_or(BreakKind::Session);
+                Err(error) => {
+                    let Some(kind) = self.break_kind(&error) else {
+                        return Err(error);
+                    };
+                    if resumes >= resume::MAX_RESUME_ATTEMPTS {
+                        return Err(error);
+                    }
+                    resumes += 1;
+                    // A kept queue is a probe of the owner's health: if its
+                    // window passes without a CQE the next expiry reports a
+                    // data break and only the rewrite remains (design 7.3).
+                    self.live_leased.probe_unhealed = kind == BreakKind::Session;
                     self.resume_after_break(kind)?;
                 }
                 other => return other,
@@ -1868,11 +1896,22 @@ impl super::Client {
                 counters.record_unknown_write();
             }
             // A deadline is a probe, not a verdict: the owner may be overloaded,
-            // so the resume keeps the queue and grants one more window.
-            return Err(super::TcpError::with_kind(
-                std::io::ErrorKind::TimedOut,
-                "leased write deadline expired",
-            ));
+            // so the first one keeps the queue and grants one more window. An
+            // expiry while `probe_unhealed` is set means that window passed
+            // without a single CQE, so the queue does not progress and only a
+            // detach-and-rewrite can tell a dead link from an overloaded owner
+            // (design 7.3). The data class makes the resume do exactly that.
+            return Err(if self.live_leased.probe_unhealed {
+                super::TcpError::with_kind(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "leased write deadline expired after a probe completed no frame",
+                )
+            } else {
+                super::TcpError::with_kind(
+                    std::io::ErrorKind::TimedOut,
+                    "leased write deadline expired",
+                )
+            });
         }
         let writer = self
             .live_writer
@@ -1897,23 +1936,44 @@ impl super::Client {
         // a lost controller is transient, a rejected or short write is not.
         let write_errno = writer.io.last_write_errno();
         let harvested = !self.live_leased.completions.is_empty();
+        if harvested {
+            // A CQE proves the kept queue still progresses, so a deadline that
+            // expires later is a fresh probe, not an escalation (design 7.3).
+            self.live_leased.probe_unhealed = false;
+        }
         for completion in self.live_leased.completions.drain(..) {
             if let Some((id, covers_seq, _)) = self.live_leased.flush_in_flight
                 && completion.id == id
             {
                 if !matches!(completion.result, Ok(LiveIoResult::Flushed)) {
+                    let timed_out = after.timeouts > before.timeouts;
                     if let Some(counters) = &self.live_counters {
-                        counters.record_leased_write_failure(if after.timeouts > before.timeouts {
+                        counters.record_leased_write_failure(if timed_out {
                             LiveWriteFailure::TimedOut
                         } else {
                             LiveWriteFailure::Failed
                         });
                         counters.record_unknown_write();
                     }
-                    return Err(super::TcpError::with_kind(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "leased namespace flush failed",
-                    ));
+                    // A flush CQE reports `UnknownWrite` both for a late
+                    // deadline and for a device error, so the errno decides:
+                    // `EIO`/`ENOSPC`/`EFBIG`/`EINVAL` are the filesystem's
+                    // verdict and a retry is never issued, while a lost
+                    // controller is the same resumable break as a write. Only
+                    // a deadline that recorded no error is the probe of 7.3.
+                    return Err(match write_errno {
+                        Some(errno) => resume::classify_io_error(
+                            crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
+                            Some(errno),
+                        ),
+                        None if timed_out => super::TcpError::with_kind(
+                            std::io::ErrorKind::TimedOut,
+                            "leased namespace flush deadline expired",
+                        ),
+                        None => super::TcpError::new(
+                            "leased namespace flush failed: the outcome is unknown",
+                        ),
+                    });
                 }
                 if let Some(started) = self.live_leased.flush_submitted_at.take()
                     && let Some(counters) = &self.live_counters
@@ -2070,6 +2130,10 @@ impl super::Client {
                     }
                 };
                 self.live_leased.next_flight_id = id;
+                #[cfg(test)]
+                if let Some(result) = self.live_leased.next_flush_result.take() {
+                    writer.io.override_completion_result(id, result);
+                }
                 self.live_leased.flush_in_flight = Some((id, covers_seq, deadline));
                 self.live_leased.flush_submitted_at = Some(submitted_at);
                 if let Some(counters) = &self.live_counters {
@@ -2125,6 +2189,9 @@ impl super::Client {
                         // A lost queue cannot deliver the CQE the wait asks
                         // for; the resume rewrites the unadopted suffix.
                         Some(kind) => {
+                            // A kept queue is a probe; its window decides
+                            // whether the next break rewrites (design 7.3).
+                            self.live_leased.probe_unhealed = kind == BreakKind::Session;
                             self.resume_after_break(kind)?;
                         }
                         None => return Err(error),
@@ -2820,17 +2887,53 @@ pub(crate) mod leased_tests {
         }
     }
 
-    /// Owner-side read of `reference` at the owner's serving boundary (covering
-    /// barrier, then the record), the oracle that replaced the removed
-    /// owner-RPC `Client::read_records` (now a live NVMe-oF read). The removed
-    /// owner read handler applied the same two steps.
+    /// Owner-side read of `reference` at the owner's serving boundary, the
+    /// oracle that replaced the removed owner-RPC `Client::read_records` (now a
+    /// live NVMe-oF read).
+    ///
+    /// A leased receipt can name bytes the owner adopted whose frontier
+    /// publication still lags the acknowledgement, so the production read
+    /// boundary persists them before it serves the record
+    /// (`load_serving_record_authority` → `persist_for_read`). This oracle takes
+    /// the same step instead of asserting the read-side frontier directly.
     pub(crate) fn owner_read(
         fixture: &Fixture,
         reference: &crate::distributed::types::ValueRecordReference,
     ) -> Vec<crate::distributed::codec::Mutation> {
+        use crate::distributed::storage::StorageError;
         let log = fixture.node.log_for_test(1);
-        log.validate_durable_record_reference(reference).unwrap();
-        vec![log.read_record(reference).unwrap()]
+        if let Err(error) = log.validate_durable_record_reference(reference) {
+            assert!(
+                matches!(error, StorageError::NeedsPersistence),
+                "the owner rejects record {}: {error}",
+                reference.batch_address.offset
+            );
+            // The read's own covering barrier, the same pair a durable-progress
+            // nudge runs on the owner: adopt the leased frames, then publish
+            // everything appended. Both run off the syncer thread.
+            if let Err(error) = log.self_adopt_live_extent() {
+                panic!(
+                    "the owner cannot adopt record {} before serving it: {error}",
+                    reference.batch_address.offset
+                );
+            }
+            if let Err(error) = log.persist_live_progress() {
+                panic!(
+                    "the owner cannot persist record {} before serving it: {error}",
+                    reference.batch_address.offset
+                );
+            }
+        }
+        if let Err(error) = log.validate_durable_record_reference(reference) {
+            panic!(
+                "the owner still cannot serve record {} after persisting it: {error}",
+                reference.batch_address.offset
+            );
+        }
+        vec![
+            log.read_record(reference)
+                .expect("the owner reads its record"),
+        ]
     }
 
     impl Drop for Fixture {
@@ -5355,6 +5458,24 @@ impl super::Client {
     /// Fail the next submission before any SQE, as a lost controller does.
     pub(crate) fn leased_test_fail_submit(&mut self, errno: i32) {
         self.live_leased.next_submit_result = Some(errno);
+    }
+    /// Override the next group flush's CQE with `result`, a raw negative errno.
+    pub(crate) fn leased_test_fail_flush(&mut self, result: i32) {
+        self.live_leased.next_flush_result = Some(result);
+    }
+    /// `(flushed through sequence, flush id in flight)`.
+    pub(crate) fn leased_test_flush_state(&self) -> (u64, Option<u64>) {
+        (
+            self.live_leased.flushed_through_seq,
+            self.live_leased.flush_in_flight.map(|(id, _, _)| id),
+        )
+    }
+    /// Whether each submitted write carried `LiveWriteSync::Data`, in order.
+    pub(crate) fn leased_test_write_syncs(&self) -> Vec<bool> {
+        self.live_writer
+            .as_ref()
+            .map(|writer| writer.io.submitted_data_sync().to_vec())
+            .unwrap_or_default()
     }
     /// Enable the write resume with no reaper: a local-file queue owns no
     /// kernel controller, so the fixture path drains it inline.
