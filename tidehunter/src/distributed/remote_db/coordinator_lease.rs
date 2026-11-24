@@ -470,6 +470,7 @@ impl super::RemoteDatabase {
             path,
             shape,
             config,
+            crate::metrics::Metrics::new(),
             None,
             None,
             Some(lease_hook),

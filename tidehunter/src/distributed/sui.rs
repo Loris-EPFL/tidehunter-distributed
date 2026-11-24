@@ -663,13 +663,36 @@ impl Db {
         let capture_id = kv_capture::open(path, &shape, None).map_err(error)?;
         Ok(Self::new(Backend::Native(db), shape, capture_id))
     }
+    /// Opens a coordinated remote database with metrics built from the index
+    /// configuration, as native `Db::open` is given them by its caller: the
+    /// `metrics_enabled` row of the index section decides whether this open
+    /// collects, and the handles go to a registry private to this database.
+    ///
+    /// Callers that own a registry (Sui registers one per database) use
+    /// [`Self::open_remote_with_metrics`] instead, so every index, read and
+    /// flusher counter lands in their registry.
     pub fn open_remote(
         path: &Path,
         shape: KeyShape,
         config: RemoteDatabaseConfig,
     ) -> Result<Arc<Self>> {
+        let metrics =
+            Metrics::new_in_enabled(&prometheus::Registry::new(), config.index.metrics_enabled);
+        Self::open_remote_with_metrics(path, shape, config, metrics)
+    }
+
+    /// [`Self::open_remote`] with the caller's metrics, exactly as native
+    /// `Db::open` takes them: the caller builds them from its registry, and the
+    /// coordinator's index, read and flusher counters land there. The remote
+    /// adapter gauges stay separate (`register_remote_metrics` /
+    /// `register_nvmeof_metrics`).
+    pub fn open_remote_with_metrics(
+        path: &Path,
+        shape: KeyShape,
+        config: RemoteDatabaseConfig,
+        metrics: Arc<Metrics>,
+    ) -> Result<Arc<Self>> {
         Self::open_remote_inner(path, shape, config, |path, shape, config| {
-            let metrics = Metrics::new_in_enabled(&prometheus::Registry::new(), false);
             RemoteDatabase::open(path, shape, config, metrics)
         })
     }

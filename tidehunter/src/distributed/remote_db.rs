@@ -915,9 +915,9 @@ impl RemoteDatabase {
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
-        _metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> Result<Self, LocalDbError> {
-        Self::open_inner(path, shape, config, None)
+        Self::open_inner(path, shape, config, metrics, None)
     }
     /// `open` over the rootless ordinary-file live I/O fixture (`buffered`
     /// selects buffered fixture I/O). Every client created during open selects
@@ -935,6 +935,7 @@ impl RemoteDatabase {
             path,
             shape,
             config,
+            Metrics::new(),
             None,
             #[cfg(test)]
             None,
@@ -950,7 +951,7 @@ impl RemoteDatabase {
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
-        _metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
         successful_fences: usize,
     ) -> Result<Self, LocalDbError> {
         if successful_fences == 0 || successful_fences >= config.endpoints.len() {
@@ -962,6 +963,7 @@ impl RemoteDatabase {
             path,
             shape,
             config,
+            metrics,
             Some(OpenInterruption::AfterFences(successful_fences)),
         )
     }
@@ -970,12 +972,14 @@ impl RemoteDatabase {
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
+        metrics: Arc<Metrics>,
         interruption: Option<OpenInterruption>,
     ) -> Result<Self, LocalDbError> {
         Self::open_inner_with(
             path,
             shape,
             config,
+            metrics,
             interruption,
             #[cfg(test)]
             None,
@@ -1010,6 +1014,7 @@ impl RemoteDatabase {
             path,
             shape,
             config,
+            Metrics::new(),
             interruption,
             None,
             #[cfg(test)]
@@ -1018,10 +1023,15 @@ impl RemoteDatabase {
         )
     }
 
+    // The parameter set is the open's whole control surface: the caller's
+    // metrics, the injected interruption, and the test-only read hook, lease
+    // hook and I/O fixture that `#[cfg]` removes from a production build.
+    #[allow(clippy::too_many_arguments)]
     fn open_inner_with(
         path: &Path,
         shape: &KeyShape,
         config: RemoteDatabaseConfig,
+        metrics: Arc<Metrics>,
         interruption: Option<OpenInterruption>,
         #[cfg(test)] read_hook: Option<ReadHook<'_>>,
         // Test-only: the renewer's send decision per owner, so a test can stop
@@ -1273,7 +1283,7 @@ impl RemoteDatabase {
             Arc::new(shape.clone()),
             &config.index,
             cuts,
-            Metrics::new(),
+            metrics,
             &partitions,
         )?);
         table.validate_partitions(&partitions)?;
@@ -2704,6 +2714,9 @@ mod wal_replay_tests;
 
 #[cfg(test)]
 mod open_tests;
+
+#[cfg(test)]
+mod metrics_tests;
 
 #[cfg(test)]
 mod stream_bound_tests;
