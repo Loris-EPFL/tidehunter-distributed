@@ -417,12 +417,11 @@ jobs:
           --base "${{ github.event.pull_request.base.sha }}"
           --tip "${{ github.sha }}"
 
-      - name: Enforce file length and test layout
+      - name: Enforce test layout
         if: matrix.profile == 'format'
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          python3 -B .github/scripts/checks.py file-length
           python3 -B .github/scripts/checks.py test-layout
           python3 -B -m unittest discover -s .github/scripts -p 'test_checks.py' -v
           python3 -B -m unittest discover -s .github/scripts -p 'test_lint_stack.py' -v

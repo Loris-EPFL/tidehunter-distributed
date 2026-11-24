@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "experiments"))
 from resident_config import software_fabric_environment
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness",
-            "file-length", "test-layout", "lint-backends", "all")
+            "test-layout", "lint-backends", "all")
 # Needs hosted-runner system packages; never part of `all` on a developer machine.
 ALL_PROFILES = tuple(profile for profile in PROFILES[:-1] if profile != "lint-backends")
 # Every feature-gated kv-research backend, grouped as a hosted runner can build it.
@@ -110,7 +110,6 @@ def selected_ignored(env, target, selector, expected):
             raise RuntimeError(f"Selected test did not execute exactly once: {name}")
 
 
-FILE_LENGTH_LIMIT = 1500
 RATCHET_ROOTS = (
     "tidehunter/src/distributed",
     "tidehunter/examples/support",
@@ -118,7 +117,6 @@ RATCHET_ROOTS = (
     "benchmarks/kv-research/src",
     "tidehunter-fabric/src",
 )
-FILE_LENGTH_BASELINE = ROOT / ".github/scripts/file-length-baseline.txt"
 TEST_LAYOUT_BASELINE = ROOT / ".github/scripts/test-layout-baseline.txt"
 TEST_LAYOUT_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 # `#[test]`, `#[tokio::test]`, `#[tokio::test(flavor = "multi_thread")]` and any `#[a::b::test]`.
@@ -157,35 +155,6 @@ def rust_files(root):
             raise RuntimeError(f"ratchet root is missing: {relative_root}")
         for path in directory.rglob("*.rs"):
             yield path.relative_to(root), path
-
-
-def check_file_length(root=ROOT, baseline_path=FILE_LENGTH_BASELINE):
-    """Exact ratchet: a listed file equals its recorded length; others stay within the cap."""
-    baseline = {path: values[0] for path, values in read_baseline(baseline_path, 1).items()}
-    problems = []
-    counts = {}
-    for relative, path in sorted(rust_files(root)):
-        relative = str(relative)
-        counts[relative] = len(path.read_bytes().splitlines())
-    for relative, lines in counts.items():
-        recorded = baseline.get(relative)
-        if recorded is None:
-            if lines > FILE_LENGTH_LIMIT:
-                problems.append(f"{relative}: {lines} lines, over the cap and not in the baseline")
-        elif lines > recorded:
-            problems.append(f"{relative}: {lines} lines, grew past baseline {recorded}")
-        elif lines < recorded and lines > FILE_LENGTH_LIMIT:
-            problems.append(f"{relative}: {lines} lines, below baseline {recorded}; "
-                            f"change the baseline line to: {relative} {lines}")
-    for relative in sorted(baseline):
-        lines = counts.get(relative)
-        if lines is None or lines <= FILE_LENGTH_LIMIT:
-            problems.append(f"{relative}: stale baseline entry (file missing or within the cap); "
-                            f"delete the line: {relative} {baseline[relative]}")
-    if problems:
-        raise RuntimeError(
-            "file-length ratchet failed; the baseline may only shrink, in the same change "
-            "that shrinks the file:\n  " + "\n  ".join(problems))
 
 
 def without_comments_and_strings(source):
@@ -315,8 +284,6 @@ def check(profile, env):
     print(f"\n=== {profile}: correctness only; no hardware/performance claim ===", flush=True)
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
-    elif profile == "file-length":
-        check_file_length()
     elif profile == "test-layout":
         check_test_layout()
     elif profile == "lint":

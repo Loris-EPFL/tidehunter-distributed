@@ -334,8 +334,7 @@ exists, and a source link.
   Source: `kvstore-concurrency` skill (outside this repository).
 - **TST-7** Do not weaken an assertion to make a flaky test pass; fix the cause.
   [AGENTS.md, Task Quality](../AGENTS.md)
-- **TST-8** Keep a test file at or below 1,500 lines, the same cap as a production file.
-  [Book 11.1](https://doc.rust-lang.org/book/ch11-01-writing-tests.html)
+- **TST-8** Withdrawn (owner, 2026-11-25): no file-length limit; see DEC-6.
 - **TST-9** A wait in a test follows observed progress (a counter, a handshake, a joined thread) and is capped by one named constant per test module with a single documented reason; a fixed sleep is allowed only as a floor after a progress signal. Do not relax a production validator or limit so a test can pass a larger cap.
   Source: extends TST-7 (fix the cause, do not weaken the check); added in revision r2 from the batch-2 review of the time-bound test patches.
 
@@ -604,10 +603,10 @@ not replace `AGENTS.md` or the `kvstore-concurrency` skill.
   today. In the other two scopes, review enforces CLN-1 and CLN-2 until stage 2
   lands. A pedantic allow is item-level with a
   `reason`; only `module_name_repetitions` may be allowed module-wide.
-- **DEC-6** Production and test files target 1,000 lines.
-  `.github/scripts/checks.py file-length` enforces a ratchet: a file listed in
-  `.github/scripts/file-length-baseline.txt` must match its entry exactly. Any other file in the
-  audited trees stays at or below 1,500 lines. A difference in either direction fails the check. Split a baseline file and lower its entry in the same PR; never raise it.
+- **DEC-6** No file-length limit, as in upstream Tidehunter (owner, 2026-11-25). Organize
+  files by concern: one module per coherent unit (for example, the error types of a
+  subsystem in their own module). Never split or merge a file only to meet a line count.
+  Move code with cut and paste, never by retyping it.
 - **DEC-7** A hot-path change needs the local live bench at c=1, 4, and 16 with the
   no-waiting rule, 5 interleaved repeats, and p50/p99 within 3% or a written
   justification. Run it in a quiet window: load below 5, no other cargo, rustc, or dd.

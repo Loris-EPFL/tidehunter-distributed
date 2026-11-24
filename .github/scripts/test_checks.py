@@ -220,56 +220,6 @@ class TestLayoutRatchetTests(RatchetFixture):
             self.run_check()
 
 
-class FileLengthRatchetTests(RatchetFixture):
-    def lines(self, count):
-        return "fn f() {}\n" * count
-
-    def run_check(self):
-        checks.check_file_length(root=self.root, baseline_path=self.baseline)
-
-    def test_unlisted_file_within_cap_passes(self):
-        self.write(f"{DISTRIBUTED}/small.rs", self.lines(checks.FILE_LENGTH_LIMIT))
-        self.run_check()
-
-    def test_unlisted_file_over_cap_fails(self):
-        self.write(f"{DISTRIBUTED}/big.rs", self.lines(checks.FILE_LENGTH_LIMIT + 1))
-        with self.assertRaisesRegex(RuntimeError, "over the cap and not in the baseline"):
-            self.run_check()
-
-    def test_listed_equal_passes(self):
-        relative = self.write(f"{DISTRIBUTED}/big.rs", self.lines(1600))
-        self.baseline.write_text(f"{relative} 1600\n")
-        self.run_check()
-
-    def test_listed_growth_fails(self):
-        relative = self.write(f"{DISTRIBUTED}/big.rs", self.lines(1601))
-        self.baseline.write_text(f"{relative} 1600\n")
-        with self.assertRaisesRegex(RuntimeError, "grew past baseline 1600"):
-            self.run_check()
-
-    def test_shrink_requires_the_exact_baseline_line(self):
-        relative = self.write(f"{DISTRIBUTED}/big.rs", self.lines(1550))
-        self.baseline.write_text(f"{relative} 1600\n")
-        with self.assertRaisesRegex(RuntimeError, f"change the baseline line to: {relative} 1550"):
-            self.run_check()
-
-    def test_entry_within_cap_is_stale(self):
-        relative = self.write(f"{DISTRIBUTED}/big.rs", self.lines(1500))
-        self.baseline.write_text(f"{relative} 1600\n")
-        with self.assertRaisesRegex(RuntimeError, "stale baseline entry"):
-            self.run_check()
-
-    def test_vanished_file_entry_is_stale(self):
-        self.baseline.write_text(f"{DISTRIBUTED}/gone.rs 1600\n")
-        with self.assertRaisesRegex(RuntimeError, "stale baseline entry"):
-            self.run_check()
-
-    def test_missing_root_fails(self):
-        (self.root / "tidehunter-fabric/src").rmdir()
-        with self.assertRaisesRegex(RuntimeError, "ratchet root is missing"):
-            self.run_check()
-
-
 class BaselineParsingTests(RatchetFixture):
     def test_duplicate_entry_is_rejected(self):
         self.baseline.write_text("a.rs 1 1\na.rs 1 2\n")
