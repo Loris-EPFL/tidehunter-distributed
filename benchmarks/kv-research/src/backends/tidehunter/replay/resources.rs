@@ -14,6 +14,13 @@ use tidehunter::distributed::HYBRID_POSITION_ENCODED_LEN;
 //   flush per cell at a snapshot, and the run is credited with no snapshot,
 //   so all flushes of the run stay on disk. Cells of one table are assumed
 //   to hold equal shares of its rows, so a flush rewrites the average blob.
+// * Preallocated index WAL fragment: the coordinator opens its index WAL and
+//   creates the writer, which maps the writer's fragment and clears its suffix
+//   (`WalIterator::into_writer` -> `clear_fragment_from_position`). On the
+//   open path that clear covers the whole fragment, so the file's allocation
+//   is one `frag_size` however little of it holds frames; native's own writer
+//   does the same. Fragments the mapper only extends stay sparse (an unfilled
+//   extension is never zero-filled), so one fragment per database is counted.
 // * Control region: native keeps two retained generations and writes a third;
 //   each holds one fixed-size entry per cell. `REGION_BYTES_PER_CELL` bounds
 //   only a cell whose L1 is one blob. With L1 auto-sharding (Sui `TH_AUTOSHARD`,
@@ -34,6 +41,8 @@ const REGION_BYTES_PER_CELL: u64 = 256;
 const SHARD_BLOB_FLOOR_BYTES: u64 = 64 * 1024;
 const SHARD_ENTRY_FIXED_BYTES: u64 = 32;
 const REGION_GENERATIONS: u64 = 2 + 1;
+/// Index WAL fragments the coordinator's open allocates: the writer's own.
+const INDEX_WAL_FRAGMENTS: u64 = 1;
 
 fn add(a: u64, b: u64) -> BackendResult<u64> {
     a.checked_add(b)
@@ -204,16 +213,27 @@ pub(super) fn reservation(
         }
         batches = mul(batches, repetitions)?;
         encoded = mul(encoded, repetitions)?;
-        let reserve = index.total()?;
+        // Coordinator index WAL geometry of this database: an external
+        // document owns its index rows; a fixture override fills the rest from
+        // the production default, exactly as `Options::index` is applied.
+        let index_frag = match &opts.external_remote_config {
+            Some(remote) => remote.index.frag_size,
+            None => opts.index.map_or_else(
+                || tidehunter::distributed::remote_db::HybridIndexConfig::default().frag_size,
+                |geometry| geometry.frag_size,
+            ),
+        };
+        let wal_fragment = mul(INDEX_WAL_FRAGMENTS, index_frag)?;
+        let reserve = add(index.total()?, wal_fragment)?;
         total = add(total, reserve)?;
         databases.push(serde_json::json!({"db_id":db,"reservation_bytes":reserve,
             "index_live_bytes":index.live,"index_superseded_bytes":index.superseded,
-            "control_region_bytes":index.region,"cells":cells,
+            "control_region_bytes":index.region,"index_wal_fragment_bytes":wal_fragment,"cells":cells,
             "batches":batches,"encoded_batch_bytes":encoded}));
     }
     Ok(
         serde_json::json!({"reservation_bytes":total,"databases":databases,
-        "model":"[INFERENCE] coordinator index: live flat rows + every whole-cell flush of the run (no snapshot credit) + three control-region generations, each entry sized for an L1 split into at most 2 * ceil(average blob / 64 KiB) shards (assumed floor, uncalibrated); owner WAL allocation is enforced on each external owner"}),
+        "model":"[INFERENCE] coordinator index: live flat rows + every whole-cell flush of the run (no snapshot credit) + three control-region generations, each entry sized for an L1 split into at most 2 * ceil(average blob / 64 KiB) shards (assumed floor, uncalibrated) + the writer's index WAL fragment, fully allocated by the open's suffix clear (a frag_size each, not sparse); owner WAL allocation is enforced on each external owner"}),
     )
 }
 

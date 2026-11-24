@@ -72,6 +72,11 @@ fn cloud_perpetual_reservation_counts_coordinator_metadata_not_external_wal() {
         database["index_live_bytes"].as_u64().unwrap()
             + database["index_superseded_bytes"].as_u64().unwrap()
             + database["control_region_bytes"].as_u64().unwrap()
+            + database["index_wal_fragment_bytes"].as_u64().unwrap()
+    );
+    assert!(
+        database["index_wal_fragment_bytes"].as_u64().unwrap() > 0,
+        "the coordinator's open allocates its index WAL writer fragment: {database}"
     );
     assert_eq!(bound["reservation_bytes"], database["reservation_bytes"]);
     // z4m-highmem-16: one 14,000 GiB local SSD; keep the owner's 50% guard.
