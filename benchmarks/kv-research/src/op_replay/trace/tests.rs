@@ -148,21 +148,20 @@ fn read_all(bytes: &[u8]) -> BackendResult<usize> {
     read_version(bytes, 1)
 }
 
-/// Read every frame of `bytes` as a stream of `version`; the scratch file is
-/// removed before the result is returned.
+/// Read every frame of `bytes` as a stream of `version`; the guard removes the
+/// scratch tree when the call returns.
 fn read_version(bytes: &[u8], version: u32) -> BackendResult<usize> {
     let guard = scratch("corrupt")?;
     let path = guard.path().join("ops.bin");
     std::fs::write(&path, bytes)?;
-    let result = (|| {
+    (|| {
         let mut reader = Reader::open(&path, version)?;
         let mut frames = 0;
         while reader.next_frame()?.is_some() {
             frames += 1;
         }
         BackendResult::Ok(frames)
-    })();
-    result
+    })()
 }
 
 #[test]
