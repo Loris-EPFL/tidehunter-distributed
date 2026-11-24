@@ -253,3 +253,64 @@ fn public_drop_never_classifies_while_an_open_holds_the_namespace() {
     crate::distributed::sui::Db::drop_db(&plain).unwrap();
     assert!(!plain.exists());
 }
+
+/// The coordinator's database-lock wait is bounded by the configured
+/// `open_lock_retry_timeout`, not by native's call site hard-coding zero: a
+/// previous generation of this process that still holds the authority
+/// directory open makes the open wait for the configured window, and a zero
+/// window refuses at once.
+#[test]
+fn the_configured_open_lock_retry_timeout_bounds_the_authority_lock_wait() {
+    use crate::distributed::hybrid::config::HybridIndexConfig;
+    use std::time::Duration;
+
+    let temp = tempdir::TempDir::new("authority-lock-window").unwrap();
+    let target = temp.path().join("database");
+    fs::create_dir(&target).unwrap();
+    let held = DbLock::acquire(&target, Duration::ZERO).unwrap();
+
+    // A zero window is the pre-fix behaviour: refuse while the directory is held.
+    let zero = HybridIndexConfig {
+        open_lock_retry_timeout: Duration::ZERO,
+        ..HybridIndexConfig::default()
+    };
+    let error = acquire_authority_lock(&target, &zero).expect_err("held by this process");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::AlreadyExists,
+        "a zero window refuses at once: {error}",
+    );
+
+    // A configured window waits: the same lock, released from this thread while
+    // the opener retries, is granted. The opener must not have finished before
+    // the release, or the configured window was not consulted.
+    let windowed = HybridIndexConfig {
+        open_lock_retry_timeout: Duration::from_secs(30),
+        ..zero
+    };
+    let (started, started_rx) = std::sync::mpsc::sync_channel(1);
+    let path = target.clone();
+    let waiter = std::thread::spawn(move || {
+        let _ = started.send(());
+        acquire_authority_lock(&path, &windowed)
+    });
+    started_rx.recv().expect("the opener thread started");
+    // Give the opener the processor without waiting on a clock: each yield lets
+    // it run, and a zero-window implementation would have returned by now.
+    for _ in 0..10_000 {
+        if waiter.is_finished() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        !waiter.is_finished(),
+        "the wait must stay open while the directory is held",
+    );
+    drop(held);
+    let lock = waiter
+        .join()
+        .expect("the opener thread did not panic")
+        .expect("the handoff grants the lock");
+    drop(lock);
+}

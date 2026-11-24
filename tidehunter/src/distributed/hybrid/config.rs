@@ -71,7 +71,8 @@ pub struct HybridIndexConfig {
     pub relocation_batch_max_bytes: Option<usize>,
     pub index_min_occupancy_pct: u8,
     pub metrics_enabled: bool,
-    /// Coordinator database-lock acquisition, before any fence or reservation
+    /// Coordinator database-lock acquisition on the authority directory: how
+    /// long the open waits for a previous generation of this process to close
     /// (native `open_lock_retry_timeout`).
     pub open_lock_retry_timeout: Duration,
     pub index_auto_shard_threshold: Option<usize>,

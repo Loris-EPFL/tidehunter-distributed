@@ -326,6 +326,20 @@ fn provision_owners(
     Ok(())
 }
 
+/// The coordinator's database-lock wait on the authority directory.
+///
+/// `DbLock` retries while a previous generation of this process still holds the
+/// directory open, and gives up after the configured
+/// `open_lock_retry_timeout` (native `Config::open_lock_retry_timeout`, the same
+/// field native `Db::open` passes). It is distinct from the namespace lock,
+/// which is taken first and never waits.
+fn acquire_authority_lock(
+    path: &Path,
+    index: &super::super::hybrid::config::HybridIndexConfig,
+) -> Result<DbLock, LocalDbError> {
+    Ok(DbLock::acquire(path, index.open_lock_retry_timeout)?)
+}
+
 /// Lock, recover and, for a new path, provision the authority directory.
 /// Returns `NotFound` after completing a pending drop found at `path`.
 pub(super) fn open_authority(
@@ -336,7 +350,7 @@ pub(super) fn open_authority(
 ) -> Result<OpenedAuthority, LocalDbError> {
     let namespace = NamespaceGuard::acquire(path, NamespaceMode::Open)?;
     step(AuthorityStep::OpenAfterNamespace)?;
-    let lock = DbLock::acquire(namespace.target(), Duration::ZERO)?;
+    let lock = acquire_authority_lock(namespace.target(), &config.index)?;
     let path = namespace.target().to_path_buf();
     drop_tx::reap_quarantines(&path)?;
     let manifest_path = path.join(MANIFEST);
