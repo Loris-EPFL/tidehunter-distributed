@@ -29,6 +29,7 @@ mod anchor;
 mod boundary;
 mod index_blob_cache;
 mod layout;
+mod pending_promotion;
 mod shard_preload;
 mod value_cache;
 

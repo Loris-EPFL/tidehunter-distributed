@@ -1049,6 +1049,24 @@ impl<P: IndexPosition> LargeTable<P> {
         }
     }
 
+    /// Marks the row shard that holds `key` as holding work for the
+    /// event-driven promotion thread, and returns that shard.
+    ///
+    /// Native sets the flag in its batch-commit path (`apply_pending_batch`)
+    /// and unparks the owning shard's thread from `do_write_batch`. The hybrid
+    /// publishes cell by cell through [`Self::insert`], which never fills the
+    /// pending table, so it marks the shard and wakes the thread itself; without
+    /// that, a cell that crossed the flush threshold while a flush was in flight
+    /// would wait for the next write or snapshot.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn mark_pending_dirty_for(&self, context: &KsContext, key: &[u8]) -> usize {
+        let cell = context.ks_config.cell_id(key);
+        let mutex = context.ks_config.mutex_for_cell(&cell);
+        // Release/Acquire pair with `promote_dirty_pending`'s `swap(false, Acquire)`.
+        self.ks_table(&context.ks_config).pending_dirty[mutex].store(true, Ordering::Release);
+        mutex
+    }
+
     fn row(&self, context: &KsContext, k: &[u8]) -> (MutexGuard<'_, Row<P>>, CellId) {
         let cell = context.ks_config.cell_id(k);
         let mutex = context.ks_config.mutex_for_cell(&cell);

@@ -48,11 +48,11 @@ use super::region::{
     max_region_cells,
 };
 use super::snapshot::{self, StoredSnapshot};
-use crate::background_health::BackgroundHealth;
+use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::cell::CellId;
 use crate::container::LargeTableContainer;
 use crate::context::KsContext;
-use crate::db::CONTROL_REGION_FILE;
+use crate::db::{CONTROL_REGION_FILE, DbError};
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::hybrid::loader::KsContextVec;
 use crate::distributed::remote_db::StreamControls;
@@ -66,7 +66,7 @@ use crate::index_blob_cache::IndexBlobCache;
 use crate::iterators::IteratorResult;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{CellUpdateError, GetResult, LargeTable, Loader, SnapshotEntryData};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, TimerExt};
 use crate::wal::layout::WalKind;
 use crate::wal::position::{IndexCut, IndexEntryKind, IndexPosition, WalPosition};
 use crate::wal::tracker::SharedLastProcessed;
@@ -80,6 +80,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
+use std::thread;
 
 /// One published member: what the write path inserts, and where its value is.
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +180,10 @@ pub(crate) struct TableInner {
     /// generation, so a non-zero value is a broken invariant that stays
     /// visible instead of silently dropping the row. Relaxed: diagnostic only.
     older_rows_without_end: AtomicU64,
+    /// Event-driven promotion threads, one per mutex shard, registered by the
+    /// opener (native `Db::pending_promotion_threads`). `len()` is the shard
+    /// count publication hashes against.
+    pending_promotion_threads: Box<[OnceLock<thread::Thread>]>,
     /// See [`HybridTable::set_after_pin_sample`].
     #[cfg(test)]
     after_pin_sample: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -321,6 +326,9 @@ impl HybridTable {
             streams: OnceLock::new(),
             latch_deferrals: AtomicU64::new(0),
             older_rows_without_end: AtomicU64::new(0),
+            pending_promotion_threads: (0..config.num_pending_promotion_threads.max(1))
+                .map(|_| OnceLock::new())
+                .collect(),
             #[cfg(test)]
             after_pin_sample: Mutex::new(None),
             #[cfg(test)]
@@ -334,6 +342,17 @@ impl HybridTable {
             Arc::downgrade(&inner),
             metrics,
         ));
+        // Register the promotion threads before the open returns, as native
+        // `Db::open` does: the first publication must never miss a wakeup
+        // because a worker had not registered yet.
+        let num_shards = inner.pending_promotion_threads.len();
+        for shard_idx in 0..num_shards {
+            let handle =
+                start_pending_promotion_job(Arc::downgrade(&inner), shard_idx, num_shards)?;
+            inner.pending_promotion_threads[shard_idx]
+                .set(handle.thread().clone())
+                .map_err(|_| LocalDbError::new("pending-promotion thread registered twice"))?;
+        }
         Ok(Self { inner })
     }
 
@@ -1096,6 +1115,8 @@ impl TableInner {
             )));
         }
         self.cuts.add_bytes(value_bytes);
+        let shards = self.pending_promotion_threads.len();
+        let mut wake = vec![false; shards];
         for mutation in mutations {
             let context = self.contexts.ks_context(mutation.keyspace);
             let key = Bytes::copy_from_slice(mutation.key);
@@ -1103,7 +1124,7 @@ impl TableInner {
             match (mutation.kind, mutation.value) {
                 (RecordKind::Put, Some(value)) => self.table.insert(
                     context,
-                    reduced,
+                    reduced.clone(),
                     key,
                     mutation.position,
                     value,
@@ -1116,8 +1137,17 @@ impl TableInner {
                 }
                 (RecordKind::Delete, _) => {
                     self.table
-                        .remove(context, reduced, mutation.position, self.loader.as_ref())?;
+                        .remove(context, reduced.clone(), mutation.position, self.loader.as_ref())?;
                 }
+            }
+            let mutex = self.table.mark_pending_dirty_for(context, &reduced);
+            wake[mutex % shards] = true;
+        }
+        // Native unparks the shards its batch's mutex shards hash to; the hybrid
+        // publishes cell by cell, so it does the same for every touched shard.
+        for (shard, touched) in wake.iter().enumerate() {
+            if *touched && let Some(worker) = self.pending_promotion_threads[shard].get() {
+                worker.unpark();
             }
         }
         Ok(())
@@ -1314,6 +1344,75 @@ impl FlusherHost<VersionPosition> for TableInner {
     fn background_health(&self) -> Arc<BackgroundHealth> {
         self.health.clone()
     }
+}
+
+impl Drop for TableInner {
+    fn drop(&mut self) {
+        // The parked promotion threads hold only a `Weak`; wake each so it can
+        // observe the dead table and exit, as native `Db::drop` does.
+        for slot in self.pending_promotion_threads.iter() {
+            if let Some(thread) = slot.get() {
+                thread.unpark();
+            }
+        }
+    }
+}
+
+/// Starts the event-driven promotion thread of one mutex shard (native
+/// `Db::start_pending_promotion_job`). It parks until a publication that
+/// touched the shard unparks it, then promotes and checks the flush threshold
+/// of every cell in the shard.
+///
+/// The thread holds the table only for one pass, so a dropped table lets it
+/// exit; the opener registered the handle before returning so the first
+/// publication cannot miss the wakeup.
+fn start_pending_promotion_job(
+    table: std::sync::Weak<TableInner>,
+    shard_idx: usize,
+    num_shards: usize,
+) -> Result<thread::JoinHandle<()>, LocalDbError> {
+    let health = Arc::clone(
+        &table
+            .upgrade()
+            .ok_or_else(|| LocalDbError::new("table dropped before its workers started"))?
+            .health,
+    );
+    thread::Builder::new()
+        .name(format!("pending-promotion-{shard_idx}"))
+        .spawn(move || {
+            health.run(BackgroundThread::PendingPromotion, || {
+                loop {
+                    thread::park();
+                    let Some(table) = table.upgrade() else { break };
+                    let _timer = table
+                        .metrics
+                        .pending_promotion_job_time_mcs
+                        .clone()
+                        .mcs_timer();
+                    if let Err(error) =
+                        table
+                            .table
+                            .promote_dirty_pending(table.as_ref(), shard_idx, num_shards)
+                    {
+                        // `BackgroundHealth::record_error` speaks native `DbError`;
+                        // the hybrid error carries the same kind and text.
+                        let failure = DbError::Io(std::io::Error::new(
+                            error.kind(),
+                            error.message().to_owned(),
+                        ));
+                        table
+                            .health
+                            .record_error(BackgroundThread::PendingPromotion, &failure);
+                        eprintln!("Error in hybrid pending promotion job: {error:?}");
+                    }
+                }
+            });
+        })
+        .map_err(|error| {
+            LocalDbError::new(format!(
+                "start pending-promotion thread {shard_idx}: {error}"
+            ))
+        })
 }
 
 #[cfg(test)]
