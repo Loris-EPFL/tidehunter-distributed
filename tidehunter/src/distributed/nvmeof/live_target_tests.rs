@@ -636,6 +636,45 @@ fn write_protect_commissions_one_controller_per_subsystem() {
 }
 
 #[test]
+fn write_protect_seals_only_the_named_namespaces_of_a_subsystem() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let sealed = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let second_file = f.extra_wal("wal-1");
+    let writable = manager
+        .export_permanent(&f.name(1), second_file.clone(), false)
+        .unwrap();
+    assert_eq!(
+        sealed.nqn, writable.nqn,
+        "both exports must share one subsystem"
+    );
+    manager
+        .write_protect(std::slice::from_ref(&sealed))
+        .unwrap();
+    let subsystem = f.configfs.join("subsystems").join(&sealed.nqn);
+    assert_eq!(
+        attribute(&subsystem.join("namespaces/1/write_protect")).unwrap(),
+        "1",
+        "the sealed namespace is write-protected"
+    );
+    assert_eq!(
+        optional_attribute(&subsystem.join("namespaces/2/write_protect")).unwrap(),
+        None,
+        "the writable namespace in the same subsystem stays untouched"
+    );
+    let again = manager
+        .export_permanent(&f.name(1), second_file, false)
+        .unwrap();
+    assert!(
+        !again.readonly,
+        "an unsealed namespace in a fenced subsystem stays writable"
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn inode_reuse_on_different_wal_path_does_not_match_marker() {
     let f = Fixture::new();
     let mut manager = f.open().unwrap();
