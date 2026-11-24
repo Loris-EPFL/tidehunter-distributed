@@ -29,6 +29,17 @@ fn record_lease_reservations(
     accounting.record_allocation_cap_hits(queue.cap_hits());
 }
 
+/// The stage a leased write failure belongs to. A resume that refused or
+/// failed names `live_resume`, so an operator can tell a broken link from a
+/// broken frame in the first-failure record.
+fn leased_failure_stage(client: &mut Client, stage: &'static str) -> &'static str {
+    if client.take_resume_failure() {
+        "live_resume"
+    } else {
+        stage
+    }
+}
+
 impl ClientWorker {
     #[allow(
         clippy::too_many_arguments,
@@ -270,15 +281,31 @@ impl ClientWorker {
                             leased_failure_stage = "leased_adoption";
                             if client.leased_adoption_pending() {
                                 client.progress_session()?;
-                                client.harvest_leased_adoption()?;
+                                // A refusal here is the owner's verdict and
+                                // still fails the database; a transport break
+                                // resumes inside the step.
+                                client.leased_step(
+                                    crate::distributed::tcp::BreakKind::Session,
+                                    |client| client.harvest_leased_adoption(),
+                                )?;
                             }
                             if matches!(queued.front(), Some(WorkerItem::Append(..)) | None) {
-                                client.submit_leased_adoption()?;
+                                client.leased_step(
+                                    crate::distributed::tcp::BreakKind::Session,
+                                    |client| client.submit_leased_adoption(),
+                                )?;
                             }
                             Ok::<(), crate::distributed::tcp::TcpError>(())
                         })();
                         if let Err(error) = result {
                             client.record_live_write_error();
+                            // A failed write resume names its own stage, so the
+                            // runbook can tell a broken link from a broken frame.
+                            let leased_failure_stage = if client.take_resume_failure() {
+                                "live_resume"
+                            } else {
+                                leased_failure_stage
+                            };
                             // Every frame still in flight has an unknown outcome.
                             record_first_failure(
                                 &first_failure,
@@ -390,11 +417,12 @@ impl ClientWorker {
                             Err(error) => {
                                 deferred = Some((epoch, Vec::new(), members));
                                 client.record_live_write_error();
+                                let stage = leased_failure_stage(&mut client, "live_group");
                                 record_first_failure(
                                     &first_failure,
                                     Some(partition),
                                     None,
-                                    "live_group",
+                                    stage,
                                     &error,
                                 );
                                 failure.store(true, std::sync::atomic::Ordering::Release);
@@ -414,6 +442,7 @@ impl ClientWorker {
                         worker_queue.unpark();
                         if let Err(error) = waited {
                             client.record_live_write_error();
+                            let stage = leased_failure_stage(&mut client, "live_group");
                             record_first_failure(
                                 &first_failure,
                                 Some(partition),
@@ -421,7 +450,7 @@ impl ClientWorker {
                                     &leased_replies,
                                     deferred.as_ref().map(|(_, _, members)| members),
                                 ),
-                                "live_group",
+                                stage,
                                 &error,
                             );
                             failure.store(true, std::sync::atomic::Ordering::Release);
@@ -602,11 +631,12 @@ impl ClientWorker {
                                 Err(error) => {
                                     deferred = Some((epoch, Vec::new(), members));
                                     client.record_live_write_error();
+                                    let stage = leased_failure_stage(&mut client, "live_group");
                                     record_first_failure(
                                         &first_failure,
                                         Some(partition),
                                         Some(first),
-                                        "live_group",
+                                        stage,
                                         &error,
                                     );
                                     failure.store(true, std::sync::atomic::Ordering::Release);
@@ -792,11 +822,12 @@ impl ClientWorker {
                                 client.close_leased_extent(&mut released, Some(&write_timeline))
                         {
                             client.record_live_write_error();
+                            let stage = leased_failure_stage(&mut client, "leased_close");
                             record_first_failure(
                                 &first_failure,
                                 Some(partition),
                                 None,
-                                "leased_close",
+                                stage,
                                 &error,
                             );
                             // Release publishes the fatal outcome to the authority.

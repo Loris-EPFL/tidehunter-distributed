@@ -219,7 +219,14 @@ counter_fields!(
     leased_submit_ready_left_full,
     leased_submit_ready_left_full_batches,
     /// Submissions of a group that an earlier attempt deferred for credit.
-    leased_deferred_submits;
+    leased_deferred_submits,
+    /// Write-resume episodes (W1): every attempt past the decision checks, the
+    /// attempts that rewrote at least one frame, the frames they rewrote, and
+    /// the attempts a decision check refused.
+    resume_attempts,
+    resume_rewrites,
+    resume_frames,
+    resume_refused;
     max:
     // Peak over each producer's lifetime; aggregation keeps the largest peak.
     max_leased_in_flight,
@@ -406,6 +413,22 @@ impl LiveNvmeCounters {
     pub fn record_extent_lease(&self) {
         // Relaxed: evidence only, not an allocation publication.
         self.extents_leased.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One write-resume attempt that reached the reconnect (W1).
+    pub(crate) fn record_resume_attempt(&self) {
+        // Relaxed: evidence only, not a stream ordering barrier.
+        self.resume_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One resume that rewrote `frames` retained frames.
+    pub(crate) fn record_resume_rewrite(&self, frames: u64) {
+        // Relaxed: evidence only; the CQEs establish completion.
+        self.resume_rewrites.fetch_add(1, Ordering::Relaxed);
+        self.resume_frames.fetch_add(frames, Ordering::Relaxed);
+    }
+    /// One resume refused by a decision check or by its budget.
+    pub(crate) fn record_resume_refused(&self) {
+        // Relaxed: evidence only, not a failure publication.
+        self.resume_refused.fetch_add(1, Ordering::Relaxed);
     }
     pub(crate) fn record_extent_prelease(&self) {
         // Relaxed: grant evidence, not publication of the writer state.

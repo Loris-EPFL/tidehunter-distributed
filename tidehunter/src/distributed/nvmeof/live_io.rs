@@ -179,6 +179,13 @@ pub struct LiveIo {
     #[cfg(test)]
     next_completion_result: Option<i32>,
     #[cfg(test)]
+    next_submit_result: Option<i32>,
+    /// `(offset, len)` of every accepted write, in submission order. Test only:
+    /// a resume test proves where a rewrite landed.
+    #[cfg(test)]
+    submitted_writes: Vec<(u64, usize)>,
+    /// Errno of the latest completed namespace write when that write failed.
+    /// A resume classifies a break from it, so it is recorded in production.
     last_write_errno: Option<i32>,
     #[cfg(test)]
     held_ids: Vec<u64>,
@@ -238,6 +245,9 @@ impl LiveIo {
             #[cfg(test)]
             next_completion_result: None,
             #[cfg(test)]
+            next_submit_result: None,
+            #[cfg(test)]
+            submitted_writes: Vec::new(),
             last_write_errno: None,
             #[cfg(test)]
             held_ids: Vec::new(),
@@ -336,9 +346,20 @@ impl LiveIo {
     pub(crate) fn override_completion_result(&mut self, id: u64, result: i32) {
         self.completion_results.push((id, result));
     }
-    #[cfg(test)]
+    /// Errno of the last completed namespace write, when it failed. Read by the
+    /// write resume to decide whether a lost write is a transport break.
     pub(crate) fn last_write_errno(&self) -> Option<i32> {
         self.last_write_errno
+    }
+    /// Test only: fail the next submission with `errno`, before any SQE.
+    #[cfg(test)]
+    pub(crate) fn override_submit_result(&mut self, errno: i32) {
+        self.next_submit_result = Some(errno);
+    }
+    /// Test only: `(offset, len)` of every accepted write, in order.
+    #[cfg(test)]
+    pub(crate) fn submitted_writes(&self) -> &[(u64, usize)] {
+        &self.submitted_writes
     }
     pub fn stats(&self) -> LiveIoStats {
         self.stats.clone()
@@ -544,6 +565,11 @@ impl LiveIo {
     pub fn write_buffer(&mut self, len: usize) -> Result<LiveWriteBuffer<'_>, LiveIoError> {
         if self.closed || self.fatal_at.is_some() {
             return Err(LiveIoError::Invalid("queue closed"));
+        }
+        #[cfg(test)]
+        if let Some(errno) = self.next_submit_result.take() {
+            self.stats.errors += 1;
+            return Err(LiveIoError::Io(io::Error::from_raw_os_error(errno)));
         }
         if self.namespace.access != LiveNamespaceAccess::ReadWrite {
             return Err(LiveIoError::Invalid("namespace is read only"));
@@ -762,6 +788,10 @@ impl LiveIo {
                 }
             };
             entries.push((entry, token));
+            #[cfg(test)]
+            if data.is_some() && !flush {
+                self.submitted_writes.push((offset, len));
+            }
             prepared.push((
                 token,
                 Operation {
@@ -1026,8 +1056,9 @@ impl LiveIo {
             if let (Some(trace), Some(queue)) = (&req.trace, self.trace_queue) {
                 trace.event_io("live_io_cqe_observed", queue, user_data);
             }
-            #[cfg(test)]
             if write {
+                // A successful write clears the record, so the value always
+                // names the latest write's outcome and never an older failure.
                 self.last_write_errno = (result < 0).then_some(-result);
             }
             #[cfg(test)]

@@ -903,6 +903,13 @@ const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
     "failed_write_ops",
     "short_write_ops",
     "short_write_bytes",
+    // W1 write resume: attempts past the decision checks, attempts that rewrote
+    // at least one frame, the frames they rewrote, and refused attempts. All are
+    // monotonic event counts (`fetch_add` in live_metrics.rs), not gauges.
+    "resume_attempts",
+    "resume_rewrites",
+    "resume_frames",
+    "resume_refused",
 ];
 /// Lifetime maxima of `LiveNvmeCounts`: gauge peaks recorded at both boundaries, never deltas.
 const LIVE_NVMEOF_PEAK_FIELDS: &[&str] = &[
@@ -6822,6 +6829,10 @@ mod tests {
             "adopt_profile_samples",
             "extent_preleases",
             "extent_switch_waits",
+            "resume_attempts",
+            "resume_rewrites",
+            "resume_frames",
+            "resume_refused",
         ] {
             stats[name] = serde_json::json!(0);
         }

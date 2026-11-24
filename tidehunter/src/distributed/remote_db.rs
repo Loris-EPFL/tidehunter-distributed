@@ -176,6 +176,14 @@ pub struct RemoteDatabaseConfig {
     /// means 5000.
     #[serde(default = "coordinator_lease::default_ms")]
     pub coordinator_lease_ms: u32,
+    /// Resume a leased write after a transient connection break to an owner
+    /// that kept running, instead of failing the whole database (W1). The
+    /// owner must have the same incarnation and a valid coordinator lease, so
+    /// a restart or a lapse still fails the database and the application
+    /// reopens it. Absent means `true`: the change adds no property and removes
+    /// an accidental fail-stop, and `false` restores the old determinism.
+    #[serde(default = "default_resume_transient_writes")]
+    pub resume_transient_writes: bool,
     /// The leased live owner-WAL NVMe-oF route; required. Remote databases have
     /// no other data path.
     pub live_nvme: super::tcp::LiveClientConfig,
@@ -192,6 +200,9 @@ pub struct RemoteDatabaseConfig {
     pub index: HybridIndexConfig,
 }
 
+fn default_resume_transient_writes() -> bool {
+    true
+}
 fn default_max_pending_reads() -> usize {
     256
 }
@@ -857,6 +868,9 @@ pub struct RemoteDatabase {
     /// Coordinator lease renewers, one per owner. Dropped after
     /// `Drop::drop` stopped and joined them.
     lease: coordinator_lease::CoordinatorLease,
+    /// The one DMA reaper of detached live write queues (W1), joined by
+    /// `Drop::drop`.
+    resume_reaper: super::tcp::ResumeReaper,
     // The shared core joins every worker before this directory lock is dropped.
     _lock: DbLock,
 }
@@ -1370,6 +1384,12 @@ impl RemoteDatabase {
         let (cut_record, recovered_cut) = cut_plan.finish(epoch, tracked, &owner_fences);
         recovery_stats.recovered_cut = recovered_cut;
         recovery_stats.tail_replay_ns = elapsed(replay_started);
+        // W1: one thread per database retires a queue a resume detached. It
+        // starts before the workers so no resume can find the channel closed.
+        let resume_reaper = super::tcp::ResumeReaper::start(config.endpoints.len())
+            .map_err(LocalDbError::component)?;
+        let resume_sender = resume_reaper.sender();
+        let resume_writes = config.resume_transient_writes;
         let mut workers = Vec::new();
         let write_profile = Arc::new(Mutex::new(WriteProfileSnapshot {
             limit_per_connection: config.write_profile_limit,
@@ -1390,8 +1410,9 @@ impl RemoteDatabase {
             4096,
             config.max_pending_batches,
         );
-        for client in clients {
+        for mut client in clients {
             let partition = config.endpoints[workers.len()].partition;
+            client.set_resume_writes(resume_writes, resume_sender.clone());
             let worker = ClientWorker::start(
                 client,
                 config
@@ -1626,6 +1647,7 @@ impl RemoteDatabase {
             core,
             reader,
             lease,
+            resume_reaper,
             _lock: lock,
         };
         // Offline fencing-generation maintenance (L1): no handle escaped, no
@@ -2259,6 +2281,10 @@ impl RemoteDatabase {
 impl Drop for RemoteDatabase {
     fn drop(&mut self) {
         let _ = self.shutdown();
+        // The clients that hand queues over live in `core`, which drops after
+        // this function, so the reaper stops on its flag rather than on a
+        // closed channel. A queue already received is drained first.
+        self.resume_reaper.finish();
     }
 }
 
