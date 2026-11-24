@@ -58,8 +58,10 @@ pub(super) fn configure(config: &mut RemoteDatabaseConfig, profile: LeasedCase) 
         },
         leased_flush_min_frame_bytes: LiveClientConfig::default_leased_flush_min_frame_bytes(),
         max_inflight_bytes: 4 * 1024 * 1024,
-        connect_timeout_ms: 5000,
-        io_timeout_ms: 5000,
+        // The fixture shares CPU and disk with every other test process: this
+        // is the module's progress cap as a hang guard, not a latency premise.
+        connect_timeout_ms: PROGRESS_CAP.as_millis() as u64,
+        io_timeout_ms: PROGRESS_CAP.as_millis() as u64,
         leased_durability: if profile.synchronous {
             DurabilityTier::Synchronous
         } else {

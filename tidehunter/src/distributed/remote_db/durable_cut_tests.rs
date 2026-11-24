@@ -5,11 +5,11 @@
 use super::durable_cut::RECORD;
 use super::pipeline_tests::Fixture;
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use crate::key_shape::KeyType;
 
 /// No nudge can fire during a test: the cut moves only by flush or report.
 const QUIET_LAG_MS: u64 = 3_600_000;
-const WAIT: Duration = Duration::from_secs(30);
 
 fn fixture(owners: usize, durable_cut: DurableCutConfig) -> Fixture {
     Fixture::new_with_root(
@@ -425,7 +425,7 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
     let persisted = cut.persisted_events();
     db.write_batch(fixture.operation(0, 1), vec![put(1, 1)])
         .unwrap();
-    assert_eq!(persisted.recv_timeout(WAIT).unwrap(), 1);
+    assert_eq!(persisted.recv_timeout(PROGRESS_CAP).unwrap(), 1);
     let warm = db.durable_cut_stats();
     assert_eq!(warm.persisted_next, 1);
     assert!(warm.nudges >= 1);
@@ -434,11 +434,11 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
         .pause_next_persist();
     db.write_batch(fixture.operation(0, 2), vec![put(2, 2)])
         .unwrap();
-    entered.recv_timeout(WAIT).unwrap();
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     assert!(persisted.try_recv().is_err(), "cut moved before the sync");
     assert!(db.durable_cut_stats().nudges > warm.nudges);
     resume.send(()).unwrap();
-    assert_eq!(persisted.recv_timeout(WAIT).unwrap(), 2);
+    assert_eq!(persisted.recv_timeout(PROGRESS_CAP).unwrap(), 2);
     let stats = db.durable_cut_stats();
     assert_eq!(stats.persisted_next, 2);
     assert!(stats.reports > warm.reports);
