@@ -105,6 +105,7 @@ impl Fixture {
             Metrics::new(),
             SharedLastProcessed::default(),
             &loader,
+            Arc::default(),
         );
         Self { table, loader }
     }
@@ -155,6 +156,7 @@ fn empty_cell_is_absent_and_is_not_touched() {
         Metrics::new(),
         SharedLastProcessed::default(),
         &loader,
+        Arc::default(),
     );
     let context = table.ks_context(KeySpace::first());
     let cell = context.ks_config.cell_id(&key(1));
@@ -368,6 +370,7 @@ impl InFlight {
             Metrics::new(),
             SharedLastProcessed::default(),
             &loader,
+            Arc::default(),
         );
         let (notify, waiting) = mpsc::channel();
         let first_wait = AtomicBool::new(true);

@@ -209,6 +209,7 @@ impl Db {
             metrics.clone(),
             last_processed.clone(),
             indexes.as_ref(),
+            background_health.clone(),
         );
         let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position().as_u64())?;
         let wal_writer = crate::wal_replay::replay_wal(
@@ -613,6 +614,7 @@ impl Db {
         v: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -657,6 +659,7 @@ impl Db {
         k: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -684,6 +687,7 @@ impl Db {
         result
     }
     pub fn insert(&self, ks: KeySpace, k: impl Into<Bytes>, v: impl Into<Bytes>) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -703,6 +707,7 @@ impl Db {
     }
 
     pub fn remove(&self, ks: KeySpace, k: impl Into<Bytes>) -> DbResult<()> {
+        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -832,6 +837,7 @@ impl Db {
         from_inclusive: &[u8],
         to_inclusive: &[u8],
     ) -> DbResult<()> {
+        self.check_background_health()?;
         let ksd = self.key_shape.ks(ks);
 
         // Convert keys from user format to index format
@@ -856,7 +862,7 @@ impl Db {
 
         let context = self.ks_context(ks);
         self.large_table
-            .drop_cells_in_range(context, &from_cell, &to_cell);
+            .drop_cells_in_range(context, &from_cell, &to_cell)?;
         drop(guard);
 
         Ok(())
@@ -886,10 +892,11 @@ impl Db {
     /// frames. Like [`Db::drop_cells_in_range`], this intentionally does
     /// not preserve data for held checkpoints.
     pub fn destroy_key_space(&self, name: &str) -> DbResult<()> {
+        self.check_background_health()?;
         let Some(ks) = self.tombstone_key_space(name)? else {
             return Ok(());
         };
-        self.large_table.drop_all_cells(self.ks_context(ks));
+        self.large_table.drop_all_cells(self.ks_context(ks))?;
         Ok(())
     }
 
@@ -941,6 +948,7 @@ impl Db {
     }
 
     pub(crate) fn do_write_batch(&self, batch: WriteBatch) -> DbResult<()> {
+        self.check_background_health()?;
         let WriteBatch {
             transaction,
             mut writes,
@@ -1591,6 +1599,7 @@ impl Db {
     /// Native asynchronous acknowledgement remains unchanged.
     #[cfg(feature = "experimental-distributed")]
     pub fn persist_value_wal_for_benchmark(&self) -> DbResult<()> {
+        self.check_background_health()?;
         self.wal.persist_registered_files()?;
         Ok(())
     }
@@ -1617,6 +1626,7 @@ impl Db {
         &self,
         profile: &mut ValueWalPersistenceProfile,
     ) -> DbResult<()> {
+        self.check_background_health()?;
         self.wal.persist_registered_files_profiled(profile)?;
         Ok(())
     }
@@ -1690,6 +1700,7 @@ impl Db {
     }
 
     pub fn force_rebuild_control_region(&self) -> DbResult<u64> {
+        self.check_background_health()?;
         // Wait for the async WAL tracker to catch up so all recent writes are included in the snapshot.
         self.wal_writer.wal_tracker_barrier();
         self.rebuild_control_region_from(self.wal_writer.position())
@@ -1701,6 +1712,7 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
+        self.check_background_health()?;
         // Capture index writer position before pass 1 so files created by the
         // pass-1 flushes (and pass-2 force-relocations) are excluded from the
         // relocation candidate set built from the accumulator.
@@ -1961,6 +1973,7 @@ impl Db {
 
     /// Create a snapshot of the current db state
     pub fn create_state_snapshot(&self, snapshot_path: PathBuf) -> DbResult<()> {
+        self.check_background_health()?;
         let guard = self.control_region_store.lock();
         let control_region_path = guard.path().clone();
         drop(guard);
@@ -2644,6 +2657,10 @@ impl From<bincode::Error> for DbError {
 #[cfg(test)]
 #[path = "db_tests/generated.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db_tests/test_background_health.rs"]
+mod background_health_tests;
 
 #[cfg(all(test, feature = "experimental-distributed"))]
 #[path = "db_tests/test_decode_record.rs"]
