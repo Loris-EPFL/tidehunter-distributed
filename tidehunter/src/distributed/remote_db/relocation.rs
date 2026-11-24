@@ -195,6 +195,11 @@ struct Cursor {
     start: Option<u64>,
     /// Set once nothing more will be fetched.
     upper: Option<u64>,
+    /// True when a scanned batch's version is at or above the scan cut `Q`:
+    /// native's scan stops at its first record at or above its upper limit.
+    /// A stream that ends without one ended at its durable end, where native
+    /// reaches `EndOfWal` and stops with terminal 0.
+    above_cut: bool,
 }
 
 /// One value copy for the serving generation: full key, value and the logical
@@ -301,6 +306,7 @@ impl ConcurrentRemoteDatabase {
                 buffer: VecDeque::new(),
                 start: None,
                 upper: None,
+                above_cut: false,
             })
             .collect();
         let mut clients = self.relocation_clients()?;
@@ -936,6 +942,7 @@ impl ConcurrentRemoteDatabase {
             for batch in page.batches {
                 if batch.version > q {
                     cursor.upper = Some(batch.address.offset);
+                    cursor.above_cut = true;
                     break;
                 }
                 cursor.buffer.push_back(batch);
@@ -984,7 +991,15 @@ fn stream_reports(
             // there, as the native clean tail does: the leased scan only
             // completes adopted groups, so no torn frame lies below.
             let ended = || processed_upper;
+            // No `Stop` and no record at or above `Q` anywhere in the scan:
+            // native's scan reaches `EndOfWal` and leaves the terminal at 0, so
+            // the pass performs no stripe (no copy, no cutoff, no retirement).
+            // The clean tail only becomes a terminal once some stream stopped
+            // at a record at or above `Q`, which is the position native stops
+            // at when its frontier lags the written data.
+            let no_stop = stop.is_none() && !cursors.iter().any(|cursor| cursor.above_cut);
             let terminal_position = match stop {
+                _ if no_stop => 0,
                 Some((stream, _, offset)) if stream == index => offset,
                 // Every unconsumed head is after the Stop in logical order, so
                 // this stream stops at its first record, the position native's

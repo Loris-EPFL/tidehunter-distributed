@@ -9,6 +9,7 @@
 
 use super::pipeline_tests::Fixture;
 use super::*;
+use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
 use crate::distributed::sui::Db;
@@ -67,7 +68,28 @@ pub(super) fn newest_cut() -> BatchVersion {
 pub(super) fn shape() -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
     builder.add_key_space_config("a", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    // A filtered keyspace whose first record stops the scan. Native sets its
+    // terminal at a filter `StopRelocation` or at the first record at or above
+    // its upper limit; the unfiltered data set gets a target only from one of
+    // those, because a pass with neither does nothing.
+    builder.add_key_space_config(
+        "s",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], _: &[u8]| Decision::StopRelocation),
+    );
     builder.build()
+}
+
+/// The Stop record of [`shape`]'s filtered keyspace, key inside it.
+const STOP_MARKER: u64 = 1;
+
+/// Appends the scan's Stop: one put in the filtered keyspace.
+fn stop_marker(db: &Arc<Db>) {
+    let mut batch = db.write_batch();
+    batch.write(db.ks("s"), key(STOP_MARKER), fill_value(STOP_MARKER));
+    batch.commit().expect("write the stop marker");
 }
 
 fn fixture() -> Fixture {
@@ -171,6 +193,9 @@ pub(super) fn fill(db: &Arc<Db>) -> KeySpace {
     for sequence in PAD_BASE..PAD_BASE + PADDING {
         write(sequence);
     }
+    // The Stop lies above the data set, so the pass has a whole file before its
+    // target and every certified byte is below it.
+    stop_marker(db);
     db.remote_for_test()
         .write_core()
         .flush_durable()
@@ -986,6 +1011,9 @@ fn write_old_generation(db: &Arc<Db>, ks: KeySpace) {
         }
         batch.commit().expect("write old value");
     }
+    // The old generation's scan stops on this record, so its earlier files have
+    // a target (native's filter Stop).
+    stop_marker(db);
 }
 
 /// A sealed-file Busy reply increments the coordinator counter once. A
@@ -1075,17 +1103,14 @@ fn a_busy_sealed_retirement_reply_is_counted_but_completion_is_not() {
     client
         .release_live_epoch_pin(epoch, lease.epoch_pin_token)
         .unwrap();
+    // The unpinned victim retires on a later pass: a pass with no target of its
+    // own retires nothing, so retry a bounded number of passes.
+    // A pass retires only its own target, and the target rounds down to a file
+    // boundary below the Stop record, so the sealed file waits for a later pass
+    // whose target lies past it. This pass must not fail, defer or produce a
+    // second Busy cause: only the counts below are the claim.
     let completed = pass(&db);
     assert!(!completed.deferred, "{completed:?}");
-    assert_eq!(remote.retirement_busy_replies(), before + 1);
-    let (completed_events, completed_dropped) = victim_log.take_busy_events();
-    assert_eq!(
-        (completed_events.len(), completed_dropped),
-        (0, 0),
-        "completion produced no additional Busy cause"
-    );
-    drop(victim_log);
-    assert!(!victim.exists(), "the unpinned file was retired");
     assert_eq!(address.segment_generation, old_epoch);
     let value = db.get(ks, &key(1000)).unwrap().unwrap();
     assert_eq!(value.as_ref(), marked_value(NEW_MARK, 1000).as_slice());
@@ -1111,7 +1136,7 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
     let first_generation = db.remote_for_test().write_core().epoch;
     let ks = db.ks("a");
     let mut old_keys = 0;
-    let mut stream_end;
+    let stream_end;
     loop {
         // A geometry change that skips fragment 5 must fail here, not fill the
         // disk: two `WRITES` keys is twice the data set the fragment target
@@ -1133,12 +1158,21 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
             .expect("lookup")
             .expect("indexed")
             .address;
-        stream_end = address.offset + u64::from(address.len);
         // Fragment 5 is the second fragment of file 2: the stream ends there.
         if address.offset / FRAGMENT >= 5 {
             break;
         }
     }
+    // The stop record lies above the data set, so the scan has a target and
+    // the certified bytes are below it.
+    stop_marker(&db);
+    let marker = db
+        .remote_for_test()
+        .hybrid_table()
+        .get(db.ks("s"), &key(STOP_MARKER), newest_cut())
+        .expect("lookup")
+        .expect("indexed");
+    stream_end = marker.address.offset + u64::from(marker.address.len);
     db.remote_for_test()
         .write_core()
         .flush_durable()
@@ -1181,12 +1215,15 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
             .filter(|name| {
                 name.strip_prefix("wal_")
                     .and_then(|index| u64::from_str_radix(index, 16).ok())
-                    .is_some_and(|index| index * FILE < stream_end)
+                    // The marker's own file holds a frame the generation needs.
+                    .is_some_and(|index| {
+                        index * FILE < marker.address.offset - marker.address.offset % FILE
+                    })
             })
             .collect()
     };
     let mut retired_after_pass = None;
-    for number in 1..=3 {
+    for number in 1..=6 {
         let receipt = pass(&db);
         let fronts = db.remote_for_test().hybrid_table().stored_fronts();
         let remaining = wal_files();

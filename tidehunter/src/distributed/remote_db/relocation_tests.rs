@@ -833,128 +833,253 @@ fn assert_state(
 #[test]
 fn one_owner_matches_native_gate_callbacks_frontiers_and_state() {
     const WRITES: u64 = 130;
-    for decisions in [Decisions::RemoveOnly, Decisions::KeepAfterRemoves] {
-        let case = format!("{decisions:?}");
-        let leased_policy = Policy::new();
-        let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
-        let leased = fixture.open();
-        let native_policy = Policy::new();
-        let native_root = tempdir::TempDir::new("r1-native-parity").unwrap();
-        let config = native_config(WRITES);
-        let native = open_native(native_root.path(), &native_policy, &config);
-        let a = leased.ks("a");
-        for db in [&leased, &native] {
-            for sequence in 0..WRITES {
-                write(db, sequence, &[a, a]);
+    for member in [0u8, 1] {
+        for decisions in [Decisions::RemoveOnly, Decisions::KeepAfterRemoves] {
+            let case = format!("{decisions:?} stop member {member}");
+            let leased_policy = Policy::new();
+            let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
+            let leased = fixture.open();
+            let native_policy = Policy::new();
+            let native_root = tempdir::TempDir::new("r1-native-parity").unwrap();
+            let config = native_config(WRITES);
+            let native = open_native(native_root.path(), &native_policy, &config);
+            let a = leased.ks("a");
+            for db in [&leased, &native] {
+                for sequence in 0..WRITES {
+                    write(db, sequence, &[a, a]);
+                }
             }
-        }
-        // Paper 3.1/4.4: the leased pass scans the durable processed
-        // prefix; native applies the index synchronously, the leased owner
-        // fsync runs in the background.
-        leased.flush().unwrap();
-        native
-            .native()
-            .unwrap()
-            .force_rebuild_control_region()
-            .unwrap();
-        assert_eq!(
-            native_levels(&native, a),
-            (true, false),
-            "{case}: premise, the forced native flush leaves every entry in L0"
-        );
-        // Positions come from each arm's index: a pass without a Stop
-        // would already reclaim on both arms (clean tail at the
-        // processed upper), so no probe pass runs.
-        let leased_offset = |sequence: u64| address(&leased, a, sequence).offset;
-        let stop = (0..WRITES)
-            .find(|&sequence| {
-                leased_offset(sequence) >= FILE && native_position(&native, a, sequence, 0) >= FILE
-            })
-            .unwrap();
-        let remove_below = match decisions {
-            Decisions::RemoveOnly => stop,
-            Decisions::KeepAfterRemoves => stop / 2,
-        };
-        // With Keep rows the case proves that a `Keep` decision copies
-        // nothing on either arm: every Remove lies in WAL file 0, below
-        // both targets.
-        if decisions == Decisions::KeepAfterRemoves {
-            let last_remove = remove_below - 1;
-            assert!(
-                leased_offset(last_remove) < FILE
-                    && native_position(&native, a, last_remove, 0) < FILE,
+            // Paper 3.1/4.4: the leased pass scans the durable processed
+            // prefix; native applies the index synchronously, the leased owner
+            // fsync runs in the background.
+            leased.flush().unwrap();
+            native
+                .native()
+                .unwrap()
+                .force_rebuild_control_region()
+                .unwrap();
+            assert_eq!(
+                native_levels(&native, a),
+                (true, false),
+                "{case}: premise, the forced native flush leaves every entry in L0"
+            );
+            // Positions come from each arm's index: a pass without a Stop
+            // would already reclaim on both arms (clean tail at the
+            // processed upper), so no probe pass runs.
+            let leased_offset = |sequence: u64| address(&leased, a, sequence).offset;
+            let stop = (0..WRITES)
+                .find(|&sequence| {
+                    leased_offset(sequence) >= FILE
+                        && native_position(&native, a, sequence, 0) >= FILE
+                })
+                .unwrap();
+            let remove_below = match decisions {
+                Decisions::RemoveOnly => stop,
+                Decisions::KeepAfterRemoves => stop / 2,
+            };
+            // With Keep rows the case proves that a `Keep` decision copies
+            // nothing on either arm: every Remove lies in WAL file 0, below
+            // both targets.
+            if decisions == Decisions::KeepAfterRemoves {
+                let last_remove = remove_below - 1;
+                assert!(
+                    leased_offset(last_remove) < FILE
+                        && native_position(&native, a, last_remove, 0) < FILE,
+                    "{case}"
+                );
+            }
+            // The Stop at member 0 keeps the whole batch on both arms; at member 1
+            // the earlier member lies below the Stop record and is dropped on both.
+            for policy in [&leased_policy, &native_policy] {
+                policy.set(Some((stop, member)), remove_below);
+            }
+            let leased_pass = observe(&leased);
+            let native_pass = observe(&native);
+            assert_eq!(leased_pass.gate, crate::RelocationGate::DidWork, "{case}");
+            assert_eq!(native_pass.gate, leased_pass.gate, "{case}");
+            let rows = |observation: &RelocationObservation| -> Vec<_> {
+                observation
+                    .callbacks
+                    .iter()
+                    .map(|callback| {
+                        (
+                            callback.keyspace,
+                            callback.key.to_vec(),
+                            callback.value.to_vec(),
+                            callback.decision,
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(rows(&leased_pass), rows(&native_pass), "{case}");
+            assert_eq!(
+                callbacks(&leased_pass),
+                expected_callbacks(a, (stop, member), remove_below),
                 "{case}"
             );
-        }
-        for policy in [&leased_policy, &native_policy] {
-            policy.set(Some((stop, 0)), remove_below);
-        }
-        let leased_pass = observe(&leased);
-        let native_pass = observe(&native);
-        assert_eq!(leased_pass.gate, crate::RelocationGate::DidWork, "{case}");
-        assert_eq!(native_pass.gate, leased_pass.gate, "{case}");
-        let rows = |observation: &RelocationObservation| -> Vec<_> {
-            observation
-                .callbacks
-                .iter()
-                .map(|callback| {
-                    (
-                        callback.keyspace,
-                        callback.key.to_vec(),
-                        callback.value.to_vec(),
-                        callback.decision,
-                    )
-                })
-                .collect()
-        };
-        assert_eq!(rows(&leased_pass), rows(&native_pass), "{case}");
-        assert_eq!(
-            callbacks(&leased_pass),
-            expected_callbacks(a, (stop, 0), remove_below),
-            "{case}"
-        );
-        for (arm, pass, terminal) in [
-            ("leased", &leased_pass, member_address(&leased, a, stop, 0)),
-            ("native", &native_pass, native_position(&native, a, stop, 0)),
-        ] {
-            assert_eq!(pass.streams.len(), 1, "{case} {arm}");
-            let stream = &pass.streams[0];
-            assert_eq!(stream.terminal_position, terminal, "{case} {arm}");
-            assert!(
-                stream.terminal_position < stream.processed_upper,
-                "{case} {arm}"
+            for (arm, pass, terminal) in [
+                (
+                    "leased",
+                    &leased_pass,
+                    member_address(&leased, a, stop, member),
+                ),
+                (
+                    "native",
+                    &native_pass,
+                    native_position(&native, a, stop, member),
+                ),
+            ] {
+                assert_eq!(pass.streams.len(), 1, "{case} {arm}");
+                let stream = &pass.streams[0];
+                assert_eq!(stream.terminal_position, terminal, "{case} {arm}");
+                assert!(
+                    stream.terminal_position < stream.processed_upper,
+                    "{case} {arm}"
+                );
+                assert_eq!(stream.rounded_target, FILE, "{case} {arm}");
+            }
+            assert_eq!(
+                leased_pass.copied_survivors, 0,
+                "{case}: a filtered keyspace copies nothing"
             );
-            assert_eq!(stream.rounded_target, FILE, "{case} {arm}");
+            assert_eq!(
+                native_pass.copied_survivors, 0,
+                "{case}: native copies nothing for a filtered keyspace"
+            );
+            // Both arms keep the Stop record and every later record; the Stop
+            // batch's earlier members are dropped with the rest of the prefix.
+            let expected: Vec<(u64, u8)> = (u64::from(member)..2)
+                .map(|member| (stop, member as u8))
+                .chain(
+                    (stop + 1..WRITES)
+                        .flat_map(|sequence| (0..2).map(move |member| (sequence, member))),
+                )
+                .collect();
+            let arms = (leased.as_ref(), native.as_ref());
+            assert_state(
+                &format!("{case}, after the pass"),
+                arms,
+                a,
+                WRITES,
+                &expected,
+            );
+            leased.wait_for_background_threads_to_finish().unwrap();
+            native.wait_for_background_threads_to_finish().unwrap();
+            let leased = fixture.open();
+            let native = open_native(native_root.path(), &native_policy, &config);
+            let arms = (leased.as_ref(), native.as_ref());
+            assert_state(&format!("{case}, after reopen"), arms, a, WRITES, &expected);
+            leased.wait_for_background_threads_to_finish().unwrap();
+            native.wait_for_background_threads_to_finish().unwrap();
         }
-        assert_eq!(
-            leased_pass.copied_survivors, 0,
-            "{case}: a filtered keyspace copies nothing"
-        );
-        assert_eq!(
-            native_pass.copied_survivors, 0,
-            "{case}: native copies nothing for a filtered keyspace"
-        );
-        // Both arms keep the Stop record and every later record.
-        let expected: Vec<(u64, u8)> = (stop..WRITES)
-            .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
-            .collect();
-        let arms = (leased.as_ref(), native.as_ref());
-        assert_state(
-            &format!("{case}, after the pass"),
-            arms,
-            a,
-            WRITES,
-            &expected,
-        );
-        leased.wait_for_background_threads_to_finish().unwrap();
-        native.wait_for_background_threads_to_finish().unwrap();
-        let leased = fixture.open();
-        let native = open_native(native_root.path(), &native_policy, &config);
-        let arms = (leased.as_ref(), native.as_ref());
-        assert_state(&format!("{case}, after reopen"), arms, a, WRITES, &expected);
-        leased.wait_for_background_threads_to_finish().unwrap();
-        native.wait_for_background_threads_to_finish().unwrap();
     }
+}
+
+/// No `StopRelocation` in the window: native's scan reaches `EndOfWal` and
+/// leaves its terminal at 0, so the pass performs no stripe (no copy, no
+/// cutoff, no retirement, no callback past the scan). The hybrid must do the
+/// same; the clean tail at the durable end is the fork's D27 rule, extras-only.
+///
+/// Both arms call the same filters, copy nothing, drop nothing and keep every
+/// key after the pass and after a reopen.
+#[test]
+fn no_stop_matches_native_and_leaves_every_key() {
+    const WRITES: u64 = 130;
+    let leased_policy = Policy::new();
+    let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
+    let leased = fixture.open();
+    let native_policy = Policy::new();
+    for policy in [&leased_policy, &native_policy] {
+        // No Stop, and every put is kept.
+        policy.set(None, 0);
+    }
+    let native_root = tempdir::TempDir::new("r1-native-no-stop").unwrap();
+    let config = native_config(WRITES);
+    let native = open_native(native_root.path(), &native_policy, &config);
+    let a = leased.ks("a");
+    for db in [&leased, &native] {
+        for sequence in 0..WRITES {
+            write(db, sequence, &[a, a]);
+        }
+    }
+    leased.flush().unwrap();
+    native
+        .native()
+        .unwrap()
+        .force_rebuild_control_region()
+        .unwrap();
+    // Premise: the hybrid's whole durable prefix is processed, so no batch
+    // lies at or above the scan cut and the scan ends at the durable end. This
+    // is the state native reaches at `EndOfWal` with nothing above its upper
+    // limit.
+    let core = leased.remote_for_test().write_core();
+    let mut tries = 0u32;
+    loop {
+        let q = core.table.last_processed();
+        let published = core.publisher.lock().published_next;
+        if q.epoch == core.epoch && q.sequence == published {
+            break;
+        }
+        assert!(
+            tries < 1_000_000,
+            "premise: the index never applied the whole prefix: {q:?} vs {published}"
+        );
+        tries += 1;
+        std::thread::yield_now();
+    }
+    let leased_pass = observe(&leased);
+    let native_pass = observe(&native);
+    assert_eq!(
+        leased_pass.gate,
+        crate::RelocationGate::NoWork,
+        "no Stop leaves the hybrid pass with nothing to do: {leased_pass:?}"
+    );
+    assert_eq!(native_pass.gate, leased_pass.gate);
+    let rows = |observation: &RelocationObservation| -> Vec<_> {
+        observation
+            .callbacks
+            .iter()
+            .map(|callback| {
+                (
+                    callback.keyspace,
+                    callback.key.to_vec(),
+                    callback.value.to_vec(),
+                    callback.decision,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(rows(&leased_pass), rows(&native_pass));
+    let expected_callbacks: Vec<(KeySpace, u64, u8, Decision)> = (0..WRITES)
+        .flat_map(|sequence| (0..2).map(move |member| (a, sequence, member, Decision::Keep)))
+        .collect();
+    assert_eq!(callbacks(&leased_pass), expected_callbacks);
+    assert_eq!(leased_pass.copied_survivors, 0);
+    assert_eq!(native_pass.copied_survivors, 0);
+    for (arm, pass) in [("leased", &leased_pass), ("native", &native_pass)] {
+        assert_eq!(pass.streams.len(), 1, "{arm}");
+        assert_eq!(pass.streams[0].terminal_position, 0, "{arm}");
+        assert_eq!(pass.streams[0].rounded_target, 0, "{arm}");
+    }
+    // The hybrid reached the durable end (a clean tail past one file), so the
+    // fork's clean-tail rule would have relocated here.
+    assert!(
+        leased_pass.streams[0].processed_upper > FILE,
+        "premise: the hybrid's clean tail lies past one whole file: {leased_pass:?}"
+    );
+    let all: Vec<(u64, u8)> = (0..WRITES)
+        .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
+        .collect();
+    let arms = (leased.as_ref(), native.as_ref());
+    assert_state("no Stop, after the pass", arms, a, WRITES, &all);
+    leased.wait_for_background_threads_to_finish().unwrap();
+    native.wait_for_background_threads_to_finish().unwrap();
+    let leased = fixture.open();
+    let native = open_native(native_root.path(), &native_policy, &config);
+    let arms = (leased.as_ref(), native.as_ref());
+    assert_state("no Stop, after reopen", arms, a, WRITES, &all);
+    leased.wait_for_background_threads_to_finish().unwrap();
+    native.wait_for_background_threads_to_finish().unwrap();
 }
 
 /// The test slot does not coalesce: a second named pass while one runs is

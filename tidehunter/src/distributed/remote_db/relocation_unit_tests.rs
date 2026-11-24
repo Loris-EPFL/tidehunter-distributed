@@ -43,6 +43,8 @@ fn cursor(
         scan,
         buffer,
         start: Some(start),
+        // Callers that only classify positions never cross the scan cut.
+        above_cut: false,
         upper,
     }
 }
