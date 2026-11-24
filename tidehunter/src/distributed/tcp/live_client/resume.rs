@@ -16,10 +16,13 @@
 //! Bounds: one reconnect after the first break (`MAX_RESUME_ATTEMPTS`), at most
 //! three resumes without an adopted frame between them
 //! (`MAX_CONSECUTIVE_RESUMES`), and one budget of `2 x io_timeout_ms` capped by
-//! the coordinator lease's own deadline. Nothing here creates a session or a
-//! thread: the reconnect reuses the authenticated route a read lane already
-//! rebuilds from, and a detached data queue goes to the database's one DMA
-//! reaper.
+//! the coordinator lease's own deadline (D-W1-5). That budget bounds **every**
+//! step, not only the reconnect: each control exchange is capped by the budget
+//! that remains, each queue open derives its controller and namespace deadlines
+//! from it, and the lease and the budget are rechecked before the resume
+//! reports success. Nothing here creates a session or a thread: the reconnect
+//! reuses the authenticated route a read lane already rebuilds from, and a
+//! detached data queue goes to the database's one DMA reaper.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -240,7 +243,7 @@ impl Client {
         // Step 4: the owner is the oracle for each extent's real frontier. The
         // probe declares `through = adopted.end`, which is always at or below
         // the owner's frontier, so the owner answers from memory without a scan.
-        self.probe_leased_extents()?;
+        self.probe_leased_extents(deadline)?;
         // Step 5: rebuild the data path, or keep a live queue as it is.
         match kind {
             BreakKind::Data => {
@@ -256,14 +259,77 @@ impl Client {
         }
         // Step 6: declare what the owner can now prove, and settle the flights
         // it covers. Nothing is popped and nothing is reordered.
-        self.declare_resumed_adoption(kind == BreakKind::Data)?;
+        self.declare_resumed_adoption(kind == BreakKind::Data, deadline)?;
         // Step 7: a detached queue left the settled flights without a device to
         // report on. Reopen one so their release, and the covering flush the
         // synchronous tier needs, run on a live namespace.
         if kind == BreakKind::Data {
-            self.reopen_detached_queue()?;
+            self.reopen_detached_queue(deadline)?;
         }
+        // The lease is the authority on the right to write, and the budget is
+        // the bound the caller was promised: neither may have lapsed while the
+        // last exchange ran.
+        self.remaining_resume(deadline)?;
         Ok(())
+    }
+
+    /// The budget left for the next resume step, after rechecking the right to
+    /// write. A lapsed lease and a spent budget both refuse the step, so no
+    /// exchange, queue open or rewrite starts past the episode's bound.
+    pub(super) fn remaining_resume(&self, deadline: Instant) -> Result<Duration, TcpError> {
+        if let Some(validity) = &self.lease_validity {
+            validity.ensure_writable(self.expected.partition)?;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TcpError::with_kind(
+                io::ErrorKind::TimedOut,
+                "live write resume budget expired",
+            ));
+        }
+        Ok(remaining)
+    }
+
+    /// Run one control exchange inside the episode budget. The client's request
+    /// timeouts do not know that budget, so the session timeout is capped for
+    /// the call and restored afterwards; a spent budget never reaches the wire.
+    pub(super) fn within_resume_budget<T>(
+        &mut self,
+        deadline: Instant,
+        step: impl FnOnce(&mut Self) -> Result<T, TcpError>,
+    ) -> Result<T, TcpError> {
+        let remaining = self.remaining_resume(deadline)?;
+        let previous = self.timeout;
+        self.timeout = previous.min(remaining);
+        let result = step(self);
+        self.timeout = previous;
+        result
+    }
+
+    /// Open a queue on `leased`, with the controller and namespace deadlines
+    /// derived from the episode budget. The shared open derives both from
+    /// `connect_timeout_ms`, so that value is capped for the call.
+    pub(super) fn open_queue_within(
+        &mut self,
+        leased: &LiveLeased,
+        deadline: Instant,
+    ) -> Result<(), TcpError> {
+        let remaining = self.remaining_resume(deadline)?;
+        let capped_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let previous = self
+            .live_config
+            .as_ref()
+            .map(|config| config.connect_timeout_ms);
+        if let Some(config) = self.live_config.as_mut() {
+            config.connect_timeout_ms = config.connect_timeout_ms.min(capped_ms);
+        }
+        let result = self.open_leased_queue_with(leased);
+        if let (Some(config), Some(previous)) = (self.live_config.as_mut(), previous) {
+            config.connect_timeout_ms = previous;
+        }
+        result
     }
 
     /// Replace only the transport session, so every live field of this client
@@ -330,8 +396,8 @@ impl Client {
     }
 
     /// Probe the closing extent first, then the current one: a rollover closes
-    /// before the new extent is written.
-    fn probe_leased_extents(&mut self) -> Result<(), TcpError> {
+    /// before the new extent is written. Each probe is one bounded exchange.
+    fn probe_leased_extents(&mut self, deadline: Instant) -> Result<(), TcpError> {
         for target in [PendingTarget::Closing, PendingTarget::Current] {
             let Some((epoch, token, through)) = self.extent_adoption(target) else {
                 continue;
@@ -342,7 +408,9 @@ impl Client {
                 lease_next: false,
                 target,
             };
-            let reply = self.adopt_live_extent(epoch, token, through, false, false)?;
+            let reply = self.within_resume_budget(deadline, |client| {
+                client.adopt_live_extent(epoch, token, through, false, false)
+            })?;
             self.check_leased_adoption(pending, &reply)?;
             if let Some(extent) = self.extent_mut(target) {
                 // The owner's frontier is the only truth: a declaration whose
@@ -441,6 +509,9 @@ impl Client {
     }
 
     fn rewrite_frame(&mut self, frame: &RetainedFrame, deadline: Instant) -> Result<(), TcpError> {
+        // One frame is one round trip: the episode budget bounds the sequence,
+        // so a long rewrite never outlives the lease it started under.
+        self.remaining_resume(deadline)?;
         let Some(extent) = self.retained_extent(frame.token) else {
             return Err(TcpError::new(
                 "live resume retained a frame of an extent that is no longer open",
@@ -454,7 +525,7 @@ impl Client {
             if self.live_writer.is_some() {
                 self.detach_live_queue()?;
             }
-            self.open_leased_queue_with(&extent)?;
+            self.open_queue_within(&extent, deadline)?;
         }
         let config = self
             .live_config
@@ -581,8 +652,15 @@ impl Client {
     /// already covers this prefix no request is sent, and those flights must
     /// still be marked. Their CQEs died with the detached queue, so no later
     /// progress pass can ever complete them.
-    fn declare_resumed_adoption(&mut self, complete: bool) -> Result<(), TcpError> {
+    fn declare_resumed_adoption(
+        &mut self,
+        complete: bool,
+        deadline: Instant,
+    ) -> Result<(), TcpError> {
         for target in [PendingTarget::Closing, PendingTarget::Current] {
+            // A skip still needs the budget: the settlement below runs on the
+            // proof this step would have refreshed.
+            self.remaining_resume(deadline)?;
             let Some(extent) = self.extent_mut(target) else {
                 continue;
             };
@@ -607,7 +685,9 @@ impl Client {
                     lease_next: false,
                     target,
                 };
-                let reply = self.adopt_live_extent(epoch, token, through, false, false)?;
+                let reply = self.within_resume_budget(deadline, |client| {
+                    client.adopt_live_extent(epoch, token, through, false, false)
+                })?;
                 self.check_leased_adoption(pending, &reply)?;
                 let Some(extent) = self.extent_mut(target) else {
                     continue;
@@ -643,7 +723,7 @@ impl Client {
     /// A rewrite opens the queue of the extent it last wrote, which is the
     /// closing extent when the current one had no retained frame. The queue
     /// then owns no DMA, so it is drained and rebound rather than detached.
-    fn reopen_detached_queue(&mut self) -> Result<(), TcpError> {
+    fn reopen_detached_queue(&mut self, deadline: Instant) -> Result<(), TcpError> {
         if self.live_leased.flights.is_empty() {
             return Ok(());
         }
@@ -666,7 +746,7 @@ impl Client {
         if self.live_writer.is_some() {
             self.drain_live_queue()?;
         }
-        self.open_leased_queue_with(&leased)
+        self.open_queue_within(&leased, deadline)
     }
 }
 
