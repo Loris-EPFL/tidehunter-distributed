@@ -18,13 +18,17 @@
 //!    callbacks, later members of its batch included. `Keep` is not a copy
 //!    decision: like native at the parity tip, a filtered keyspace copies
 //!    nothing.
-//! 3. Per stream: terminal = the `Stop` batch, the first batch after `Stop`
-//!    (other streams), the first batch above `Q`, or the clean tail at the
-//!    durable end. The target is the native rule
-//!    `round_down_to_file(min(terminal, lo + budget))` with the per-owner
+//! 3. Per stream: the scan stops at the first batch at or above `Q` (cuts are
+//!    exclusive, so that batch is not read) and otherwise at the durable end.
+//!    Terminal = the `Stop` batch, the first batch after `Stop` (other
+//!    streams) or the clean tail at the durable end; the clean tail is a
+//!    terminal only when the pass saw a `Stop` or a record at or above `Q`,
+//!    and without either the pass reports `NoWork`. The target is the native
+//!    rule `round_down_to_file(min(terminal, lo + budget))` with the per-owner
 //!    `relocation_max_reclaim_pct` budget. Without one complete file before a
-//!    target the pass is `NoWork`: no copy, no start, no snapshot, no
-//!    retirement.
+//!    target the pass is `NoWork`: no copy, no start, no snapshot. It still
+//!    runs retirement when a stream has a non-zero whole-file target, as
+//!    native re-runs its gc against a target that did not advance.
 //! 4. `DidWork`: a filtered keyspace copies nothing and drops every entry
 //!    below its stream's TERMINAL unread, as native's cutoff
 //!    (`relocation/mod.rs` `relocate_stripe`, `RelocationFlush::Cutoff`) does;
@@ -41,8 +45,9 @@
 //!    advanced watermark. Bytes below both terms hold no live value, so no
 //!    `Keep` survivor is ever unreachable and no reference walk is needed.
 //!
-//! A `NoWork` pass changes nothing. Offsets of different streams are never
-//! compared: every target and every watermark term is per `(partition,
+//! A `NoWork` pass copies nothing, stores nothing and moves no start; only its
+//! retirement retry can delete retired files. Offsets of different streams are
+//! never compared: every target and every watermark term is per `(partition,
 //! generation)`, because independent owner WALs have no shared byte order.
 
 use super::concurrent::RelocatedCopies;
