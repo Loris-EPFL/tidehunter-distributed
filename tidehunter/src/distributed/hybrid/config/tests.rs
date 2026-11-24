@@ -257,3 +257,62 @@ fn index_based_relocation_is_refused_at_open() {
     .validate()
     .expect("WalBased is the only supported strategy");
 }
+
+#[test]
+fn index_blob_cache_rows_pass_through_both_bridges() {
+    let mut native = Config::small();
+    native.index_blob_cache_bytes = Some(8 * 1024 * 1024);
+    native.index_blob_cache_min_bytes = 2 * 1024 * 1024;
+    let hybrid = HybridIndexConfig::from_native(&native);
+    assert_eq!(hybrid.index_blob_cache_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(hybrid.index_blob_cache_min_bytes, 2 * 1024 * 1024);
+    let back = hybrid.to_native_config();
+    assert_eq!(back.index_blob_cache_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(back.index_blob_cache_min_bytes, 2 * 1024 * 1024);
+    hybrid.validate().expect("native invariants hold");
+
+    // The default is native's: disabled, with a 64 MiB admission floor.
+    let default = HybridIndexConfig::default();
+    assert_eq!(default.index_blob_cache_bytes, None);
+    assert_eq!(default.index_blob_cache_min_bytes, 64 * 1024 * 1024);
+    assert_eq!(
+        default.to_native_config().index_blob_cache_min_bytes,
+        Config::default().index_blob_cache_min_bytes,
+    );
+}
+
+#[test]
+fn validate_checks_the_index_blob_cache_budget() {
+    let zero = HybridIndexConfig {
+        index_blob_cache_bytes: Some(0),
+        ..HybridIndexConfig::default()
+    };
+    let error = zero
+        .validate()
+        .expect_err("a zero budget is native's disabled spelling");
+    assert_eq!(
+        error.to_string(),
+        "index_blob_cache_bytes must be non-zero; use None to disable the cache",
+    );
+
+    let floor_above_budget = HybridIndexConfig {
+        index_blob_cache_bytes: Some(1024),
+        index_blob_cache_min_bytes: 2048,
+        ..HybridIndexConfig::default()
+    };
+    let error = floor_above_budget
+        .validate()
+        .expect_err("every blob would be rejected as oversized");
+    assert_eq!(
+        error.to_string(),
+        "index_blob_cache_min_bytes 2048 exceeds index_blob_cache_bytes 1024: every blob \
+         that qualified for admission would be rejected as oversized",
+    );
+
+    let fits = HybridIndexConfig {
+        index_blob_cache_bytes: Some(2048),
+        index_blob_cache_min_bytes: 2048,
+        ..HybridIndexConfig::default()
+    };
+    fits.validate().expect("a floor equal to the budget admits");
+}

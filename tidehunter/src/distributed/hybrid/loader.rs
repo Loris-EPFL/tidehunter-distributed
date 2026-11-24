@@ -31,16 +31,18 @@
 
 use super::position::VersionPosition;
 use super::region::StreamFront;
-use crate::context::{KsContext, WalEntryKind};
+use crate::context::{KsContext, ReadType, WalEntryKind};
 use crate::db::WalEntry;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::BatchVersion;
 use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
+use crate::index_blob_cache::IndexBlobCache;
 use crate::key_shape::KeyShape;
 use crate::key_shape::{KeySpace, KeySpaceDesc};
 use crate::large_table::Loader;
+use crate::lookup::RandomRead;
 use crate::wal::position::{IndexCut, WalPosition};
 use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
@@ -487,6 +489,9 @@ pub(crate) struct HybridLoader {
     index_writer: Arc<WalWriter>,
     contexts: Arc<KsContextVec>,
     cuts: CutSources,
+    /// Native [`IndexBlobCache`] over the coordinator's index WAL, present when
+    /// `HybridIndexConfig::index_blob_cache_bytes` is set.
+    index_blob_cache: Option<Arc<IndexBlobCache>>,
 }
 
 impl HybridLoader {
@@ -495,12 +500,28 @@ impl HybridLoader {
         index_writer: Arc<WalWriter>,
         contexts: Arc<KsContextVec>,
         cuts: CutSources,
+        index_blob_cache: Option<Arc<IndexBlobCache>>,
     ) -> Self {
         Self {
             index_wal,
             index_writer,
             contexts,
             cuts,
+            index_blob_cache,
+        }
+    }
+
+    /// Drops from the index blob cache the blobs a completed flush or
+    /// relocation removed from a cell's levels. Positions are never reused
+    /// within a loader, so a blob that no level references is dead; without
+    /// this a superseded L1 would occupy the budget until the CLOCK sweep got
+    /// to it. Native `Db::retire_index_blobs`.
+    pub(crate) fn retire_index_blobs(&self, dropped: &[WalPosition]) {
+        let Some(cache) = &self.index_blob_cache else {
+            return;
+        };
+        for position in dropped {
+            cache.remove(*position);
         }
     }
 
@@ -560,6 +581,19 @@ impl Loader for HybridLoader {
         ks: &KeySpaceDesc,
         position: WalPosition,
     ) -> Result<IndexTable<VersionPosition>, LocalDbError> {
+        // A resident blob is adopted from the cache: the cached bytes are
+        // exactly the `WalEntry::Index` payload (see `index_reader`), so a
+        // promote or relocation of a hot cell spares the re-read of its L1.
+        // `load` never admits, and `peek` is non-blocking because `load` runs
+        // under the row lock. Native `Db::load`.
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            let context = self.contexts.ks_context(ks.id());
+            context.inc_read(WalEntryKind::Index, ReadType::Cached);
+            context.inc_read_bytes(WalEntryKind::Index, ReadType::Cached, blob.len() as u64);
+            return Ok(ks.index_format().deserialize_index(ks, blob));
+        }
         let (read_type, frame) = self
             .index_wal
             .read(position)
@@ -592,9 +626,44 @@ impl Loader for HybridLoader {
     }
 
     fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, LocalDbError> {
-        self.index_wal
+        let Some(cache) = &self.index_blob_cache else {
+            return self
+                .index_wal
+                .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)
+                .map_err(|error| index_wal_error("random reader", error));
+        };
+        // Called under the row lock by every disk-walking read path, so the
+        // probe is non-blocking: a resident blob is served as `Cached`, and a
+        // syscall-path blob within the admission bounds becomes a `CachedFill`
+        // that fills (or joins the fill) on its first read, after the caller
+        // released the lock. Native `Db::index_reader`.
+        if let Some(blob) = cache.peek(position) {
+            return Ok(WalRandomRead::Cached(blob));
+        }
+        let reader = self
+            .index_wal
             .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)
-            .map_err(|error| index_wal_error("random reader", error))
+            .map_err(|error| index_wal_error("random reader", error))?;
+        Ok(match reader {
+            WalRandomRead::File(file) if cache.admit(file.len()) => {
+                WalRandomRead::CachedFill(cache.lazy_reader(position, file))
+            }
+            reader => reader,
+        })
+    }
+
+    /// Opens the index blob at `position` for a scan that reads it whole, once:
+    /// a resident blob comes from the cache, a cold one is read as one whole
+    /// frame and is never admitted. Native `Db::index_scan_reader`.
+    fn index_scan_reader(&self, position: WalPosition) -> Result<WalRandomRead, LocalDbError> {
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            return Ok(WalRandomRead::Cached(blob));
+        }
+        self.index_wal
+            .whole_frame_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)
+            .map_err(|error| index_wal_error("scan reader", error))
     }
 
     fn flush_supported(&self) -> bool {

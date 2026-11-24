@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 mod anchor;
 mod boundary;
+mod index_blob_cache;
 mod layout;
 mod shard_preload;
 mod value_cache;

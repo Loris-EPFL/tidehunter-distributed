@@ -62,6 +62,7 @@ use crate::flusher::{FlusherHost, IndexFlusher};
 use crate::index::index_format::IndexIterCaches;
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
+use crate::index_blob_cache::IndexBlobCache;
 use crate::iterators::IteratorResult;
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc};
 use crate::large_table::{CellUpdateError, GetResult, LargeTable, Loader, SnapshotEntryData};
@@ -248,11 +249,25 @@ impl HybridTable {
             metrics.clone(),
             SharedLastProcessed::default(),
         ));
+        // Built exactly as native `Db::open` builds it: one cache over the
+        // index WAL, reachability and whole-frame reads from the same `Wal`.
+        let index_blob_cache = config.index_blob_cache_bytes.map(|max_bytes| {
+            let reachable_indexes = index_wal.clone();
+            let frame_indexes = index_wal.clone();
+            Arc::new(IndexBlobCache::new(
+                max_bytes,
+                config.index_blob_cache_min_bytes,
+                Box::new(move |position| reachable_indexes.is_reachable(position)),
+                Box::new(move |position| frame_indexes.read(position).map(|(_, payload)| payload)),
+                &metrics,
+            ))
+        });
         let loader = Arc::new(HybridLoader::new(
             index_wal,
             index_writer,
             contexts.clone(),
             cuts.clone(),
+            index_blob_cache,
         ));
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..config.num_flusher_threads)
             .map(|_| mpsc::channel())
@@ -1228,6 +1243,10 @@ impl Loader for TableInner {
         self.loader.index_reader(position)
     }
 
+    fn index_scan_reader(&self, position: WalPosition) -> Result<WalRandomRead, LocalDbError> {
+        self.loader.index_scan_reader(position)
+    }
+
     fn flush_supported(&self) -> bool {
         self.loader.flush_supported()
     }
@@ -1270,16 +1289,18 @@ impl FlusherHost<VersionPosition> for TableInner {
         new_levels: IndexLevels,
     ) {
         let context = self.contexts.ks_context(ks);
-        let _dropped = self
+        let dropped = self
             .table
             .update_flushed_index(context, &cell, original, new_levels);
+        self.loader.retire_index_blobs(&dropped);
     }
 
     fn update_relocated_index(&self, ks: KeySpace, cell: CellId, new_levels: IndexLevels) {
         let context = self.contexts.ks_context(ks);
-        let _dropped = self
+        let dropped = self
             .table
             .update_relocated_index(context, &cell, new_levels);
+        self.loader.retire_index_blobs(&dropped);
     }
 
     fn ks_context(&self, ks: KeySpace) -> &KsContext {

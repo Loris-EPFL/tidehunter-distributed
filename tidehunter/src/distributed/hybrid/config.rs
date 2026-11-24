@@ -22,6 +22,12 @@
 //! whole owner frames, not native compressed batches, so the request is
 //! accepted and reported once at open as unsupported (it is not silently
 //! reinterpreted as index compression).
+//!
+//! The index blob cache rows (`index_blob_cache_bytes`,
+//! `index_blob_cache_min_bytes`) pass through unchanged and drive the same
+//! [`crate::index_blob_cache::IndexBlobCache`] in the hybrid loader: the
+//! coordinator's index WAL is the native index WAL, so its blobs age out of
+//! the mmap window in the same way.
 
 use crate::compressed_batch::BatchCodec;
 use crate::config::Config;
@@ -74,6 +80,12 @@ pub struct HybridIndexConfig {
     pub batch_codec: Option<BatchCodec>,
     /// Unsupported request, paired with `batch_codec`.
     pub compressed_batch_cache_bytes: Option<usize>,
+    /// Whole index blobs that aged out of the index WAL's mmap window, as
+    /// native [`Config::index_blob_cache_bytes`]. `None` disables the cache.
+    pub index_blob_cache_bytes: Option<usize>,
+    /// Admission floor of the index blob cache, as native
+    /// [`Config::index_blob_cache_min_bytes`].
+    pub index_blob_cache_min_bytes: usize,
 }
 
 impl Default for HybridIndexConfig {
@@ -101,6 +113,8 @@ impl Default for HybridIndexConfig {
             index_auto_shard_threshold: None,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
+            index_blob_cache_bytes: None,
+            index_blob_cache_min_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -161,6 +175,22 @@ impl HybridIndexConfig {
                     .to_owned(),
             );
         }
+        if let Some(cache_bytes) = self.index_blob_cache_bytes {
+            // Same two invariants, and the same text, as native `Config::validate`.
+            if cache_bytes == 0 {
+                return invalid(
+                    "index_blob_cache_bytes must be non-zero; use None to disable the cache"
+                        .to_owned(),
+                );
+            }
+            if self.index_blob_cache_min_bytes > cache_bytes {
+                return invalid(format!(
+                    "index_blob_cache_min_bytes {} exceeds index_blob_cache_bytes {cache_bytes}: \
+                     every blob that qualified for admission would be rejected as oversized",
+                    self.index_blob_cache_min_bytes,
+                ));
+            }
+        }
         if self.index_auto_shard_threshold != Some(usize::MAX) {
             // `Some(usize::MAX)` is native's "auto-sharding disabled" spelling
             // (`Config::disable_index_auto_sharding`), so it has no ceiling.
@@ -217,10 +247,8 @@ impl HybridIndexConfig {
             index_auto_shard_threshold: self.index_auto_shard_threshold,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
-            // The coordinator has no index blob cache: its index blobs are
-            // read once per relocation pass, not repeatedly.
-            index_blob_cache_bytes: None,
-            index_blob_cache_min_bytes: 64 * 1024 * 1024,
+            index_blob_cache_bytes: self.index_blob_cache_bytes,
+            index_blob_cache_min_bytes: self.index_blob_cache_min_bytes,
             // Native striped relocation is the single-node `Db` path; the
             // hybrid runs its own relocation pass, so the native value is
             // never read.
@@ -256,6 +284,8 @@ impl HybridIndexConfig {
             index_auto_shard_threshold: config.index_auto_shard_threshold,
             batch_codec: config.batch_codec,
             compressed_batch_cache_bytes: config.compressed_batch_cache_bytes,
+            index_blob_cache_bytes: config.index_blob_cache_bytes,
+            index_blob_cache_min_bytes: config.index_blob_cache_min_bytes,
         }
     }
 
