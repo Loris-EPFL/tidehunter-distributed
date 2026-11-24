@@ -675,6 +675,54 @@ fn write_protect_seals_only_the_named_namespaces_of_a_subsystem() {
 }
 
 #[test]
+fn write_protect_is_not_blocked_by_another_host_controller_on_the_subsystem() {
+    // A stale coordinator keeps its controller attached to the same subsystem.
+    // Configfs models each attached host as an allowed_hosts link; write
+    // protection must fence the namespace through the owner's own controller
+    // and must not depend on being the only controller of the subsystem.
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let binding = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let subsystem = f.configfs.join("subsystems").join(&binding.nqn);
+    let foreign = "nqn.2026-01.test:stale-coordinator";
+    let foreign_host = f.configfs.join("hosts").join(foreign);
+    fs::create_dir(&foreign_host).unwrap();
+    let foreign_link = subsystem.join("allowed_hosts").join(foreign);
+    symlink(&foreign_host, &foreign_link).unwrap();
+    assert!(
+        foreign_link.is_symlink(),
+        "the fixture must present a second host on the subsystem"
+    );
+
+    manager
+        .write_protect(std::slice::from_ref(&binding))
+        .unwrap();
+
+    assert_eq!(
+        attribute(&subsystem.join("namespaces/1/write_protect")).unwrap(),
+        "1",
+        "the namespace is write-protected while another host is attached"
+    );
+    assert_eq!(
+        manager.sealed_file(&f.file.path).unwrap().as_ref(),
+        Some(&f.file),
+        "write protection must leave a durable sealed marker"
+    );
+    assert!(
+        foreign_link.is_symlink(),
+        "write protection must not remove another host's controller claim"
+    );
+    assert_eq!(
+        manager.commission_groups.get(),
+        1,
+        "one commissioning controller serves the subsystem"
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn inode_reuse_on_different_wal_path_does_not_match_marker() {
     let f = Fixture::new();
     let mut manager = f.open().unwrap();

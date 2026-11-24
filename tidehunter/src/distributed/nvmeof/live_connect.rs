@@ -167,6 +167,27 @@ impl LiveController {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(Self, LiveNamespaceBinding)> {
+        let mut controller =
+            Self::connect_controller(registry, target, host_nqn, host_id, deadline)?;
+        match controller.resolve_verified(access, deadline) {
+            Ok(binding) => Ok((controller, binding)),
+            Err(error) => Err(connect_error_after_cleanup(
+                error,
+                controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT),
+            )),
+        }
+    }
+    /// Establish and verify the owned controller without resolving a namespace
+    /// block device. Write protection runs admin commands on this controller;
+    /// only the data path needs the namespace, so a subsystem shared with
+    /// another host's controller must not block it.
+    pub(super) fn connect_controller(
+        registry: &LiveConnectionRegistry,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<Self> {
         target.geometry.validate().map_err(invalid)?;
         if !valid_nqn(&target.nqn)
             || !valid_nqn(host_nqn)
@@ -207,11 +228,8 @@ impl LiveController {
                 return Err(invalid("connection worker failed"));
             }
         };
-        match controller
-            .verify_queue_geometry()
-            .and_then(|()| controller.resolve_verified(access, deadline))
-        {
-            Ok(binding) => Ok((controller, binding)),
+        match controller.verify_queue_geometry() {
+            Ok(()) => Ok(controller),
             Err(error) => Err(connect_error_after_cleanup(
                 error,
                 controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT),
@@ -508,25 +526,70 @@ impl LiveController {
         if nsid != self.resolver.target.nsid {
             return Err(invalid("namespace id mismatch"));
         }
-        self.set_read_only_checked(nsid, deadline)
+        let uuid = self.resolver.target.uuid;
+        self.set_read_only_admin(nsid, uuid, deadline)
     }
-    /// Write-protect another namespace of the same subsystem. Resolve its
-    /// membership before the admin command (the identify bit is still clear),
-    /// then resolve again as read-only to verify the applied policy.
+    /// Write-protect another namespace of the same subsystem. The namespace is
+    /// identified through this controller's admin queue, never through the
+    /// namespace block device: the kernel may group several host controllers
+    /// under one subsystem, which is exactly the case write protection fences.
     pub(super) fn set_read_only_member(
         &mut self,
         nsid: u32,
         uuid: [u8; 16],
         deadline: Instant,
     ) -> io::Result<()> {
-        self.resolver
-            .resolve_namespace(nsid, uuid, LiveNamespaceAccess::ReadShared, deadline)?;
-        self.set_read_only_checked(nsid, deadline)?;
-        self.resolver
-            .resolve_namespace(nsid, uuid, LiveNamespaceAccess::ReadOnly, deadline)?;
-        Ok(())
+        if nsid == 0 || uuid == [0; 16] {
+            return Err(invalid("invalid namespace identity"));
+        }
+        self.set_read_only_admin(nsid, uuid, deadline)
     }
-    fn set_read_only_checked(&mut self, nsid: u32, deadline: Instant) -> io::Result<()> {
+    /// Runs Identify Namespace Identification Descriptor List, Set Features
+    /// (FID 0x84) and Identify Namespace on the owned controller's admin
+    /// queue. The UUID descriptor proves the nsid belongs to the expected
+    /// namespace of this subsystem, and the identify write-protect bit proves
+    /// the policy is applied.
+    fn set_read_only_admin(
+        &mut self,
+        nsid: u32,
+        uuid: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let (file, controller_path) = self.open_admin_device(deadline)?;
+        let descriptors = identify_namespace(&file, &controller_path, nsid, 0x03, deadline)?;
+        if namespace_uuid(&descriptors) != Some(uuid) {
+            return Err(invalid("namespace identify UUID mismatch"));
+        }
+        let ms = remaining(deadline)?.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let mut cmd = NvmeAdminCommand {
+            opcode: 0x09,
+            nsid,
+            cdw10: 0x84,
+            cdw11: 1,
+            timeout_ms: ms,
+            ..Default::default()
+        };
+        // SAFETY: the command matches nvme_passthru_cmd and remains valid for the synchronous ioctl.
+        let status = unsafe { libc::ioctl(file.as_raw_fd(), 0xc0484e41, &mut cmd) };
+        if status < 0 {
+            return Err(with_context(
+                "namespace write-protection admin command",
+                &controller_path,
+                io::Error::last_os_error(),
+            ));
+        }
+        if status != 0 {
+            return Err(invalid("namespace write protection failed"));
+        }
+        let after = identify_namespace(&file, &controller_path, nsid, 0, deadline)?;
+        if after[99] & 1 == 0 {
+            return Err(invalid("namespace write protection not applied"));
+        }
+        self.verify()
+    }
+    /// Opens the controller's admin character device and verifies that it is
+    /// still the pinned controller of this connection.
+    fn open_admin_device(&self, deadline: Instant) -> io::Result<(File, PathBuf)> {
         let controller_path = Path::new("/dev").join(&self.resolver.name);
         let file = wait_for_device(
             "open controller admin device",
@@ -548,30 +611,7 @@ impl LiveController {
             return Err(invalid("controller device number mismatch"));
         }
         self.verify()?;
-        for (opcode, value) in [(0x09, 1), (0x0a, 0)] {
-            let ms = remaining(deadline)?.as_millis().clamp(1, u32::MAX as u128) as u32;
-            let mut cmd = NvmeAdminCommand {
-                opcode,
-                nsid,
-                cdw10: 0x84,
-                cdw11: value,
-                timeout_ms: ms,
-                ..Default::default()
-            };
-            // SAFETY: the command matches nvme_passthru_cmd and remains valid for the synchronous ioctl.
-            let status = unsafe { libc::ioctl(file.as_raw_fd(), 0xc0484e41, &mut cmd) };
-            if status < 0 {
-                return Err(with_context(
-                    "namespace write-protection admin command",
-                    &controller_path,
-                    io::Error::last_os_error(),
-                ));
-            }
-            if status != 0 || (opcode == 0x0a && cmd.result != 1) {
-                return Err(invalid("namespace write protection failed"));
-            }
-        }
-        self.verify()
+        Ok((file, controller_path))
     }
     /// The caller must first close and drain all namespace users.
     pub fn disconnect(&mut self, deadline: Instant) -> io::Result<()> {
@@ -656,6 +696,65 @@ impl LiveController {
             teardown_locks: Vec::new(),
         })
     }
+}
+/// Identify Namespace (`cns` 0) or its Identification Descriptor List (`cns`
+/// 0x03) on a controller's admin queue. The nsid is scoped to the subsystem
+/// the verified controller is attached to, so no block device or subsystem
+/// controller count is involved.
+fn identify_namespace(
+    file: &File,
+    controller_path: &Path,
+    nsid: u32,
+    cns: u32,
+    deadline: Instant,
+) -> io::Result<[u8; 4096]> {
+    let mut identify = [0u8; 4096];
+    let ms = remaining(deadline)?.as_millis().clamp(1, u32::MAX as u128) as u32;
+    let mut cmd = NvmeAdminCommand {
+        opcode: 0x06,
+        nsid,
+        addr: identify.as_mut_ptr() as u64,
+        data_len: 4096,
+        cdw10: cns,
+        timeout_ms: ms,
+        ..Default::default()
+    };
+    // SAFETY: the command matches nvme_passthru_cmd, its data_len matches the
+    // live 4096-byte identify buffer, and the ioctl is synchronous.
+    let status = unsafe { libc::ioctl(file.as_raw_fd(), 0xc0484e41, &mut cmd) };
+    if status < 0 {
+        return Err(with_context(
+            "namespace identify admin command",
+            controller_path,
+            io::Error::last_os_error(),
+        ));
+    }
+    if status != 0 {
+        return Err(invalid("namespace identify failed"));
+    }
+    Ok(identify)
+}
+
+/// The namespace UUID from an Identify Namespace Identification Descriptor
+/// List (`cns` 0x03). Linux nvmet reports the configfs `device_uuid` as a
+/// 16-byte UUID descriptor; Identify Namespace itself starts with the size and
+/// capacity, so it cannot prove the namespace identity.
+fn namespace_uuid(descriptors: &[u8]) -> Option<[u8; 16]> {
+    let mut rest = descriptors;
+    while rest.len() >= 4 {
+        let kind = rest[0];
+        let len = usize::from(rest[1]);
+        if len == 0 || rest.len() < 4 + len {
+            return None;
+        }
+        if kind == 0x03 && len == 16 {
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(&rest[4..20]);
+            return Some(uuid);
+        }
+        rest = &rest[4 + len..];
+    }
+    None
 }
 #[repr(C)]
 #[derive(Default)]

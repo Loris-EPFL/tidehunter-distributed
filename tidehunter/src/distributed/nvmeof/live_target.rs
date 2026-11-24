@@ -13,7 +13,6 @@
 //! local users. The NVMe data plane assumes trusted, non-Byzantine initiators:
 //! namespace write protection can be changed by an authorized controller.
 use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
-use super::live_namespace::LiveNamespaceAccess;
 use super::live_storage::LiveTargetBinding;
 use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::distributed::tcp::host_identity::NQN_PREFIX;
@@ -853,17 +852,14 @@ impl LiveTargetManager {
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         let host_nqn = self.commissioning_host();
-        let (mut controller, _namespace) = self
+        // Admin-only connection: another host's controller may already be
+        // attached to this subsystem, so the write-protect path must not open
+        // the shared namespace block device.
+        let mut controller = self
             .commissioning
             .as_mut()
             .ok_or_else(|| invalid("missing commissioning registry"))?
-            .connect(
-                &local,
-                &host_nqn,
-                random_id()?,
-                LiveNamespaceAccess::ReadWrite,
-                deadline,
-            )?;
+            .connect_controller(&local, &host_nqn, random_id()?, deadline)?;
         let checked = bindings.iter().try_for_each(|binding| {
             controller.set_read_only_member(binding.nsid, binding.uuid, deadline)
         });

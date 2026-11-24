@@ -227,4 +227,15 @@ impl LiveConnectionRegistry {
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
         LiveController::connect(self, target, host_nqn, host_id, access, deadline)
     }
+    /// Connect and verify the controller alone, for admin-only users such as
+    /// the commissioning write-protect path.
+    pub(crate) fn connect_controller(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<LiveController> {
+        LiveController::connect_controller(self, target, host_nqn, host_id, deadline)
+    }
 }

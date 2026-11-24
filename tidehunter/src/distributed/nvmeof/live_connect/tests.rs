@@ -1045,3 +1045,61 @@ fn namespace_identity_without_a_controller_record_deserializes_as_none() {
         serde_json::from_value(json).unwrap();
     assert_eq!(identity.controller, None);
 }
+
+/// Identify Namespace Identification Descriptor List: a 4-byte descriptor
+/// header (`nidt`, `nidl`, two reserved bytes) followed by `nidl` value bytes.
+fn descriptors(entries: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    for (kind, value) in entries {
+        buffer.push(*kind);
+        buffer.push(u8::try_from(value.len()).unwrap());
+        buffer.extend_from_slice(&[0, 0]);
+        buffer.extend_from_slice(value);
+    }
+    buffer
+}
+
+#[test]
+fn namespace_uuid_reads_the_uuid_descriptor_after_its_siblings() {
+    let uuid = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00,
+    ];
+    let eui = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let nguid = [9u8; 16];
+    let list = descriptors(&[(0x01, &eui), (0x02, &nguid), (0x03, &uuid)]);
+    assert_eq!(
+        namespace_uuid(&list),
+        Some(uuid),
+        "the UUID descriptor is read past the EUI64 and NGUID descriptors"
+    );
+}
+
+#[test]
+fn namespace_uuid_rejects_a_namespace_identify_buffer() {
+    // Identify Namespace (CNS 0) starts with NSZE and NCAP, and its write
+    // protect bit at byte 99 does not name the namespace.
+    let mut identify = [0u8; 4096];
+    identify[..16].copy_from_slice(&[0x77; 16]);
+    identify[99] = 1;
+    assert_eq!(
+        namespace_uuid(&identify),
+        None,
+        "a CNS 0 identify buffer must not be read as a descriptor list"
+    );
+}
+
+#[test]
+fn namespace_uuid_rejects_a_list_without_a_uuid_descriptor() {
+    let eui = [1u8; 8];
+    assert_eq!(
+        namespace_uuid(&descriptors(&[(0x01, &eui)])),
+        None,
+        "an EUI64-only list names no namespace UUID"
+    );
+    assert_eq!(
+        namespace_uuid(&[0u8; 4096]),
+        None,
+        "zero padding ends the descriptor list"
+    );
+}
