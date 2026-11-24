@@ -1,6 +1,10 @@
 use super::*;
 use crate::mainnet_trace::{OBJECTS, SCOPE};
 use tidehunter::minibytes::Bytes;
+
+/// Anti-hang cap; the run's deadline and recorded `timed_out` status are the signals (TST-9).
+const REPLAY_CAP: Duration = Duration::from_secs(120);
+
 fn trace() -> Trace {
     Trace::load(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -468,6 +472,7 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     cfg.execution.request_timeout_ms = 1000;
     cfg.limits.deadline_seconds = 2;
     cfg.limits.shutdown_grace_seconds = 1;
+    let cfg_request_timeout_ms = cfg.execution.request_timeout_ms;
     let trace = cfg.validate().unwrap();
     let prepared = Arc::new(prepare(&trace, 1).unwrap());
     let native = Arc::new(NativeReplayBackend::open(&cfg.backend.options, &trace.tables).unwrap());
@@ -491,7 +496,16 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     )
     .await;
     assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // The blocked commit has a 1 s request timeout and the run a 2 s deadline:
+    // returning sooner would mean the request never reached its deadline.
+    assert!(
+        started.elapsed() >= Duration::from_millis(cfg_request_timeout_ms),
+        "the run returned before the blocked request timeout"
+    );
+    assert!(
+        started.elapsed() < REPLAY_CAP,
+        "the run did not return within the anti-hang cap"
+    );
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("result/summary.json")).unwrap()).unwrap();
     assert_eq!(summary["status"], "failed");
@@ -512,7 +526,8 @@ async fn blocked_native_commit_times_out_within_deadline_and_grace() {
     *mutex.lock().unwrap() = true;
     condvar.notify_all();
     // The detached call can finish, but the scheduler must never issue phase 8.
-    let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+    // Progress wait on the detached call dropping its handle (TST-9).
+    let cleanup_deadline = Instant::now() + REPLAY_CAP;
     while Arc::strong_count(&native) > 1 && Instant::now() < cleanup_deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

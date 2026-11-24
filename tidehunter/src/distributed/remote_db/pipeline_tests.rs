@@ -18,6 +18,7 @@ use crate::distributed::tcp::{
     LiveClientConfig, LiveTargetPool, NodeConfig, OwnerHost, OwnerHostConfig, StorageNode,
     TcpError, TcpLimits,
 };
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use crate::index::index_format::IndexIterCaches;
 use crate::key_shape::KeyType;
 use std::net::TcpListener;
@@ -48,8 +49,8 @@ pub(super) fn live_config(tier: DurabilityTier) -> LiveClientConfig {
         leased_sync: Default::default(),
         leased_flush_min_frame_bytes: LiveClientConfig::default_leased_flush_min_frame_bytes(),
         max_inflight_bytes: 4 * 1024 * 1024,
-        connect_timeout_ms: 5000,
-        io_timeout_ms: 5000,
+        connect_timeout_ms: PROGRESS_CAP.as_millis() as u64,
+        io_timeout_ms: PROGRESS_CAP.as_millis() as u64,
         leased_durability: tier,
         lease_ahead: true,
         polled_writes: false,
@@ -84,9 +85,7 @@ pub(super) fn coordinator_config(
         },
         endpoints: Vec::new(),
         tls,
-        // Five-node startup/replay shares disk and CPU with the full suite.
-        // This is a bounded liveness guard, not a latency assertion.
-        timeout: Duration::from_secs(30),
+        timeout: PROGRESS_CAP,
         max_admitted_batches: max_batches,
         max_pending_batches: 64,
         max_pending_bytes: 1024 * 1024,
@@ -149,9 +148,9 @@ pub(super) fn trusted_owner_host_config(root: PathBuf) -> OwnerHostConfig {
     config
 }
 
-fn owner_limits() -> TcpLimits {
+pub(super) fn owner_limits() -> TcpLimits {
     TcpLimits {
-        io_timeout: Duration::from_secs(30),
+        io_timeout: PROGRESS_CAP,
         ..TcpLimits::default()
     }
 }
@@ -421,7 +420,7 @@ impl Fixture {
         let mut client = Client::connect(
             &endpoint.address,
             &tls,
-            Duration::from_secs(5),
+            PROGRESS_CAP,
             self.config.partition_config(1, endpoint.partition),
             &self.shape,
         )
@@ -563,7 +562,8 @@ pub(super) fn read_at_cut(
 /// predecessor. Workers publish on their own thread; there is no authority
 /// completion route left to consume.
 fn settle_publication(db: &RemoteDatabase, expected: &[u64]) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Progress wait on the owner receipts, not a timing measurement (TST-9).
+    let deadline = Instant::now() + PROGRESS_CAP;
     for &sequence in expected {
         while !db.core.publication_settled(sequence) {
             db.core.ensure_healthy().expect("owner append failed");
@@ -638,7 +638,7 @@ fn wait_unpublished(db: &RemoteDatabase, batches: usize) {
     assert!(
         db.core
             .admission
-            .wait_charges(Instant::now() + Duration::from_secs(10), |charges| charges
+            .wait_charges(Instant::now() + PROGRESS_CAP, |charges| charges
                 .partition_batches
                 == batches),
         "publication finalization did not complete"
@@ -678,7 +678,7 @@ fn assert_worker_bytes(db: &RemoteDatabase, owner: usize, groups: usize, sequenc
 /// Observe submitted RPC flights, not worker-local queued groups. Persistence
 /// is explicitly paused by the caller, so the expected count cannot retire.
 fn wait_for_flights(db: &RemoteDatabase, owner: usize, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PROGRESS_CAP;
     loop {
         let flights = db.core.clients[owner]
             .client

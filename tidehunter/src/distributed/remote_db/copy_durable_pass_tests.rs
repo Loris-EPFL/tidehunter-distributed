@@ -31,25 +31,25 @@ pub(super) const VALUE: usize = 8 * KIB as usize;
 /// About 2.4 MiB of 8 KiB values: more than two whole 1 MiB files, so a pass
 /// has a complete file to reclaim.
 const WRITES: u64 = 300;
-/// Quiet but reactive: the owner pollers sample their nudge flag every quarter
-/// lag, so the lag must be short against the wait's production bound for the
-/// wait's own request to be served. The cut's lag timer ALSO nudges once a lag
-/// passes with an unsynced receipt; it is long against the handshakes of these
-/// tests, but no test depends on it never firing. Only
+/// Quiet but reactive: the owner poller serves a nudge on its long poll, whose
+/// wait is a quarter of the lag capped at 5 s, so the copy wait's own request
+/// is served well inside [`COPY_WAIT`]. The cut's lag timer ALSO nudges once a
+/// lag passes with an unsynced receipt; this bound is the maximum accepted lag,
+/// so no test depends on a handshake finishing before that timer. Only
 /// `a_native_tier_pass_syncs_its_copies_before_it_re_points` asserts that the
 /// copy wait asked an owner to sync; the other tests assert the request delta and
 /// the parked persist of the copies.
-const QUIET_LAG_MS: u64 = 10_000;
-/// The bound a test waits for a hook or a pass: generous against the
-/// production waits (8 x lag + timeout), never a sleep.
+const QUIET_LAG_MS: u64 = 3_600_000;
+/// The bound a test waits for a hook, a channel or a pass. Every wait follows
+/// observed progress (a parked persist, a counter or a joined pass), so this is
+/// a hang guard, not a latency premise (TST-9).
 pub(super) const WAIT: Duration = Duration::from_secs(120);
 
 /// The pass's own wait for its copies to become durable in the tests that
 /// inject a failure of that sync. It only ends the wait (the cut never
 /// advances after the injected failure), so it must outlast the hook handshake
-/// of the test and the poller's nudge pickup; the tests assert the failure
-/// fired, so a pass that ended early fails loudly. The CAS test also sets it,
-/// so its own park wait keeps margin over the production wait.
+/// of the test and the poller's nudge pickup. Every such test installs it as
+/// `copy_durable_timeout`, so the wait never depends on the configured cut lag.
 pub(super) const COPY_WAIT: Duration = Duration::from_secs(30);
 
 /// A cut above every version of every epoch: the index holds only published

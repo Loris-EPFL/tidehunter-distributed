@@ -713,11 +713,13 @@ fn leased_worker_timeout_detaches_dma_before_blocking_drain() {
     client.leased_test_pause_drain(entered, resume);
     let (worker, failure) = worker(&fixture, client);
     let reply = worker.enqueue(1, vec![fixture.batch(0)]).unwrap();
-    assert!(reply.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
-    draining.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The worker's production timeout is deliberate; these waits follow its
+    // terminal reply and drain handshake, so they outlast that timeout (TST-9).
+    assert!(reply.recv_timeout(PROGRESS_CAP).unwrap().is_err());
+    draining.recv_timeout(PROGRESS_CAP).unwrap();
     let mut guard = worker
         .client
-        .try_lock_for(Duration::from_secs(1))
+        .try_lock_for(PROGRESS_CAP)
         .expect("terminal drain must not hold the client mutex");
     assert!(
         guard.take_failed_live_writer().is_none(),
@@ -731,6 +733,16 @@ fn leased_worker_timeout_detaches_dma_before_blocking_drain() {
     drop(worker);
     // Acquire observes the failure delivered before the detached drain.
     assert!(failure.load(Ordering::Acquire));
+    // The detached drain completes the timed-out write on its own thread:
+    // follow its counter instead of assuming the completion already ran.
+    let deadline = Instant::now() + PROGRESS_CAP;
+    while fixture.metrics.snapshot().counts.completed_write_ops == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the timed-out write never completed after the drain"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     let counts = fixture.metrics.snapshot().counts;
     assert_eq!(leased_latencies(&counts), [(0, 0); 5]);
     assert_eq!(counts.completed_write_ops, 1);

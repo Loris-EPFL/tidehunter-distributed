@@ -10,6 +10,7 @@ use super::tests::{fail_stop_without_checkpoint, recovery_metrics, reopen_result
 use super::*;
 use crate::cell::CellId;
 use crate::distributed::sui::Db;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use crate::key_shape::{KeyIndexing, KeyShapeBuilder, KeyType};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use smallvec::SmallVec;
@@ -62,8 +63,9 @@ fn within_deadline<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static)
     let worker = thread::spawn(move || {
         let _ = done.send(work());
     });
+    // Progress wait on the joined worker, not a timing measurement (TST-9).
     let value = result
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(PROGRESS_CAP)
         .expect("operation blocked");
     worker.join().unwrap();
     value

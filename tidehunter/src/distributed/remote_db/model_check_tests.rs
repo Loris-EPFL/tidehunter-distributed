@@ -8,7 +8,7 @@
 //! gates follow a seed-selected acknowledged prefix, never a count of physical
 //! writes/flushes. Every failure retains its exact history, gate and boundary
 //! trace.
-use super::pipeline_tests::{Fixture, open_live_fixture_host};
+use super::pipeline_tests::{Fixture, open_live_fixture_host, owner_limits};
 use super::*;
 use crate::distributed::test_bounds::CHILD_RUN_CAP;
 use crate::failpoints::write_model;
@@ -184,9 +184,7 @@ impl Restart {
                 let listener = std::net::TcpListener::bind(&endpoint.address).unwrap();
                 let tls = tls.clone();
                 let stop = Arc::clone(shutdown);
-                thread::spawn(move || {
-                    host.serve(listener, tls, super::super::tcp::TcpLimits::default(), stop)
-                })
+                thread::spawn(move || host.serve(listener, tls, owner_limits(), stop))
             })
             .collect()
     }

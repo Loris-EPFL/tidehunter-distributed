@@ -117,7 +117,11 @@ fn sui_adapter_pages_reverse_bounds_snapshot_and_reopen() {
     assert!(timing.contains_key("write_profile_sampled_requests"));
     db.flush().unwrap();
 
-    drop(db);
+    // Each collected iterator and the checkpoint above release their clone of
+    // the authority. Join its workers before the reopen, so the new authority
+    // cannot contend with the old one over the same owner files and controllers.
+    db.wait_for_background_threads_to_finish()
+        .expect("shutdown before reopen");
     let db = Db::open_remote_local_fixture(&path, fixture.shape.clone(), fixture.config.clone())
         .unwrap();
     assert!(db.get(ks, &255u32.to_be_bytes()).unwrap().is_none());
