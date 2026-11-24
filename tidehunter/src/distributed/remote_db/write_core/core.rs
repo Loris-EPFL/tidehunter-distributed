@@ -184,10 +184,10 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     pub write_timeline: Arc<WriteTimeline>,
     pub publisher: Mutex<PublisherState>,
     pub floor_changed: Condvar,
-    /// Retirement gate and the relocation shadow witness kept between passes.
-    /// Serialises retirement with the callback-start adoption of a relocation
-    /// pass; the witness is never persisted (see `RetirementGate`).
-    pub(crate) retirement: Mutex<super::super::dead_wal_files::RetirementGate>,
+    /// Serialises owner-file retirement with the callback-start adoption of a
+    /// relocation pass. It carries no state: the watermark is computed from the
+    /// stored terms under this lock.
+    pub(crate) retirement: Mutex<()>,
     /// Opt-in ordered R1 evidence stream; inert until enabled.
     pub(crate) r1_events: super::super::r1_events::R1EventSlot,
     pub stats: Mutex<CoreStats>,
@@ -196,18 +196,6 @@ pub(in crate::distributed::remote_db) struct WriteCore {
     /// cover their copies in time. Diagnostic only (a persistent value means an
     /// owner cannot sync): relaxed, nothing is ordered against it.
     pub(crate) copy_deferrals: AtomicU64,
-    /// Retirement passes that refused every stream because a reader latch sat
-    /// below the stored cut (`dead_wal_files::take_snapshot`). Diagnostic only:
-    /// relaxed, nothing is ordered against it.
-    pub(crate) retirement_latch_caps: AtomicU64,
-    /// Retirement passes whose per-stream watermark a shadowed relocation
-    /// re-point capped (`dead_wal_files::take_snapshot`, from the retained
-    /// `RetirementGate` witness, not from one pass's copies). Diagnostic only:
-    /// relaxed, nothing is ordered against it.
-    pub(crate) retirement_pin_caps: AtomicU64,
-    /// Stream watermarks lowered by that cap, summed over passes. Diagnostic
-    /// only: relaxed, nothing is ordered against it.
-    pub(crate) retirement_pin_streams: AtomicU64,
     /// Seeded start streams that a retirement pass found with no row in the
     /// region this process stored (`dead_wal_files::take_snapshot`), summed
     /// over passes. Every store names every retained generation, so a
@@ -273,15 +261,12 @@ impl WriteCore {
             write_profile: open.write_profile,
             write_timeline: open.write_timeline,
             floor_changed: Condvar::new(),
-            retirement: Mutex::new(Default::default()),
+            retirement: Mutex::new(()),
             r1_events: Default::default(),
             stats: Mutex::new(open.stats),
             admission,
             read_resolve_ns: AtomicU64::new(0),
             copy_deferrals: AtomicU64::new(0),
-            retirement_latch_caps: AtomicU64::new(0),
-            retirement_pin_caps: AtomicU64::new(0),
-            retirement_pin_streams: AtomicU64::new(0),
             retirement_missing_rows: AtomicU64::new(0),
             retirement_busy_replies: AtomicU64::new(0),
             value_read_ns: AtomicU64::new(0),

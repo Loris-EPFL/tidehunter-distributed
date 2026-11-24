@@ -233,56 +233,6 @@ fn below_target(position: &VersionPosition, targets: &[(u32, u64, u64)]) -> bool
     })
 }
 
-/// Whether a shadowed as-of position still needs a retirement cap.
-///
-/// `shadowing` is the cell entry that stopped the re-point, so a read cut at or
-/// below that version still resolves the old position. A held latch at or below
-/// it therefore needs the file; a latch above it resolves the shadowing entry or
-/// a newer one. With no latch, only a shadowing version the published cut does
-/// not cover can still be named by a latch created later: `published` is read
-/// before `lowest_held` (the SeqCst Dekker pair at `CutLatches::publish_min` and
-/// `min_held`, loader.rs), so a racing pin either appears in the latch read or
-/// samples a cut at or above the published one. The pass's store also waits for
-/// the publisher critical section that inserted the shadowing entry
-/// (`publish_durable` advances the published front in that section and
-/// `WriteCore::older_streams` takes the same lock), so the uncovered branch is
-/// reachable only after a publication failure. Paper 4.4: the GC watermark
-/// tracks the oldest position that may still be referenced.
-///
-/// `dead_wal_files::RetirementGate::caps` re-evaluates the retained witness with
-/// this predicate on every retirement, not only on the pass that saw the
-/// shadow.
-pub(super) fn shadow_needs_cap(
-    held: Option<BatchVersion>,
-    published: BatchVersion,
-    shadowing: BatchVersion,
-) -> bool {
-    match held {
-        Some(held) => cut_at_or_below(held, shadowing),
-        None => !published_covers(published, shadowing),
-    }
-}
-
-/// A cut is exclusive: a read at `cut` resolves versions below it, so it
-/// resolves `version`'s predecessor exactly when `cut` is at or below `version`.
-/// Epochs are fencing generations; an older epoch is entirely below a newer one.
-fn cut_at_or_below(cut: BatchVersion, version: BatchVersion) -> bool {
-    if cut.epoch != version.epoch {
-        return cut.epoch < version.epoch;
-    }
-    cut.sequence <= version.sequence
-}
-
-/// Whether the published cut `published` (the next sequence to publish) covers
-/// `version`: every batch at or below it is published, so a latch taken later
-/// has a cut above `version` and resolves it or a newer entry.
-fn published_covers(published: BatchVersion, version: BatchVersion) -> bool {
-    if published.epoch != version.epoch {
-        return published.epoch > version.epoch;
-    }
-    published.sequence > version.sequence
-}
-
 impl ConcurrentRemoteDatabase {
     /// One production pass. Native panics its relocator on a pass error and
     /// its background health then fails every later operation; the leased
@@ -486,20 +436,12 @@ impl ConcurrentRemoteDatabase {
                 )
             })
             .collect();
-        let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
         let (copied, rejected, blocked) =
-            self.relocate_cells(q, &targets, &drop_targets, cancel, &mut shadowed)?;
+            self.relocate_cells(q, &targets, &drop_targets, cancel)?;
         // A survivor this pass could not verify or copy keeps its stream's
         // start where it was: advancing it would let retirement reclaim bytes
         // that still hold a live value. The copy of that key is not applied.
         targets.retain(|&(partition, generation, _)| !blocked.contains(&(partition, generation)));
-        // This pass's shadowed positions join the retirement witness before any
-        // early return below: a pass whose store is not usable retires nothing,
-        // but the witness it produced still constrains the next pass that does
-        // retire, and the next pass may not target this stream at all.
-        if !shadowed.is_empty() {
-            core.retirement.lock().merge(&shadowed);
-        }
         let callback_starts: BTreeMap<(u32, u64), u64> = targets
             .iter()
             .map(|&(partition, generation, target)| ((partition, generation), target))
@@ -578,14 +520,12 @@ impl ConcurrentRemoteDatabase {
         if std::mem::take(&mut core.test_hooks.lock().relocation_prune_interruption) {
             return Err(LocalDbError::new("injected relocation prune interruption"));
         }
-        // Retirement under the advanced watermark. The shadow witness kept in
-        // `core.retirement` (merged above and on every earlier pass) caps each
-        // stream's watermark inside `take_snapshot`, whatever this pass
-        // targeted; see `RetirementGate` and `shadow_needs_cap` for the proof
-        // and the publication-floor/latch read order.
+        // Retirement under the advanced watermark. Like native, a held
+        // checkpoint does not keep owner WAL files: the watermark is the two
+        // stored terms alone (`dead_wal_files::take_snapshot`).
         {
-            let mut gate = core.retirement.lock();
-            core_retire_dead_wal_files(core, &mut gate)?;
+            let _retirement = core.retirement.lock();
+            core_retire_dead_wal_files(core)?;
         }
         Ok(RelocationReport {
             gate: RelocationGate::DidWork,
@@ -623,7 +563,6 @@ impl ConcurrentRemoteDatabase {
         targets: &[(u32, u64, u64)],
         drop_targets: &[(u32, u64, u64)],
         cancel: &AtomicBool,
-        shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
     ) -> Result<(u64, u64, BTreeSet<(u32, u64)>), LocalDbError> {
         let limit = self.relocation_batch_max_bytes();
         let mut copied = 0u64;
@@ -649,8 +588,6 @@ impl ConcurrentRemoteDatabase {
                 if filtered {
                     // Native copies nothing for a filtered keyspace: the
                     // entries it removes are dropped unread below the terminal.
-                    // A drop names no re-point, so it produces no shadowed
-                    // expectation.
                     self.write_core().table.relocation_apply(
                         keyspace,
                         &cell,
@@ -668,7 +605,6 @@ impl ConcurrentRemoteDatabase {
                         cancel,
                         &mut rejected,
                         &mut blocked,
-                        shadowed,
                     )?;
                 }
                 let Some(next) = self.write_core().table.next_cell(descriptor, &cell, false) else {
@@ -681,8 +617,8 @@ impl ConcurrentRemoteDatabase {
     }
 
     /// One cell: copy its live survivors in bounded chunks and re-point each
-    /// chunk before the next. The view holds a cut latch, so promotion cannot pass
-    /// `Q` while its positions are still being copied (I6).
+    /// chunk before the next. The view holds a cut latch, so promotion cannot
+    /// pass `Q` while its positions are still being copied (I6).
     #[allow(
         clippy::too_many_arguments,
         reason = "one internal call site; the accumulators are the pass's own outputs"
@@ -698,7 +634,6 @@ impl ConcurrentRemoteDatabase {
         cancel: &AtomicBool,
         rejected: &mut u64,
         blocked: &mut BTreeSet<(u32, u64)>,
-        shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
     ) -> Result<u64, LocalDbError> {
         let (view, latch) = self.write_core().table.relocation_view(keyspace, cell, q)?;
         let mut chunk: Vec<RelocatedValue> = Vec::new();
@@ -750,7 +685,6 @@ impl ConcurrentRemoteDatabase {
                     targets,
                     rejected,
                     blocked,
-                    shadowed,
                 )?;
                 bytes = 0;
             }
@@ -771,7 +705,6 @@ impl ConcurrentRemoteDatabase {
             &live,
             rejected,
             blocked,
-            shadowed,
         )?;
         drop(latch);
         Ok(copied)
@@ -793,7 +726,6 @@ impl ConcurrentRemoteDatabase {
         targets: &[(u32, u64, u64)],
         rejected: &mut u64,
         blocked: &mut BTreeSet<(u32, u64)>,
-        shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
     ) -> Result<u64, LocalDbError> {
         if chunk.is_empty() {
             return Ok(0);
@@ -859,16 +791,12 @@ impl ConcurrentRemoteDatabase {
             .copied()
             .filter(|&(partition, generation, _)| !blocked.contains(&(partition, generation)))
             .collect();
-        let not_applied = self.write_core().table.relocation_apply(
+        self.write_core().table.relocation_apply(
             keyspace,
             cell,
             RelocationApply::Repoint(&updates),
             &live,
         )?;
-        // A position whose re-point did not land is still named by a read cut at
-        // or below the entry that shadowed it; `relocation_pass` turns the
-        // lowest of these per stream into a retirement cap.
-        shadowed.extend(not_applied);
         Ok(copied)
     }
 
@@ -1135,13 +1063,5 @@ fn stream_reports(
 mod unit_tests;
 
 #[cfg(test)]
-#[path = "relocation_shadow_tests.rs"]
-mod shadow_tests;
-
-#[cfg(test)]
 #[path = "relocation_promoted_l1_tests.rs"]
 mod promoted_l1_tests;
-
-#[cfg(test)]
-#[path = "relocation_witness_tests.rs"]
-mod witness_tests;

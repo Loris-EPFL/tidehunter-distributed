@@ -80,7 +80,9 @@ pub(crate) mod file_inventory;
 use fencing_generations::AuthorityGeneration;
 #[cfg(test)]
 use fencing_generations::GenerationState;
+pub(crate) mod checkpoint_read;
 pub(crate) mod pending_read;
+pub use checkpoint_read::ReadCheckpoint;
 pub(crate) use pending_read::ReadTraceChild;
 pub use pending_read::ReadTraceSnapshot;
 mod write_core;
@@ -845,17 +847,6 @@ pub struct WriteProfileSnapshot {
     pub profile_activation_errors: u64,
     pub profile_capture_errors: u64,
     pub profile: super::tcp::ConnectionProfile,
-}
-
-/// A held read view (native `DbCheckpoint`): the publication cut at the time of
-/// the call and the latch that keeps flushes from promoting past it, so a later
-/// overwrite does not change what this view reads.
-pub struct ReadCheckpoint {
-    database: [u8; 16],
-    /// The serving epoch of the open that took the view.
-    epoch: u64,
-    cut: BatchVersion,
-    _latch: CutLatch,
 }
 
 pub struct RemoteDatabase {
@@ -1747,6 +1738,7 @@ impl RemoteDatabase {
     /// compares the full key, and so does this (`need_check_index_key`), through
     /// the entry read that returns the member's own key and bypasses the value
     /// cache, which is keyed by position and would answer for the wrong key.
+    ///
     pub(super) fn read_value(
         &self,
         ks: KeySpace,
@@ -1757,15 +1749,14 @@ impl RemoteDatabase {
         let table = &self.core.table;
         let descriptor = table.ks_desc(ks);
         let reduced = descriptor.reduce_key(key);
+        let at = reduced.as_ref();
+        let reader = &self.reader;
         let resolve = || table.get(ks, key, cut);
         if descriptor.need_check_index_key() {
-            let entry =
-                self.reader
-                    .read_entry_with_resolve(ks, reduced.as_ref(), position, resolve)?;
+            let entry = reader.read_entry_with_resolve(ks, at, position, resolve, false)?;
             Ok(entry.and_then(|(full, value)| (full.as_ref() == key).then_some(value)))
         } else {
-            self.reader
-                .read_with_resolve(ks, reduced.as_ref(), position, resolve)
+            reader.read_with_resolve(ks, at, position, resolve, false)
         }
     }
 
@@ -1932,38 +1923,6 @@ impl RemoteDatabase {
 
     pub fn exists(&mut self, ks: KeySpace, key: &[u8]) -> Result<bool, LocalDbError> {
         self.exists_at_cut(ks, key, self.core.table.current())
-    }
-
-    /// A read view of everything acknowledged so far (native `DbCheckpoint`):
-    /// the publication cut after a drain, latched so no flush promotes past it.
-    pub fn checkpoint(&mut self) -> Result<ReadCheckpoint, LocalDbError> {
-        self.drain()?;
-        let (cut, latch) = self.core.table.pin_checkpoint();
-        Ok(ReadCheckpoint {
-            database: self.core.config.storage.database,
-            epoch: self.core.epoch,
-            cut,
-            _latch: latch,
-        })
-    }
-
-    pub fn get_at(
-        &mut self,
-        ks: KeySpace,
-        key: &[u8],
-        checkpoint: &ReadCheckpoint,
-    ) -> Result<Option<Bytes>, LocalDbError> {
-        if checkpoint.database != self.core.config.storage.database {
-            return Err(LocalDbError::new("checkpoint belongs to another database"));
-        }
-        // The latch pins the table of the open that took the view: after a
-        // reopen it pins nothing here, and the cut names old-epoch versions.
-        if checkpoint.epoch != self.core.epoch {
-            return Err(LocalDbError::new(
-                "checkpoint belongs to an earlier open of this database",
-            ));
-        }
-        self.get_at_cut(ks, key, checkpoint.cut)
     }
 
     /// One native snapshot pass: flushes the cells that are stale by value-byte

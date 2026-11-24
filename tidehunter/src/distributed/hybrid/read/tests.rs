@@ -705,3 +705,39 @@ fn a_decoded_member_shares_the_fetched_allocation() {
         "the value was copied out of the frame"
     );
 }
+
+/// The latched-view rule: a read whose member the owner no longer holds, and
+/// whose re-resolve names the same physical member, answers absent. That is
+/// native's result for an unreachable position (`Db::resolve_record_frame`
+/// returns `None`, and `DbCheckpoint` reads through it), and it is why a held
+/// checkpoint does not need retirement to keep its files (`dead_wal_files`).
+/// The live read of the same state keeps the typed eviction, which
+/// [`retry_after_a_second_failure_is_the_typed_evicted_error`] pins.
+#[test]
+fn a_latched_read_of_a_reclaimed_member_answers_absent() {
+    let evicted = || {
+        retry_once(
+            Err::<Option<u32>, _>(retired()),
+            BatchVersion {
+                epoch: 1,
+                sequence: 7,
+            },
+            || Ok(()),
+            || {
+                Err(LocalDbError::new(
+                    "re-resolve returned the same physical member",
+                ))
+            },
+        )
+    };
+    assert_eq!(
+        latched_absent(evicted(), true).expect("a latched read never fails on eviction"),
+        None,
+        "a reclaimed frame reads as absent on a held cut"
+    );
+    assert!(evicted().is_err(), "the live read keeps the typed eviction");
+    assert!(
+        latched_absent(Err::<Option<u32>, _>(retired()), true).is_err(),
+        "only a terminal eviction maps to absent; a first transport failure still propagates"
+    );
+}

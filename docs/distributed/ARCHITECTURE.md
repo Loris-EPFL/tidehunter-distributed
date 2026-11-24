@@ -295,10 +295,6 @@ Gauges of the capacity path (exported by `sui.rs`, with `snapshot_latch_deferral
 - `relocation_copy_deferrals`: passes that applied nothing because the owners
   had not made the copies durable in time. The relocator runs the pass again.
   It is a count, not a database failure.
-- `retirement_latch_caps`: retirement runs that retired nothing because a held
-  latch (a relocation pass's frozen cut, or the short NONE latch of a
-  checkpoint pin) was below the stored cut. The check fails closed. A later run
-  retries the files.
 - `retirement_busy_replies`: retirement requests the owner answered `Busy`
   because another lifecycle operation held the gate. The coordinator retries.
 - `deferred_retirements` (`FileMaintenanceStats` in `tcp/inventory.rs`):
@@ -307,11 +303,16 @@ Gauges of the capacity path (exported by `sui.rs`, with `snapshot_latch_deferral
   adoption, or for the next open. The engine does not export this counter to
   the Sui metrics (open owner item).
 
-These four counters mean "non-zero = defect or operator-visible state". The
-first two use the dynamic `stat` label of the `tidehunter_adapter` metric in
-the Sui adapter (`crates/typed-store/src/tidehunter_util.rs`, no registry
-change). The last two are engine counters in `RecoveryStats`; only the
-kv-research open record exports them.
+These counters mean "non-zero = defect or operator-visible state". The first
+two use the dynamic `stat` label of the `tidehunter_adapter` metric in the Sui
+adapter (`crates/typed-store/src/tidehunter_util.rs`, no registry change). The
+last two are engine counters in `RecoveryStats`; only the kv-research open
+record exports them.
+
+A held checkpoint does not keep owner WAL files: the retirement watermark is
+`min(adopted callback start, stored replay_from)` per stream, as native's
+relocation GC, and a read through a checkpoint whose frame a pass reclaimed
+answers absent, which is native's result for an unreachable position.
 
 - `retirement_missing_rows`: a retirement proof found fewer index rows than
   the files it covered. The retirement fails closed. Zero unless an invariant

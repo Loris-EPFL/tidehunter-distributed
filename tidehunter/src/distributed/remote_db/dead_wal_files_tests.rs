@@ -613,76 +613,20 @@ fn coordinator_pass_crash_cuts_match_the_no_gc_control() {
     }
 }
 
-/// A held checkpoint pin keeps its VIEW readable across relocation passes, and
-/// its file stays while it is held: the entry the pinned view names is an older
-/// version of an overwritten key, so the pass copies its value but cannot carry
-/// the re-point (the cell's latest entry is a newer version). The retirement
-/// watermark is capped below that position (paper 4.4: the GC watermark tracks
-/// the oldest position that may still be referenced), so file 0 is not retired
-/// until the pin drops; the next pass after the release reclaims it.
-#[test]
-fn a_held_read_pin_keeps_its_view_across_a_retirement() {
-    let fixture = Fixture::new(DurabilityTier::Native);
-    let db = fixture.open();
-    let generation = db.epoch;
-    churn(&db, 0, KEYS);
-    let (cut, pin) = db.hybrid_table().pin_checkpoint();
-    let pinned = db
-        .hybrid_table()
-        .get(KeySpace(0), &key(0), cut)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pinned.address.offset / FILE_BYTES, 0);
-    churn(&db, KEYS, INITIAL_WRITES);
-    let mut written = KEYS + INITIAL_WRITES;
-    for _ in 0..ROUNDS {
-        churn(&db, written, ROUND_WRITES);
-        written += ROUND_WRITES;
-        retire(&db).unwrap();
-        // The pinned cut still names offset 128 in file 0 (the first write of
-        // key 0), so every pass must leave that file in place.
-        assert!(
-            fixture.wal_files(generation).contains(&0),
-            "a held pin's file was retired"
-        );
-    }
-    assert!(
-        db.retirement_pin_caps() > 0,
-        "premise: the pass saw the shadowed position and capped the watermark"
-    );
-    let pinned_value = pipeline_tests::read_at_cut(&db, KeySpace(0), &key(0), cut)
-        .unwrap()
-        .expect("the pinned cut still sees the first write of key 0");
-    assert_eq!(pinned_value.to_vec(), value(0));
-    drop(pin);
-    for _ in 0..ROUNDS {
-        churn(&db, written, ROUND_WRITES);
-        written += ROUND_WRITES;
-        retire(&db).unwrap();
-        if !fixture.wal_files(generation).contains(&0) {
-            break;
-        }
-    }
-    assert!(!fixture.wal_files(generation).contains(&0));
-    db.shutdown().unwrap();
-}
-
-/// A `NoWork` pass keeps the shadow witness. The pass that first copied a
-/// shadowed as-of position is not necessarily the pass that retires its file: a
-/// pass with no whole file before a target merges nothing and retires nothing
-/// (`targets.is_empty()` returns before the scan), and the next retirement
-/// decision must still see the position. The direct retirement below is the
-/// smallest way to observe that survival: it is the same function a pass calls
-/// after its store.
+/// A held checkpoint does not keep owner WAL files, exactly as native
+/// `Db::checkpoint` does not ("does not itself hold WAL files from being
+/// reclaimed, so it is intended for short-lived reads"). The entry the pinned
+/// cut names is an older version of an overwritten key: the pass copies its
+/// value but cannot carry the re-point (the cell's latest entry is newer), so
+/// the pinned cut keeps naming the old position. With no latch term in the
+/// retirement watermark, the file that holds it retires anyway.
 ///
-/// Negative control (mutation run): drop the witness when a pass has no target
-/// (`self.shadows.clear()` at the `targets.is_empty()` return in
-/// `relocation_pass`); the direct retirement below then retires file 0 and the
-/// assertion after it fails ("the NoWork pass dropped the witness"). Rebuilding
-/// the witness only from the current pass's list is a different mutation and
-/// cannot turn this test red, because a `NoWork` pass returns before the merge.
+/// The owner still serves an unlinked file from its open sealed log, so the
+/// pinned read keeps resolving its own value here; a frame the owner no longer
+/// holds at all answers absent (`hybrid::read::tests::
+/// a_latched_read_of_a_reclaimed_member_answers_absent`). No held read fails.
 #[test]
-fn a_no_work_pass_keeps_the_shadow_cap() {
+fn a_held_checkpoint_does_not_keep_a_retired_file() {
     let fixture = Fixture::new(DurabilityTier::Native);
     let db = fixture.open();
     let generation = db.epoch;
@@ -699,54 +643,6 @@ fn a_no_work_pass_keeps_the_shadow_cap() {
         "premise: the pinned cut names a position in WAL file 0"
     );
     churn(&db, KEYS, INITIAL_WRITES);
-
-    // The first pass has whole files before its target: it copies the as-of
-    // positions, cannot re-point the overwritten key and caps the stream.
-    let first = retire_report(&db);
-    assert_eq!(
-        first.gate,
-        crate::distributed::remote_db::relocation::RelocationGate::DidWork,
-        "{first:?}"
-    );
-    assert!(
-        db.retirement_pin_caps() > 0,
-        "premise: the first pass saw the shadowed position and capped the watermark: {first:?}"
-    );
-    assert!(
-        fixture.wal_files(generation).contains(&0),
-        "the first pass retired the pinned file"
-    );
-
-    // The next pass has no whole file before its target (`target == from`), so
-    // it returns before the scan and before any retirement.
-    let second = retire_report(&db);
-    assert_eq!(
-        second.gate,
-        crate::distributed::remote_db::relocation::RelocationGate::NoWork,
-        "premise: pass 2 has no target: {second:?}"
-    );
-
-    // The witness outlived that pass: a retirement decision taken now still caps
-    // the stream.
-    {
-        let core = db.write_core();
-        let mut gate = core.retirement.lock();
-        super::dead_wal_files::core_retire_dead_wal_files(core, &mut gate)
-            .expect("retirement after the NoWork pass");
-    }
-    assert!(
-        fixture.wal_files(generation).contains(&0),
-        "the NoWork pass dropped the witness: the next retirement reclaimed the file a held cut \
-         still resolves"
-    );
-    let pinned_value = pipeline_tests::read_at_cut(&db, KeySpace(0), &key(0), cut)
-        .unwrap()
-        .expect("the pinned cut still sees the first write of key 0");
-    assert_eq!(pinned_value.to_vec(), value(0));
-
-    // Release: the witness is no longer needed and the next reclaiming pass
-    // retires file 0, so the cap is never a permanent stall.
-    drop(pin);
     let mut written = KEYS + INITIAL_WRITES;
     for _ in 0..ROUNDS {
         churn(&db, written, ROUND_WRITES);
@@ -758,26 +654,52 @@ fn a_no_work_pass_keeps_the_shadow_cap() {
     }
     assert!(
         !fixture.wal_files(generation).contains(&0),
-        "file 0 never retired after the pin dropped"
+        "a held checkpoint kept WAL file 0 from being retired"
     );
+    // Every key of the pinned cut resolved its first write, and those first
+    // writes were all in the retired file. A held read must not fail on a
+    // retired file: it answers the write it names, or absent once the owner no
+    // longer holds the bytes.
+    for sequence in 0..KEYS {
+        let read = pipeline_tests::read_at_cut(&db, KeySpace(0), &key(sequence), cut)
+            .unwrap_or_else(|error| {
+                panic!("key {sequence}: a held read failed on a retired file: {error:?}")
+            });
+        if let Some(bytes) = read {
+            assert_eq!(
+                bytes.to_vec(),
+                value(sequence),
+                "key {sequence}: the pinned read names its own write"
+            );
+        }
+    }
+    // The live view is unaffected: every hot key reads its latest value.
+    for sequence in written - KEYS..written {
+        assert_eq!(
+            pipeline_tests::read_at_cut(
+                &db,
+                KeySpace(0),
+                &key(sequence),
+                pipeline_tests::newest_cut()
+            )
+            .unwrap()
+            .unwrap()
+            .to_vec(),
+            value(sequence),
+            "live read after the retirement"
+        );
+    }
+    drop(pin);
     db.shutdown().unwrap();
 }
 
-/// One production relocation pass with its report, for tests that assert the
-/// gate rather than only the effect.
-fn retire_report(db: &ConcurrentRemoteDatabase) -> crate::distributed::remote_db::RelocationReport {
-    db.relocation_pass(false, &AtomicBool::new(false))
-        .expect("relocation pass")
-}
-
 /// A held read cut that can name no byte of the victims does not block
-/// retirement. Every key is rewritten after the file it first named, so the
-/// position the pinned cut resolves is in a later file; the pass's as-of view
-/// shows those positions, the live entries above the cut shadow them, and the
-/// per-stream cap therefore sits above the victims. File 0 retires while the
-/// checkpoint is held, and every pinned read still resolves its own value.
+/// retirement, and no latch term widens the watermark either way. Every key is
+/// rewritten after the file it first named, so the position the pinned cut
+/// resolves is in a later file; file 0 retires while the checkpoint is held and
+/// every pinned read still resolves its own value from its surviving file.
 #[test]
-fn a_latch_whose_positions_are_all_above_the_victims_does_not_block_retirement() {
+fn a_held_read_cut_naming_later_files_does_not_block_retirement() {
     let fixture = Fixture::new(DurabilityTier::Native);
     let db = fixture.open();
     let generation = db.epoch;
@@ -811,16 +733,12 @@ fn a_latch_whose_positions_are_all_above_the_victims_does_not_block_retirement()
         );
     };
     // A newer write per key after the pin, so the pass's compare-and-set is
-    // shadowed and its cap has to decide the file.
+    // shadowed: the pinned positions keep their addresses.
     churn(&db, written, 4 * KEYS);
     retire(&db).unwrap();
     assert!(
         !fixture.wal_files(generation).contains(&0),
         "file 0 holds no position the pinned cut can resolve: it must retire"
-    );
-    assert!(
-        db.retirement_pin_caps() > 0,
-        "premise: the pass saw shadowed re-points and capped the watermark"
     );
     for sequence in 0..KEYS {
         let pinned_value = pipeline_tests::read_at_cut(&db, KeySpace(0), &key(sequence), cut)

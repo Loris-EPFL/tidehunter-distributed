@@ -97,6 +97,19 @@ pub(crate) fn retry_once<T>(
     }
 }
 
+/// Apply the latched-view rule for an unreachable member: absent, exactly as
+/// native answers for a reclaimed position. A live read returns the typed
+/// eviction unchanged.
+fn latched_absent<T>(
+    result: Result<Option<T>, LocalDbError>,
+    latched: bool,
+) -> Result<Option<T>, LocalDbError> {
+    match result {
+        Err(error) if latched && error.is_evicted_during_read() => Ok(None),
+        other => other,
+    }
+}
+
 /// Reads values by position. One instance per open database.
 ///
 /// `lanes` owns the bounded async read service and its owner connections;
@@ -179,16 +192,25 @@ impl ValueReader {
     /// the entry either moved, in which case its new address is read, or it is
     /// gone, in which case the read is not-found. A second fetch failure is the
     /// typed `value evicted during read` error — never a retry loop.
+    ///
+    /// `latched` marks a read at a held checkpoint cut. Such a read answers a
+    /// frame a pass reclaimed as absent, which is native's storage-layer result
+    /// for an unreachable position (`Db::resolve_record_frame` returns `None`,
+    /// and `DbCheckpoint` reads through it); native's checkpoint docs say the
+    /// view does not hold WAL files. A live read keeps the typed eviction,
+    /// because only a held cut can name a frame retirement has passed.
     pub(crate) fn read_with_resolve(
         &self,
         ks: KeySpace,
         indexed_key: &[u8],
         position: VersionPosition,
         resolve: impl FnOnce() -> Result<Option<VersionPosition>, LocalDbError>,
+        latched: bool,
     ) -> Result<Option<Bytes>, LocalDbError> {
-        self.resolve_retrying(position, resolve, |at| {
+        let result = self.resolve_retrying(position, resolve, |at| {
             self.read_position(ks, indexed_key, at)
-        })
+        });
+        latched_absent(result, latched)
     }
 
     /// Like [`Self::read_with_resolve`], but returns the member's **full key** with
@@ -207,10 +229,12 @@ impl ValueReader {
         indexed_key: &[u8],
         position: VersionPosition,
         resolve: impl FnOnce() -> Result<Option<VersionPosition>, LocalDbError>,
+        latched: bool,
     ) -> Result<Option<(Bytes, Bytes)>, LocalDbError> {
-        self.resolve_retrying(position, resolve, |at| {
+        let result = self.resolve_retrying(position, resolve, |at| {
             self.read_entry_position(ks, indexed_key, at)
-        })
+        });
+        latched_absent(result, latched)
     }
 
     /// The one retry policy of the value path: read, and on a retired-member

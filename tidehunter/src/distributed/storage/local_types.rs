@@ -94,7 +94,6 @@ impl LocalDbError {
     }
 
     /// True for [`Self::evicted_during_read`].
-    #[cfg(test)]
     pub(crate) fn is_evicted_during_read(&self) -> bool {
         self.message.starts_with("value evicted during read:")
     }

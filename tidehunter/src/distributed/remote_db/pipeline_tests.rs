@@ -488,7 +488,7 @@ pub(super) fn live_rows(db: &RemoteDatabase, ks: KeySpace) -> Vec<(Bytes, Bytes)
         let key = entry.key.clone();
         let row = db
             .reader
-            .read_entry_with_resolve(ks, &key, entry.value, || table.get(ks, &key, cut))
+            .read_entry_with_resolve(ks, &key, entry.value, || table.get(ks, &key, cut), true)
             .unwrap();
         rows.extend(row);
         cell = entry
@@ -536,9 +536,9 @@ pub(super) fn read_at_cut(
     let Some(position) = table.get(ks, key, cut)? else {
         return Ok(None);
     };
-    let row = db
-        .value_reader()
-        .read_entry_with_resolve(ks, key, position, || table.get(ks, key, cut))?;
+    let reader = db.value_reader();
+    let resolve = || table.get(ks, key, cut);
+    let row = reader.read_entry_with_resolve(ks, key, position, resolve, true)?;
     Ok(row.map(|(_, value)| value))
 }
 

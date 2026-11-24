@@ -135,6 +135,7 @@ impl DistributedIterSource for HybridIterSource {
         self.db.validate_cached_read().map_err(remote_error)?;
         let table = self.db.hybrid_table();
         let reader = self.db.value_reader();
+        let latched = self.cut.is_some();
         let mut skipped = 0;
         let entry = next_resolved(
             cell,
@@ -159,7 +160,9 @@ impl DistributedIterSource for HybridIterSource {
                     self.cut,
                 )
             },
-            |key, position, resolve| reader.read_entry_with_resolve(ks, key, position, resolve),
+            |key, position, resolve| {
+                reader.read_entry_with_resolve(ks, key, position, resolve, latched)
+            },
             &mut skipped,
         );
         if let Some(counter) = self.latched_skips.as_ref().filter(|_| skipped != 0) {

@@ -1318,6 +1318,7 @@ fn a_dropped_key_resolves_absent_at_every_cut() {
         "the drop tombstone does not hide a later write",
     );
 }
+
 /// Native's relocation cutoff prunes only the L0 it rebuilds, never a deeper
 /// level (`flusher.rs` `handle_command`, `RelocationFlush::Cutoff`). A key that
 /// lives only in a promoted, unloaded L1 blob therefore stays readable after a

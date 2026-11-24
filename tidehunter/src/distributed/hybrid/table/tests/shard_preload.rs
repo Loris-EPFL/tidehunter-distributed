@@ -219,7 +219,7 @@ fn sharded_cell_relocation_loads_only_the_needed_shard_and_preserves_other_shard
     let targets = [(0u32, 1u64, 20_000u64)];
 
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -233,10 +233,6 @@ fn sharded_cell_relocation_loads_only_the_needed_shard_and_preserves_other_shard
         )
         .expect("relocation_apply on one shard");
     let loads = index_loads(&fixture.table, fixture.ks) - loads_before;
-    assert!(
-        shadowed.is_empty(),
-        "matching expectation must apply cleanly: {shadowed:?}"
-    );
     assert_eq!(
         loads,
         1,
@@ -364,7 +360,7 @@ fn sharded_cell_relocation_caches_shards_for_unsorted_updates_and_skips_l0_and_o
     let targets = [(0u32, 1u64, 20_000u64)];
 
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -377,15 +373,6 @@ fn sharded_cell_relocation_caches_shards_for_unsorted_updates_and_skips_l0_and_o
     assert_eq!(
         loads, 2,
         "must load only shard 1 and shard 2 once each (shard 0 skipped), loaded {loads}"
-    );
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "only the L0-overwritten key must join shadowed: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&old_s0_l0) && shadowed[0].1 == version(overwrite_seq),
-        "L0-overwritten expectation must record the L0 shadowing version: {shadowed:?}"
     );
 
     let read_cut = version(overwrite_seq + 1);
@@ -417,19 +404,18 @@ fn sharded_cell_relocation_caches_shards_for_unsorted_updates_and_skips_l0_and_o
 }
 
 #[test]
-fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witness() {
-    let fixture = ShardedFixture::new("hybrid-shard-preload-witness", 8);
+fn sharded_cell_unmatched_expectations_keep_narrow_loads() {
+    let fixture = ShardedFixture::new("hybrid-shard-preload-unmatched", 8);
     let published = fixture.table.current();
-    let expected_unexamined_version = published;
     let targets = [(0u32, 1u64, 20_000u64)];
 
-    // (a) Stale expectation in shard 1: loads shard 1 once, joins `shadowed`
-    // with the shard entry's version, and keeps the cell clean (`Loaded`).
+    // (a) Stale expectation in shard 1: loads shard 1 once and keeps the
+    // cell clean (`Loaded`).
     let s1_min = fixture.shard_min_seed(1);
     let s1_actual = fixture.expected_position(s1_min);
     let stale_expected = position(u64::from(s1_min), 500);
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -447,15 +433,6 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         1,
         "stale shard check must load only shard 1"
     );
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "stale shard expectation must be reported: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&stale_expected) && shadowed[0].1 == s1_actual.batch,
-        "stale shard expectation must report shard entry's version: {shadowed:?}"
-    );
     let state = fixture.table.large_table().entry_state_for_test(
         fixture.table.contexts().ks_context(fixture.ks),
         &fixture.cell,
@@ -466,11 +443,11 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
     );
 
     // (b) Key in the gap between shard 0's max_key and shard 1's min_key:
-    // `shard_for` returns `None`, 0 shard loads, joins shadow witness.
+    // `shard_for` returns `None`, so 0 shard loads.
     let gap_raw = [fixture.shard_max_seed(0) * KEY_STRIDE + 1, 0, 0, 0];
     let gap_expected = position(2, 600);
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -488,18 +465,9 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         0,
         "gap key between shards must load 0 shards"
     );
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "unexamined gap key must join shadow witness: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&gap_expected) && shadowed[0].1 == expected_unexamined_version,
-        "gap key must record published shadowing version: {shadowed:?}"
-    );
 
     // (c) Key strictly inside shard 1's `[min_key, max_key]` that is absent
-    // from shard 1: loads shard 1 once, joins shadow witness.
+    // from shard 1: loads shard 1 once and applies nothing.
     let absent_in_s1_raw = [s1_min * KEY_STRIDE + 1, 0, 0, 0];
     assert!(
         absent_in_s1_raw.as_slice() < fixture.shards[1].1.max_key.as_slice(),
@@ -507,7 +475,7 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
     );
     let absent_expected = position(3, 700);
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -525,22 +493,12 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         1,
         "absent key inside shard 1 range must load only shard 1"
     );
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "unexamined absent-in-shard key must join shadow witness: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&absent_expected)
-            && shadowed[0].1 == expected_unexamined_version,
-        "absent-in-shard key must record published shadowing version: {shadowed:?}"
-    );
 
     // (d) A re-point on a sharded cell keeps narrow shard loading (matching
     // native `lift_shard_entries`).
     let moved_s1 = s1_actual.moved_to(position(u64::from(s1_min), 73_000).address);
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -558,18 +516,13 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         1,
         "a re-point on a sharded cell must still load only the owning shard"
     );
-    assert!(
-        shadowed.is_empty(),
-        "matching update must apply cleanly: {shadowed:?}"
-    );
     assert_eq!(
         fixture.get_offset(s1_min, version(published.sequence + 1)),
         Some(member_offset(73_000)),
         "s1_min re-pointed"
     );
 
-    // (e) Dropped cell: 0 shard loads and every below-target expectation joins
-    // the shadow witness.
+    // (e) Dropped cell: 0 shard loads and the call still succeeds.
     fixture
         .table
         .drop_cells(
@@ -581,7 +534,7 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .expect("drop cell");
     let dropped_expected = position(4, 800);
     let loads_before = index_loads(&fixture.table, fixture.ks);
-    let shadowed = fixture
+    fixture
         .table
         .relocation_apply(
             fixture.ks,
@@ -598,121 +551,5 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         index_loads(&fixture.table, fixture.ks) - loads_before,
         0,
         "dropped cell must load 0 shards"
-    );
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "expectation on a dropped cell must join shadow witness: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&dropped_expected)
-            && shadowed[0].1 == expected_unexamined_version,
-        "dropped-cell expectation must record published shadowing version: {shadowed:?}"
-    );
-}
-
-#[test]
-fn unexamined_witness_at_the_serving_epoch_start_keeps_the_published_cut() {
-    // A latch can hold cut `(epoch, 0)` while the epoch's first `DropCells`
-    // batch is already in the index but not yet published (the index mutation
-    // runs before the watermark advance). The expectation loaded from the
-    // previous epoch lies below that cut, so the witness must be the cut, not
-    // the expectation's own batch: `cut_at_or_below((E, 0), (E-1, x))` is
-    // false, and a latch pinned at `(E, 0)` would lose the file. Serving
-    // epoch 2 with no publication in it reaches that state deterministically;
-    // on the old `None => expected` fallback this test fails.
-    let dir = tempdir::TempDir::new("hybrid-shard-preload-unpublished").expect("scratch directory");
-    let cuts = CutSources::new(2, DurabilityTier::Native);
-    let table = HybridTable::open(
-        dir.path(),
-        sharded_shape(),
-        &HybridIndexConfig::default(),
-        cuts,
-        Metrics::new(),
-    )
-    .expect("open table");
-    let ks = table.shape().iter_ks().next().expect("one keyspace").id();
-    let cell = table.shape().ks(ks).cell_id(&spaced_key(1));
-    let epoch_start = crate::distributed::types::BatchVersion {
-        epoch: 2,
-        sequence: 0,
-    };
-    assert_eq!(
-        table.current(),
-        epoch_start,
-        "premise: nothing is published in the serving epoch yet"
-    );
-    // One key of the previous epoch, without a watermark advance: the cell
-    // exists while `published` stays at `(2, 0)`. The cell's frontier is the
-    // minimum of the entry and the applied bound, so inserting below it is
-    // legal and is exactly the retained-epoch case under test.
-    let stored_key = spaced_key(7);
-    table
-        .insert_published(
-            &[PublishedMutation {
-                keyspace: ks,
-                key: &stored_key,
-                kind: RecordKind::Put,
-                position: position(1, initial_offset(7)),
-            }],
-            64,
-        )
-        .expect("publish one key");
-    let targets = [(0u32, 1u64, 20_000u64)];
-
-    // (a) A live cell, with an expectation for a key it does not hold.
-    let absent_expected = position(1, 500);
-    assert!(
-        absent_expected.batch < epoch_start,
-        "premise: the expectation is below the serving epoch's start"
-    );
-    let shadowed = table
-        .relocation_apply(
-            ks,
-            &cell,
-            RelocationApply::Repoint(&[(
-                reduced_key(&table, ks, &spaced_key(11)),
-                absent_expected,
-                absent_expected.moved_to(position(1, 60_000).address),
-            )]),
-            &targets,
-        )
-        .expect("relocation_apply before any publication");
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "unexamined expectation must join the witness: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&absent_expected) && shadowed[0].1 == table.current(),
-        "the witness must keep the serving epoch's start cut: {shadowed:?}"
-    );
-
-    // (b) The cell dropped before the drop's publication: the `Ok(None)`
-    // branch applies the same bound.
-    table
-        .drop_cells(ks, cell.clone(), cell.clone(), version(1))
-        .expect("drop cell");
-    let dropped_expected = position(1, 600);
-    let shadowed = table
-        .relocation_apply(
-            ks,
-            &cell,
-            RelocationApply::Repoint(&[(
-                reduced_key(&table, ks, &spaced_key(11)),
-                dropped_expected,
-                dropped_expected.moved_to(position(1, 61_000).address),
-            )]),
-            &targets,
-        )
-        .expect("relocation_apply on a dropped cell before any publication");
-    assert_eq!(
-        shadowed.len(),
-        1,
-        "dropped-cell expectation must join the witness: {shadowed:?}"
-    );
-    assert!(
-        shadowed[0].0.same_physical(&dropped_expected) && shadowed[0].1 == table.current(),
-        "the dropped-cell witness must keep the serving epoch's start cut: {shadowed:?}"
     );
 }
