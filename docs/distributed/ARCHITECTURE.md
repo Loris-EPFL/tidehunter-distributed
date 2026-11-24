@@ -91,8 +91,11 @@ physical part. When the keyspace sets `value_cache_size`, the index answers
 from the native per-cell value LRU instead of a position, and a resident answer
 costs no owner request. Publication fills that LRU with the value the batch
 wrote, so the first read of a hot key after its write costs no owner request. A
-live read that fetched a member from its owner refills the LRU; a remove pops it
-and a dropped cell clears it.
+live read that fetched a member from its owner refills the LRU, but only while
+the position the fetch resolved is still the key's latest: a remote fetch can
+outlive a publication that supersedes it, and the cut check serves a resident
+entry on the premise that it holds the latest value. A remove pops it and a
+dropped cell clears it.
 
 Every read is cut-checked: it samples a cut (the live cut is the publication
 watermark) and the index answers the position as of that cut. The LRU is
@@ -105,14 +108,19 @@ installed above the published prefix, so one read could return a batch before a
 lower version became visible and the total-order read contract would not hold.
 Consequently a read of a clean unloaded cell fetches the member from its owner
 even though the coordinator's LRU still holds the value: that owner round trip
-is the price of the ordering guarantee. A keyspace with a relocation filter is
-index-first: a filtered relocation marks dropped keys `Removed` while
-deliberately leaving their resident value, and only the index-first lookup
-answers not-found for them. A latched read consults the LRU only when the key is
-unchanged since its cut, and never refills it (native `DbCheckpoint::get`). A
-live iterator consults it as native `Db::next_entry` does; a latched iterator
-does not. Otherwise the value reader (`hybrid/read.rs`) checks the coordinator
-value cache (`remote_db/read_cache.rs`). On a miss it
+is the price of the ordering guarantee. A Sui batch read resolves every key at
+one sampled cut with the same lookup, serves a resident value inline, and
+fetches all misses in one batched owner read per owner; a retired member is
+retried per slot through the scalar path, which re-resolves its key exactly once,
+as native `Db::multi_get`'s per-key `Db::get` does. A keyspace with a relocation
+filter keeps the same cut-checked lookup: a filtered relocation marks dropped
+keys `Removed` while deliberately leaving their resident value, and only the
+index-first lookup answers not-found for them. A latched read consults the LRU
+only when the key is unchanged since its cut, and never refills it (native
+`DbCheckpoint::get`). A live iterator consults it as native `Db::next_entry`
+does; a latched iterator does not. Otherwise the value
+reader (`hybrid/read.rs`) checks the coordinator value cache
+(`remote_db/read_cache.rs`). On a miss it
 fetches the member frame and nothing else. The fetch uses a bounded live read
 lane (`remote_db/pending_read.rs`). The lane obtains an authenticated owner
 mapping, opens the verified namespace and issues aligned block reads through

@@ -678,6 +678,55 @@ impl<P: IndexPosition> LargeTable<P> {
         LargeTableEntry::<P>::update_lru_metric(context, previous, delta);
     }
 
+    /// Install a value the read path fetched from its owner, but only while
+    /// `position` is still the key's latest index position.
+    ///
+    /// [`Self::update_lru`] installs unconditionally, which the native
+    /// in-process read path gets away with: its resolve and its fill are two
+    /// steps of one call, so a stale fill is normally overwritten by the newer
+    /// write's own publication fill. A remote read resolves a position at a cut,
+    /// fetches the member over the network and only then fills, so a newer
+    /// publication can land in between. Installing the older value would leave
+    /// the LRU serving it to every read whose cut covers the newer write,
+    /// because [`Self::get_checkpoint`] trusts that a resident entry holds the
+    /// key's latest value. This keeps that invariant: a superseded position
+    /// fills nothing.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn refill_lru(
+        &self,
+        context: &KsContext,
+        reduced_key: Bytes,
+        position: P,
+        full_key: Bytes,
+        value: Bytes,
+    ) {
+        if context.ks_config.value_cache_size().is_none() {
+            return;
+        }
+        let (mut row, cell) = self.row(context, &reduced_key);
+        let entry = self.entry_mut(&mut row, &cell);
+        if entry.value_lru.is_none() {
+            return;
+        }
+        // Apply a committed batch that is still pending, exactly as the lookup
+        // that produced `position` does (see `get_checkpoint`).
+        entry.promote_pending();
+        if entry.state == LargeTableEntryState::Unloaded
+            || entry.get(reduced_key.as_ref()) != Some(position)
+        {
+            return;
+        }
+        let Some(value_lru) = &mut entry.value_lru else {
+            return;
+        };
+        let reduced_key = reduced_key.into_owned();
+        let full_key = full_key.into_owned();
+        let value = value.into_owned();
+        let delta: i64 = (reduced_key.len() + full_key.len() + value.len()) as i64;
+        let previous = value_lru.push(reduced_key, (full_key, value));
+        LargeTableEntry::<P>::update_lru_metric(context, previous, delta);
+    }
+
     pub fn get<L: Loader<Position = P>>(
         &self,
         context: &KsContext,

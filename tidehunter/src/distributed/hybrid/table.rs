@@ -745,14 +745,20 @@ impl TableInner {
         }
     }
 
-    /// What the index answers for `key` as of `cut`: a position to fetch, or the
-    /// value already resident in the native per-cell LRU.
+    /// What the index answers for `key` as of `cut`: a position to fetch, or
+    /// the value already resident in the native per-cell LRU.
     ///
     /// The LRU is the native [`LargeTable`] cache, unchanged: it is filled at
     /// publication and by the read refill, bounded per cell by the keyspace's
     /// `value_cache_size`, and consulted by `LargeTable::get_checkpoint` only
     /// when the key's as-of position is also its latest. `value_cache_size = 0`
-    /// allocates no LRU, so this always returns a position.
+    /// allocates no LRU, so a position is always returned.
+    ///
+    /// A read never resolves like native `Db::get`, which consults the LRU
+    /// before the cell's index state: that path also serves a value whose batch
+    /// sparse publication installed above the published prefix, and so could
+    /// answer later than a key the caller already saw. Every read therefore goes
+    /// through the cut-checked lookup, at the watermark a live read samples.
     pub(crate) fn get_value(
         &self,
         ks: KeySpace,
@@ -779,13 +785,26 @@ impl TableInner {
     /// native per-cell LRU, exactly as native `Db::get` does after a WAL record
     /// read.
     ///
-    /// `reduced` is the index key the LRU is keyed by; `full_key` is the key the
-    /// member carries, which a reducing keyspace compares before serving it.
-    /// A keyspace without a value cache has no LRU and this is a no-op, as in
-    /// native `LargeTable::update_lru`.
-    pub(crate) fn refill_value(&self, ks: KeySpace, reduced: Bytes, full_key: Bytes, value: Bytes) {
+    /// `reduced` is the index key the LRU is keyed by; `position` is the member
+    /// position the fetch resolved; `full_key` is the key the member carries,
+    /// which a reducing keyspace compares before serving it. A keyspace without
+    /// a value cache has no LRU and this is a no-op.
+    ///
+    /// Only a position that is still the key's latest fills the LRU
+    /// ([`LargeTable::refill_lru`]): a remote fetch can outlive a publication
+    /// that supersedes it, and the cut check serves a resident value on the
+    /// premise that it is the key's latest.
+    pub(crate) fn refill_value(
+        &self,
+        ks: KeySpace,
+        reduced: Bytes,
+        position: VersionPosition,
+        full_key: Bytes,
+        value: Bytes,
+    ) {
         let context = self.contexts.ks_context(ks);
-        self.table.update_lru(context, reduced, full_key, value);
+        self.table
+            .refill_lru(context, reduced, position, full_key, value);
     }
 
     /// The next index entry of a cell, as of `cut` when one is given.

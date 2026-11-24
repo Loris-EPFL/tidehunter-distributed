@@ -24,8 +24,10 @@ impl ConcurrentRemoteDatabase {
         self.database.exists_at_cut(ks, key, self.table.current())
     }
 
-    /// One key: an index lookup at the publication watermark, then the owner
-    /// read of the member frame the position names.
+    /// One key: an index lookup at the publication watermark, then either the
+    /// native per-cell LRU's resident value or the owner read of the member
+    /// frame the position names. The lookup is cut-checked: the LRU answers
+    /// only when the key is unchanged since the watermark.
     ///
     /// The owner may retire the file between the lookup and the fetch (release
     /// is an unlink and a directory sync, with no reader pin), so the fetch gets
@@ -70,8 +72,11 @@ impl ConcurrentRemoteDatabase {
         result
     }
 
-    /// Any number of keys at one publication cut, fetched in pages. An invalid
-    /// key fails only its own slot; a failed owner page fails the call.
+    /// Any number of keys at one publication cut: a resident value answers with
+    /// no owner contact and every miss is fetched in one batched owner read per
+    /// owner (see `RemoteDatabase::get_many_live`). A retired member is retried
+    /// per slot through the scalar path, as native `multi_get`'s per-key
+    /// `Db::get` does. An invalid key fails only its own slot.
     ///
     /// # Errors
     /// Returns an observed authority failure or a failed owner page.
@@ -91,7 +96,6 @@ impl ConcurrentRemoteDatabase {
         keys: &[K],
         trace: Option<&ReadTraceCallGuard>,
     ) -> Result<Vec<Result<Option<Bytes>, LocalDbError>>, LocalDbError> {
-        self.database
-            .get_many_at_cut(ks, keys, self.table.current(), trace, true)
+        self.database.get_many_live(ks, keys, trace)
     }
 }

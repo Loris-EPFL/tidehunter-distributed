@@ -174,7 +174,13 @@ impl DistributedIterSource for HybridIterSource {
                     let row =
                         reader.read_entry_with_resolve(ks, key, position, resolve, latched)?;
                     if refill && let Some((full_key, value)) = &row {
-                        table.refill_value(ks, key.clone(), full_key.clone(), value.clone());
+                        table.refill_value(
+                            ks,
+                            key.clone(),
+                            position,
+                            full_key.clone(),
+                            value.clone(),
+                        );
                     }
                     Ok(row)
                 }
