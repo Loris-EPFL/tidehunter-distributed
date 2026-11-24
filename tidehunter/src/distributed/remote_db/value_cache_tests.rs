@@ -29,6 +29,7 @@ use crate::key_shape::{KeyShape, KeySpaceConfig, KeyType};
 use crate::relocation::Decision;
 use minibytes::Bytes;
 use std::collections::BTreeSet;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -738,4 +739,73 @@ fn a_filtered_keyspace_batch_stays_index_first() {
         "the filtered batch resolved at the index with no owner read",
     );
     db.wait_for_background_threads_to_finish().unwrap();
+}
+
+/// The per-slot batch re-reads every slot through the scalar path when the
+/// batched fetch reports a retired member (`NotFound`), and fails the call for
+/// any other kind. The strict batch keeps its contract: a failed owner page
+/// fails the call.
+#[test]
+fn a_retired_batch_member_falls_back_and_other_kinds_fail() {
+    let slot_fixture = fixture("remote-cache-batch-fallback", cached_shape(16)).synchronous();
+    let ks = KeySpace(0);
+    let db = open(&slot_fixture);
+    for cell in 1..=4u32 {
+        db.insert(ks, key(cell), vec![cell as u8; 8])
+            .expect("write");
+    }
+    db.wait_for_background_threads_to_finish()
+        .expect("shut down before the reopen");
+    // The reopen leaves the LRU and the derivative cache cold, so each batch
+    // must reach the injected batched-fetch failure.
+    let db = open(&slot_fixture);
+    let reader = &db.remote_for_test().reader;
+
+    // (a) `NotFound` is the retired-member kind: the per-slot batch re-reads
+    // every slot through the scalar path and answers the values it resolved.
+    let keys = [key(1), key(2)];
+    reader.set_read_many_fault_for_test(Some(io::ErrorKind::NotFound));
+    let values = db.multi_get(ks, &keys);
+    reader.set_read_many_fault_for_test(None);
+    for (slot, cell) in [1u8, 2].into_iter().enumerate() {
+        assert_eq!(
+            values[slot].as_ref().unwrap().as_deref(),
+            Some([cell; 8].as_slice()),
+            "the scalar fallback answers slot {slot}",
+        );
+    }
+
+    // (c) A non-retryable kind fails the per-slot batch call, and so every slot.
+    // Cells 3 and 4 are still cold: (a) read only cells 1 and 2.
+    let keys = [key(3), key(4)];
+    reader.set_read_many_fault_for_test(Some(io::ErrorKind::PermissionDenied));
+    let values = db.multi_get(ks, &keys);
+    reader.set_read_many_fault_for_test(None);
+    for (slot, value) in values.iter().enumerate() {
+        assert!(
+            value.is_err(),
+            "a non-retryable batched failure fails slot {slot}",
+        );
+    }
+
+    // (b) The strict batch keeps its contract: the failed page fails the call.
+    let cut_fixture = fixture("remote-cache-batch-fallback-cut", cached_shape(0));
+    let cut_db = cut_fixture.open();
+    cut_db
+        .write_batch([7; 16], vec![put(&key(1), 1), put(&key(2), 2)])
+        .expect("write");
+    cut_db.drain().expect("drain");
+    cut_db
+        .reader
+        .set_read_many_fault_for_test(Some(io::ErrorKind::NotFound));
+    let cut = cut_db.core.table.current();
+    let outcome = cut_db.get_many_at_cut(ks, &[key(1), key(2)], cut, None, false);
+    cut_db.reader.set_read_many_fault_for_test(None);
+    assert!(
+        outcome.is_err(),
+        "a cut batch fails the call on a failed owner page",
+    );
+
+    db.wait_for_background_threads_to_finish().unwrap();
+    cut_db.shutdown().unwrap();
 }
