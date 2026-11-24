@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::position_cache::PositionCacheMetrics;
 use prometheus::{
     Histogram as PromHistogram, HistogramVec as PromHistogramVec, IntCounter as PromIntCounter,
     IntCounterVec as PromIntCounterVec, IntGauge as PromIntGauge, IntGaugeVec as PromIntGaugeVec,
@@ -205,6 +206,44 @@ pub struct Metrics {
     /// the counterpart of `large_table_contention` for the cache's shards.
     /// Uncontended acquisitions are not recorded.
     pub decompress_cache_contention: MetricHistogram,
+    /// Bodies the decompressed-batch cache evicted to stay under its budget.
+    pub decompress_cache_evictions: MetricIntCounter,
+    /// Total bytes of index blobs currently retained by the index blob
+    /// cache (`Config::index_blob_cache_bytes`). Stays 0 when the cache is
+    /// disabled or no blob has qualified for admission.
+    pub index_blob_cache_bytes: MetricIntGauge,
+    /// Index reader opens on syscall-path blobs at or above the admission
+    /// floor that were not admitted because the blob exceeds the whole
+    /// budget; those lookups stay on the plain section-read path. A
+    /// non-zero rate means the budget is smaller than the workload's largest
+    /// blob — the cell the cache exists for is silently still paying the
+    /// full section copy per lookup.
+    pub index_blob_cache_rejected: MetricIntCounter,
+    /// Fills whose frame failed CRC validation or could not be read. The
+    /// blob is served raw, as on the uncached path, and never retained.
+    /// Non-zero means an index blob on disk is corrupt.
+    pub index_blob_cache_unreadable: MetricIntCounter,
+    /// Cumulative microseconds lookups spent blocked on another thread's
+    /// in-flight fill of the same index blob (single-flight waits).
+    pub index_blob_cache_wait_mcs: MetricIntCounter,
+    /// Time to acquire a contended index-blob-cache shard lock. Uncontended
+    /// acquisitions are not recorded.
+    pub index_blob_cache_contention: MetricHistogram,
+    /// Probes answered from a cached blob: index readers (resident at probe
+    /// time, or supplied by another thread's fill the reader waited on) and
+    /// `Db::load` calls from the flusher and relocation.
+    pub index_blob_cache_hits: MetricIntCounter,
+    /// Whole-blob reads run to fill the index blob cache — one per admitted
+    /// blob each time it enters the cache (first syscall-path lookup after
+    /// it leaves the mmap window, or after an eviction).
+    pub index_blob_cache_fills: MetricIntCounter,
+    /// Cumulative microseconds spent in those fill reads.
+    pub index_blob_cache_fill_mcs: MetricIntCounter,
+    /// Cached index blobs dropped explicitly because a flush or relocation
+    /// replaced them in their cell's levels.
+    pub index_blob_cache_drops: MetricIntCounter,
+    /// Index blobs the cache evicted to stay under its budget.
+    pub index_blob_cache_evictions: MetricIntCounter,
 
     pub large_table_contention: MetricHistogramVec,
     pub wal_write_wait: MetricIntCounter,
@@ -248,19 +287,26 @@ pub struct Metrics {
     pub l0_bytes_written: MetricIntCounterVec,
     pub l1_bytes_written: MetricIntCounterVec,
     pub promote_total: MetricIntCounterVec,
-    /// Number of L1 shard blobs written by the flusher. Each shard blob
-    /// counts as one increment regardless of whether it came from initial
-    /// sharding or re-sharding.
+    /// Number of L1 shard blobs written by the flusher, one increment per
+    /// blob: initial sharding, re-sharding promotes, relocation
+    /// compare-and-set rewrites, and snapshot forced-relocation reflushes.
     pub l1_shards_total: MetricIntCounterVec,
-    /// Number of times a promote produced more than one L1 shard (i.e.
-    /// auto-sharding kicked in for this cell on this promote). Counts both
-    /// initial-sharding invocations and re-sharding re-split events.
+    /// Number of times a shard write produced more than one L1 shard blob:
+    /// the initial sharding of a promoted L1, and a shard splitting while a
+    /// re-sharding promote or a relocation compare-and-set rewrites it.
     pub l1_shard_split_total: MetricIntCounterVec,
-    /// Number of existing shards rewritten during a re-sharding promote.
-    /// Stays at zero until re-sharding fires.
+    /// Number of existing shards rewritten by the flusher: by a re-sharding
+    /// promote folding L0 keys into them, by a relocation compare-and-set
+    /// re-pointing keys inside them, or by a snapshot forced relocation
+    /// reflushing them out of a low-occupancy index file. Stays at zero
+    /// while no cell is sharded.
     pub l1_shard_rewritten_total: MetricIntCounterVec,
 
     pub relocation_target_position: MetricIntGauge,
+    /// Stripes a WAL-based relocation run completed: each stored a control
+    /// region and reclaimed the WAL below its end, or below the control
+    /// region's replay position when that is lower.
+    pub relocation_stripes: MetricIntCounter,
     pub relocation_terminal_position: MetricIntGauge,
     pub gc_position: MetricIntGaugeVec,
     pub relocation_kept: MetricIntCounterVec,
@@ -350,6 +396,28 @@ macro_rules! histogram_vec (
     };
 );
 impl Metrics {
+    /// Metric handles for the decompressed-batch `PositionCache`.
+    pub(crate) fn decompress_cache_metrics(&self) -> PositionCacheMetrics {
+        PositionCacheMetrics {
+            bytes: self.decompress_cache_bytes.clone(),
+            rejected: self.decompress_cache_rejected.clone(),
+            wait_mcs: self.decompress_cache_wait_mcs.clone(),
+            contention: self.decompress_cache_contention.clone(),
+            evictions: self.decompress_cache_evictions.clone(),
+        }
+    }
+
+    /// Metric handles for the index blob `PositionCache`.
+    pub(crate) fn index_blob_cache_metrics(&self) -> PositionCacheMetrics {
+        PositionCacheMetrics {
+            bytes: self.index_blob_cache_bytes.clone(),
+            rejected: self.index_blob_cache_rejected.clone(),
+            wait_mcs: self.index_blob_cache_wait_mcs.clone(),
+            contention: self.index_blob_cache_contention.clone(),
+            evictions: self.index_blob_cache_evictions.clone(),
+        }
+    }
+
     pub fn new() -> Arc<Self> {
         Self::new_in(&Registry::default())
     }
@@ -441,6 +509,22 @@ impl Metrics {
                 registry,
                 enabled
             ),
+            decompress_cache_evictions: counter!("decompress_cache_evictions", registry, enabled),
+            index_blob_cache_bytes: gauge!("index_blob_cache_bytes", registry, enabled),
+            index_blob_cache_rejected: counter!("index_blob_cache_rejected", registry, enabled),
+            index_blob_cache_unreadable: counter!("index_blob_cache_unreadable", registry, enabled),
+            index_blob_cache_wait_mcs: counter!("index_blob_cache_wait_mcs", registry, enabled),
+            index_blob_cache_contention: histogram!(
+                "index_blob_cache_contention",
+                lock_buckets.clone(),
+                registry,
+                enabled
+            ),
+            index_blob_cache_hits: counter!("index_blob_cache_hits", registry, enabled),
+            index_blob_cache_fills: counter!("index_blob_cache_fills", registry, enabled),
+            index_blob_cache_fill_mcs: counter!("index_blob_cache_fill_mcs", registry, enabled),
+            index_blob_cache_drops: counter!("index_blob_cache_drops", registry, enabled),
+            index_blob_cache_evictions: counter!("index_blob_cache_evictions", registry, enabled),
             large_table_contention: histogram_vec!(
                 "large_table_contention",
                 &["ks"],
@@ -491,6 +575,9 @@ impl Metrics {
                 registry,
                 enabled
             ),
+            // Writes ordered behind a newer write to the same key
+            // (`IndexTable::checked_insert`, `WriteOrder::Stale`). The metric
+            // name is kept for dashboard continuity.
             skip_stale_update: counter_vec!("skip_stale_update", &["ks", "op"], registry, enabled),
 
             snapshot_lock_time_mcs: histogram!(
@@ -541,6 +628,7 @@ impl Metrics {
             ),
 
             relocation_target_position: gauge!("relocation_target_position", registry, enabled),
+            relocation_stripes: counter!("relocation_stripes", registry, enabled),
             relocation_terminal_position: gauge!("relocation_terminal_position", registry, enabled),
             gc_position: gauge_vec!("gc_position", &["kind"], registry, enabled),
             relocation_kept: counter_vec!("relocation_kept", &["ks"], registry, enabled),

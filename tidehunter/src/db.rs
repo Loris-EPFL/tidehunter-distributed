@@ -7,20 +7,22 @@ use crate::compressed_batch::{
     BatchCodec, CompressedBatch, decompress_wal_entry, find_record, find_record_by,
 };
 use crate::config::Config;
-use crate::context::{DbOpKind, KsContext, KsContextVec, ReadType, WalEntryKind};
+use crate::context::{DbOpKind, KsContext, ReadType, WalEntryKind};
 use crate::control::{ControlRegion, ControlRegionStore, RelocateFiles};
 use crate::crc::IntoBytesFixed;
-use crate::decompress_cache::{CacheOutcome, DecompressCache};
-use crate::flusher::{FlusherHost, IndexFlusher};
+use crate::flusher::{FlusherHost, IndexFlusher, RelocationFlush};
 use crate::index::index_format::{IndexFormat, IndexIterCaches};
 use crate::index::index_table::IndexTable;
 use crate::index::levels::IndexLevels;
+use crate::index_blob_cache::IndexBlobCache;
 use crate::iterators::IteratorResult;
 use crate::iterators::db_iterator::{DbIterator, IterationSource};
 use crate::key_shape::{KeyShape, KeySpace, KeySpaceDesc, KeySpaces, KeyType};
 use crate::large_table::{GetResult, LargeTable, Loader, PendingBatchOp};
 use crate::lock::DbLock;
+use crate::lookup::RandomRead;
 use crate::metrics::{Metrics, TimerExt};
+use crate::position_cache::{CacheOutcome, PositionCache};
 use crate::relocation::updates::RelocationUpdates;
 use crate::relocation::{RelocationCommand, RelocationDriver, RelocationStrategy, Relocator};
 use crate::state_snapshot;
@@ -28,7 +30,7 @@ use crate::state_snapshot;
 pub use crate::wal::ValueWalPersistenceProfile;
 use crate::wal::layout::WalKind;
 use crate::wal::position::{IndexCut, LastProcessed, WalFileId, WalPosition};
-use crate::wal::tracker::WalGuard;
+use crate::wal::tracker::{SharedLastProcessed, WalGuard};
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
 use bytes::{Buf, BufMut, BytesMut};
 use minibytes::Bytes;
@@ -38,6 +40,7 @@ use std::io;
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,9 +81,20 @@ pub struct Db {
     /// resolved via [`Db::ks`] / [`Db::try_ks`] / [`Db::single_ks`].
     keyspaces: KeySpaces,
     relocator: Relocator,
+    /// Set while a WAL-based relocation run is in progress. The run stores a
+    /// control region after each stripe, and the periodic snapshot thread
+    /// skips its size-triggered snapshots meanwhile; hourly ones still run.
+    /// The thread reads the flag once per tick, so a snapshot it has already
+    /// started when a run begins runs to completion alongside the run.
+    pub(crate) relocation_running: AtomicBool,
     /// Present when `Config::compressed_batch_cache_bytes` is set; serves
     /// decompressed `CompressedBatch` bodies on the read paths.
-    decompress_cache: Option<DecompressCache>,
+    decompress_cache: Option<PositionCache>,
+    /// Present when `Config::index_blob_cache_bytes` is set; serves whole
+    /// index blobs that have aged out of the index WAL's mmap window to the
+    /// index readers (see `index_blob_cache`). Shared with the lazy readers
+    /// it hands out, hence the `Arc`.
+    index_blob_cache: Option<Arc<IndexBlobCache>>,
     commit_pool: Option<rayon::ThreadPool>,
     /// One handle per pending-promotion shard, for waking threads after batch commits.
     /// Index `i` owns mutex shards where `mutex_idx % len == i`.
@@ -183,27 +197,29 @@ impl Db {
 
         let flusher = IndexFlusher::new(flusher_senders, metrics.clone());
         let relocator = Relocator(relocator_sender);
+        // The WAL tracker, started by `replay_wal`, publishes its externally
+        // observed `last_processed` into this handle; the key space contexts
+        // built before it read the handle.
+        let last_processed = SharedLastProcessed::default();
         let large_table = LargeTable::from_unloaded(
             &key_shape,
             control_region.snapshot(),
             config.clone(),
             flusher,
             metrics.clone(),
+            last_processed.clone(),
             indexes.as_ref(),
-            background_health.clone(),
         );
-        let contexts = KsContextVec::new(&key_shape, config.clone(), metrics.clone());
-        // The native cut is a value-WAL byte offset; this is the value-WAL
-        // replay start, so read it back as the offset itself rather than
-        // through the byte-cadence mapping.
         let wal_iterator = wal.wal_iterator_for_writer(control_region.last_position().as_u64())?;
         let wal_writer = crate::wal_replay::replay_wal(
-            &contexts,
             &large_table,
             &key_shape,
-            wal_iterator,
+            crate::wal_replay::WalReplaySource {
+                iterator: wal_iterator,
+                last_processed,
+            },
             &metrics,
-            wal.as_ref(),
+            indexes.as_ref(),
         )
         .map_err(crate::wal_replay::ReplayError::into_db_error)?;
         let last_index_position = control_region.last_index_wal_position();
@@ -234,11 +250,22 @@ impl Db {
 
         let decompress_cache = config.compressed_batch_cache_bytes.map(|max_bytes| {
             let reachable_wal = wal.clone();
-            DecompressCache::new(
+            PositionCache::new(
                 max_bytes,
                 Box::new(move |position| reachable_wal.is_reachable(position)),
-                &metrics,
+                metrics.decompress_cache_metrics(),
             )
+        });
+        let index_blob_cache = config.index_blob_cache_bytes.map(|max_bytes| {
+            let reachable_indexes = indexes.clone();
+            let frame_indexes = indexes.clone();
+            Arc::new(IndexBlobCache::new(
+                max_bytes,
+                config.index_blob_cache_min_bytes,
+                Box::new(move |position| reachable_indexes.is_reachable(position)),
+                Box::new(move |position| frame_indexes.read(position).map(|(_, payload)| payload)),
+                &metrics,
+            ))
         });
 
         let this = Self {
@@ -254,7 +281,9 @@ impl Db {
             key_shape,
             keyspaces,
             relocator,
+            relocation_running: AtomicBool::new(false),
             decompress_cache,
+            index_blob_cache,
             commit_pool,
             pending_promotion_threads,
             background_health,
@@ -385,25 +414,15 @@ impl Db {
                 "Failed to serialize key shape: {e}"
             )))
         })?;
-        // WAL records use the canonical keyspace ids, so the file must be
-        // durable before the first write after open.
-        Self::write_file_durably(path, &Self::shape_v2_file_path(path), yaml.as_bytes())?;
-        Ok(())
-    }
-
-    /// Atomically and durably replaces `file` in the database directory `path`:
-    /// write a temp file, sync it, rename it, then sync the directory.
-    fn write_file_durably(path: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
-        let mut temp_file = file.as_os_str().to_owned();
-        temp_file.push(".tmp");
-        let temp_file = PathBuf::from(temp_file);
+        let shape_file_path = Self::shape_v2_file_path(path);
+        let temp_file = shape_file_path.with_extension("yaml.tmp");
         {
-            let mut temp = std::fs::File::create(&temp_file)?;
-            temp.write_all(bytes)?;
-            temp.sync_all()?;
+            let mut file = std::fs::File::create(&temp_file)?;
+            file.write_all(yaml.as_bytes())?;
+            file.sync_all()?;
         }
-        std::fs::rename(&temp_file, file)?;
-        std::fs::File::open(path)?.sync_all()
+        std::fs::rename(&temp_file, &shape_file_path)?;
+        Ok(())
     }
 
     /// Load key shape from database directory.
@@ -480,8 +499,7 @@ impl Db {
             let yaml = serde_yaml::to_string(config).map_err(|e| {
                 DbError::Io(io::Error::other(format!("Failed to serialize config: {e}")))
             })?;
-            // A crash must leave either no file or the complete file.
-            Self::write_file_durably(path, &config_file_path, yaml.as_bytes())?;
+            std::fs::write(&config_file_path, yaml)?;
         }
         Ok(())
     }
@@ -536,6 +554,12 @@ impl Db {
 
             let db = weak.upgrade()?;
             db.large_table.report_entries_state();
+            // A relocation run stores a control region after each stripe. Its
+            // copies would otherwise trigger a snapshot every
+            // `snapshot_written_bytes`, flushing every dirty cell many times
+            // over one run, so only the hourly snapshot runs meanwhile. It
+            // bounds replay after a crash between two stripe stores.
+            let relocating = db.relocation_running.load(Ordering::Acquire);
             // todo when we get to wal position wrapping around this will need to be fixed
             let current_wal_position = db.wal_writer.position();
             let written = current_wal_position.checked_sub(position).unwrap();
@@ -547,7 +571,8 @@ impl Db {
                 } else {
                     false
                 };
-            if timed_snapshot || written > db.config.snapshot_written_bytes() {
+            if timed_snapshot || (!relocating && written > db.config.snapshot_written_bytes()) {
+                // todo taint storage instance on failure?
                 let snapshot_position = db
                     .rebuild_control_region()
                     .expect("Failed to rebuild control region");
@@ -577,7 +602,6 @@ impl Db {
         v: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
-        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -622,7 +646,6 @@ impl Db {
         k: impl Into<Bytes>,
         profile: &mut NativeWriteStages,
     ) -> DbResult<()> {
-        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -650,7 +673,6 @@ impl Db {
         result
     }
     pub fn insert(&self, ks: KeySpace, k: impl Into<Bytes>, v: impl Into<Bytes>) -> DbResult<()> {
-        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Insert);
         let k = k.into();
@@ -670,7 +692,6 @@ impl Db {
     }
 
     pub fn remove(&self, ks: KeySpace, k: impl Into<Bytes>) -> DbResult<()> {
-        self.check_background_health()?;
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::Remove);
         let k = k.into();
@@ -696,18 +717,16 @@ impl Db {
                 }
                 Ok(Some(value))
             }
-            GetResult::WalPosition(w, cache_refill) => {
+            GetResult::WalPosition(w) => {
                 let value = self.read_record_check_key(context, k, w)?;
                 let Some(value) = value else {
                     return Ok(None);
                 };
-                self.large_table.fp.fp_before_value_cache_refill();
                 self.large_table.update_lru(
                     context,
                     reduced_key.to_vec().into(),
                     Bytes::from(k.to_vec()),
                     value.clone(),
-                    cache_refill,
                 );
                 Ok(Some(value))
             }
@@ -744,16 +763,13 @@ impl Db {
             GetResult::Value(full_key, _) => {
                 Ok(!context.ks_config.need_check_index_key() || full_key.as_ref() == k)
             }
-            GetResult::WalPosition(w, _) => {
+            GetResult::WalPosition(w) => {
                 if context.ks_config.need_check_index_key() {
                     // With key reduction an index hit may be a different key that
                     // reduces to the same index key, so read the record to compare.
                     Ok(self.read_record_check_key(context, k, w)?.is_some())
                 } else {
-                    // An index entry into a reclaimed WAL file is stale (index
-                    // cleanup after relocation is eventual); `get` reads it as
-                    // absent, so `exists` must too.
-                    Ok(self.wal.is_reachable(w))
+                    Ok(true)
                 }
             }
             GetResult::NotFound => Ok(false),
@@ -792,13 +808,19 @@ impl Db {
     /// of a dropped cell returns `None`, and once GC reclaims the underlying
     /// WAL space the read may fail. Do not hold a checkpoint across a drop
     /// of a range it still needs.
+    ///
+    /// # Concurrent writes
+    ///
+    /// Writes to the range being dropped must not race the drop: the WAL
+    /// orders them against the DropCells frame while the in-memory clear
+    /// orders them against the row locks, and the two orders may differ, so
+    /// the live table and a replay can disagree about such a write.
     pub fn drop_cells_in_range(
         &self,
         ks: KeySpace,
         from_inclusive: &[u8],
         to_inclusive: &[u8],
     ) -> DbResult<()> {
-        self.check_background_health()?;
         let ksd = self.key_shape.ks(ks);
 
         // Convert keys from user format to index format
@@ -810,11 +832,21 @@ impl Db {
 
         let entry = WalEntry::DropCells(ks, from_cell.clone(), to_cell.clone());
         let w = PreparedWalWrite::new(&entry);
-        self.wal_writer.write(&w)?;
+        // The frame's guard is held until every cell is cleared: the WAL
+        // frontier stays at or below the frame, so a control region stored
+        // meanwhile has replay_from at or below it and a restart replays the
+        // drop over whatever the control region stored for the cells. The
+        // clear waits out any async flush of a cell in flight, and the held
+        // guard then stalls the tracker: checkpoint creation, relocation and,
+        // once writers are past the WAL mapper's lookahead, every write wait
+        // for the drop. Dropped cells rarely have a flush pending, so the
+        // stall is accepted.
+        let guard = self.wal_writer.write(&w)?;
 
         let context = self.ks_context(ks);
         self.large_table
-            .drop_cells_in_range(context, &from_cell, &to_cell)?;
+            .drop_cells_in_range(context, &from_cell, &to_cell);
+        drop(guard);
 
         Ok(())
     }
@@ -843,11 +875,10 @@ impl Db {
     /// frames. Like [`Db::drop_cells_in_range`], this intentionally does
     /// not preserve data for held checkpoints.
     pub fn destroy_key_space(&self, name: &str) -> DbResult<()> {
-        self.check_background_health()?;
         let Some(ks) = self.tombstone_key_space(name)? else {
             return Ok(());
         };
-        self.large_table.drop_all_cells(self.ks_context(ks))?;
+        self.large_table.drop_all_cells(self.ks_context(ks));
         Ok(())
     }
 
@@ -899,7 +930,6 @@ impl Db {
     }
 
     pub(crate) fn do_write_batch(&self, batch: WriteBatch) -> DbResult<()> {
-        self.check_background_health()?;
         let WriteBatch {
             transaction,
             mut writes,
@@ -1102,17 +1132,28 @@ impl Db {
             .relocation_written_bytes
             .inc_by(size_bytes as u64);
         let positions = self.write_relocated_batch_into_wal(&prepared_writes)?;
-        // `last_processed` is captured as the value-WAL byte frontier, which is
-        // exactly `LastProcessed` natively; the hybrid cut is built at its own
-        // call site instead of reusing this batch type.
+        // Index the copies only once every frame below them is applied. The
+        // next control region rebuild persists the blob written below, and a
+        // frame still being written when the process crashes is torn: replay
+        // stops at it, so a copy above it is unreachable and, since replay
+        // skips relocated frames, never re-derived, while GC has already
+        // reclaimed the original. With every frame below the copies applied,
+        // a crash can only cut the WAL above them. The wait covers at least
+        // every write allocated before the copies; their own guards are
+        // already dropped, so it cannot wait on itself.
+        self.wal_writer.wait_processed();
         let mut updates = RelocationUpdates::new(LastProcessed::new(last_processed));
         for (pos, key) in positions.into_iter().zip(keys.into_iter()) {
             let reduced_key = context.ks_config.reduced_key_bytes(key);
             updates.add(reduced_key, pos);
         }
-        // todo this do not hold guards before flushing the index - need to confirm if this is ok
-        self.large_table
-            .sync_flush_for_relocation(context, &cell_id, self, Some(updates), None)?;
+        let dropped = self.large_table.sync_flush_for_relocation(
+            context,
+            &cell_id,
+            self,
+            RelocationFlush::Updates(updates),
+        )?;
+        self.retire_index_blobs(&dropped);
         Ok(())
     }
 
@@ -1155,11 +1196,16 @@ impl Db {
         Ok((vec![guard], positions))
     }
 
+    /// Appends the relocated copies and returns their positions. The guards
+    /// are dropped at once: a copy is not an acknowledged write of its own,
+    /// its original stays readable until relocation reclaims the WAL under
+    /// it (at the end of the stripe, or of an index-based run), and
+    /// [`Self::write_relocated_batch`] waits for the tracker's frontier to
+    /// pass the copies before it indexes them.
     fn write_relocated_batch_into_wal(
         &self,
         prepared_writes: &[PreparedWalWrite],
     ) -> DbResult<Vec<WalPosition>> {
-        // todo make sure its ok to drop guard right away
         prepared_writes
             .iter()
             .map(|write| {
@@ -1260,16 +1306,14 @@ impl Db {
             };
             let (key, value) = match result.value {
                 GetResult::Value(ref full_key, ref v) => (full_key.clone(), v.clone()),
-                GetResult::WalPosition(w, ref cache_refill) => {
+                GetResult::WalPosition(w) => {
                     match self.read_record_for_indexed_key(context, w, result.key.as_ref())? {
                         Some((k, v)) => {
-                            self.large_table.fp.fp_before_value_cache_refill();
                             self.large_table.update_lru(
                                 context,
                                 result.key.clone(),
                                 k.clone(),
                                 v.clone(),
-                                cache_refill.clone(),
                             );
                             (k, v)
                         }
@@ -1318,8 +1362,10 @@ impl Db {
     ) {
         let context = self.ks_context(ks);
         let _timer = context.db_op_timer(DbOpKind::UpdateFlushedIndex);
-        self.large_table
-            .update_flushed_index(context, &cell, original_index, new_levels)
+        let dropped =
+            self.large_table
+                .update_flushed_index(context, &cell, original_index, new_levels);
+        self.retire_index_blobs(&dropped);
     }
 
     pub(crate) fn update_relocated_index(
@@ -1329,8 +1375,24 @@ impl Db {
         new_levels: IndexLevels,
     ) {
         let context = self.ks_context(ks);
-        self.large_table
+        let dropped = self
+            .large_table
             .update_relocated_index(context, &cell, new_levels);
+        self.retire_index_blobs(&dropped);
+    }
+
+    /// Drops from the index blob cache the blobs a completed flush or
+    /// relocation removed from a cell's levels. Positions are never reused
+    /// within a `Db` instance, so a blob that no level references is dead;
+    /// without this a superseded L1 would occupy the budget until the CLOCK
+    /// sweep got to it.
+    pub(crate) fn retire_index_blobs(&self, dropped: &[WalPosition]) {
+        let Some(cache) = &self.index_blob_cache else {
+            return;
+        };
+        for position in dropped {
+            cache.remove(*position);
+        }
     }
 
     pub(crate) fn read_record_check_key(
@@ -1475,12 +1537,12 @@ impl Db {
                 let _timer = context.read_decompress_mcs.clone().mcs_timer();
                 decompress_wal_entry(batch_entry).expect("caller matched WalEntry::CompressedBatch")
             };
-            match cache.get_or_decompress(position, decompress) {
+            match cache.get_or_fill(position, decompress) {
                 CacheOutcome::Hit(body) => {
                     context.read_decompress_cache_hits.inc();
                     return Ok(Some(body));
                 }
-                CacheOutcome::Decompressed(body) => {
+                CacheOutcome::Filled(body) => {
                     context.read_decompress_count.inc();
                     return Ok(Some(body));
                 }
@@ -1518,7 +1580,6 @@ impl Db {
     /// Native asynchronous acknowledgement remains unchanged.
     #[cfg(feature = "experimental-distributed")]
     pub fn persist_value_wal_for_benchmark(&self) -> DbResult<()> {
-        self.check_background_health()?;
         self.wal.persist_registered_files()?;
         Ok(())
     }
@@ -1545,7 +1606,6 @@ impl Db {
         &self,
         profile: &mut ValueWalPersistenceProfile,
     ) -> DbResult<()> {
-        self.check_background_health()?;
         self.wal.persist_registered_files_profiled(profile)?;
         Ok(())
     }
@@ -1591,19 +1651,17 @@ impl Db {
                     Some(value)
                 }
             }
-            GetResult::WalPosition(position, refill) => {
+            GetResult::WalPosition(position) => {
                 let began = Instant::now();
                 let value = self.read_record_check_key(context, k, position)?;
                 profile.wal_and_decode_ns =
                     u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 if let Some(value) = &value {
-                    self.large_table.fp.fp_before_value_cache_refill();
                     self.large_table.update_lru(
                         context,
                         reduced_key.to_vec().into(),
                         Bytes::from(k.to_vec()),
                         value.clone(),
-                        refill,
                     );
                 }
                 value
@@ -1621,7 +1679,6 @@ impl Db {
     }
 
     pub fn force_rebuild_control_region(&self) -> DbResult<u64> {
-        self.check_background_health()?;
         // Wait for the async WAL tracker to catch up so all recent writes are included in the snapshot.
         self.wal_writer.wal_tracker_barrier();
         self.rebuild_control_region_from(self.wal_writer.position())
@@ -1633,7 +1690,6 @@ impl Db {
     }
 
     pub(crate) fn rebuild_control_region_from(&self, threshold_position: u64) -> DbResult<u64> {
-        self.check_background_health()?;
         // Capture index writer position before pass 1 so files created by the
         // pass-1 flushes (and pass-2 force-relocations) are excluded from the
         // relocation candidate set built from the accumulator.
@@ -1703,26 +1759,8 @@ impl Db {
             // must keep every file the writer might traverse.
             None => Vec::new(),
         };
-        // The new control region depends on the index files it references and
-        // on the value WAL entries those index files point to. Those entries
-        // can lie above `replay_from` (a cell flushed after the oldest dirty
-        // cell) and above the processed frontier (an earlier allocation still
-        // in flight), but below the current allocation position. Persist
-        // those files before the control region can become durable: the map
-        // syncer works asynchronously and gives no such order. The processed
-        // frontiers are captured before the syncs, so writes below them have
-        // finished.
-        let index_complete_below = layout.locate_file(self.index_writer.last_processed().as_u64());
-        if let Some(max_live_file) = max_live_file {
-            self.indexes
-                .sync_files_through(max_live_file, index_complete_below)?;
-        }
-        let wal_layout = self.wal.layout();
-        let wal_complete_below = wal_layout.locate_file(self.wal_writer.last_processed().as_u64());
-        self.wal.sync_files_through(
-            wal_layout.locate_file(self.wal_writer.position()),
-            wal_complete_below,
-        )?;
+        self.indexes.fsync()?;
+        self.wal.fsync()?;
         // Persist the control region BEFORE unlinking files. A crash between
         // these steps must leave the on-disk CR consistent with the files
         // still present: extra (un-deleted) files are tolerated by the next
@@ -1894,7 +1932,6 @@ impl Db {
 
     /// Create a snapshot of the current db state
     pub fn create_state_snapshot(&self, snapshot_path: PathBuf) -> DbResult<()> {
-        self.check_background_health()?;
         let guard = self.control_region_store.lock();
         let control_region_path = guard.path().clone();
         drop(guard);
@@ -2171,7 +2208,21 @@ impl Loader for Db {
     type Position = WalPosition;
     type Error = DbError;
 
+    /// Deserializes the index blob at `position`. A blob resident in the
+    /// index blob cache is adopted from there (the cached bytes are exactly
+    /// the `WalEntry::Index` payload, see `index_reader`), which spares a
+    /// promote or relocation of a hot cell the re-read of its L1 from disk.
+    /// `load` never admits a blob, only lookups fill the cache; and it
+    /// probes non-blocking because `maybe_load` calls it under the row lock.
     fn load(&self, ks: &KeySpaceDesc, position: WalPosition) -> DbResult<IndexTable> {
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            let context = self.ks_context(ks.id());
+            context.inc_read(WalEntryKind::Index, ReadType::Cached);
+            context.inc_read_bytes(WalEntryKind::Index, ReadType::Cached, blob.len() as u64);
+            return Ok(ks.index_format().deserialize_index(ks, blob));
+        }
         let entry = self.read_report_entry(&self.indexes, position)?;
         Self::read_index(
             ks,
@@ -2184,10 +2235,46 @@ impl Loader for Db {
         )
     }
 
+    /// Opens a reader over the index blob at `position`. Called under the
+    /// row lock by every disk-walking read path, so with the index blob
+    /// cache enabled the probe is non-blocking: a resident blob is served as
+    /// `WalRandomRead::Cached`, and a syscall-path blob within the admission
+    /// bounds becomes a `WalRandomRead::CachedFill` that fills the cache (or
+    /// joins the fill in flight) on its first read, after the caller has
+    /// released the lock. Mapped blobs, blobs below the floor and blobs
+    /// above the budget are returned as they are.
     fn index_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error> {
+        let Some(cache) = &self.index_blob_cache else {
+            return Ok(self
+                .indexes
+                .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?);
+        };
+        if let Some(blob) = cache.peek(position) {
+            return Ok(WalRandomRead::Cached(blob));
+        }
+        let reader = self
+            .indexes
+            .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?;
+        Ok(match reader {
+            WalRandomRead::File(file) if cache.admit(file.len()) => {
+                WalRandomRead::CachedFill(cache.lazy_reader(position, file))
+            }
+            reader => reader,
+        })
+    }
+
+    /// Opens the index blob at `position` for a scan, sourcing it as `load`
+    /// does: from the index blob cache when the blob is resident, with a
+    /// whole-frame read otherwise, and without admitting it into the cache.
+    fn index_scan_reader(&self, position: WalPosition) -> Result<WalRandomRead, Self::Error> {
+        if let Some(cache) = &self.index_blob_cache
+            && let Some(blob) = cache.peek(position)
+        {
+            return Ok(WalRandomRead::Cached(blob));
+        }
         Ok(self
             .indexes
-            .random_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?)
+            .whole_frame_reader_at(position, WalEntry::INDEX_PREFIX_SIZE)?)
     }
 
     fn flush_supported(&self) -> bool {
@@ -2528,14 +2615,6 @@ impl From<bincode::Error> for DbError {
 #[cfg(test)]
 #[path = "db_tests/generated.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "db_tests/test_cache_refill.rs"]
-mod cache_refill_tests;
-
-#[cfg(test)]
-#[path = "db_tests/test_background_health.rs"]
-mod background_health_tests;
 
 #[cfg(all(test, feature = "experimental-distributed"))]
 #[path = "db_tests/test_decode_record.rs"]

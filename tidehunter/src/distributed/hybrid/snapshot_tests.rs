@@ -915,9 +915,10 @@ fn cell_layout(table: &HybridTable) -> (usize, bool) {
 /// cell, and the shape never changes what a key resolves to. The native
 /// fragment is 4 KiB and one key costs about 66 index bytes, so a cell of 55
 /// keys (about 3.6 KiB) fits one fragment as one blob but is above a 1 KiB
-/// threshold. With `None` the cell is one L1 blob (a larger one would abort the
-/// flusher at the fragment size, which is why the fixture stops at 55); with
-/// `Some(1024)` it flushes as shards. Both reload every position byte-exact,
+/// threshold. With auto-sharding disabled (`Some(usize::MAX)`, native's
+/// spelling) the cell is one L1 blob (a larger one would abort the flusher at
+/// the fragment size, which is why the fixture stops at 55); with `Some(1024)`
+/// it flushes as shards. Both reload every position byte-exact,
 /// and a second promotion (re-promotion, 15 more keys into the sharded cell)
 /// keeps every earlier key.
 ///
@@ -927,7 +928,7 @@ fn cell_layout(table: &HybridTable) -> (usize, bool) {
 #[test]
 fn the_native_shard_threshold_controls_the_promoted_cell_and_no_key_is_lost() {
     let offset = |seed: u64| 1000 + seed * 64;
-    for threshold in [None, Some(1024usize)] {
+    for threshold in [Some(usize::MAX), Some(1024usize)] {
         let mut fixture = Fixture::with_config(
             "hybrid-snapshot-shard-option",
             HybridIndexConfig {
@@ -966,7 +967,11 @@ fn the_native_shard_threshold_controls_the_promoted_cell_and_no_key_is_lost() {
         assert!(first.stored, "{threshold:?}: the pass stores a region");
         let (shards, l1) = cell_layout(&fixture.table);
         match threshold {
-            None => assert!(l1 && shards == 0, "None: one L1 blob, got {shards} shards"),
+            Some(usize::MAX) => assert!(
+                l1 && shards == 0,
+                "Some(usize::MAX): one L1 blob, got {shards} shards"
+            ),
+            None => panic!("the loop uses explicit thresholds only"),
             Some(_) => assert!(
                 shards > 1,
                 "first promotion must produce shards, got {shards}"

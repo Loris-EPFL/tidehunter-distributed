@@ -245,6 +245,21 @@ fn main() {
     config.l0_max_entries = Some(6);
     config.snapshot_unload_threshold = 1024;
     config.snapshot_written_bytes = 4 * 1024 * 1024; // 4 MB — trigger snapshots frequently
+    // Auto-shard L1 at 2 KiB so the secondary key space's cells split into
+    // many shards and its promotes and relocations run over them.
+    config.with_index_auto_shard_threshold(2 * 1024);
+    // Opt-in index blob cache: a budget in bytes, admitting every blob that
+    // leaves the index mmap window. Every cell here is rewritten constantly,
+    // so blobs leave the window mainly across restarts, when only the
+    // newest fragments are mapped again: small fragments and a three-map
+    // window keep that set small enough for the cache to see traffic.
+    let index_blob_cache_bytes = env_usize("CONCURRENT_TEST_INDEX_BLOB_CACHE_BYTES", 0);
+    if index_blob_cache_bytes > 0 {
+        config.index_blob_cache_bytes = Some(index_blob_cache_bytes);
+        config.index_blob_cache_min_bytes = 1;
+        config.frag_size = 64 * 1024;
+        config.max_index_maps = Some(3);
+    }
     let config = Arc::new(config);
 
     let mut key_shape_builder = KeyShapeBuilder::new();
@@ -754,6 +769,22 @@ fn main() {
         .with_label_values(&["secondary"])
         .get();
     println!("  relocation_kept: {relocation_kept}");
+    if index_blob_cache_bytes > 0 {
+        let fills = shared_metrics.index_blob_cache_fills.get();
+        println!(
+            "  index_blob_cache: fills={fills} hits={} drops={} evictions={} rejected={} unreadable={}",
+            shared_metrics.index_blob_cache_hits.get(),
+            shared_metrics.index_blob_cache_drops.get(),
+            shared_metrics.index_blob_cache_evictions.get(),
+            shared_metrics.index_blob_cache_rejected.get(),
+            shared_metrics.index_blob_cache_unreadable.get(),
+        );
+        assert!(
+            fills > 0,
+            "CONCURRENT_TEST_INDEX_BLOB_CACHE_BYTES is set but no index blob was ever cached"
+        );
+        assert_eq!(0, shared_metrics.index_blob_cache_unreadable.get());
+    }
     let relocation_removed = shared_metrics
         .relocation_removed
         .with_label_values(&["secondary"])
@@ -780,6 +811,18 @@ fn main() {
             .with_label_values(&[ks])
             .get();
         let promotes = shared_metrics.promote_total.with_label_values(&[ks]).get();
+        let shard_blobs = shared_metrics
+            .l1_shards_total
+            .with_label_values(&[ks])
+            .get();
+        let shard_splits = shared_metrics
+            .l1_shard_split_total
+            .with_label_values(&[ks])
+            .get();
+        let shard_rewrites = shared_metrics
+            .l1_shard_rewritten_total
+            .with_label_values(&[ks])
+            .get();
         let mut read_index_0 = 0u64;
         let mut read_index_1 = 0u64;
         for result in ["found", "not_found"] {
@@ -794,8 +837,19 @@ fn main() {
         }
         println!(
             "  lsm[{ks}]: l0_bytes={l0_bytes} l1_bytes={l1_bytes} promotes={promotes} \
-             reads_index_0={read_index_0} reads_index_1={read_index_1}"
+             shard_blobs={shard_blobs} shard_splits={shard_splits} \
+             shard_rewrites={shard_rewrites} reads_index_0={read_index_0} \
+             reads_index_1={read_index_1}"
         );
+        if ks == "secondary" && total_operations >= 1_000_000 {
+            // A full-size run writes enough secondary keys for its cells to
+            // split; a short run may not.
+            assert!(shard_splits > 0, "secondary cells never split into shards");
+            assert!(
+                shard_rewrites > 0,
+                "no secondary shard was rewritten by a promote or a relocation"
+            );
+        }
     }
     drop(db_read);
 

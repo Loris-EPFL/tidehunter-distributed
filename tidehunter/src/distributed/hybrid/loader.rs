@@ -31,16 +31,18 @@
 
 use super::position::VersionPosition;
 use super::region::StreamFront;
-use crate::context::{KsContextVec, WalEntryKind};
+use crate::context::{KsContext, WalEntryKind};
 use crate::db::WalEntry;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::BatchVersion;
 use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
+use crate::key_shape::KeyShape;
 use crate::key_shape::{KeySpace, KeySpaceDesc};
 use crate::large_table::Loader;
 use crate::wal::position::{IndexCut, WalPosition};
+use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{PreparedWalWrite, Wal, WalError, WalRandomRead, WalWriter};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -444,6 +446,41 @@ fn index_wal_error(operation: &str, error: WalError) -> LocalDbError {
     LocalDbError::new(format!("index WAL {operation}: {error:?}"))
 }
 
+/// The hybrid's key space contexts.
+///
+/// Native `Db` keeps one per keyspace and lets `LargeTable` own them; the
+/// hybrid builds its own before the table exists (its loader needs them) and
+/// shares them with the table and the flusher host.
+pub(crate) struct KsContextVec {
+    contexts: Vec<KsContext>,
+}
+
+impl KsContextVec {
+    pub(crate) fn new(
+        key_shape: &KeyShape,
+        config: Arc<crate::config::Config>,
+        metrics: Arc<crate::metrics::Metrics>,
+        last_processed: SharedLastProcessed,
+    ) -> Self {
+        let contexts = key_shape
+            .iter_ks()
+            .map(|ks_desc| {
+                KsContext::new(
+                    config.clone(),
+                    ks_desc.clone(),
+                    metrics.clone(),
+                    last_processed.clone(),
+                )
+            })
+            .collect();
+        Self { contexts }
+    }
+
+    pub(crate) fn ks_context(&self, ks: crate::key_shape::KeySpace) -> &KsContext {
+        &self.contexts[ks.as_usize()]
+    }
+}
+
 /// The hybrid [`Loader`]: the coordinator's local index WAL plus the cut fronts.
 pub(crate) struct HybridLoader {
     index_wal: Arc<Wal>,
@@ -593,6 +630,13 @@ impl Loader for HybridLoader {
             .write(&write)
             .map_err(|error| index_wal_error("write", error))?;
         Ok(*guard.wal_position())
+    }
+
+    /// The index-applied prefix, not `last_processed`: the latched cut can sit
+    /// below what the stored region already names, and a snapshot must not
+    /// lower its `replay_from` below that.
+    fn snapshot_replay_bound(&self) -> BatchVersion {
+        self.cuts.durable().min(self.cuts.applied())
     }
 
     fn last_processed(&self) -> BatchVersion {

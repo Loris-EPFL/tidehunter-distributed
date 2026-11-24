@@ -450,7 +450,7 @@ fn lagging_owner_is_nudged_and_idle_owner_does_not_pin_the_cut() {
 /// real owners and return the exact values, including after another promotion.
 #[test]
 fn native_sharding_option_controls_hybrid_promotion_and_reopen() {
-    for (threshold, expect_shards) in [(None, false), (Some(2048), true)] {
+    for (threshold, expect_shards) in [(Some(usize::MAX), false), (Some(2048), true)] {
         let fixture = Fixture::new_with_root(
             tempdir::TempDir::new("sharding-option").expect("fixture root"),
             1,
@@ -492,7 +492,7 @@ fn native_sharding_option_controls_hybrid_promotion_and_reopen() {
                     } else if !expect_shards {
                         assert!(
                             levels.l1().is_some(),
-                            "None must retain one promoted L1 blob"
+                            "Some(usize::MAX) must retain one promoted L1 blob"
                         );
                     }
                 });

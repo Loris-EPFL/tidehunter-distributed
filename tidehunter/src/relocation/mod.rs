@@ -1,7 +1,7 @@
 use crate::WalPosition;
 use crate::batch::RelocatedWriteBatch;
 use crate::db::{BackgroundThread, Db, DbResult, WalEntry};
-use crate::index::index_table::IndexTable;
+use crate::flusher::RelocationFlush;
 use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
 use crate::relocation::watermark::RelocationWatermarks;
@@ -11,6 +11,7 @@ pub use cell_reference::CellReference;
 use minibytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::thread::JoinHandle;
 
@@ -60,6 +61,29 @@ pub fn compute_target_position_from_ratio(db: &Arc<Db>, ratio: f64) -> Option<u6
 
     // Ensure we don't exceed last_processed
     Some(target.min(last_processed))
+}
+
+/// WAL range one relocation stripe covers: `stripe_bytes` rounded down to
+/// whole WAL files, and at least one file.
+fn stripe_range(stripe_bytes: u64, wal_file_size: u64) -> u64 {
+    (stripe_bytes / wal_file_size).max(1) * wal_file_size
+}
+
+/// Raises `Db::relocation_running` for the duration of a WAL-based run, which
+/// pauses the periodic snapshot thread's size-triggered snapshots.
+struct PeriodicSnapshotPause<'a>(&'a AtomicBool);
+
+impl<'a> PeriodicSnapshotPause<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for PeriodicSnapshotPause<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 pub(crate) struct Relocator(pub(crate) mpsc::Sender<RelocationCommand>);
@@ -493,6 +517,9 @@ impl RelocationDriver {
             db.config.batch_codec.is_none(),
             "wal-based relocation does not support Config::batch_codec yet"
         );
+        // Raised before the scan below, so a periodic snapshot already under
+        // way when the run starts can finish while the scan reads the WAL.
+        let _paused = PeriodicSnapshotPause::new(&db.relocation_running);
         let last_processed = db.wal_writer.last_processed();
         let upper_limit = last_processed.as_u64();
         let min_wal_position = db.wal.min_wal_position();
@@ -506,24 +533,9 @@ impl RelocationDriver {
                 .max(db.wal.wal_file_size());
         // find target cut-off position
         let mut terminal_position = 0;
-        // Per keyspace: its filter returned `Keep` for a record below the terminal.
-        let mut keep_seen = vec![false; db.key_shape.num_ks()];
-        // WAL offsets of those records below the reclaim cap, ascending. The
-        // copy loop selects survivors from them, so each record gets exactly
-        // one filter call. Bounded by the records in the reclaim span.
-        let mut kept_positions = Vec::new();
         loop {
             let entry = wal_iterator.next();
-            if let Err(error @ (WalError::Crc(_) | WalError::EndOfWal)) = &entry {
-                // The scan read every frame below the processed frontier, and
-                // nothing is written at the frontier: the processed prefix is
-                // complete. A stop below the frontier, or a torn or corrupt
-                // frame at it, leaves the terminal at zero.
-                if wal_iterator.position() == upper_limit
-                    && (matches!(error, WalError::EndOfWal) || wal_iterator.is_zeroed_header())
-                {
-                    terminal_position = upper_limit;
-                }
+            if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
                 break;
             }
             let (position, raw_entry) = entry?;
@@ -553,18 +565,9 @@ impl RelocationDriver {
                         decision,
                     });
                 }
-                match decision {
-                    Decision::Keep => {
-                        keep_seen[ks.as_usize()] = true;
-                        if position.offset() < max_target_position {
-                            kept_positions.push(position.offset());
-                        }
-                    }
-                    Decision::Remove => {}
-                    Decision::StopRelocation => {
-                        terminal_position = position.offset();
-                        break;
-                    }
+                if let Decision::StopRelocation = decision {
+                    terminal_position = position.offset();
+                    break;
                 }
             }
         }
@@ -596,48 +599,96 @@ impl RelocationDriver {
         if let Some(observed) = &mut observed {
             observed.gate = RelocationGate::DidWork;
         }
+        let stripe_range = stripe_range(db.config.relocation_stripe_bytes, db.wal.wal_file_size());
+        let mut stripe_start = min_wal_position;
+        let mut cutoff = Some(terminal_position);
+        while stripe_start < target_position {
+            let stripe_end = stripe_start
+                .saturating_add(stripe_range)
+                .min(target_position);
+            self.relocate_stripe(
+                db,
+                stripe_end,
+                cutoff.take(),
+                last_processed,
+                #[cfg(feature = "test_methods")]
+                observed.as_deref_mut(),
+            )?;
+            // Every entry below `stripe_end` is now re-pointed or dropped in
+            // the index; persist that before the WAL below it is reclaimed.
+            // The stripe's snapshot stands in for the periodic one, so it
+            // force-unloads behind the live tail as that would. Cells written
+            // since the run started are flushed too, and replay after a crash
+            // starts no earlier than the last stripe's snapshot.
+            let unload_threshold = db
+                .wal_writer
+                .position()
+                .saturating_sub(db.config.snapshot_unload_threshold());
+            db.rebuild_control_region_from(stripe_end.max(unload_threshold))?;
+            let replay_from = db.control_region_store.lock().last_position();
+            db.wal_writer.gc(stripe_end.min(replay_from.as_u64()))?;
+            self.metrics.relocation_stripes.inc();
+            db.large_table.fp.fp_relocation_after_stripe();
+            stripe_start = stripe_end;
+        }
+        Ok(Some(target_position))
+    }
+
+    /// One pass over every cell for the stripe ending at `stripe_end`. Key
+    /// spaces without a relocation filter get their live entries below
+    /// `stripe_end` copied to the WAL tail, and their index re-pointed at the
+    /// copies; entries below the previous stripe's end were moved by that
+    /// stripe. Key spaces with a filter only drop the entries below
+    /// `cutoff`, which the first stripe does for the whole run.
+    fn relocate_stripe(
+        &self,
+        db: &Arc<Db>,
+        stripe_end: u64,
+        cutoff: Option<u64>,
+        last_processed: LastProcessed,
+        #[cfg(feature = "test_methods")] mut observed: Option<&mut RelocationObservation>,
+    ) -> DbResult<()> {
         let mut current_cell = CellReference::first(db, KeySpace::first());
         while let Some(cell) = current_cell.take() {
             current_cell = cell.next(db);
             let ks = db.key_shape.ks(cell.keyspace);
-            let filter = ks.relocation_filter();
-            // Every record of this keyspace below the terminal scanned as
-            // `Remove`: drop its index entries below the terminal unread.
-            if filter.is_some() && !keep_seen[cell.keyspace.as_usize()] {
-                db.large_table.sync_flush_for_relocation(
-                    db.ks_context(cell.keyspace),
-                    &cell.cell_id,
-                    db.as_ref(),
-                    None,
-                    Some(LastProcessed::new(terminal_position)),
-                )?;
+            // For keyspaces with relocation filter, flush and clear stale entries
+            if ks.relocation_filter().is_some() {
+                if let Some(cutoff) = cutoff {
+                    let dropped = db.large_table.sync_flush_for_relocation(
+                        db.ks_context(cell.keyspace),
+                        &cell.cell_id,
+                        db.as_ref(),
+                        RelocationFlush::Cutoff(LastProcessed::new(cutoff)),
+                    )?;
+                    db.retire_index_blobs(&dropped);
+                }
                 continue;
             }
-            let batch_limit = db.config.relocation_batch_max_bytes();
-            let mut batch =
-                RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), target_position);
+            // For keyspaces without relocation filter, relocate entries.
             // Relocate the value as of the checkpoint frontier, not the live
             // latest: a post-frontier overwrite would otherwise strand the
             // as-of value (which GC reclaims) that a held checkpoint reads.
             // `get_index_for_cell` returns that as-of view directly — the overlay
             // is filtered to < `last_processed` before any latest-per-key collapse,
             // and the on-disk levels it merges under are already as-of-safe.
-            let index = db
-                .large_table
-                .get_index_for_cell(
-                    db.ks_context(cell.keyspace),
-                    &cell.cell_id,
-                    db.as_ref(),
-                    last_processed,
-                )?
-                .unwrap_or(IndexTable::default().into());
             let context = db.ks_context(cell.keyspace);
-            for (reduced_key, position) in index.iter() {
-                // In a filtered keyspace, an entry is live only if the scan
-                // kept its record.
-                if position.offset() < target_position
-                    && (filter.is_none()
-                        || kept_positions.binary_search(&position.offset()).is_ok())
+            let Some(mut index) = db.large_table.get_index_for_cell(
+                context,
+                &cell.cell_id,
+                db.as_ref(),
+                last_processed,
+            )?
+            else {
+                continue;
+            };
+            let batch_limit = db.config.relocation_batch_max_bytes();
+            // The copies re-point a key only while its latest position is
+            // still below `stripe_end`, i.e. the original this stripe read.
+            let mut batch =
+                RelocatedWriteBatch::new(cell.keyspace, cell.cell_id.clone(), stripe_end);
+            for (reduced_key, position) in index.iter(context) {
+                if position.offset() < stripe_end
                     && let Some((key, value)) =
                         db.read_record_for_indexed_key(context, position, reduced_key.as_ref())?
                 {
@@ -657,7 +708,7 @@ impl RelocationDriver {
                         batch = RelocatedWriteBatch::new(
                             cell.keyspace,
                             cell.cell_id.clone(),
-                            target_position,
+                            stripe_end,
                         );
                     }
                 }
@@ -671,20 +722,8 @@ impl RelocationDriver {
                     observed.copied_survivors += copied;
                 }
             }
-            if filter.is_some() {
-                // Kept entries now point to their copies at the WAL head.
-                // Drop the removed entries below the target. Entries from the
-                // target to the terminal stay: their files are not reclaimed.
-                db.large_table.sync_flush_for_relocation(
-                    context,
-                    &cell.cell_id,
-                    db.as_ref(),
-                    None,
-                    Some(LastProcessed::new(target_position)),
-                )?;
-            }
         }
-        Ok(Some(target_position))
+        Ok(())
     }
 
     fn should_cancel_relocation(&self) -> bool {
@@ -720,7 +759,8 @@ impl RelocationDriver {
         // offset >= `effective_limit`; a higher threshold (e.g. the live
         // frontier) would let the CAS re-point such a write to the relocated
         // copy of the older as-of value, losing the overwrite. (The WAL-based
-        // path passes its `target_position` for the same reason.)
+        // path passes each stripe's end, which lies at or below the frontier
+        // its view is built with.)
         let batch =
             RelocatedWriteBatch::new(cell_ref.keyspace, cell_ref.cell_id.clone(), effective_limit);
         let mut context = CellProcessingContext::new(batch);
@@ -728,7 +768,7 @@ impl RelocationDriver {
 
         // Phase A: Get shared reference to cell index, as of the relocation
         // frontier (filters the overlay before any latest-per-key collapse).
-        let index = match db.large_table.get_index_for_cell(
+        let mut index = match db.large_table.get_index_for_cell(
             db.ks_context(cell_ref.keyspace),
             &cell_ref.cell_id,
             db.as_ref(),
@@ -761,21 +801,24 @@ impl RelocationDriver {
         // (see the WAL-based path for why). `get_index_for_cell` already returns
         // the as-of view; the loop below skips any on-disk entry still at >= the
         // cutoff.
-        for (key, position) in index.iter() {
+        for (reduced_key, position) in index.iter(ks_context) {
             if position.offset() >= effective_limit {
                 continue;
             }
 
-            // Read the actual value from WAL
-            let value = match db.read_record_for_indexed_key(ks_context, position, key.as_ref())? {
-                Some((_, val)) => val,
-                None => {
-                    // Entry might have been deleted or corrupted, skip it
-                    context.mark_entry_removed(position);
-                    removed_count += 1;
-                    continue;
-                }
-            };
+            // Read the record from WAL. The index holds the reduced key (a hash
+            // or a key range for such keyspaces); the filter and the relocated
+            // copy take the full key the record carries, as on the WAL-based path.
+            let (key, value) =
+                match db.read_record_for_indexed_key(ks_context, position, reduced_key.as_ref())? {
+                    Some(record) => record,
+                    None => {
+                        // Entry might have been deleted or corrupted, skip it
+                        context.mark_entry_removed(position);
+                        removed_count += 1;
+                        continue;
+                    }
+                };
 
             // Simplified decision logic for index-based relocation. Since we're iterating through
             // current index entries, we only need to check the relocation filter
@@ -785,7 +828,7 @@ impl RelocationDriver {
 
             match decision {
                 Decision::Keep => {
-                    context.add_entry_to_relocate(key.clone(), value, position);
+                    context.add_entry_to_relocate(key, value, position);
                 }
                 Decision::Remove => {
                     context.mark_entry_removed(position);

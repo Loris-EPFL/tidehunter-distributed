@@ -143,10 +143,18 @@ impl HybridIndexConfig {
         if self.relocation_max_reclaim_pct > 100 {
             return invalid("index relocation_max_reclaim_pct must be in 0..=100".to_owned());
         }
-        if let Some(threshold) = self.index_auto_shard_threshold {
-            // Same ceiling as native `Config::validate`: one serialized index
-            // blob must fit in a WAL fragment after framing and worst-case
-            // alignment.
+        if self.index_auto_shard_threshold != Some(usize::MAX) {
+            // `Some(usize::MAX)` is native's "auto-sharding disabled" spelling
+            // (`Config::disable_index_auto_sharding`), so it has no ceiling.
+            //
+            // Otherwise the effective threshold is native's
+            // `Config::auto_shard_threshold`: half a fragment when the option
+            // is `None`. Same ceiling as native `Config::validate`: one
+            // serialized index blob must fit in a WAL fragment after framing
+            // and worst-case alignment.
+            let threshold = self
+                .index_auto_shard_threshold
+                .unwrap_or((self.frag_size / 2) as usize);
             let alignment = if self.direct_io { 512 } else { 8 };
             let overhead = CrcFrame::CRC_HEADER_LENGTH + WalEntry::INDEX_PREFIX_SIZE + alignment;
             let max = self.frag_size.saturating_sub(overhead as u64);
@@ -191,6 +199,14 @@ impl HybridIndexConfig {
             index_auto_shard_threshold: self.index_auto_shard_threshold,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
+            // The coordinator has no index blob cache: its index blobs are
+            // read once per relocation pass, not repeatedly.
+            index_blob_cache_bytes: None,
+            index_blob_cache_min_bytes: 64 * 1024 * 1024,
+            // Native striped relocation is the single-node `Db` path; the
+            // hybrid runs its own relocation pass, so the native value is
+            // never read.
+            relocation_stripe_bytes: 64 * 1024 * 1024 * 1024,
         }
     }
 

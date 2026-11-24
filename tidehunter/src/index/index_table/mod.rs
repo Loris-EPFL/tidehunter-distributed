@@ -123,6 +123,22 @@ impl<P: IndexPosition> Default for IndexTable<P> {
     }
 }
 
+/// Where a live write landed in the `data` overlay (`IndexTable::insert` /
+/// `remove`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)] // pub only because `IndexTable::insert`/`remove` are pub; no external user
+pub enum WriteOrder {
+    /// The write is the key's latest position: it is the live value.
+    Latest,
+    /// A newer write to the key was already recorded (concurrent writers to
+    /// one key took the row lock out of WAL order), so this one was ordered
+    /// behind it. It is not the live value, but it is the key's as-of value
+    /// for every frontier between it and the newer write, which checkpoint
+    /// `get_at`, the relocation as-of view and the flush blob filter
+    /// (`retain_processed`) all read per position.
+    Stale,
+}
+
 impl<P: IndexPosition> Clone for IndexTable<P> {
     fn clone(&self) -> Self {
         Self {
@@ -150,6 +166,9 @@ impl<P: IndexPosition> std::fmt::Debug for IndexTable<P> {
 // Compile time check: the native tagged position keeps its historical size,
 // which is what makes `LargeTable::<WalPosition>` layout-identical to the base.
 const _: [u8; 16] = [0u8; size_of::<TaggedWalPosition>()];
+// Compile time check to ensure the tagged position consumes the same amount of
+// memory as the bare position plus its kind.
+const _: [u8; size_of::<WalPosition>()] = [0u8; size_of::<WalPosition>()];
 
 /// Adjust `dirty_count` when an entry transitions between clean and dirty states.
 /// Takes a direct reference to the counter to avoid borrow conflicts when `self.data` is held.
@@ -189,28 +208,68 @@ fn disk_tombstone<P: IndexPosition>() -> IndexWalPosition<P> {
 // ---------------------------------------------------------------------------
 
 impl<P: IndexPosition> IndexTable<P> {
-    pub fn insert(&mut self, k: Bytes, v: P) -> Option<P> {
+    /// Records the write of `k` at `v` and reports whether it is the key's
+    /// latest position; see `checked_insert`.
+    pub fn insert(&mut self, k: Bytes, v: P) -> WriteOrder {
         self.checked_insert(k, P::tag(v, IndexEntryKind::Modified))
     }
 
-    pub fn remove(&mut self, k: Bytes, v: P) -> Option<P> {
+    /// Records the removal of `k` at `v`; see `insert`.
+    pub fn remove(&mut self, k: Bytes, v: P) -> WriteOrder {
         self.checked_insert(k, P::tag(v, IndexEntryKind::Removed))
     }
 
-    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition<P>) -> Option<P> {
+    /// Records a live write in the `data` overlay.
+    ///
+    /// A write above the key's latest `data` position (the common case)
+    /// appends and becomes the live value. A write below it is stale: a
+    /// concurrent writer to the same key took the row lock out of WAL order.
+    /// The stale write is inserted in order behind the newer position rather
+    /// than dropped, because it is the key's as-of value for every frontier
+    /// between the two (`WriteOrder::Stale`). Neither `key_bytes` (per unique
+    /// key) nor `dirty_count` (per key, from its latest position) changes for
+    /// a stale write.
+    ///
+    /// Ordering consults `data` alone, never `flat`. The other in-flight
+    /// writes to the key are always still in `data` when a write lands:
+    ///   - a direct write holds its WAL guard until it is applied, so the
+    ///     tracker frontier, and with it every promote threshold, stays at or
+    ///     below it and nothing newer is promoted into `flat` meanwhile;
+    ///   - a batch write releases its guards at commit while its ops wait in
+    ///     `pending_data`, but every frontier capture reads `last_processed`
+    ///     before `promote_pending` under the row lock, and the live
+    ///     `insert`/`remove` run `promote_pending_for` first, so a pending op
+    ///     is applied (and ordered against `data` here) before anything newer
+    ///     leaves `data`.
+    ///
+    /// Every `flat` entry is therefore either an older processed write or
+    /// disk-derived, and disk-derived entries carry offsets that are
+    /// meaningless for ordering: a tombstone's `INVALID` sentinel (u64::MAX)
+    /// and a relocated copy's WAL-tail offset would both wrongly outrank a
+    /// genuine newer write, hiding a re-insert from the live view.
+    ///
+    /// See test_concurrent_single_value_update for the end-to-end test of
+    /// out-of-order writes.
+    fn checked_insert(&mut self, k: Bytes, v: IndexWalPosition<P>) -> WriteOrder {
         let k = k.into_owned();
-        // Only update index entry if new entry has higher wal position then the previous entry
-        // See test_concurrent_single_value_update for details how this is tested
-        // todo handle this comparison correctly when we have data relocation
-        // todo might want a separate test with snapshot enabled
 
         // Enforce the ordering assertion for keys promoted to flat but not yet
         // in `data`. Done before `entry` so the immutable flat read doesn't
         // overlap the mutable `data` borrow the entry holds (the `contains_key`
         // probe is debug/test-only — release does a single `data` descent).
+        // Only `Modified`/`Removed`-kind flat entries with a genuine offset are
+        // checked: those are promoted in-memory writes, which are always
+        // older than a write landing now. A `Clean` flat entry is disk-derived
+        // (`maybe_load`, `rebase_on_as_of`) or a demoted in-memory write, and
+        // a disk-derived entry's offset says nothing about ordering: a
+        // relocated copy sits at a WAL-tail offset that can exceed a write
+        // allocated before the copy, and a disk tombstone carries the
+        // `INVALID` sentinel.
         #[cfg(any(debug_assertions, feature = "test_methods"))]
         if !self.data.contains_key(&k)
             && let Some(existing) = self.flat_binary_search(&k)
+            && !P::tagged_is_clean(existing)
+            && !P::tagged_is_sentinel(existing)
         {
             assert!(
                 P::tagged_position(existing).precedes(P::tagged_position(v)),
@@ -221,9 +280,25 @@ impl<P: IndexPosition> IndexTable<P> {
         match self.data.entry(k) {
             Entry::Occupied(mut oc) => {
                 // `positions` is non-empty and ascending by tagged position, so
-                // the latest is its last element and the new (strictly greater)
-                // position appends in order.
+                // the latest is its last element.
                 let prev = *oc.get().last().unwrap();
+                if P::tagged_position(v).precedes(P::tagged_position(prev)) {
+                    // Stale: order it behind the newer position. Same canary
+                    // as below: a repeated offset is never a legitimate write.
+                    // Offsets are unique per key, so the slot found by offset
+                    // is the slot in IWP order.
+                    let positions = oc.get_mut();
+                    let slot = match positions
+                        .binary_search_by(|p| P::tagged_position(*p).cmp(&P::tagged_position(v)))
+                    {
+                        Err(slot) => slot,
+                        Ok(_) => panic!("Index WAL position must be unique per key"),
+                    };
+                    positions.insert(slot, v);
+                    return WriteOrder::Stale;
+                }
+                // The canary for a duplicate-key compressed batch or an
+                // ordering bug: a repeated offset is never a legitimate write.
                 assert!(
                     P::tagged_position(prev).precedes(P::tagged_position(v)),
                     "Index WAL position must be increasing"
@@ -234,13 +309,13 @@ impl<P: IndexPosition> IndexTable<P> {
                     !P::tagged_is_clean(v),
                 );
                 oc.get_mut().push(v);
-                Some(P::tagged_into_position(prev))
+                WriteOrder::Latest
             }
             Entry::Vacant(va) => {
                 self.key_bytes += va.key().len();
                 adjust_dirty_count(&mut self.dirty_count, false, !P::tagged_is_clean(v));
                 va.insert(smallvec![v]);
-                None
+                WriteOrder::Latest
             }
         }
     }
@@ -309,11 +384,11 @@ impl<P: IndexPosition> IndexTable<P> {
 
         // ---- flat side: dirty's disk-derived `flat` folds into self.flat ----
         // Invariant: entries that originated on disk live only in `flat`, never
-        // in the `data` overlay. The old code lifted them into `data`, where
-        // the offset-based filters then misread them — most damagingly,
-        // `retain_processed` saw a disk tombstone's INVALID sentinel offset
-        // (u64::MAX) as an unprocessed post-frontier write and dropped it,
-        // resurrecting the value the tombstone shadowed in a deeper level.
+        // in the `data` overlay. Lifting them into `data` would expose them to
+        // the offset-based filters, which misread them — most damagingly,
+        // `retain_processed` would take a disk tombstone's INVALID sentinel
+        // offset (u64::MAX) for an unprocessed post-frontier write and drop
+        // it, resurrecting the value the tombstone shadows in a deeper level.
         // `flat`'s dirty-entry count: `fold_dirty_flat` tallies it while building
         // the new buffer, so the merged blob is not re-decoded here. When there
         // is no `dirty.flat` to fold, `self.flat` is unchanged and counted once.
@@ -343,19 +418,28 @@ impl<P: IndexPosition> IndexTable<P> {
     /// `self.flat`, upholding the invariant that disk entries never enter the
     /// `data` overlay.
     ///
-    /// `dirty` is the fresher side, so on equal keys its flat entry wins over
-    /// `self.flat` — except where `dirty.data` already carries the key, in
-    /// which case the overlay (just merged into `self.data`) is freshest and
-    /// `self.flat`'s entry is kept untouched as the below-overlay value
-    /// (matching the prior behavior of skipping `dirty.flat` for overlay keys).
+    /// `dirty` is the fresher side on both halves, so its flat entry is always
+    /// taken: over `self.flat`'s entry on equal keys, and also when
+    /// `dirty.data` carries the same key. The merged table then holds that
+    /// key on both sides, exactly as `dirty` did: the overlay positions in
+    /// `data` and the older promoted value in `flat`, which `data` shadows.
+    /// That `flat` entry is the key's as-of value for every frontier below the
+    /// overlay positions. The flusher runs `retain_processed` after this
+    /// merge and drops the overlay positions above the flush frontier, so the
+    /// blob must find the `flat` entry beneath them, and `maybe_load` hands
+    /// the merged table to `get_at`, which falls through to `flat` the same
+    /// way. Keeping `self.flat`'s entry instead would leave the base's older
+    /// value for the key, and the flush completion clears the overlay's
+    /// `flat`, so the promoted value would survive nowhere. `dirty_count`
+    /// counts such a key on both sides, as the overlay already does.
     ///
-    /// For a key taken from `dirty.flat`, any now-stale `self.data` tuple is
-    /// dropped so the flat value is the one observed. In every production
-    /// caller `self` is a freshly-loaded merge base with empty `data`, so that
-    /// cleanup is a no-op there; it only matters for synthetic callers that
-    /// pre-seed `self.data` with values older than `dirty` (debug asserts
-    /// enforce the "older" contract on both the dropped tuples and equal-key
-    /// flat entries).
+    /// For a key taken from `dirty.flat` that `dirty.data` does not hold, any
+    /// now-stale `self.data` tuple is dropped so the flat value is the one
+    /// observed. In every production caller `self` is a freshly-loaded merge
+    /// base with empty `data`, so that cleanup is a no-op there; it only
+    /// matters for synthetic callers that pre-seed `self.data` with values
+    /// older than `dirty` (a debug assert enforces the "older" contract on
+    /// the dropped tuples).
     ///
     /// Returns the number of dirty (non-clean) entries in the rebuilt `flat`,
     /// so the caller can finish its stats without re-decoding the blob.
@@ -401,44 +485,35 @@ impl<P: IndexPosition> IndexTable<P> {
                 }
                 Ordering::Greater => {
                     let (k, v) = dirty_it.next().unwrap();
-                    if dirty.data_contains_key(k) {
-                        continue; // overlay carries the fresher value
-                    }
                     let key = dirty.flat.slice_to_bytes(k);
-                    keys_from_dirty.push((key.clone(), v));
+                    if !dirty.data_contains_key(k) {
+                        keys_from_dirty.push((key.clone(), v));
+                    }
                     merged.push((key, demote(v)));
                 }
                 Ordering::Equal => {
-                    let (sk, sv) = self_it.next().unwrap();
+                    // Caller contract: `dirty` is the fresher side. The two
+                    // offsets are not comparable, so this is not asserted:
+                    // either side may be a disk tombstone (`INVALID`
+                    // sentinel) or a relocated copy, which sits at a
+                    // WAL-tail offset above genuine writes it predates (a
+                    // copy promoted into L1 under a held checkpoint versus
+                    // the newer overwrite that later reaches L0).
+                    self_it.next();
                     let (dk, dv) = dirty_it.next().unwrap();
-                    if dirty.data_contains_key(dk) {
-                        // Overlay is freshest; keep self.flat's entry beneath it.
-                        merged.push((self_flat.slice_to_bytes(sk), sv));
-                    } else {
-                        // Caller contract: `dirty` is the fresher side. A disk
-                        // tombstone carries the sentinel instead of a write
-                        // position, so it is not comparable; see
-                        // [`disk_tombstone`]. An in-memory delete keeps its real
-                        // write position and is still ordered.
-                        debug_assert!(
-                            sv == disk_tombstone::<P>()
-                                || dv == disk_tombstone::<P>()
-                                || !P::tagged_position(dv).precedes(P::tagged_position(sv)),
-                            "fold_dirty_flat: dirty.flat entry at {:?} is older than \
-                             self.flat entry at {:?} for the same key",
-                            P::tagged_position(dv),
-                            P::tagged_position(sv)
-                        );
-                        let key = dirty.flat.slice_to_bytes(dk);
+                    let key = dirty.flat.slice_to_bytes(dk);
+                    if !dirty.data_contains_key(dk) {
                         keys_from_dirty.push((key.clone(), dv));
-                        merged.push((key, demote(dv)));
                     }
+                    merged.push((key, demote(dv)));
                 }
             }
         }
 
         // Drop overlay positions shadowed by a value just taken from dirty.flat:
         // every position for that key is below the winner, so the whole key goes.
+        // A key `dirty.data` holds is not in this list: its overlay positions,
+        // folded into `self.data` above, are newer than its `flat` entry.
         for (key, winner) in keys_from_dirty {
             if let Some(stale) = self.data.remove(&key) {
                 for e in &stale {
@@ -663,6 +738,12 @@ impl<P: IndexPosition> IndexTable<P> {
         self.flat = build_flat_bytes::<P>(kept, self.key_size);
     }
 
+    /// True when this table holds an entry for `k`, in the overlay or in
+    /// flat, tombstones included.
+    pub fn contains_key(&self, k: &[u8]) -> bool {
+        self.data_contains_key(k) || self.flat_binary_search(k).is_some()
+    }
+
     pub fn get(&self, k: &[u8]) -> Option<P> {
         // `data` (write buffer) takes priority over `flat` — its latest entry
         // for `k` shadows any flat entry for the same key.
@@ -682,10 +763,12 @@ impl<P: IndexPosition> IndexTable<P> {
     /// The data overlay is searched for the latest *processed* position; if the
     /// key only has unprocessed positions there (a write that postdates the
     /// checkpoint), we fall through to `flat`. Falling through is correct
-    /// because, for any key, `data` entries always have a higher WAL offset
-    /// than a `flat` entry for the same key (data is the newer write buffer;
-    /// `promote_to_flat` only ever moves lower offsets down). So a processed
-    /// data entry, when present, is the freshest as-of-frontier value and wins.
+    /// because `data` shadows `flat` for the same key: a `flat` entry is
+    /// either an older processed write (`promote_to_flat` only moves
+    /// processed positions down) or disk-derived — a tombstone, or a
+    /// relocated copy that may sit at a higher WAL-tail offset yet holds the
+    /// as-of-frontier value. So a processed data entry, when present, is the
+    /// freshest as-of-frontier value and wins.
     ///
     /// `flat` is always safe to consult in full: by the unprocessed-write
     /// retention invariant (see the `crate::checkpoint` module docs) no user
@@ -857,6 +940,28 @@ impl<P: IndexPosition> IndexTable<P> {
     /// tombstones on disk (two-level LSM L0 over L1).
     pub fn iter_with_tombstones(&self) -> impl Iterator<Item = (Bytes, P)> + '_ {
         self.iter_inner(true)
+    }
+
+    /// Consumes a flat-only table — a blob as deserialized from disk — and
+    /// yields its entries in key order as zero-copy slices of the owned
+    /// flat. A tombstone is persisted with `WalPosition::INVALID` as its
+    /// position and decodes back as a `Removed` entry; like [`Self::iter`],
+    /// this skips those, so a caller sees only keys with a readable record.
+    /// [`Self::iter_with_tombstones`] is the borrowing variant that yields
+    /// them as `(key, WalPosition::INVALID)` instead, for callers that must
+    /// keep a tombstone shadowing a deeper level.
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = (Bytes, P)> {
+        assert!(
+            self.data.is_empty(),
+            "into_entries: the table must be flat-only"
+        );
+        let IndexTable { flat, key_size, .. } = self;
+        let count = flat_count::<P>(&flat, key_size);
+        (0..count).filter_map(move |index| {
+            let (key, iwp) = flat_entry_at::<P>(&flat, key_size, index);
+            let pos = P::tagged_into_position(iwp);
+            pos.is_valid().then(|| (flat.slice_to_bytes(key), pos))
+        })
     }
 
     /// Merge `flat` and `data` into the table's logical view: one entry per
@@ -1313,14 +1418,35 @@ impl<P: IndexPosition> IndexTable<P> {
         debug_assert_eq!(self.dirty_count, 0);
     }
 
-    /// Retain only unprocessed entries (those not below the cut).
+    /// Retain only unprocessed positions (a position at or above `cut`),
+    /// per position: a key keeps the suffix of its list from its first
+    /// unprocessed position on, and a key with none is dropped. The mirror of
+    /// [`Self::retain_processed`].
     ///
     /// By the `flat` field invariant (no in-flight entries, see its doc),
     /// `flat` is cleared unconditionally. The BTreeMap still holds entries on
     /// both sides of the boundary and is filtered.
+    ///
+    /// Runs at flush completion (`clear_after_flush`) and at the
+    /// ForceRelocate completion that demotes a DirtyLoaded cell
+    /// (`update_relocated_position`), once the blob just written holds each
+    /// key's as-of-frontier position or has dropped it on purpose (relocation
+    /// cutoff, WAL floor, compactor, deepest-level tombstone strip). A
+    /// processed position must not stay behind a newer, unprocessed one for
+    /// the same key: a relocation flush re-points the processed position to a
+    /// copy and the run's GC reclaims its frame, so a checkpoint read that
+    /// still finds it in the overlay reads a reclaimed frame instead of
+    /// falling through to the copy in the blob.
     pub fn retain_unprocessed(&mut self, cut: P::Cut) {
         self.flat = Bytes::default();
-        self.retain(|_, v| !P::tagged_position(*v).below(cut));
+        self.data.retain(|_, positions| {
+            positions.retain(|v| !P::tagged_position(*v).below(cut));
+            !positions.is_empty()
+        });
+        // Flat is empty, so the data side is the whole count.
+        let (kb, dc) = self.recount_data_stats();
+        self.key_bytes = kb;
+        self.dirty_count = dc;
     }
 
     /// Returns true if this index table has any unprocessed entries.
@@ -1340,33 +1466,6 @@ impl<P: IndexPosition> IndexTable<P> {
     pub fn retain_above_position(&mut self, cut: P::Cut) {
         self.retain_flat(|_, iwp| (!P::tagged_position(iwp).below(cut)).then_some(iwp));
         self.retain(|_, v| !P::tagged_position(*v).below(cut));
-    }
-
-    /// Turns every live entry below `cut` into a tombstone at its own position.
-    /// Existing tombstones and entries at or above `cut` stay. Returns whether
-    /// any entry changed. Used over a deeper level, where dropping the entry
-    /// would expose an older version of its key.
-    pub fn tombstone_below_position(&mut self, cut: P::Cut) -> bool {
-        let mut changed = false;
-        self.retain_flat(|_, iwp| {
-            if P::tagged_position(iwp).below(cut) && !P::tagged_is_removed(iwp) {
-                changed = true;
-                Some(P::with_kind(iwp, IndexEntryKind::Removed))
-            } else {
-                Some(iwp)
-            }
-        });
-        for positions in self.data.values_mut() {
-            let latest = *positions.last().expect("data positions are never empty");
-            if P::tagged_position(latest).below(cut) && !P::tagged_is_removed(latest) {
-                *positions = smallvec![P::with_kind(latest, IndexEntryKind::Removed)];
-                changed = true;
-            }
-        }
-        let (kb, dc) = self.recount_stats();
-        self.key_bytes = kb;
-        self.dirty_count = dc;
-        changed
     }
 
     /// Compact index by retaining keys identified by the compactor.
@@ -1714,7 +1813,8 @@ impl<P: IndexPosition> IndexTable<P> {
     /// and set semantics (an identical position is not duplicated). Creates the
     /// key's entry if absent. Used by merge/rebase paths where the incoming
     /// position is not guaranteed to be the largest for the key (the hot insert
-    /// path appends directly in `checked_insert`).
+    /// path appends directly in `checked_insert`, which also orders a stale
+    /// live write into the key's existing list).
     fn data_insert_sorted(&mut self, key: Bytes, iwp: IndexWalPosition<P>) {
         let positions = self.data.entry(key).or_default();
         crate::index::versioned_overlay::insert_unique_by(positions, iwp, Ord::cmp);
@@ -2485,6 +2585,41 @@ mod tests {
     }
 
     #[test]
+    fn test_retain_unprocessed_is_per_position() {
+        // Flush completion keeps only the unprocessed suffix of every key: a
+        // key overwritten past the frontier drops its processed position,
+        // which the blob holds (re-pointed to a copy after a relocation).
+        let mut index = IndexTable::default();
+        index.insert(vec![1].into(), WalPosition::test_value(100));
+        index.insert(vec![1].into(), WalPosition::test_value(500));
+        index.insert(vec![2].into(), WalPosition::test_value(200));
+        index.insert(vec![3].into(), WalPosition::test_value(400));
+        index.insert(vec![3].into(), WalPosition::test_value(600));
+        // Key 2 is fully processed and promotes into flat; the other keys
+        // keep their whole lists in the BTreeMap.
+        index.promote_to_flat_force(LastProcessed::new(300));
+        assert_eq!(index.flat_len(), 1);
+        assert_eq!(index.data.len(), 2);
+
+        index.retain_unprocessed(LastProcessed::new(300));
+
+        assert!(index.flat.is_empty());
+        assert_eq!(index.get(&[2]), None);
+        let positions =
+            |key: &[u8]| -> Vec<u64> { index.data[key].iter().map(|v| v.offset).collect() };
+        assert_eq!(positions(&[1]), vec![500]);
+        assert_eq!(positions(&[3]), vec![400, 600]);
+        assert_eq!(index.get_at(&[1], LastProcessed::new(300)), None);
+        assert_eq!(index.get(&[1]), Some(WalPosition::test_value(500)));
+        assert_eq!(
+            index.get_at(&[3], LastProcessed::new(500)),
+            Some(WalPosition::test_value(400))
+        );
+        assert_eq!(index.dirty_count(), 2);
+        assert_eq!(index.key_bytes, 2);
+    }
+
+    #[test]
     fn test_promote_to_flat_equal_key_unprocessed_keeps_flat() {
         // Coverage for `merge_walk`'s Equal-key handling under the filter: an
         // unprocessed BTreeMap write that shadows an existing flat entry must
@@ -2541,31 +2676,6 @@ mod tests {
         assert!(index.get(&[2]).is_none()); // offset 200, removed
         assert_eq!(index.get(&[3]), Some(WalPosition::test_value(300))); // offset 300, kept
         assert_eq!(index.get(&[4]), Some(WalPosition::test_value(400))); // offset 400, kept
-    }
-
-    #[test]
-    fn test_tombstone_below_position() {
-        let mut index = IndexTable::default();
-        index.insert(vec![1].into(), WalPosition::test_value(100));
-        index.insert(vec![2].into(), WalPosition::test_value(200));
-        index.remove(vec![5].into(), WalPosition::test_value(150));
-        // Keys 1, 2 and the tombstone move to flat; keys 3, 4 and 6 go to data.
-        index.promote_to_flat_unconditionally(LastProcessed::new(250));
-        index.insert(vec![3].into(), WalPosition::test_value(300));
-        index.insert(vec![4].into(), WalPosition::test_value(400));
-        index.insert(vec![6].into(), WalPosition::test_value(210));
-
-        assert!(index.tombstone_below_position(LastProcessed::new(250)));
-        assert_eq!(index.len(), 6, "no key is dropped");
-        for key in [1, 2, 5, 6] {
-            assert_eq!(index.get(&[key]), Some(WalPosition::INVALID), "key {key}");
-        }
-        assert_eq!(index.get(&[3]), Some(WalPosition::test_value(300)));
-        assert_eq!(index.get(&[4]), Some(WalPosition::test_value(400)));
-        assert!(
-            !index.tombstone_below_position(LastProcessed::new(250)),
-            "already hidden"
-        );
     }
 
     #[test]
@@ -3229,6 +3339,105 @@ mod tests {
         let loaded = load(&with_tombstone);
         assert_eq!(zero_copy_loads_for_test(), before, "tombstones rebuild");
         assert_eq!(loaded.get(&[2]), Some(WalPosition::INVALID));
+    }
+
+    #[test]
+    fn test_insert_ignores_disk_tombstone_for_ordering() {
+        // A tombstone loaded from disk sits in `flat` with the INVALID
+        // sentinel offset (u64::MAX). It must neither order a later write as
+        // stale nor trip the flat ordering assert when that write lands.
+        let mut table = IndexTable::default();
+        table.insert(vec![1].into(), WalPosition::test_value(10));
+        table.remove(vec![2].into(), WalPosition::test_value(25));
+
+        let shape = KeyShape::new_single_config_indexing(
+            KeyIndexing::variable_length(),
+            1,
+            KeyType::uniform(1),
+            Default::default(),
+        );
+        let ks = shape.ks(KeySpace::first());
+        let mut buf = BytesMut::new();
+        table.serialize_index_entries(ks, &mut buf);
+        let mut loaded = IndexTable::deserialize_index_entries(ks, Bytes::from(buf.freeze()));
+        assert_eq!(loaded.get(&[2]), Some(WalPosition::INVALID));
+
+        // Re-inserting the tombstoned key is the key's latest write and
+        // shadows the tombstone.
+        let reinsert = WalPosition::test_value(30);
+        assert_eq!(loaded.insert(vec![2].into(), reinsert), WriteOrder::Latest);
+        assert_eq!(loaded.get(&[2]), Some(reinsert));
+        assert_eq!(
+            loaded.iter().collect::<Vec<_>>(),
+            vec![
+                (Bytes::from(vec![1]), WalPosition::test_value(10)),
+                (Bytes::from(vec![2]), reinsert),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stale_write_is_ordered_behind_newer_write() {
+        // Two writers to one key applied out of WAL order: the later-applied
+        // write at the lower offset is stale. It must not become the live
+        // value, but every as-of view between the two offsets must see it.
+        let key: Bytes = vec![1].into();
+        let newer = WalPosition::test_value(30);
+        let stale = WalPosition::test_value(10);
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.dirty_count(), 1);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(20)), Some(stale));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(31)), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(10)), None);
+
+        // A stale write between two recorded positions lands in the middle.
+        let older = WalPosition::test_value(5);
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), older), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.insert(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(6)), Some(older));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(11)), Some(stale));
+        assert_eq!(table.get_at(&key, LastProcessed::new_test(31)), Some(newer));
+
+        // A stale remove is an as-of tombstone behind the newer write.
+        let mut table = IndexTable::default();
+        assert_eq!(table.insert(key.clone(), newer), WriteOrder::Latest);
+        assert_eq!(table.remove(key.clone(), stale), WriteOrder::Stale);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(
+            table.get_at(&key, LastProcessed::new_test(20)),
+            Some(WalPosition::INVALID)
+        );
+    }
+
+    #[test]
+    fn test_unmerge_flushed_keeps_stale_position() {
+        // A stale write recorded after the flush snapshot was taken is not in
+        // the blob, so the unmerge must leave it in the overlay while removing
+        // the flushed position below it.
+        let key: Bytes = vec![1].into();
+        let mut original = IndexTable::default();
+        original.insert(key.clone(), WalPosition::test_value(5));
+        original.insert(key.clone(), WalPosition::test_value(30));
+        let mut live = original.clone();
+        assert_eq!(
+            live.insert(key.clone(), WalPosition::test_value(10)),
+            WriteOrder::Stale
+        );
+        // Frontier 8: the flush covered position 5 only.
+        live.unmerge_flushed(&original, LastProcessed::new_test(8));
+        assert_eq!(live.get_at(&key, LastProcessed::new_test(8)), None);
+        assert_eq!(
+            live.get_at(&key, LastProcessed::new_test(11)),
+            Some(WalPosition::test_value(10))
+        );
+        assert_eq!(live.get(&key), Some(WalPosition::test_value(30)));
     }
 
     #[test]
@@ -4159,6 +4368,70 @@ mod tests {
         // All three positions coexist for [1]: the base @5 plus both dirty
         // positions — the below-latest @10 must survive the merge.
         assert_eq!(self_table.data.get([1].as_ref()).map(|p| p.len()), Some(3));
+    }
+
+    #[test]
+    fn test_merge_dirty_keeps_flat_entry_under_overlay_key() {
+        // A key promoted into the overlay's `flat` and then overwritten in
+        // `data` above the frontier: the merge must keep the `flat` entry
+        // (the as-of value) beneath the overlay position, on both the flush
+        // path (`_and_clean`) and the load path (`_no_clean`). [1] has an
+        // older base entry that must not win; [2] has none.
+        let frontier = LastProcessed::new(25);
+        let mut base = IndexTable::default();
+        base.insert(vec![1].into(), WalPosition::test_value(10));
+        base.demote_data_modified_to_clean();
+        base.promote_to_flat(LastProcessed::new(u64::MAX));
+
+        let mut dirty = IndexTable::default();
+        dirty.insert(vec![1].into(), WalPosition::test_value(20));
+        dirty.insert(vec![2].into(), WalPosition::test_value(21));
+        dirty.promote_to_flat(frontier);
+        dirty.insert(vec![1].into(), WalPosition::test_value(30));
+        dirty.insert(vec![2].into(), WalPosition::test_value(31));
+        assert!(dirty.data_contains_key(&[1]) && dirty.data_contains_key(&[2]));
+        assert_eq!(
+            dirty.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+
+        let mut merged = base.clone();
+        merged.merge_dirty_and_clean(&dirty);
+        assert_eq!(merged.get(&[1]), Some(WalPosition::test_value(30)));
+        assert_eq!(merged.get(&[2]), Some(WalPosition::test_value(31)));
+        assert_eq!(
+            merged.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+        assert_eq!(
+            merged.get_at(&[2], frontier),
+            Some(WalPosition::test_value(21))
+        );
+        // The flusher's frontier filter then drops the overlay positions, and
+        // the blob serializes the `flat` entries.
+        merged.retain_processed(frontier);
+        assert_eq!(
+            merged.iter_with_tombstones().collect::<Vec<_>>(),
+            vec![
+                (Bytes::from(vec![1]), WalPosition::test_value(20)),
+                (Bytes::from(vec![2]), WalPosition::test_value(21)),
+            ]
+        );
+
+        let mut loaded = base;
+        loaded.merge_dirty_no_clean(&dirty);
+        assert_eq!(loaded.get(&[1]), Some(WalPosition::test_value(30)));
+        assert_eq!(
+            loaded.get_at(&[1], frontier),
+            Some(WalPosition::test_value(20))
+        );
+        assert_eq!(
+            loaded.get_at(&[2], frontier),
+            Some(WalPosition::test_value(21))
+        );
+        // Both sides stay dirty on the load path and are counted as the
+        // overlay counted them.
+        assert_eq!(loaded.dirty_count(), dirty.dirty_count());
     }
 
     #[test]

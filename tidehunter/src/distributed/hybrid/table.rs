@@ -49,10 +49,10 @@ use super::snapshot::{self, StoredSnapshot};
 use crate::background_health::BackgroundHealth;
 use crate::cell::CellId;
 use crate::container::LargeTableContainer;
-use crate::context::{KsContext, KsContextVec};
+use crate::context::KsContext;
 use crate::db::CONTROL_REGION_FILE;
-use crate::db::DbError;
 use crate::distributed::durability::DurabilityTier;
+use crate::distributed::hybrid::loader::KsContextVec;
 use crate::distributed::remote_db::StreamControls;
 use crate::distributed::storage::LocalDbError;
 use crate::distributed::types::{BatchVersion, RecordKind};
@@ -66,6 +66,7 @@ use crate::large_table::{CellUpdateError, GetResult, LargeTable, Loader, Snapsho
 use crate::metrics::Metrics;
 use crate::wal::layout::WalKind;
 use crate::wal::position::{IndexCut, IndexEntryKind, IndexPosition, WalPosition};
+use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{Wal, WalRandomRead};
 use minibytes::Bytes;
 use parking_lot::Mutex;
@@ -234,6 +235,7 @@ impl HybridTable {
             &shape,
             native_config.clone(),
             metrics.clone(),
+            SharedLastProcessed::default(),
         ));
         let loader = Arc::new(HybridLoader::new(
             index_wal,
@@ -250,8 +252,8 @@ impl HybridTable {
             native_config,
             IndexFlusher::new(senders, metrics.clone()),
             metrics.clone(),
+            SharedLastProcessed::default(),
             loader.as_ref(),
-            health.clone(),
         );
         let opened_fronts = region
             .as_ref()
@@ -586,6 +588,7 @@ impl TableInner {
         &self.shape
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contexts(&self) -> &KsContextVec {
         &self.contexts
     }
@@ -694,7 +697,7 @@ impl TableInner {
             .table
             .get_checkpoint(context, reduced.as_ref(), cut, self.loader.as_ref())?
         {
-            GetResult::WalPosition(position, _) => Ok(position.is_valid().then_some(position)),
+            GetResult::WalPosition(position) => Ok(position.is_valid().then_some(position)),
             GetResult::NotFound => Ok(None),
             // `require_owner_resident_values` refuses a value cache at open.
             GetResult::Value(..) => Err(LocalDbError::new(
@@ -737,7 +740,7 @@ impl TableInner {
             return Ok(None);
         };
         match result.value {
-            GetResult::WalPosition(position, _) => Ok(Some(IteratorResult {
+            GetResult::WalPosition(position) => Ok(Some(IteratorResult {
                 cell: result.cell,
                 key: result.key,
                 value: position,
@@ -804,8 +807,7 @@ impl TableInner {
         let view = self
             .table
             .get_index_for_cell(context, cell, self.loader.as_ref(), q)?
-            // A freshly merged table is unshared; the clone is the cold fallback.
-            .map(|view| Arc::try_unwrap(view).unwrap_or_else(|shared| (*shared).clone()))
+            .map(|view| view.into_table(context))
             .unwrap_or_default();
         Ok((view, latch))
     }
@@ -823,8 +825,8 @@ impl TableInner {
     ///   an `insert` (which compares equal on the logical identity and would be
     ///   dropped as stale).
     /// * Drop: with `drop_removed`, every live entry not listed and below its
-    ///   target becomes a tombstone at its own position (as native's
-    ///   `tombstone_below_position`: dropping would expose an older level).
+    ///   target becomes a tombstone at its own position: dropping it would
+    ///   expose an older level.
     ///
     /// A stale expectation is skipped, never forced. The cell is only marked for
     /// flush when something changed; the next covering store persists it.
@@ -848,7 +850,7 @@ impl TableInner {
     ///   time) and lifts only re-pointed entries into `index`, matching native
     ///   `flusher.rs` `lift_shard_entries`. Untouched shards are never read and
     ///   never copied into live `index`; `drop_removed` scans `index` (L0 plus
-    ///   overlay), matching native `tombstone_below_position`.
+    ///   overlay).
     pub(crate) fn relocation_apply(
         &self,
         ks: KeySpace,
@@ -1032,7 +1034,6 @@ impl TableInner {
                 Ok((shadowed, changed))
             })
             .map_err(|error| match error {
-                CellUpdateError::Background(error) => db_error("relocation apply", error),
                 CellUpdateError::Loader(error) => error,
             })?;
         Ok(match result {
@@ -1145,9 +1146,8 @@ impl TableInner {
     ) -> Result<(), LocalDbError> {
         self.check_background_health()?;
         let context = self.contexts.ks_context(ks);
-        self.table
-            .drop_cells_in_range(context, &from, &to)
-            .map_err(|error| db_error("drop cells in range", error))
+        self.table.drop_cells_in_range(context, &from, &to);
+        Ok(())
     }
 
     /// Native `Db::check_background_health`: once a flusher (or any worker the
@@ -1157,22 +1157,6 @@ impl TableInner {
         self.health.check().map_err(|error| {
             LocalDbError::new(format!("hybrid index background worker failed: {error:?}"))
         })
-    }
-}
-
-/// Maps a native `DbError` keeping the kind the value path keys on: an I/O error
-/// keeps its own kind and corruption is `InvalidData` (never retried); anything
-/// else is a background failure, kind `Other`.
-fn db_error(context: &str, error: DbError) -> LocalDbError {
-    match error {
-        DbError::Io(error) => LocalDbError::with_kind(error.kind(), format!("{context}: {error}")),
-        DbError::CrCorrupted | DbError::CorruptedIndexEntry(_) | DbError::WalError(_) => {
-            LocalDbError::with_kind(
-                std::io::ErrorKind::InvalidData,
-                format!("{context}: {error:?}"),
-            )
-        }
-        DbError::BackgroundFailure(_) => LocalDbError::new(format!("{context}: {error:?}")),
     }
 }
 
@@ -1262,14 +1246,16 @@ impl FlusherHost<VersionPosition> for TableInner {
         new_levels: IndexLevels,
     ) {
         let context = self.contexts.ks_context(ks);
-        self.table
-            .update_flushed_index(context, &cell, original, new_levels)
+        let _dropped = self
+            .table
+            .update_flushed_index(context, &cell, original, new_levels);
     }
 
     fn update_relocated_index(&self, ks: KeySpace, cell: CellId, new_levels: IndexLevels) {
         let context = self.contexts.ks_context(ks);
-        self.table
-            .update_relocated_index(context, &cell, new_levels)
+        let _dropped = self
+            .table
+            .update_relocated_index(context, &cell, new_levels);
     }
 
     fn ks_context(&self, ks: KeySpace) -> &KsContext {

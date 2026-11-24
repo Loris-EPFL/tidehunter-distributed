@@ -191,3 +191,33 @@ fn native_auto_sharding_option_passes_through_unchanged() {
         hybrid.validate().expect("native threshold is valid");
     }
 }
+
+#[test]
+fn a_default_shard_threshold_must_fit_the_fragment_it_is_derived_from() {
+    // `None` means native's half-fragment default, so it is subject to the
+    // same fragment ceiling: a 32-byte fragment leaves no room for a 16-byte
+    // half-fragment blob once framing and alignment are added.
+    let config = HybridIndexConfig {
+        frag_size: 32,
+        direct_io: false,
+        ..HybridIndexConfig::default()
+    };
+    let error = config
+        .validate()
+        .expect_err("a half-fragment threshold exceeds a tiny fragment's ceiling");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("index_auto_shard_threshold 16 exceeds the WAL fragment ceiling"),
+        "the error must name the resolved threshold and the ceiling: {message}"
+    );
+    // The explicit "disabled" spelling stays exempt.
+    let disabled = HybridIndexConfig {
+        frag_size: 32,
+        direct_io: false,
+        index_auto_shard_threshold: Some(usize::MAX),
+        ..HybridIndexConfig::default()
+    };
+    disabled
+        .validate()
+        .expect("disabling auto-sharding has no ceiling");
+}

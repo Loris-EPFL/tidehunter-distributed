@@ -3228,27 +3228,76 @@ fn test_force_rebuild_control_region() {
     );
 }
 
-/// Opens the db at `path`, looks up the cell-3 key written by
-/// `test_reopen_premaps_live_index_fragments` (its index blob lives in the
-/// first index fragment), and returns how many disk lookups went through the
-/// mapped vs the syscall read path.
-fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> (u64, u64) {
-    let db_metrics = Metrics::new();
-    let db = Db::open(path, key_shape.clone(), config, db_metrics.clone()).unwrap();
-    let ks = db.single_ks();
-    assert_eq!(
-        Some(vec![3].into()),
-        db.get(ks, &[3 << 4, 0, 0, 0]).unwrap()
-    );
-    let lookups = |read_type: ReadType| {
-        let histogram = db_metrics
+/// Disk lookups of `ks` per read type: `(mapped, syscall, cached)`.
+pub(super) fn lookup_counts(metrics: &Metrics, db: &Db, ks: KeySpace) -> (u64, u64, u64) {
+    let count = |read_type: ReadType| {
+        let histogram = metrics
             .lookup_mcs
             .with_label_values(&[read_type.as_ref(), db.ks_context(ks).name()]);
         metrics::get_histogram_sum_count(&histogram)
             .expect("metrics are enabled")
             .1
     };
-    (lookups(ReadType::Mapped), lookups(ReadType::Syscall))
+    (
+        count(ReadType::Mapped),
+        count(ReadType::Syscall),
+        count(ReadType::Cached),
+    )
+}
+
+/// Opens the db at `path`, looks up the cell-3 key written by
+/// `write_blobs_outside_window` (its index blob lives in the first index
+/// fragment), and returns how many disk lookups went through the mapped vs
+/// the syscall read path.
+fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> (u64, u64) {
+    let db_metrics = Metrics::new();
+    let db = Db::open(path, key_shape.clone(), config, db_metrics.clone()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(Some(vec![3].into()), db.get(ks, &cell_key(3)).unwrap());
+    let (mapped, syscall, _) = lookup_counts(&db_metrics, &db, ks);
+    (mapped, syscall)
+}
+
+/// `Config::small` with a 128 KiB fragment and a window of three maps
+/// (writer plus two lookahead), so blobs written before the index writer
+/// moved two fragments on are read through the syscall path after a reopen.
+pub(super) fn unmapped_window_config() -> Config {
+    let mut config = Config::small();
+    config.frag_size = 128 * 1024;
+    config.wal_file_size = 4 * 1024 * 1024;
+    config.max_maps = 3;
+    config
+}
+
+/// 16 cells; a key's cell is its first byte >> 4.
+pub(super) fn sixteen_cells() -> KeyShape {
+    KeyShape::new_single(4, 16, KeyType::uniform(1))
+}
+
+/// The one key `write_blobs_outside_window` puts in `cell`.
+pub(super) fn cell_key(cell: u8) -> Vec<u8> {
+    vec![cell << 4, 0, 0, 0]
+}
+
+/// Writes one key per cell of `sixteen_cells`, flushed into the first index
+/// fragment, then churns the last cell until the index writer sits at least
+/// two fragments past those blobs, which stay live and are never rewritten.
+pub(super) fn write_blobs_outside_window(dir: &Path, key_shape: &KeyShape, config: &Arc<Config>) {
+    let db = Db::open(dir, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    for cell in 0..16u8 {
+        db.insert(ks, cell_key(cell), vec![cell]).unwrap();
+    }
+    db.force_rebuild_control_region().unwrap();
+    let mut i = 0u32;
+    while db.index_writer.position() < 2 * config.frag_size {
+        for _ in 0..200 {
+            i += 1;
+            let [_, b1, b2, b3] = i.to_be_bytes();
+            db.insert(ks, vec![0xF0, b1, b2, b3], vec![1]).unwrap();
+        }
+        db.force_rebuild_control_region().unwrap();
+    }
 }
 
 /// After a restart, index blobs written before the restart must be served
@@ -3257,41 +3306,9 @@ fn lookup_read_types(path: &Path, key_shape: &KeyShape, config: Arc<Config>) -> 
 #[test]
 fn test_reopen_premaps_live_index_fragments() {
     let dir = tempdir::TempDir::new("test-premap-index").unwrap();
-    let mut config = Config::small();
-    config.frag_size = 128 * 1024;
-    config.wal_file_size = 4 * 1024 * 1024;
-    // Writer's fragment + 2 lookahead: no room for historical maps.
-    config.max_maps = 3;
-    let config = Arc::new(config);
-    // 16 cells; a key's cell is its first byte >> 4.
-    let key_shape = KeyShape::new_single(4, 16, KeyType::uniform(1));
-    {
-        let db = Db::open(
-            dir.path(),
-            key_shape.clone(),
-            config.clone(),
-            Metrics::new(),
-        )
-        .unwrap();
-        let ks = db.single_ks();
-        // One key per cell, all flushed into the first index fragment.
-        for cell in 0..16u8 {
-            db.insert(ks, vec![cell << 4, 0, 0, 0], vec![cell]).unwrap();
-        }
-        db.force_rebuild_control_region().unwrap();
-        // Keep flushing fresh keys into the last cell only, until the index
-        // writer has moved at least two fragments past the blobs of the
-        // other cells. Those blobs stay live and are never rewritten.
-        let mut i = 0u32;
-        while db.index_writer.position() < 2 * config.frag_size {
-            for _ in 0..200 {
-                i += 1;
-                let [_, b1, b2, b3] = i.to_be_bytes();
-                db.insert(ks, vec![0xF0, b1, b2, b3], vec![1]).unwrap();
-            }
-            db.force_rebuild_control_region().unwrap();
-        }
-    }
+    let config = Arc::new(unmapped_window_config());
+    let key_shape = sixteen_cells();
+    write_blobs_outside_window(dir.path(), &key_shape, &config);
 
     // Sanity check of the setup: with no room to map history the lookup
     // takes the syscall path.
@@ -3692,260 +3709,6 @@ fn test_sparse_gc_reopen_with_dead_window() {
     let ks = db.ks("ks");
     let v = db.get(ks, &rare_key).expect("read after reopen");
     assert_eq!(v.as_deref(), Some(&rare_value[..]));
-}
-
-/// A crash between the control-region rename and its directory sync can
-/// reopen the previous control region. The snapshot deletes index files that
-/// only the previous control region references, so it must not delete them
-/// before the directory sync succeeds.
-///
-/// The test makes that sync fail: right after the rename it moves the database
-/// directory aside, so the directory cannot be opened. The snapshot must panic
-/// before it deletes a file of the previous control region, and the previous
-/// control region must reopen and return every value.
-#[test]
-fn test_control_region_directory_sync_precedes_index_file_deletion() {
-    use crate::control::ControlRegion;
-    use crate::wal::position::{LastProcessed, WalFileId};
-    use std::collections::BTreeSet;
-
-    const NUM_KEYS: u32 = 128;
-    const ROUNDS: u8 = 4;
-
-    let key = |i: u32| -> Vec<u8> {
-        let mut k = [0u8; 8];
-        k[..4].copy_from_slice(&(i * (u32::MAX / NUM_KEYS)).to_be_bytes());
-        k.to_vec()
-    };
-
-    let dir = tempdir::TempDir::new("test_cr_dir_sync_precedes_gc").unwrap();
-    let db_path = dir.path().join("db");
-    std::fs::create_dir(&db_path).unwrap();
-    let db_path = db_path.canonicalize().unwrap();
-    let aside = dir.path().join("aside");
-    let cr_path = db_path.join(CONTROL_REGION_FILE);
-    let mut config = Config::small();
-    // Tiny index files so a snapshot deletes the files of earlier snapshots.
-    config.frag_size = 8 * 1024;
-    config.wal_file_size = 8 * 1024;
-    config.index_min_occupancy_pct = 0;
-    config.snapshot_unload_threshold = 0;
-    config.max_dirty_keys = 100_000;
-    let config = Arc::new(config);
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
-    let key_shape = builder.build();
-
-    {
-        let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
-        let ks = db.ks("bulk");
-        for round in 0..ROUNDS {
-            for i in 0..NUM_KEYS {
-                db.insert(ks, key(i), vec![round; 128]).unwrap();
-            }
-            db.force_rebuild_control_region().unwrap();
-        }
-        // Dropping the database drains the unlink worker, so no thread uses
-        // the directory path while the hook below moves it aside.
-    }
-
-    let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
-    let ks = db.ks("bulk");
-    let layout = db.indexes.layout().clone();
-    let previous_root = std::fs::read(&cr_path).unwrap();
-    let previous_files: BTreeSet<WalFileId> =
-        ControlRegion::<LastProcessed>::read(&cr_path, &key_shape)
-            .unwrap()
-            .snapshot()
-            .iter_valid_val_positions()
-            .map(|position| layout.locate_file(position.offset()))
-            .collect();
-    assert!(
-        !previous_files.is_empty(),
-        "the previous control region references no index file"
-    );
-    // Move the index writer past the files of the previous control region,
-    // so the next snapshot deletes them.
-    let payload = vec![0u8; config.frag_size as usize - 16];
-    for _ in 0..16 {
-        db.index_writer
-            .write(&PreparedWalWrite::new(&payload))
-            .unwrap();
-    }
-    for i in 0..NUM_KEYS {
-        db.insert(ks, key(i), vec![ROUNDS; 128]).unwrap();
-    }
-    {
-        let weak = Arc::downgrade(&db);
-        let db_path = db_path.clone();
-        let aside = aside.clone();
-        db.control_region_store
-            .lock()
-            .set_after_rename_hook(Box::new(move || {
-                let db = weak.upgrade().unwrap();
-                // Drain the trackers and mappers: no thread may create a WAL
-                // file while the directory is aside. `gc(0)` deletes nothing
-                // and returns after the mapper handled every queued message.
-                for writer in [&db.wal_writer, &db.index_writer] {
-                    writer.wal_tracker_barrier();
-                    writer.gc(0).unwrap();
-                }
-                drop(db);
-                std::fs::rename(&db_path, &aside).unwrap();
-            }));
-    }
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        db.force_rebuild_control_region()
-    }));
-    std::fs::rename(&aside, &db_path).unwrap();
-    let panic = result.expect_err("the snapshot must fail when the directory sync fails");
-    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(
-        message.contains("Failed to sync control region directory"),
-        "unexpected panic: {message}"
-    );
-    let deleted: Vec<WalFileId> = previous_files
-        .iter()
-        .copied()
-        .filter(|id| !layout.wal_file_name(&db_path, *id).exists())
-        .collect();
-    assert!(
-        deleted.is_empty(),
-        "the snapshot deleted index files of the previous control region \
-         before the directory sync: {deleted:?}"
-    );
-    drop(db);
-
-    // A crash after the rename can reopen the previous control region.
-    std::fs::write(&cr_path, &previous_root).unwrap();
-    let db = Db::open(&db_path, key_shape, config, Metrics::new()).unwrap();
-    let ks = db.ks("bulk");
-    for i in 0..NUM_KEYS {
-        assert_eq!(
-            db.get(ks, &key(i)).unwrap().as_deref(),
-            Some(&[ROUNDS; 128][..])
-        );
-    }
-}
-
-/// A power loss keeps only the WAL pages that a sync covered. The snapshot
-/// must persist every WAL file the new control region depends on before the
-/// control region can become durable: the map syncer is asynchronous.
-///
-/// The test models the file system: the durable content of a WAL file is its
-/// content at its last sync by `Wal::fsync` or `Wal::sync_files_through`.
-/// Map-syncer msyncs are not credited: the model drops all of them, older maps
-/// included. At each control-region rename the test builds the crash image
-/// (durable WAL content, zeros for never-synced files, the new control
-/// region), reopens it, and reads the values of the round the snapshot covers.
-#[test]
-fn test_snapshot_syncs_wal_files_before_control_region_rename() {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-
-    const NUM_KEYS: u32 = 128;
-    const ROUNDS: u8 = 4;
-
-    fn file_name(path: &Path) -> String {
-        path.file_name().unwrap().to_str().unwrap().to_string()
-    }
-
-    let key = |i: u32| -> Vec<u8> {
-        let mut k = [0u8; 8];
-        k[..4].copy_from_slice(&(i * (u32::MAX / NUM_KEYS)).to_be_bytes());
-        k.to_vec()
-    };
-
-    let dir = tempdir::TempDir::new("test_snapshot_syncs_wal").unwrap();
-    let images = tempdir::TempDir::new("test_snapshot_syncs_wal_images").unwrap();
-    let db_path = dir.path().canonicalize().unwrap();
-    let mut config = Config::small();
-    // Tiny files so one round spans several value and index files.
-    config.frag_size = 8 * 1024;
-    config.wal_file_size = 8 * 1024;
-    config.index_min_occupancy_pct = 0;
-    config.snapshot_unload_threshold = 0;
-    config.max_dirty_keys = 100_000;
-    let config = Arc::new(config);
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space("bulk", 8, 16, KeyType::uniform(8));
-    let key_shape = builder.build();
-    let db = Db::open(&db_path, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
-
-    // Durable WAL content by file name.
-    let durable: Arc<parking_lot::Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
-    for wal in [&db.wal, &db.indexes] {
-        let durable = durable.clone();
-        let layout = wal.layout().clone();
-        let db_path = db_path.clone();
-        wal.set_file_sync_hook(Box::new(move |id| {
-            let path = layout.wal_file_name(&db_path, id);
-            let bytes = std::fs::read(&path).unwrap();
-            durable.lock().insert(file_name(&path), bytes);
-        }));
-    }
-    let crash_images: Arc<parking_lot::Mutex<Vec<PathBuf>>> = Arc::default();
-    {
-        let durable = durable.clone();
-        let crash_images = crash_images.clone();
-        let images = images.path().to_path_buf();
-        let db_path = db_path.clone();
-        db.control_region_store
-            .lock()
-            .set_after_rename_hook(Box::new(move || {
-                let image = images.join(std::fs::read_dir(&images).unwrap().count().to_string());
-                std::fs::create_dir(&image).unwrap();
-                let durable = durable.lock();
-                for entry in std::fs::read_dir(&db_path).unwrap() {
-                    let entry = entry.unwrap();
-                    if !entry.file_type().unwrap().is_file() {
-                        continue;
-                    }
-                    let name = file_name(&entry.path());
-                    let target = image.join(&name);
-                    if name.starts_with("wal_") || name.starts_with("index_") {
-                        match durable.get(&name) {
-                            Some(bytes) => std::fs::write(&target, bytes).unwrap(),
-                            // Never synced: no page of the file reached the device.
-                            None => std::fs::File::create(&target)
-                                .unwrap()
-                                .set_len(entry.metadata().unwrap().len())
-                                .unwrap(),
-                        }
-                    } else {
-                        std::fs::copy(entry.path(), &target).unwrap();
-                    }
-                }
-                crash_images.lock().push(image);
-            }));
-    }
-
-    let ks = db.ks("bulk");
-    for round in 0..ROUNDS {
-        for i in 0..NUM_KEYS {
-            db.insert(ks, key(i), vec![round; 128]).unwrap();
-        }
-        db.force_rebuild_control_region().unwrap();
-        let image = {
-            let mut crash_images = crash_images.lock();
-            assert_eq!(
-                crash_images.len(),
-                1,
-                "round {round}: one control-region rename"
-            );
-            crash_images.pop().unwrap()
-        };
-        let reopened = Db::open(&image, key_shape.clone(), config.clone(), Metrics::new()).unwrap();
-        let reopened_ks = reopened.ks("bulk");
-        for i in 0..NUM_KEYS {
-            assert_eq!(
-                reopened.get(reopened_ks, &key(i)).unwrap().as_deref(),
-                Some(&[round; 128][..]),
-                "round {round} key {i}: a crash after the control-region rename lost a value"
-            );
-        }
-    }
 }
 
 #[test]
@@ -4797,6 +4560,176 @@ fn test_compact_with_preserves_tombstones_shadowing_l1() {
     );
 }
 
+/// A key deleted and flushed into an L0 that sits above an L1 leaves a
+/// tombstone in that L0. When the cell is then loaded (here by the live
+/// iterator of a keyspace with the unloaded iterator disabled), the tombstone
+/// is lifted into the entry's `flat` with the `INVALID` sentinel offset. A
+/// later write to the key must land in the index: the stale-write check must
+/// not read the sentinel as a newer position and drop the write, which would
+/// lose the key for good once the next promote folds the tombstone into L1.
+///
+/// `remove_first` first deletes the key again on the loaded cell (a tombstone
+/// over the flat tombstone), `use_batch` re-inserts through `write_batch`
+/// instead of `insert`, and `hold_checkpoint` keeps a `Db::checkpoint` latch
+/// across the re-insert and the following flush, so that flush rewrites the
+/// as-of-frontier L0 (tombstone included) while the re-insert stays in the
+/// overlay.
+fn reinsert_after_loaded_disk_tombstone(
+    remove_first: bool,
+    use_batch: bool,
+    hold_checkpoint: bool,
+) {
+    let dir = tempdir::TempDir::new("test-reinsert-after-loaded-disk-tombstone").unwrap();
+    let config = Arc::new(Config::small());
+    // One cell. l0_max_entries=2: a flush of three keys promotes into L1,
+    // a flush of a lone tombstone writes an L0 above it.
+    let ks_config = KeySpaceConfig::new()
+        .with_l0_max_entries(2)
+        .with_unloaded_iterator(false);
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ks_config);
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+
+    let k = |n: u64| n.to_be_bytes().to_vec();
+    let v = |b: u8| -> Bytes { vec![b].into() };
+    let live = |db: &Arc<Db>| -> Vec<(Bytes, Bytes)> {
+        db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap()
+    };
+    let skipped = |op: &str| {
+        metrics
+            .skip_stale_update
+            .with_label_values(&["k", op])
+            .get()
+    };
+
+    // Phase 1: three keys, flushed. 3 > l0_max_entries promotes everything
+    // into L1; the cell ends as [INVALID, L1].
+    for n in 1..=3u64 {
+        db.insert(ks, k(n), v(n as u8)).unwrap();
+    }
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(
+            entry.levels().l0().is_none(),
+            "expected post-promote L0 to be INVALID"
+        );
+        assert!(
+            entry.levels().l1().is_some(),
+            "expected L1 to hold the blob"
+        );
+    });
+
+    // Phase 2: delete k1 and flush. A lone tombstone is under the threshold,
+    // so it is written as a new L0 above L1, tombstone preserved.
+    db.remove(ks, k(1)).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(
+            entry.levels().l0().is_some(),
+            "expected the tombstone L0 above L1"
+        );
+        assert!(entry.levels().l1().is_some(), "L1 must still be populated");
+    });
+    assert_eq!(None, db.get(ks, &k(1)).unwrap());
+
+    // Phase 3: a live iterator loads the cell; the L0 tombstone now sits in
+    // the entry's `flat`.
+    assert_eq!(live(&db), vec![(k(2).into(), v(2)), (k(3).into(), v(3))]);
+    db.large_table
+        .each_entry(|entry| assert!(entry.is_index_loaded(), "iterator must load the cell"));
+
+    let checkpoint = hold_checkpoint.then(|| db.checkpoint());
+
+    // Phase 4: write k1 on the loaded cell. Every write must be applied, not
+    // skipped as stale against the tombstone's sentinel offset.
+    if remove_first {
+        db.remove(ks, k(1)).unwrap();
+        assert_eq!(0, skipped("remove"), "remove was skipped as a stale update");
+        assert_eq!(None, db.get(ks, &k(1)).unwrap());
+    }
+    if use_batch {
+        let mut batch = db.write_batch();
+        batch.write(ks, k(1), v(11));
+        batch.commit().unwrap();
+    } else {
+        db.insert(ks, k(1), v(11)).unwrap();
+    }
+    // `get` promotes a committed batch op before reading, so the skip counter
+    // is final once it returns.
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    assert_eq!(
+        0,
+        skipped("insert"),
+        "re-insert was skipped as a stale update"
+    );
+    assert!(db.exists(ks, &k(1)).unwrap());
+    assert_eq!(
+        live(&db),
+        vec![
+            (k(1).into(), v(11)),
+            (k(2).into(), v(2)),
+            (k(3).into(), v(3)),
+        ]
+    );
+    if let Some(checkpoint) = &checkpoint {
+        assert_eq!(None, checkpoint.get(ks, &k(1)).unwrap());
+    }
+
+    // Phase 5: flush the loaded cell. With no latch held the new L0 carries
+    // the re-insert rather than the tombstone it shadows; with the latch held
+    // the flush rewrites the as-of-frontier L0 (tombstone included) and the
+    // re-insert stays in the overlay. Live and checkpoint reads must not
+    // change either way.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    if let Some(checkpoint) = checkpoint {
+        assert_eq!(None, checkpoint.get(ks, &k(1)).unwrap());
+        drop(checkpoint);
+        db.force_rebuild_control_region().unwrap();
+        assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    }
+
+    // Phase 6: push over the threshold so the next flush promotes into L1
+    // (the deepest level, where tombstones are stripped). k1 must survive.
+    db.insert(ks, k(4), v(4)).unwrap();
+    db.insert(ks, k(5), v(5)).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    db.large_table.each_entry(|entry| {
+        assert!(entry.levels().l0().is_none(), "expected a promote into L1");
+    });
+    assert_eq!(Some(v(11)), db.get(ks, &k(1)).unwrap());
+    assert_eq!(
+        live(&db),
+        vec![
+            (k(1).into(), v(11)),
+            (k(2).into(), v(2)),
+            (k(3).into(), v(3)),
+            (k(4).into(), v(4)),
+            (k(5).into(), v(5)),
+        ]
+    );
+    assert_eq!(0, skipped("insert"));
+    assert_eq!(0, skipped("remove"));
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone() {
+    reinsert_after_loaded_disk_tombstone(false, false, false);
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone_batch_after_remove() {
+    reinsert_after_loaded_disk_tombstone(true, true, false);
+}
+
+#[test]
+fn test_reinsert_after_loaded_disk_tombstone_checkpoint_held() {
+    reinsert_after_loaded_disk_tombstone(false, false, true);
+}
+
 #[test]
 fn test_auto_sharding_concurrent() {
     use parking_lot::Mutex;
@@ -5128,4 +5061,532 @@ fn test_auto_sharding_concurrent() {
          l1_shard_rewritten_total={resharding}",
     );
     reshard_db.wait_for_background_threads_to_finish();
+}
+
+/// A batch commit wakes only a pending-promotion thread that has already
+/// registered itself, and right after `Db::open` the first commit can beat
+/// that registration; the batch is then left to the flat-promotion job.
+fn wait_for_pending_promotion_threads(db: &Db) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while db
+        .pending_promotion_threads
+        .iter()
+        .any(|t| t.get().is_none())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending-promotion threads did not start"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A fresh cell's `last_processed` anchor must not sit above the tracker
+/// frontier, or a later flush that captures the real frontier makes the next
+/// snapshot's `replay_from` look like a regression to
+/// `ControlRegionStore::store`.
+///
+/// W1 (direct insert into the cell) is parked after its WAL allocation, so
+/// the tracker frontier cannot pass p1. A batch write into the same cell at
+/// p2 > p1 commits and is promoted first, which anchors the cell: the anchor
+/// must be clamped to the pinned frontier, which the first snapshot records.
+/// Filler batch writes then push the cell over `max_dirty_keys`; the
+/// resulting flush captures that same frontier and completion sets
+/// `last_processed` to it, so the second snapshot records the same position.
+/// Without the clamp the first snapshot records p2 and the second regresses,
+/// which `ControlRegionStore::store` turns into a panic.
+#[test]
+fn test_snapshot_survives_empty_cell_anchor_above_frontier() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test-snapshot-anchor-above-frontier").unwrap();
+    // `Config::small` flushes at 32 dirty keys, and its snapshot threshold
+    // saturates to 0, so a snapshot flushes only a cell anchored at 0.
+    let config = Arc::new(Config::small());
+    let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.single_ks();
+    let key = |n: u64| n.to_be_bytes().to_vec();
+    let value: Bytes = vec![1u8].into();
+
+    // Put the first WAL frames into the cell and drop it again, so W1's
+    // offset p1, and the frontier its guard pins, sit above the WAL start:
+    // at 0 the clamped anchor would be indistinguishable from an unanchored
+    // cell and the first snapshot would flush the cell on its own.
+    db.insert(ks, key(7), value.clone()).unwrap();
+    let (cell_first, cell_last) = db
+        .key_shape
+        .ks(ks)
+        .cell_range(&crate::cell::CellId::Integer(0));
+    db.drop_cells_in_range(ks, &cell_first, &cell_last).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+
+    // Park W1 after its WAL allocation: the frontier stays at p1.
+    let (insert_latch, insert_guard) = Latch::new();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    db.large_table.fp.0.write().fp_insert_before_lock =
+        FailPoint::latch_counting(insert_latch, arrivals.clone());
+    let w1 = {
+        let db = db.clone();
+        let value = value.clone();
+        thread::spawn(move || db.insert(ks, key(42), value).unwrap())
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while arrivals.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "W1 did not reach the failpoint");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // A batch write into the same cell commits and is promoted: the Empty cell
+    // anchors last_processed while the frontier is pinned below p2.
+    let mut batch = db.write_batch();
+    batch.write(ks, key(43), value.clone());
+    batch.commit().unwrap();
+    assert_eq!(Some(value.clone()), db.get(ks, &key(43)).unwrap());
+
+    let pinned = db.wal_writer.last_processed().as_u64();
+    assert!(pinned > 0, "W1 must pin the frontier above the WAL start");
+    let first = db.rebuild_control_region().unwrap();
+    assert_eq!(
+        first, pinned,
+        "the first snapshot must clamp the anchor to the frontier W1 pins"
+    );
+
+    // Push the cell over max_dirty_keys with batch writes (they bypass the
+    // parked failpoint); the promotion thread requests the flush, which
+    // captures the pinned frontier.
+    let flushes_before = metrics.unload.with_label_values(&["flush"]).get();
+    wait_for_pending_promotion_threads(&db);
+    let mut batch = db.write_batch();
+    for n in 100..140u64 {
+        batch.write(ks, key(n), value.clone());
+    }
+    batch.commit().unwrap();
+    while metrics.unload.with_label_values(&["flush"]).get() == flushes_before {
+        assert!(Instant::now() < deadline, "the cell was not flushed");
+        thread::sleep(Duration::from_millis(1));
+    }
+    db.large_table.flusher.barrier();
+
+    let second = db.rebuild_control_region().unwrap();
+    assert_eq!(
+        second, first,
+        "the flush must have captured the frontier the first anchor was clamped to"
+    );
+
+    drop(insert_guard);
+    w1.join().unwrap();
+}
+
+/// A batch's ops are promoted in whatever order their keys come up, and a
+/// direct write promotes only its own key. Here a direct write to `b`
+/// promotes `b@p2` alone, which anchors the fresh cell; `a@p1` (p1 < p2, same
+/// batch) is promoted by the snapshot itself. The snapshot's `replay_from`
+/// must still cover `a`: the cell has no blob, so after a crash `a` survives
+/// only through replay.
+#[test]
+fn test_snapshot_covers_batch_op_promoted_after_its_sibling() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test-snapshot-batch-op-after-sibling").unwrap();
+    let config = Arc::new(Config::small());
+    let key_shape = KeyShape::new_single(8, 16, KeyType::uniform(16));
+    let key = |n: u64| n.to_be_bytes().to_vec();
+    let value_a: Bytes = vec![1u8].into();
+    let value_b: Bytes = vec![2u8].into();
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            Metrics::new(),
+        )
+        .unwrap();
+        let ks = db.single_ks();
+
+        // Park the pending-promotion thread, which the commit wakes to
+        // promote the whole batch. It parks before taking any row lock and
+        // holds a strong reference to the Db while parked.
+        let (promote_latch, promote_guard) = Latch::new();
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        db.large_table.fp.0.write().fp_promote_dirty_pending =
+            FailPoint::latch_counting(promote_latch, arrivals.clone());
+        wait_for_pending_promotion_threads(&db);
+
+        let mut batch = db.write_batch();
+        batch.write(ks, key(1), value_a.clone());
+        batch.write(ks, key(2), value_b.clone());
+        batch.commit().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the promotion thread did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Let the frontier pass both ops, so the anchor comes from the op
+        // itself rather than from a frontier still pinned below it.
+        db.wal_writer.wal_tracker_barrier();
+        // Promotes `b@p2` alone (`promote_pending_for`), then applies the
+        // direct write above it.
+        db.insert(ks, key(2), value_b.clone()).unwrap();
+        let replay_from = db.rebuild_control_region().unwrap();
+        assert!(replay_from > 0, "the cell must have anchored replay_from");
+
+        drop(promote_guard);
+        db.wait_for_background_threads_to_finish();
+    }
+    // Crash and reopen: `a` is in no blob and must be replayed.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(Some(value_a), db.get(ks, &key(1)).unwrap());
+    assert_eq!(Some(value_b), db.get(ks, &key(2)).unwrap());
+}
+
+/// An iterator step on a key space with `with_unloaded_iterator(false)`
+/// reaches a cell whose async flush is parked before its completion. The step
+/// must walk the cell unloaded instead of loading it: a load would fold the L0
+/// blob the flush is replacing under the overlay and replace the `data` Arc,
+/// so the completion would take the `unmerge_flushed` path, which removes the
+/// flushed overlay positions and nothing else, and the old L0 copy of the key
+/// would shadow the new blob on reads and be written over it by the next
+/// flush. Finding F6 of the TLA+ model of the cell protocol.
+#[test]
+fn test_iterator_step_during_flush_keeps_flushed_value() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempdir::TempDir::new("test-iter-load-during-flush").unwrap();
+    let mut config = Config::small();
+    config.snapshot_unload_threshold = 0;
+    let config = Arc::new(config);
+    let ks_config = KeySpaceConfig::new().with_unloaded_iterator(false);
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ks_config);
+    let key_shape = ksb.build();
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+
+    let key = 42u64.to_be_bytes().to_vec();
+    let v1: Bytes = vec![1u8].into();
+    let v2: Bytes = vec![2u8].into();
+
+    // v1 lands in an on-disk L0 and the cell unloads.
+    db.insert(ks, key.clone(), v1.clone()).unwrap();
+    db.force_rebuild_control_region().unwrap();
+    // v2 makes the cell DirtyUnloaded; wait until it is processed so the
+    // flush below writes it.
+    db.insert(ks, key.clone(), v2.clone()).unwrap();
+    db.wal_writer.wal_tracker_barrier();
+    let clears_before = metrics.flush_update.with_label_values(&["clear"]).get();
+
+    // Park the flush after its work, before its completion, and wait until
+    // the flusher is parked there. The latch releases when its guard drops,
+    // including on a panicking assertion.
+    let (completion_latch, completion_latch_guard) = Latch::new();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    db.large_table.fp.0.write().fp_flush_before_completion =
+        FailPoint::latch_counting(completion_latch, arrivals.clone());
+    let db2 = db.clone();
+    let rebuild = thread::spawn(move || db2.rebuild_control_region().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while arrivals.load(Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the flusher did not reach the completion failpoint before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // The iterator step walks the cell unloaded: the overlay (v2) over the
+    // on-disk L0 (v1).
+    let scanned: Vec<(Bytes, Bytes)> = db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap();
+    assert_eq!(scanned, vec![(key.clone().into(), v2.clone())]);
+    db.large_table.each_entry(|entry| {
+        assert!(
+            !entry.is_index_loaded(),
+            "an iterator step must not load a cell whose flush is in flight"
+        )
+    });
+
+    drop(completion_latch_guard);
+    let _: u64 = rebuild.join().unwrap();
+    assert_eq!(
+        0,
+        metrics.flush_update.with_label_values(&["unmerge"]).get(),
+        "the completion must find the snapshot it took and not unmerge"
+    );
+    assert_eq!(
+        clears_before + 1,
+        metrics.flush_update.with_label_values(&["clear"]).get(),
+        "the completion must find the snapshot it took and clear the overlay"
+    );
+
+    assert_eq!(
+        Some(v2.clone()),
+        db.get(ks, &key).unwrap(),
+        "live read right after the flush completion"
+    );
+    // With no flush in flight the step loads the cell as usual.
+    let scanned: Vec<(Bytes, Bytes)> = db.iterator(ks).collect::<DbResult<Vec<_>>>().unwrap();
+    assert_eq!(scanned, vec![(key.clone().into(), v2.clone())]);
+    let loaded = std::cell::Cell::new(false);
+    db.large_table.each_entry(|entry| {
+        if entry.is_index_loaded() {
+            loaded.set(true);
+        }
+    });
+    assert!(loaded.get(), "the step after the completion loads the cell");
+    // A rebuild must leave v2 in place: a cell left DirtyUnloaded with the
+    // old L0's entries in its overlay would flush them over the new blob.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(
+        Some(v2),
+        db.get(ks, &key).unwrap(),
+        "live read after the next flush"
+    );
+}
+
+/// The snapshot walk visits ks1's only cell while it is still empty, so the cell
+/// contributes nothing to replay_from. Its first write lands right after the
+/// visit and is processed by the tracker; ks2's first write then anchors its
+/// last_processed above that position, and the walk reaches ks2. Only the
+/// frontier read before the walk keeps replay_from at or below ks1's write;
+/// the stored control region holds ks1 as empty, so the restart must replay it.
+#[test]
+fn test_first_write_to_empty_cell_during_snapshot_survives_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempdir::TempDir::new("test-empty-cell-snapshot").unwrap();
+    let config = Arc::new(Config::small());
+    // One row per key space, ks1 walked first: the walk parks exactly once
+    // between ks1's row and ks2's.
+    let mut builder = KeyShapeBuilder::new();
+    builder.add_key_space("ks1", 8, 1, KeyType::uniform(1));
+    builder.add_key_space("ks2", 8, 1, KeyType::uniform(1));
+    let key_shape = builder.build();
+    let k1 = 1u64.to_be_bytes().to_vec();
+    let k2 = 2u64.to_be_bytes().to_vec();
+    {
+        let db = Arc::new(
+            Db::open(
+                dir.path(),
+                key_shape.clone(),
+                config.clone(),
+                Metrics::new(),
+            )
+            .unwrap(),
+        );
+        let ks1 = db.ks("ks1");
+        let ks2 = db.ks("ks2");
+
+        // Both failpoints are installed before anyone can park on them: a parked
+        // thread holds the failpoint read lock.
+        let (insert_latch, insert_guard) = Latch::new();
+        let insert_arrivals = Arc::new(AtomicUsize::new(0));
+        let (walk_latch, walk_guard) = Latch::new();
+        let walk_arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let mut fp = db.large_table.fp.0.write();
+            fp.fp_insert_before_lock =
+                FailPoint::latch_counting(insert_latch, insert_arrivals.clone());
+            fp.fp_snapshot_after_row = FailPoint::latch_counting(walk_latch, walk_arrivals.clone());
+        }
+
+        // ks1's first write: in the WAL, parked before it takes the row lock.
+        let tail_before_write = db.wal_writer.position();
+        let writer = {
+            let db = db.clone();
+            let k1 = k1.clone();
+            thread::spawn(move || db.insert(ks1, k1, vec![1]).unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while insert_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ks1's write did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The periodic rebuild: its snapshot walk visits ks1 (empty) and parks
+        // after releasing ks1's row, before ks2.
+        let rebuild = {
+            let db = db.clone();
+            thread::spawn(move || db.rebuild_control_region().unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while walk_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the snapshot walk did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // ks1's write lands and is processed by the tracker; ks2's first write
+        // anchors its last_processed above it.
+        drop(insert_guard);
+        writer.join().unwrap();
+        db.wal_writer.wal_tracker_barrier();
+        db.insert(ks2, k2.clone(), vec![2]).unwrap();
+
+        // The walk continues to ks2 and the control region is stored with a
+        // replay_from at or below ks1's write.
+        drop(walk_guard);
+        let replay_from = rebuild.join().unwrap();
+        assert_eq!(
+            2,
+            walk_arrivals.load(Ordering::SeqCst),
+            "the walk parks once per row"
+        );
+        assert!(
+            replay_from <= tail_before_write,
+            "replay_from {replay_from} is above the WAL tail {tail_before_write} from before ks1's write"
+        );
+        assert_eq!(Some(vec![1].into()), db.get(ks1, &k1).unwrap());
+        assert_eq!(Some(vec![2].into()), db.get(ks2, &k2).unwrap());
+        // The next store must not regress (the store asserts it too).
+        let next_replay_from = db.rebuild_control_region().unwrap();
+        assert!(
+            next_replay_from >= replay_from,
+            "replay_from regressed from {replay_from} to {next_replay_from}"
+        );
+    }
+    // Restart from the stored control region.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks1 = db.ks("ks1");
+    let ks2 = db.ks("ks2");
+    assert_eq!(Some(vec![2].into()), db.get(ks2, &k2).unwrap());
+    assert_eq!(
+        Some(vec![1].into()),
+        db.get(ks1, &k1).unwrap(),
+        "ks1's first write was lost by the restart"
+    );
+}
+
+/// `drop_cells_in_range` keeps the DropCells frame's WAL guard until every
+/// cell in the range is cleared, so the WAL frontier stays at or below the
+/// frame while the cells still hold their data. Here the periodic rebuild
+/// flushes the cell and stores a control region while the drop is parked
+/// between its frame and the clear: the stored replay_from is at or below the
+/// frame, so a restart replays the drop over the cell's stored blob.
+#[test]
+fn test_drop_during_snapshot_survives_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempdir::TempDir::new("test-drop-during-snapshot").unwrap();
+    let mut config = Config::small();
+    // Pass 1 of the rebuild flushes every dirty cell.
+    config.snapshot_unload_threshold = 0;
+    let config = Arc::new(config);
+    let key_shape = KeyShape::new_single(8, 1, KeyType::uniform(1));
+    let k = 1u64.to_be_bytes().to_vec();
+    {
+        let db = Arc::new(
+            Db::open(
+                dir.path(),
+                key_shape.clone(),
+                config.clone(),
+                Metrics::new(),
+            )
+            .unwrap(),
+        );
+        let ks = db.single_ks();
+        let (first_key, last_key) = db
+            .key_shape
+            .ks(ks)
+            .cell_range(&crate::cell::CellId::Integer(0));
+        db.insert(ks, k.clone(), vec![1]).unwrap();
+        db.wal_writer.wal_tracker_barrier();
+
+        // Both failpoints are installed before anyone can park on one: a parked
+        // thread holds the failpoint read lock.
+        let (drop_latch, drop_guard) = Latch::new();
+        let drop_arrivals = Arc::new(AtomicUsize::new(0));
+        let (flush_latch, flush_guard) = Latch::new();
+        let flush_arrivals = Arc::new(AtomicUsize::new(0));
+        {
+            let mut fp = db.large_table.fp.0.write();
+            fp.fp_drop_cells_before_lock =
+                FailPoint::latch_counting(drop_latch, drop_arrivals.clone());
+            fp.fp_flush_before_completion =
+                FailPoint::latch_counting(flush_latch, flush_arrivals.clone());
+        }
+
+        // The drop: its DropCells frame is in the WAL at `drop_frame` with its
+        // guard held; it parks before locking the cell.
+        let drop_frame = db.wal_writer.position();
+        let dropper = {
+            let db = db.clone();
+            thread::spawn(move || db.drop_cells_in_range(ks, &first_key, &last_key).unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while drop_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drop did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The periodic rebuild: pass 1 flushes the dirty cell; the flusher parks
+        // before completion, so the rebuild waits at its barrier.
+        let rebuild = {
+            let db = db.clone();
+            thread::spawn(move || db.rebuild_control_region().unwrap())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while flush_arrivals.load(Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flush did not reach the failpoint"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let frontier = db.wal_writer.last_processed().as_u64();
+        assert!(
+            frontier <= drop_frame,
+            "the frontier {frontier} passed the DropCells frame at {drop_frame} while the drop holds its guard"
+        );
+
+        // The flush completes and the rebuild stores a control region holding
+        // the cell's blob.
+        drop(flush_guard);
+        let replay_from = rebuild.join().unwrap();
+        assert_eq!(
+            1,
+            flush_arrivals.load(Ordering::SeqCst),
+            "pass 2 of the rebuild queues no flush"
+        );
+        assert!(
+            replay_from <= drop_frame,
+            "replay_from {replay_from} is above the DropCells frame at {drop_frame}"
+        );
+
+        // The drop clears the cell and releases its guard, so the frontier
+        // passes the frame.
+        drop(drop_guard);
+        dropper.join().unwrap();
+        assert_eq!(None, db.get(ks, &k).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while db.wal_writer.last_processed().as_u64() <= drop_frame {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frontier is still at or below the DropCells frame at {drop_frame} after the drop: its guard leaked"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    // Restart from the stored control region.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    let ks = db.single_ks();
+    assert_eq!(
+        None,
+        db.get(ks, &k).unwrap(),
+        "the dropped cell came back after the restart"
+    );
 }
