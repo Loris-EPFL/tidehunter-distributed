@@ -1375,3 +1375,171 @@ fn io_counter_deltas_do_not_recount_prior_completions() {
     assert_eq!((counts.cq_ns, counts.cq_samples), (9, 1));
     assert_eq!(counts.recovery_read_ops, 0);
 }
+
+/// Two `File` grants of one subsystem (files 0 and 1 of 1024) opened through
+/// one pooled controller lease, as a lane holds them after reading both files.
+fn pooled_file_grants() -> (
+    Lane,
+    Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>,
+) {
+    use crate::distributed::nvmeof::NvmeofTransport;
+    use crate::distributed::nvmeof::live_connect::LiveConnectionRegistry;
+    use crate::distributed::nvmeof::live_pool::LiveControllerPool;
+    use crate::distributed::nvmeof::live_storage::LiveTargetBinding;
+    let mut lane = lane(4);
+    lane.cache.grants.clear();
+    let pool = Arc::new(
+        LiveControllerPool::new(
+            LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+            8,
+            4,
+        )
+        .unwrap(),
+    );
+    lane.client.set_live_pool(pool.clone());
+    // The file acquisition creates the lease, so the pool entry carries the
+    // retirement routing (`identity.file`) the owner's eviction matches on.
+    lane.client.live_write_local_fixture = true;
+    let config = lane.client.live_config.clone().unwrap();
+    let partition = lane.client.expected.partition;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for (file, nsid) in [(0u64, 1u32), (1, 2)] {
+        let binding = LiveTargetBinding {
+            nqn: "nqn.2026-01.test:wal".into(),
+            uuid: [u8::try_from(nsid).unwrap(); 16],
+            nsid,
+            bytes: 8192,
+            block_size: 4096,
+            address: "127.0.0.1".into(),
+            service: 4420,
+            transport: NvmeofTransport::Tcp,
+            readonly: true,
+            permanent: false,
+        };
+        let location = LiveRecordLocation {
+            member: if file == 0 {
+                lane.a.address
+            } else {
+                lane.b.address
+            },
+            offset: 0,
+            len: 0,
+            segment: LiveWalSegment {
+                database: [51; 16],
+                partition,
+                epoch: 1,
+                generation: 1,
+                file_index: file,
+                path: lane._dir.path().join(format!("wal-{file}")),
+                bytes: 8192,
+                device: 0,
+                inode: 0,
+                block_size: 4096,
+            },
+            binding: binding.clone(),
+        };
+        let target = LiveConnectTarget {
+            nqn: binding.nqn,
+            uuid: binding.uuid,
+            nsid: binding.nsid,
+            bytes: binding.bytes,
+            block_size: binding.block_size,
+            address: binding.address,
+            service: binding.service,
+            transport: binding.transport,
+            geometry: config.queue_geometry,
+        };
+        // No owner pin token: the pin exchange is orthogonal to whether the
+        // cached grants release the shared subsystem lease.
+        let Ok(grant) = LiveReadCache::connect_scope(
+            &lane.client,
+            1,
+            target,
+            GrantScope::File(location),
+            None,
+            file + 1,
+            LiveNamespaceAccess::ReadOnly,
+            deadline,
+            false,
+        ) else {
+            panic!("file grant {file} setup failed");
+        };
+        lane.cache.grants.push(grant);
+    }
+    (lane, pool)
+}
+
+/// An idle cached grant of sibling file B keeps the shared subsystem lease
+/// live, so retiring file A must release B's grant too. Otherwise the pooled
+/// controller of one subsystem can never be evicted while B stays cached.
+#[test]
+fn idle_sibling_grant_of_the_victim_subsystem_does_not_defer_retirement() {
+    use crate::distributed::tcp::checkpoint::RetirementResult;
+    let (mut lane, pool) = pooled_file_grants();
+    let partition = lane.client.expected.partition;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert_eq!(
+        pool.evict_files(partition, 1, 8192, &[0], deadline)
+            .unwrap(),
+        RetirementResult::Busy,
+        "both idle grants still pin the shared subsystem lease"
+    );
+    lane.cache
+        .evict_retirement_files(&mut lane.client, 1, 1, &[0])
+        .unwrap();
+    let ids: Vec<u64> = lane.cache.grants.iter().map(|grant| grant.id).collect();
+    assert!(
+        ids.is_empty(),
+        "an idle cached grant of sibling file 1 must not defer retiring file 0: {ids:?}"
+    );
+    assert_eq!(
+        pool.evict_files(partition, 1, 8192, &[0], deadline)
+            .unwrap(),
+        RetirementResult::Completed,
+        "retirement completes once the idle subsystem grants are released"
+    );
+}
+
+/// An in-flight read of the victim file still pins its namespace, so the
+/// pooled controller stays busy until that read drains.
+#[test]
+fn in_flight_victim_read_still_defers_retirement() {
+    use crate::distributed::tcp::checkpoint::RetirementResult;
+    let (mut lane, pool) = pooled_file_grants();
+    let partition = lane.client.expected.partition;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    lane.cache.grants[0]
+        .io
+        .submit_reads(99, &[(0, 1)], Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        lane.cache.grants[0].outstanding(),
+        1,
+        "the victim read is in flight"
+    );
+    lane.cache
+        .evict_retirement_files(&mut lane.client, 1, 1, &[0])
+        .unwrap();
+    let ids: Vec<u64> = lane.cache.grants.iter().map(|grant| grant.id).collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "only the in-flight victim grant keeps the subsystem: {ids:?}"
+    );
+    assert_eq!(
+        pool.evict_files(partition, 1, 8192, &[0], deadline)
+            .unwrap(),
+        RetirementResult::Busy,
+        "an in-flight read of the victim still defers the retirement"
+    );
+    // The read drains: retirement then completes on the next pass.
+    lane.cache
+        .fail_grant(&lane.client, 0, &TcpError::new("test drain"));
+    lane.cache.retire_broken(&mut lane.client, 1);
+    assert_eq!(
+        pool.evict_files(partition, 1, 8192, &[0], deadline)
+            .unwrap(),
+        RetirementResult::Completed,
+        "retirement completes once the victim read is drained"
+    );
+}

@@ -372,6 +372,34 @@ impl GrantScope {
             }
         }
     }
+    /// Whether retiring `generation`'s `files` reaches this grant. A pooled
+    /// controller serves every namespace of one subsystem, so a grant of a
+    /// victim file's subsystem must be released too: an idle sibling would
+    /// otherwise keep the subsystem lease live and defer the retirement.
+    fn covers_retirement(&self, generation: u64, files: &[u64]) -> bool {
+        let subsystem_of = |file: u64, files_per_subsystem: u64| file / files_per_subsystem;
+        match self {
+            Self::File(location) => {
+                location.segment.generation == generation
+                    && files.iter().any(|&start| {
+                        subsystem_of(start / location.segment.bytes, FILES_PER_SUBSYSTEM)
+                            == subsystem_of(location.segment.file_index, FILES_PER_SUBSYSTEM)
+                    })
+            }
+            Self::Subsystem {
+                generation: source,
+                subsystem,
+                files_per_subsystem,
+                file_bytes,
+                ..
+            } => {
+                *source == generation
+                    && files.iter().any(|&start| {
+                        subsystem_of(start / file_bytes, *files_per_subsystem) == *subsystem
+                    })
+            }
+        }
+    }
     fn slot(&self, position: &VersionPosition) -> Option<NamespaceSlot> {
         match self {
             Self::File(_) => None,
@@ -807,8 +835,11 @@ impl LiveReadCache {
         self.release_pending(client, epoch)
     }
 
-    /// Retire idle grants covering the requested files. In-flight grants keep
-    /// their pins and the owner can defer the retirement with `Busy`.
+    /// Retire idle grants of the retired files' subsystems. A pooled
+    /// controller serves every namespace of one subsystem, so an idle cached
+    /// grant of a sibling file would otherwise keep the subsystem lease live
+    /// and defer the retirement indefinitely. In-flight grants keep their pins
+    /// and the owner can defer the retirement with `Busy`.
     pub(crate) fn evict_retirement_files(
         &mut self,
         client: &mut Client,
@@ -819,27 +850,7 @@ impl LiveReadCache {
         let mut index = 0;
         while index < self.grants.len() {
             let grant = &self.grants[index];
-            let matches = match &grant.scope {
-                GrantScope::File(location) => {
-                    location.segment.generation == generation
-                        && files.iter().any(|&start| {
-                            start / location.segment.bytes == location.segment.file_index
-                        })
-                }
-                GrantScope::Subsystem {
-                    generation: source,
-                    subsystem,
-                    files_per_subsystem,
-                    file_bytes,
-                    ..
-                } => {
-                    *source == generation
-                        && files
-                            .iter()
-                            .any(|&start| start / file_bytes / files_per_subsystem == *subsystem)
-                }
-            };
-            if matches && grant.outstanding() == 0 {
+            if grant.scope.covers_retirement(generation, files) && grant.outstanding() == 0 {
                 self.retire(client, epoch, index)?;
             } else {
                 index += 1;
