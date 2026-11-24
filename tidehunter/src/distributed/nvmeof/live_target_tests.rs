@@ -931,3 +931,31 @@ fn crash_before_tombstone_release_is_durable_repeats_retirement() {
     assert!(reopened.sealed_file(&f.file.path).unwrap().is_none());
     reopened.shutdown().unwrap();
 }
+
+/// A file whose inventory witness is durable was preallocated before any byte
+/// was granted, so a restart must refuse it at any other length even when no
+/// durable end record survives (a Native leased acknowledgement releases on its
+/// target completion, before the owner's persistence barrier). An unwitnessed
+/// empty successor was never granted any byte and stays legal.
+#[test]
+fn a_witnessed_wal_file_must_keep_its_preallocated_size() {
+    let temp = tempdir::TempDir::new("witnessed-wal-geometry").unwrap();
+    let epoch = temp.path().join("epoch_0000000000000001");
+    fs::create_dir(&epoch).unwrap();
+    let first = epoch.join("wal_0000000000000000");
+    let successor = epoch.join("wal_0000000000000001");
+    fs::write(&first, []).unwrap();
+    fs::write(&successor, []).unwrap();
+    super::verify_live_epoch_sizes(&epoch, 4096, None, &[])
+        .expect("an unwitnessed empty successor is legal");
+    let error = super::verify_live_epoch_sizes(&epoch, 4096, None, &[0])
+        .expect_err("a witnessed file below its preallocated size is truncated");
+    assert!(
+        error
+            .to_string()
+            .contains("WAL backing file identity, size or allocation changed"),
+        "{error}"
+    );
+    fs::write(&first, [0u8; 4096]).unwrap();
+    super::verify_live_epoch_sizes(&epoch, 4096, None, &[0]).expect("the witnessed size is intact");
+}

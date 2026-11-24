@@ -223,6 +223,34 @@ fn syncer_defers_live_root_and_recovers_by_scan() {
     }
 }
 
+/// A fail-stopped live stream has no position proof, so the durable frontier
+/// its acknowledgements installed is the witness a restart compares a
+/// truncated WAL against. Only the frontier covers the acknowledged end here.
+#[test]
+fn live_synced_end_includes_the_durable_frontier() {
+    let temp = tempdir::TempDir::new("live-synced-frontier").unwrap();
+    let config = live_config();
+    let path = temp.path().join("stream");
+    let log = PartitionLog::create_live(&path, config.clone(), &shape(), metrics()).unwrap();
+    let acknowledged = append_live_fixture(&log, &config, 0);
+    log.persist_through(acknowledged).unwrap();
+    let frontier = live_root_end(&path);
+    assert_eq!(
+        frontier, 4096,
+        "the barrier installed the durable frontier before the receipt"
+    );
+    let root_end = WalRoot::open(&path, &config).unwrap().synced_end;
+    assert!(
+        root_end < frontier,
+        "no position proof ran, so the WAL root must lag the frontier: {root_end} >= {frontier}"
+    );
+    assert_eq!(
+        PartitionLog::live_synced_end(&path, &config).unwrap(),
+        Some(frontier),
+        "the acknowledged end is the pre-restart witness without a position proof"
+    );
+}
+
 /// Crash at every step of the explicit root catch-up after a deferral: the
 /// failed barrier reports an unknown outcome, and recovery still finds every
 /// synced frame whichever root (old or new) survived.

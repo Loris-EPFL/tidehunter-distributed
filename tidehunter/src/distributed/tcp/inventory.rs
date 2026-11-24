@@ -575,10 +575,21 @@ impl NodeInventory {
                     let expected = partition_at(&config.partition, epoch.epoch);
                     let synced = PartitionLog::live_synced_end(&path, &expected)
                         .map_err(TcpError::component)?;
+                    // A file whose durable inventory witness exists was
+                    // preallocated before any byte was granted; an active epoch
+                    // must still show that size, whatever the durable end
+                    // records. A sealed epoch trims its files.
+                    let witnessed = if epoch.state == EpochState::Active {
+                        super::super::storage::file_inventory::witnessed_files(&path)
+                            .map_err(TcpError::component)?
+                    } else {
+                        Vec::new()
+                    };
                     super::super::nvmeof::live_target::verify_live_epoch_sizes(
                         &path,
                         expected.wal_file_bytes,
                         synced,
+                        &witnessed,
                     )
                     .map_err(TcpError::component)?;
                 }

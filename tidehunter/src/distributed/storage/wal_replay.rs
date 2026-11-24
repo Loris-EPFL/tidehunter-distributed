@@ -82,6 +82,37 @@ const ROOT_FORMAT: u32 = 2;
 const MEMBER_MISMATCH: &str = "WAL member differs from the reference";
 pub(super) const FRAME_BOUNDARY: &str = "replay position is not a frame boundary";
 
+/// The durable live frontier of this stream, validated the one way recovery
+/// reads it: the record must name this stream and its tail must lie inside the
+/// end. Stream creation installs the frontier before its live registration, so
+/// a registered live stream always has one; a missing record is an error, never
+/// a zero end. A restart uses the same reader as its pre-scan witness, so both
+/// agree on the durable end.
+pub(super) fn read_live_frontier(
+    path: &Path,
+    config: &PartitionConfig,
+) -> Result<LiveFrontier, StorageError> {
+    let path = path.join(LIVE_FRONTIER);
+    let frontier: LiveFrontier = read_metadata(&path)?;
+    let identity = LiveFrontier::new(config);
+    if frontier.database != identity.database
+        || frontier.partition != identity.partition
+        || frontier.epoch != identity.epoch
+        || frontier.generation != identity.generation
+        || (frontier.end == 0) != frontier.tail.is_none()
+        || !frontier.end.is_multiple_of(4096)
+        || frontier.tail.as_ref().is_some_and(|tail| {
+            !tail.offset.is_multiple_of(4096)
+                || tail.offset >= frontier.end
+                || tail.id.database != identity.database
+                || tail.version.epoch != identity.epoch
+        })
+    {
+        return Err(StorageError::Invalid("invalid live durable frontier"));
+    }
+    Ok(frontier)
+}
+
 /// Fragment-aligned start of a replay of `offset`.
 ///
 /// A stored stream front is fragment aligned, and an aligned offset is always a
@@ -907,24 +938,7 @@ impl PartitionLog {
             .last_key_value()
             .map_or(root.scan_from, |(offset, len)| offset + len);
         let frontier = if live {
-            let frontier: LiveFrontier = read_metadata(&path.join(LIVE_FRONTIER))?;
-            let identity = LiveFrontier::new(expected);
-            if frontier.database != identity.database
-                || frontier.partition != identity.partition
-                || frontier.epoch != identity.epoch
-                || frontier.generation != identity.generation
-                || (frontier.end == 0) != frontier.tail.is_none()
-                || !frontier.end.is_multiple_of(4096)
-                || frontier.tail.as_ref().is_some_and(|tail| {
-                    !tail.offset.is_multiple_of(4096)
-                        || tail.offset >= frontier.end
-                        || tail.id.database != identity.database
-                        || tail.version.epoch != identity.epoch
-                })
-            {
-                return Err(StorageError::Invalid("invalid live durable frontier"));
-            }
-            Some(frontier)
+            Some(read_live_frontier(&path, expected)?)
         } else {
             None
         };

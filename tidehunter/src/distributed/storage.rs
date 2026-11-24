@@ -927,16 +927,24 @@ impl PartitionLog {
         Ok(log)
     }
 
-    /// Durable end of this live stream's WAL root, the witness a restart
-    /// checks before any frame scan. `None` when the root is absent.
+    /// Durable end recorded for this live stream, the witness a restart checks
+    /// before any frame scan. A registered live stream always has its durable
+    /// frontier (creation installs it before the live registration); only a
+    /// position proof advances the WAL root, so the frontier is the end a
+    /// fail-stop without a checkpoint leaves behind. The larger of the two
+    /// covers every acknowledged byte.
     pub(crate) fn live_synced_end(
         path: &Path,
         config: &PartitionConfig,
     ) -> Result<Option<u64>, StorageError> {
-        if !path.join(wal_replay::ROOT).exists() {
-            return Ok(None);
-        }
-        Ok(Some(wal_replay::WalRoot::open(path, config)?.synced_end))
+        let root = path.join(wal_replay::ROOT);
+        let root_end = if root.exists() {
+            Some(wal_replay::WalRoot::open(path, config)?.synced_end)
+        } else {
+            None
+        };
+        let frontier_end = wal_replay::read_live_frontier(path, config)?.end;
+        Ok(Some(root_end.unwrap_or(0).max(frontier_end)))
     }
 
     /// The callback must synchronously revoke and drain all writable targets

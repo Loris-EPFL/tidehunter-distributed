@@ -45,6 +45,27 @@ fn parse(name: &str) -> Result<Option<u64>, StorageError> {
     })?))
 }
 
+pub(crate) fn witnessed_files(path: &Path) -> Result<Vec<u64>, StorageError> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or(StorageError::Invalid("non-UTF8 witness filename"))?;
+        let authority_name = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".pending"))
+            .unwrap_or(name);
+        if let Some(file) = parse(authority_name)? {
+            files.push(file);
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    Ok(files)
+}
+
 pub(super) fn persist(
     path: &Path,
     config: &PartitionConfig,

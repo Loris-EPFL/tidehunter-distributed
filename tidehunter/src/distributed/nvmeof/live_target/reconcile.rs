@@ -1,15 +1,19 @@
 //! Recovery scan of one owner's configfs scope.
 use super::*;
 
-/// Refuse a live WAL file longer than a WAL file may be, or shorter than the
-/// durable end requires, before the target open seals it. A sealed marker
-/// written from such a file would launder the truncation into an identity
-/// that later matches itself. The durable root is the pre-restart witness;
-/// frames still missing below it are caught by the recovery scan.
+/// Refuse a live WAL file longer than a WAL file may be, shorter than the
+/// durable end requires, or shorter than the preallocated size its own durable
+/// inventory witness proved before any byte was granted. A sealed marker
+/// written from such a file would launder the truncation into an identity that
+/// later matches itself. The durable end and the per-file witnesses are the
+/// pre-restart evidence; frames still missing below them are caught by the
+/// recovery scan. An unwitnessed file is an unallocated successor: it may be
+/// empty because no byte was ever granted in it.
 pub(crate) fn verify_live_epoch_sizes(
     directory: &Path,
     file_bytes: u64,
     synced_end: Option<u64>,
+    witnessed: &[u64],
 ) -> io::Result<()> {
     let entries =
         fs::read_dir(directory).map_err(|error| path_error("list live epoch", directory, error))?;
@@ -34,7 +38,12 @@ pub(crate) fn verify_live_epoch_sizes(
                     .map(|end| (end - start).min(file_bytes))
             })
             .unwrap_or(0);
-        if !meta.is_file() || meta.len() > file_bytes || meta.len() < required {
+        // The witness is durable before the first grant, and the file is then
+        // preallocated to exactly one WAL file size; any other length means
+        // bytes below the acknowledged grant were cut.
+        let witnessed_short =
+            index.is_some_and(|index| witnessed.contains(&index) && meta.len() != file_bytes);
+        if !meta.is_file() || meta.len() > file_bytes || meta.len() < required || witnessed_short {
             return Err(invalid(
                 "WAL backing file identity, size or allocation changed",
             ));
