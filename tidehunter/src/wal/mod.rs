@@ -1254,8 +1254,14 @@ impl WalIterator {
             wal.metrics.wal_mmap_bytes.clone(),
             for_writer,
             wal.is_retained(),
-        )?
-        .expect("First map must be available"); // todo check this is actually true
+        )?;
+        // A retained WAL is sealed and never extends a short or unlinked
+        // file, so a missing first map is the end of its scan.
+        let map = if wal.is_retained() {
+            map.ok_or(WalError::EndOfWal)?
+        } else {
+            map.expect("First map must be available") // todo check this is actually true
+        };
         Ok(Self {
             maps,
             wal,
