@@ -19,6 +19,7 @@
 use super::fencing_generations::generation_unused;
 use super::pipeline_tests::{Fixture, newest_cut};
 use super::*;
+use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
 use crate::distributed::hybrid::{RelocationApply, SnapshotBoundary, inject_snapshot_fault};
@@ -63,7 +64,31 @@ pub(super) const WAIT: Duration = Duration::from_secs(120);
 pub(super) fn shape() -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
     builder.add_key_space_config("a", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    // The pass stops at the first record of this filtered keyspace, so the
+    // unfiltered data set gets a whole-file target: a pass with no Stop and no
+    // record at or above its scan cut does nothing, as native does.
+    builder.add_key_space_config(
+        "s",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], _: &[u8]| Decision::StopRelocation),
+    );
     builder.build()
+}
+
+/// Key inside [`shape`]'s filtered keyspace that carries the Stop record.
+pub(super) const STOP_MARKER: u64 = 1;
+
+/// Appends the scan's Stop above the data set written so far.
+pub(super) fn stop_marker(db: &Arc<Db>) {
+    let mut batch = db.write_batch();
+    batch.write(
+        db.ks("s"),
+        key(STOP_MARKER),
+        vec![(STOP_MARKER % 251) as u8; VALUE],
+    );
+    batch.commit().expect("write the stop marker");
 }
 
 /// A zero stale-unload window: every dirty cell is stale, so the ordinary
@@ -132,6 +157,7 @@ pub(super) fn fill(db: &Arc<Db>) -> KeySpace {
         batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
         batch.commit().expect("write");
     }
+    stop_marker(db);
     db.remote_for_test()
         .write_core()
         .flush_durable()
@@ -204,6 +230,9 @@ pub(super) fn write_range(db: &Arc<Db>, sequences: Range<u64>) {
         batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
         batch.commit().expect("write");
     }
+    // Each extension ends with its own Stop, so a later pass still has a target
+    // above the adopted start.
+    stop_marker(db);
 }
 
 /// Reads every key with `get` and compares the bytes: `exists` is index-only.

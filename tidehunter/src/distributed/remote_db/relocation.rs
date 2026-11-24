@@ -202,6 +202,13 @@ struct Cursor {
     above_cut: bool,
 }
 
+/// Whether `version` is at or above the scan cut `q`. Cuts are exclusive, so
+/// the batch at `q` is the first unprocessed one and the scan stops there, as
+/// native's `position.offset() >= upper_limit` test does.
+fn at_or_above_cut(version: BatchVersion, q: BatchVersion) -> bool {
+    version >= q
+}
+
 /// One value copy for the serving generation: full key, value and the logical
 /// version the copy re-points.
 type RelocatedValue = (Bytes, Bytes, BatchVersion);
@@ -406,7 +413,14 @@ impl ConcurrentRemoteDatabase {
             }
         });
         if targets.is_empty() {
-            // Native: the filters were called, nothing else happens.
+            // Native runs its GC with the whole-file target on every run that
+            // has one, including a target that did not advance; the hybrid
+            // retries the retirement here under the already adopted watermark.
+            // Nothing is copied, dropped or stored.
+            if reports.iter().any(|stream| stream.rounded_target > 0) {
+                let _retirement = core.retirement.lock();
+                core_retire_dead_wal_files(core)?;
+            }
             return Ok(empty(reports, callbacks, q));
         }
         // Native's unread-drop bound: a filtered keyspace drops its entries
@@ -940,7 +954,7 @@ impl ConcurrentRemoteDatabase {
                 continue;
             }
             for batch in page.batches {
-                if batch.version > q {
+                if at_or_above_cut(batch.version, q) {
                     cursor.upper = Some(batch.address.offset);
                     cursor.above_cut = true;
                     break;

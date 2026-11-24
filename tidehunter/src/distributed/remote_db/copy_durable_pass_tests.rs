@@ -1103,14 +1103,11 @@ fn a_busy_sealed_retirement_reply_is_counted_but_completion_is_not() {
     client
         .release_live_epoch_pin(epoch, lease.epoch_pin_token)
         .unwrap();
-    // The unpinned victim retires on a later pass: a pass with no target of its
-    // own retires nothing, so retry a bounded number of passes.
-    // A pass retires only its own target, and the target rounds down to a file
-    // boundary below the Stop record, so the sealed file waits for a later pass
-    // whose target lies past it. This pass must not fail, defer or produce a
-    // second Busy cause: only the counts below are the claim.
+    // The next pass has the same whole-file target (it did not advance) and
+    // retries the retirement, as native's gc does.
     let completed = pass(&db);
     assert!(!completed.deferred, "{completed:?}");
+    assert!(!victim.exists(), "the unpinned file was retired");
     assert_eq!(address.segment_generation, old_epoch);
     let value = db.get(ks, &key(1000)).unwrap().unwrap();
     assert_eq!(value.as_ref(), marked_value(NEW_MARK, 1000).as_slice());
@@ -1136,7 +1133,6 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
     let first_generation = db.remote_for_test().write_core().epoch;
     let ks = db.ks("a");
     let mut old_keys = 0;
-    let stream_end;
     loop {
         // A geometry change that skips fragment 5 must fail here, not fill the
         // disk: two `WRITES` keys is twice the data set the fragment target
@@ -1172,7 +1168,7 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
         .get(db.ks("s"), &key(STOP_MARKER), newest_cut())
         .expect("lookup")
         .expect("indexed");
-    stream_end = marker.address.offset + u64::from(marker.address.len);
+    let stream_end = marker.address.offset + u64::from(marker.address.len);
     db.remote_for_test()
         .write_core()
         .flush_durable()

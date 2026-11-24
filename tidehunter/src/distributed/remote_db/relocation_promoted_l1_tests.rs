@@ -88,6 +88,8 @@ fn fill_and_promote(db: &Arc<Db>) {
         batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
         batch.commit().expect("write");
     }
+    // The Stop above the data set gives the pass a whole-file target.
+    super::retained_generation_tests::stop_marker(db);
     let core = db.remote_for_test().write_core();
     core.flush_durable().expect("certify the data set");
     core.flush_index().expect("promote store");
