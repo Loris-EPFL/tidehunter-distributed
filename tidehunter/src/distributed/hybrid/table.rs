@@ -1136,8 +1136,12 @@ impl TableInner {
                     return Err(LocalDbError::new("published put carries no resident value"));
                 }
                 (RecordKind::Delete, _) => {
-                    self.table
-                        .remove(context, reduced.clone(), mutation.position, self.loader.as_ref())?;
+                    self.table.remove(
+                        context,
+                        reduced.clone(),
+                        mutation.position,
+                        self.loader.as_ref(),
+                    )?;
                 }
             }
             let mutex = self.table.mark_pending_dirty_for(context, &reduced);

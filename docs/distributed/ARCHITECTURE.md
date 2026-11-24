@@ -50,6 +50,13 @@ on that branch. Open it there. The index settings are the `index` field
 (`HybridIndexConfig`). Sui fills it from its native configuration
 (`RemoteDatabaseConfig::with_native_index`).
 
+Two native index rows do not apply to the coordinator. `relocation_stripe_bytes`
+sizes the stripes of the single-node relocation pass, while one hybrid pass is
+bounded by one owner WAL file end (`remote_db/relocation.rs`), so the row is
+never read. `commit_pool_size` sizes the native value-batch commit pool, while
+the hybrid's value-commit parallelism is one worker per owner, so the
+coordinator sets it to 0 in `to_native_config`.
+
 ## 3. Acknowledgement tiers
 
 Two tiers (`durability/{mod,native,synchronous}.rs`, `DURABILITY_TIERS.md`):
