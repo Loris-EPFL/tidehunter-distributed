@@ -379,6 +379,18 @@ pub trait IndexPosition:
         a == b
     }
 
+    /// True when the tagged entry's position is the on-disk tombstone sentinel.
+    ///
+    /// A tombstone a flush wrote at its own position carries a genuine offset
+    /// and is not a sentinel; a disk-derived tombstone decodes to the sentinel
+    /// with a rewritten length word, so comparing against [`Self::INVALID`]
+    /// field-wise would not recognise it.
+    #[inline]
+    fn tagged_is_sentinel(tagged: Self::Tagged) -> bool {
+        Self::tagged_position(tagged)
+            == Self::tagged_position(Self::from_disk_position(Self::INVALID))
+    }
+
     /// The frontier a cell stores when a flush it requested commits at `new`
     /// while the cell currently stores `old` (see `commit_flushed_cut`).
     ///

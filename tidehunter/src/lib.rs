@@ -13,7 +13,6 @@ pub mod control;
 #[doc(hidden)] // Used by benchmarks and tools for WAL writes
 pub mod crc;
 pub mod db;
-mod decompress_cache;
 #[cfg(feature = "experimental-distributed")]
 pub mod distributed;
 #[cfg(test)]
@@ -21,6 +20,7 @@ mod failpoints;
 pub mod file_reader;
 mod flusher;
 pub mod index;
+mod index_blob_cache;
 pub mod iterators;
 pub mod key_shape;
 #[doc(hidden)] // Used by tools/tideconsole for control region inspection
@@ -30,6 +30,7 @@ pub mod lookup;
 mod math;
 pub mod metrics;
 pub mod parallelism;
+mod position_cache;
 mod primitives;
 // The distributed owner protocol carries the evidence structs in every build.
 #[cfg(any(

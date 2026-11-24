@@ -1,11 +1,13 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use std::{path::Path, sync::Arc, thread, time::Duration};
 
 use crate::control::RelocateFiles;
 use crate::failpoints::FailPoint;
-use crate::key_shape::{KeySpace, KeySpaceConfig};
+use crate::key_shape::{KeyIndexing, KeySpace, KeySpaceConfig};
 use crate::large_table::Loader;
-use crate::latch::Latch;
+use crate::latch::{Latch, LatchGuard};
 use crate::relocation::CellReference;
 use crate::relocation::watermark::WatermarkData;
 use crate::wal::layout::WalKind;
@@ -13,11 +15,20 @@ use crate::{
     RelocationStrategy,
     config::Config,
     db::{Db, DbResult},
-    key_shape::{KeyShapeBuilder, KeyType},
+    key_shape::{KeyShape, KeyShapeBuilder, KeyType},
     relocation::RelocationWatermarks,
 };
 use crate::{metrics::Metrics, relocation::Decision};
 use minibytes::Bytes;
+
+/// `Config::small` with one WAL file per relocation stripe, so the WAL-based
+/// runs in these tests span several stripes.
+fn small_config() -> Config {
+    Config {
+        relocation_stripe_bytes: 0,
+        ..Config::small()
+    }
+}
 
 fn force_unload_config(config: &Config) -> Arc<Config> {
     let mut config2 = Config::clone(config);
@@ -26,9 +37,49 @@ fn force_unload_config(config: &Config) -> Arc<Config> {
 }
 
 fn index_based_config() -> Arc<Config> {
-    let mut config = Config::small();
+    let mut config = small_config();
     config.relocation_strategy = RelocationStrategy::IndexBased(None);
     force_unload_config(&config)
+}
+
+/// `small_config` with WAL files of two fragments, cells unloading at every
+/// control-region rebuild, and, when `sharded`, small dirty and L0 limits plus
+/// an auto-shard threshold of 2 KiB so a cell of a few hundred 8-byte keys
+/// splits its promoted L1.
+fn relocation_test_config(sharded: bool) -> Arc<Config> {
+    let mut config = small_config();
+    config.wal_file_size = 2 * config.frag_size;
+    if sharded {
+        config.max_dirty_keys = 8;
+        config.l0_max_entries = Some(16);
+        config.with_index_auto_shard_threshold(2048);
+    }
+    force_unload_config(&config)
+}
+
+/// Key spaces `k` (under `ksc`) and `pad`, the latter for writes that move the
+/// WAL without touching the cell under test.
+fn k_and_pad_key_shape(ksc: KeySpaceConfig) -> KeyShape {
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), ksc);
+    ksb.add_key_space_config("pad", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.build()
+}
+
+/// True when any cell of `ks` has an auto-sharded L1.
+fn any_cell_sharded(db: &Db, ks: KeySpace) -> bool {
+    let context = db.ks_context(ks);
+    let mut cell_ref = CellReference::first(db, ks);
+    while let Some(cell) = cell_ref.take() {
+        let sharded = db
+            .large_table
+            .with_entry_for_test(context, &cell.cell_id, |entry| entry.levels().is_sharded());
+        if sharded {
+            return true;
+        }
+        cell_ref = cell.next_in_ks(db);
+    }
+    false
 }
 
 fn relocation_cells_processed(metrics: &Metrics, keyspace_name: &str) -> u64 {
@@ -133,7 +184,7 @@ fn test_checkpoint_survives_relocation_with_unload() {
     // Forced unload during the held checkpoint (snapshot_unload_threshold = 0):
     // the cell unloads, so the checkpoint reads the as-of value from the
     // relocated on-disk blob rather than the post-checkpoint value.
-    let mut config = Config::small();
+    let mut config = small_config();
     config.wal_file_size = 2 * config.frag_size;
     checkpoint_survives_relocation(force_unload_config(&config), KeySpaceConfig::new());
 }
@@ -143,71 +194,205 @@ fn test_checkpoint_survives_relocation_without_unload() {
     // Unloading disabled: the cell stays loaded, so the as-of value must survive
     // relocation in the in-memory overlay (relocation rewrites its position to
     // >= L and reclaims the original frame).
-    let mut config = Config::small();
+    let mut config = small_config();
     config.wal_file_size = 2 * config.frag_size;
     checkpoint_survives_relocation(Arc::new(config), KeySpaceConfig::new().disable_unload());
 }
 
-// Regression: a key overwritten after a checkpoint, whose as-of value lives as a
-// distinct *overlay* position (not promoted to flat/L1) in a multi-level/unloaded
-// cell, must survive relocation. Before the fix, `get_index_for_cell` collapsed
-// the overlay to latest-per-key before `retain_processed`, discarding the
-// below-frontier value; it was never relocated, and GC reclaimed its WAL file, so
-// the held checkpoint read `None`.
+/// A write allocated before a relocation copies its key's as-of value sits
+/// below the copy the relocation writes at the WAL tail: its guard pins the
+/// tracker frontier, so the relocation must not index the copy
+/// until the write is applied (a torn frame below an indexed copy would
+/// strand the key after a crash), and once it is, the compare-and-set must
+/// leave the key on the newer write, which sits at a lower offset than the
+/// copy of the older value. Unloading is disabled so the relocation flush
+/// re-points the loaded overlay at the relocated blob (`rebase_on_as_of`)
+/// instead of unloading the cell; the writer is parked on
+/// `fp_insert_before_lock` between its WAL write and the row lock.
 #[test]
-fn test_checkpoint_survives_relocation_overlay_asof_value() {
-    let dir = tempdir::TempDir::new("ckpt_reloc_overlay_asof").unwrap();
-    let mut config = Config::small();
-    config.wal_file_size = 2 * config.frag_size;
-    let config = force_unload_config(&config); // snapshot_unload_threshold = 0
+fn test_relocation_waits_for_racing_write_on_loaded_cell() {
+    use std::time::Instant;
+
+    let dir = tempdir::TempDir::new("test_reloc_racing_write").unwrap();
+    let config = Arc::new(small_config());
     let mut ksb = KeyShapeBuilder::new();
-    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
-    ksb.add_key_space_config("k2", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config(
+        "k",
+        8,
+        1,
+        KeyType::uniform(1),
+        KeySpaceConfig::new().disable_unload(),
+    );
     let key_shape = ksb.build();
     let metrics = Metrics::new();
     let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
     let ks = db.ks("k");
-    let ks2 = db.ks("k2");
+    let context = db.ks_context(ks);
+    let key = 3u64.to_be_bytes().to_vec();
+    let cell = context.ks_config.cell_id(&key);
+    let old_value = vec![1u8; 64];
+    let new_value = vec![2u8; 64];
+    let indexed_position = || {
+        db.large_table.with_entry_for_test(context, &cell, |entry| {
+            entry.get(&key).expect("key must be indexed")
+        })
+    };
+    let skipped_inserts = || {
+        metrics
+            .skip_stale_update
+            .with_label_values(&["k", "insert"])
+            .get()
+    };
+
+    db.insert(ks, key.clone(), old_value.clone()).unwrap();
+    // The relocation only considers positions the tracker has processed.
+    db.wal_writer.wal_tracker_barrier();
+    let original = indexed_position();
+
+    // Park the racing writer between its WAL write (guard held, so the
+    // tracker frontier stays at or below it) and the row lock.
+    let (latch, latch_guard) = Latch::new();
+    db.large_table.fp.0.write().fp_insert_before_lock = FailPoint::latch(latch);
+    let written_before = metrics.wal_written_bytes.get();
+    let writer = {
+        let db = db.clone();
+        let key = key.clone();
+        let new_value = new_value.clone();
+        thread::spawn(move || db.insert(ks, key, new_value).unwrap())
+    };
+    // `Db::insert` publishes the frame offset right after the WAL write and
+    // before the failpoint, so a changed gauge means the write is in flight.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while metrics.wal_written_bytes.get() == written_before {
+        assert!(
+            Instant::now() < deadline,
+            "racing writer did not reach the WAL before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let in_flight_offset = metrics.wal_written_bytes.get() as u64;
+
+    // Relocate just the key's original record: everything below its
+    // successor offset. The copy lands past the in-flight write, so the
+    // relocation must park until that write is applied.
+    let wait_requests_before = db.wal_writer.wait_requests_sent();
+    let relocation = {
+        let db = db.clone();
+        thread::spawn(move || {
+            db.start_blocking_relocation_with_strategy(RelocationStrategy::IndexBased(Some(
+                original.offset() + 1,
+            )))
+        })
+    };
+    while db.wal_writer.wait_requests_sent() == wait_requests_before {
+        assert!(
+            !relocation.is_finished(),
+            "relocation finished with a write in flight below its copy"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "relocation did not wait for the in-flight write"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !relocation.is_finished(),
+        "relocation finished with a write in flight below its copy"
+    );
+    assert_eq!(
+        original,
+        indexed_position(),
+        "the copy must not be indexed while the write below it is in flight"
+    );
+
+    // Release the writer: it is applied first, and the relocation's
+    // compare-and-set then leaves the key on the newer write, which sits at
+    // a lower offset than the copy.
+    drop(latch_guard);
+    writer
+        .join()
+        .expect("racing write must be applied without panicking");
+    relocation.join().unwrap();
+    assert_eq!(
+        1,
+        metrics.relocation_kept.with_label_values(&["k"]).get(),
+        "relocation must have copied the key's record"
+    );
+    assert_eq!(0, skipped_inserts(), "racing write was skipped as stale");
+    assert_eq!(in_flight_offset, indexed_position().offset());
+    assert_eq!(Some(new_value.clone().into()), db.get(ks, &key).unwrap());
+    db.large_table.each_entry(|entry| {
+        assert!(entry.is_index_loaded(), "cell must stay loaded");
+    });
+
+    // A flush must persist the newer write, not the copy of the older one.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(Some(new_value.into()), db.get(ks, &key).unwrap());
+    assert_eq!(0, skipped_inserts());
+}
+
+// A key overwritten after a checkpoint, whose as-of value is a distinct overlay
+// position (never promoted to flat or a deeper level), must survive relocation:
+// the as-of view relocates it, the flush re-points it to the copy, and the held
+// checkpoint reads the copy once GC reclaims its WAL file. The WAL is moved
+// several files past the as-of write before the checkpoint, so the relocation
+// target passes its file. On an unloading-enabled cell the flush completion
+// must drop the re-pointed position from the overlay although the key's latest
+// position is past the frontier, and a later flush of the cell must not write
+// the reclaimed position back into the blob.
+fn checkpoint_survives_relocation_overlay_asof_value(sharded: bool) {
+    let dir = tempdir::TempDir::new("ckpt_reloc_overlay_asof").unwrap();
+    let config = relocation_test_config(sharded);
+    let key_shape = k_and_pad_key_shape(KeySpaceConfig::new());
+    let metrics = Metrics::new();
+    let db = Db::open(dir.path(), key_shape, config, metrics.clone()).unwrap();
+    let ks = db.ks("k");
+    let pad = db.ks("pad");
 
     let big = |b: u8| -> Vec<u8> { vec![b; 12 * 1000] };
-    let target = 3u64;
+    let target = 3u64.to_be_bytes().to_vec();
 
-    // 1. Build a cell from OTHER keys (not `target`); flush it to disk
-    //    synchronously so the bulk lives on-disk and the overlay is clean.
-    //    Two force-rebuilds encourage an L0->L1 compaction (multi-level cell).
+    // 1. Build the cell from other keys and flush it to disk, so the bulk
+    //    lives below L0 (split into shards when `sharded`) and the overlay
+    //    is clean.
     for i in 1000..3000u64 {
         db.insert(ks, i.to_be_bytes().to_vec(), big(7)).unwrap();
     }
     db.force_rebuild_control_region().unwrap();
-    db.force_rebuild_control_region().unwrap();
+    if sharded {
+        assert!(
+            any_cell_sharded(&db, ks),
+            "test setup must produce a sharded cell"
+        );
+    }
 
-    // 2. Insert the target's as-of value into a fresh overlay over the on-disk
-    //    cell. One dirty key (< max_dirty_keys=32) => stays in `data`.
-    db.insert(ks, target.to_be_bytes().to_vec(), big(1))
-        .unwrap();
+    // 2. The target's as-of value lands in a fresh overlay over the on-disk
+    //    cell: one dirty key stays in `data`.
+    db.insert(ks, target.clone(), big(1)).unwrap();
 
-    // 3. Pin a checkpoint at this frontier (target == big(1) as of here).
+    // 3. Move the WAL several files past the as-of write, through another
+    //    key space, so the relocation target passes its file.
+    for i in 0..4000u64 {
+        db.insert(pad, i.to_be_bytes().to_vec(), big(9)).unwrap();
+    }
+
+    // 4. Pin a checkpoint at this frontier.
     let checkpoint = db.checkpoint();
     assert_eq!(
-        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        checkpoint.get(ks, &target).unwrap(),
         Some(big(1).into()),
         "SANITY: as-of read works right after checkpoint"
     );
 
-    // 4. Overwrite target after the frontier => overlay holds BOTH positions.
-    db.insert(ks, target.to_be_bytes().to_vec(), big(2))
-        .unwrap();
+    // 5. Overwrite the target after the frontier, so the overlay holds both
+    //    positions; the overwrite is also the entry past the frontier that
+    //    the cut-off scan stops at.
+    db.insert(ks, target.clone(), big(2)).unwrap();
     assert_eq!(
-        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        checkpoint.get(ks, &target).unwrap(),
         Some(big(1).into()),
         "SANITY: as-of read still works after the post-frontier overwrite (pre-relocation)"
     );
-
-    // 5. Advance the global WAL position via a different keyspace/cell so
-    //    relocation's target_position passes the as-of value's offset.
-    for i in 0..4000u64 {
-        db.insert(ks2, i.to_be_bytes().to_vec(), big(9)).unwrap();
-    }
 
     // 6. Relocate (default WAL-based) => GC reclaims files below target_position.
     db.start_blocking_relocation();
@@ -217,22 +402,47 @@ fn test_checkpoint_survives_relocation_overlay_asof_value() {
     );
 
     assert_eq!(
-        db.get(ks, &target.to_be_bytes()).unwrap(),
+        db.get(ks, &target).unwrap(),
         Some(big(2).into()),
         "live get must be the overwrite"
     );
     assert_eq!(
-        checkpoint.get(ks, &target.to_be_bytes()).unwrap(),
+        checkpoint.get(ks, &target).unwrap(),
         Some(big(1).into()),
         "checkpoint must read the as-of value big(1) after relocation; \
-         None => the below-frontier overlay value was lost"
+         None => the overlay still points at the reclaimed position"
     );
+
+    // 7. Flush the cell again while the checkpoint is held. The overlay
+    //    holds only the overwrite now, so the new blob keeps the copy.
+    db.force_rebuild_control_region().unwrap();
+    assert_eq!(
+        db.get(ks, &target).unwrap(),
+        Some(big(2).into()),
+        "live get must still be the overwrite after the second flush"
+    );
+    assert_eq!(
+        checkpoint.get(ks, &target).unwrap(),
+        Some(big(1).into()),
+        "checkpoint must still read the as-of value after the second flush; \
+         None => the blob was rewritten with the reclaimed position"
+    );
+}
+
+#[test]
+fn test_checkpoint_survives_relocation_overlay_asof_value() {
+    checkpoint_survives_relocation_overlay_asof_value(false);
+}
+
+#[test]
+fn test_checkpoint_survives_relocation_overlay_asof_value_sharded() {
+    checkpoint_survives_relocation_overlay_asof_value(true);
 }
 
 #[test]
 fn test_wal_relocation_basic_flow() {
     let dir = tempdir::TempDir::new("test_relocation_filter").unwrap();
-    let mut config = Config::small();
+    let mut config = small_config();
     config.wal_file_size = 2 * config.frag_size;
     let config = Arc::new(config);
     let mut ksb = KeyShapeBuilder::new();
@@ -319,7 +529,7 @@ fn test_iterator_skips_reclaimed_positions() {
     // return every live key: stopping at the first unreadable entry hides the
     // whole live half, because the removed keys sort in front of it.
     let dir = tempdir::TempDir::new("test_iterator_skips_reclaimed_positions").unwrap();
-    let mut config = Config::small();
+    let mut config = small_config();
     config.wal_file_size = 2 * config.frag_size;
     let config = Arc::new(config);
     let mut ksb = KeyShapeBuilder::new();
@@ -478,7 +688,7 @@ fn test_index_based_relocation_point_deletes() {
 #[test]
 fn test_index_based_relocation_filter() {
     let dir = tempdir::TempDir::new("test_index_based_relocation_filter").unwrap();
-    let mut config = Config::small();
+    let mut config = small_config();
     config.wal_file_size = 2 * config.frag_size;
     config.relocation_strategy = RelocationStrategy::IndexBased(None);
     let config = force_unload_config(&config);
@@ -598,12 +808,8 @@ fn test_index_based_relocation_filter() {
 fn test_relocation_strategies_produce_identical_results() {
     let dir1 = tempdir::TempDir::new("test_wal_strategy").unwrap();
     let dir2 = tempdir::TempDir::new("test_index_strategy").unwrap();
-    let mut config = Config::small();
-    config.wal_file_size = 2 * config.frag_size;
-    let config = Arc::new(config);
-    let mut index_config = Config::clone(&config);
-    index_config.relocation_strategy = RelocationStrategy::IndexBased(None);
-    let index_config = force_unload_config(&index_config);
+    let config = Arc::new(small_config());
+    let index_config = index_based_config();
 
     // Create identical keyspace configurations
     let mut ksb = KeyShapeBuilder::new();
@@ -669,11 +875,6 @@ fn test_relocation_strategies_produce_identical_results() {
 
         (db_wal, db_index, ks)
     };
-    let first_wal_file = dir1.path().join(format!(
-        "wal_{:016x}",
-        db_wal.wal.min_wal_position() / config.wal_file_size
-    ));
-
     // Run different relocation strategies
     db_wal.rebuild_control_region().unwrap();
     db_index.rebuild_control_region().unwrap();
@@ -690,23 +891,17 @@ fn test_relocation_strategies_produce_identical_results() {
         assert_eq!(val_wal, val_index, "Databases differ for key {}", key);
     }
 
-    // Both strategies must have done work: WAL-based copied live entries
-    // below its target, index-based processed cells.
-    let wal_kept = metrics_wal
-        .relocation_kept
-        .with_label_values(&["test"])
-        .get();
+    // Index-based relocation processes cells on every pass. A WAL-based pass
+    // over an idle unfiltered keyspace finds no terminal (the scan ends at the
+    // processed frontier), so it reclaims nothing: that needs the terminal
+    // fallback, which native does not have (upstream leaves `terminal_position`
+    // at zero without a `StopRelocation` marker).
     let index_processed = relocation_cells_processed(&metrics_index, "test");
-    assert!(wal_kept > 0, "WAL-based should have copied live entries");
     assert!(
         index_processed > 0,
         "Index-based should have processed some cells"
     );
     db_wal.wait_for_background_threads_to_finish();
-    assert!(
-        !first_wal_file.exists(),
-        "WAL-based should have reclaimed the first WAL file"
-    );
     db_index.wait_for_background_threads_to_finish();
 }
 
@@ -719,7 +914,7 @@ fn test_both_strategies_handle_concurrent_writes() {
         let config = if use_index_based {
             index_based_config()
         } else {
-            force_unload_config(&Config::small())
+            force_unload_config(&small_config())
         };
         let mut ksb = KeyShapeBuilder::new();
         let ksc = KeySpaceConfig::new();
@@ -1203,7 +1398,7 @@ fn test_index_based_relocation_preserves_overwrite_above_target() {
     let db = Db::open(
         dir.path(),
         key_shape,
-        Arc::new(Config::small()),
+        Arc::new(small_config()),
         metrics.clone(),
     )
     .unwrap();
@@ -1261,7 +1456,7 @@ fn test_force_relocate_concurrent_write_keeps_below_l0_keys() {
     let dir = tempdir::TempDir::new("force_relocate_dirty_loaded").unwrap();
     // Forced unload (threshold 0) so the flushed cell unloads; the later read
     // reloads it folding only L0 into the overlay, leaving L1 on disk.
-    let config = force_unload_config(&Config::small());
+    let config = force_unload_config(&small_config());
     let mut ksb = KeyShapeBuilder::new();
     // Unloaded iteration off so that stepping an iterator loads the cell
     // (point reads never load; this is the only read-path load trigger).
@@ -1426,7 +1621,7 @@ fn test_compute_target_position_from_ratio() {
     use crate::relocation::compute_target_position_from_ratio;
 
     let dir = tempdir::TempDir::new("test_compute_ratio").unwrap();
-    let config = Arc::new(Config::small());
+    let config = Arc::new(small_config());
     let mut ksb = KeyShapeBuilder::new();
     ksb.add_key_space("default", 8, 1, KeyType::uniform(1));
     let key_shape = ksb.build();
@@ -1485,425 +1680,729 @@ fn test_compute_target_position_from_ratio() {
     assert_eq!(target_over_one, last_pos_at_over);
 }
 
-const KEEP: u8 = 0;
-const REMOVE: u8 = 1;
-const STOP: u8 = 2;
+// WAL-based relocation on a cell whose L1 has been auto-sharded. Keys that live
+// only in shards must be relocated too (the as-of view folds every shard in),
+// and the relocation flush must re-point them shard by shard. Keys overwritten
+// or removed after the split cover the case where a fresher copy above the
+// shard shadows the shard copy; keys overwritten after the checkpoint cover the
+// case where the shard copy is the as-of value a held checkpoint still reads.
+fn wal_relocation_on_sharded_cell(ksc: KeySpaceConfig) {
+    let dir = tempdir::TempDir::new("test_wal_relocation_sharded").unwrap();
+    let config = relocation_test_config(true);
+    let key_shape = k_and_pad_key_shape(ksc);
+    let metrics = Metrics::new();
 
-fn class_key(class: u8, number: u32) -> Vec<u8> {
-    let mut key = vec![class, 0, 0, 0];
-    key.extend_from_slice(&number.to_be_bytes());
-    key
-}
+    let key = |i: u64| i.to_be_bytes().to_vec();
+    let value = |i: u64, tag: u8| -> Vec<u8> {
+        let mut v = vec![(i % 251) as u8; 12 * 1000];
+        v[0] = tag;
+        v
+    };
+    let insert_count = 2000u64;
+    let overwritten = 0..100u64;
+    let removed = 100..150u64;
+    let overwritten_after_checkpoint = 150..160u64;
 
-fn class_decision(key: &[u8]) -> Decision {
-    match key[0] {
-        KEEP => Decision::Keep,
-        REMOVE => Decision::Remove,
-        _ => Decision::StopRelocation,
+    let verify_live = |db: &Arc<Db>, ks: KeySpace, label: &str| {
+        for i in 0..insert_count {
+            let expected = if overwritten.contains(&i) {
+                Some(value(i, 2).into())
+            } else if removed.contains(&i) {
+                None
+            } else if overwritten_after_checkpoint.contains(&i) {
+                Some(value(i, 3).into())
+            } else {
+                Some(value(i, 1).into())
+            };
+            assert_eq!(db.get(ks, &key(i)).unwrap(), expected, "{label}: key {i}");
+        }
+        let mut live_count = 0u64;
+        for entry in db.iterator(ks) {
+            let _: (Bytes, Bytes) = entry.unwrap();
+            live_count += 1;
+        }
+        assert_eq!(
+            live_count,
+            insert_count - (removed.end - removed.start),
+            "{label}: iterator must see every live key"
+        );
+    };
+
+    {
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+        let ks = db.ks("k");
+        for i in 0..insert_count {
+            db.insert(ks, key(i), value(i, 1)).unwrap();
+        }
+        // Flush and promote everything written so far so the cell's L1 splits.
+        db.force_rebuild_control_region().unwrap();
+        assert!(
+            any_cell_sharded(&db, ks),
+            "test setup must produce a sharded cell"
+        );
+        for i in overwritten.clone() {
+            db.insert(ks, key(i), value(i, 2)).unwrap();
+        }
+        for i in removed.clone() {
+            db.remove(ks, key(i)).unwrap();
+        }
+
+        // Pin the frontier here; the overwrites below land past it, which
+        // also gives the relocation cut-off scan an entry to stop at.
+        let checkpoint = db.checkpoint();
+        for i in overwritten_after_checkpoint.clone() {
+            db.insert(ks, key(i), value(i, 3)).unwrap();
+        }
+
+        let shards_rewritten_before = metrics
+            .l1_shard_rewritten_total
+            .with_label_values(&["k"])
+            .get();
+        db.start_blocking_relocation();
+
+        assert!(
+            metrics.relocation_kept.with_label_values(&["k"]).get() > 0,
+            "relocation must have relocated entries"
+        );
+        assert!(
+            metrics
+                .l1_shard_rewritten_total
+                .with_label_values(&["k"])
+                .get()
+                > shards_rewritten_before,
+            "relocation must have rewritten the shards holding re-pointed keys"
+        );
+        // Reclamation is checked through the WAL file map, which gc updates
+        // before it returns; the dirent itself is removed later by the unlink
+        // worker, so a directory listing is not a synchronous signal.
+        assert!(
+            db.wal.min_wal_position() >= db.wal.wal_file_size(),
+            "relocation must have reclaimed the oldest WAL file"
+        );
+        verify_live(&db, ks, "after relocation");
+        // The checkpoint reads the as-of values: the relocated shard copy for
+        // a key overwritten after the frontier, and the post-split copies for
+        // the keys overwritten or removed before it.
+        for i in overwritten_after_checkpoint.clone() {
+            assert_eq!(
+                checkpoint.get(ks, &key(i)).unwrap(),
+                Some(value(i, 1).into()),
+                "checkpoint: key {i} must read the relocated as-of shard copy"
+            );
+        }
+        assert_eq!(
+            checkpoint.get(ks, &key(overwritten.start)).unwrap(),
+            Some(value(overwritten.start, 2).into())
+        );
+        assert_eq!(checkpoint.get(ks, &key(removed.start)).unwrap(), None);
+        drop(checkpoint);
+        db.wait_for_background_threads_to_finish();
     }
+
+    // Reopen: the index must point at the relocated copies.
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    verify_live(&db, db.ks("k"), "after reopen");
 }
 
-fn keep_below_stop_config() -> Arc<Config> {
-    let mut config = Config::small();
-    config.wal_file_size = 2 * config.frag_size;
-    config.snapshot_written_bytes = u64::MAX;
-    Arc::new(config)
+#[test]
+fn test_wal_relocation_on_sharded_cell_with_unload() {
+    // Cells unload between flushes, so at relocation time most keys live only
+    // in shards and the relocation flush re-points them shard by shard.
+    wal_relocation_on_sharded_cell(KeySpaceConfig::new());
 }
 
-fn keep_below_stop_shape(
-    filter: impl Fn(&[u8], &[u8]) -> Decision + Send + Sync + 'static,
-) -> crate::key_shape::KeyShape {
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "k",
+#[test]
+fn test_wal_relocation_on_sharded_cell_without_unload() {
+    // The cell never unloads, so the relocation flushes start from the
+    // in-memory overlay rather than from the shards alone and must still
+    // re-point the shard copies.
+    wal_relocation_on_sharded_cell(KeySpaceConfig::new().disable_unload());
+}
+
+fn torn_frame_config() -> Arc<Config> {
+    relocation_test_config(false)
+}
+
+/// Key spaces `k` and `pad`; relocation drops the padding instead of copying
+/// it, so the run's copies fit in the fragments the mapper prepares ahead of
+/// a tracker that is stuck behind a parked writer.
+fn torn_frame_key_shape() -> KeyShape {
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    ksb.add_key_space_config(
+        "pad",
         8,
         1,
         KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(filter),
+        KeySpaceConfig::new().with_relocation_filter(|_, _| Decision::Remove),
     );
-    builder.build()
+    ksb.build()
 }
 
-/// Writes a Keep row in the first WAL file, Remove rows past the second
-/// file, then one batch of a Keep row and a Stop row. The Stop's whole-file
-/// target covers the first file. Returns the value of every row.
-fn write_keep_below_stop(db: &Arc<Db>, config: &Config) -> Vec<u8> {
+fn torn_frame_key() -> Vec<u8> {
+    3u64.to_be_bytes().to_vec()
+}
+
+fn torn_frame_value() -> Vec<u8> {
+    vec![1u8; 64]
+}
+
+fn torn_frame_pad_value() -> Vec<u8> {
+    vec![7u8; 12 * 1000]
+}
+
+/// A relocated copy may be indexed, and so persisted by the control region
+/// rebuild that ends its stripe, only once every WAL frame below it is applied:
+/// a crash tears a frame still being written, replay stops at it, and a copy
+/// above the torn frame is unreachable (replay skips relocated frames) while
+/// its original is already reclaimed. The child process parks a writer
+/// between its WAL write and the row lock, so the tracker frontier stays at
+/// its frame while a WAL relocation copies a key written earlier; it then
+/// tears the parked frame and exits without closing the database. The parent
+/// reopens it and must still read the key.
+#[test]
+fn test_relocated_copies_survive_crash_with_torn_frame_below() {
+    use std::process::Command;
+
+    const CHILD_DB_PATH: &str = "TIDEHUNTER_TEST_TORN_FRAME_DB_PATH";
+    const CHILD_EXIT_CODE: i32 = 37;
+    if let Some(path) = std::env::var_os(CHILD_DB_PATH) {
+        torn_frame_crash_child(Path::new(&path), CHILD_EXIT_CODE);
+    }
+
+    let dir = tempdir::TempDir::new("test_reloc_torn_frame").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "relocation::relocation_tests::test_relocated_copies_survive_crash_with_torn_frame_below",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(CHILD_DB_PATH, dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(CHILD_EXIT_CODE),
+        "child did not reach its crash point\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = Db::open(
+        dir.path(),
+        torn_frame_key_shape(),
+        torn_frame_config(),
+        Metrics::new(),
+    )
+    .unwrap();
     let ks = db.ks("k");
-    let value = vec![7u8; 64 * 1024];
-    db.insert(ks, class_key(KEEP, 0), value.clone()).unwrap();
-    db.insert(ks, class_key(REMOVE, 0), value.clone()).unwrap();
-    let mut number = 1;
-    while db.wal_writer.position() < config.wal_file_size + config.frag_size {
-        db.insert(ks, class_key(REMOVE, number), value.clone())
+    let pad = db.ks("pad");
+    // The writer resumes at the torn frame; a few writes overwrite whatever
+    // sat above it, as the first writes after a restart would.
+    for i in 0..4u64 {
+        db.insert(pad, i.to_be_bytes().to_vec(), torn_frame_pad_value())
             .unwrap();
-        number += 1;
     }
-    let mut batch = db.write_batch();
-    batch.write(ks, class_key(KEEP, 1), value.clone());
-    batch.write(ks, class_key(STOP, 0), value.clone());
-    batch.commit().unwrap();
-    db.wal_writer.wal_tracker_barrier();
-    value
-}
-
-fn assert_keep_rows(db: &Db, value: &[u8], phase: &str) {
-    let ks = db.ks("k");
-    for number in [0, 1] {
-        assert_eq!(
-            db.get(ks, &class_key(KEEP, number)).unwrap().as_deref(),
-            Some(value),
-            "Keep row {number} lost ({phase})"
-        );
-    }
-    assert!(
-        db.get(ks, &class_key(STOP, 0)).unwrap().is_some(),
-        "{phase}"
-    );
-}
-
-#[derive(Clone, Copy, Debug)]
-enum CrashAfter {
-    RelocatedWrites,
-    ControlRegion,
-    Reclaim,
-}
-
-// WalBased relocation copies the live rows of a filtered keyspace to the WAL
-// head before the index drops entries below the target, then stores the
-// control region, then reclaims files. A crash at each boundary must reopen
-// with every Keep row readable, and the next pass must complete.
-#[test]
-fn test_wal_relocation_keeps_filtered_keep_rows_across_crashes() {
-    let config = keep_below_stop_config();
-    let shape = keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key));
-    for crash in [
-        CrashAfter::RelocatedWrites,
-        CrashAfter::ControlRegion,
-        CrashAfter::Reclaim,
-    ] {
-        let phase = format!("{crash:?}");
-        let dir = tempdir::TempDir::new("wal_relocation_keep_crash").unwrap();
-        let open = |metrics| Db::open(dir.path(), shape.clone(), config.clone(), metrics).unwrap();
-        let db = open(Metrics::new());
-        let value = write_keep_below_stop(&db, &config);
-        let first_file_id = db.wal.min_wal_position() / config.wal_file_size;
-        let first_file = dir.path().join(format!("wal_{first_file_id:016x}"));
-        let first_file_end = i64::try_from((first_file_id + 1) * config.wal_file_size).unwrap();
-        let (_sender, receiver) = std::sync::mpsc::channel();
-        let mut driver = crate::relocation::RelocationDriver {
-            db: Arc::downgrade(&db),
-            path: dir.path().to_path_buf(),
-            receiver,
-            metrics: Metrics::new(),
-        };
-        match crash {
-            CrashAfter::RelocatedWrites => {
-                driver.relocate_wal_prefix(&db).unwrap().unwrap();
-            }
-            CrashAfter::ControlRegion => {
-                let target = driver.relocate_wal_prefix(&db).unwrap().unwrap();
-                db.rebuild_control_region_from(target).unwrap();
-            }
-            CrashAfter::Reclaim => driver.wal_based_relocation(db.clone()).unwrap(),
-        }
-        assert_keep_rows(&db, &value, &phase);
-        // No later relocation step runs: the reopen sees the crash state.
-        db.wait_for_background_threads_to_finish();
-
-        let metrics = Metrics::new();
-        let db = open(metrics.clone());
-        assert_keep_rows(&db, &value, &format!("{phase}, reopen"));
-        let ks = db.ks("k");
-        let remove_row = db.get(ks, &class_key(REMOVE, 0)).unwrap();
-        match crash {
-            // The old control region and WAL replay give the state before the pass.
-            CrashAfter::RelocatedWrites => assert!(remove_row.is_some(), "{phase}"),
-            CrashAfter::ControlRegion => {}
-            CrashAfter::Reclaim => assert!(remove_row.is_none(), "{phase}"),
-        }
-        assert_eq!(
-            first_file.exists(),
-            !matches!(crash, CrashAfter::Reclaim),
-            "{phase}"
-        );
-
-        db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-        assert_keep_rows(&db, &value, &format!("{phase}, next pass"));
-        if !matches!(crash, CrashAfter::Reclaim) {
-            // The unlink itself can lag: the mapper skips files that the
-            // reopened writer still maps writeable (`wal/mapper.rs`).
-            assert!(
-                metrics.gc_position.with_label_values(&["wal"]).get() >= first_file_end,
-                "{phase}"
-            );
-        }
-        db.wait_for_background_threads_to_finish();
-
-        let db = open(Metrics::new());
-        assert_keep_rows(&db, &value, &format!("{phase}, final reopen"));
-        assert!(
-            db.get(ks, &class_key(REMOVE, 0)).unwrap().is_none(),
-            "{phase}"
-        );
-        db.wait_for_background_threads_to_finish();
-    }
-}
-
-// A write that lands after the pass captures its as-of view but before it
-// installs the relocated copy wins: the copy only replaces an index entry
-// still below the target.
-#[test]
-fn test_wal_relocation_concurrent_overwrite_wins_over_kept_copy() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{OnceLock, Weak};
-
-    let config = keep_below_stop_config();
-    let newer = vec![9u8; 1024];
-    let db_slot = Arc::new(OnceLock::<Weak<Db>>::new());
-    let keep_calls = Arc::new(AtomicUsize::new(0));
-    let shape = {
-        let db_slot = db_slot.clone();
-        let keep_calls = keep_calls.clone();
-        let newer = newer.clone();
-        keep_below_stop_shape(move |key: &[u8], _: &[u8]| {
-            if key == class_key(KEEP, 0).as_slice() {
-                keep_calls.fetch_add(1, Ordering::SeqCst);
-            }
-            // The scan reaches the Stop after it kept the row and before the
-            // copy loop runs.
-            if key == class_key(STOP, 0).as_slice() {
-                let db = db_slot.get().unwrap().upgrade().unwrap();
-                db.insert(db.ks("k"), class_key(KEEP, 0), newer.clone())
-                    .unwrap();
-            }
-            class_decision(key)
-        })
-    };
-    let dir = tempdir::TempDir::new("wal_relocation_keep_overwrite").unwrap();
-    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
-    let db = open();
-    db_slot.set(Arc::downgrade(&db)).unwrap();
-    let ks = db.ks("k");
-    let value = write_keep_below_stop(&db, &config);
-    let first_file = dir.path().join(format!(
-        "wal_{:016x}",
-        db.wal.min_wal_position() / config.wal_file_size
-    ));
-
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-    assert_eq!(keep_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        db.get(ks, &class_key(KEEP, 0)).unwrap().as_deref(),
-        Some(&newer[..])
+        db.get(ks, &torn_frame_key()).unwrap(),
+        Some(torn_frame_value().into()),
+        "key relocated above a torn frame was lost"
     );
-    assert_eq!(
-        db.get(ks, &class_key(KEEP, 1)).unwrap().as_deref(),
-        Some(&value[..])
-    );
-    db.wait_for_background_threads_to_finish();
-    assert!(!first_file.exists());
-
-    let db = open();
-    assert_eq!(
-        db.get(ks, &class_key(KEEP, 0)).unwrap().as_deref(),
-        Some(&newer[..])
-    );
-    db.wait_for_background_threads_to_finish();
 }
 
-// A stateful filter answers Keep on its first call for a key and Remove after.
-// The pass must call it exactly once per scanned record and act on that
-// answer, so the Keep rows survive the pass and a reopen.
-#[test]
-fn test_wal_relocation_calls_filter_once_per_record() {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+/// The child half of `test_relocated_copies_survive_crash_with_torn_frame_below`.
+/// Exits the process with `exit_code` instead of returning.
+fn torn_frame_crash_child(path: &Path, exit_code: i32) -> ! {
+    use crate::crc::CrcFrame;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use std::time::Instant;
 
-    let config = keep_below_stop_config();
-    let calls = Arc::new(Mutex::new(HashMap::<Vec<u8>, usize>::new()));
-    let shape = {
-        let calls = calls.clone();
-        keep_below_stop_shape(move |key: &[u8], _: &[u8]| {
-            let mut calls = calls.lock().unwrap();
-            let count = calls.entry(key.to_vec()).or_default();
-            *count += 1;
-            match class_decision(key) {
-                Decision::Keep if *count > 1 => Decision::Remove,
-                decision => decision,
-            }
-        })
-    };
-    let dir = tempdir::TempDir::new("wal_relocation_filter_once").unwrap();
-    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
-    let db = open();
-    let value = write_keep_below_stop(&db, &config);
-    let records = calls.lock().unwrap().len();
-    assert_eq!(records, 0, "writes do not call the filter");
-
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-    {
-        let calls = calls.lock().unwrap();
-        assert!(calls.contains_key(&class_key(KEEP, 0)));
-        assert!(calls.contains_key(&class_key(STOP, 0)));
-        for (key, count) in calls.iter() {
-            assert_eq!(*count, 1, "filter calls for key {key:?}");
-        }
-    }
-    assert_keep_rows(&db, &value, "after the pass");
-    db.wait_for_background_threads_to_finish();
-
-    let db = open();
-    assert_keep_rows(&db, &value, "after reopen");
-    db.wait_for_background_threads_to_finish();
-}
-
-// Removed rows that were promoted to L1 keep stale index entries into the
-// reclaimed files (the cutoff does not rewrite L1). `get` reads them as
-// absent; `exists` must agree, after the pass and after reopen.
-#[test]
-fn test_wal_relocation_exists_agrees_with_get_on_stale_l1() {
-    let mut config = Config::small();
-    config.wal_file_size = 2 * config.frag_size;
-    config.snapshot_written_bytes = u64::MAX;
-    config.l0_max_entries = Some(1);
-    let config = Arc::new(config);
-    let shape = keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key));
-    let dir = tempdir::TempDir::new("wal_relocation_exists").unwrap();
-    let open = || Db::open(dir.path(), shape.clone(), config.clone(), Metrics::new()).unwrap();
-    let db = open();
-    let ks = db.ks("k");
-    let mut rows = 0;
-    while db.wal_writer.position() < 2 * config.wal_file_size {
-        db.insert(ks, class_key(REMOVE, rows), vec![1u8; 64 * 1024])
-            .unwrap();
-        rows += 1;
-    }
-    db.wal_writer.wal_tracker_barrier();
-    db.force_rebuild_control_region().unwrap();
-    db.insert(ks, class_key(STOP, 0), vec![3u8; 1024]).unwrap();
-    db.wal_writer.wal_tracker_barrier();
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-    let check = |db: &Db, phase: &str| {
-        let mut absent = 0;
-        for number in 0..rows {
-            let key = class_key(REMOVE, number);
-            let found = db.get(ks, &key).unwrap().is_some();
-            assert_eq!(
-                db.exists(ks, &key).unwrap(),
-                found,
-                "row {number} ({phase})"
-            );
-            absent += usize::from(!found);
-        }
-        assert!(absent > 0, "the pass must leave stale L1 entries ({phase})");
-    };
-    check(&db, "after the pass");
-    db.wait_for_background_threads_to_finish();
-    let db = open();
-    check(&db, "after reopen");
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-    check(&db, "after a second pass");
-    db.wait_for_background_threads_to_finish();
-}
-
-// A row of an auto-sharded cell lives only in an L1 shard when the pass
-// copies it. The relocation view must include the shards, and the relocated
-// copy must re-point the shard entry.
-//
-// Premise: the cell's L1 must be sharded before the pass starts. Only a
-// promote splits L1, and a promote writes only the entries below the cut the
-// requester captured (`FlushKind::Flush::cut`, filtered by `retain_processed`
-// in `flusher.rs`). A flush dispatched by the insert loop can therefore carry
-// a partial image, write L0 instead of promoting, and leave the split to
-// tracker timing. The rows stay below `max_dirty_keys`, so no flush runs
-// while they are written; the tracker barrier then pins the frontier past all
-// of them, and the rebuild dispatches one flush whose promote sees the whole
-// cell.
-fn sharded_cell_keeps_rows(filtered: bool) {
-    let mut config = Config::small();
-    config.frag_size = 64 * 1024;
-    config.wal_file_size = 2 * config.frag_size;
-    config.max_dirty_keys = 4096;
-    config.l0_max_entries = Some(16);
-    config.snapshot_unload_threshold = 0;
-    config.snapshot_written_bytes = u64::MAX;
-    config.with_index_auto_shard_threshold(1024);
-    let config = Arc::new(config);
-    let shape = if filtered {
-        keep_below_stop_shape(|key: &[u8], _: &[u8]| class_decision(key))
-    } else {
-        let mut builder = KeyShapeBuilder::new();
-        builder.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
-        builder.build()
-    };
-    let dir = tempdir::TempDir::new("wal_relocation_sharded").unwrap();
-    let open = |metrics| Db::open(dir.path(), shape.clone(), config.clone(), metrics).unwrap();
     let metrics = Metrics::new();
-    let db = open(metrics.clone());
+    let config = torn_frame_config();
+    let db = Db::open(
+        path,
+        torn_frame_key_shape(),
+        config.clone(),
+        metrics.clone(),
+    )
+    .unwrap();
     let ks = db.ks("k");
-    let value = vec![7u8; 1024];
-    db.insert(ks, class_key(KEEP, 0), value.clone()).unwrap();
-    let mut number = 0;
-    while db.wal_writer.position() < config.wal_file_size + config.frag_size {
-        db.insert(ks, class_key(REMOVE, number), value.clone())
+    let pad = db.ks("pad");
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    db.insert(ks, torn_frame_key(), torn_frame_value()).unwrap();
+    // Push the writer past two WAL files so the relocation target, a file
+    // boundary at or below the parked write, covers the key's file.
+    let mut i = 0u64;
+    while db.wal_writer.position() < 2 * config.wal_file_size {
+        db.insert(pad, i.to_be_bytes().to_vec(), torn_frame_pad_value())
             .unwrap();
-        number += 1;
+        i += 1;
     }
-    let mut batch = db.write_batch();
-    batch.write(ks, class_key(KEEP, 1), value.clone());
-    batch.write(ks, class_key(STOP, 0), value.clone());
-    batch.commit().unwrap();
-    // Rows written before the barrier: the KEEP 0 row, the REMOVE filler, and
-    // the two batch rows.
-    let bulk_rows = number as usize + 3;
-    assert!(
-        bulk_rows < config.max_dirty_keys,
-        "{bulk_rows} bulk rows must stay below max_dirty_keys={} so that no \
-         insert dispatches a flush from an older frontier",
-        config.max_dirty_keys,
-    );
-    let l0_threshold = config
-        .l0_max_entries
-        .expect("the fixture sets l0_max_entries");
-    assert!(
-        bulk_rows > l0_threshold,
-        "the promote needs more rows than l0_max_entries: {bulk_rows} rows, \
-         threshold {l0_threshold}",
-    );
-    // Pin the frontier past every row, then flush. The rebuild requests the
-    // flush with that pinned frontier, so the promote below it retains every
-    // row and the L1 image exceeds the shard threshold.
     db.wal_writer.wal_tracker_barrier();
-    db.force_rebuild_control_region().unwrap();
-    assert!(
-        metrics.l1_shard_split_total.with_label_values(&["k"]).get() > 0,
-        "the fixture must shard the cell's L1"
-    );
-    let first_file = dir.path().join(format!(
-        "wal_{:016x}",
-        db.wal.min_wal_position() / config.wal_file_size
-    ));
 
-    db.start_blocking_relocation_with_strategy(RelocationStrategy::WalBased);
-    assert_keep_rows(&db, &value, "after the pass");
+    // Park a writer between its WAL write and the row lock: its guard keeps
+    // the tracker frontier at its frame for the rest of the child's life.
+    let (latch, _latch_guard) = Latch::new();
+    db.large_table.fp.0.write().fp_insert_before_lock = FailPoint::latch(latch);
+    let written_before = metrics.wal_written_bytes.get();
+    let _parked = {
+        let db = db.clone();
+        thread::spawn(move || {
+            db.insert(pad, u64::MAX.to_be_bytes().to_vec(), vec![0u8; 8])
+                .unwrap()
+        })
+    };
+    // `Db::insert` publishes the frame offset right after the WAL write and
+    // before the failpoint, so a changed gauge means the write is in flight.
+    while metrics.wal_written_bytes.get() == written_before {
+        assert!(
+            Instant::now() < deadline,
+            "parked writer did not reach the WAL before the deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let torn_offset = metrics.wal_written_bytes.get() as u64;
+
+    // With the frontier pinned at the parked frame, the relocation must park
+    // in the tracker wait before indexing the copies. If it finishes instead,
+    // it indexed copies above the frontier, and the parent then fails to read
+    // the key.
+    let wait_requests_before = db.wal_writer.wait_requests_sent();
+    let relocation = {
+        let db = db.clone();
+        thread::spawn(move || db.start_blocking_relocation())
+    };
+    while !relocation.is_finished() && db.wal_writer.wait_requests_sent() == wait_requests_before {
+        assert!(
+            Instant::now() < deadline,
+            "relocation neither finished nor waited for the frontier"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    if relocation.is_finished() {
+        relocation.join().unwrap();
+        assert!(
+            metrics.relocation_kept.with_label_values(&["k"]).get() > 0,
+            "relocation must have copied the key"
+        );
+    }
+
+    // Tear the parked frame: its header never landed.
+    let layout = db.wal.layout();
+    let file = layout.wal_file_name(path, layout.locate_file(torn_offset));
+    let file = OpenOptions::new().write(true).open(file).unwrap();
+    file.write_all_at(
+        &[0u8; CrcFrame::CRC_HEADER_LENGTH],
+        torn_offset % config.wal_file_size,
+    )
+    .unwrap();
+    // Crash: `process::exit` runs no destructors, so nothing is flushed or
+    // closed on the way out.
+    std::process::exit(exit_code)
+}
+
+/// Index-based relocation of a keyspace of 16-byte keys indexed by `indexing`.
+/// Every key must read its value once the pass has reclaimed the WAL files
+/// holding the originals, and again after a reopen. The relocation filter must
+/// be called once per key with the full key, not the index key.
+fn index_based_relocation_with_key_indexing(indexing: KeyIndexing) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const KEY_LEN: usize = 16;
+    let dir = tempdir::TempDir::new("index_based_relocation_with_key_indexing").unwrap();
+    let mut config = Config::small();
+    config.wal_file_size = 2 * config.frag_size;
+    config.relocation_strategy = RelocationStrategy::IndexBased(None);
+    let config = force_unload_config(&config);
+    let filter_calls = Arc::new(AtomicU64::new(0));
+    let filter_short_keys = Arc::new(AtomicU64::new(0));
+    let ksc = KeySpaceConfig::new().with_relocation_filter({
+        let filter_calls = filter_calls.clone();
+        let filter_short_keys = filter_short_keys.clone();
+        move |key, _| {
+            filter_calls.fetch_add(1, Ordering::Relaxed);
+            if key.len() != KEY_LEN {
+                filter_short_keys.fetch_add(1, Ordering::Relaxed);
+            }
+            Decision::Keep
+        }
+    });
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config_indexing("k", indexing, 1, KeyType::uniform(1), ksc);
+    let key_shape = ksb.build();
+    // Both halves are unique per key, so either half works as a reduced key.
+    let key = |i: u64| -> Vec<u8> { [i.to_be_bytes(), (!i).to_be_bytes()].concat() };
+    let value = |i: u64| -> Vec<u8> { vec![(i % 251) as u8; 12 * 1024] };
+    let n = 600u64;
+    let check_all = |db: &Db, stage: &str| {
+        let ks = db.ks("k");
+        for i in 0..n {
+            assert_eq!(
+                db.get(ks, &key(i)).unwrap(),
+                Some(value(i).into()),
+                "key {i} {stage}"
+            );
+        }
+    };
+    {
+        let metrics = Metrics::new();
+        let db = Db::open(
+            dir.path(),
+            key_shape.clone(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+        let ks = db.ks("k");
+        let mut first_half_end = 0;
+        for i in 0..n {
+            db.insert(ks, key(i), value(i)).unwrap();
+            if i == n / 2 {
+                first_half_end = db.wal_writer.position();
+            }
+        }
+        db.rebuild_control_region().unwrap();
+        start_index_based_relocation(&db);
+        // The reads below must come from the copies.
+        assert!(
+            db.wal.min_wal_position() >= first_half_end,
+            "the pass must reclaim the originals of the first half of the keys \
+             (min WAL position {}, first half ends at {first_half_end})",
+            db.wal.min_wal_position()
+        );
+        assert_eq!(metrics.relocation_kept.with_label_values(&["k"]).get(), n);
+        assert_eq!(filter_calls.load(Ordering::Relaxed), n);
+        assert_eq!(filter_short_keys.load(Ordering::Relaxed), 0);
+        check_all(&db, "after the relocation pass");
+        // The index-based pass stores no control region after its GC; store
+        // one so the reopen reads the relocated copies through their blobs.
+        db.rebuild_control_region().unwrap();
+        db.wait_for_background_threads_to_finish();
+    }
+    let db = Db::open(dir.path(), key_shape, config, Metrics::new()).unwrap();
+    check_all(&db, "after reopen");
+}
+
+#[test]
+fn test_index_based_relocation_fixed_key_indexing() {
+    index_based_relocation_with_key_indexing(KeyIndexing::fixed(16));
+}
+
+#[test]
+fn test_index_based_relocation_hash_key_indexing() {
+    index_based_relocation_with_key_indexing(KeyIndexing::hash());
+}
+
+#[test]
+fn test_index_based_relocation_key_reduction_prefix() {
+    index_based_relocation_with_key_indexing(KeyIndexing::key_reduction(16, 0..8));
+}
+
+#[test]
+fn test_index_based_relocation_key_reduction_suffix() {
+    index_based_relocation_with_key_indexing(KeyIndexing::key_reduction(16, 8..16));
+}
+
+/// Key in `pad` at which the relocation filter stops a run.
+const STOP_MARKER: u64 = u64::MAX;
+
+/// Relocation filter of `pad` and `tail`: drops every record but
+/// `STOP_MARKER`, which stops the run there.
+fn drop_until_stop_marker(key: &[u8], _value: &[u8]) -> Decision {
+    if key == STOP_MARKER.to_be_bytes() {
+        Decision::StopRelocation
+    } else {
+        Decision::Remove
+    }
+}
+
+/// Key spaces `k`, which relocation copies, and `pad` and `tail`, which it
+/// drops (see `drop_until_stop_marker`). `tail` holds a few records only, so
+/// they stay in its cell's dirty overlay until a flush.
+fn copy_and_drop_key_shape() -> KeyShape {
+    let mut ksb = KeyShapeBuilder::new();
+    ksb.add_key_space_config("k", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
+    for name in ["pad", "tail"] {
+        ksb.add_key_space_config(
+            name,
+            8,
+            1,
+            KeyType::uniform(1),
+            KeySpaceConfig::new().with_relocation_filter(drop_until_stop_marker),
+        );
+    }
+    ksb.build()
+}
+
+const STRIPED_KEYS: u64 = 600;
+
+/// Every sixth key of `k` is overwritten, so every stripe holds both live
+/// records, which it copies and so grows the WAL, and dead versions.
+fn striped_key_overwritten(i: u64) -> bool {
+    i.is_multiple_of(6)
+}
+
+/// Records written to `tail` just before `STOP_MARKER`. The run's filter
+/// cutoff drops them from the index; nothing else does while their WAL file
+/// is still on disk.
+const TAIL_KEYS: u64 = 4;
+
+/// Asserts that no `tail` record written before `STOP_MARKER` is readable.
+fn assert_tail_records_dropped(db: &Db, label: &str) {
+    let tail = db.ks("tail");
+    for i in 0..TAIL_KEYS {
+        assert_eq!(
+            db.get(tail, &i.to_be_bytes()).unwrap(),
+            None,
+            "{label}: the filter cutoff must drop tail record {i}"
+        );
+    }
+}
+
+fn striped_value(i: u64, tag: u8) -> Vec<u8> {
+    let mut v = vec![(i % 251) as u8; 12 * 1000];
+    v[0] = tag;
+    v
+}
+
+/// Writes `STRIPED_KEYS` keys of `k` interleaved with `pad` records, then
+/// overwrites the keys `striped_key_overwritten` picks, so the WAL spans
+/// several files that each hold live records, dead versions and records the
+/// filter drops. Ends with `TAIL_KEYS` records in `tail` and then `STOP_MARKER`,
+/// where relocation runs stop.
+fn write_striped_relocation_data(db: &Db) {
+    let ks = db.ks("k");
+    let pad = db.ks("pad");
+    let tail = db.ks("tail");
+    for i in 0..STRIPED_KEYS {
+        db.insert(ks, i.to_be_bytes().to_vec(), striped_value(i, 1))
+            .unwrap();
+        db.insert(pad, i.to_be_bytes().to_vec(), striped_value(i, 0))
+            .unwrap();
+    }
+    for i in (0..STRIPED_KEYS).filter(|i| striped_key_overwritten(*i)) {
+        db.insert(ks, i.to_be_bytes().to_vec(), striped_value(i, 2))
+            .unwrap();
+    }
+    for i in 0..TAIL_KEYS {
+        db.insert(tail, i.to_be_bytes().to_vec(), vec![1u8; 8])
+            .unwrap();
+    }
+    db.insert(pad, STOP_MARKER.to_be_bytes().to_vec(), vec![0u8; 8])
+        .unwrap();
+    // A run reaches only up to the tracker's frontier, which trails the
+    // writes; without this barrier a run started now could stop short of
+    // `STOP_MARKER` and leave the `tail` records above its cutoff.
+    db.wal_writer.wal_tracker_barrier();
+}
+
+fn verify_striped_relocation_data(db: &Db, label: &str) {
+    let ks = db.ks("k");
+    for i in 0..STRIPED_KEYS {
+        let tag = if striped_key_overwritten(i) { 2 } else { 1 };
+        assert_eq!(
+            db.get(ks, &i.to_be_bytes()).unwrap(),
+            Some(striped_value(i, tag).into()),
+            "{label}: key {i}"
+        );
+    }
+}
+
+/// Parks a WAL-based relocation run at the failpoint after its first stripe
+/// and returns once it is parked. Dropping the returned guard lets the run
+/// continue.
+fn park_relocation_after_first_stripe(db: &Arc<Db>) -> (thread::JoinHandle<()>, LatchGuard) {
+    let (latch, latch_guard) = Latch::new();
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    db.large_table.fp.0.write().fp_relocation_after_stripe =
+        FailPoint::latch_counting(latch, arrivals.clone());
+    let relocation = {
+        let db = db.clone();
+        thread::spawn(move || db.start_blocking_relocation())
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while arrivals.load(Ordering::SeqCst) == 0 {
+        assert!(
+            !relocation.is_finished() && Instant::now() < deadline,
+            "relocation did not reach the end of its first stripe"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    (relocation, latch_guard)
+}
+
+/// A WAL-based run over several stripes stores a control region and reclaims
+/// the WAL below each stripe before it copies the next, so the copies of one
+/// stripe at most are held on top of their originals. The first stripe
+/// applies the filter cutoff for the whole run, and a later stripe's control
+/// region covers a cell written during the run that no stripe copies into.
+#[test]
+fn test_wal_relocation_reclaims_each_stripe_before_the_next() {
+    let dir = tempdir::TempDir::new("test_wal_relocation_stripes").unwrap();
+    // `small_config` makes each stripe one WAL file. Index files are not
+    // compacted, so only the stripe's unload threshold decides which dirty
+    // cells its control region flushes.
+    let mut config = Config::clone(&relocation_test_config(false));
+    config.index_min_occupancy_pct = 0;
+    let config = Arc::new(config);
+    let metrics = Metrics::new();
+    {
+        let db = Db::open(
+            dir.path(),
+            copy_and_drop_key_shape(),
+            config.clone(),
+            metrics.clone(),
+        )
+        .unwrap();
+        write_striped_relocation_data(&db);
+        let wal_file_size = db.wal.wal_file_size();
+
+        let (relocation, latch_guard) = park_relocation_after_first_stripe(&db);
+        let target = metrics.relocation_target_position.get() as u64;
+        assert!(
+            target >= 3 * wal_file_size,
+            "test setup must give a run of several stripes, target {target}"
+        );
+        assert_eq!(metrics.relocation_stripes.get(), 1);
+        assert_eq!(
+            db.wal.min_wal_position(),
+            wal_file_size,
+            "the first stripe must be reclaimed before the second one starts"
+        );
+        verify_striped_relocation_data(&db, "between stripes");
+        assert_tail_records_dropped(&db, "between stripes");
+        // A write above the run's frontier, to a cell that has on-disk
+        // levels and that no later stripe copies into: the next stripe's
+        // control region must still flush it, or replay after a crash would
+        // start below it.
+        let late_write_start = db.wal_writer.position();
+        db.insert(
+            db.ks("pad"),
+            STRIPED_KEYS.to_be_bytes().to_vec(),
+            vec![2u8; 8],
+        )
+        .unwrap();
+
+        drop(latch_guard);
+        relocation.join().unwrap();
+        assert_eq!(metrics.relocation_stripes.get(), target / wal_file_size);
+        assert_eq!(db.wal.min_wal_position(), target);
+        assert_tail_records_dropped(&db, "after relocation");
+        let replay_from = db.control_region_store.lock().last_position().as_u64();
+        assert!(
+            replay_from > late_write_start,
+            "replay must start above the write made between stripes, \
+             replay_from {replay_from}, write at {late_write_start}"
+        );
+        verify_striped_relocation_data(&db, "after relocation");
+        db.wait_for_background_threads_to_finish();
+    }
+    let db = Db::open(
+        dir.path(),
+        copy_and_drop_key_shape(),
+        config,
+        Metrics::new(),
+    )
+    .unwrap();
+    verify_striped_relocation_data(&db, "after reopen");
+    assert_tail_records_dropped(&db, "after reopen");
     assert_eq!(
-        db.get(ks, &class_key(REMOVE, 0)).unwrap().is_some(),
-        !filtered
+        db.get(db.ks("pad"), &STRIPED_KEYS.to_be_bytes()).unwrap(),
+        Some(vec![2u8; 8].into()),
+        "after reopen: the write made between stripes"
     );
-    db.wait_for_background_threads_to_finish();
-    assert!(!first_file.exists(), "the pass must reclaim the first file");
-
-    let db = open(Metrics::new());
-    assert_keep_rows(&db, &value, "after reopen");
-    db.wait_for_background_threads_to_finish();
 }
 
+/// A crash between two stripes keeps the first one: the reopened database
+/// reads every key, the WAL below the first stripe stays reclaimed, and the
+/// next run carries on from there. The child process parks a run after its
+/// first stripe, waits for the stripe's WAL file to be unlinked and exits
+/// without closing the database.
 #[test]
-fn test_wal_relocation_keeps_keep_row_in_sharded_cell() {
-    sharded_cell_keeps_rows(true);
+fn test_wal_relocation_crash_between_stripes_keeps_progress() {
+    use std::process::Command;
+
+    const CHILD_DB_PATH: &str = "TIDEHUNTER_TEST_STRIPE_CRASH_DB_PATH";
+    const CHILD_EXIT_CODE: i32 = 38;
+    if let Some(path) = std::env::var_os(CHILD_DB_PATH) {
+        stripe_crash_child(Path::new(&path), CHILD_EXIT_CODE);
+    }
+
+    let dir = tempdir::TempDir::new("test_wal_relocation_stripe_crash").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "relocation::relocation_tests::test_wal_relocation_crash_between_stripes_keeps_progress",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(CHILD_DB_PATH, dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(CHILD_EXIT_CODE),
+        "child did not reach its crash point\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metrics = Metrics::new();
+    let db = Db::open(
+        dir.path(),
+        copy_and_drop_key_shape(),
+        relocation_test_config(false),
+        metrics.clone(),
+    )
+    .unwrap();
+    let wal_file_size = db.wal.wal_file_size();
+    assert_eq!(
+        db.wal.min_wal_position(),
+        wal_file_size,
+        "the stripe stored before the crash must stay reclaimed"
+    );
+    verify_striped_relocation_data(&db, "after crash");
+    assert_tail_records_dropped(&db, "after crash");
+
+    db.start_blocking_relocation();
+    assert!(metrics.relocation_stripes.get() >= 2);
+    assert!(db.wal.min_wal_position() > 2 * wal_file_size);
+    verify_striped_relocation_data(&db, "after the next run");
 }
 
-#[test]
-fn test_wal_relocation_keeps_rows_in_sharded_unfiltered_cell() {
-    sharded_cell_keeps_rows(false);
+/// The child half of `test_wal_relocation_crash_between_stripes_keeps_progress`.
+/// Exits the process with `exit_code` instead of returning.
+fn stripe_crash_child(path: &Path, exit_code: i32) -> ! {
+    let db = Db::open(
+        path,
+        copy_and_drop_key_shape(),
+        relocation_test_config(false),
+        Metrics::new(),
+    )
+    .unwrap();
+    write_striped_relocation_data(&db);
+    let (_relocation, _latch_guard) = park_relocation_after_first_stripe(&db);
+    // GC hands the unlink to a background worker; wait for it so the parent
+    // sees the file gone rather than reclaiming it again on open.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while list_wal_files(path)
+        .iter()
+        .any(|name| name == "wal_0000000000000000")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the first stripe's WAL file was not unlinked"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Crash: `process::exit` runs no destructors, so nothing is flushed or
+    // closed on the way out.
+    std::process::exit(exit_code)
 }

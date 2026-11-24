@@ -35,13 +35,13 @@
 //! Lives in its own module so `db.rs` doesn't carry the loop body.
 
 use crate::compressed_batch::{InnerIter, decompress_wal_entry};
-use crate::context::KsContextVec;
 use crate::db::{DbError, WalEntry};
 use crate::key_shape::KeyShape;
 use crate::large_table::{LargeTable, Loader};
 use crate::metrics::Metrics;
 use crate::replay_buffer::ReplayBuffer;
 use crate::wal::position::{IndexPosition, WalPosition};
+use crate::wal::tracker::SharedLastProcessed;
 use crate::wal::{WalError, WalIterator, WalWriter};
 
 /// One unit of replay input, already decoded into a [`WalEntry`]. `P` is the
@@ -80,7 +80,6 @@ pub(crate) trait ReplaySource<P: IndexPosition> {
 #[derive(Debug)]
 pub(crate) enum ReplayError<E> {
     Source(E),
-    Db(DbError),
 }
 
 impl<E> ReplayError<E> {
@@ -93,7 +92,6 @@ impl<E> ReplayError<E> {
     {
         match self {
             Self::Source(error) => error.into(),
-            Self::Db(error) => error,
         }
     }
 }
@@ -102,7 +100,6 @@ impl<E: std::fmt::Display> std::fmt::Display for ReplayError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "replay source failed: {error}"),
-            Self::Db(error) => write!(f, "replay apply failed: {error:?}"),
         }
     }
 }
@@ -111,12 +108,21 @@ impl<E: std::fmt::Display> std::fmt::Display for ReplayError<E> {
 ///
 /// Replay stops at the first bad CRC or at the end of the WAL, which is the
 /// native recovery contract: a tail that does not verify is not applied.
-impl ReplaySource<WalPosition> for WalIterator {
+///
+/// The iterator alone is not the source: the writer it becomes must publish
+/// its externally observed `last_processed` into the handle the key space
+/// contexts were built on, or a reader would never see replay's progress.
+pub(crate) struct WalReplaySource {
+    pub(crate) iterator: WalIterator,
+    pub(crate) last_processed: SharedLastProcessed,
+}
+
+impl ReplaySource<WalPosition> for WalReplaySource {
     type Error = WalError;
     type Output = WalWriter;
 
     fn next(&mut self) -> Result<Option<ReplayFrame<WalPosition>>, Self::Error> {
-        let (position, raw_entry) = match WalIterator::next(self) {
+        let (position, raw_entry) = match WalIterator::next(&mut self.iterator) {
             Ok(frame) => frame,
             Err(WalError::Crc(_) | WalError::EndOfWal) => return Ok(None),
             Err(error) => return Err(error),
@@ -128,12 +134,14 @@ impl ReplaySource<WalPosition> for WalIterator {
     }
 
     fn finish(self, cutoff: Option<WalPosition>) -> Result<Self::Output, Self::Error> {
-        Ok(self.into_writer(cutoff.map(|position| position.offset())))
+        Ok(self.iterator.into_writer_with_last_processed(
+            cutoff.map(|position| position.offset()),
+            self.last_processed,
+        ))
     }
 }
 
 pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Position = P> + Sync>(
-    contexts: &KsContextVec,
     large_table: &LargeTable<P>,
     key_shape: &KeyShape,
     mut source: S,
@@ -189,7 +197,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
             match entry {
                 WalEntry::Record(ks, k, _v, relocated) => {
                     metrics.replayed_wal_records.inc();
-                    let context = contexts.ks_context(ks);
+                    let context = large_table.ks_context(ks);
                     if !relocated && !context.destroyed() {
                         let reduced_key = context.ks_config.reduced_key_bytes(k);
                         let cell = context.ks_config.cell_id(&reduced_key);
@@ -198,7 +206,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                 }
                 WalEntry::Remove(ks, k) => {
                     metrics.replayed_wal_records.inc();
-                    let context = contexts.ks_context(ks);
+                    let context = large_table.ks_context(ks);
                     if !context.destroyed() {
                         let reduced_key = context.ks_config.reduced_key_bytes(k);
                         let cell = context.ks_config.cell_id(&reduced_key);
@@ -223,7 +231,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                     // Nothing needs to be done for the relocated record
                     continue;
                 }
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -236,7 +244,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
             }
             WalEntry::Remove(ks, k) => {
                 metrics.replayed_wal_records.inc();
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -251,7 +259,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
             }
             WalEntry::DropCells(ks, from_cell, to_cell) => {
                 metrics.replayed_wal_records.inc();
-                let context = contexts.ks_context(ks);
+                let context = large_table.ks_context(ks);
                 if context.destroyed() {
                     continue;
                 }
@@ -260,9 +268,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                 // cells exist as Unloaded entries from a CR snapshot loaded
                 // at replay start).
                 buffer.drop_cells_in_range(ks, &from_cell, &to_cell);
-                large_table
-                    .drop_cells_in_range(context, &from_cell, &to_cell)
-                    .map_err(ReplayError::Db)?;
+                large_table.drop_cells_in_range(context, &from_cell, &to_cell);
             }
             entry @ WalEntry::CompressedBatch(..) => {
                 // A compressed batch is one durable WAL frame — either it
@@ -274,7 +280,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                     metrics.replayed_wal_records.inc();
                     match inner {
                         WalEntry::Record(ks, key, _value, _relocated) => {
-                            let context = contexts.ks_context(ks);
+                            let context = large_table.ks_context(ks);
                             if context.destroyed() {
                                 continue;
                             }
@@ -283,7 +289,7 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                             buffer.insert(ks, cell, reduced_key, position);
                         }
                         WalEntry::Remove(ks, key) => {
-                            let context = contexts.ks_context(ks);
+                            let context = large_table.ks_context(ks);
                             if context.destroyed() {
                                 continue;
                             }

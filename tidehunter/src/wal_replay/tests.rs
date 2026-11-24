@@ -49,7 +49,6 @@ impl<P: IndexPosition> ReplaySource<P> for Scripted<P> {
 
 struct Fixture<P: IndexPosition> {
     shape: KeyShape,
-    contexts: KsContextVec,
     table: LargeTable<P>,
     loader: CadenceLoader<P>,
     metrics: Arc<Metrics>,
@@ -67,13 +66,11 @@ impl<P: IndexPosition> Fixture<P> {
             config.clone(),
             IndexFlusher::new_unstarted_for_test(),
             metrics.clone(),
+            SharedLastProcessed::default(),
             &loader,
-            Arc::default(),
         );
-        let contexts = KsContextVec::new(&shape, config, metrics.clone());
         Self {
             shape,
-            contexts,
             table,
             loader,
             metrics,
@@ -82,7 +79,6 @@ impl<P: IndexPosition> Fixture<P> {
 
     fn replay(&self, frames: Vec<ReplayFrame<P>>) -> Option<P> {
         replay_wal(
-            &self.contexts,
             &self.table,
             &self.shape,
             Scripted::new(frames),

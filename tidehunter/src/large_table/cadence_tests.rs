@@ -28,8 +28,8 @@ fn reopened<P: IndexPosition>(
         Arc::new(Config::small()),
         IndexFlusher::new_unstarted_for_test(),
         Metrics::new(),
+        SharedLastProcessed::default(),
         loader,
-        Arc::default(),
     )
 }
 
@@ -127,8 +127,8 @@ fn live_insert_takes_the_loader_cadence_on_first_dirtying_only() {
         Arc::new(Config::small()),
         IndexFlusher::new_unstarted_for_test(),
         Metrics::new(),
+        SharedLastProcessed::default(),
         &loader,
-        Arc::default(),
     );
     let context = table.ks_context(KeySpace::first());
     let write = |offset| {
@@ -153,12 +153,12 @@ fn live_insert_takes_the_loader_cadence_on_first_dirtying_only() {
     );
 }
 
-/// A clean cell's frontier only advances at a snapshot. A loader that reports
-/// a lower cut than the cell already stores (a versioned engine inside its
-/// pinned-NONE window: `CadenceLoader::last_processed` is `NONE`) must not
-/// drag the cell, and with it `replay_from`, back below what is stored.
+/// A clean cell's stored frontier is left alone by a snapshot, and the
+/// snapshot's `replay_from` is the minimum of that frontier and the loader's
+/// cut read before the walk: the frontier bounds the writes the walk cannot
+/// see, so it may only make replay conservative, never skip a write.
 #[test]
-fn snapshot_never_lowers_a_clean_cells_frontier() {
+fn snapshot_leaves_a_clean_cell_frontier_and_bounds_replay_from() {
     let shape = shape();
     let loader = CadenceLoader::<TestPosition>::new(|cut| cut.0);
     let table = reopened(&shape, TestCut(40), &loader);
@@ -171,5 +171,10 @@ fn snapshot_never_lowers_a_clean_cells_frontier() {
         .next()
         .expect("the shape has one cell");
     assert_eq!(cell.last_processed, TestCut(40));
-    assert_eq!(snapshot.replay_from, TestCut(40));
+    assert_eq!(
+        snapshot.replay_from,
+        TestCut::NONE,
+        "the loader's cut ({:?}) is below the cell's, so it bounds replay_from",
+        loader.last_processed()
+    );
 }

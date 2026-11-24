@@ -714,7 +714,6 @@ pub(crate) fn replay_pages<P: OwnerPages>(
     .map_err(LocalDbError::component)?;
     let replay_started = std::time::Instant::now();
     let outcome = crate::wal_replay::replay_wal(
-        table.contexts(),
         table.large_table(),
         table.shape(),
         source,

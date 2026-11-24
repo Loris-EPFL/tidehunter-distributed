@@ -191,6 +191,14 @@ impl HybridIndexConfig {
             index_auto_shard_threshold: self.index_auto_shard_threshold,
             batch_codec: None,
             compressed_batch_cache_bytes: None,
+            // The coordinator has no index blob cache: its index blobs are
+            // read once per relocation pass, not repeatedly.
+            index_blob_cache_bytes: None,
+            index_blob_cache_min_bytes: 64 * 1024 * 1024,
+            // Native striped relocation is the single-node `Db` path; the
+            // hybrid runs its own relocation pass, so the native value is
+            // never read.
+            relocation_stripe_bytes: 64 * 1024 * 1024 * 1024,
         }
     }
 

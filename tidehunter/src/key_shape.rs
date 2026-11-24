@@ -698,6 +698,9 @@ impl KeySpaceConfig {
         self
     }
 
+    /// Whether an iterator walks an unloaded cell from its on-disk levels
+    /// (the default) or loads the cell first. A disabled unloaded iterator
+    /// still walks a cell unloaded while an async flush of it is in flight.
     pub fn with_unloaded_iterator(mut self, enabled: bool) -> Self {
         self.unloaded_iterator = enabled;
         self
@@ -958,7 +961,7 @@ impl KeySpace {
     }
 
     /// Index for slice-based per-keyspace storage. Crate-internal — matches
-    /// the layout used by `KsContextVec` and friends.
+    /// the layout of `LargeTable`'s per-keyspace tables.
     pub(crate) fn index(&self) -> usize {
         self.0 as usize
     }

@@ -148,8 +148,8 @@ impl<P: IndexPosition> Fixture<P> {
             Arc::new(Config::small()),
             IndexFlusher::new(vec![sender], Metrics::new()),
             Metrics::new(),
+            SharedLastProcessed::default(),
             &loader,
-            Arc::default(),
         );
         Self {
             shape,
@@ -211,10 +211,11 @@ impl<P: IndexPosition> Fixture<P> {
     fn run_and_complete(&self, command: &IndexFlushCommand<P>, live_at_run: u64) {
         self.set_live(live_at_run);
         let (original, new_levels) =
-            handle_command(&self.loader, command, self.context(), None, None)
+            handle_command(&self.loader, command, self.context(), RelocationFlush::None)
                 .expect("a dirty flush produces levels");
-        self.table
-            .update_flushed_index(self.context(), &self.cell(), original, new_levels);
+        let _dropped =
+            self.table
+                .update_flushed_index(self.context(), &self.cell(), original, new_levels);
     }
 
     fn state(&self) -> String {
@@ -446,8 +447,8 @@ fn reopen_from(
             Arc::new(Config::small()),
             IndexFlusher::new(vec![sender], Metrics::new()),
             Metrics::new(),
+            SharedLastProcessed::default(),
             &fixture.loader,
-            Arc::default(),
         ),
         loader: MovingFrontierLoader {
             disk: parking_lot::Mutex::new(fixture.loader.disk.lock().clone()),

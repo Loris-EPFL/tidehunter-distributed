@@ -2,7 +2,7 @@
 //! index (relocation / compaction of a versioned engine), not a write.
 
 use super::*;
-use crate::background_health::BackgroundThread;
+use crate::db::DbError;
 use crate::failpoints::FailPoint;
 use crate::flusher::{FlushKind, FlusherCommand};
 use crate::index::levels::IndexLevels;
@@ -87,7 +87,6 @@ const FRONTIER: u64 = 40;
 struct Fixture {
     table: LargeTable,
     loader: DiskLoader,
-    health: Arc<BackgroundHealth>,
 }
 
 impl Fixture {
@@ -96,7 +95,6 @@ impl Fixture {
     fn reopened() -> Self {
         let shape = KeyShape::new_single(8, 1, KeyType::uniform(1));
         let loader = DiskLoader::new();
-        let health = Arc::<BackgroundHealth>::default();
         let blob = IndexLevels::single(WalPosition::test_value(1));
         let entry = SnapshotEntryData::from_levels(blob, LastProcessed::new(FRONTIER));
         let table = LargeTable::from_unloaded(
@@ -105,14 +103,10 @@ impl Fixture {
             Arc::new(Config::small()),
             IndexFlusher::new_unstarted_for_test(),
             Metrics::new(),
+            SharedLastProcessed::default(),
             &loader,
-            health.clone(),
         );
-        Self {
-            table,
-            loader,
-            health,
-        }
+        Self { table, loader }
     }
 
     fn context(&self) -> &KsContext {
@@ -159,8 +153,8 @@ fn empty_cell_is_absent_and_is_not_touched() {
         Arc::new(Config::small()),
         IndexFlusher::new_unstarted_for_test(),
         Metrics::new(),
+        SharedLastProcessed::default(),
         &loader,
-        Arc::default(),
     );
     let context = table.ks_context(KeySpace::first());
     let cell = context.ks_config.cell_id(&key(1));
@@ -217,7 +211,7 @@ fn changed_cell_is_marked_dirty_and_the_flusher_writes_it() {
     fixture
         .table
         .with_entry_for_test(fixture.context(), &fixture.cell(), |entry| {
-            entry.sync_flush(&fixture.loader, false, None, None)
+            entry.sync_flush(&fixture.loader, RelocationFlush::None)
         })
         .expect("the flush succeeds");
     let flushed = fixture.loader.flushed.lock();
@@ -270,26 +264,6 @@ fn loader_failure_maps_to_the_loader_error() {
         "Unloaded",
         "a failed load leaves the cell as it was"
     );
-}
-
-#[test]
-fn background_failure_maps_to_the_background_error() {
-    let fixture = Fixture::reopened();
-    fixture
-        .health
-        .record_error(BackgroundThread::Flusher, &DbError::CrCorrupted);
-    let mut ran = false;
-    let error = fixture
-        .update(|_| {
-            ran = true;
-            ((), false)
-        })
-        .expect_err("the table is failed");
-    assert!(matches!(
-        error,
-        CellUpdateError::Background(DbError::BackgroundFailure(_))
-    ));
-    assert!(!ran);
 }
 
 // ---- a re-point racing an async flush -------------------------------------
@@ -392,8 +366,8 @@ impl InFlight {
             Arc::new(Config::small()),
             IndexFlusher::new(vec![sender], Metrics::new()),
             Metrics::new(),
+            SharedLastProcessed::default(),
             &loader,
-            Arc::default(),
         );
         let (notify, waiting) = mpsc::channel();
         let first_wait = AtomicBool::new(true);
