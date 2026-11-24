@@ -69,7 +69,10 @@ LIVE_NVMEOF_EXTRA_FIELDS = (
     "owner_drain_stop_empty", "owner_drain_stop_allocated", "owner_drain_stop_fence",
     "owner_drain_stop_limit", "owner_drain_stop_credit", "leased_submit_ready_left",
     "leased_submit_ready_left_batches", "leased_submit_ready_left_full",
-    "leased_submit_ready_left_full_batches", "leased_deferred_submits")
+    "leased_submit_ready_left_full_batches", "leased_deferred_submits",
+    # W1 write resume: monotonic attempt, rewrite, frame and refusal counts
+    # (fetch_add in live_metrics.rs), so they are measurement deltas too.
+    "resume_attempts", "resume_rewrites", "resume_frames", "resume_refused")
 LIVE_NVMEOF_EXTRA_STAGES = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
                             "extent_switch", "adoption_async", "adoption_settle")
 # Lifetime maxima (gauge peaks): exported as boundary snapshots, never as deltas.

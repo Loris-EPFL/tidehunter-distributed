@@ -101,6 +101,7 @@ pub(super) fn coordinator_config(
         write_profile_limit: 0,
         // No scheduler-starvation lapses in fixtures; lapse tests set their own.
         coordinator_lease_ms: 30_000,
+        resume_transient_writes: true,
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
         index: Default::default(),

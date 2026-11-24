@@ -3,7 +3,11 @@
 use super::LiveQueueGeometry;
 use serde::{Deserialize, Serialize};
 
+mod resume;
+mod resume_reaper;
 mod write_accounting;
+pub(crate) use resume::BreakKind;
+pub(crate) use resume_reaper::ResumeReaper;
 pub(crate) use write_accounting::LiveGroupBudget;
 use write_accounting::record_write_io;
 
@@ -92,6 +96,12 @@ pub struct LiveClientConfig {
 fn default_inline_reads() -> bool {
     true
 }
+
+/// Retained frame bytes per owner worker: two write windows, so one adoption
+/// round plus one window of payload is the most a resume can need (D-W1-3).
+const RESUME_RETAIN_WINDOWS: usize = 2;
+/// Hard cap on retained frame bytes per owner worker.
+const RESUME_RETAIN_CAP: usize = 64 * 1024 * 1024;
 
 impl LiveClientConfig {
     /// Physical frame threshold selected from the F6b large/small-frame crossover.
@@ -320,6 +330,33 @@ pub(crate) enum LeasedSubmit {
     Deferred(Vec<super::CompleteBatch>),
 }
 
+/// One write of one encoded frame: the identity its CQE returns, where it lands,
+/// how much it covers, and the barrier and deadline it is submitted with.
+#[derive(Clone, Copy)]
+struct FrameWrite {
+    id: u64,
+    offset: u64,
+    len: usize,
+    sync: crate::distributed::nvmeof::live_io::LiveWriteSync,
+    deadline: Instant,
+}
+
+/// One submitted frame that the owner has not adopted yet, kept so a resume can
+/// rewrite it as identical bytes at its identical offset (W1). The group is
+/// retained instead of its encoded bytes: re-encoding is deterministic and
+/// costs no hot-path copy, and the owner's receipt digest proves the identity.
+struct RetainedFrame {
+    /// The extent grant that owns these bytes; it names the binding a rewrite
+    /// opens and keeps two extents' frames apart during a rollover.
+    token: [u8; 16],
+    start: u64,
+    end: u64,
+    /// The sync the original submission used, so a resent `synchronous` frame
+    /// still implies the same barrier before its receipt is released.
+    durable_at_completion: bool,
+    frame: crate::distributed::group::LiveFrame,
+}
+
 /// The existing per-owner worker owns this state, with no additional lock.
 #[derive(Default)]
 pub(super) struct LeasedWriter {
@@ -343,8 +380,32 @@ pub(super) struct LeasedWriter {
     worker_wake: Option<std::os::fd::RawFd>,
     worker_wake_registered: bool,
     queue_rebound: bool,
+    /// Frames submitted but not yet adopted, oldest first. Bound:
+    /// `resume_retain_bytes`; full retention turns the next submission into
+    /// `LeasedSubmit::Deferred`, never into an unbounded queue.
+    retained: std::collections::VecDeque<RetainedFrame>,
+    retained_bytes: usize,
+    /// A detached queue the reaper could not take. It is never dropped on the
+    /// worker thread: `take_failed_writer` hands it to the shutdown drain.
+    undrained: Option<LiveWriteQueue>,
+    /// A resume detached the queue that owned the flights still in the deque,
+    /// so no live DMA belongs to any flight. Cleared when a new frame is
+    /// submitted, because that frame's CQE the new queue owes.
+    queue_detached: bool,
+    /// A resume is not re-entrant: it runs on the worker thread, inside the one
+    /// client guard of the operation that broke.
+    resuming: bool,
+    /// Resumes without a frame submitted and adopted between them.
+    resume_consecutive: u32,
+    /// The last failure of this client came from a resume that refused or
+    /// failed, so the worker names that stage instead of the operation's own.
+    resume_failed: bool,
+    #[cfg(test)]
+    resume_retain_bytes: Option<usize>,
     #[cfg(test)]
     next_write_result: Option<i32>,
+    #[cfg(test)]
+    next_submit_result: Option<i32>,
     #[cfg(test)]
     delay_write: bool,
     #[cfg(test)]
@@ -448,6 +509,11 @@ impl super::Client {
 
     /// Transfer failed DMA ownership without waiting under the client mutex.
     pub(crate) fn take_failed_live_writer(&mut self) -> Option<LiveWriteQueue> {
+        // A queue a resume detached but could not hand over comes first: only
+        // the shutdown drain may wait for its DMA.
+        if let Some(queue) = self.live_leased.undrained.take() {
+            return Some(queue);
+        }
         if !self.live_write_failed {
             return None;
         }
@@ -788,6 +854,19 @@ impl LeasedWriter {
     }
 
     fn recycle(&mut self, mut extent: ExtentState) {
+        // A closed extent adopted its whole prefix, so its retained frames were
+        // pruned already; drop any residue so a later resume cannot rewrite a
+        // grant that no longer exists.
+        let token = extent.lease.extent.token;
+        let mut dropped = 0usize;
+        self.retained.retain(|frame| {
+            let keep = frame.token != token;
+            if !keep {
+                dropped += frame.frame.len();
+            }
+            keep
+        });
+        self.retained_bytes = self.retained_bytes.saturating_sub(dropped);
         extent.prefixes.clear();
         let index = if self.prefix_buffers[0].capacity() == 0 {
             0
@@ -889,6 +968,12 @@ impl super::Client {
         pending: PendingAdoption,
         reply: &super::LiveAdopted,
     ) -> Result<(), super::TcpError> {
+        let previous = match pending.target {
+            PendingTarget::Current => self.live_leased.current.as_ref(),
+            PendingTarget::Closing => self.live_leased.closing.as_ref(),
+            PendingTarget::Prelease => None,
+        }
+        .map_or(0, |extent| extent.adopted.end);
         let extent = match pending.target {
             PendingTarget::Current => self.live_leased.current.as_mut(),
             PendingTarget::Closing => self.live_leased.closing.as_mut(),
@@ -900,10 +985,17 @@ impl super::Client {
         if result.is_err() {
             self.live_write_failed = true;
         }
-        if result.is_ok()
-            && let Some(counters) = &self.live_counters
-        {
-            counters.record_adopt_profile(reply.profile);
+        if result.is_ok() {
+            let adopted_end = reply.adoption.adopted_end;
+            self.prune_retained(reply.adoption.token, adopted_end);
+            if adopted_end > previous {
+                // A frame the owner adopted proves the last resume healed the
+                // path, so a later flap starts from a fresh budget.
+                self.live_leased.resume_consecutive = 0;
+            }
+            if let Some(counters) = &self.live_counters {
+                counters.record_adopt_profile(reply.profile);
+            }
         }
         #[cfg(test)]
         if result.is_ok()
@@ -1166,9 +1258,11 @@ impl super::Client {
         released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
         timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
     ) -> Result<(), super::TcpError> {
-        let result = self
-            .drain_leased_flights(released, timeline)
-            .and_then(|()| self.wait_leased_adoption());
+        let result = self.leased_step(BreakKind::Session, |client| {
+            client
+                .drain_leased_flights(released, timeline)
+                .and_then(|()| client.wait_leased_adoption())
+        });
         if result.is_err() {
             self.live_write_failed = true;
         }
@@ -1182,10 +1276,14 @@ impl super::Client {
     ) -> Result<(), super::TcpError> {
         let started = Instant::now();
         let has_extent = self.live_leased.current.is_some();
-        let result = self
-            .drain_leased_flights(released, timeline)
-            .and_then(|()| self.wait_closing_extent(false))
-            .and_then(|()| self.adopt_leased_sync(false, false));
+        // The sequence is idempotent, so a transient break resumes once and
+        // runs it again from the owner's real frontier.
+        let result = self.leased_step(BreakKind::Session, |client| {
+            client
+                .drain_leased_flights(released, timeline)
+                .and_then(|()| client.wait_closing_extent(false))
+                .and_then(|()| client.adopt_leased_sync(false, false))
+        });
         if result.is_err() {
             self.live_write_failed = true;
         } else if has_extent && let Some(counters) = &self.live_counters {
@@ -1203,23 +1301,23 @@ impl super::Client {
         released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
         timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
     ) -> Result<(), super::TcpError> {
-        let result = (|| {
-            self.ensure_leased_healthy()?;
-            self.drain_leased_flights(released, timeline)?;
-            self.wait_closing_extent(false)?;
-            self.wait_leased_adoption()?;
-            if self.live_leased.current.is_none() {
+        let result = self.leased_step(BreakKind::Session, |client| {
+            client.ensure_leased_healthy()?;
+            client.drain_leased_flights(released, timeline)?;
+            client.wait_closing_extent(false)?;
+            client.wait_leased_adoption()?;
+            if client.live_leased.current.is_none() {
                 return Ok(());
             }
-            self.write_leased_skip()?;
-            self.adopt_leased_sync(true, false)?;
-            if let Some(next) = self.live_leased.next.take() {
-                self.live_leased.install(next, &self.expected);
-                self.write_leased_skip()?;
-                self.adopt_leased_sync(true, false)?;
+            client.write_leased_skip()?;
+            client.adopt_leased_sync(true, false)?;
+            if let Some(next) = client.live_leased.next.take() {
+                client.live_leased.install(next, &client.expected);
+                client.write_leased_skip()?;
+                client.adopt_leased_sync(true, false)?;
             }
             Ok(())
-        })();
+        });
         if result.is_err() {
             self.live_write_failed = true;
         }
@@ -1227,16 +1325,12 @@ impl super::Client {
     }
 
     fn ensure_leased_queue(&mut self) -> Result<(), super::TcpError> {
-        use crate::distributed::nvmeof::{
-            live_connect::LiveConnectTarget, live_io::LiveIo, live_namespace::LiveNamespaceAccess,
-        };
-        use std::time::{Duration, Instant};
         let leased = self
             .live_leased
             .current
             .as_ref()
+            .map(|extent| extent.lease.clone())
             .ok_or_else(|| super::TcpError::new("live leased extent missing"))?;
-        let leased = &leased.lease;
         if self
             .live_writer
             .as_ref()
@@ -1244,20 +1338,34 @@ impl super::Client {
         {
             return Ok(());
         }
-        debug_assert!(self.live_leased.flights.is_empty());
-        if !self.live_leased.flights.is_empty() {
-            return Err(super::TcpError::new(
-                "leased queue rebind with writes in flight",
-            ));
+        if self.live_writer.is_some() {
+            // Replacing a queue that still owns DMA is safe only when nothing
+            // waits on it. After a resume detached that queue, no flight is
+            // owed a CQE by the one now bound, so the check does not apply.
+            if !self.live_leased.queue_detached {
+                debug_assert!(self.live_leased.flights.is_empty());
+                if !self.live_leased.flights.is_empty() {
+                    return Err(super::TcpError::new(
+                        "leased queue rebind with writes in flight",
+                    ));
+                }
+            }
+            self.live_leased.queue_rebound = true;
+            self.drain_live_queue()?;
         }
-        self.live_leased.queue_rebound = self.live_writer.is_some();
-        self.drain_live_queue()?;
-        let leased = self
-            .live_leased
-            .current
-            .as_ref()
-            .ok_or_else(|| super::TcpError::new("live leased extent missing"))?;
-        let leased = &leased.lease;
+        self.open_leased_queue_with(&leased)
+    }
+
+    /// Open a write queue on `leased`'s binding. No flight deque precondition:
+    /// the caller owns the decision that no live DMA remains on an older queue.
+    fn open_leased_queue_with(
+        &mut self,
+        leased: &super::LiveLeased,
+    ) -> Result<(), super::TcpError> {
+        use crate::distributed::nvmeof::{
+            live_connect::LiveConnectTarget, live_io::LiveIo, live_namespace::LiveNamespaceAccess,
+        };
+        use std::time::{Duration, Instant};
         let binding = &leased.binding;
         let config = self
             .live_config
@@ -1447,54 +1555,112 @@ impl super::Client {
         }
     }
 
+    /// Submit one encoded frame, resuming the write path once if the
+    /// submission hits a transient transport break (W1). The retry reuses the
+    /// same offset and cursor: the failed frame never advanced either.
     fn submit_leased_frame(
         &mut self,
         offset: u64,
         len: usize,
         queue_empty: bool,
-        encode: impl FnOnce(&mut [u8]) -> Result<(), super::TcpError>,
+        encode: impl Fn(&mut [u8]) -> Result<(), super::TcpError>,
         trace: Option<(
             &crate::distributed::write_timeline::WriteTimeline,
             crate::distributed::write_timeline::LiveGroupSample,
         )>,
     ) -> Result<(u64, Instant, Instant, bool), super::TcpError> {
-        use crate::distributed::nvmeof::live_io::{LiveIoError, LiveSubmitOutcome, LiveWriteSync};
-        use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
+        use crate::distributed::nvmeof::live_io::LiveWriteSync;
         self.check_lease()?;
         self.ensure_leased_healthy()?;
-        self.ensure_leased_queue()?;
-        let config = self
-            .live_config
-            .as_ref()
-            .ok_or_else(|| super::TcpError::new("live config missing"))?;
-        let deadline = Instant::now() + std::time::Duration::from_millis(config.io_timeout_ms);
-        let id = self
-            .live_leased
-            .next_flight_id
-            .checked_add(1)
-            .ok_or_else(|| super::TcpError::new("leased flight ID exhausted"))?;
-        let tier = self
-            .live_leased
-            .current
-            .as_ref()
-            .ok_or_else(|| super::TcpError::new("leased extent missing"))?
-            .lease
-            .tier;
-        // A window of one frame cannot share a flush; FUA avoids a serial write then flush.
-        let durable_at_completion = tier == crate::distributed::durability::DurabilityTier::Native
-            || config.leased_sync == LeasedSync::PerFrameFua
-            // IOPOLL rings cannot submit Fsync, so polled writes keep per-frame FUA.
-            || config.polled_writes
-            || self.leased_write_window() == 1
-            || len < config.leased_flush_min_frame_bytes
-            || (self.live_leased.flights.is_empty() && queue_empty);
-        let sync = if tier == crate::distributed::durability::DurabilityTier::Synchronous
-            && durable_at_completion
-        {
-            LiveWriteSync::Data
-        } else {
-            LiveWriteSync::None
-        };
+        let mut attempt = 1u32;
+        loop {
+            self.ensure_leased_queue()?;
+            let config = self
+                .live_config
+                .as_ref()
+                .ok_or_else(|| super::TcpError::new("live config missing"))?;
+            let deadline = Instant::now() + std::time::Duration::from_millis(config.io_timeout_ms);
+            let id = self
+                .live_leased
+                .next_flight_id
+                .checked_add(1)
+                .ok_or_else(|| super::TcpError::new("leased flight ID exhausted"))?;
+            let tier = self
+                .live_leased
+                .current
+                .as_ref()
+                .ok_or_else(|| super::TcpError::new("leased extent missing"))?
+                .lease
+                .tier;
+            // A window of one frame cannot share a flush; FUA avoids a serial write then flush.
+            let durable_at_completion = tier == crate::distributed::durability::DurabilityTier::Native
+                || config.leased_sync == LeasedSync::PerFrameFua
+                // IOPOLL rings cannot submit Fsync, so polled writes keep per-frame FUA.
+                || config.polled_writes
+                || self.leased_write_window() == 1
+                || len < config.leased_flush_min_frame_bytes
+                || (self.live_leased.flights.is_empty() && queue_empty);
+            let sync = if tier == crate::distributed::durability::DurabilityTier::Synchronous
+                && durable_at_completion
+            {
+                LiveWriteSync::Data
+            } else {
+                LiveWriteSync::None
+            };
+            let write = FrameWrite {
+                id,
+                offset,
+                len,
+                sync,
+                deadline,
+            };
+            match self.write_frame(write, &encode, trace) {
+                Ok(()) => {
+                    let submitted_at = Instant::now();
+                    self.live_leased.next_flight_id = id;
+                    // This queue owes the frame's CQE, so a later rebind must
+                    // wait for the flight deque again.
+                    self.live_leased.queue_detached = false;
+                    if sync == LiveWriteSync::Data
+                        && let Some(counters) = &self.live_counters
+                    {
+                        counters.record_fua_write();
+                    }
+                    return Ok((id, deadline, submitted_at, durable_at_completion));
+                }
+                Err(error) => {
+                    if attempt < resume::MAX_RESUME_ATTEMPTS && self.break_kind(&error).is_some() {
+                        attempt += 1;
+                        self.resume_after_break(BreakKind::Data)?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// One write of one encoded frame into the queue's DMA buffer. The caller
+    /// owns the flight bookkeeping; this step only classifies its own errors so
+    /// a lost controller stays distinguishable from a rejected command.
+    fn write_frame(
+        &mut self,
+        write: FrameWrite,
+        encode: &impl Fn(&mut [u8]) -> Result<(), super::TcpError>,
+        trace: Option<(
+            &crate::distributed::write_timeline::WriteTimeline,
+            crate::distributed::write_timeline::LiveGroupSample,
+        )>,
+    ) -> Result<(), super::TcpError> {
+        use crate::distributed::nvmeof::live_io::{LiveIoError, LiveSubmitOutcome};
+        use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
+        let FrameWrite {
+            id,
+            offset,
+            len,
+            sync,
+            deadline,
+        } = write;
         let writer = self
             .live_writer
             .as_mut()
@@ -1503,18 +1669,24 @@ impl super::Client {
         if let Some(result) = self.live_leased.next_write_result.take() {
             writer.io.override_completion_result(id, result);
         }
+        #[cfg(test)]
+        if let Some(errno) = std::mem::take(&mut self.live_leased.next_submit_result) {
+            writer.io.override_submit_result(errno);
+        }
         let before = writer.io.stats();
-        let mut buffer = writer.io.write_buffer(len).map_err(|error| {
-            if let Some(counters) = &self.live_counters {
-                counters.record_leased_write_failure(match error {
-                    crate::distributed::nvmeof::live_io::LiveIoError::Full => {
-                        crate::distributed::nvmeof::live_metrics::LiveWriteFailure::Full
-                    }
-                    _ => crate::distributed::nvmeof::live_metrics::LiveWriteFailure::Failed,
-                });
+        let mut buffer = match writer.io.write_buffer(len) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                if let Some(counters) = &self.live_counters {
+                    counters.record_leased_write_failure(match error {
+                        LiveIoError::Full => LiveWriteFailure::Full,
+                        _ => LiveWriteFailure::Failed,
+                    });
+                }
+                // Buffer admission never carries a device errno.
+                return Err(resume::classify_io_error(error, None));
             }
-            super::TcpError::component(error)
-        })?;
+        };
         encode(&mut buffer).inspect_err(|_| {
             if let Some(counters) = &self.live_counters {
                 counters.record_leased_write_failure(LiveWriteFailure::Failed);
@@ -1526,7 +1698,9 @@ impl super::Client {
                 crate::distributed::write_timeline::WriteTimelineStage::LiveFrameEncoded,
             );
         }
-        match buffer.submit_write_buffer(id, offset, sync, deadline) {
+        // Consuming the buffer ends its borrow of the queue.
+        let outcome = buffer.submit_write_buffer(id, offset, sync, deadline);
+        match outcome {
             Ok(LiveSubmitOutcome::Submitted) => {}
             outcome => {
                 if let Some(counters) = &self.live_counters {
@@ -1538,14 +1712,13 @@ impl super::Client {
                         _ => LiveWriteFailure::Failed,
                     });
                 }
+                let errno = writer.io.last_write_errno();
                 return Err(match outcome {
-                    Err(error) => super::TcpError::component(error),
+                    Err(error) => resume::classify_io_error(error, errno),
                     _ => super::TcpError::new("live leased write admission full"),
                 });
             }
         }
-        let submitted_at = Instant::now();
-        self.live_leased.next_flight_id = id;
         if writer.failed_accounting.is_none()
             && let Some(counters) = &self.live_counters
         {
@@ -1553,11 +1726,6 @@ impl super::Client {
                 before,
                 counters: counters.clone(),
             });
-        }
-        if sync == LiveWriteSync::Data
-            && let Some(counters) = &self.live_counters
-        {
-            counters.record_fua_write();
         }
         if let Some((timeline, sample)) = trace {
             // Sampled groups pay one extra submit syscall to expose this boundary.
@@ -1577,9 +1745,55 @@ impl super::Client {
         }
         #[cfg(test)]
         if std::mem::take(&mut self.live_leased.delay_write) {
-            std::thread::sleep(std::time::Duration::from_millis(config.io_timeout_ms + 1));
+            let timeout_ms = self
+                .live_config
+                .as_ref()
+                .map_or(0, |config| config.io_timeout_ms);
+            std::thread::sleep(std::time::Duration::from_millis(timeout_ms + 1));
         }
-        Ok((id, deadline, submitted_at, durable_at_completion))
+        Ok(())
+    }
+
+    /// Whether the next frame would exceed the retained-frame budget. The
+    /// first frame is always admitted, so a budget smaller than one frame still
+    /// makes progress.
+    fn retention_full(&self, frame_len: usize) -> bool {
+        self.resume_writes
+            && !self.live_leased.retained.is_empty()
+            && self.live_leased.retained_bytes.saturating_add(frame_len)
+                > self.resume_retain_bytes()
+    }
+
+    /// Drop the retained frames the owner has adopted. Matched by grant token,
+    /// so a partial adoption of a closing extent never drops a current frame.
+    fn prune_retained(&mut self, token: [u8; 16], adopted_end: u64) {
+        let mut dropped = 0usize;
+        while self
+            .live_leased
+            .retained
+            .front()
+            .is_some_and(|frame| frame.token == token && frame.end <= adopted_end)
+        {
+            if let Some(frame) = self.live_leased.retained.pop_front() {
+                dropped += frame.frame.len();
+            }
+        }
+        self.live_leased.retained_bytes = self.live_leased.retained_bytes.saturating_sub(dropped);
+    }
+
+    /// Retained frame budget: two write windows, hard capped. A test may shrink
+    /// it to observe the `Deferred` admission with one window.
+    fn resume_retain_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(bytes) = self.live_leased.resume_retain_bytes {
+            return bytes;
+        }
+        self.live_config.as_ref().map_or(0, |config| {
+            config
+                .max_inflight_bytes
+                .saturating_mul(RESUME_RETAIN_WINDOWS)
+                .min(RESUME_RETAIN_CAP)
+        })
     }
 
     pub(crate) fn leased_write_window(&self) -> usize {
@@ -1606,7 +1820,31 @@ impl super::Client {
         result
     }
 
+    /// Harvest completions, resuming once when the queue or a frame reports a
+    /// transient break (W1). A resumed pass returns `Ok`, so the wrapper never
+    /// poisons the writer for a break the resume healed.
     fn progress_leased_flights_inner(
+        &mut self,
+        released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
+        timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
+    ) -> Result<(), super::TcpError> {
+        let mut attempt = 1u32;
+        loop {
+            match self.progress_leased_flights_once(released, timeline) {
+                Err(error)
+                    if attempt < resume::MAX_RESUME_ATTEMPTS
+                        && self.break_kind(&error).is_some() =>
+                {
+                    attempt += 1;
+                    let kind = self.break_kind(&error).unwrap_or(BreakKind::Session);
+                    self.resume_after_break(kind)?;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn progress_leased_flights_once(
         &mut self,
         released: &mut Vec<(u64, Vec<super::DurableBatch>)>,
         timeline: Option<&crate::distributed::write_timeline::WriteTimeline>,
@@ -1629,7 +1867,12 @@ impl super::Client {
                 counters.record_leased_write_failure(LiveWriteFailure::TimedOut);
                 counters.record_unknown_write();
             }
-            return Err(super::TcpError::new("leased write deadline expired"));
+            // A deadline is a probe, not a verdict: the owner may be overloaded,
+            // so the resume keeps the queue and grants one more window.
+            return Err(super::TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
+                "leased write deadline expired",
+            ));
         }
         let writer = self
             .live_writer
@@ -1640,17 +1883,19 @@ impl super::Client {
             .as_ref()
             .map_or_else(|| writer.io.stats(), |accounting| accounting.before.clone());
         self.live_leased.completions.clear();
-        writer
-            .io
-            .progress_into(&mut self.live_leased.completions)
-            .map_err(|error| {
-                if let Some(counters) = &self.live_counters {
-                    counters.record_leased_write_failure(LiveWriteFailure::Failed);
-                    counters.record_unknown_write();
-                }
-                super::TcpError::component(error)
-            })?;
+        let progress = writer.io.progress_into(&mut self.live_leased.completions);
+        if let Err(error) = progress {
+            if let Some(counters) = &self.live_counters {
+                counters.record_leased_write_failure(LiveWriteFailure::Failed);
+                counters.record_unknown_write();
+            }
+            let errno = writer.io.last_write_errno();
+            return Err(resume::classify_io_error(error, errno));
+        }
         let after = writer.io.stats();
+        // The latest completed write's errno, read once under the queue borrow:
+        // a lost controller is transient, a rejected or short write is not.
+        let write_errno = writer.io.last_write_errno();
         let harvested = !self.live_leased.completions.is_empty();
         for completion in self.live_leased.completions.drain(..) {
             if let Some((id, covers_seq, _)) = self.live_leased.flush_in_flight
@@ -1665,7 +1910,10 @@ impl super::Client {
                         });
                         counters.record_unknown_write();
                     }
-                    return Err(super::TcpError::new("leased namespace flush failed"));
+                    return Err(super::TcpError::with_kind(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "leased namespace flush failed",
+                    ));
                 }
                 if let Some(started) = self.live_leased.flush_submitted_at.take()
                     && let Some(counters) = &self.live_counters
@@ -1694,7 +1942,12 @@ impl super::Client {
                     counters.record_leased_write_failure(LiveWriteFailure::Failed);
                     counters.record_unknown_write();
                 }
-                return Err(super::TcpError::new("leased write failed"));
+                // The queue lost this frame's completion: a lost controller is
+                // transient, a rejected or short write is not.
+                return Err(resume::classify_io_error(
+                    crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
+                    write_errno,
+                ));
             };
             if let Some(timeline) = timeline {
                 timeline.live_group_event(flight.sample, Stage::LiveIoCompleted);
@@ -1711,7 +1964,10 @@ impl super::Client {
                     counters.record_leased_write_failure(failure);
                     counters.record_unknown_write();
                 }
-                return Err(super::TcpError::new("leased write failed"));
+                return Err(resume::classify_io_error(
+                    crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
+                    write_errno,
+                ));
             }
             if let Some(counters) = &self.live_counters {
                 counters.record_timing(
@@ -1739,7 +1995,10 @@ impl super::Client {
                 counters.record_leased_write_failure(LiveWriteFailure::TimedOut);
                 counters.record_unknown_write();
             }
-            return Err(super::TcpError::new("leased write deadline expired"));
+            return Err(super::TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
+                "leased write deadline expired",
+            ));
         }
         if harvested {
             if let Some(counters) = &self.live_counters {
@@ -1758,7 +2017,8 @@ impl super::Client {
                 counters.record_leased_write_failure(LiveWriteFailure::TimedOut);
                 counters.record_unknown_write();
             }
-            return Err(super::TcpError::new(
+            return Err(super::TcpError::with_kind(
+                std::io::ErrorKind::TimedOut,
                 "leased namespace flush deadline expired",
             ));
         }
@@ -1797,13 +2057,18 @@ impl super::Client {
                     .next_flight_id
                     .checked_add(1)
                     .ok_or_else(|| super::TcpError::new("leased flight ID exhausted"))?;
-                let id = writer.io.submit_flush(id, deadline).map_err(|error| {
-                    if let Some(counters) = &self.live_counters {
-                        counters.record_leased_write_failure(LiveWriteFailure::Failed);
-                        counters.record_unknown_write();
+                let submit = writer.io.submit_flush(id, deadline);
+                let id = match submit {
+                    Ok(id) => id,
+                    Err(error) => {
+                        if let Some(counters) = &self.live_counters {
+                            counters.record_leased_write_failure(LiveWriteFailure::Failed);
+                            counters.record_unknown_write();
+                        }
+                        let errno = writer.io.last_write_errno();
+                        return Err(resume::classify_io_error(error, errno));
                     }
-                    super::TcpError::component(error)
-                })?;
+                };
                 self.live_leased.next_flight_id = id;
                 self.live_leased.flush_in_flight = Some((id, covers_seq, deadline));
                 self.live_leased.flush_submitted_at = Some(submitted_at);
@@ -1854,7 +2119,17 @@ impl super::Client {
     ) -> Result<(), super::TcpError> {
         let result = (|| {
             while !self.live_leased.flights.is_empty() {
-                self.wait_leased_flights(false)?;
+                match self.wait_leased_flights(false) {
+                    Ok(()) => {}
+                    Err(error) => match self.break_kind(&error) {
+                        // A lost queue cannot deliver the CQE the wait asks
+                        // for; the resume rewrites the unadopted suffix.
+                        Some(kind) => {
+                            self.resume_after_break(kind)?;
+                        }
+                        None => return Err(error),
+                    },
+                }
                 self.progress_leased_flights(released, timeline)?;
             }
             Ok(())
@@ -1927,13 +2202,20 @@ impl super::Client {
             .as_mut()
             .ok_or_else(|| super::TcpError::new("live queue missing"))?
             .io;
-        let completed = io
-            .wait(if polled {
-                std::time::Duration::ZERO
-            } else {
-                remaining
-            })
-            .map_err(super::TcpError::component)?;
+        let waited = io.wait(if polled {
+            std::time::Duration::ZERO
+        } else {
+            remaining
+        });
+        let completed = match waited {
+            Ok(completed) => completed,
+            Err(error) => {
+                // A wait on a lost queue is a transient break; keep its class so
+                // the caller can resume instead of failing the database.
+                let errno = io.last_write_errno();
+                return Err(resume::classify_io_error(error, errno));
+            }
+        };
         if let Some(counters) = &self.live_counters {
             counters.record_leased_worker_wait(!polled && !completed);
         }
@@ -2050,6 +2332,7 @@ impl super::Client {
             ));
         }
         if self.live_leased.flights.len() == self.leased_write_window()
+            || self.retention_full(frame_len)
             || (!self.live_leased.flights.is_empty()
                 && (self
                     .live_writer
@@ -2090,8 +2373,11 @@ impl super::Client {
                 counters.record_metadata_request();
                 counters.record_lease_exchange();
             }
-            let leased = self.lease_live_extent(epoch)?;
-            self.install_leased_extent(leased)?;
+            let leased =
+                self.leased_step(BreakKind::Session, |client| client.lease_live_extent(epoch))?;
+            self.leased_step(BreakKind::Session, |client| {
+                client.install_leased_extent(leased.clone())
+            })?;
             if let Some(counters) = &self.live_counters {
                 counters.record_extent_lease();
             }
@@ -2108,9 +2394,11 @@ impl super::Client {
                     if let Some(counters) = &self.live_counters {
                         counters.record_extent_switch_wait();
                     }
-                    self.wait_closing_extent(true)?;
+                    self.leased_step(BreakKind::Session, |client| {
+                        client.wait_closing_extent(true)
+                    })?;
                 }
-                self.write_leased_skip()?;
+                self.leased_step(BreakKind::Session, |client| client.write_leased_skip())?;
                 let next = self
                     .live_leased
                     .next
@@ -2137,8 +2425,10 @@ impl super::Client {
                     counters.record_extent_lease();
                 }
             } else {
-                self.write_leased_skip()?;
-                self.adopt_leased_sync(true, true)?;
+                self.leased_step(BreakKind::Session, |client| client.write_leased_skip())?;
+                self.leased_step(BreakKind::Session, |client| {
+                    client.adopt_leased_sync(true, true)
+                })?;
             }
             if let Some(counters) = &self.live_counters {
                 counters.record_timing(
@@ -2160,6 +2450,7 @@ impl super::Client {
             return Err(super::TcpError::new("frame does not fit granted extent"));
         }
         timeline.live_group_token(sample, current.lease.extent.token);
+        let token = current.lease.extent.token;
         let cursor = current.cursor;
         let offset = cursor % current.lease.extent.segment.bytes;
         let end = cursor
@@ -2287,6 +2578,22 @@ impl super::Client {
         if let Some(counters) = &self.live_counters {
             counters.record_max_leased_in_flight(self.live_leased.flights.len() as u64);
         }
+        // Retain the group, not a copy of its bytes: `encode_into` is
+        // deterministic, so a resume regenerates the identical frame, and the
+        // owner's receipt digest proves it. Bounded admission is what keeps
+        // this deque from growing past `resume_retain_bytes`.
+        // Only a writer whose database enabled the resume pays for retention.
+        if self.resume_writes {
+            self.live_leased.retained_bytes =
+                self.live_leased.retained_bytes.saturating_add(frame_len);
+            self.live_leased.retained.push_back(RetainedFrame {
+                token,
+                start: cursor,
+                end,
+                durable_at_completion,
+                frame: group,
+            });
+        }
         if std::mem::take(&mut self.live_leased.queue_rebound) {
             timeline.live_group_event(sample, Stage::LiveQueueRebound);
         }
@@ -2300,6 +2607,8 @@ impl super::Client {
     }
 }
 
+#[cfg(test)]
+mod resume_tests;
 #[cfg(test)]
 pub(crate) mod leased_tests {
     use super::*;
@@ -2595,7 +2904,10 @@ pub(crate) mod leased_tests {
             eprintln!("local filesystem or kernel rejects polled writes: errno={errno:?}");
         };
         let unsupported_write = |client: &mut Client, error: super::super::TcpError| {
-            assert_eq!(error.to_string(), "leased write failed");
+            assert!(
+                error.to_string().starts_with("leased write failed"),
+                "unexpected polled writer error: {error}"
+            );
             let io = &mut client.live_writer.as_mut().unwrap().io;
             unsupported(io.last_write_errno());
             assert_eq!(io.outstanding(), 0);
@@ -5040,9 +5352,50 @@ impl super::Client {
     pub(crate) fn leased_test_fail_write(&mut self, result: i32) {
         self.live_leased.next_write_result = Some(result);
     }
+    /// Fail the next submission before any SQE, as a lost controller does.
+    pub(crate) fn leased_test_fail_submit(&mut self, errno: i32) {
+        self.live_leased.next_submit_result = Some(errno);
+    }
+    /// Enable the write resume with no reaper: a local-file queue owns no
+    /// kernel controller, so the fixture path drains it inline.
+    pub(crate) fn leased_test_resume(&mut self, enabled: bool) {
+        self.set_resume_writes(enabled, None);
+    }
+    /// Shrink the retained-frame budget so one frame fills it.
+    pub(crate) fn leased_test_set_resume_retention(&mut self, bytes: usize) {
+        self.live_leased.resume_retain_bytes = Some(bytes);
+    }
+    /// `(retained frames, retained bytes)`.
+    pub(crate) fn leased_test_retained(&self) -> (usize, usize) {
+        (
+            self.live_leased.retained.len(),
+            self.live_leased.retained_bytes,
+        )
+    }
+    /// `(offset, len)` of every write this queue accepted, in order.
+    pub(crate) fn leased_test_write_submissions(&self) -> Vec<(u64, usize)> {
+        self.live_writer
+            .as_ref()
+            .map(|writer| writer.io.submitted_writes().to_vec())
+            .unwrap_or_default()
+    }
+    /// `(extent start, cursor, written end, adopted end)` of the current extent.
+    pub(crate) fn leased_test_extent_ends(&self) -> Option<(u64, u64, u64, u64)> {
+        self.live_leased.current.as_ref().map(|extent| {
+            (
+                extent.lease.extent.start,
+                extent.cursor,
+                extent.written_end,
+                extent.adopted.end,
+            )
+        })
+    }
     pub(crate) fn leased_test_timeout_write(&mut self) {
         if let Some(config) = &mut self.live_config {
-            config.io_timeout_ms = 1;
+            // Not 1 ms: the deadline must still admit the submission when a
+            // parallel debug test competes for the CPU. The delayed write then
+            // expires it after the SQE is in the ring, which is the premise.
+            config.io_timeout_ms = 50;
         }
         self.live_leased.delay_write = true;
     }

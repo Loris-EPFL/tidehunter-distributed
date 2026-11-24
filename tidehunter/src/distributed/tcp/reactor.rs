@@ -1259,6 +1259,15 @@ impl Client {
     pub(crate) fn progress_session(&mut self) -> Result<(), TcpError> {
         if let Err(error) = self.progress_correlated() {
             self.fail_connection();
+            // A write worker's client resumes the leased write path instead of
+            // failing the database for a transport break (W1). Every other
+            // client keeps the fail-stop contract.
+            if self.break_kind(&error).is_some() {
+                // The control session is what failed, so the queue is kept and
+                // its outstanding CQEs are harvested as usual.
+                self.resume_after_break(super::live_client::BreakKind::Session)?;
+                return Ok(());
+            }
             return Err(error);
         }
         Ok(())

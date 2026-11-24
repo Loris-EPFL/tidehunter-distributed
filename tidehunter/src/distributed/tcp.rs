@@ -39,6 +39,7 @@ mod inventory;
 #[cfg(test)]
 pub(crate) use generation_control::OwnerTrimCrash;
 mod live_client;
+pub(crate) use live_client::{BreakKind, ResumeReaper};
 mod progress_wait;
 pub(crate) use progress_wait::WakeFd;
 #[cfg(test)]
@@ -464,6 +465,43 @@ impl From<TcpError> for io::Error {
     fn from(error: TcpError) -> Self {
         io::Error::new(error.kind, error.message)
     }
+}
+/// Whether `error` is a transport break that a write resume may heal (W1): a
+/// lost session or data queue whose writes can be re-issued as identical bytes.
+///
+/// Only transport classes qualify. A protocol error, a permission error and a
+/// typed remote verdict are the owner's answer and must still fail-stop, as
+/// must an error whose kind says the bytes may be on the device but unreadable
+/// (`InvalidData`).
+pub(crate) fn is_transient_break(error: &TcpError) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+    )
+}
+/// Whether an errno reported by the NVMe-oF queue is a lost queue or link
+/// rather than a rejected command: the write may be retried at the same offset.
+pub(crate) fn is_transient_errno(errno: i32) -> bool {
+    [
+        libc::ENODEV,
+        libc::ENXIO,
+        libc::ENOTCONN,
+        libc::ECONNRESET,
+        libc::EPIPE,
+        libc::ETIMEDOUT,
+        libc::EHOSTUNREACH,
+        libc::ENETDOWN,
+        libc::ENETRESET,
+    ]
+    .contains(&errno)
 }
 impl From<&str> for WireError {
     fn from(message: &str) -> Self {
@@ -1371,6 +1409,15 @@ pub struct Client {
     /// The coordinator's lease on this owner, when this client is a write
     /// worker's client. Leased writes check it before every submission.
     lease_validity: Option<Arc<super::remote_db::coordinator_lease::LeaseValidity>>,
+    /// W1: resume a leased write after a transient transport break. The
+    /// database config decides; a client that is not a write worker leaves it
+    /// false, so a read or control client never rebuilds itself in place.
+    resume_writes: bool,
+    /// The database's one DMA reaper. A resume that detaches a dead queue hands
+    /// it here instead of draining it on the worker thread: `LiveIo::shutdown`
+    /// is unbounded and the kernel keep-alive can hold a lost command.
+    /// Capacity: one queue per owner worker; a full reaper fails the resume.
+    resume_reaper: Option<std::sync::mpsc::SyncSender<live_client::LiveWriteQueue>>,
 }
 impl Client {
     /// The node's authenticated policy, adopted by ordinary read/control drivers.

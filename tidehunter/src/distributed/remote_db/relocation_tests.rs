@@ -195,6 +195,7 @@ impl Fixture {
             max_pending_read_bytes: 16 * 1024 * KIB as usize,
             write_profile_limit: 0,
             coordinator_lease_ms: 5_000,
+            resume_transient_writes: true,
             live_nvme: LiveClientConfig {
                 lease_ahead: true,
                 polled_writes: false,

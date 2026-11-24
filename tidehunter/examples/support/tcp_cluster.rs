@@ -209,6 +209,7 @@ pub fn prepare_external_case(
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
         coordinator_lease_ms: 5_000,
+        resume_transient_writes: true,
         durable_cut: Default::default(),
         index: Default::default(),
     };

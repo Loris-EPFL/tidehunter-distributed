@@ -91,6 +91,17 @@ impl LeaseValidity {
         nanos(self.base.elapsed()) >= self.valid_until_ns.load(Ordering::Acquire)
     }
 
+    /// The instant this owner's right ends, on the coordinator's clock. A write
+    /// resume never runs past it: the lease is the authority, so the budget is
+    /// the earlier of this deadline and the resume's own bound.
+    pub(crate) fn admitted_until(&self) -> Instant {
+        self.base
+            .checked_add(Duration::from_nanos(
+                self.valid_until_ns.load(Ordering::Acquire),
+            ))
+            .unwrap_or(self.base)
+    }
+
     /// Install a grant measured from `sent`. The deadline ends
     /// [`DEADLINE_MARGIN`] before the owner's grant does.
     fn store_grant(&self, sent: Duration, granted_ms: u32) {
