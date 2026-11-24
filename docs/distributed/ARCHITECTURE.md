@@ -268,11 +268,13 @@ position. It runs asynchronously on one background worker per database
 (`sui/relocation.rs` `RemoteRelocator`, `Db::start_relocation` in `sui.rs`).
 A pass has six steps:
 
-1. Evaluate the Sui filters on the native index.
-2. Copy each surviving value to the current generation.
+1. Scan each owner stream and stop at the first `StopRelocation` decision.
+2. A filtered keyspace (Sui's shape) copies nothing and drops every entry
+   below its terminal, as native's cutoff does; every other keyspace copies
+   each live value below its own stream's target to the current generation.
 3. Wait until the owners made the copies durable.
-4. Re-point the index entry with a compare-and-swap on the exact old physical
-   position.
+4. Re-point each copied entry with a compare-and-swap on the exact old
+   physical position.
 5. Store a control region.
 6. Retire the dead sealed files.
 

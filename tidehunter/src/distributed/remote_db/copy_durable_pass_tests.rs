@@ -9,7 +9,6 @@
 
 use super::pipeline_tests::Fixture;
 use super::*;
-use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
 use crate::distributed::sui::Db;
@@ -61,15 +60,13 @@ pub(super) fn newest_cut() -> BatchVersion {
     }
 }
 
-fn shape() -> KeyShape {
+/// One keyspace with no relocation filter: the pass copies every live entry
+/// below its stream's target and re-points it. A filtered keyspace copies
+/// nothing at the parity tip (D24), so a filter would empty the copy path these
+/// tests exercise.
+pub(super) fn shape() -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "a",
-        8,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], _: &[u8]| Decision::Keep),
-    );
+    builder.add_key_space_config("a", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
     builder.build()
 }
 
@@ -81,9 +78,19 @@ fn fixture_with(shape: KeyShape) -> Fixture {
     fixture_with_batch_bytes(shape, 64 * KIB as usize)
 }
 
-/// `batch_bytes` bounds one batch: a pass writes its survivors' copies in as
+/// `batch_bytes` bounds one batch: a pass writes its copied entries in as
 /// many batches (and so as many append groups) as it needs.
 pub(super) fn fixture_with_batch_bytes(shape: KeyShape, batch_bytes: usize) -> Fixture {
+    fixture_with_limits(shape, batch_bytes, 256 * KIB as usize)
+}
+
+/// [`fixture_with_batch_bytes`] with the append-group byte limit chosen too:
+/// a copy set below it reaches the owner in one append group.
+pub(super) fn fixture_with_limits(
+    shape: KeyShape,
+    batch_bytes: usize,
+    group_bytes: usize,
+) -> Fixture {
     Fixture::new_with_root(
         tempdir::TempDir::new("copy-durable-pass").unwrap(),
         1,
@@ -101,11 +108,14 @@ pub(super) fn fixture_with_batch_bytes(shape: KeyShape, batch_bytes: usize) -> F
             };
             config.storage.group_limits = GroupLimits {
                 max_batches: 32,
-                max_encoded_bytes: 256 * KIB as usize,
+                max_encoded_bytes: group_bytes,
             };
             config.storage.fragment_bytes = FRAGMENT;
             config.storage.wal_file_bytes = FILE;
             config.timeout = Duration::from_secs(60);
+            // One pass chunk covers a whole file's copy set, so the tests can
+            // choose the batch and group limits that decide the append shape.
+            config.index.relocation_batch_max_bytes = Some(4 * 1024 * KIB as usize);
         },
         |_| {},
     )
@@ -124,13 +134,42 @@ pub(super) fn key(sequence: u64) -> Vec<u8> {
     sequence.to_be_bytes().to_vec()
 }
 
+/// Keys whose only write lies in the first WAL file: the live set a pass
+/// copies, because the file is below its target.
+pub(super) const SURVIVORS: u64 = 12;
+/// Padding keys: they fill the first file and are then overwritten above it, so
+/// their live versions lie above the one-file target and their first-file bytes
+/// are dead. The copy set stays a few tens of KiB (one batch and one append
+/// group at the fixture's limits) without a relocation filter.
+const PADDING: u64 = 120;
+/// First padding key, so a padding write never touches a survivor's entry.
+const PAD_BASE: u64 = 1000;
+
+/// Value bytes of `sequence`: the fixture's one value shape for both sets.
+fn fill_value(sequence: u64) -> Vec<u8> {
+    vec![(sequence % 251) as u8; VALUE]
+}
+
 /// Writes the data set and certifies it: every later unsynced byte is a copy.
+///
+/// The layout gives the pass one whole file to reclaim and a small copy set:
+/// the survivors' only writes fill the start of file 0, dead padding fills the
+/// rest of it, and the padding's live versions land above the one-file target.
 pub(super) fn fill(db: &Arc<Db>) -> KeySpace {
     let ks = db.ks("a");
-    for sequence in 0..WRITES {
+    let write = |sequence: u64| {
         let mut batch = db.write_batch();
-        batch.write(ks, key(sequence), vec![(sequence % 251) as u8; VALUE]);
+        batch.write(ks, key(sequence), fill_value(sequence));
         batch.commit().expect("write");
+    };
+    for sequence in 0..SURVIVORS {
+        write(sequence);
+    }
+    for sequence in PAD_BASE..PAD_BASE + PADDING {
+        write(sequence);
+    }
+    for sequence in PAD_BASE..PAD_BASE + PADDING {
+        write(sequence);
     }
     db.remote_for_test()
         .write_core()
@@ -150,7 +189,7 @@ fn pass(db: &Db) -> RelocationReport {
 }
 
 fn offsets(db: &Db, ks: KeySpace) -> Vec<(u64, u64)> {
-    (0..WRITES)
+    (0..SURVIVORS)
         .map(|sequence| {
             let address = db
                 .remote_for_test()
@@ -189,7 +228,7 @@ fn a_native_tier_pass_syncs_its_copies_before_it_re_points() {
         "the quiet lag never nudges: only the copy wait asked an owner to sync"
     );
     assert!(
-        stats.persisted_next > WRITES,
+        stats.persisted_next > SURVIVORS,
         "the cut covers the copies the index now names: {stats:?}"
     );
     assert_eq!(db.remote_for_test().relocation_copy_deferrals(), 0);
@@ -200,35 +239,28 @@ fn a_native_tier_pass_syncs_its_copies_before_it_re_points() {
 /// applies, stores and retires nothing, and the deferral is counted. After the
 /// owner syncs, the next pass completes.
 ///
-/// The copies are ONE batch (the fixture keeps 12 survivors and its batch
-/// limit holds them), so they are one append group. A persist parked between
-/// two appends would hold the persistence lock, and the next append's lease
-/// request would block on it until the owner's deadline, which poisons instead
-/// of deferring. The live root is caught up first, so a root-only barrier
-/// cannot take the hold before the copies are appended either. At the park the
-/// test asserts that the copies advanced the appended end and are still
-/// unsynced, so the park is on a persist of them.
+/// The live root is caught up first, so a root-only barrier cannot take the hold
+/// before the copies are appended. At the park the test asserts that the copies
+/// advanced the appended end and are still unsynced, so the park is on a persist
+/// of them.
 #[test]
 fn a_pass_whose_copies_cannot_be_synced_applies_nothing_and_the_next_pass_completes() {
-    let fixture = fixture_with_batch_bytes(few_survivors_shape(), 128 * KIB as usize);
+    let fixture = fixture_with_batch_bytes(shape(), 128 * KIB as usize);
     let db = open(&fixture);
     let ks = fill(&db);
-    let survivor_offsets = |db: &Db| -> Vec<(u64, u64)> {
-        (0..WRITES)
-            .filter(|sequence| sequence.is_multiple_of(SURVIVOR_STRIDE))
-            .map(|sequence| {
-                let address = db
-                    .remote_for_test()
-                    .hybrid_table()
-                    .get(ks, &key(sequence), newest_cut())
-                    .expect("lookup")
-                    .expect("indexed")
-                    .address;
-                (address.segment_generation, address.offset)
-            })
-            .collect()
+    // A copied key: key 0 is the first write of the serving stream, so it lies
+    // in WAL file 0, which every qualifying target reclaims.
+    let copied_offset = |db: &Db| -> (u64, u64) {
+        let address = db
+            .remote_for_test()
+            .hybrid_table()
+            .get(ks, &key(0), newest_cut())
+            .expect("lookup")
+            .expect("indexed")
+            .address;
+        (address.segment_generation, address.offset)
     };
-    let before = survivor_offsets(&db);
+    let before = copied_offset(&db);
     let all_before = offsets(&db, ks);
     let core = db.remote_for_test().write_core();
     core.test_hooks.lock().copy_durable_timeout = Some(COPY_WAIT);
@@ -288,10 +320,10 @@ fn a_pass_whose_copies_cannot_be_synced_applies_nothing_and_the_next_pass_comple
         !receipt.deferred && receipt.copied_survivors > 0,
         "{receipt:?}"
     );
-    assert_ne!(survivor_offsets(&db), before);
-    assert!(
-        db.get(ks, &key(1)).expect("read").is_none(),
-        "the completed pass applied the removal of key 1"
+    assert_ne!(
+        copied_offset(&db),
+        before,
+        "the completed pass re-pointed the copied key"
     );
     assert_eq!(
         db.remote_for_test().relocation_copy_deferrals(),
@@ -323,26 +355,22 @@ fn a_pass_whose_copies_cannot_be_synced_applies_nothing_and_the_next_pass_comple
 /// `fail_next_live_progress` and the consumed assertion fails.
 #[test]
 fn a_failed_progress_poll_defers_the_pass_without_re_pointing() {
-    // The filter keeps few survivors, so their copies fit in one fragment.
-    let fixture = fixture_with(few_survivors_shape());
+    let fixture = fixture_with(shape());
     let db = open(&fixture);
     let ks = fill(&db);
-    let survivor_offsets = |db: &Db| -> Vec<(u64, u64)> {
-        (0..WRITES)
-            .filter(|sequence| sequence.is_multiple_of(SURVIVOR_STRIDE))
-            .map(|sequence| {
-                let address = db
-                    .remote_for_test()
-                    .hybrid_table()
-                    .get(ks, &key(sequence), newest_cut())
-                    .expect("lookup")
-                    .expect("indexed")
-                    .address;
-                (address.segment_generation, address.offset)
-            })
-            .collect()
+    // A copied key: key 0 is the first write of the serving stream, so it lies
+    // in WAL file 0, which every qualifying target reclaims.
+    let copied_offset = |db: &Db| -> (u64, u64) {
+        let address = db
+            .remote_for_test()
+            .hybrid_table()
+            .get(ks, &key(0), newest_cut())
+            .expect("lookup")
+            .expect("indexed")
+            .address;
+        (address.segment_generation, address.offset)
     };
-    let before = survivor_offsets(&db);
+    let before = copied_offset(&db);
     let core = db.remote_for_test().write_core();
     core.test_hooks.lock().copy_durable_timeout = Some(COPY_WAIT);
     let log = fixture.nodes[0].log_for_test(core.epoch);
@@ -415,19 +443,15 @@ fn a_failed_progress_poll_defers_the_pass_without_re_pointing() {
         1,
         "the failed owner sync is a counted deferral"
     );
-    assert_eq!(
-        survivor_offsets(&db),
-        before,
-        "no re-point over a failed sync"
-    );
-    for sequence in 0..WRITES {
+    assert_eq!(copied_offset(&db), before, "no re-point over a failed sync");
+    for sequence in (0..SURVIVORS).chain(PAD_BASE..PAD_BASE + PADDING) {
         let value = db
             .get(ks, &key(sequence))
             .expect("read")
             .expect("key retained");
         assert_eq!(
             value.as_ref(),
-            vec![(sequence % 251) as u8; VALUE].as_slice(),
+            fill_value(sequence).as_slice(),
             "key {sequence}: a deferred pass preserves the value"
         );
     }
@@ -442,24 +466,24 @@ fn a_failed_progress_poll_defers_the_pass_without_re_pointing() {
         !receipt.deferred && receipt.copied_survivors > 0,
         "{receipt:?}"
     );
-    assert_ne!(survivor_offsets(&db), before);
-    assert!(
-        db.get(ks, &key(1)).expect("read").is_none(),
-        "the completed pass applied the removal of key 1"
+    assert_ne!(
+        copied_offset(&db),
+        before,
+        "the completed pass re-pointed the copied key"
     );
     assert_eq!(db.remote_for_test().relocation_copy_deferrals(), 1);
     db.wait_for_background_threads_to_finish().unwrap();
 }
 
-/// An owner persist failure of the RELOCATED COPIES must defer the pass
-/// without re-pointing the index. Unlike the progress-poll test above, the
-/// failure here fires on the persist of the adopted copies themselves, so the
-/// copies are appended and cannot become durable. The injected failure is
-/// fail-stop, exactly like a real sync failure (the owner poisons its
-/// writer), so this test claims what is provable: at the hold every key still
-/// names its old position (the copies are parked unsynced and the index has
-/// not moved), the failure fired, the pass counted a deferral, and no key was
-/// re-pointed or dropped. The byte-exact reads run BEFORE the pass, while the
+/// An owner persist failure of the RELOCATED COPIES must never re-point the
+/// index. Unlike the progress-poll test above, the failure here fires on the
+/// persist of the adopted copies themselves, so the copies are appended and
+/// cannot become durable. The injected failure is fail-stop, exactly like a
+/// real sync failure (the owner poisons its writer), so this test claims what
+/// is provable: at the hold every key still names its old position (the copies
+/// are parked unsynced and the index has not moved), the failure fired, no key
+/// was re-pointed or dropped, and the engine reports the failure instead of
+/// continuing. The byte-exact reads run BEFORE the pass, while the
 /// database is quiescent, so no owner read lies inside the pass's wait. It
 /// does not claim reads after the failure or a later pass.
 ///
@@ -477,24 +501,23 @@ fn a_failed_progress_poll_defers_the_pass_without_re_pointing() {
 /// The test lasts about that bound by design: the wait never wakes on a
 /// persist failure.
 ///
-/// The copies are ONE batch (the fixture's batch limit holds every survivor),
-/// so they reach the owner in one append group. Any persist that can take the
-/// hold then covers the whole copy set, and no append is left to meet a
-/// poisoned writer. This holds for every early trigger: the nudge of the copy
-/// wait, the durable cut's lag timer, and the syncer's fragment-boundary
-/// trigger (which depends on the data layout, not on the clock). No premise
-/// rests on a timer being long.
+/// An unfiltered keyspace makes the copy set one whole WAL file of live
+/// entries, so the fixture splits it into consecutive batches; the persist that
+/// takes the hold is the first of them, and the pass never re-points a chunk
+/// whose sync failed. Every early trigger (the copy wait's nudge, the durable
+/// cut's lag timer, the syncer's fragment boundary) reaches the same hold, so
+/// no premise rests on a timer being long.
 ///
-/// Negative controls (mutation runs): `m01` (copy wait removed) re-points the
-/// survivors over the failed persist; `m02` (deferral mapped to a poison)
-/// fails the deferral count.
+/// Negative control (mutation run `m01`): remove the copy wait and the pass
+/// re-points the copied keys over the failed persist.
 #[test]
-fn a_failed_owner_persist_of_the_copies_defers_the_pass_without_re_pointing() {
-    let fixture = fixture_with_batch_bytes(few_survivors_shape(), 128 * KIB as usize);
+fn a_failed_owner_persist_of_the_copies_never_re_points_the_index() {
+    let fixture = fixture_with_batch_bytes(shape(), 128 * KIB as usize);
     let db = open(&fixture);
     let ks = fill(&db);
     let before = offsets(&db, ks);
     let core = db.remote_for_test().write_core();
+    let data_set_cut = core.table.current();
     core.test_hooks.lock().copy_durable_timeout = Some(COPY_WAIT);
     let log = fixture.nodes[0].log_for_test(core.epoch);
     let frontier = log.frontier().unwrap();
@@ -512,17 +535,16 @@ fn a_failed_owner_persist_of_the_copies_defers_the_pass_without_re_pointing() {
     // live root end, so it cannot serve as the premise.
     log.persist_live_root()
         .expect("the live root catches up before the pass");
-    // Byte-exact reads of the keys a re-point would move (the survivors) and
-    // of one key a drop would delete, while nothing else runs.
-    let sampled = |sequence: &u64| sequence.is_multiple_of(SURVIVOR_STRIDE) || *sequence == 1;
-    for sequence in (0..WRITES).filter(sampled) {
+    // Byte-exact reads of the keys a re-point would move, while nothing else
+    // runs.
+    for sequence in (0..SURVIVORS).chain(PAD_BASE..PAD_BASE + PADDING) {
         let value = db
             .get(ks, &key(sequence))
             .expect("read")
             .unwrap_or_else(|| panic!("key {sequence} unreadable before the pass"));
         assert_eq!(
             value.as_ref(),
-            vec![(sequence % 251) as u8; VALUE].as_slice(),
+            fill_value(sequence).as_slice(),
             "key {sequence}: the data set reads byte-equal before the pass"
         );
     }
@@ -568,27 +590,22 @@ fn a_failed_owner_persist_of_the_copies_defers_the_pass_without_re_pointing() {
         resume.send(()).unwrap();
         relocation.join().unwrap();
     });
-    assert_eq!(
-        core.table.current(),
-        BatchVersion {
-            epoch: core.epoch,
-            sequence: WRITES + 1,
-        },
-        "premise: the data set plus one batch of copies was published"
+    assert!(
+        core.table.current() > data_set_cut,
+        "premise: at least one batch of copies was published past the data set"
     );
     assert!(
         log.appended_persist_failure_consumed(),
         "premise: the injected owner persist failure of the copies fired"
     );
     assert_eq!(
-        db.remote_for_test().relocation_copy_deferrals(),
-        1,
-        "the failed owner persist is a counted deferral"
-    );
-    assert_eq!(
         offsets(&db, ks),
         before,
         "no re-point and no drop over a failed owner persist"
+    );
+    assert!(
+        core.ensure_healthy().is_err(),
+        "a failed persist of the copies is fail-stop, never a silent skip"
     );
     // The injected failure is fail-stop: the owner poisons its writer and the
     // coordinator records the uncertain version, so no read is claimed here.
@@ -705,31 +722,6 @@ fn assert_front_within_root(db: &Db, fixture: &Fixture, label: &str) {
     }
 }
 
-/// One key in this many survives the filter of [`few_survivors_shape`].
-const SURVIVOR_STRIDE: u64 = 25;
-
-/// Keeps one key in [`SURVIVOR_STRIDE`] and removes the rest: a pass copies only
-/// the survivors, so its copies are a few tens of KiB and stay inside the file
-/// the writer is still filling (no file seal raises the owner root over them).
-pub(super) fn few_survivors_shape() -> KeyShape {
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "a",
-        8,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|key: &[u8], _: &[u8]| {
-            let sequence = u64::from_be_bytes(key.try_into().expect("an 8-byte key"));
-            if sequence.is_multiple_of(SURVIVOR_STRIDE) {
-                Decision::Keep
-            } else {
-                Decision::Remove
-            }
-        }),
-    );
-    builder.build()
-}
-
 /// Crash cut with data loss. The owner's sync is parked, so the deferred pass
 /// has written its copies but no root covers them. The crash point is that
 /// instant: an IMAGE of the owner's files is taken while the sync is still
@@ -742,9 +734,9 @@ pub(super) fn few_survivors_shape() -> KeyShape {
 /// re-points and the removals, and the reopened index would name bytes the
 /// owner lost or lack keys the owner still holds.
 ///
-/// The fixture keeps the copies ABOVE the root's `synced_end`: the pass copies
-/// only [`SURVIVOR_STRIDE`]-th keys, so the copies stay in the file the writer
-/// is filling and no file seal (which fsyncs and raises the root) covers them.
+/// The fixture keeps the copies ABOVE the root's `synced_end`: the pass appends
+/// them at the head after the certified data set, and the parked persist is the
+/// only path that could sync them.
 /// The premise `root_synced < copy_end` is asserted before the loss. At the
 /// park the test asserts that the pass still waits. After the join it asserts
 /// that the copy wait asked an owner to sync (a `targeted_syncs` delta: only
@@ -762,7 +754,7 @@ pub(super) fn few_survivors_shape() -> KeyShape {
 /// parked sync, and a key reads `None` or errors after the restart.
 #[test]
 fn a_native_tier_crash_after_a_deferred_pass_loses_no_value() {
-    let mut fixture = fixture_with_batch_bytes(few_survivors_shape(), 128 * KIB as usize);
+    let mut fixture = fixture_with_batch_bytes(shape(), 128 * KIB as usize);
     let db = open(&fixture);
     fill(&db);
     db.remote_for_test()
@@ -873,7 +865,7 @@ fn a_native_tier_crash_after_a_deferred_pass_loses_no_value() {
     fixture.restart_owners().unwrap();
     let db = open(&fixture);
     let ks = db.ks("a");
-    for sequence in 0..WRITES {
+    for sequence in (0..SURVIVORS).chain(PAD_BASE..PAD_BASE + PADDING) {
         // `exists` is index-only for a keyspace without key check: read the
         // bytes, which is what a lost value would change.
         let value = db
@@ -882,7 +874,7 @@ fn a_native_tier_crash_after_a_deferred_pass_loses_no_value() {
             .unwrap_or_else(|| panic!("key {sequence} lost"));
         assert_eq!(
             value.as_ref(),
-            vec![(sequence % 251) as u8; VALUE].as_slice(),
+            fill_value(sequence).as_slice(),
             "key {sequence} has the wrong bytes"
         );
     }
@@ -978,25 +970,6 @@ fn marked_value(mark: u8, sequence: u64) -> Vec<u8> {
     value
 }
 
-/// Every value written by the first generation is removed; later ones stay.
-fn removing_old_values_shape() -> KeyShape {
-    let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "a",
-        8,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], value: &[u8]| {
-            if value[0] == OLD_MARK {
-                Decision::Remove
-            } else {
-                Decision::Keep
-            }
-        }),
-    );
-    builder.build()
-}
-
 /// Values per commit when a generation is written only to fill files. Seven
 /// 8 KiB values plus their member headers stay below the fixture's 64 KiB
 /// batch limit, and the same values still span the same 1 MiB files; the
@@ -1019,7 +992,7 @@ fn write_old_generation(db: &Arc<Db>, ks: KeySpace) {
 /// completed retirement after the record lease is released does not.
 #[test]
 fn a_busy_sealed_retirement_reply_is_counted_but_completion_is_not() {
-    let fixture = fixture_with(removing_old_values_shape());
+    let fixture = fixture_with(shape());
     let db = open(&fixture);
     let ks = db.ks("a");
     write_old_generation(&db, ks);
@@ -1133,7 +1106,7 @@ fn a_busy_sealed_retirement_reply_is_counted_but_completion_is_not() {
 /// must stay removed.
 #[test]
 fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_every_key() {
-    let mut fixture = fixture_with(removing_old_values_shape());
+    let mut fixture = fixture_with(shape());
     let db = open(&fixture);
     let first_generation = db.remote_for_test().write_core().epoch;
     let ks = db.ks("a");
@@ -1221,10 +1194,9 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
         eprintln!(
             "liveness pass {number}: receipt {receipt:?} stored fronts {fronts:?} \
              generation 1 WAL files {remaining:?} busy replies {} owner busy retirements {} \
-             latch caps {} missing rows {}",
+             missing rows {}",
             remote.retirement_busy_replies(),
             fixture.nodes[0].file_maintenance_stats().busy_retirements,
-            remote.retirement_latch_caps(),
             remote.retirement_missing_rows(),
         );
         assert!(!receipt.deferred, "pass {number}: {receipt:?}");
@@ -1324,10 +1296,18 @@ fn an_owner_restart_after_the_last_data_file_retired_still_opens_and_serves_ever
                 "restart {restart}: key {sequence} has the wrong bytes"
             );
         }
+        // An unfiltered keyspace copies every live entry below its target, so
+        // generation 1's values survive their files' retirement at their
+        // serving-generation copies.
         for sequence in 0..old_keys {
-            assert!(
-                db.get(ks, &key(sequence)).expect("read").is_none(),
-                "restart {restart}: removed key {sequence} came back"
+            let value = db
+                .get(ks, &key(sequence))
+                .unwrap_or_else(|error| panic!("restart {restart}: read {sequence}: {error:?}"))
+                .unwrap_or_else(|| panic!("restart {restart}: copied key {sequence} lost"));
+            assert_eq!(
+                value.as_ref(),
+                marked_value(OLD_MARK, sequence).as_slice(),
+                "restart {restart}: key {sequence} has the wrong bytes"
             );
         }
         db.wait_for_background_threads_to_finish().unwrap();

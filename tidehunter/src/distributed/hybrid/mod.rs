@@ -30,6 +30,7 @@ pub(crate) mod region;
 pub(crate) mod table;
 
 pub use config::HybridIndexConfig;
+pub(crate) use table::RelocationApply;
 
 pub(crate) mod replay;
 mod snapshot;

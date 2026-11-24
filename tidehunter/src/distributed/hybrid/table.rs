@@ -403,6 +403,23 @@ fn unexamined_shadowing(expected: BatchVersion, published: BatchVersion) -> Batc
     expected.max(published)
 }
 
+/// One relocation operation on a cell: native's two filter-driven flush kinds
+/// (`RelocationFlush::Updates` for a copied survivor, `RelocationFlush::Cutoff`
+/// for a filtered keyspace).
+pub(crate) enum RelocationApply<'a> {
+    /// Compare-and-set re-point of the entries a pass copied, on their exact
+    /// scanned positions.
+    Repoint(&'a [(Bytes, VersionPosition, VersionPosition)]),
+    /// Drop every live entry of this cell below `targets`, the cutoff a
+    /// filtered keyspace takes.
+    ///
+    /// Only entries the cell holds in memory are dropped: native's cutoff
+    /// prunes the L0 it rebuilds (`flusher.rs` `handle_command`,
+    /// `RelocationFlush::Cutoff`) and never a deeper level, so a key that
+    /// lives only in a promoted L1 blob stays readable, as it does natively.
+    Drop,
+}
+
 impl TableInner {
     /// Seeds the per-cell byte positions and the byte counter from the region
     /// this open loaded (A26).
@@ -824,8 +841,8 @@ impl TableInner {
     ///   logical version never changes, the kind is preserved, and this is never
     ///   an `insert` (which compares equal on the logical identity and would be
     ///   dropped as stale).
-    /// * Drop: with `drop_removed`, every live entry not listed and below its
-    ///   target leaves the index at every read cut, as native's cutoff
+    /// * Drop ([`RelocationApply::Drop`]): every live in-memory entry below
+    ///   its target leaves the index at every read cut, as native's cutoff
     ///   `retain_above_position` does. The key's other versions below its
     ///   target go with it, and one tombstone at the dropped live position
     ///   keeps a deeper level from resurfacing the key.
@@ -857,11 +874,14 @@ impl TableInner {
         &self,
         ks: KeySpace,
         cell: &CellId,
-        updates: Option<&[(Bytes, VersionPosition, VersionPosition)]>,
+        mode: RelocationApply<'_>,
         targets: &[(u32, u64, u64)],
-        drop_removed: bool,
     ) -> Result<Vec<(VersionPosition, BatchVersion)>, LocalDbError> {
         self.check_background_health()?;
+        let (updates, drop_entries) = match mode {
+            RelocationApply::Repoint(updates) => (updates, false),
+            RelocationApply::Drop => (&[][..], true),
+        };
         let below_target = |position: VersionPosition| {
             let address = position.address;
             targets.iter().any(|&(partition, generation, end)| {
@@ -869,12 +889,6 @@ impl TableInner {
                     && address.segment_generation == generation
                     && address.offset < end
             })
-        };
-        let updates = updates.unwrap_or_default();
-        let listed: HashSet<&[u8]> = if drop_removed {
-            updates.iter().map(|(key, ..)| key.as_ref()).collect()
-        } else {
-            HashSet::new()
         };
         let context = self.contexts.ks_context(ks);
         let loader = self.loader.as_ref();
@@ -1018,7 +1032,7 @@ impl TableInner {
                         }
                     }
                 }
-                if drop_removed {
+                if drop_entries {
                     // Native's relocation cutoff retains only entries at or
                     // above it (`IndexTable::retain_above_position`), so a key
                     // whose live positions all sit below the cutoff leaves no
@@ -1032,9 +1046,7 @@ impl TableInner {
                     // re-inserted at the dropped live position.
                     let doomed: Vec<(Bytes, VersionPosition)> = index
                         .iter()
-                        .filter(|(key, position)| {
-                            !listed.contains(key.as_ref()) && below_target(*position)
-                        })
+                        .filter(|(_, position)| below_target(*position))
                         .collect();
                     if !doomed.is_empty() {
                         let dropped: HashSet<&[u8]> =

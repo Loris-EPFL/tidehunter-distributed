@@ -320,6 +320,17 @@ fn address(db: &Db, keyspace: KeySpace, sequence: u64) -> BatchAddress {
     }
 }
 
+/// The owner address of the member frame that holds `member` of `sequence`:
+/// the position the relocation terminal names for a Stop.
+fn member_address(db: &Db, keyspace: KeySpace, sequence: u64, member: u8) -> u64 {
+    let table = db.remote_for_test().hybrid_table();
+    let position = table
+        .get(keyspace, &key(sequence, member), table.current())
+        .unwrap()
+        .expect("the written member is indexed");
+    position.address.offset
+}
+
 fn observe(db: &Db) -> RelocationObservation {
     db.start_relocation_for_test(Instant::now() + Duration::from_secs(120))
         .unwrap()
@@ -503,7 +514,8 @@ fn stop_semantics_follow_the_native_whole_file_gate() {
     assert_eq!(observation.streams.len(), 1);
     assert_eq!(
         observation.streams[0].terminal_position,
-        offsets[stop as usize]
+        member_address(&db, db.ks("a"), stop, 1),
+        "the terminal is the Stop record's own position, as native's scan"
     );
     assert_eq!(observation.streams[0].rounded_target, 0);
     assert_eq!(
@@ -533,9 +545,9 @@ fn stop_semantics_follow_the_native_whole_file_gate() {
         let StopCase {
             fixture: _c,
             db,
-            offsets,
             stop,
             observation,
+            ..
         } = stop_case(WRITES, |offsets| {
             Some(first_in_second_file(offsets) + after)
         });
@@ -548,14 +560,32 @@ fn stop_semantics_follow_the_native_whole_file_gate() {
         );
         assert_eq!(
             observation.streams[0].terminal_position,
-            offsets[stop as usize]
+            member_address(&db, a, stop, 1),
+            "after {after}: the terminal is the Stop record's own position"
         );
         assert_eq!(observation.streams[0].rounded_target, FILE);
         assert_eq!(callbacks(&observation), expected_callbacks(a, (stop, 1), 1));
+        // Everything the filter removed below the terminal is dropped, the
+        // earlier member of the Stop batch included: native's cutoff is the
+        // Stop record's position.
         assert!(!exists(&db, a, 0, 0) && !exists(&db, a, 0, 1));
-        // The Stop batch survives whole, although its member 0 was Remove.
-        assert!(exists(&db, a, stop, 0) && exists(&db, a, stop, 1));
-        assert_eq!(visible(&db, a, WRITES).len(), 2 * WRITES as usize - 2);
+        assert!(
+            !exists(&db, a, stop, 0),
+            "after {after}: member 0 of the Stop batch lies below the Stop record"
+        );
+        assert!(
+            exists(&db, a, stop, 1),
+            "after {after}: the Stop record itself stays"
+        );
+        assert_eq!(
+            visible(&db, a, WRITES).len(),
+            2 * (WRITES - stop - 1) as usize + 1,
+            "after {after}"
+        );
+        assert_eq!(
+            observation.copied_survivors, 0,
+            "after {after}: a filtered keyspace copies nothing"
+        );
         db.wait_for_background_threads_to_finish().unwrap();
     }
 }
@@ -603,7 +633,11 @@ fn crash_after_start_persist_before_prune_keeps_removals_and_start() {
 
     let db = fixture.open();
     assert!(!exists(&db, a, 0, 0) && !exists(&db, a, 0, 1));
-    assert_eq!(visible(&db, a, WRITES).len(), 2 * WRITES as usize - 2);
+    assert_eq!(
+        visible(&db, a, WRITES).len(),
+        2 * (WRITES - stop - 1) as usize + 1,
+        "everything below the Stop record stays dropped"
+    );
     let observation = observe(&db);
     assert_eq!(observation.gate, crate::RelocationGate::NoWork);
     assert_eq!(
@@ -613,7 +647,10 @@ fn crash_after_start_persist_before_prune_keeps_removals_and_start() {
             (a, stop, 1, Decision::StopRelocation)
         ]
     );
-    assert_eq!(visible(&db, a, WRITES).len(), 2 * WRITES as usize - 2);
+    assert_eq!(
+        visible(&db, a, WRITES).len(),
+        2 * (WRITES - stop - 1) as usize + 1
+    );
     db.wait_for_background_threads_to_finish().unwrap();
 }
 
@@ -633,7 +670,8 @@ fn restart_after_completed_pass_is_idempotent() {
     let stop = stop.unwrap();
     let a = db.ks("a");
     assert_eq!(observation.gate, crate::RelocationGate::DidWork);
-    let generation = address(&db, a, 1).segment_generation;
+    // A sequence the pass kept, so its entry still names the old generation.
+    let generation = address(&db, a, WRITES - 1).segment_generation;
     let before = visible(&db, a, WRITES);
     db.wait_for_background_threads_to_finish().unwrap();
 
@@ -660,33 +698,13 @@ fn restart_after_completed_pass_is_idempotent() {
     drop(fixture);
 }
 
-/// Native index state before the pass, set through native's own forced flush
-/// (`force_rebuild_control_region`) so the oracle never depends on when the
-/// background flusher ran or whether it promoted the cell. The write path
-/// queues no flush because `max_dirty_keys` exceeds the row count, so the
-/// forced rebuild's flush alone decides the level state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeIndexState {
-    /// Every entry flushed into L0; `l0_max_entries` exceeds the row count.
-    FlushedL0,
-    /// Every entry promoted into L1: with `l0_max_entries` 8 the forced flush
-    /// promotes the cell.
-    PromotedL1,
-}
-
-/// Filter decisions below the Stop of the one-owner parity oracle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Decisions {
-    /// Sui's shape: every put before the Stop is `Remove` (Sui filters
-    /// return only `Remove` or `StopRelocation`).
-    RemoveOnly,
-    /// The first half before the Stop is `Remove`, the rest `Keep`. Fixed
-    /// native copies the Keep rows below its target to the WAL head; R1 keeps
-    /// them, and their files, in place.
-    KeepAfterRemoves,
-}
-
-fn native_config(state: NativeIndexState, writes: u64) -> Arc<crate::config::Config> {
+/// Native's configuration for the one-owner parity oracle.
+///
+/// Every entry of the oracle's cell sits in L0: the forced rebuild's flush
+/// alone decides the level state (the write path queues no flush because
+/// `max_dirty_keys` exceeds the row count), and `l0_max_entries` exceeds the
+/// row count so that flush writes an L0 instead of promoting.
+fn native_config(writes: u64) -> Arc<crate::config::Config> {
     let mut config = crate::config::Config::small();
     config.frag_size = FRAGMENT;
     config.wal_file_size = FILE;
@@ -696,18 +714,23 @@ fn native_config(state: NativeIndexState, writes: u64) -> Arc<crate::config::Con
     // rows than `max_dirty_keys` (`LargeTable::too_many_dirty`). Keep the
     // threshold above every row this test writes (two members per sequence)
     // so that only `force_rebuild_control_region` flushes, and therefore only
-    // it decides the level state. Otherwise a background flush can promote
-    // the cell, and a later forced flush of at most `l0_max_entries` rows
-    // writes a new L0 above that L1 (`IndexFlusherThread::handle_command`,
-    // the L0-or-promote decision) and leaves `[L0, L1]`, which is not a state
-    // this oracle describes.
+    // it decides the level state.
     let rows = writes.saturating_mul(2);
     config.max_dirty_keys = usize::try_from(rows.saturating_mul(4)).unwrap_or(usize::MAX / 16);
-    config.l0_max_entries = Some(match state {
-        NativeIndexState::FlushedL0 => 4096,
-        NativeIndexState::PromotedL1 => 8,
-    });
+    config.l0_max_entries = Some(4096);
     Arc::new(config)
+}
+
+/// Filter decisions below the Stop of the one-owner parity oracle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Decisions {
+    /// Sui's shape: every put before the Stop is `Remove` (Sui filters
+    /// return only `Remove` or `StopRelocation`).
+    RemoveOnly,
+    /// The first half before the Stop is `Remove`, the rest `Keep`. Both arms
+    /// at the parity tip copy nothing for a filtered keyspace, so the `Keep`
+    /// rows below the terminal are dropped too.
+    KeepAfterRemoves,
 }
 
 fn open_native(root: &Path, policy: &Arc<Policy>, config: &Arc<crate::config::Config>) -> Arc<Db> {
@@ -785,163 +808,152 @@ fn assert_state(
     }
 }
 
-/// One owner with native's geometry against fixed native Tidehunter, for each
-/// forced native index state and both decision shapes: equal gates, equal
-/// ordered callbacks (keyspace, key, value, decision), equal whole-file
-/// targets, each arm's terminal at its own Stop position below its own
-/// processed upper, and equal visible state (`exists` and value reads) right
-/// after the pass and after a reopen of both arms. Byte positions differ by
-/// WAL format, so terminals and uppers are checked per arm, not across.
+/// One owner with native's geometry against native Tidehunter at the parity
+/// tip, for both decision shapes: equal
+/// gates, equal ordered callbacks (keyspace, key, value, decision), equal
+/// whole-file targets, each arm's terminal at its own Stop record below its own
+/// processed upper, zero copied survivors on both arms, and equal visible state
+/// (`exists` and value reads) right after the pass and after a reopen of both
+/// arms. Byte positions differ by WAL format, so terminals and uppers are
+/// checked per arm, not across.
 ///
-/// `copied_survivors` is compared per arm; byte positions differ by WAL
-/// format. Native writes a relocated batch to the WAL head; the leased pass
-/// writes the copy to the serving generation and re-points the entry (module
-/// doc step 4).
+/// D24: for a filtered keyspace the WAL-based pass copies nothing and drops
+/// every entry below its terminal (`relocation/mod.rs` `relocate_stripe`,
+/// `RelocationFlush::Cutoff`). The Stop is placed at member 0 of its batch, so
+/// no earlier member of that batch exists: both arms then keep exactly the
+/// Stop record and every later record, and the same keys survive.
 ///
-/// Under D24 both arms keep upstream's rule: for a filtered keyspace WAL
-/// relocation copies nothing and drops everything below its target, so
-/// `copied_survivors` is 0 on both arms. This test still asserts the fork's
-/// Keep-copy parity (native copied the Keep rows below its target); the hybrid
-/// D24 task rewrites it for the upstream rule and re-enables it.
-#[ignore = "rewrite for D24 upstream rule: hybrid relocation will match native (no Keep copies)"]
+/// The oracle runs with every entry in L0. Native's cutoff prunes only the L0
+/// it rebuilds, so a key that lives only in a promoted, unloaded L1 blob is not
+/// pruned by the pass; the hybrid mirrors that by applying `Drop` to the
+/// in-memory level alone (`hybrid::RelocationApply::Drop`, covered by
+/// `hybrid::table::tests::a_promoted_cell_is_not_pruned_by_the_drop`). The
+/// hybrid fixture promotes no cell (`l0_max_entries` is Sui's default), so this
+/// oracle compares the one state both arms can reach.
 #[test]
-fn one_owner_matches_fixed_native_gate_callbacks_frontiers_and_state() {
+fn one_owner_matches_native_gate_callbacks_frontiers_and_state() {
     const WRITES: u64 = 130;
-    for state in [NativeIndexState::FlushedL0, NativeIndexState::PromotedL1] {
-        for decisions in [Decisions::RemoveOnly, Decisions::KeepAfterRemoves] {
-            let case = format!("{state:?} {decisions:?}");
-            let leased_policy = Policy::new();
-            let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
-            let leased = fixture.open();
-            let native_policy = Policy::new();
-            let native_root = tempdir::TempDir::new("r1-native-parity").unwrap();
-            let config = native_config(state, WRITES);
-            let native = open_native(native_root.path(), &native_policy, &config);
-            let a = leased.ks("a");
-            for db in [&leased, &native] {
-                for sequence in 0..WRITES {
-                    write(db, sequence, &[a, a]);
-                }
+    for decisions in [Decisions::RemoveOnly, Decisions::KeepAfterRemoves] {
+        let case = format!("{decisions:?}");
+        let leased_policy = Policy::new();
+        let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
+        let leased = fixture.open();
+        let native_policy = Policy::new();
+        let native_root = tempdir::TempDir::new("r1-native-parity").unwrap();
+        let config = native_config(WRITES);
+        let native = open_native(native_root.path(), &native_policy, &config);
+        let a = leased.ks("a");
+        for db in [&leased, &native] {
+            for sequence in 0..WRITES {
+                write(db, sequence, &[a, a]);
             }
-            // Paper 3.1/4.4: the leased pass scans the durable processed
-            // prefix; native applies the index synchronously, the leased owner
-            // fsync runs in the background.
-            leased.flush().unwrap();
-            native
-                .native()
-                .unwrap()
-                .force_rebuild_control_region()
-                .unwrap();
-            assert_eq!(
-                native_levels(&native, a),
-                match state {
-                    NativeIndexState::FlushedL0 => (true, false),
-                    NativeIndexState::PromotedL1 => (false, true),
-                },
-                "{case}: forced native index state"
-            );
-            // Positions come from each arm's index: a pass without a Stop
-            // would already reclaim on both arms (clean tail at the
-            // processed upper), so no probe pass runs.
-            let leased_offset = |sequence: u64| address(&leased, a, sequence).offset;
-            let stop = (0..WRITES)
-                .find(|&sequence| {
-                    leased_offset(sequence) >= FILE
-                        && native_position(&native, a, sequence, 0) >= FILE
-                })
-                .unwrap();
-            let remove_below = match decisions {
-                Decisions::RemoveOnly => stop,
-                Decisions::KeepAfterRemoves => stop / 2,
-            };
-            // With Keep rows, every Remove lies in WAL file 0 on both arms,
-            // below both targets: fixed native's Keep branch cuts at its
-            // target and leaves Removes between target and terminal for a
-            // later pass, while R1 removes every Remove before the Stop.
-            if decisions == Decisions::KeepAfterRemoves {
-                let last_remove = remove_below - 1;
-                assert!(
-                    leased_offset(last_remove) < FILE
-                        && native_position(&native, a, last_remove, 1) < FILE,
-                    "{case}"
-                );
-            }
-            for policy in [&leased_policy, &native_policy] {
-                policy.set(Some((stop, 0)), remove_below);
-            }
-            let native_stop = native_position(&native, a, stop, 0);
-            let native_copies = (remove_below..stop)
-                .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
-                .filter(|&(sequence, member)| native_position(&native, a, sequence, member) < FILE)
-                .count() as u64;
-            // Byte positions differ by WAL format, so each arm copies the Keep
-            // rows below ITS OWN file target; the counts are checked per arm.
-            let leased_copies = (remove_below..stop)
-                .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
-                .filter(|&(sequence, _)| leased_offset(sequence) < FILE)
-                .count() as u64;
-            let leased_pass = observe(&leased);
-            let native_pass = observe(&native);
-            assert_eq!(leased_pass.gate, crate::RelocationGate::DidWork, "{case}");
-            assert_eq!(native_pass.gate, leased_pass.gate, "{case}");
-            let rows = |observation: &RelocationObservation| -> Vec<_> {
-                observation
-                    .callbacks
-                    .iter()
-                    .map(|callback| {
-                        (
-                            callback.keyspace,
-                            callback.key.to_vec(),
-                            callback.value.to_vec(),
-                            callback.decision,
-                        )
-                    })
-                    .collect()
-            };
-            assert_eq!(rows(&leased_pass), rows(&native_pass), "{case}");
-            assert_eq!(
-                callbacks(&leased_pass),
-                expected_callbacks(a, (stop, 0), remove_below),
+        }
+        // Paper 3.1/4.4: the leased pass scans the durable processed
+        // prefix; native applies the index synchronously, the leased owner
+        // fsync runs in the background.
+        leased.flush().unwrap();
+        native
+            .native()
+            .unwrap()
+            .force_rebuild_control_region()
+            .unwrap();
+        assert_eq!(
+            native_levels(&native, a),
+            (true, false),
+            "{case}: premise, the forced native flush leaves every entry in L0"
+        );
+        // Positions come from each arm's index: a pass without a Stop
+        // would already reclaim on both arms (clean tail at the
+        // processed upper), so no probe pass runs.
+        let leased_offset = |sequence: u64| address(&leased, a, sequence).offset;
+        let stop = (0..WRITES)
+            .find(|&sequence| {
+                leased_offset(sequence) >= FILE && native_position(&native, a, sequence, 0) >= FILE
+            })
+            .unwrap();
+        let remove_below = match decisions {
+            Decisions::RemoveOnly => stop,
+            Decisions::KeepAfterRemoves => stop / 2,
+        };
+        // With Keep rows the case proves that a `Keep` decision copies
+        // nothing on either arm: every Remove lies in WAL file 0, below
+        // both targets.
+        if decisions == Decisions::KeepAfterRemoves {
+            let last_remove = remove_below - 1;
+            assert!(
+                leased_offset(last_remove) < FILE
+                    && native_position(&native, a, last_remove, 0) < FILE,
                 "{case}"
             );
-            for (arm, pass, terminal) in [
-                ("leased", &leased_pass, leased_offset(stop)),
-                ("native", &native_pass, native_stop),
-            ] {
-                assert_eq!(pass.streams.len(), 1, "{case} {arm}");
-                let stream = &pass.streams[0];
-                assert_eq!(stream.terminal_position, terminal, "{case} {arm}");
-                assert!(
-                    stream.terminal_position < stream.processed_upper,
-                    "{case} {arm}"
-                );
-                assert_eq!(stream.rounded_target, FILE, "{case} {arm}");
-            }
-            assert_eq!(leased_pass.copied_survivors, leased_copies, "{case}");
-            assert_eq!(native_pass.copied_survivors, native_copies, "{case}");
-            if decisions == Decisions::KeepAfterRemoves {
-                assert!(native_copies > 0, "{case}: the case must copy on native");
-            }
-            let expected: Vec<(u64, u8)> = (remove_below..WRITES)
-                .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
-                .collect();
-            let arms = (leased.as_ref(), native.as_ref());
-            assert_state(
-                &format!("{case}, after the pass"),
-                arms,
-                a,
-                WRITES,
-                &expected,
-            );
-            leased.wait_for_background_threads_to_finish().unwrap();
-            native.wait_for_background_threads_to_finish().unwrap();
-            let leased = fixture.open();
-            let native = open_native(native_root.path(), &native_policy, &config);
-            let arms = (leased.as_ref(), native.as_ref());
-            assert_state(&format!("{case}, after reopen"), arms, a, WRITES, &expected);
-            leased.wait_for_background_threads_to_finish().unwrap();
-            native.wait_for_background_threads_to_finish().unwrap();
         }
+        for policy in [&leased_policy, &native_policy] {
+            policy.set(Some((stop, 0)), remove_below);
+        }
+        let leased_pass = observe(&leased);
+        let native_pass = observe(&native);
+        assert_eq!(leased_pass.gate, crate::RelocationGate::DidWork, "{case}");
+        assert_eq!(native_pass.gate, leased_pass.gate, "{case}");
+        let rows = |observation: &RelocationObservation| -> Vec<_> {
+            observation
+                .callbacks
+                .iter()
+                .map(|callback| {
+                    (
+                        callback.keyspace,
+                        callback.key.to_vec(),
+                        callback.value.to_vec(),
+                        callback.decision,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(rows(&leased_pass), rows(&native_pass), "{case}");
+        assert_eq!(
+            callbacks(&leased_pass),
+            expected_callbacks(a, (stop, 0), remove_below),
+            "{case}"
+        );
+        for (arm, pass, terminal) in [
+            ("leased", &leased_pass, member_address(&leased, a, stop, 0)),
+            ("native", &native_pass, native_position(&native, a, stop, 0)),
+        ] {
+            assert_eq!(pass.streams.len(), 1, "{case} {arm}");
+            let stream = &pass.streams[0];
+            assert_eq!(stream.terminal_position, terminal, "{case} {arm}");
+            assert!(
+                stream.terminal_position < stream.processed_upper,
+                "{case} {arm}"
+            );
+            assert_eq!(stream.rounded_target, FILE, "{case} {arm}");
+        }
+        assert_eq!(
+            leased_pass.copied_survivors, 0,
+            "{case}: a filtered keyspace copies nothing"
+        );
+        assert_eq!(
+            native_pass.copied_survivors, 0,
+            "{case}: native copies nothing for a filtered keyspace"
+        );
+        // Both arms keep the Stop record and every later record.
+        let expected: Vec<(u64, u8)> = (stop..WRITES)
+            .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
+            .collect();
+        let arms = (leased.as_ref(), native.as_ref());
+        assert_state(
+            &format!("{case}, after the pass"),
+            arms,
+            a,
+            WRITES,
+            &expected,
+        );
+        leased.wait_for_background_threads_to_finish().unwrap();
+        native.wait_for_background_threads_to_finish().unwrap();
+        let leased = fixture.open();
+        let native = open_native(native_root.path(), &native_policy, &config);
+        let arms = (leased.as_ref(), native.as_ref());
+        assert_state(&format!("{case}, after reopen"), arms, a, WRITES, &expected);
+        leased.wait_for_background_threads_to_finish().unwrap();
+        native.wait_for_background_threads_to_finish().unwrap();
     }
 }
 

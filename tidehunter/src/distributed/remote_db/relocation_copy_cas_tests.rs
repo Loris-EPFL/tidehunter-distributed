@@ -2,8 +2,7 @@
 //! its re-point keeps the newer position; the pass installs no stale copy.
 
 use super::copy_durable_pass_tests::{
-    COPY_WAIT, KIB, VALUE, WAIT, few_survivors_shape, fill, fixture_with_batch_bytes, newest_cut,
-    open,
+    COPY_WAIT, KIB, VALUE, WAIT, fill, fixture_with_batch_bytes, newest_cut, open, shape,
 };
 use super::*;
 use crate::distributed::sui::Db;
@@ -33,7 +32,7 @@ fn position(db: &Db, ks: KeySpace, key: &[u8]) -> (u64, u64) {
 /// write, and the index refuses the colliding position in `apply_update`.
 #[test]
 fn a_rewrite_between_the_copy_and_the_re_point_keeps_the_newer_position() {
-    let fixture = fixture_with_batch_bytes(few_survivors_shape(), 128 * KIB as usize);
+    let fixture = fixture_with_batch_bytes(shape(), 128 * KIB as usize);
     let db = open(&fixture);
     let ks = fill(&db);
     let core = db.remote_for_test().write_core();

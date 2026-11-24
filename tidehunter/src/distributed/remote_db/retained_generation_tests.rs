@@ -19,10 +19,9 @@
 use super::fencing_generations::generation_unused;
 use super::pipeline_tests::{Fixture, newest_cut};
 use super::*;
-use crate::Decision;
 use crate::distributed::codec::BatchLimits;
 use crate::distributed::group::GroupLimits;
-use crate::distributed::hybrid::{SnapshotBoundary, inject_snapshot_fault};
+use crate::distributed::hybrid::{RelocationApply, SnapshotBoundary, inject_snapshot_fault};
 use crate::distributed::sui::Db;
 use crate::key_shape::{KeyShapeBuilder, KeySpaceConfig, KeyType};
 use std::ops::Range;
@@ -57,15 +56,13 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// after this bound. No test relies on it expiring.
 pub(super) const WAIT: Duration = Duration::from_secs(120);
 
+/// One keyspace with no relocation filter: the WAL-based pass copies every
+/// live entry below its stream's target and re-points it, which is what these
+/// tests observe. A filtered keyspace copies nothing at the parity tip (D24),
+/// so a filter would empty the copy path under test.
 pub(super) fn shape() -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
-    builder.add_key_space_config(
-        "a",
-        8,
-        1,
-        KeyType::uniform(1),
-        KeySpaceConfig::new().with_relocation_filter(|_: &[u8], _: &[u8]| Decision::Keep),
-    );
+    builder.add_key_space_config("a", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
     builder.build()
 }
 
@@ -947,7 +944,7 @@ fn a_stale_relocation_update_does_not_replace_an_overwrite() {
     )];
     let updates = [(reduced, old, stale_copy)];
     table
-        .relocation_apply(ks, &cell, Some(&updates), &target, true)
+        .relocation_apply(ks, &cell, RelocationApply::Repoint(&updates), &target)
         .unwrap();
     assert!(
         table
@@ -968,7 +965,7 @@ fn a_stale_relocation_update_does_not_replace_an_overwrite() {
         ),
     ];
     table
-        .relocation_apply(ks, &cell, Some(&updates), &both_targets, true)
+        .relocation_apply(ks, &cell, RelocationApply::Repoint(&updates), &both_targets)
         .unwrap();
     let after = table.get(ks, &raw_key, newest_cut()).unwrap().unwrap();
     assert!(

@@ -3,7 +3,7 @@
 //! relocation clamp. Owner drain and value reads are covered where an owner
 //! exists (the leased fixture tests).
 
-use super::{HybridTable, PublishedMutation};
+use super::{HybridTable, PublishedMutation, RelocationApply};
 use crate::db::WalEntry;
 use crate::distributed::codec::RecordKind;
 use crate::distributed::durability::DurabilityTier;
@@ -84,9 +84,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        Self::with_config(name, HybridIndexConfig::default())
+    }
+
+    fn with_config(name: &str, config: HybridIndexConfig) -> Self {
         let dir = tempdir::TempDir::new(name).expect("scratch directory");
         let cuts = CutSources::new(1, DurabilityTier::Native);
-        let table = open(&dir, &cuts);
+        let table = HybridTable::open(dir.path(), shape(), &config, cuts.clone(), Metrics::new())
+            .expect("open table");
         Self { dir, table, cuts }
     }
 
@@ -212,9 +217,8 @@ fn relocation_compare_and_set_preserves_a_newer_head() {
                 .relocation_apply(
                     ks,
                     &cell,
-                    Some(&[(reduced.clone(), old, first_copy)]),
+                    RelocationApply::Repoint(&[(reduced.clone(), old, first_copy)]),
                     &[(0, 1, 500)],
-                    false,
                 )
                 .expect("first re-point");
         }
@@ -224,9 +228,8 @@ fn relocation_compare_and_set_preserves_a_newer_head() {
             .relocation_apply(
                 ks,
                 &cell,
-                Some(&[(reduced, old, stale_copy)]),
+                RelocationApply::Repoint(&[(reduced, old, stale_copy)]),
                 &[(0, 1, 500)],
-                true,
             )
             .expect("stale re-point");
         let after = fixture.get(1, version(6)).expect("head survives");
@@ -934,9 +937,8 @@ fn a_relocation_view_shows_a_flat_entry_above_q_and_apply_repoints_only_what_it_
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(key.clone(), position(2, 100), position(2, 800))]),
+            RelocationApply::Repoint(&[(key.clone(), position(2, 100), position(2, 800))]),
             &targets,
-            false,
         )
         .expect("stale expectation");
     assert_eq!(
@@ -951,9 +953,8 @@ fn a_relocation_view_shows_a_flat_entry_above_q_and_apply_repoints_only_what_it_
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(key.clone(), seen, position(4, 600))]),
+            RelocationApply::Repoint(&[(key.clone(), seen, position(4, 600))]),
             &outside,
-            false,
         )
         .expect("target span of another stream");
     assert_eq!(
@@ -968,9 +969,8 @@ fn a_relocation_view_shows_a_flat_entry_above_q_and_apply_repoints_only_what_it_
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(key.clone(), seen, moved)]),
+            RelocationApply::Repoint(&[(key.clone(), seen, moved)]),
             &targets,
-            false,
         )
         .expect("matching expectation");
     assert_eq!(
@@ -986,9 +986,8 @@ fn a_relocation_view_shows_a_flat_entry_above_q_and_apply_repoints_only_what_it_
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(key, moved, position(4, 950))]),
+            RelocationApply::Repoint(&[(key, moved, position(4, 950))]),
             &targets,
-            false,
         )
         .expect("overwritten expectation");
     assert_eq!(
@@ -1301,7 +1300,7 @@ fn a_dropped_key_resolves_absent_at_every_cut() {
     );
     fixture
         .table
-        .relocation_apply(ks, &cell, None, &[(0, 1, 1000)], true)
+        .relocation_apply(ks, &cell, RelocationApply::Drop, &[(0, 1, 1000)])
         .expect("drop every entry of the key below the target");
     for cut in [version(3), version(5), version(9)] {
         assert!(
@@ -1318,4 +1317,46 @@ fn a_dropped_key_resolves_absent_at_every_cut() {
         Some(member_offset(1000)),
         "the drop tombstone does not hide a later write",
     );
+}
+/// Native's relocation cutoff prunes only the L0 it rebuilds, never a deeper
+/// level (`flusher.rs` `handle_command`, `RelocationFlush::Cutoff`). A key that
+/// lives only in a promoted, unloaded L1 blob therefore stays readable after a
+/// relocation pass. The hybrid's `Drop` applies to the cell's in-memory level
+/// alone, so it keeps that key too.
+///
+/// Negative control (mutation run): drop through the cell's disk levels (load
+/// L1 into the drop's table) and the key reads absent below.
+#[test]
+fn a_promoted_cell_is_not_pruned_by_the_drop() {
+    let fixture = Fixture::with_config(
+        "hybrid-table-drop-promoted",
+        HybridIndexConfig {
+            // Two rows promote the single cell, and the zero stale window makes
+            // the store unload it, so nothing of it is in memory.
+            l0_max_entries: Some(1),
+            snapshot_unload_threshold: 0,
+            ..HybridIndexConfig::default()
+        },
+    );
+    fixture.publish(RecordKind::Put, 1, 2, 100);
+    fixture.publish(RecordKind::Put, 2, 2, 200);
+    fixture.table.advance_applied(version(3));
+    fixture.cuts.set_durable(version(3));
+    fixture
+        .table
+        .snapshot_for_relocation(version(3))
+        .expect("the store promotes and unloads the cell");
+    let ks = fixture.ks();
+    let cell = fixture.table.shape().ks(ks).cell_id(&[1; 4]);
+    fixture
+        .table
+        .relocation_apply(ks, &cell, RelocationApply::Drop, &[(0, 1, 1000)])
+        .expect("a drop with nothing in the in-memory level");
+    for cut in [version(3), version(5)] {
+        assert_eq!(
+            fixture.get(1, cut).map(|found| found.address.offset),
+            Some(member_offset(100)),
+            "cut {cut:?}: a promoted cell's entry is not pruned by the drop",
+        );
+    }
 }

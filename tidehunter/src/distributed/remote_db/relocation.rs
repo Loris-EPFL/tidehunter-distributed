@@ -15,9 +15,9 @@
 //!    per stream. Every authenticated put of a filtered keyspace is read
 //!    through the ordinary position read and passed to the filter once,
 //!    including puts the index no longer holds. The first `Stop` ends all
-//!    callbacks, later members of its batch included. `Keep` members below the
-//!    owner's span budget are remembered by keyspace and physical member
-//!    address, never by value.
+//!    callbacks, later members of its batch included. `Keep` is not a copy
+//!    decision: like native at the parity tip, a filtered keyspace copies
+//!    nothing.
 //! 3. Per stream: terminal = the `Stop` batch, the first batch after `Stop`
 //!    (other streams), the first batch above `Q`, or the clean tail at the
 //!    durable end. The target is the native rule
@@ -25,17 +25,16 @@
 //!    `relocation_max_reclaim_pct` budget. Without one complete file before a
 //!    target the pass is `NoWork`: no copy, no start, no snapshot, no
 //!    retirement.
-//! 4. `DidWork`: per cell, take the as-of view at `Q` under its latch; a `Keep`
-//!    entry below its own stream's target is copied to the serving generation
-//!    at the head, then re-pointed by compare-and-set on its exact expected
-//!    position (never `insert`: equal order would be dropped, I4b). A filtered
-//!    keyspace with no kept record below the terminal drops its non-kept
-//!    entries below the TERMINAL unread (native's `!keep_seen` branch); with a
-//!    kept record it drops them below the target only, so entries from the
-//!    target to the terminal stay until a later pass. A copy keeps the
-//!    logical version and operation index of the position it re-points and
-//!    gets a new address and payload CRC, so the winner never changes by
-//!    version.
+//! 4. `DidWork`: a filtered keyspace copies nothing and drops every entry
+//!    below its stream's TERMINAL unread, as native's cutoff
+//!    (`relocation/mod.rs` `relocate_stripe`, `RelocationFlush::Cutoff`) does;
+//!    entries from the target to the terminal go with them. Every other
+//!    keyspace copies each live entry below its own stream's target to the
+//!    serving generation at the head, then re-points it by compare-and-set on
+//!    its exact expected position (never `insert`: equal order would be
+//!    dropped, I4b). A copy keeps the logical version and operation index of
+//!    the position it re-points and gets a new address and payload CRC, so the
+//!    winner never changes by version.
 //! 5. Make it durable: one snapshot stores the re-pointed index and the
 //!    control region (per-stream `replay_from`), one manifest replacement
 //!    raises the callback starts monotonically, then retirement runs under the
@@ -51,12 +50,12 @@ use super::dead_wal_files::core_retire_dead_wal_files;
 use super::file_inventory::{OwnerSpan, span_budget_end};
 use super::*;
 use crate::cell::CellId;
+use crate::distributed::hybrid::RelocationApply;
 use crate::distributed::hybrid::StoredSnapshot;
 use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::storage::RelocationBatch;
-use crate::distributed::types::PhysicalValueAddress;
 use crate::wal::position::IndexCut;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Batches requested per owner page; one page per stream is the merge state.
@@ -197,11 +196,6 @@ struct Cursor {
     /// Set once nothing more will be fetched.
     upper: Option<u64>,
 }
-
-/// A scanned `Keep` member, identified by its immutable physical address.
-/// A relocated index entry retains its original logical version, but a scan
-/// sees the copy batch's version, so logical identity cannot match both.
-type KeptKey = (u8, PhysicalValueAddress);
 
 /// One value copy for the serving generation: full key, value and the logical
 /// version the copy re-points.
@@ -367,35 +361,7 @@ impl ConcurrentRemoteDatabase {
             self.fill_cursor(&mut clients[cursor.scan.node], cursor, q, cancel)?;
         }
         let mut callbacks = Vec::new();
-        // `Keep` members below the span budget, by position identity. Memory
-        // is bounded by the reclaim span, not by the retained data set.
-        let mut kept: HashSet<KeptKey> = HashSet::new();
-        let mut kept_seen = vec![false; self.shape.num_ks()];
         let mut stop: Option<(usize, BatchVersion, u64)> = None;
-        // Per-owner budget ends: fixed before the scan, exactly the native
-        // reclaim cap, so the kept set never holds a survivor the pass cannot
-        // reach.
-        let budgets: BTreeMap<u32, BTreeMap<u64, u64>> = cursors
-            .iter()
-            .map(|cursor| cursor.scan.partition)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|partition| {
-                let spans: Vec<OwnerSpan> = cursors
-                    .iter()
-                    .filter(|cursor| cursor.scan.partition == partition)
-                    .map(|cursor| OwnerSpan {
-                        generation: cursor.scan.generation,
-                        lo: cursor
-                            .start
-                            .unwrap_or(cursor.scan.from)
-                            .max(cursor.scan.from),
-                        hi: cursor.upper.unwrap_or(cursor.scan.required_end),
-                    })
-                    .collect();
-                (partition, span_budget_end(&spans, file, pct))
-            })
-            .collect();
         'merge: loop {
             // Relaxed: a cancellation hint; shutdown joins the worker.
             if cancel.load(Ordering::Relaxed) {
@@ -440,22 +406,17 @@ impl ConcurrentRemoteDatabase {
                     });
                 }
                 match decision {
-                    // The whole Stop batch stays: its removals are dropped.
+                    // Native's scan stops at the Stop record's own position, so
+                    // the record and every later one survive and the earlier
+                    // members of its batch (called before it in this loop) are
+                    // dropped with the rest of the prefix.
                     CallbackDecision::Stop => {
-                        stop = Some((index, batch.version, batch.address.offset));
+                        stop = Some((index, batch.version, put.position.address.offset));
                         break 'merge;
                     }
-                    CallbackDecision::Keep => {
-                        kept_seen[keyspace.as_usize()] = true;
-                        let reachable = budgets
-                            .get(&cursors[index].scan.partition)
-                            .and_then(|ends| ends.get(&cursors[index].scan.generation))
-                            .is_some_and(|&end| batch.address.offset < end);
-                        if reachable {
-                            kept.insert((keyspace.0, put.position.address));
-                        }
-                    }
-                    CallbackDecision::Remove => {}
+                    // Native at the parity tip: a filtered keyspace decides
+                    // only where to stop. `Keep` and `Remove` copy nothing.
+                    CallbackDecision::Keep | CallbackDecision::Remove => {}
                 }
             }
         }
@@ -492,12 +453,11 @@ impl ConcurrentRemoteDatabase {
             // Native: the filters were called, nothing else happens.
             return Ok(empty(reports, callbacks, q));
         }
-        // Native's unread-drop bound: a filtered keyspace with no kept record
-        // below the terminal drops its entries below the TERMINAL
-        // (`relocation/mod.rs`: "drop its index entries below the terminal
-        // unread", `LastProcessed::new(terminal_position)`), not below the
-        // rounded target. Entries between the target and the terminal stay on
-        // the kept path only, where their files are not reclaimed either.
+        // Native's unread-drop bound: a filtered keyspace drops its entries
+        // below the TERMINAL unread, never below the rounded target
+        // (`relocation/mod.rs` `relocate_stripe`, `RelocationFlush::Cutoff`
+        // carries `terminal_position`). Entries between the target and the
+        // terminal go with them, exactly as native's cutoff removes them.
         //
         // Safety of the bound: `relocation_apply` compares an entry with the
         // terminal of its OWN `(partition, generation)` stream only, never
@@ -527,15 +487,8 @@ impl ConcurrentRemoteDatabase {
             })
             .collect();
         let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
-        let (copied, rejected, blocked) = self.relocate_cells(
-            q,
-            &targets,
-            &drop_targets,
-            &kept,
-            &kept_seen,
-            cancel,
-            &mut shadowed,
-        )?;
+        let (copied, rejected, blocked) =
+            self.relocate_cells(q, &targets, &drop_targets, cancel, &mut shadowed)?;
         // A survivor this pass could not verify or copy keeps its stream's
         // start where it was: advancing it would let retirement reclaim bytes
         // that still hold a live value. The copy of that key is not applied.
@@ -648,12 +601,14 @@ impl ConcurrentRemoteDatabase {
         })
     }
 
-    /// Copy and re-point every `Keep` entry below its own stream's target,
-    /// then drop every non-kept entry below the drop bound of a filtered
-    /// keyspace (the terminal when nothing was kept, the target otherwise).
-    /// No exclusive gate and no write barrier: entries at or above their
-    /// target are untouched, and a concurrent write above `Q` keeps its
-    /// version because a re-point never changes a version.
+    /// Drop every entry of a filtered keyspace below its stream's terminal,
+    /// then copy and re-point every live entry of every other keyspace below
+    /// its own stream's target. Native's rule at the parity tip: a filtered
+    /// keyspace copies nothing (`relocation/mod.rs` calls only
+    /// `sync_flush_for_relocation(.., Cutoff)` for it). No exclusive gate and
+    /// no write barrier: entries at or above their target are untouched, and a
+    /// concurrent write above `Q` keeps its version because a re-point never
+    /// changes a version.
     #[allow(
         clippy::type_complexity,
         reason = "three scalars of one pass outcome; a struct would rename the tuple fields only"
@@ -667,8 +622,6 @@ impl ConcurrentRemoteDatabase {
         q: BatchVersion,
         targets: &[(u32, u64, u64)],
         drop_targets: &[(u32, u64, u64)],
-        kept: &HashSet<KeptKey>,
-        kept_seen: &[bool],
         cancel: &AtomicBool,
         shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
     ) -> Result<(u64, u64, BTreeSet<(u32, u64)>), LocalDbError> {
@@ -685,10 +638,6 @@ impl ConcurrentRemoteDatabase {
                 continue;
             }
             let filtered = descriptor.relocation_filter().is_some();
-            // Every record of this keyspace below the terminal scanned as
-            // `Remove`: drop its entries below the terminal unread, as native
-            // does.
-            let drop_all = filtered && !kept_seen[keyspace.as_usize()];
             let mut cell = descriptor.first_cell();
             loop {
                 if cancel.load(Ordering::Relaxed) {
@@ -697,16 +646,16 @@ impl ConcurrentRemoteDatabase {
                 live_targets.retain(|&(partition, generation, _)| {
                     !blocked.contains(&(partition, generation))
                 });
-                if drop_all {
-                    // A drop names no re-point: the entries it removes were
-                    // dropped unread below the terminal, native's `!keep_seen`
-                    // branch, so no shadowed expectation is produced here.
+                if filtered {
+                    // Native copies nothing for a filtered keyspace: the
+                    // entries it removes are dropped unread below the terminal.
+                    // A drop names no re-point, so it produces no shadowed
+                    // expectation.
                     self.write_core().table.relocation_apply(
                         keyspace,
                         &cell,
-                        None,
+                        RelocationApply::Drop,
                         drop_targets,
-                        true,
                     )?;
                 } else {
                     copied += self.relocate_cell(
@@ -715,8 +664,6 @@ impl ConcurrentRemoteDatabase {
                         &cell,
                         q,
                         &live_targets,
-                        kept,
-                        filtered,
                         limit,
                         cancel,
                         &mut rejected,
@@ -733,8 +680,8 @@ impl ConcurrentRemoteDatabase {
         Ok((copied, rejected, blocked))
     }
 
-    /// One cell: copy kept survivors in bounded chunks and re-point each chunk
-    /// before the next. The view holds a cut latch, so promotion cannot pass
+    /// One cell: copy its live survivors in bounded chunks and re-point each
+    /// chunk before the next. The view holds a cut latch, so promotion cannot pass
     /// `Q` while its positions are still being copied (I6).
     #[allow(
         clippy::too_many_arguments,
@@ -747,8 +694,6 @@ impl ConcurrentRemoteDatabase {
         cell: &CellId,
         q: BatchVersion,
         targets: &[(u32, u64, u64)],
-        kept: &HashSet<KeptKey>,
-        filtered: bool,
         limit: usize,
         cancel: &AtomicBool,
         rejected: &mut u64,
@@ -767,9 +712,6 @@ impl ConcurrentRemoteDatabase {
             // Below its own stream's target only: offsets of other streams are
             // never comparable.
             if !below_target(&position, targets) {
-                continue;
-            }
-            if filtered && !kept.contains(&(keyspace.0, position.address)) {
                 continue;
             }
             // A survivor whose bytes do not verify against the indexed CRC is
@@ -791,7 +733,9 @@ impl ConcurrentRemoteDatabase {
                 }
             };
             let Some((key, value)) = value else {
-                // A tombstone has no value to copy; the drop below removes it.
+                // A tombstone has no value to copy. A filtered keyspace never
+                // reaches here; another keyspace keeps the tombstone's entry,
+                // and native copies nothing for it either.
                 continue;
             };
             bytes = bytes.saturating_add(value.len());
@@ -804,8 +748,6 @@ impl ConcurrentRemoteDatabase {
                     &mut chunk,
                     &mut expected,
                     targets,
-                    filtered,
-                    false,
                     rejected,
                     blocked,
                     shadowed,
@@ -813,10 +755,9 @@ impl ConcurrentRemoteDatabase {
                 bytes = 0;
             }
         }
-        // The drop runs only on the cell's last chunk: an entry still waiting
-        // in a later chunk is below its target and must not be removed before
-        // its copy exists. A stream that lost a survivor in this very cell is
-        // excluded here too, or the rejected key would be dropped unread.
+        // A stream that lost a survivor anywhere in this cell keeps no target
+        // for the remaining chunks either, or a re-point would name bytes the
+        // pass did not verify.
         let live: Vec<(u32, u64, u64)> = targets
             .iter()
             .copied()
@@ -828,8 +769,6 @@ impl ConcurrentRemoteDatabase {
             &mut chunk,
             &mut expected,
             &live,
-            filtered,
-            true,
             rejected,
             blocked,
             shadowed,
@@ -839,10 +778,8 @@ impl ConcurrentRemoteDatabase {
     }
 
     /// Write one chunk of copies to the serving generation, then re-point the
-    /// expected positions. `last` is set for the cell's final chunk, which also
-    /// drops the non-kept entries below the drop bound of a filtered keyspace.
-    /// The copy is written before the compare-and-set, so a crash leaves either
-    /// the old position (copy unreferenced) or the new one.
+    /// expected positions. The copy is written before the compare-and-set, so a
+    /// crash leaves either the old position (copy unreferenced) or the new one.
     #[allow(
         clippy::too_many_arguments,
         reason = "one internal call site; a context struct would only rename the parameters"
@@ -854,20 +791,11 @@ impl ConcurrentRemoteDatabase {
         chunk: &mut Vec<RelocatedValue>,
         expected: &mut Vec<(Bytes, VersionPosition)>,
         targets: &[(u32, u64, u64)],
-        filtered: bool,
-        last: bool,
         rejected: &mut u64,
         blocked: &mut BTreeSet<(u32, u64)>,
         shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
     ) -> Result<u64, LocalDbError> {
-        // Removals are only safe once every survivor of the cell has a copy.
-        let drop_removed = filtered && last;
         if chunk.is_empty() {
-            if drop_removed {
-                self.write_core()
-                    .table
-                    .relocation_apply(keyspace, cell, None, targets, true)?;
-            }
             return Ok(0);
         }
         let RelocatedCopies {
@@ -934,9 +862,8 @@ impl ConcurrentRemoteDatabase {
         let not_applied = self.write_core().table.relocation_apply(
             keyspace,
             cell,
-            Some(&updates),
+            RelocationApply::Repoint(&updates),
             &live,
-            drop_removed,
         )?;
         // A position whose re-point did not land is still named by a read cut at
         // or below the entry that shadowed it; `relocation_pass` turns the
@@ -1131,11 +1058,14 @@ fn stream_reports(
             let ended = || processed_upper;
             let terminal_position = match stop {
                 Some((stream, _, offset)) if stream == index => offset,
-                // Every unconsumed head is after the Stop in logical order.
-                Some(_) => cursor
-                    .buffer
-                    .front()
-                    .map_or_else(ended, |head| head.address.offset),
+                // Every unconsumed head is after the Stop in logical order, so
+                // this stream stops at its first record, the position native's
+                // linear scan would have stopped at.
+                Some(_) => cursor.buffer.front().map_or_else(ended, |head| {
+                    head.puts
+                        .first()
+                        .map_or(head.address.offset, |put| put.position.address.offset)
+                }),
                 None => ended(),
             };
             StreamReport {

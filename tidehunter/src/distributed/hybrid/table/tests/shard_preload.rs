@@ -17,7 +17,7 @@
 //! `sharded_cell_relocation_loads_only_the_needed_shard_and_preserves_other_shards`
 //! fail at `loads == 1` with `loaded 4` (total shards = 4).
 
-use super::{HybridTable, PublishedMutation, member_offset, position, version};
+use super::{HybridTable, PublishedMutation, RelocationApply, member_offset, position, version};
 use crate::cell::CellId;
 use crate::context::{ReadType, WalEntryKind};
 use crate::distributed::codec::RecordKind;
@@ -224,13 +224,12 @@ fn sharded_cell_relocation_loads_only_the_needed_shard_and_preserves_other_shard
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &spaced_key(target_seed)),
                 old,
                 moved,
             )]),
             &targets,
-            false,
         )
         .expect("relocation_apply on one shard");
     let loads = index_loads(&fixture.table, fixture.ks) - loads_before;
@@ -367,7 +366,12 @@ fn sharded_cell_relocation_caches_shards_for_unsorted_updates_and_skips_l0_and_o
     let loads_before = index_loads(&fixture.table, fixture.ks);
     let shadowed = fixture
         .table
-        .relocation_apply(fixture.ks, &fixture.cell, Some(&updates), &targets, false)
+        .relocation_apply(
+            fixture.ks,
+            &fixture.cell,
+            RelocationApply::Repoint(&updates),
+            &targets,
+        )
         .expect("relocation_apply unsorted multi-shard");
     let loads = index_loads(&fixture.table, fixture.ks) - loads_before;
     assert_eq!(
@@ -430,13 +434,12 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &spaced_key(s1_min)),
                 stale_expected,
                 stale_expected.moved_to(position(u64::from(s1_min), 70_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("stale shard expectation");
     assert_eq!(
@@ -472,13 +475,12 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &gap_raw),
                 gap_expected,
                 gap_expected.moved_to(position(2, 71_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("gap key expectation");
     assert_eq!(
@@ -510,13 +512,12 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &absent_in_s1_raw),
                 absent_expected,
                 absent_expected.moved_to(position(3, 72_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("absent-in-shard expectation");
     assert_eq!(
@@ -535,8 +536,8 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         "absent-in-shard key must record published shadowing version: {shadowed:?}"
     );
 
-    // (d) `drop_removed = true` on a sharded cell keeps narrow shard loading
-    // (Option A, matching native `lift_shard_entries` + `tombstone_below_position`).
+    // (d) A re-point on a sharded cell keeps narrow shard loading (matching
+    // native `lift_shard_entries`).
     let moved_s1 = s1_actual.moved_to(position(u64::from(s1_min), 73_000).address);
     let loads_before = index_loads(&fixture.table, fixture.ks);
     let shadowed = fixture
@@ -544,28 +545,27 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &spaced_key(s1_min)),
                 s1_actual,
                 moved_s1,
             )]),
             &targets,
-            true,
         )
-        .expect("drop_removed with one shard update");
+        .expect("re-point with one shard update");
     assert_eq!(
         index_loads(&fixture.table, fixture.ks) - loads_before,
         1,
-        "drop_removed on a sharded cell must still load only the owning shard"
+        "a re-point on a sharded cell must still load only the owning shard"
     );
     assert!(
         shadowed.is_empty(),
-        "matching update with drop_removed must apply cleanly: {shadowed:?}"
+        "matching update must apply cleanly: {shadowed:?}"
     );
     assert_eq!(
         fixture.get_offset(s1_min, version(published.sequence + 1)),
         Some(member_offset(73_000)),
-        "s1_min re-pointed under drop_removed"
+        "s1_min re-pointed"
     );
 
     // (e) Dropped cell: 0 shard loads and every below-target expectation joins
@@ -586,13 +586,12 @@ fn sharded_cell_shadowed_unexamined_and_drop_removed_keep_narrow_loads_and_witne
         .relocation_apply(
             fixture.ks,
             &fixture.cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&fixture.table, fixture.ks, &spaced_key(s1_min)),
                 dropped_expected,
                 dropped_expected.moved_to(position(4, 74_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("relocation_apply on dropped cell");
     assert_eq!(
@@ -671,13 +670,12 @@ fn unexamined_witness_at_the_serving_epoch_start_keeps_the_published_cut() {
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&table, ks, &spaced_key(11)),
                 absent_expected,
                 absent_expected.moved_to(position(1, 60_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("relocation_apply before any publication");
     assert_eq!(
@@ -700,13 +698,12 @@ fn unexamined_witness_at_the_serving_epoch_start_keeps_the_published_cut() {
         .relocation_apply(
             ks,
             &cell,
-            Some(&[(
+            RelocationApply::Repoint(&[(
                 reduced_key(&table, ks, &spaced_key(11)),
                 dropped_expected,
                 dropped_expected.moved_to(position(1, 61_000).address),
             )]),
             &targets,
-            false,
         )
         .expect("relocation_apply on a dropped cell before any publication");
     assert_eq!(
