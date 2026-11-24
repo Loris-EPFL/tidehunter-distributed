@@ -8,6 +8,43 @@
 
 use super::*;
 
+#[derive(Serialize, Deserialize)]
+pub(in crate::distributed::tcp) struct Envelope<T> {
+    pub(in crate::distributed::tcp) protocol: u32,
+    pub(in crate::distributed::tcp) id: u64,
+    pub(in crate::distributed::tcp) body: T,
+}
+
+/// Answer a coordinator lease renewal inline, ahead of the control queue.
+///
+/// A renewal is memory work of the database's lease cell: it touches no log or
+/// export, so an exclusive control (`control_active`) does not order it. Answer
+/// it here so a fence, seal or trim can never lapse a live coordinator. Returns
+/// true when the request was a renewal and its reply is queued.
+pub(super) fn answer_renewal(
+    pending: &mut HashMap<u64, ServerPending>,
+    envelope: &Envelope<Request>,
+    control: &super::super::control::ControlContext,
+) -> Result<bool, TcpError> {
+    let Request::RenewCoordinatorLease {
+        authority_epoch,
+        holder,
+        duration_ms,
+    } = &envelope.body
+    else {
+        return Ok(false);
+    };
+    let response = match control
+        .coordinator_lease
+        .renew(*authority_epoch, *holder, *duration_ms)
+    {
+        Ok(granted_ms) => Response::CoordinatorLease { granted_ms },
+        Err(error) => Response::Error(error.into()),
+    };
+    queue_response(pending, envelope.id, response)?;
+    Ok(true)
+}
+
 /// Removes the front output frame once its completion fence has retired.
 /// Check and removal share one borrow, so no unreachable `pop_front` result exists.
 pub(super) fn pop_retired(output: &mut VecDeque<Output>, completed: u64) -> Option<Output> {

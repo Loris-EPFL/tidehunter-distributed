@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 mod write_accounting;
 pub(crate) use write_accounting::LiveGroupBudget;
+use write_accounting::record_write_io;
 
 use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
 use crate::distributed::types::{BatchVersion, PhysicalValueAddress};
@@ -389,45 +390,6 @@ impl LiveWriteQueue {
             && target.address == binding.address
             && target.service == binding.service
             && target.transport == binding.transport
-    }
-}
-
-fn record_write_io(
-    counters: &crate::distributed::nvmeof::live_metrics::LiveNvmeCounters,
-    before: &crate::distributed::nvmeof::live_io::LiveIoStats,
-    after: &crate::distributed::nvmeof::live_io::LiveIoStats,
-) {
-    use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
-    let ns = |n: u128| n.min(u64::MAX as u128) as u64;
-    counters.record_write(
-        after
-            .completed_write_ops
-            .saturating_sub(before.completed_write_ops),
-        after
-            .completed_write_bytes
-            .saturating_sub(before.completed_write_bytes),
-    );
-    counters.record_write_submit_calls(after.submit_calls.saturating_sub(before.submit_calls));
-    let submissions = after.submissions.saturating_sub(before.submissions);
-    if submissions != 0 {
-        counters.record_timing(
-            LiveTimingStage::Queue,
-            ns(after.queue_ns.saturating_sub(before.queue_ns)),
-            submissions,
-        );
-        counters.record_timing(
-            LiveTimingStage::Submit,
-            ns(after.submit_ns.saturating_sub(before.submit_ns)),
-            submissions,
-        );
-    }
-    let completions = after.completions.saturating_sub(before.completions);
-    if completions != 0 {
-        counters.record_timing(
-            LiveTimingStage::Completion,
-            ns(after.submit_to_cq_ns.saturating_sub(before.submit_to_cq_ns)),
-            completions,
-        );
     }
 }
 
@@ -891,7 +853,10 @@ impl ExtentState {
 }
 
 impl super::Client {
-    fn install_leased_extent(&mut self, leased: super::LiveLeased) -> Result<(), super::TcpError> {
+    pub(crate) fn install_leased_extent(
+        &mut self,
+        leased: super::LiveLeased,
+    ) -> Result<(), super::TcpError> {
         if !self.valid_live_extent(&leased, leased.extent.segment.epoch) {
             self.live_write_failed = true;
             return Err(super::TcpError::new(
@@ -1495,6 +1460,7 @@ impl super::Client {
     ) -> Result<(u64, Instant, Instant, bool), super::TcpError> {
         use crate::distributed::nvmeof::live_io::{LiveIoError, LiveSubmitOutcome, LiveWriteSync};
         use crate::distributed::nvmeof::live_metrics::LiveWriteFailure;
+        self.check_lease()?;
         self.ensure_leased_healthy()?;
         self.ensure_leased_queue()?;
         let config = self
@@ -1974,7 +1940,7 @@ impl super::Client {
         Ok(())
     }
 
-    fn write_leased_skip(&mut self) -> Result<(), super::TcpError> {
+    pub(crate) fn write_leased_skip(&mut self) -> Result<(), super::TcpError> {
         debug_assert!(self.live_leased.flights.is_empty());
         if !self.live_leased.flights.is_empty() {
             return Err(super::TcpError::new(
@@ -2047,12 +2013,6 @@ impl super::Client {
         use crate::distributed::group::LiveFrame;
         use crate::distributed::nvmeof::live_storage::extend_live_receipt_digest;
         use crate::distributed::write_timeline::WriteTimelineStage as Stage;
-        // The coordinator's right to write this owner ends before the owner's
-        // grant does: a lapsed lease refuses the frame before it is encoded,
-        // with one Acquire load and no lock.
-        if let Some(validity) = &self.lease_validity {
-            validity.ensure_writable(self.expected.partition)?;
-        }
         self.ensure_leased_healthy()?;
         if self.live_writer_closing || !self.live_nvme_configured() {
             return Err(super::TcpError::new(
@@ -2566,8 +2526,7 @@ pub(crate) mod leased_tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            // Release wakes the server's shutdown checks; no stream state travels
-            // through this flag.
+            // Release wakes the server's shutdown checks; no stream state travels.
             self.stop.store(true, Ordering::Release);
             if let Some(server) = self.server.take() {
                 server.join().unwrap();

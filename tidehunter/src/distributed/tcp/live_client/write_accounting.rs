@@ -88,3 +88,42 @@ impl Client {
         }
     }
 }
+
+pub(super) fn record_write_io(
+    counters: &crate::distributed::nvmeof::live_metrics::LiveNvmeCounters,
+    before: &crate::distributed::nvmeof::live_io::LiveIoStats,
+    after: &crate::distributed::nvmeof::live_io::LiveIoStats,
+) {
+    use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
+    let ns = |n: u128| n.min(u64::MAX as u128) as u64;
+    counters.record_write(
+        after
+            .completed_write_ops
+            .saturating_sub(before.completed_write_ops),
+        after
+            .completed_write_bytes
+            .saturating_sub(before.completed_write_bytes),
+    );
+    counters.record_write_submit_calls(after.submit_calls.saturating_sub(before.submit_calls));
+    let submissions = after.submissions.saturating_sub(before.submissions);
+    if submissions != 0 {
+        counters.record_timing(
+            LiveTimingStage::Queue,
+            ns(after.queue_ns.saturating_sub(before.queue_ns)),
+            submissions,
+        );
+        counters.record_timing(
+            LiveTimingStage::Submit,
+            ns(after.submit_ns.saturating_sub(before.submit_ns)),
+            submissions,
+        );
+    }
+    let completions = after.completions.saturating_sub(before.completions);
+    if completions != 0 {
+        counters.record_timing(
+            LiveTimingStage::Completion,
+            ns(after.submit_to_cq_ns.saturating_sub(before.submit_to_cq_ns)),
+            completions,
+        );
+    }
+}

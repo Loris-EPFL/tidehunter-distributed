@@ -451,7 +451,11 @@ impl WriteCore {
             combine_error(&mut result, LocalDbError::component(error));
         }
         let started = Instant::now();
-        if result.is_ok() {
+        // A fail-stopped database never seals: its exports stay for recovery
+        // and a sealed marker from a file of unknown content would launder the
+        // truncation that recovery must report. `shutdown_result` reports the
+        // failure either way.
+        if result.is_ok() && !self.concurrent_failure.load(Ordering::Acquire) {
             let seals: Vec<_> = self
                 .clients
                 .iter()

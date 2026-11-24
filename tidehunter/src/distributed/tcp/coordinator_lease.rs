@@ -32,6 +32,10 @@ const OWNER_MARGIN: Duration = Duration::from_millis(1_000);
 pub(super) struct CoordinatorLeaseCell {
     state: Mutex<LeaseState>,
     changed: Condvar,
+    /// Grants this epoch granted. Test-only: a shutdown test observes renewals
+    /// continuing through a held Seal.
+    #[cfg(test)]
+    grants: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +55,8 @@ impl CoordinatorLeaseCell {
         Self {
             state: Mutex::new(LeaseState::default()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            grants: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -105,6 +111,9 @@ impl CoordinatorLeaseCell {
         }
         state.holder = Some(holder);
         state.expires = Some(now + Duration::from_millis(u64::from(duration_ms)));
+        #[cfg(test)]
+        self.grants
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The watchdog recomputes its deadline from the granted expiry.
         self.changed.notify_all();
         Ok(duration_ms)
@@ -122,10 +131,13 @@ impl CoordinatorLeaseCell {
         self.changed.notify_all();
     }
 
-    /// Retire the lease authority of a sealed epoch: no renewal is granted and
-    /// the watchdog parks.
-    pub(super) fn deactivate(&self) {
+    /// Retire the lease authority of sealed `epoch`. A stale Seal for another
+    /// epoch leaves the current lease alone: a new fence owns it.
+    pub(super) fn deactivate(&self, epoch: u64) {
         let mut state = self.state.lock();
+        if state.active_epoch != epoch {
+            return;
+        }
         state.active_epoch = 0;
         state.holder = None;
         state.expires = None;
@@ -173,6 +185,18 @@ impl CoordinatorLeaseCell {
         }
     }
 
+    /// Test-only: grants of the current epoch.
+    #[cfg(test)]
+    pub(super) fn grants(&self) -> u64 {
+        self.grants.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: whether the current epoch lapsed.
+    #[cfg(test)]
+    pub(super) fn is_lapsed(&self) -> bool {
+        self.state.lock().lapsed
+    }
+
     /// Wake a parked [`Self::wait_lapse`] when the watchdog must stop.
     pub(super) fn stop_waiting(&self) {
         self.changed.notify_all();
@@ -193,6 +217,16 @@ impl super::Client {
         validity: Arc<super::super::remote_db::coordinator_lease::LeaseValidity>,
     ) {
         self.lease_validity = Some(validity);
+    }
+
+    /// Submission-time lease gate: the coordinator's right to write this owner
+    /// ends before the owner's grant does, so a lapsed lease refuses the frame
+    /// before it is encoded. One `Acquire` load, no lock.
+    pub(crate) fn check_lease(&self) -> Result<(), super::TcpError> {
+        match &self.lease_validity {
+            Some(validity) => validity.ensure_writable(self.expected.partition),
+            None => Ok(()),
+        }
     }
 
     /// Renew the coordinator lease of `authority_epoch`. The owner clamps the
@@ -244,7 +278,7 @@ pub(super) fn lease_watch(context: &super::control::ControlContext, stop: &Atomi
     while let Some(epoch) = context.coordinator_lease.wait_lapse(stop) {
         let _gate = context.live_control_gate.lock();
         let mut slot = context.lifecycle.lock();
-        let result = super::NodeInventory::protect_lapsed_epoch(
+        let result = super::inventory::lease::protect_lapsed_epoch(
             &mut context.inventory.lock(),
             &mut slot,
             epoch,

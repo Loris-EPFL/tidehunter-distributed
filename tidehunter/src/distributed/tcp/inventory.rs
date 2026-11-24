@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod capacity;
 mod file_maintenance;
+pub(super) mod lease;
 pub(super) mod r1_events;
 mod ready_binding;
 mod relocation;
@@ -144,8 +145,7 @@ fn open_live_target_fixture(
     }
 }
 
-/// What the lifecycle gate owns: the live target registry when one is
-/// configured.
+/// What the lifecycle gate owns: the live target registry when one is configured.
 pub(super) type LifecycleSlot = Option<super::super::nvmeof::live_target::LiveTargetManager>;
 
 /// The node lifecycle gate. It is the single writer of the node's durable
@@ -1139,20 +1139,6 @@ impl NodeInventory {
                 *writable = false;
                 binding.readonly = true;
             }
-        }
-        Ok(())
-    }
-
-    /// Write-protect the writable exports of `epoch` after its coordinator
-    /// lease lapsed. The caller holds the live-control gate, the lifecycle gate
-    /// and the inventory; the target work releases the inventory.
-    pub(super) fn protect_lapsed_epoch<H: InventoryAccess>(
-        inventory: &mut H,
-        slot: &mut LifecycleSlot,
-        epoch: u64,
-    ) -> Result<(), TcpError> {
-        if let Some(target) = live_target(inventory, slot)? {
-            Self::protect_live_targets(inventory, target, epoch)?;
         }
         Ok(())
     }

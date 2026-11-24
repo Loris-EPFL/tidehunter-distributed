@@ -100,7 +100,8 @@ pub(super) fn coordinator_config(
         max_pending_reads: 256,
         max_pending_read_bytes: 64 * 1024 * 1024,
         write_profile_limit: 0,
-        coordinator_lease_ms: 5_000,
+        // No scheduler-starvation lapses in fixtures; lapse tests set their own.
+        coordinator_lease_ms: 30_000,
         live_nvme: live_config(DurabilityTier::Native),
         durable_cut: Default::default(),
         index: Default::default(),
@@ -334,8 +335,7 @@ impl Fixture {
         &self.startups[owner].0.root
     }
 
-    /// Stop serving and release every owner host: the next restart sees
-    /// only the durable image.
+    /// Stop serving and release every owner host: the next restart sees only the durable image.
     pub(super) fn stop_owners(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         for server in self.servers.drain(..) {
@@ -1426,8 +1426,7 @@ fn submit_many_preserves_order_retries_and_complete_recovery() {
     reopened.drain().unwrap();
     assert_eq!(reopened.stats().admitted_batches, 4);
     assert!(reopened.pipeline_stats().append_requests > 0);
-    // The retried values differ from the first epoch's (7..=10), so only a
-    // new write can show them.
+    // The retried values differ from the first epoch's (7..=10), so only a new write shows them.
     for key in 0..4 {
         assert_eq!(value(&mut reopened, key), Some(vec![key as u8 + 27; 32]));
     }

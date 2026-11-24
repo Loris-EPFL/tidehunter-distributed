@@ -135,3 +135,66 @@ fn a_stopped_watchdog_returns_at_once() {
         "a stopped watchdog must not report a lapse"
     );
 }
+
+#[test]
+fn a_stale_seal_leaves_the_newer_epoch_lease_alone() {
+    let cell = CoordinatorLeaseCell::new();
+    let now = Instant::now();
+    cell.activate(1);
+    cell.renew_at(now, 1, HOLDER_A, 5_000)
+        .expect("epoch 1 grants");
+    // A new authority fences; the old Seal arrives afterwards.
+    cell.activate(2);
+    cell.renew_at(now, 2, HOLDER_A, 5_000)
+        .expect("epoch 2 grants");
+    cell.deactivate(1);
+    assert!(!cell.is_lapsed(), "the newer epoch is not lapsed");
+    assert_eq!(
+        cell.renew_at(now, 2, HOLDER_A, 1_000)
+            .expect("epoch 2 still renews after the stale Seal"),
+        1_000,
+        "the newer epoch keeps its lease"
+    );
+    cell.deactivate(2);
+    let error = cell
+        .renew_at(now, 2, HOLDER_A, 1_000)
+        .expect_err("a sealed epoch grants nothing");
+    assert_eq!(
+        error.to_string(),
+        "stale coordinator lease authority",
+        "the sealed epoch is inactive"
+    );
+}
+
+/// A closing skip frame goes through the same submission choke point as a data
+/// frame: an expired lease refuses it before any DMA and writes no marker.
+#[test]
+fn an_expired_lease_refuses_the_closing_skip_frame() {
+    use crate::distributed::durability::DurabilityTier;
+    use crate::distributed::tcp::leased_tests::Fixture;
+
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 16384);
+    let mut client = fixture.writer_without_ahead();
+    let leased = client
+        .lease_live_extent(1)
+        .expect("the fixture owner grants a lease");
+    client
+        .install_leased_extent(leased)
+        .expect("the extent opens");
+    client.set_lease_validity(Arc::new(
+        crate::distributed::remote_db::coordinator_lease::LeaseValidity::expired_for_test(),
+    ));
+    let before = fixture.metrics.snapshot().counts.leased_skip_markers;
+    let refused = client
+        .write_leased_skip()
+        .expect_err("an expired lease refuses the closing skip frame");
+    assert!(
+        refused.to_string().contains("coordinator lease lapsed"),
+        "{refused}"
+    );
+    assert_eq!(
+        fixture.metrics.snapshot().counts.leased_skip_markers,
+        before,
+        "no skip marker is written after expiry"
+    );
+}

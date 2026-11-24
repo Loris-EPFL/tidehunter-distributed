@@ -50,7 +50,11 @@ mod stream_positions;
 use stream_positions::{OwnerTail, check_stream_bound, seed_positions};
 mod coordinator_io;
 pub(crate) mod coordinator_lease;
+mod failure;
 use coordinator_io::CoordinatorIoCategory;
+pub(in crate::distributed::remote_db) use failure::{
+    FirstFailure, failure_context, record_first_failure,
+};
 mod authority_lifecycle;
 pub(crate) use authority_lifecycle::drop_db;
 pub use authority_lifecycle::{AuthorityLifecycle, OwnerControlConfig};
@@ -165,8 +169,10 @@ pub struct RemoteDatabaseConfig {
     /// Coordinator lease duration in milliseconds, validated to
     /// 1000..=30000. The owner clamps and returns the granted value; the
     /// renewer renews at a fifth of it, so a lapse is detected within about one
-    /// lease. Absent means 5000.
-    #[serde(default = "default_coordinator_lease_ms")]
+    /// lease. The default 5000 assumes the renewal thread is scheduled within
+    /// about 4.5 s; a host that starves it will fail-stop the database. Absent
+    /// means 5000.
+    #[serde(default = "coordinator_lease::default_ms")]
     pub coordinator_lease_ms: u32,
     /// The leased live owner-WAL NVMe-oF route; required. Remote databases have
     /// no other data path.
@@ -208,10 +214,6 @@ fn default_read_memory_allowance_bytes() -> usize {
 }
 fn default_write_profile_limit() -> usize {
     0
-}
-
-fn default_coordinator_lease_ms() -> u32 {
-    5_000
 }
 
 fn default_owner_append_occupancy() -> usize {
@@ -1021,27 +1023,6 @@ impl RemoteDatabase {
             None,
             #[cfg(test)]
             None,
-            Some(false),
-        )
-    }
-
-    /// `open_local_live_fixture` with a renewal send hook: `hook(owner)`
-    /// returns `false` to drop that owner's next renewal request, so a test can
-    /// stop one owner's renewals without stopping the owner.
-    #[cfg(test)]
-    pub(crate) fn open_local_live_fixture_with_lease_hook(
-        path: &Path,
-        shape: &KeyShape,
-        config: RemoteDatabaseConfig,
-        lease_hook: coordinator_lease::SendHook,
-    ) -> Result<Self, LocalDbError> {
-        Self::open_inner_with(
-            path,
-            shape,
-            config,
-            None,
-            None,
-            Some(lease_hook),
             Some(false),
         )
     }
@@ -2159,10 +2140,8 @@ impl RemoteDatabase {
             .map(|(endpoint, client)| Ok((endpoint.partition, receive(client.stats()?)?)))
     }
     pub fn shutdown(&self) -> Result<(), LocalDbError> {
-        // Stop renewals before the Seal: a renewal that lands after it is
-        // refused by the owner, and a lapsed lease must not fail a clean close.
-        self.lease.stop();
-        self.core.shutdown()
+        // Renewals run through the Seal; see `close_engine`.
+        self.close_engine(|core| core.shutdown())
     }
 }
 
@@ -2250,80 +2229,6 @@ fn record_write_profile_error(shared: &Mutex<WriteProfileSnapshot>, activation: 
         snapshot.profile_capture_errors += 1;
     }
 }
-/// First causal fail-stop record: the bounded message plus the uncertain
-/// version it names. It is written once, before any failure flag is stored,
-/// so a control wait that observes the flag can report the typed version.
-#[derive(Debug)]
-struct FirstFailure {
-    message: String,
-    version: Option<BatchVersion>,
-}
-
-impl FirstFailure {
-    fn version(&self) -> Option<BatchVersion> {
-        self.version
-    }
-}
-
-impl std::ops::Deref for FirstFailure {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for FirstFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-// Failure-only evidence. No caller data is included, and formatting is capped
-// while writing rather than allocating an unbounded intermediate error string.
-fn record_first_failure(
-    slot: &std::sync::OnceLock<FirstFailure>,
-    partition: Option<u32>,
-    version: Option<BatchVersion>,
-    stage: &'static str,
-    error: &dyn std::fmt::Display,
-) {
-    struct Bounded(String, bool);
-    impl std::fmt::Write for Bounded {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            let remaining = 4084usize.saturating_sub(self.0.len());
-            let mut end = remaining.min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            self.1 |= end < text.len();
-            self.0.push_str(&text[..end]);
-            Ok(())
-        }
-    }
-    if slot.get().is_none() {
-        use std::fmt::Write;
-        let mut message = Bounded(String::new(), false);
-        let _ = write!(
-            message,
-            "owner={partition:?} batch={version:?} stage={stage}: {error}"
-        );
-        if message.1 {
-            message.0.push_str(" [truncated]");
-        }
-        let _ = slot.set(FirstFailure {
-            message: message.0,
-            version,
-        });
-    }
-}
-
-fn failure_context(slot: &std::sync::OnceLock<FirstFailure>, message: &str) -> String {
-    match slot.get() {
-        Some(cause) => format!("{message}; first causal failure: {cause}"),
-        None => message.to_owned(),
-    }
-}
-
 type Pending<T> = mpsc::Receiver<Result<T, LocalDbError>>;
 /// The owner drain lanes of one database: one control handle per owner worker,
 /// in dense stream order. The snapshot pass drains through it, once per real

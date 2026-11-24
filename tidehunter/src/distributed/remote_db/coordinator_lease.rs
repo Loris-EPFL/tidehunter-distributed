@@ -14,7 +14,7 @@
 //! There is no degraded mode.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,6 @@ const FAILED: u8 = 2;
 /// The holder's deadline ends this much before the grant it measured, so the
 /// owner's grant always expires later than the holder's right.
 const DEADLINE_MARGIN: Duration = Duration::from_millis(500);
-
 /// One test-only decision per renewal attempt: `true` sends the request,
 /// `false` drops it, so a test can stop one owner's renewals without a clock
 /// or a stopped owner.
@@ -55,6 +54,16 @@ impl LeaseValidity {
     fn new(base: Instant) -> Self {
         Self {
             base,
+            valid_until_ns: AtomicU64::new(0),
+            state: AtomicU8::new(VALID),
+        }
+    }
+
+    /// A stamp that is already expired, for the submission-gate tests.
+    #[cfg(test)]
+    pub(crate) fn expired_for_test() -> Self {
+        Self {
+            base: Instant::now(),
             valid_until_ns: AtomicU64::new(0),
             state: AtomicU8::new(VALID),
         }
@@ -174,6 +183,9 @@ impl Stop {
 pub(super) struct CoordinatorLease {
     validity: Vec<Arc<LeaseValidity>>,
     stop: Arc<Stop>,
+    /// Set when the database starts closing: renewals continue, but a renewal
+    /// failure is no longer a failure of the database.
+    closing: Arc<AtomicBool>,
     wakes: Vec<Arc<WakeFd>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -237,6 +249,7 @@ impl CoordinatorLease {
             })
             .collect();
         let stop = Arc::new(Stop::default());
+        let closing = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::with_capacity(targets.len());
         for (index, (target, (client, granted, _sent))) in
             targets.into_iter().zip(grants).enumerate()
@@ -245,6 +258,7 @@ impl CoordinatorLease {
             let thread_stop = stop.clone();
             let wake = wakes[index].clone();
             let core = core.clone();
+            let closing = closing.clone();
             let cadence =
                 Duration::from_millis(u64::from(granted) / 5).max(Duration::from_millis(1));
             #[cfg(test)]
@@ -265,6 +279,7 @@ impl CoordinatorLease {
                         wake,
                         cadence,
                         core,
+                        closing,
                         #[cfg(test)]
                         hook,
                     );
@@ -285,6 +300,7 @@ impl CoordinatorLease {
         Ok(Self {
             validity,
             stop,
+            closing,
             wakes,
             threads: Mutex::new(threads),
         })
@@ -295,8 +311,15 @@ impl CoordinatorLease {
         self.validity[owner].clone()
     }
 
+    /// The database stopped accepting writes and is sealing its owners.
+    /// Renewals continue until `stop`, so a Seal slower than the lease cannot
+    /// lapse it; from here a renewal failure is not a database failure.
+    pub(super) fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
+    }
+
     /// Stop every renewer and join it. Safe to call twice; the second call
-    /// joins nothing.
+    /// joins nothing. Called after the owners sealed.
     pub(super) fn stop(&self) {
         self.stop.stop();
         for wake in &self.wakes {
@@ -335,6 +358,7 @@ fn renew_loop(
     wake: Arc<WakeFd>,
     mut cadence: Duration,
     core: Arc<WriteCore>,
+    closing: Arc<AtomicBool>,
     #[cfg(test)] send_hook: Option<SendHook>,
 ) {
     let RenewTarget { partition, connect } = target;
@@ -359,8 +383,12 @@ fn renew_loop(
                 Err(_) => {
                     validity.store_state(SUSPECT);
                     // A transport failure leaves the session unusable: replace
-                    // it and confirm once at once, then keep the cadence.
-                    if let Ok(mut fresh) = connect(wake.clone()) {
+                    // it and confirm once at once, then keep the cadence. While
+                    // the database closes the owner may have sealed already, so
+                    // its refusal is expected and a new session buys nothing.
+                    if !closing.load(Ordering::Acquire)
+                        && let Ok(mut fresh) = connect(wake.clone())
+                    {
                         let sent = base.elapsed();
                         if let Ok(granted) = fresh.renew_coordinator_lease_within(
                             epoch,
@@ -380,6 +408,11 @@ fn renew_loop(
             validity.store_state(SUSPECT);
         }
         if nanos(base.elapsed()) >= validity.valid_until_ns.load(Ordering::Acquire) {
+            if closing.load(Ordering::Acquire) {
+                // The database is closing: its owners seal under a live lease,
+                // then this thread is stopped. A lapse is not a failure here.
+                return;
+            }
             // Terminal for this database: a read-only owner is a failed disk.
             validity.store_state(FAILED);
             core.fail(LocalDbError::with_kind(
@@ -394,3 +427,53 @@ fn renew_loop(
 #[cfg(test)]
 #[path = "coordinator_lease_tests.rs"]
 mod coordinator_lease_tests;
+
+impl super::RemoteDatabase {
+    /// Close the engine with the renewers alive: they run through the owners'
+    /// seal sweep and stop after it, so a slow close cannot lapse the lease.
+    /// `begin_close` makes a renewal failure during the close a no-op.
+    pub(super) fn close_engine<T>(
+        &self,
+        run: impl FnOnce(&Arc<WriteCore>) -> Result<T, LocalDbError>,
+    ) -> Result<T, LocalDbError> {
+        self.lease.begin_close();
+        let result = run(&self.core);
+        self.lease.stop();
+        result
+    }
+
+    /// Final campaign teardown through the same close contract as `shutdown`.
+    pub(super) fn shutdown_live_target_final(
+        &self,
+    ) -> Result<Vec<(u32, super::super::nvmeof::LiveTargetStats)>, LocalDbError> {
+        self.close_engine(|core| core.shutdown_live_target_final())
+    }
+}
+
+/// Default coordinator lease duration of a configuration that omits it.
+pub(super) fn default_ms() -> u32 {
+    5_000
+}
+
+#[cfg(test)]
+impl super::RemoteDatabase {
+    /// `open_local_live_fixture` with a renewal send hook: `hook(owner)`
+    /// returns `false` to drop that owner's next renewal request, so a test can
+    /// stop one owner's renewals without stopping the owner.
+    pub(crate) fn open_local_live_fixture_with_lease_hook(
+        path: &std::path::Path,
+        shape: &crate::key_shape::KeyShape,
+        config: super::RemoteDatabaseConfig,
+        lease_hook: SendHook,
+    ) -> Result<Self, super::super::storage::LocalDbError> {
+        Self::open_inner_with(
+            path,
+            shape,
+            config,
+            None,
+            None,
+            Some(lease_hook),
+            Some(false),
+        )
+    }
+}

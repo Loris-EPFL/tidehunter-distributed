@@ -1380,7 +1380,7 @@ impl ConcurrentRemoteDatabase {
             .live_metrics
             .take()
             .ok_or_else(|| LocalDbError::new("live NVMe is not configured"))?;
-        let targets = self.database.core.shutdown_live_target_final()?;
+        let targets = self.database.shutdown_live_target_final()?;
         Ok(LiveFinalShutdownEvidence {
             metrics: metrics.snapshot(),
             targets,
@@ -1397,7 +1397,7 @@ impl ConcurrentRemoteDatabase {
         self.database.core.finish_write_profile()
     }
     fn stop(&mut self) -> Result<(), LocalDbError> {
-        self.database.core.shutdown()
+        self.database.shutdown()
     }
 }
 impl Drop for ConcurrentRemoteDatabase {

@@ -46,6 +46,7 @@ mod wait;
 
 pub(crate) use host_session::HostClient;
 pub(super) use host_session::serve_host_session;
+pub(super) use reply::Envelope;
 use reply::{flush_responses, pop_retired, queue_response, request_kind_code, retire_responses};
 use wait::idle_wait_timeout;
 
@@ -154,13 +155,6 @@ impl ActivePoll {
             (true, false)
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct Envelope<T> {
-    pub(super) protocol: u32,
-    pub(super) id: u64,
-    pub(super) body: T,
 }
 
 struct Output {
@@ -2012,26 +2006,8 @@ pub(super) fn serve_session(
                 if matches!(&envelope.body, Request::ReplayLiveWal { .. }) {
                     replay_stages.accept(envelope.id);
                 }
-                // A lease renewal is memory work of the database's lease cell,
-                // and a renewal that waits behind an exclusive fence, seal or
-                // trim would lapse a live coordinator. Answer it here, on the
-                // queued-response path, before the control queue. It touches no
-                // log or export, so `control_active` does not order it.
-                if let Request::RenewCoordinatorLease {
-                    authority_epoch,
-                    holder,
-                    duration_ms,
-                } = &envelope.body
-                {
-                    let response = match node.control_context.coordinator_lease.renew(
-                        *authority_epoch,
-                        *holder,
-                        *duration_ms,
-                    ) {
-                        Ok(granted_ms) => Response::CoordinatorLease { granted_ms },
-                        Err(error) => Response::Error(error.into()),
-                    };
-                    queue_response(&mut pending, envelope.id, response)?;
+                // A lease renewal must not wait behind an exclusive control.
+                if reply::answer_renewal(&mut pending, &envelope, &node.control_context)? {
                     continue;
                 }
                 controls.push_back((envelope.id, envelope.body));
