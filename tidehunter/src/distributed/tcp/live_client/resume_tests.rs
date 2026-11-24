@@ -637,3 +637,422 @@ fn retention_is_pruned_by_the_owner_frontier() {
         "everything the owner adopted left the retained set"
     );
 }
+
+/// A writer whose frames are not per-frame FUA, so the group flush is the
+/// acknowledgement point for every frame after the first.
+///
+/// The `native` tier is always durable at completion (its checkpoint is the
+/// owner's page cache), so only the `synchronous` tier can leave a frame
+/// waiting for the covering flush.
+fn flush_writer(fixture: &Fixture) -> Client {
+    let mut client = resumed_writer(fixture);
+    client.leased_test_group_flush();
+    client
+        .live_config
+        .as_mut()
+        .expect("a configured writer")
+        .leased_flush_min_frame_bytes = 0;
+    client
+}
+
+/// An fsync data error is the filesystem's verdict, not a lost link: the flush
+/// CQE carries `EIO`, the resume never runs, and the writer fail-stops.
+#[test]
+fn failed_flush_eio_is_not_resumed() {
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
+    let mut client = flush_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    submit(&mut client, &fixture, 1);
+    client.leased_test_fail_flush(-libc::EIO);
+    let error = client
+        .drain_leased_flights(&mut released, None)
+        .expect_err("a failed fsync is sticky");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "a media error is not a transient break: {error}"
+    );
+    assert!(
+        error.to_string().contains("errno 5"),
+        "the refusal names the flush errno: {error}"
+    );
+    assert!(
+        client.live_write_failed,
+        "the writer fail-stops after a failed flush"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(
+        counts.resume_attempts, 0,
+        "a flush data error is never retried"
+    );
+    assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// A session break while a group flush is in flight keeps the queue, so
+/// `flushed_through_seq` is not reset and the flush CQE is still harvested.
+#[test]
+fn pending_flush_survives_a_session_break() {
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
+    let mut client = flush_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    submit(&mut client, &fixture, 1);
+    let retire_by = Instant::now() + std::time::Duration::from_secs(30);
+    while client.leased_test_flush_state().1.is_none() {
+        assert!(
+            Instant::now() < retire_by,
+            "the group flush was never submitted"
+        );
+        client
+            .wait_leased_flights(false)
+            .expect("the queue progresses");
+        client
+            .progress_leased_flights(&mut released, None)
+            .expect("the completions are harvested");
+    }
+    let (flushed, flush_id) = client.leased_test_flush_state();
+    assert_eq!(
+        flushed, 0,
+        "no frame is proven flushed before the flush CQE"
+    );
+    client.fail_connection_for_test();
+    client
+        .progress_session()
+        .expect("the session break resumes on the same incarnation");
+    let (after, id) = client.leased_test_flush_state();
+    assert_eq!(
+        after, 0,
+        "a kept queue keeps its flush coverage across a session break"
+    );
+    assert_eq!(id, flush_id, "the same flush is still awaited");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume episode");
+    assert_eq!(
+        counts.resume_rewrites, 0,
+        "a session break rewrites nothing"
+    );
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the pending flush CQE still releases its frame");
+    assert!(
+        client.leased_test_flush_state().0 > 0,
+        "the kept flush completed and covered the frame"
+    );
+    assert_eq!(released.len(), 2, "both frames were released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// A deadline that expires after a probe completed no frame is not probed a
+/// second time: the queue is detached and the retained suffix rewritten
+/// (design 7.3). The new queue proves the detach, because it reaped nothing.
+#[test]
+fn timeout_probe_escalates_to_the_data_path_when_the_queue_stalls() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    // Short enough that the test waits one bounded window, long enough for the
+    // resume's session setup on its own budget.
+    client
+        .live_config
+        .as_mut()
+        .expect("a configured writer")
+        .io_timeout_ms = 250;
+    // The frame reaches the device, and its CQE is reaped but never delivered:
+    // the queue stalls with a frame outstanding and nothing to harvest.
+    client.leased_test_hold_next_completion();
+    submit(&mut client, &fixture, 0);
+    let retire_by = Instant::now() + std::time::Duration::from_secs(30);
+    while client.leased_test_reaped_writes() == 0 {
+        assert!(
+            Instant::now() < retire_by,
+            "the withheld write did not reach the completion queue"
+        );
+        let writer = client.live_writer.as_mut().expect("a bound queue");
+        let mut completions = Vec::new();
+        writer
+            .io
+            .progress_into(&mut completions)
+            .expect("the queue reaps the write");
+    }
+    assert_eq!(
+        client.leased_flights_in_flight(),
+        1,
+        "the withheld completion leaves the flight outstanding"
+    );
+    // Expire the flight outright: the first pass probes, and the probe's retimed
+    // window then runs out without a CQE, which is the escalation.
+    client
+        .live_leased
+        .flights
+        .front_mut()
+        .expect("one outstanding flight")
+        .deadline = Instant::now();
+    let mut released = Vec::new();
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the escalation detaches the stalled queue and settles the frame");
+    let counts = counters(&fixture);
+    assert_eq!(
+        counts.resume_attempts, 2,
+        "one timeout probe, then one data resume"
+    );
+    // Whether the data resume had to resend the frame depends on how far the
+    // owner's own scan got: the probe may already have proved it written (the
+    // design's `ControlOnly` outcome) or the rewrite may still owe it. Both are
+    // correct; what the second resume must not do is probe a third time.
+    assert!(
+        counts.resume_rewrites <= 1,
+        "at most one rewrite episode: {}",
+        counts.resume_rewrites
+    );
+    assert_eq!(released.len(), 1, "the frame was released once");
+    assert_reads_back(&fixture, &fixture.batch(0), &released[0].1[0]);
+}
+
+/// A rewritten synchronous frame carries the FUA its original submission
+/// recorded, so a resent receipt still implies the barrier (design 8).
+#[test]
+fn fua_frame_stays_fua_on_resend() {
+    let fixture = Fixture::new(DurabilityTier::Synchronous, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    // The fixture requests per-frame FUA, so a synchronous frame's
+    // acknowledgement point is its own barrier rather than a group flush.
+    let mut released = Vec::new();
+    for sequence in 0..2 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the two FUA frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the FUA prefix");
+    assert_eq!(
+        client.leased_test_write_syncs(),
+        vec![true, true],
+        "both original submissions carried FUA"
+    );
+    let (_, cursor, _, adopted_end) = client.leased_test_extent_ends().expect("an open extent");
+    assert_eq!(adopted_end, cursor, "the FUA prefix is written and adopted");
+    for sequence in 2..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the two later FUA frames complete");
+    assert_eq!(
+        client.leased_test_retained().0,
+        2,
+        "the two unadopted frames are retained for a resend"
+    );
+    let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    // Tearing the first unadopted frame keeps the owner's frontier below it, so
+    // the resume must resend both frames instead of declaring them adopted.
+    let torn = owned_bytes(&client, adopted_end, cursor);
+    write_bytes(&client, adopted_end, &vec![0u8; torn.len()]);
+    client.leased_test_fail_submit(libc::ENODEV);
+    submit(&mut client, &fixture, 4);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the resumed submission completes");
+    assert_eq!(
+        client.leased_test_write_syncs(),
+        vec![true, true, true],
+        "the two resends and the retried frame all carry FUA"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
+    assert_eq!(counts.resume_frames, 2, "both unadopted frames were resent");
+    assert_eq!(released.len(), 5, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// An owner that refuses adoption because its own scan hit a torn frame is
+/// terminal for this epoch: the resume refuses once and never retries.
+#[test]
+fn poisoned_owner_is_refused_without_retry() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    for sequence in 0..2 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first two frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first prefix");
+    for sequence in 2..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the two later frames complete");
+    let (_, cursor, _, adopted_end) = client.leased_test_extent_ends().expect("an open extent");
+    // The explicit adoption below scans this window; tear its second frame so
+    // the owner's own scan stops on an invalid frame and it poisons itself.
+    write_bytes(&client, adopted_end + 4096, &vec![0u8; 4096]);
+    let token = client
+        .live_leased
+        .current
+        .as_ref()
+        .expect("an open extent")
+        .lease
+        .extent
+        .token;
+    let poisoned = client
+        .adopt_live_extent(1, token, cursor, false, false)
+        .expect_err("a torn frame in an explicit adoption poisons the owner");
+    assert!(
+        poisoned.to_string().contains("incomplete live frame"),
+        "the owner reported the invalid frame, not a transport error: {poisoned}"
+    );
+    // The queue is lost next; the rebuilt session's handshake sees the owner is
+    // no longer recovery-clean and the resume refuses without a retry.
+    client.leased_test_fail_submit(libc::ENODEV);
+    let refused = client.submit_leased_group(
+        1,
+        vec![fixture.batch(4)],
+        &WriteTimeline::default(),
+        2,
+        true,
+    );
+    let error = match refused {
+        Err(error) => error,
+        Ok(_) => panic!("a poisoned owner cannot be resumed"),
+    };
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "the recovery-clean gate is terminal: {error}"
+    );
+    assert!(
+        error.to_string().contains("reopen required"),
+        "the refusal names the repair: {error}"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(
+        counts.resume_attempts, 1,
+        "the recovery-clean gate stops at one attempt"
+    );
+    assert_eq!(counts.resume_refused, 1, "the refusal is counted");
+    assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// A link that flaps without carrying a frame cannot live forever: three
+/// resumes with no adopted frame between are the budget, and the fourth
+/// refuses and fail-stops.
+#[test]
+fn second_break_exhausts_the_budget() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    for expected in 1..=2 {
+        client.fail_connection_for_test();
+        client
+            .progress_session()
+            .expect("the break resumes while the budget lasts");
+        assert_eq!(
+            counters(&fixture).resume_attempts,
+            expected,
+            "each break is one episode"
+        );
+    }
+    client.fail_connection_for_test();
+    client
+        .progress_session()
+        .expect("the third consecutive resume is still inside the budget");
+    assert_eq!(
+        counters(&fixture).resume_attempts,
+        3,
+        "three resumes without an adopted frame"
+    );
+    client.fail_connection_for_test();
+    let error = client
+        .progress_session()
+        .expect_err("the fourth consecutive resume is refused");
+    assert!(
+        error.to_string().contains("3 consecutive resumes"),
+        "the refusal names the budget: {error}"
+    );
+    assert_eq!(
+        counters(&fixture).resume_attempts,
+        3,
+        "a refused resume is not an attempt"
+    );
+    assert_eq!(
+        counters(&fixture).resume_refused,
+        1,
+        "the refusal is counted"
+    );
+}
+
+/// A reaper that cannot take the detached queue is a capacity condition, not a
+/// break: the resume fails once, the queue waits for the shutdown drain, and no
+/// later detach can replace it.
+#[test]
+fn reaper_full_is_refused_without_a_retry() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    // A rendezvous channel never accepts a send without a waiting receiver, so
+    // every `try_send` reports a full reaper.
+    let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
+    client.set_resume_writes(true, Some(sender));
+    client.leased_test_fail_submit(libc::ENODEV);
+    let refused = client.submit_leased_group(
+        1,
+        vec![fixture.batch(0)],
+        &WriteTimeline::default(),
+        2,
+        true,
+    );
+    let error = match refused {
+        Err(error) => error,
+        Ok(_) => panic!("a full reaper fails the resume"),
+    };
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "reaper saturation is not a transient break: {error}"
+    );
+    assert!(
+        error.to_string().contains("reaper cannot retire"),
+        "the refusal names the reaper: {error}"
+    );
+    assert!(
+        client.live_write_failed,
+        "the writer fail-stops on a parked queue"
+    );
+    assert_eq!(
+        counters(&fixture).resume_attempts,
+        1,
+        "a full reaper is not retried"
+    );
+    // A second detach must not replace the parked queue: the resume refuses
+    // before it takes anything, so nothing is dropped on this thread.
+    let again = client
+        .resume_after_break(super::resume::BreakKind::Data)
+        .expect_err("a parked queue refuses another detach");
+    assert!(
+        again.to_string().contains("already parked"),
+        "the second detach is refused: {again}"
+    );
+    assert!(
+        client.live_leased.undrained.is_some(),
+        "the first detached queue is still parked"
+    );
+    let mut parked = client
+        .take_failed_live_writer()
+        .expect("the parked queue is handed to the shutdown drain");
+    assert!(
+        client.live_leased.undrained.is_none(),
+        "taking the parked queue clears the slot"
+    );
+    parked
+        .drain_failed()
+        .expect("the fixture queue's bounded drain completes inline");
+}

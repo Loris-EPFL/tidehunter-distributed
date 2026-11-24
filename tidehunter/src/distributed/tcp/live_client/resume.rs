@@ -446,6 +446,16 @@ impl Client {
     /// unbounded and a lost command can stay outstanding until the kernel
     /// keep-alive fires, so the worker thread never drains it.
     fn detach_live_queue(&mut self) -> Result<(), TcpError> {
+        // At most one queue per client waits for the shutdown drain. Parking a
+        // second would overwrite the first, and the overwritten queue's `Drop`
+        // calls the unbounded `LiveIo::shutdown` on this thread, which aborts
+        // when the drain times out. A parked queue is already a fail-stop, so
+        // refuse before anything is taken.
+        if self.live_leased.undrained.is_some() {
+            return Err(TcpError::new(
+                "live write queue is already parked for the shutdown drain",
+            ));
+        }
         let Some(mut queue) = self.live_writer.take() else {
             return Ok(());
         };
@@ -469,9 +479,15 @@ impl Client {
                 };
                 match parked {
                     Some(queue) => {
+                        // A full or stopped reaper is a capacity condition, not
+                        // a break: a transient class would let the episode
+                        // reconnect and report success with this queue still
+                        // parked, so the worker must fail-stop here. The parked
+                        // queue goes to the shutdown drain off this thread and
+                        // is never replaced.
+                        debug_assert!(self.live_leased.undrained.is_none());
                         self.live_leased.undrained = Some(queue);
-                        Err(TcpError::with_kind(
-                            io::ErrorKind::ConnectionAborted,
+                        Err(TcpError::new(
                             "live resume reaper cannot retire the detached queue",
                         ))
                     }

@@ -19,6 +19,8 @@ pub(super) mod owner_sender;
 mod publisher;
 pub(super) mod receipts;
 #[cfg(test)]
+mod resume_tests;
+#[cfg(test)]
 mod scenario_tests;
 mod sequencer;
 #[cfg(test)]
