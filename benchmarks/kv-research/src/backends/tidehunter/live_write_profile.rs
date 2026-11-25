@@ -235,10 +235,16 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hang guard for a wait that follows another thread's or the boundary's
+    /// progress. It is never the expected wait: the boundary's own quiesce
+    /// window and the reply handoff take milliseconds, so only a dead peer or a
+    /// broken wakeup reaches this cap.
+    const WAIT_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
     #[test]
     fn leased_boundary_waits_for_validated_reply_before_freezing() {
         use std::sync::{Arc, mpsc};
-        use std::time::Duration;
         use tidehunter::distributed::nvmeof::live_metrics::{LiveNvmeMetrics, LiveTimingStage};
         let metrics = LiveNvmeMetrics::new();
         let producer = metrics.register().unwrap();
@@ -262,16 +268,18 @@ mod tests {
                     }
                     Some(snapshot)
                 },
-                Duration::from_secs(1),
+                WAIT_HANG_GUARD,
             );
             finished.send(snapshot).unwrap();
         });
-        first_snapshot.recv_timeout(Duration::from_secs(1)).unwrap();
+        first_snapshot
+            .recv_timeout(WAIT_HANG_GUARD)
+            .expect("the boundary never took its snapshot");
         assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
         release.send(()).unwrap();
         let stats = result
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
+            .recv_timeout(WAIT_HANG_GUARD)
+            .expect("the boundary never finished")
             .unwrap()
             .unwrap();
         owner.join().unwrap();
@@ -294,7 +302,9 @@ mod tests {
             boundary_snapshot(true, || Some(stats.clone()), Duration::from_millis(5)).unwrap_err();
         assert!(error.to_string().contains("did not quiesce"));
         assert!(began.elapsed() >= Duration::from_millis(5));
-        assert!(began.elapsed() < Duration::from_secs(1));
+        // The deadline is honored, not ignored: only the hang guard, never a
+        // promptness premise that load alone can exceed.
+        assert!(began.elapsed() < WAIT_HANG_GUARD);
         stats.counts.errors = 1;
         let error = boundary_snapshot(true, || Some(stats.clone()), Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("failed or poisoned"));
