@@ -38,7 +38,7 @@ Every cell also gets `resources.csv` and `resources.json` in its output: per
 2 s `/proc` samples of the cell's process (CPU, RSS, VmHWM, swap, io counters)
 and of each host that ran or owned the cell (`/proc/vmstat` swap,
 `/sys/block/*/stat` device bytes), written with the same parser as
-`manual_sui`'s sampler (`manual_sui.parse_proc`), plus the cell's payload bytes
+`proc_sampler`, the module `manual_sui` uses too, plus the cell's payload bytes
 and the device-write ratio.
 
 `--resume` skips passed cells whose config hash matches and reruns failed,
