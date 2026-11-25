@@ -752,6 +752,17 @@ IMAGE=projects/mysten-research/global/images/bench-img-3012611b9ce24218-image
 BUNDLE=c7b69b8bd942a119bcced33e0e5dbc4222ee47650306f03471c8b42ad0230fa9
 ```
 
+0. Bind the manifest to the build that the fleet will run. The command reads
+   the bundle, build-manifest, source revisions and five binary hashes from the
+   finished `build.py` output; it never overwrites a ledger that already
+   records a cell.
+
+```sh
+python3 experiments/gcp-rdma/campaign_manifest.py \
+  --directory /absolute/cluster-campaign-2026-11-25 \
+  --build /absolute/cluster-campaign-2026-11-25/build-final
+```
+
 1. Print the request bodies. This step makes no call and writes no file.
 
 ```sh
