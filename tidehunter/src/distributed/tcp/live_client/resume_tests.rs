@@ -45,16 +45,30 @@ fn submit(client: &mut Client, fixture: &Fixture, sequence: u64) -> u64 {
     }
 }
 
-/// The owner file's bytes in `[start, end)`, read through the page cache.
-fn owned_bytes(client: &Client, start: u64, end: u64) -> Vec<u8> {
-    let extent = client.live_leased.current.as_ref().expect("an open extent");
-    let path = extent.lease.extent.segment.path.clone();
+/// The bytes of the owner file at `path` in `[start, end)`, read through the
+/// page cache.
+fn file_bytes(path: &std::path::Path, start: u64, end: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; usize::try_from(end - start).expect("bounded extent")];
     std::fs::File::open(path)
         .expect("owner WAL file")
         .read_exact_at(&mut bytes, start)
         .expect("owner WAL region");
     bytes
+}
+
+fn owned_bytes(client: &Client, start: u64, end: u64) -> Vec<u8> {
+    let extent = client.live_leased.current.as_ref().expect("an open extent");
+    file_bytes(&extent.lease.extent.segment.path, start, end)
+}
+
+/// Overwrite `bytes` at `offset` of the owner file at `path`.
+fn write_file_bytes(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("owner WAL file")
+        .write_all_at(bytes, offset)
+        .expect("tear the owner WAL region");
 }
 
 /// Overwrite `bytes` at `offset` of the owner file, as a lost or torn write does.
@@ -69,12 +83,20 @@ fn write_bytes(client: &Client, offset: u64, bytes: &[u8]) {
         .segment
         .path
         .clone();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("owner WAL file")
-        .write_all_at(bytes, offset)
-        .expect("tear the owner WAL region");
+    write_file_bytes(&path, offset, bytes);
+}
+
+/// The bytes of `path` in the absolute extent range `[start, end)`. A file
+/// holds whole extents, so the file offset is the absolute start modulo the
+/// segment length.
+fn extent_bytes(path: &std::path::Path, start: u64, end: u64, segment_bytes: u64) -> Vec<u8> {
+    let begin = start % segment_bytes;
+    file_bytes(path, begin, begin + (end - start))
+}
+
+/// Overwrite `bytes` at the absolute extent start `start` of `path`.
+fn write_extent_bytes(path: &std::path::Path, start: u64, segment_bytes: u64, bytes: &[u8]) {
+    write_file_bytes(path, start % segment_bytes, bytes);
 }
 
 fn counters(fixture: &Fixture) -> crate::distributed::nvmeof::live_metrics::LiveNvmeCounts {
@@ -1054,4 +1076,639 @@ fn reaper_full_is_refused_without_a_retry() {
     parked
         .drain_failed()
         .expect("the fixture queue's bounded drain completes inline");
+}
+
+/// One extent of the owner WAL, as the tests name it.
+struct ExtentSnapshot {
+    token: [u8; 16],
+    start: u64,
+    end: u64,
+    cursor: u64,
+    path: std::path::PathBuf,
+    segment_bytes: u64,
+}
+
+fn snapshot(extent: &super::ExtentState) -> ExtentSnapshot {
+    ExtentSnapshot {
+        token: extent.lease.extent.token,
+        start: extent.lease.extent.start,
+        end: extent.lease.extent.end,
+        cursor: extent.cursor,
+        path: extent.lease.extent.segment.path.clone(),
+        segment_bytes: extent.lease.extent.segment.bytes,
+    }
+}
+
+fn closing_snapshot(client: &Client) -> ExtentSnapshot {
+    snapshot(
+        client
+            .live_leased
+            .closing
+            .as_ref()
+            .expect("an extent is closing"),
+    )
+}
+
+fn current_snapshot(client: &Client) -> ExtentSnapshot {
+    snapshot(client.live_leased.current.as_ref().expect("an open extent"))
+}
+
+/// Fill the first file through two extents, switch to the second file, and
+/// write `extra` frames into the new current extent. Returns the closing extent
+/// (four written frames, not closed at the owner) and the current one.
+fn rollover_with_current_frames(
+    fixture: &Fixture,
+    client: &mut Client,
+    released: &mut Vec<(u64, Vec<crate::distributed::tcp::DurableBatch>)>,
+    extra: u64,
+) -> (ExtentSnapshot, ExtentSnapshot) {
+    // Four 4 KiB frames fill one 16 KiB extent, so eight fill the first 32 KiB
+    // file through two extents.
+    for sequence in 0..8 {
+        submit(client, fixture, sequence);
+        client
+            .drain_leased_flights(released, None)
+            .expect("each first-file frame completes");
+    }
+    // The ninth frame does not fit, so its submission switches extents: the
+    // second extent of the first file becomes closing and the second file
+    // becomes current.
+    submit(client, fixture, 8);
+    client
+        .drain_leased_flights(released, None)
+        .expect("the first frame of the second file completes");
+    for sequence in 9..9 + extra {
+        submit(client, fixture, sequence);
+        client
+            .drain_leased_flights(released, None)
+            .expect("each second-file frame completes");
+    }
+    (closing_snapshot(client), current_snapshot(client))
+}
+
+/// A break while one extent is closing resumes the closing extent first, then
+/// the current one: the closing grant is probed and closed before the extent
+/// that replaced it, every resend is byte-identical at its recorded offset, and
+/// both extents reach the frontier their cursor proves.
+#[test]
+fn closing_extent_is_resumed_then_current() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    let (closing, current) = rollover_with_current_frames(&fixture, &mut client, &mut released, 2);
+    assert_eq!(
+        current.start, closing.end,
+        "the new extent starts where the closing one ends"
+    );
+    assert_eq!(
+        closing.cursor, closing.end,
+        "the closing extent holds four written frames"
+    );
+    assert_eq!(
+        client.leased_test_retained().0,
+        7,
+        "the four closing frames and the three current frames wait for an adoption"
+    );
+    // The pre-break image of both extents, then a tear of both unadopted tails,
+    // so only a byte-identical resend can restore what the coordinator
+    // acknowledged.
+    let clean_closing = extent_bytes(
+        &closing.path,
+        closing.start,
+        closing.cursor,
+        closing.segment_bytes,
+    );
+    let clean_current = extent_bytes(
+        &current.path,
+        current.start,
+        current.cursor,
+        current.segment_bytes,
+    );
+    write_extent_bytes(
+        &closing.path,
+        closing.start,
+        closing.segment_bytes,
+        &vec![0u8; usize::try_from(closing.cursor - closing.start).expect("bounded extent")],
+    );
+    write_extent_bytes(
+        &current.path,
+        current.start,
+        current.segment_bytes,
+        &vec![0u8; usize::try_from(current.cursor - current.start).expect("bounded extent")],
+    );
+    client.leased_test_fail_submit(libc::ENODEV);
+    submit(&mut client, &fixture, 11);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the resumed submission completes");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume attempt");
+    assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
+    assert_eq!(
+        counts.resume_frames, 7,
+        "the four closing frames and the three current frames are resent"
+    );
+    assert_eq!(
+        client.leased_test_resume_targets(),
+        vec!["closing", "current"],
+        "the resume probes the closing extent before the current one"
+    );
+    assert!(
+        client.live_leased.closing.is_none(),
+        "the resume closed the closing extent and retired it"
+    );
+    let rewrites = client.leased_test_rewrites();
+    assert_eq!(rewrites.len(), 7, "every unadopted frame was resent once");
+    let (closing_rewrites, current_rewrites) = rewrites.split_at(4);
+    let mut expected = closing.start;
+    for (token, start, len, _) in closing_rewrites {
+        assert_eq!(
+            *token, closing.token,
+            "the first resends belong to the closing extent"
+        );
+        assert_eq!(
+            *start, expected,
+            "the closing resends ascend from its start"
+        );
+        assert_eq!(*len, 4096, "each resent frame is one aligned block");
+        expected += u64::try_from(*len).expect("bounded frame");
+    }
+    assert_eq!(
+        expected, closing.cursor,
+        "the closing extent's resends cover its whole written prefix"
+    );
+    let mut expected = current.start;
+    for (token, start, len, _) in current_rewrites {
+        assert_ne!(
+            *token, closing.token,
+            "the later resends belong to the current extent"
+        );
+        assert_eq!(
+            *start, expected,
+            "the current resends ascend from its start"
+        );
+        assert_eq!(*len, 4096, "each resent frame is one aligned block");
+        expected += u64::try_from(*len).expect("bounded frame");
+    }
+    assert_eq!(
+        expected, current.cursor,
+        "the current extent's resends cover its whole written prefix"
+    );
+    // Byte-identical: the tear is healed over the acknowledged image.
+    assert_eq!(
+        extent_bytes(
+            &closing.path,
+            closing.start,
+            closing.cursor,
+            closing.segment_bytes
+        ),
+        clean_closing,
+        "the closing extent is resent byte-identically at its own offsets"
+    );
+    assert_eq!(
+        extent_bytes(
+            &current.path,
+            current.start,
+            current.cursor,
+            current.segment_bytes
+        ),
+        clean_current,
+        "the current extent is resent byte-identically at its own offsets"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the current extent's prefix");
+    let (_, current_cursor, _, current_adopted) =
+        client.leased_test_extent_ends().expect("an open extent");
+    assert_eq!(
+        current_adopted, current_cursor,
+        "the current extent is adopted through its cursor"
+    );
+    assert_eq!(
+        client.leased_test_retained(),
+        (0, 0),
+        "nothing is left to resend"
+    );
+    let owner = fixture.node.log_for_test(1);
+    let adopted = owner.receipt_page(0, 32).expect("the owner's receipt page");
+    assert_eq!(adopted.len(), 12, "twelve frames, one receipt each");
+    for (index, receipt) in adopted.iter().enumerate() {
+        assert_eq!(
+            receipt.version().sequence,
+            index as u64,
+            "receipt {index} is the {index}th batch: no gap and no duplicate"
+        );
+    }
+    assert_eq!(released.len(), 12, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// The same resume when the owner applied the closing extent's close and its
+/// reply died with the old session. The closing probe must accept the closed
+/// summary, retire the extent, and rewrite only the current extent's unadopted
+/// frames.
+#[test]
+fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    let (closing, current) = rollover_with_current_frames(&fixture, &mut client, &mut released, 2);
+    let clean_closing = extent_bytes(
+        &closing.path,
+        closing.start,
+        closing.cursor,
+        closing.segment_bytes,
+    );
+    let clean_current = extent_bytes(
+        &current.path,
+        current.start,
+        current.cursor,
+        current.segment_bytes,
+    );
+    // The owner applies the close of the closing extent; the reply is received
+    // here and dropped, as a session break drops the answer it produced.
+    let lost = client
+        .adopt_live_extent(1, closing.token, closing.cursor, true, false)
+        .expect("the owner adopts and closes the closing extent");
+    assert_eq!(
+        lost.adoption.adopted_end, closing.cursor,
+        "the owner closed the whole written prefix"
+    );
+    assert!(lost.adoption.closed, "the owner reports the extent closed");
+    assert_eq!(
+        client.leased_test_retained().0,
+        7,
+        "the coordinator still holds every frame of both extents"
+    );
+    // Tear only the current extent: its frames are the ones that must be
+    // rewritten. The closed extent's bytes are not needed again.
+    write_extent_bytes(
+        &current.path,
+        current.start,
+        current.segment_bytes,
+        &vec![0u8; usize::try_from(current.cursor - current.start).expect("bounded extent")],
+    );
+    client.leased_test_fail_submit(libc::ENODEV);
+    submit(&mut client, &fixture, 11);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the resumed submission completes");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume attempt");
+    assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
+    assert_eq!(
+        counts.resume_frames, 3,
+        "only the current extent's three unadopted frames are resent"
+    );
+    assert_eq!(
+        client.leased_test_resume_targets(),
+        vec!["closing", "current"],
+        "the resume probes the closing extent before the current one"
+    );
+    assert!(
+        client.live_leased.closing.is_none(),
+        "the closed summary retired the closing extent"
+    );
+    let rewrites = client.leased_test_rewrites();
+    assert_eq!(rewrites.len(), 3, "only the current extent was resent");
+    let mut expected = current.start;
+    for (token, start, len, _) in &rewrites {
+        assert_ne!(
+            *token, closing.token,
+            "no frame of the closed extent is resent"
+        );
+        assert_eq!(
+            *start, expected,
+            "the current resends ascend from its start"
+        );
+        assert_eq!(*len, 4096, "each resent frame is one aligned block");
+        expected += u64::try_from(*len).expect("bounded frame");
+    }
+    assert_eq!(
+        extent_bytes(
+            &current.path,
+            current.start,
+            current.cursor,
+            current.segment_bytes
+        ),
+        clean_current,
+        "the current extent is resent byte-identically at its own offsets"
+    );
+    assert_eq!(
+        extent_bytes(
+            &closing.path,
+            closing.start,
+            closing.cursor,
+            closing.segment_bytes
+        ),
+        clean_closing,
+        "the closed extent's bytes are untouched"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the current extent's prefix");
+    assert_eq!(
+        client.leased_test_retained(),
+        (0, 0),
+        "nothing is left to resend"
+    );
+    let owner = fixture.node.log_for_test(1);
+    let adopted = owner.receipt_page(0, 32).expect("the owner's receipt page");
+    assert_eq!(adopted.len(), 12, "twelve frames, one receipt each");
+    for (index, receipt) in adopted.iter().enumerate() {
+        assert_eq!(
+            receipt.version().sequence,
+            index as u64,
+            "receipt {index} is the {index}th batch: no gap and no duplicate"
+        );
+    }
+    assert_eq!(released.len(), 12, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// The owner answers a no-op probe of the extent it preleased for the switch,
+/// because that extent has adopted nothing yet. A probe past that extent's start
+/// stays refused: only the open extent's scan may adopt frames.
+#[test]
+fn probe_of_a_preleased_extent_past_its_start_is_refused() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    let (closing, current) = rollover_with_current_frames(&fixture, &mut client, &mut released, 1);
+    assert!(
+        client.live_leased.closing.is_some(),
+        "the first extent of the switch is still closing at the owner"
+    );
+    // The preleased extent's real fresh state: nothing adopted, nothing closed.
+    let fresh = client
+        .adopt_live_extent(1, current.token, current.start, false, false)
+        .expect("the preleased extent answers its own no-op probe");
+    assert_eq!(
+        fresh.adoption.adopted_end, current.start,
+        "the preleased extent adopted nothing"
+    );
+    assert_eq!(fresh.adoption.receipt_count, 0, "no receipt is adopted");
+    assert!(!fresh.adoption.closed, "the preleased extent is not closed");
+    // One block past its start would claim adoption the owner never scanned.
+    let refused = client
+        .adopt_live_extent(1, current.token, current.start + 4096, false, false)
+        .expect_err("only the open extent may adopt frames");
+    assert!(
+        refused.to_string().contains("foreign live extent"),
+        "the refusal names the foreign extent: {refused}"
+    );
+    assert_eq!(
+        current.start, closing.cursor,
+        "the current extent is still the preleased successor"
+    );
+}
+
+/// A closed summary whose frontier differs from what the coordinator wrote is
+/// an identity mismatch, not a completed rollover: retiring the extent would
+/// drop frames that still owe a resend, so the resume fails the database.
+#[test]
+fn closed_reply_with_a_different_adopted_end_fail_stops() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    let (closing, _current) = rollover_with_current_frames(&fixture, &mut client, &mut released, 2);
+    client
+        .adopt_live_extent(1, closing.token, closing.cursor, true, false)
+        .expect("the owner adopts and closes the closing extent");
+    // The coordinator's recorded written end is now below the frontier the
+    // owner closed, as a client that holds fewer frames than the owner adopted.
+    client
+        .live_leased
+        .closing
+        .as_mut()
+        .expect("an extent is closing")
+        .written_end -= 4096;
+    client.leased_test_fail_submit(libc::ENODEV);
+    let error = match client.submit_leased_group(
+        1,
+        vec![fixture.batch(11)],
+        &WriteTimeline::default(),
+        2,
+        true,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a closed frontier the coordinator did not write is refused"),
+    };
+    assert!(
+        error.to_string().contains("identity or frontier mismatch"),
+        "the refusal names the mismatch: {error}"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "the refusal is not retried");
+    assert_eq!(counts.resume_refused, 1, "the refusal is counted");
+    assert_eq!(counts.resume_rewrites, 0, "nothing is rewritten");
+    assert_eq!(
+        client.leased_test_retained().0,
+        7,
+        "the retained frames are not dropped by a refused rollover"
+    );
+}
+
+/// A resume resend allocates a completion id the stream never used. Reusing
+/// one would let a late CQE of the original command settle the wrong frame, so
+/// every resend id of several breaks must be new and appear exactly once.
+#[test]
+fn rewrite_ids_do_not_reuse_group_ids() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    // Four adopted frames put four ids into the stream.
+    for sequence in 0..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first four frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first prefix");
+    assert_eq!(
+        client.leased_test_submitted_ids().len(),
+        4,
+        "four commands used four ids"
+    );
+    let mut seen = 0usize;
+    for episode in 0..3u64 {
+        let base = 4 + episode * 3;
+        // Two unadopted frames, then a tear from the owner's frontier: the
+        // resume must resend both.
+        for sequence in base..base + 2 {
+            submit(&mut client, &fixture, sequence);
+        }
+        client
+            .drain_leased_flights(&mut released, None)
+            .expect("the two unadopted frames complete");
+        let (_, cursor, _, adopted_end) = client.leased_test_extent_ends().expect("an open extent");
+        let torn = owned_bytes(&client, adopted_end, cursor);
+        write_bytes(&client, adopted_end, &vec![0u8; torn.len()]);
+        let entry = client.live_leased.next_flight_id;
+        client.leased_test_fail_submit(libc::ENODEV);
+        submit(&mut client, &fixture, base + 2);
+        client
+            .drain_leased_flights(&mut released, None)
+            .expect("the resumed submission completes");
+        let rewrites = client.leased_test_rewrites();
+        assert_eq!(
+            rewrites.len() - seen,
+            2,
+            "episode {episode} resends exactly the two unadopted frames"
+        );
+        let used = client.leased_test_submitted_ids();
+        let mut expected = adopted_end;
+        for (_, start, len, id) in &rewrites[seen..] {
+            assert_eq!(
+                *start, expected,
+                "episode {episode}: the resend keeps the recorded offset"
+            );
+            assert_eq!(*len, 4096, "episode {episode}: one aligned block");
+            assert!(
+                *id > entry,
+                "episode {episode}: resend id {id} must be above the {entry} ids in use at entry"
+            );
+            assert_eq!(
+                used.iter().filter(|candidate| *candidate == id).count(),
+                1,
+                "episode {episode}: resend id {id} is used exactly once"
+            );
+            expected += *len as u64;
+        }
+        assert_eq!(
+            expected, cursor,
+            "episode {episode}: the resends cover the unadopted suffix"
+        );
+        seen = rewrites.len();
+        client
+            .settle_leased_extent(&mut released, None)
+            .expect("the owner adopts the recovered suffix");
+    }
+    // Across the whole stream no completion id was ever used twice.
+    let ids = client.leased_test_submitted_ids();
+    for (position, id) in ids.iter().enumerate() {
+        assert_eq!(
+            ids[..position]
+                .iter()
+                .filter(|candidate| *candidate == id)
+                .count(),
+            0,
+            "id {id} is reused at position {position}"
+        );
+    }
+    assert_eq!(
+        counters(&fixture).resume_rewrites,
+        3,
+        "the stream ran three rewrite episodes"
+    );
+}
+
+/// The owner applied an adoption but its reply was lost, so the coordinator's
+/// adopted end is behind the owner's frontier. The resume's adopted-end query
+/// proves that frontier: it resends nothing, duplicates no receipt and leaves
+/// no gap, and every acknowledged batch reads back.
+#[test]
+fn lost_adoption_reply_is_idempotent() {
+    let fixture = Fixture::single_partition(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    for sequence in 0..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first four frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first prefix");
+    for sequence in 4..6 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the two later frames complete");
+    let (start, cursor, _, adopted_end) = client.leased_test_extent_ends().expect("an open extent");
+    assert_eq!(
+        client.leased_test_retained().0,
+        2,
+        "the two later frames wait for an adoption"
+    );
+    let clean = owned_bytes(&client, start, cursor);
+    // The owner applies the adoption of the whole written window; the reply is
+    // received here and dropped, as a session break drops the answer that the
+    // coordinator's own request produced.
+    let token = client
+        .live_leased
+        .current
+        .as_ref()
+        .expect("an open extent")
+        .lease
+        .extent
+        .token;
+    let lost = client
+        .adopt_live_extent(1, token, cursor, false, false)
+        .expect("the owner adopts the written window");
+    assert_eq!(
+        lost.adoption.adopted_end, cursor,
+        "the owner is ahead of the coordinator's adopted end of {adopted_end}"
+    );
+    assert_eq!(
+        client.leased_test_retained().0,
+        2,
+        "the lost reply leaves the coordinator's retained set unchanged"
+    );
+    // The queue is lost before the next submission, so only the resume's probe
+    // can prove the owner's frontier.
+    client.leased_test_fail_submit(libc::ENODEV);
+    submit(&mut client, &fixture, 6);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the resumed submission completes");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume attempt");
+    assert_eq!(
+        counts.resume_rewrites, 0,
+        "the adopted-end query answers the frontier, so nothing is resent"
+    );
+    assert_eq!(counts.resume_frames, 0, "no frame was resent");
+    assert_eq!(
+        client.leased_test_retained().0,
+        1,
+        "only the retried frame stays retained until the owner adopts it"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the retried frame");
+    assert_eq!(
+        client.leased_test_retained(),
+        (0, 0),
+        "the declaration adopted every frame"
+    );
+    assert_eq!(
+        owned_bytes(&client, start, cursor),
+        clean,
+        "an answered adoption changes no byte"
+    );
+    // No duplicate and no gap: one receipt per submitted frame, in order.
+    let owner = fixture.node.log_for_test(1);
+    assert_eq!(owner.receipt_count(), 7, "seven frames, seven receipts");
+    let adopted = owner.receipt_page(0, 16).expect("the owner's receipt page");
+    assert_eq!(adopted.len(), 7, "the page holds every receipt");
+    for (index, receipt) in adopted.iter().enumerate() {
+        assert_eq!(
+            receipt.version().sequence,
+            index as u64,
+            "receipt {index} is the {index}th batch: no gap and no duplicate"
+        );
+    }
+    assert_eq!(released.len(), 7, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
 }
