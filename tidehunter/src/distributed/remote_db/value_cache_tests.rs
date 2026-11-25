@@ -32,6 +32,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// 4-byte keys over 16 uniform cells (one cell per 4-bit prefix), with a native
 /// per-cell value cache of `cache` entries. `cache = 0` is native's "no cache".
@@ -808,4 +809,72 @@ fn a_retired_batch_member_falls_back_and_other_kinds_fail() {
 
     db.wait_for_background_threads_to_finish().unwrap();
     cut_db.shutdown().unwrap();
+}
+
+/// A batch that resolved before an overwrite or a remove must not refill the
+/// LRU with the value it fetched. The completion hold parks the owner read
+/// after its result is stored, so the write lands in the exact window between
+/// the batch's index resolution and its cache refill. A later live batch must
+/// then see the overwrite and the absence, not the older fetched values.
+#[test]
+fn a_batch_refill_never_undoes_an_overwrite_or_remove() {
+    /// Handshake bound for the held lane completion; never a latency bound.
+    const WAIT: Duration = Duration::from_secs(30);
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("remote-cache-batch-refill-race").expect("scratch directory"),
+        1,
+        128,
+        cached_shape(16),
+        2,
+        |_| {},
+        |_| {},
+    )
+    .synchronous();
+    let ks = KeySpace(0);
+    let db = open(&fixture);
+    db.insert(ks, key(1), vec![1; 8]).expect("write");
+    db.insert(ks, key(2), vec![2; 8]).expect("write");
+    db.wait_for_background_threads_to_finish()
+        .expect("shut down before the reopen");
+    // The reopen leaves both the native LRU and the derivative cache cold, so
+    // the batch must fetch both values from the owner.
+    let db = open(&fixture);
+    let keys = [key(1), key(2)];
+
+    let (held, completion) = db.remote_for_test().reads.bench_hold_completion();
+    std::thread::scope(|scope| {
+        let db = &db;
+        let keys = &keys;
+        let batch = scope.spawn(move || db.multi_get(ks, keys));
+        held.recv_timeout(WAIT)
+            .expect("the cold batch reached its held lane completion");
+        // The batch resolved both positions before this point. The write and
+        // the remove publish while its fetch result is held.
+        db.insert(ks, key(1), vec![0xAA; 8]).expect("overwrite");
+        db.remove(ks, key(2)).expect("remove");
+        completion.release();
+        let values = batch.join().expect("the batch thread must not panic");
+        assert_eq!(
+            values[0].as_ref().unwrap().as_deref(),
+            Some(&[1u8; 8][..]),
+            "the held batch answers the value visible when it started",
+        );
+        assert_eq!(
+            values[1].as_ref().unwrap().as_deref(),
+            Some(&[2u8; 8][..]),
+            "the held batch answers the value visible when it started",
+        );
+    });
+
+    let after = db.multi_get(ks, &keys);
+    assert_eq!(
+        after[0].as_ref().unwrap().as_deref(),
+        Some(&[0xAA; 8][..]),
+        "the next live batch sees the overwrite; the held batch must not restore the older value",
+    );
+    assert!(
+        after[1].as_ref().unwrap().is_none(),
+        "the next live batch sees the remove; the held batch must not resurrect the value",
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
 }

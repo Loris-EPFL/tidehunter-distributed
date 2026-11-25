@@ -1772,18 +1772,18 @@ impl RemoteDatabase {
     /// the entry read that returns the member's own key and bypasses the
     /// position-keyed reader cache, which would answer for the wrong key.
     ///
-    /// `refill` installs a fetched value into the native per-cell LRU, exactly
-    /// what native `Db::get` does and native `DbCheckpoint::get` does not, so a
-    /// latched or checkpoint read passes `false`. A resident answer needs no
-    /// refill: it came from that LRU. A keyspace without a value cache has no
-    /// LRU to fill, and the refill then costs nothing.
+    /// `epoch` installs a fetched value into the native per-cell LRU, exactly
+    /// what native `Db::get` does and native `DbCheckpoint::get` does not: a
+    /// checkpoint read passes `None`. A resident answer needs no refill: it came
+    /// from that LRU. The stamp is sampled before the index resolution that
+    /// produced `resolved`; a refill that finds the cell changed is dropped.
     pub(super) fn read_value(
         &self,
         ks: KeySpace,
         key: &[u8],
         cut: BatchVersion,
         resolved: ResolvedValue,
-        refill: bool,
+        epoch: Option<u64>,
     ) -> Result<Option<Bytes>, LocalDbError> {
         let table = &self.core.table;
         let descriptor = table.ks_desc(ks);
@@ -1797,7 +1797,6 @@ impl RemoteDatabase {
                 );
             }
         };
-        let refill = refill && descriptor.value_cache_size().is_some();
         let at = reduced.as_ref();
         let reader = &self.reader;
         let resolve = || table.get_value(ks, key, cut);
@@ -1811,27 +1810,29 @@ impl RemoteDatabase {
             if full_key.as_ref() != key {
                 return Ok(None);
             }
-            if refill {
+            if let Some(epoch) = epoch {
                 // The member's own key is the key the value is stored under, and
                 // it is the one the read just bound the value to.
                 table.refill_value(
                     ks,
                     reduced.into_owned().into(),
-                    position,
                     full_key,
                     value.clone(),
+                    epoch,
                 );
             }
             return Ok(Some(value));
         }
         let value = reader.read_with_resolve(ks, at, position, resolve, false)?;
-        if refill && let Some(value) = &value {
+        if let Some(value) = &value
+            && let Some(epoch) = epoch
+        {
             table.refill_value(
                 ks,
                 reduced.into_owned().into(),
-                position,
                 Bytes::copy_from_slice(key),
                 value.clone(),
+                epoch,
             );
         }
         Ok(value)
@@ -1852,6 +1853,11 @@ impl RemoteDatabase {
         refill: bool,
     ) -> Result<Option<Bytes>, LocalDbError> {
         self.ensure_healthy()?;
+        // Before the resolution: a write that reaches the cell between this
+        // stamp and the refill must invalidate the refill. Only a live read of
+        // a keyspace with a value cache refills, so only it pays this read.
+        let epoch = (refill && self.core.table.ks_desc(ks).value_cache_size().is_some())
+            .then(|| self.core.table.value_epoch(ks, key));
         let resolve_started = Instant::now();
         let resolved = self.core.table.get_value(ks, key, cut)?;
         // Relaxed: diagnostic time only, never publication authority.
@@ -1863,7 +1869,7 @@ impl RemoteDatabase {
             return Ok(None);
         };
         let fetch_started = Instant::now();
-        let value = self.read_value(ks, key, cut, resolved, refill);
+        let value = self.read_value(ks, key, cut, resolved, epoch);
         self.core
             .value_read_ns
             .fetch_add(elapsed(fetch_started), std::sync::atomic::Ordering::Relaxed);
@@ -1894,7 +1900,7 @@ impl RemoteDatabase {
             return Ok(true);
         }
         // Native `exists` never refills the LRU: presence is not a value read.
-        Ok(self.read_value(ks, key, cut, resolved, false)?.is_some())
+        Ok(self.read_value(ks, key, cut, resolved, None)?.is_some())
     }
 
     /// Any number of keys at one cut, fetched in pages of the value reader's
@@ -1953,13 +1959,21 @@ impl RemoteDatabase {
         self.ensure_healthy()?;
         let table = &self.core.table;
         let descriptor = table.ks_desc(ks);
+        // Only a refilling read of a keyspace with a value cache pays for the
+        // stamp read.
+        let track_epoch = refill && descriptor.value_cache_size().is_some();
         let mut results = Vec::with_capacity(keys.len());
         for page in keys.chunks(PAGE_KEYS) {
             let resolve_started = Instant::now();
             let mut rows: Vec<(Bytes, VersionPosition)> = Vec::with_capacity(page.len());
+            // Parallel to `rows`: the cell stamp read before each resolution.
+            let mut epochs: Vec<Option<u64>> = Vec::with_capacity(page.len());
             let mut slots = Vec::with_capacity(page.len());
             for key in page {
                 let key = key.as_ref();
+                // Before the resolution: a write that reaches the cell between
+                // this stamp and the refill must invalidate the refill.
+                let epoch = track_epoch.then(|| table.value_epoch(ks, key));
                 match table.get_value(ks, key, cut) {
                     Ok(Some(ResolvedValue::Resident { full_key, value })) => {
                         results.push(Ok((!descriptor.need_check_index_key()
@@ -1974,7 +1988,7 @@ impl RemoteDatabase {
                             key,
                             cut,
                             ResolvedValue::Position(position),
-                            refill,
+                            epoch,
                         ));
                     }
                     Ok(Some(ResolvedValue::Position(position))) => {
@@ -1983,6 +1997,7 @@ impl RemoteDatabase {
                             Bytes::copy_from_slice(descriptor.reduce_key(key).as_ref()),
                             position,
                         ));
+                        epochs.push(epoch);
                         results.push(Ok(None));
                     }
                     Ok(None) => results.push(Ok(None)),
@@ -2002,17 +2017,20 @@ impl RemoteDatabase {
             let fetch_started = Instant::now();
             let fetched = match self.reader.read_many(ks, &rows) {
                 Ok(values) => {
-                    let refill = refill && descriptor.value_cache_size().is_some();
-                    for ((slot, (reduced, position)), value) in
-                        slots.into_iter().zip(&rows).zip(values)
+                    for ((slot, (reduced, _)), (epoch, value)) in slots
+                        .into_iter()
+                        .zip(&rows)
+                        .zip(epochs.into_iter().zip(values))
                     {
-                        if refill && let Some(value) = &value {
+                        if let Some(value) = &value
+                            && let Some(epoch) = epoch
+                        {
                             table.refill_value(
                                 ks,
                                 reduced.clone(),
-                                *position,
                                 Bytes::copy_from_slice(keys[slot].as_ref()),
                                 value.clone(),
+                                epoch,
                             );
                         }
                         results[slot] = Ok(value);
@@ -2027,13 +2045,13 @@ impl RemoteDatabase {
                 // The strict batch keeps its contract (a failed page fails the
                 // call).
                 Err(error) if repair_retired && pending_read::member_read_is_retired(&error) => {
-                    for (slot, (_, position)) in slots.into_iter().zip(rows) {
+                    for ((slot, (_, position)), epoch) in slots.into_iter().zip(rows).zip(epochs) {
                         results[slot] = self.read_value(
                             ks,
                             keys[slot].as_ref(),
                             cut,
                             ResolvedValue::Position(position),
-                            refill,
+                            epoch,
                         );
                     }
                     Ok(())
@@ -2065,6 +2083,13 @@ impl RemoteDatabase {
     ) -> Result<(Option<Bytes>, RemoteReadProfile), LocalDbError> {
         self.ensure_healthy()?;
         let cut = self.core.table.current();
+        let epoch = self
+            .core
+            .table
+            .ks_desc(ks)
+            .value_cache_size()
+            .is_some()
+            .then(|| self.core.table.value_epoch(ks, key));
         let started = Instant::now();
         let resolved = self.core.table.get_value(ks, key, cut)?;
         let index_ns = elapsed(started);
@@ -2072,7 +2097,7 @@ impl RemoteDatabase {
         let started = Instant::now();
         let remote = matches!(resolved, Some(ResolvedValue::Position(_)));
         let value = match resolved {
-            Some(resolved) => self.read_value(ks, key, cut, resolved, true)?,
+            Some(resolved) => self.read_value(ks, key, cut, resolved, epoch)?,
             None => None,
         };
         self.ensure_healthy()?;

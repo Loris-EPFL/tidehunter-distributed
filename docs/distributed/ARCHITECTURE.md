@@ -92,10 +92,11 @@ from the native per-cell value LRU instead of a position, and a resident answer
 costs no owner request. Publication fills that LRU with the value the batch
 wrote, so the first read of a hot key after its write costs no owner request. A
 live read that fetched a member from its owner refills the LRU, but only while
-the position the fetch resolved is still the key's latest: a remote fetch can
-outlive a publication that supersedes it, and the cut check serves a resident
-entry on the premise that it holds the latest value. A remove pops it and a
-dropped cell clears it.
+no write reached its cell since the index resolution (a per-cell stamp): a
+remote fetch can outlive a publication that supersedes it, and the cut check
+serves a resident entry on the premise that it holds the latest value. That
+refill loses a race with an overwrite, a remove or a cell drop and cannot
+restore the older value. A remove pops it and a dropped cell clears it.
 
 Every read is cut-checked: it samples a cut (the live cut is the publication
 watermark) and the index answers the position as of that cut. The LRU is

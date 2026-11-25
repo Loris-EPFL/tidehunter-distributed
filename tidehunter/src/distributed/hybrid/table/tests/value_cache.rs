@@ -241,31 +241,27 @@ fn a_cut_below_an_overwrite_never_serves_the_newer_resident_value() {
     );
 }
 
-/// A refill must not install a value whose position a newer publication has
-/// already superseded. A remote fetch resolves a position at a cut, reads the
-/// member over the network and only then fills, so a publish can land in
-/// between; installing the older value would leave the LRU serving it to every
-/// read whose cut covers the newer write (the cut check serves a resident entry
-/// on the premise that it is the key's latest value).
+/// A refill must not install a value whose cell changed after the index
+/// resolution. A remote fetch resolves a position at a cut, reads the member
+/// over the network and only then fills, so a publish can land in between;
+/// installing the older value would leave the LRU serving it to every read
+/// whose cut covers the newer write (the cut check serves a resident entry on
+/// the premise that it is the key's latest value).
 #[test]
 fn a_refill_of_a_superseded_position_keeps_the_latest_value() {
     let fixture = Cached::new("hybrid-cache-refill-guard", 16, 1);
     fixture.publish(RecordKind::Put, 1, 2, b"one");
+    let key = Bytes::copy_from_slice(&[1; 4]);
+    // The stamp a fetch racing the overwrite sampled before it resolved.
+    let stale_epoch = fixture.table.value_epoch(fixture.ks(), &key);
     fixture.publish(RecordKind::Put, 1, 4, b"two");
     fixture.table.advance_applied(version(5));
-    // A cut below the overwrite names the superseded member: that is the
-    // position a fetch racing the overwrite resolved.
-    let superseded = match fixture.lookup(1, version(3)) {
-        Some(ResolvedValue::Position(position)) => position,
-        other => panic!("the cut below the overwrite names its member, got {other:?}"),
-    };
-    let key = Bytes::copy_from_slice(&[1; 4]);
     fixture.table.refill_value(
         fixture.ks(),
         key.clone(),
-        superseded,
         key,
         Bytes::from_static(b"one"),
+        stale_epoch,
     );
     assert_eq!(
         fixture.resident_value(1, version(5)).as_deref(),

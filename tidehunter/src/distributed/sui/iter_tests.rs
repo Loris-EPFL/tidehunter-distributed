@@ -44,7 +44,12 @@ fn walk_over(
     }
 }
 
-fn fetch_values(key: &Bytes, position: u32, _resolve: Resolve<'_>) -> Fetched {
+fn fetch_values(
+    key: &Bytes,
+    position: u32,
+    _found_in: Option<&CellId>,
+    _resolve: Resolve<'_>,
+) -> Fetched {
     Ok((position != 0).then(|| (key.clone(), Bytes::from(vec![position as u8]))))
 }
 
@@ -56,7 +61,12 @@ fn drain<P: Copy>(
         &Option<Bytes>,
         bool,
     ) -> Result<Option<IteratorResult<P>>, LocalDbError>,
-    mut fetch: impl FnMut(&Bytes, P, &mut dyn FnMut() -> Result<Option<P>, LocalDbError>) -> Fetched,
+    mut fetch: impl FnMut(
+        &Bytes,
+        P,
+        Option<&CellId>,
+        &mut dyn FnMut() -> Result<Option<P>, LocalDbError>,
+    ) -> Fetched,
 ) -> (Vec<(u8, u8)>, u64) {
     let mut skipped = 0;
     let mut out = Vec::new();
@@ -96,13 +106,13 @@ fn only_skips_after_a_re_resolve_are_counted_for_the_latched_view_metric() {
     assert_eq!(skipped, 0, "tombstones are not latch failures");
     // An entry whose file was retired and that the re-walk no longer finds
     // is the counted case.
-    let gone = |key: &Bytes, position: u32, resolve: Resolve<'_>| -> Fetched {
+    let gone = |key: &Bytes, position: u32, found_in: Option<&CellId>, resolve: Resolve<'_>| {
         if key[0] == 2 || key[0] == 4 {
             return Ok(resolve()?
                 .filter(|again| *again != position)
                 .map(|again| (key.clone(), Bytes::from(vec![again as u8]))));
         }
-        fetch_values(key, position, resolve)
+        fetch_values(key, position, found_in, resolve)
     };
     let (rows_seen, skipped) = drain(walk_over(rows(&[1, 2, 3, 4, 5], &[]), false, true), gone);
     assert_eq!(rows_seen.len(), 3);
@@ -148,18 +158,19 @@ fn a_retired_entry_is_reresolved_once_and_skipped_when_gone() {
     // Key 3's file is retired: the re-resolve walks again, still finds key 3
     // at the same position, so the fetch reports it gone.
     let attempts = Cell::new(0);
-    let fetch = |key: &Bytes, position: u32, resolve: Resolve<'_>| -> Fetched {
-        if key[0] == 3 {
-            attempts.set(attempts.get() + 1);
-            return Ok(match resolve()? {
-                Some(again) if again != position => {
-                    Some((key.clone(), Bytes::from(vec![again as u8])))
-                }
-                _ => None,
-            });
-        }
-        fetch_values(key, position, resolve)
-    };
+    let fetch =
+        |key: &Bytes, position: u32, found_in: Option<&CellId>, resolve: Resolve<'_>| -> Fetched {
+            if key[0] == 3 {
+                attempts.set(attempts.get() + 1);
+                return Ok(match resolve()? {
+                    Some(again) if again != position => {
+                        Some((key.clone(), Bytes::from(vec![again as u8])))
+                    }
+                    _ => None,
+                });
+            }
+            fetch_values(key, position, found_in, resolve)
+        };
     let walk = walk_over(rows(&[1, 2, 3, 4], &[]), false, true);
     let (rows_seen, skipped) = drain(walk, fetch);
     let keys: Vec<u8> = rows_seen.into_iter().map(|(key, _)| key).collect();
@@ -185,11 +196,12 @@ fn a_moved_entry_is_returned_from_its_new_position() {
         }))
     };
     let first = Cell::new(true);
-    let fetch = |key: &Bytes, position: u32, resolve: Resolve<'_>| -> Fetched {
-        if key[0] == 3 && first.replace(false) {
-            return Ok(resolve()?.map(|again| (key.clone(), Bytes::from(vec![again as u8]))));
-        }
-        fetch_values(key, position, resolve)
-    };
+    let fetch =
+        |key: &Bytes, position: u32, found_in: Option<&CellId>, resolve: Resolve<'_>| -> Fetched {
+            if key[0] == 3 && first.replace(false) {
+                return Ok(resolve()?.map(|again| (key.clone(), Bytes::from(vec![again as u8]))));
+            }
+            fetch_values(key, position, found_in, resolve)
+        };
     assert_eq!(drain(walk, fetch).0, [(1, 2), (2, 3), (3, 77), (4, 5)]);
 }

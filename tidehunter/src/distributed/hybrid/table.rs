@@ -782,30 +782,45 @@ impl TableInner {
         }
     }
 
+    /// The cell's value-change stamp, read before an index resolution. Pass the
+    /// result to [`Self::refill_value`]: the refill is dropped if a write
+    /// reached the cell in between.
+    pub(crate) fn value_epoch(&self, ks: KeySpace, key: &[u8]) -> u64 {
+        let context = self.contexts.ks_context(ks);
+        let reduced = context.ks_config.reduce_key(key);
+        self.table.value_epoch(context, reduced.as_ref())
+    }
+
+    /// [`Self::value_epoch`] for an iterator step that already knows the cell.
+    pub(crate) fn value_epoch_for_cell(&self, ks: KeySpace, cell: &CellId) -> u64 {
+        let context = self.contexts.ks_context(ks);
+        self.table.value_epoch_for_cell(context, cell)
+    }
+
     /// Installs a value the coordinator just fetched from its owner into the
     /// native per-cell LRU, exactly as native `Db::get` does after a WAL record
-    /// read.
+    /// read, **only while no write reached the cell since `epoch` was read**.
     ///
-    /// `reduced` is the index key the LRU is keyed by; `position` is the member
-    /// position the fetch resolved; `full_key` is the key the member carries,
-    /// which a reducing keyspace compares before serving it. A keyspace without
-    /// a value cache has no LRU and this is a no-op.
+    /// `epoch` comes from [`Self::value_epoch`] taken before the index
+    /// resolution. Without that guard a refill that lost a race with an
+    /// overwrite or remove would put the older fetched value back in front of
+    /// the index, and every later live read would answer it from the LRU.
     ///
-    /// Only a position that is still the key's latest fills the LRU
-    /// ([`LargeTable::refill_lru`]): a remote fetch can outlive a publication
-    /// that supersedes it, and the cut check serves a resident value on the
-    /// premise that it is the key's latest.
+    /// `reduced` is the index key the LRU is keyed by; `full_key` is the key the
+    /// member carries, which a reducing keyspace compares before serving it.
+    /// A keyspace without a value cache has no LRU and this is a no-op, as in
+    /// native `LargeTable::update_lru`.
     pub(crate) fn refill_value(
         &self,
         ks: KeySpace,
         reduced: Bytes,
-        position: VersionPosition,
         full_key: Bytes,
         value: Bytes,
+        epoch: u64,
     ) {
         let context = self.contexts.ks_context(ks);
         self.table
-            .refill_lru(context, reduced, position, full_key, value);
+            .update_lru_if_epoch(context, reduced, full_key, value, epoch);
     }
 
     /// The next index entry of a cell, as of `cut` when one is given.

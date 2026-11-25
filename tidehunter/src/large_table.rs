@@ -145,6 +145,16 @@ pub struct LargeTableEntry<P: IndexPosition = WalPosition> {
     /// clone; mutations replace it only while readers still hold that clone.
     /// This works for unloaded indexes without a second disk lookup.
     value_cache_generation: Option<Arc<()>>,
+    /// Value-change stamp of this cell: bumped by every applied write, remove
+    /// and cell clear under the row lock, and read under the same lock by a
+    /// reader that then fetches a member from its owner.
+    ///
+    /// A fetched value refills [`Self::value_lru`] only while this stamp is
+    /// unchanged since the index resolution ([`LargeTable::update_lru_if_epoch`]).
+    /// A refill that lost a race with an overwrite or remove therefore cannot
+    /// put an older value (or a removed one) back in front of the index.
+    #[cfg(feature = "experimental-distributed")]
+    value_epoch: u64,
     /// Last value added to the shared `loaded_key_bytes` gauge.
     /// Used to compute the delta on the next report so multiple cells
     /// can safely share one gauge via `.add()` instead of `.set()`.
@@ -703,46 +713,44 @@ impl<P: IndexPosition> LargeTable<P> {
         LargeTableEntry::<P>::update_lru_metric(context, previous, delta);
     }
 
-    /// Install a value the read path fetched from its owner, but only while
-    /// `position` is still the key's latest index position.
+    /// Install a fetched value into the native per-cell LRU only while no write
+    /// reached the cell since `epoch` was read.
     ///
-    /// [`Self::update_lru`] installs unconditionally, which the native
-    /// in-process read path gets away with: its resolve and its fill are two
-    /// steps of one call, so a stale fill is normally overwritten by the newer
-    /// write's own publication fill. A remote read resolves a position at a cut,
-    /// fetches the member over the network and only then fills, so a newer
-    /// publication can land in between. Installing the older value would leave
-    /// the LRU serving it to every read whose cut covers the newer write,
-    /// because [`Self::get_checkpoint`] trusts that a resident entry holds the
-    /// key's latest value. This keeps that invariant: a superseded position
-    /// fills nothing.
+    /// `epoch` is [`Self::value_epoch`] taken before the index resolution. The
+    /// compare and the push run under the cell's row lock, the same lock every
+    /// applied write, remove and clear takes, so a refill that lost that race
+    /// leaves the newer cache state alone instead of restoring an older value
+    /// (or a removed one). The entry must still hold a live cell: a cleared
+    /// cell (a dropped range) accepts no refill.
+    ///
+    /// A remote read resolves a position at a cut, fetches the member over the
+    /// network and only then fills, so a newer publication can land in between.
+    /// Installing the older value would leave the LRU serving it to every read
+    /// whose cut covers the newer write, because [`Self::get_checkpoint`]
+    /// trusts that a resident entry holds the key's latest value. A per-cell
+    /// stamp catches an overwrite, a remove and a dropped cell alike; the
+    /// resolved position alone catches only the same key.
     #[cfg(feature = "experimental-distributed")]
-    pub(crate) fn refill_lru(
+    pub(crate) fn update_lru_if_epoch(
         &self,
         context: &KsContext,
         reduced_key: Bytes,
-        position: P,
         full_key: Bytes,
         value: Bytes,
+        epoch: u64,
     ) {
         if context.ks_config.value_cache_size().is_none() {
             return;
         }
         let (mut row, cell) = self.row(context, &reduced_key);
-        let entry = self.entry_mut(&mut row, &cell);
-        if entry.value_lru.is_none() {
+        let Some(entry) = row.try_entry_mut(&cell) else {
             return;
-        }
-        // Apply a committed batch that is still pending, exactly as the lookup
-        // that produced `position` does (see `get_checkpoint`).
-        entry.promote_pending();
-        if entry.state == LargeTableEntryState::Unloaded
-            || entry.get(reduced_key.as_ref()) != Some(position)
-        {
+        };
+        if entry.state == LargeTableEntryState::Empty || entry.value_epoch != epoch {
             return;
         }
         let Some(value_lru) = &mut entry.value_lru else {
-            return;
+            unreachable!()
         };
         let reduced_key = reduced_key.into_owned();
         let full_key = full_key.into_owned();
@@ -750,6 +758,24 @@ impl<P: IndexPosition> LargeTable<P> {
         let delta: i64 = (reduced_key.len() + full_key.len() + value.len()) as i64;
         let previous = value_lru.push(reduced_key, (full_key, value));
         LargeTableEntry::<P>::update_lru_metric(context, previous, delta);
+    }
+
+    /// The cell's value-change stamp for `k`, read under the row lock. Read it
+    /// **before** resolving a position and pass it to
+    /// [`Self::update_lru_if_epoch`]; `0` means the cell has no entry.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn value_epoch(&self, context: &KsContext, k: &[u8]) -> u64 {
+        let (mut row, cell) = self.row(context, k);
+        row.try_entry_mut(&cell)
+            .map_or(0, |entry| entry.value_epoch)
+    }
+
+    /// [`Self::value_epoch`] for an iterator step that already knows the cell.
+    #[cfg(feature = "experimental-distributed")]
+    pub(crate) fn value_epoch_for_cell(&self, context: &KsContext, cell: &CellId) -> u64 {
+        let mutex_index = context.ks_config.mutex_for_cell(cell);
+        let mut row = self.row_by_mutex(context, mutex_index);
+        row.try_entry_mut(cell).map_or(0, |entry| entry.value_epoch)
     }
 
     pub fn get<L: Loader<Position = P>>(
@@ -2302,6 +2328,8 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             flushed_at: 0,
             value_lru,
             value_cache_generation,
+            #[cfg(feature = "experimental-distributed")]
+            value_epoch: 0,
             last_reported_key_bytes: 0,
             last_reported_flat_bytes: 0,
             last_reported_dirty_count: 0,
@@ -2351,6 +2379,8 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             .is_some_and(|generation| Arc::ptr_eq(generation, &token.0))
     }
 
+    /// Invalidates in-flight cache refills. Called by the three mutations that
+    /// can change a cell's values: insert, remove and clear.
     fn invalidate_cache_refills(&mut self) {
         if let Some(generation) = &mut self.value_cache_generation
             && Arc::strong_count(generation) > 1
@@ -2359,6 +2389,12 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             // reader holds a token, replacing the identity is unnecessary.
             // The old Arc stays alive with readers, avoiding reuse/ABA.
             *generation = Arc::new(());
+        }
+        // The distributed value path samples this stamp before its index
+        // resolution and drops a refill that finds it changed.
+        #[cfg(feature = "experimental-distributed")]
+        {
+            self.value_epoch = self.value_epoch.wrapping_add(1);
         }
     }
 

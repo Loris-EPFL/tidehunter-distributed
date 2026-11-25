@@ -142,6 +142,9 @@ impl DistributedIterSource for HybridIterSource {
         // `DbCheckpoint::next_entry`). Without a value cache there is nothing to
         // fill.
         let refill = self.cut.is_none() && table.ks_desc(ks).value_cache_size().is_some();
+        // The cell stamp the latest walk step started from, taken before that
+        // step. A refill is dropped when a write reached the cell since.
+        let epoch = std::cell::RefCell::new(None::<(CellId, u64)>);
         let mut skipped = 0;
         let entry = next_resolved(
             cell,
@@ -156,6 +159,10 @@ impl DistributedIterSource for HybridIterSource {
                 } else {
                     &mut *cache
                 };
+                if refill {
+                    *epoch.borrow_mut() =
+                        Some((cell.clone(), table.value_epoch_for_cell(ks, cell)));
+                }
                 table.next_entry(
                     ks,
                     cell.clone(),
@@ -166,21 +173,18 @@ impl DistributedIterSource for HybridIterSource {
                     self.cut,
                 )
             },
-            |key, resolved, resolve| match resolved {
+            |key, resolved, found_cell, resolve| match resolved {
                 // A live walk already answered from the native per-cell LRU: the
                 // row needs no owner contact, exactly as native `Db::next_entry`.
                 ResolvedValue::Resident { full_key, value } => Ok(Some((full_key, value))),
                 ResolvedValue::Position(position) => {
                     let row =
                         reader.read_entry_with_resolve(ks, key, position, resolve, latched)?;
-                    if refill && let Some((full_key, value)) = &row {
-                        table.refill_value(
-                            ks,
-                            key.clone(),
-                            position,
-                            full_key.clone(),
-                            value.clone(),
-                        );
+                    if let Some((full_key, value)) = &row
+                        && let Some((walked_cell, stamp)) = epoch.borrow().clone()
+                        && found_cell == Some(&walked_cell)
+                    {
+                        table.refill_value(ks, key.clone(), full_key.clone(), value.clone(), stamp);
                     }
                     Ok(row)
                 }
@@ -203,9 +207,11 @@ impl DistributedIterSource for HybridIterSource {
 /// `walk(cell, prev_key, fresh)` is one index step; `fresh` asks for empty
 /// iterator caches (the re-resolve). Its value is the index answer: a member
 /// position, or a value the native per-cell LRU already holds. `fetch(key,
-/// answer, resolve)` produces the entry's full key and value, calling `resolve`
-/// at most once to repeat the same walk step if the position's file was retired
-/// meanwhile. A fetch that finds a tombstone, or an entry no longer held, yields
+/// answer, found_in, resolve)` produces the entry's full key and value, calling
+/// `resolve` at most once to repeat the same walk step if the position's file
+/// was retired meanwhile; `found_in` is the cell the walk found the answer in,
+/// which a live step compares with the cell whose value epoch it sampled. A
+/// fetch that finds a tombstone, or an entry no longer held, yields
 /// `None` and the loop skips it, resuming in the cell the entry was found in,
 /// after its key. The walk ends only when the index walk itself reports no
 /// further entry, so a skipped last entry of a cell never truncates the
@@ -229,6 +235,7 @@ fn next_resolved<P>(
     mut fetch: impl FnMut(
         &Bytes,
         P,
+        Option<&CellId>,
         &mut dyn FnMut() -> Result<Option<P>, LocalDbError>,
     ) -> Result<Option<(Bytes, Bytes)>, LocalDbError>,
     skipped: &mut u64,
@@ -238,7 +245,7 @@ fn next_resolved<P>(
             return Ok(None);
         };
         let mut re_resolved = false;
-        let entry = fetch(&found.key, found.value, &mut || {
+        let entry = fetch(&found.key, found.value, found.cell.as_ref(), &mut || {
             re_resolved = true;
             Ok(walk(&cell, &prev_key, true)?
                 .filter(|again| again.key == found.key)
