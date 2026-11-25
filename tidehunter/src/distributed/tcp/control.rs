@@ -164,9 +164,6 @@ struct Shared {
     preparers: Mutex<Vec<PreparerSlot>>,
     // Parked durable-progress polls. Log syncers notify it after each sync.
     progress: HubSender,
-    // Stops the lease lapse watchdog. Set under no lock; the cell's condvar is
-    // notified after the store so a parked watchdog leaves at once.
-    lease_stop: AtomicBool,
     // Test-only cap of a poll's wait (ms), default `DURABLE_PROGRESS_MAX_WAIT`.
     // A long cap lets a test tell a wake from a deadline reply without a clock.
     #[cfg(test)]
@@ -224,6 +221,19 @@ struct TestGrantProfile {
 }
 
 impl Shared {
+    /// Stop admitting work and wake every parked worker.
+    ///
+    /// The queue mutex is held across the notify. `next_work` checks `stopped`
+    /// under it and then parks; parking_lot's `Condvar` registers a waiter only
+    /// inside `wait`, so a notify issued between that check and the registration
+    /// finds no waiter and is dropped. Holding the same lock makes this store
+    /// visible to the check or finds the worker already parked.
+    fn stop_workers(&self) {
+        let mut queue = self.queue.lock();
+        queue.stopped = true;
+        self.ready.notify_all();
+    }
+
     /// One worker owns each log's preparation triggers. Capacity one: a full
     /// queue coalesces triggers because the worker recomputes the target.
     /// Shutdown sets stopping, wakes publication retries, drops the sender and joins.
@@ -443,7 +453,6 @@ impl ControlOwner {
             context,
             flush,
             progress: progress.sender(),
-            lease_stop: AtomicBool::new(false),
             #[cfg(test)]
             progress_cap_ms: std::sync::atomic::AtomicU64::new(
                 super::DURABLE_PROGRESS_MAX_WAIT.as_millis() as u64,
@@ -494,8 +503,7 @@ impl ControlOwner {
             {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
-                    shared.queue.lock().stopped = true;
-                    shared.ready.notify_all();
+                    shared.stop_workers();
                     for thread in threads {
                         let _ = thread.join();
                     }
@@ -511,14 +519,11 @@ impl ControlOwner {
             let watchdog = shared.clone();
             match thread::Builder::new()
                 .name("coordinator-lease-watch".into())
-                .spawn(move || {
-                    coordinator_lease::lease_watch(&watchdog.context, &watchdog.lease_stop)
-                }) {
+                .spawn(move || coordinator_lease::lease_watch(&watchdog.context))
+            {
                 Ok(thread) => thread,
                 Err(error) => {
-                    shared.lease_stop.store(true, Ordering::Release);
-                    shared.queue.lock().stopped = true;
-                    shared.ready.notify_all();
+                    shared.stop_workers();
                     for thread in threads {
                         let _ = thread.join();
                     }
@@ -709,15 +714,13 @@ impl Drop for ControlOwner {
     fn drop(&mut self) {
         // The watchdog may be protecting exports under the gates the workers
         // take, so stop and join it before them.
-        self.shared.lease_stop.store(true, Ordering::Release);
         self.shared.context.coordinator_lease.stop_waiting();
         if let Some(thread) = self.lease_thread.take()
             && thread.join().is_err()
         {
             self.shared.context.poison_readers();
         }
-        self.shared.queue.lock().stopped = true;
-        self.shared.ready.notify_all();
+        self.shared.stop_workers();
         for thread in self.threads.drain(..) {
             if thread.join().is_err() {
                 self.shared.context.poison_readers();

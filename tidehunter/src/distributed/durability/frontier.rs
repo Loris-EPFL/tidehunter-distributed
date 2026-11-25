@@ -708,18 +708,27 @@ impl Frontier {
 
     /// Poison the frontier. Every waiter and later completion gets [`FrontierError::Failed`].
     /// The first reason is kept.
+    ///
+    /// The notify runs under the state lock: waiters check `failure` under it
+    /// and then park, and a parking_lot notify issued outside it can be dropped
+    /// in that window.
     pub fn fail(&self, reason: &str) {
         let mut st = self.state.lock();
         st.failure.get_or_insert_with(|| reason.to_owned());
-        drop(st);
         self.wake_all();
     }
 
     /// Refuse new completions and let the syncer drain: one final fsync of the appended
     /// frontier, then exit. Waiters whose condition cannot become true get
     /// [`FrontierError::Stopped`].
+    ///
+    /// The notify runs under the state lock. Every waiter checks its predicate
+    /// under that lock and then parks; parking_lot's `Condvar` registers a
+    /// waiter only inside `wait`, so a notify issued between that check and the
+    /// registration finds no waiter and is dropped.
     pub fn stop(&self) {
-        self.state.lock().stopping = true;
+        let mut st = self.state.lock();
+        st.stopping = true;
         self.wake_all();
     }
 
@@ -870,7 +879,9 @@ impl Frontier {
         // Release: pairs with the Acquire in `synced()`. The fsync returned before this
         // store, so a reader that sees the new value sees durable data.
         self.synced.store(capture.end, Ordering::Release);
-        drop(st);
+        // Notified under the state lock, which every `wait_synced`/`wait_flush`
+        // predicate is checked under: a parking_lot notify outside it can find
+        // no registered waiter and be dropped.
         self.synced_cv.notify_all();
         #[cfg(test)]
         self.parked_cv.notify_all();
@@ -880,7 +891,6 @@ impl Frontier {
         let mut st = self.state.lock();
         st.counters.fsync_failures += 1;
         st.failure.get_or_insert(reason);
-        drop(st);
         self.wake_all();
     }
 }
@@ -897,7 +907,9 @@ impl Drop for SyncerExit<'_> {
             st.failure
                 .get_or_insert_with(|| "syncer thread panicked".to_owned());
         }
-        drop(st);
+        // Under the state lock: `wait_synced`/`wait_flush` check
+        // `syncer_exited` under it and then park, and a parking_lot notify
+        // issued outside it can be dropped in that window.
         self.0.wake_all();
     }
 }

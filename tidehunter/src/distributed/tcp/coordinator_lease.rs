@@ -11,7 +11,6 @@
 
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::TcpError;
@@ -36,6 +35,10 @@ pub(super) struct CoordinatorLeaseCell {
     /// continuing through a held Seal.
     #[cfg(test)]
     grants: std::sync::atomic::AtomicU64,
+    /// Test-only seam between the stop check and the park, where a notify that
+    /// does not take the cell lock is lost.
+    #[cfg(test)]
+    before_park: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +51,9 @@ struct LeaseState {
     /// Sticky for this epoch: set once by the expiry check, cleared only by
     /// `activate` of a new epoch.
     lapsed: bool,
+    /// The owner is shutting down. Written only under the cell lock, so a
+    /// watchdog that checks it and then parks cannot miss the wakeup.
+    stopped: bool,
 }
 
 impl CoordinatorLeaseCell {
@@ -57,6 +63,8 @@ impl CoordinatorLeaseCell {
             changed: Condvar::new(),
             #[cfg(test)]
             grants: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            before_park: Mutex::new(None),
         }
     }
 
@@ -160,14 +168,22 @@ impl CoordinatorLeaseCell {
 
     /// Wait for the current holder's lease to expire past [`OWNER_MARGIN`].
     ///
-    /// Returns the epoch to write-protect once per lapse, and `None` when
-    /// `stop` is set. The loop is designed to run until `stop`: each iteration
+    /// Returns the epoch to write-protect once per lapse, and `None` when the
+    /// cell was stopped. The loop is designed to run until then: each iteration
     /// either waits on the cell or returns, and a lapse is reported once.
-    pub(super) fn wait_lapse(&self, stop: &AtomicBool) -> Option<u64> {
+    pub(super) fn wait_lapse(&self) -> Option<u64> {
         let mut state = self.state.lock();
         loop {
-            if stop.load(Ordering::Acquire) {
+            if state.stopped {
                 return None;
+            }
+            #[cfg(test)]
+            let hook = self.before_park.lock().take();
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                // Runs under the cell lock, exactly between the stop check and
+                // the park that registers the waiter.
+                hook();
             }
             match (state.holder, state.expires) {
                 (Some(_), Some(expires)) if !state.lapsed => {
@@ -185,6 +201,13 @@ impl CoordinatorLeaseCell {
         }
     }
 
+    /// Test-only: run `hook` under the cell lock between the stop check and the
+    /// next park.
+    #[cfg(test)]
+    pub(super) fn pause_before_next_park(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_park.lock() = Some(Box::new(hook));
+    }
+
     /// Test-only: grants of the current epoch.
     #[cfg(test)]
     pub(super) fn grants(&self) -> u64 {
@@ -198,7 +221,15 @@ impl CoordinatorLeaseCell {
     }
 
     /// Wake a parked [`Self::wait_lapse`] when the watchdog must stop.
+    ///
+    /// The stop predicate is written under the cell lock that `wait_lapse`
+    /// checks it and parks under. parking_lot's `Condvar` registers a waiter
+    /// only inside `wait`, so a notify issued between that check and the
+    /// registration finds no waiter and is dropped; holding the same lock makes
+    /// this store visible to the check or finds the waiter already parked.
     pub(super) fn stop_waiting(&self) {
+        let mut state = self.state.lock();
+        state.stopped = true;
         self.changed.notify_all();
     }
 }
@@ -274,8 +305,8 @@ impl super::Client {
 /// iteration waits on the cell or returns, and the cell reports one lapse per
 /// activated epoch. It takes the live-control gate, then the lifecycle gate,
 /// then the inventory; the target work releases the inventory.
-pub(super) fn lease_watch(context: &super::control::ControlContext, stop: &AtomicBool) {
-    while let Some(epoch) = context.coordinator_lease.wait_lapse(stop) {
+pub(super) fn lease_watch(context: &super::control::ControlContext) {
+    while let Some(epoch) = context.coordinator_lease.wait_lapse() {
         let _gate = context.live_control_gate.lock();
         let mut slot = context.lifecycle.lock();
         let result = super::inventory::lease::protect_lapsed_epoch(

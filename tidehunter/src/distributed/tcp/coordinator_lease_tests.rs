@@ -128,12 +128,54 @@ fn granted_duration_is_clamped() {
 #[test]
 fn a_stopped_watchdog_returns_at_once() {
     let cell = cell_at_epoch(1);
-    let stop = AtomicBool::new(true);
+    cell.stop_waiting();
     assert_eq!(
-        cell.wait_lapse(&stop),
+        cell.wait_lapse(),
         None,
         "a stopped watchdog must not report a lapse"
     );
+}
+
+/// A stop issued between the watchdog's predicate check and its park must not
+/// be lost. parking_lot's `Condvar` drops a notify that finds no registered
+/// waiter, so the stop predicate has to be written under the cell lock the
+/// checker and the parker share.
+#[test]
+fn stop_between_the_check_and_the_park_still_wakes_the_watchdog() {
+    use crate::distributed::test_bounds::PROGRESS_CAP;
+    let cell = Arc::new(CoordinatorLeaseCell::new());
+    let (entered, check_to_park) = std::sync::mpsc::sync_channel(0);
+    let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+    cell.pause_before_next_park(move || {
+        let _ = entered.send(());
+        let _ = resume_rx.recv();
+    });
+    let (finished, watchdog_exited) = std::sync::mpsc::sync_channel(1);
+    let watchdog = {
+        let cell = Arc::clone(&cell);
+        std::thread::spawn(move || {
+            assert_eq!(cell.wait_lapse(), None, "the stop must end the wait");
+            let _ = finished.send(());
+        })
+    };
+    check_to_park
+        .recv_timeout(PROGRESS_CAP)
+        .expect("the watchdog never reached the check-to-park window");
+    let stopper = {
+        let cell = Arc::clone(&cell);
+        std::thread::spawn(move || cell.stop_waiting())
+    };
+    // Either the stop already ran before the check (the watchdog reads it) or
+    // it waits for the cell lock until the watchdog parks. Releasing the hook
+    // now must end the wait in both orders.
+    resume.send(()).expect("the watchdog resumed");
+    stopper.join().expect("the stop completed");
+    assert_eq!(
+        watchdog_exited.recv_timeout(PROGRESS_CAP),
+        Ok(()),
+        "the watchdog missed the stop and stayed parked"
+    );
+    watchdog.join().expect("the watchdog thread completed");
 }
 
 #[test]
