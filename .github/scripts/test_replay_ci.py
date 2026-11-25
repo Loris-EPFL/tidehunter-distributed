@@ -433,5 +433,42 @@ class ReplayCITests(unittest.TestCase):
                 self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
 
 
+class NvmetTraceTests(unittest.TestCase):
+    def test_counts_double_completion_and_repeated_enqueue(self):
+        trace = "\n".join([
+            "  nvmet_req_init: ctrl_id=1 qid=1 cid=16 disk=loop0 status=0",
+            "  nvmet_tcp_qr: (nvmet_tcp_queue_response+0x0/0x10) req=0xffff888",
+            "  nvmet_tcp_qr: (nvmet_tcp_queue_response+0x0/0x10) req=0xffff888",
+            "  nvmet_req_complete: ctrl_id=1 qid=1 cid=16 status=0",
+            "  nvmet_req_complete: ctrl_id=1 qid=1 cid=16 status=0",
+            "  nvmet_req_complete: ctrl_id=2 qid=1 cid=16 status=0",
+        ])
+        completes, enqueues = kernel.NvmetTrace()._counts(trace)
+        self.assertEqual(completes[("1", "1", "16")], 2,
+                         "a double completion of one command is counted twice")
+        self.assertEqual(completes[("2", "1", "16")], 1)
+        self.assertEqual(enqueues["0xffff888"], 2,
+                         "two queue-response enqueues of one request are counted")
+
+    def test_capture_failure_writes_counts_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "tracefs"
+            root.mkdir()
+            (root / "trace").write_text(
+                "nvmet_req_complete: ctrl_id=1 qid=1 cid=16 status=0\n"
+                "nvmet_req_complete: ctrl_id=1 qid=1 cid=16 status=0\n")
+            trace = kernel.NvmetTrace()
+            trace.root = root
+            trace.started = 0.0
+            trace.capture_failure(Path(temporary) / "out")
+            self.assertEqual(
+                json.loads((Path(temporary) / "out" / "complete-counts.json").read_text()),
+                {"1|1|16": 2})
+            self.assertEqual(
+                json.loads((Path(temporary) / "out" / "duplicates.json").read_text()),
+                {"1|1|16": 2})
+            self.assertTrue((Path(temporary) / "out" / "trace.txt").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

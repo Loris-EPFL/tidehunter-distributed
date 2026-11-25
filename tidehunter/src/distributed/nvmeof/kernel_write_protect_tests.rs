@@ -5,7 +5,7 @@
 //! Ignored by default: it needs root, `nvmet`, `nvmet-tcp`, `nvme-tcp`, a
 //! mounted configfs and a loopback listener. CI runs it in the kernel proof
 //! job. The fixture is a real configfs target, never the ordinary-file model.
-use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
+use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry, RegistryMode};
 use super::live_namespace::LiveNamespaceAccess;
 use super::live_storage::{FILES_PER_SUBSYSTEM, wal_export_name};
 use super::live_target::{LiveFileIdentity, LiveTargetManager};
@@ -86,7 +86,8 @@ fn write_protect_blocks_a_remote_write_and_keeps_the_export() {
         transport: binding.transport,
         geometry: Default::default(),
     };
-    let connections = LiveConnectionRegistry::open(&registry).expect("open controller registry");
+    let connections = LiveConnectionRegistry::open(&registry, RegistryMode::Adopt)
+        .expect("open controller registry");
     let deadline = Instant::now() + Duration::from_secs(20);
     let (mut controller, namespace) = connections
         .connect(

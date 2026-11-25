@@ -12,7 +12,7 @@
 //! objects. The state directory and WAL paths must be protected from untrusted
 //! local users. The NVMe data plane assumes trusted, non-Byzantine initiators:
 //! namespace write protection can be changed by an authorized controller.
-use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry};
+use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry, RegistryMode};
 use super::live_storage::LiveTargetBinding;
 use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::distributed::tcp::host_identity::NQN_PREFIX;
@@ -463,7 +463,8 @@ impl LiveTargetManager {
                 Err(e) => return Err(path_error("create commissioning directory", &path, e)),
             }
             check_path(&path, true)?;
-            manager.commissioning = Some(LiveConnectionRegistry::open(&path)?);
+            manager.commissioning =
+                Some(LiveConnectionRegistry::open(&path, RegistryMode::Retire)?);
         }
         // Old writable capabilities are never re-enabled: seal every enabled
         // namespace, drain it, and remove every scoped object.
@@ -762,11 +763,7 @@ impl LiveTargetManager {
             self.create_dir(&sub)?;
             self.put(&sub.join("attr_allow_any_host"), "0")?;
         }
-        if !readonly {
-            let host = PathBuf::from("hosts").join(&self.config.host_nqn);
-            self.link_if_absent(&host_link, &host)?;
-            self.link_if_absent(&public_link, &sub)?;
-        } else {
+        if readonly {
             // A sealed file joins an existing subsystem only after the public
             // host and port can no longer reach it.
             self.remove_link_if_present(&public_link)?;
@@ -800,6 +797,13 @@ impl LiveTargetManager {
             return Err(invalid("pinned WAL changed"));
         }
         self.put(&ns.join("enable"), "1")?;
+        if !readonly {
+            // Publish only after the namespace exists, so a client can never
+            // connect to a subsystem with zero or partial namespaces.
+            let host = PathBuf::from("hosts").join(&self.config.host_nqn);
+            self.link_if_absent(&host_link, &host)?;
+            self.link_if_absent(&public_link, &sub)?;
+        }
         if readonly {
             let private_host = PathBuf::from("hosts").join(self.commissioning_host());
             self.link_if_absent(
@@ -1263,7 +1267,8 @@ impl LiveTargetManager {
                 // intents before the scoped objects are removed.
                 let path = self.config.state_dir.join(COMMISSIONING_DIRECTORY);
                 drop(self.commissioning.take());
-                self.commissioning = Some(LiveConnectionRegistry::open(&path)?);
+                self.commissioning =
+                    Some(LiveConnectionRegistry::open(&path, RegistryMode::Retire)?);
             }
             self.reconcile()
         })();

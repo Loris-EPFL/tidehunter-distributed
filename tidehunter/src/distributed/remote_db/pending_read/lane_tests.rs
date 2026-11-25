@@ -87,7 +87,11 @@ impl Case {
         // registers each leased extent's ordinary-file namespace in it, and
         // the read lane's permanent-export grant reuses that entry.
         let registry_dir = tempdir::TempDir::new("lane-registry").unwrap();
-        let registry = LiveConnectionRegistry::open(&registry_dir.path().join("registry")).unwrap();
+        let registry = LiveConnectionRegistry::open(
+            &registry_dir.path().join("registry"),
+            crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+        )
+        .unwrap();
         let pool = Arc::new(LiveControllerPool::new(registry, 64, 8).unwrap());
         client.set_live_pool(pool);
         let partition = fixture.config.partition.partition;

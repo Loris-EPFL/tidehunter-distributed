@@ -2,7 +2,8 @@
 use super::*;
 use crate::workload::{key_bytes, value_bytes};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -51,6 +52,7 @@ impl QualificationProgress {
         snapshot: Option<serde_json::Value>,
         detail: serde_json::Value,
     ) {
+        trace_phase(phase);
         self.events.push(serde_json::json!({
             "phase": phase,
             "elapsed_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -91,6 +93,17 @@ fn check(condition: bool, message: &'static str) -> BackendResult<()> {
     }
 }
 
+/// Put a client phase on the kernel clock when the CI job armed the nvmet
+/// trace. Best-effort and absent on local, non-root runs.
+fn trace_phase(phase: &str) {
+    if let Ok(mut marker) = std::fs::OpenOptions::new()
+        .append(true)
+        .open("/sys/kernel/tracing/trace_marker")
+    {
+        let _ = writeln!(marker, "{phase}");
+    }
+}
+
 fn stats(db: &sui::Db) -> BackendResult<serde_json::Value> {
     let sample = db
         .live_nvmeof_stats()
@@ -109,6 +122,146 @@ fn delta(start: &serde_json::Value, end: &serde_json::Value, field: &str) -> Bac
     count(end, field)?
         .checked_sub(count(start, field)?)
         .ok_or_else(|| format!("live NVMe-oF counter decreased: {field}").into())
+}
+
+/// The controller instance and pinned sysfs inode that served each subsystem's
+/// observed namespace route, keyed by subsystem NQN.
+fn controller_identities(
+    sample: &serde_json::Value,
+) -> BackendResult<BTreeMap<String, (u64, u64)>> {
+    let routes = sample
+        .get("routes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("observed live namespace routes unavailable")?;
+    let mut identities = BTreeMap::new();
+    for route in routes {
+        let identity = route
+            .get("namespace_identity")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("observed live namespace identity unavailable")?;
+        let nqn = identity
+            .get("nqn")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("observed live namespace NQN unavailable")?
+            .to_owned();
+        let instance = identity
+            .get("controller_instance")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("observed live controller instance unavailable")?;
+        let inode = identity
+            .get("controller")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|controller| controller.get("sysfs_inode"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("observed live controller inode unavailable")?;
+        identities.insert(nqn, (instance, inode));
+    }
+    Ok(identities)
+}
+
+/// Controller identity evidence for the abrupt-exit adoption window. The check
+/// scopes kernel-log churn to the child's own subsystems and initiator, so an
+/// owner commissioning controller for the same subsystem can neither mask nor
+/// fake a host controller recreate.
+struct AdoptionWindow {
+    nqns: BTreeSet<String>,
+    host_nqns: BTreeSet<String>,
+    /// `addr <ip>:<port>` as the host connect line prints it.
+    services: BTreeSet<String>,
+    /// Host controller names, e.g. `nvme3`.
+    instances: BTreeSet<String>,
+}
+
+impl AdoptionWindow {
+    fn from_child(sample: &serde_json::Value) -> BackendResult<Self> {
+        let routes = sample["routes"]
+            .as_array()
+            .ok_or("abrupt child routes unavailable")?;
+        check(!routes.is_empty(), "abrupt child observed no controllers")?;
+        let mut window = Self {
+            nqns: BTreeSet::new(),
+            host_nqns: BTreeSet::new(),
+            services: BTreeSet::new(),
+            instances: BTreeSet::new(),
+        };
+        for route in routes {
+            let identity = route["namespace_identity"]
+                .as_object()
+                .ok_or("abrupt child namespace identity unavailable")?;
+            let nqn = identity["nqn"]
+                .as_str()
+                .ok_or("abrupt child subsystem NQN unavailable")?;
+            let instance = identity["controller_instance"]
+                .as_u64()
+                .ok_or("abrupt child controller instance unavailable")?;
+            let address = route["address"]
+                .as_str()
+                .ok_or("abrupt child controller address unavailable")?;
+            let service = route["service"]
+                .as_u64()
+                .ok_or("abrupt child controller service unavailable")?;
+            window.nqns.insert(nqn.to_owned());
+            window.instances.insert(format!("nvme{instance}"));
+            window.services.insert(format!("addr {address}:{service}"));
+            let host_path = format!("/sys/class/nvme/nvme{instance}/hostnqn");
+            match std::fs::read_to_string(&host_path) {
+                Ok(host_nqn) => {
+                    window.host_nqns.insert(host_nqn.trim().to_owned());
+                }
+                // A route whose controller was already retired is not an
+                // adoption candidate; the secondary identity check covers it.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("read {host_path}: {error}").into()),
+            }
+        }
+        Ok(window)
+    }
+
+    /// A host or target line that creates or removes one of the child's own
+    /// public controllers. Commissioning controllers use a different host NQN,
+    /// service and host instance, so they are not counted.
+    fn is_churn(&self, line: &str) -> bool {
+        if !self.nqns.iter().any(|nqn| line.contains(nqn)) {
+            return false;
+        }
+        if line.contains("Created nvm controller") {
+            return self.host_nqns.iter().any(|host| line.contains(host));
+        }
+        if line.contains("new ctrl:") {
+            return self.services.iter().any(|service| line.contains(service));
+        }
+        if line.contains("Removing ctrl") || line.contains("Removing controller") {
+            return self
+                .instances
+                .iter()
+                .any(|instance| line.contains(&format!("nvme {instance}:")));
+        }
+        false
+    }
+}
+
+/// The kernel log, from `dmesg` or `journalctl -k`. The CI kernel job runs as
+/// root; a non-root local live run reports the missing evidence instead of
+/// silently passing.
+fn kernel_log() -> Option<String> {
+    for (program, args) in [
+        ("dmesg", Vec::new()),
+        ("journalctl", vec!["-k", "--no-pager", "-o", "cat"]),
+    ] {
+        if let Ok(output) = std::process::Command::new(program).args(args).output()
+            && output.status.success()
+        {
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+    }
+    None
+}
+
+fn controller_churn(window: &AdoptionWindow) -> BackendResult<usize> {
+    let log = kernel_log().ok_or(
+        "kernel log unavailable for the abrupt-adoption proof; run the live qualification as root",
+    )?;
+    Ok(log.lines().filter(|line| window.is_churn(line)).count())
 }
 
 // A single 64 KiB sentinel/filler or tombstone frame must fit this charge.
@@ -1173,12 +1326,45 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         .map_err(native_error)?;
     progress.mark("abrupt_child_start", None);
     let child_evidence = qualify_abrupt_child(&input, &input_bytes, output, &mut progress)?;
+    let child_controllers = controller_identities(&child_evidence["end"])?;
+    check(
+        !child_controllers.is_empty(),
+        "abrupt child observed no controllers",
+    )?;
+    // The kernel log window between the child exit and the first replay read
+    // must not create or remove a controller of the child's own initiator. This
+    // is the primary, non-recyclable evidence; the instance/inode comparison
+    // below is secondary because both allocators can reuse their values.
+    let window = AdoptionWindow::from_child(&child_evidence["end"])?;
+    let churn_after_child = controller_churn(&window)?;
     progress.mark("abrupt_recovery_open", None);
     let crash_reopened =
         sui::Db::open_remote(&input.coordinator_path, shape.clone(), remote.clone())
             .map_err(native_error)?;
+    let churn_after_open = controller_churn(&window)?;
     let crash_recovery = stats(&crash_reopened)?;
     progress.mark("abrupt_recovery_open_complete", Some(&crash_reopened));
+    let recovery_controllers = controller_identities(&crash_recovery)?;
+    check(
+        !recovery_controllers.is_empty(),
+        "abrupt reopen observed no controllers",
+    )?;
+    check(
+        churn_after_open == churn_after_child,
+        "abrupt reopen created or removed a child controller; the orphan was not adopted",
+    )?;
+    let mut created_at_reopen = 0;
+    let mut adopted = 0;
+    for (nqn, identity) in &recovery_controllers {
+        match child_controllers.get(nqn) {
+            Some(child) if child == identity => adopted += 1,
+            _ => created_at_reopen += 1,
+        }
+    }
+    check(
+        created_at_reopen == 0 && adopted > 0,
+        "abrupt reopen did not reuse the child's controller instance and sysfs inode",
+    )?;
     verify_fences(&crash_recovery, partitions)?;
     check(
         count(&crash_recovery, "recovery_read_ops")? > 0
@@ -1235,9 +1421,19 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "member_transition": member_transition, "recovery": recovery,
         "after_miss": after_miss, "after_hit": after_hit, "after_reopen_reads": after_reopen_reads,
         "abrupt_child": child_evidence, "abrupt_recovery": crash_recovery,
+        "abrupt_adoption": {
+            "child_controllers": child_controllers,
+            "recovery_controllers": recovery_controllers,
+            "adopted": adopted,
+            "created_at_reopen": created_at_reopen,
+            "kernel_churn": {
+                "after_child": churn_after_child,
+                "after_open": churn_after_open,
+            },
+        },
         "after_crash_reads": after_crash_reads, "target_reuse": target_reuse,
         "target_shutdown": target_shutdown,
-        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_write_protect":true,"cache_miss_hit":true,"target_reuse":true}
+        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_write_protect":true,"cache_miss_hit":true,"target_reuse":true,"abrupt_controller_adoption":true}
     });
     fs::write(
         output.join("qualification.json"),
@@ -1248,127 +1444,5 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_file_qualification_persists_and_recovers_real_frames() {
-        let guard = tempfile::TempDir::with_prefix("live-file-qualification-").expect("test tree");
-        let root = guard.path().to_path_buf();
-        let input = root.join("input.json");
-        fs::write(
-            &input,
-            serde_json::to_vec(&serde_json::json!({
-                "coordinator_path": root.join("stream"),
-                "namespace": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
-                "expected_route": "local_file",
-                "durability_tier": "synchronous",
-                "value_bytes": 256
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let output = root.join("result");
-        run(&input, &output).unwrap();
-        let proof: serde_json::Value =
-            serde_json::from_slice(&fs::read(output.join("qualification.json")).unwrap()).unwrap();
-        assert_eq!(proof["kind"], "live_nvmeof_file_component_qualification");
-        assert_eq!(proof["frame_count"], 3);
-        assert_eq!(proof["owner_validate_persist_retry_recovery"], true);
-    }
-
-    #[test]
-    fn qualification_requires_explicit_valid_tier() {
-        let base = serde_json::json!({
-            "coordinator_path": "/unused",
-            "namespace": vec![1; 16],
-            "expected_route": "local_file",
-            "value_bytes": 256
-        });
-        assert!(serde_json::from_value::<Input>(base.clone()).is_err());
-        for tier in ["native", "synchronous", "invalid"] {
-            let mut value = base.clone();
-            value["durability_tier"] = serde_json::json!(tier);
-            let input: Input = serde_json::from_value(value).unwrap();
-            assert_eq!(validate_tier(&input).is_ok(), tier != "invalid");
-        }
-    }
-
-    #[test]
-    fn qualification_rejects_fixture_fences_and_unverified_routes() {
-        let mut sample = serde_json::json!({
-            "route_evidence_dropped": 0, "fence_evidence_dropped": 0,
-            "routes": [{
-                "transport":"rdma", "address":"10.0.0.2", "service":4420,
-                "namespace_identity":{"namespace_path":"/dev/nvme0n1",
-                    "nqn":"nqn.2026-01.test:wal", "nsid":1, "bytes":4096,
-                    "controller_instance":0, "block_size":4096, "uuid":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-                    "controller":{"queue_count":2, "sqsize":31, "sysfs_device":22, "sysfs_inode":9}}
-            }],
-            "fences":[{"partition":0,"authority_epoch":2,
-                "target":{"fixture_only":false,"fence_count":1,
-                    "write_protect_successes":1,"errors":0}}]
-        });
-        assert!(verify_routes(&sample, "rdma").is_ok());
-        assert!(verify_routes(&sample, "tcp").is_err());
-        assert!(verify_fences(&sample, &[0]).is_ok());
-        sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(true);
-        assert!(verify_fences(&sample, &[0]).is_err());
-        sample["fences"][0]["target"]["fixture_only"] = serde_json::json!(false);
-        sample["fences"][0]["target"]["write_protect_successes"] = serde_json::json!(0);
-        assert!(verify_fences(&sample, &[0]).is_err());
-        sample["fences"][0]["target"]["write_protect_successes"] = serde_json::json!(1);
-        sample["fences"][0]["target"]["fence_count"] = serde_json::json!(0);
-        assert!(verify_fences(&sample, &[0]).is_err());
-        sample["fences"][0]["target"]["fence_count"] = serde_json::json!(1);
-        assert!(verify_fences(&sample, &[0]).is_ok());
-        sample["route_evidence_dropped"] = serde_json::json!(1);
-        assert!(verify_routes(&sample, "rdma").is_err());
-        sample["route_evidence_dropped"] = serde_json::json!(0);
-        let record = sample["routes"][0]["namespace_identity"]["controller"].clone();
-        for key in ["queue_count", "sqsize", "sysfs_device", "sysfs_inode"] {
-            for bad in [serde_json::json!(0), serde_json::Value::Null] {
-                let mut broken = sample.clone();
-                broken["routes"][0]["namespace_identity"]["controller"][key] = bad;
-                assert!(verify_routes(&broken, "rdma").is_err(), "{key} accepted");
-            }
-            let mut missing = sample.clone();
-            missing["routes"][0]["namespace_identity"]["controller"]
-                .as_object_mut()
-                .unwrap()
-                .remove(key);
-            assert!(verify_routes(&missing, "rdma").is_err(), "{key} optional");
-        }
-        sample["routes"][0]["namespace_identity"]["controller"] = serde_json::Value::Null;
-        assert!(verify_routes(&sample, "rdma").is_err());
-        sample["routes"][0]["namespace_identity"]["controller"] = record;
-        assert!(verify_routes(&sample, "rdma").is_ok());
-    }
-
-    #[test]
-    fn progress_events_carry_elapsed_time_and_detail() {
-        let guard =
-            tempfile::TempDir::with_prefix("live-qualification-progress-").expect("test tree");
-        let root = guard.path().to_path_buf();
-        let mut progress = QualificationProgress {
-            directory: root.clone(),
-            file_name: "progress.json",
-            started: Instant::now(),
-            events: Vec::new(),
-        };
-        progress.mark_value("phase", None);
-        progress.record(
-            "phase_writes",
-            None,
-            serde_json::json!({ "writes_acknowledged": 8 }),
-        );
-        let document: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("progress.json")).unwrap()).unwrap();
-        let events = document["events"].as_array().unwrap();
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| event["elapsed_ms"].is_u64()));
-        assert!(events[0]["detail"].is_null());
-        assert_eq!(events[1]["phase"], "phase_writes");
-        assert_eq!(events[1]["detail"]["writes_acknowledged"], 8);
-    }
-}
+#[path = "live_qualification_tests.rs"]
+mod tests;

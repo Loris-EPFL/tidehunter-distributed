@@ -1102,6 +1102,7 @@ impl RemoteDatabase {
         let live_pool = {
             let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
                 &path.join("live-nvme-connections"),
+                super::nvmeof::live_connect::RegistryMode::Adopt,
             )
             .map_err(LocalDbError::component)?;
             let clients = config

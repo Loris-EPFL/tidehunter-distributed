@@ -5654,7 +5654,11 @@ mod leased_rollover_tests {
         let pool_dir = tempdir::TempDir::new("per-owner-route-pool").unwrap();
         let pool = std::sync::Arc::new(
             LiveControllerPool::new(
-                LiveConnectionRegistry::open(&pool_dir.path().join("registry")).unwrap(),
+                LiveConnectionRegistry::open(
+                    &pool_dir.path().join("registry"),
+                    crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+                )
+                .unwrap(),
                 8,
                 4,
             )

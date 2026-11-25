@@ -113,6 +113,7 @@ fn replay_live_wal_page_reads_frames_through_namespace_fixture() {
     let pool_dir = tempdir::TempDir::new("replay-pool").unwrap();
     let registry = crate::distributed::nvmeof::live_connect::LiveConnectionRegistry::open(
         &pool_dir.path().join("registry"),
+        crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
     )
     .unwrap();
     client.set_live_pool(Arc::new(
@@ -181,6 +182,7 @@ impl PageSource {
         let pool_dir = tempdir::TempDir::new("replay-page-source").unwrap();
         let registry = crate::distributed::nvmeof::live_connect::LiveConnectionRegistry::open(
             &pool_dir.path().join("registry"),
+            crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
         )
         .unwrap();
         let pool = Arc::new(

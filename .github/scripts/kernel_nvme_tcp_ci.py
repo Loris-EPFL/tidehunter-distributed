@@ -8,12 +8,188 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+
+TRACING_ROOTS = (Path("/sys/kernel/tracing"), Path("/sys/kernel/debug/tracing"))
+NVMET_EVENTS = ("nvmet_req_init", "nvmet_req_complete")
+KPROBE = "p:nvmet_tcp_qr nvmet_tcp_queue_response req=%di"
+
+
+def write_text(path, value):
+    path.write_text(value if value.endswith("\n") else value + "\n")
+
+
+class NvmetTrace:
+    """Failure-only nvmet trace for the single-owner abrupt-recovery proof.
+
+    Two nvmet tracepoints plus one queue-response kprobe are armed for the
+    single-owner run. Nothing is copied on success; on failure the buffer,
+    event formats/listing and per-command counts go to the artifact directory.
+    Diagnostic failures are themselves recorded and never mask the proof.
+    """
+
+    def __init__(self):
+        self.root = None
+        self.started = None
+        self.errors = []
+
+    def _record(self, error):
+        self.errors.append(str(error))
+
+    def _resolve_root(self):
+        for candidate in TRACING_ROOTS:
+            try:
+                if (candidate / "events").is_dir():
+                    return candidate
+            except OSError as error:
+                self._record(f"probe {candidate}: {error}")
+        target = TRACING_ROOTS[0]
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["mount", "-t", "tracefs", "tracefs", str(target)],
+                           check=False, capture_output=True, text=True)
+        except OSError as error:
+            self._record(f"mount tracefs: {error}")
+            return None
+        try:
+            return target if (target / "events").is_dir() else None
+        except OSError as error:
+            self._record(f"probe {target}: {error}")
+            return None
+
+    def arm(self):
+        self.root = self._resolve_root()
+        if self.root is None:
+            self._record("tracefs unavailable; nvmet trace not armed")
+            return
+        try:
+            write_text(self.root / "tracing_on", "0")
+            for name, value in (("trace_clock", "mono"), ("buffer_size_kb", "4096")):
+                try:
+                    write_text(self.root / name, value)
+                except OSError as error:
+                    self._record(f"{name}: {error}")
+            for event in NVMET_EVENTS:
+                enable = self.root / "events" / "nvmet" / event / "enable"
+                if enable.is_file():
+                    try:
+                        write_text(enable, "1")
+                    except OSError as error:
+                        self._record(f"enable {event}: {error}")
+                else:
+                    self._record(f"missing nvmet event {event}")
+            try:
+                with (self.root / "kprobe_events").open("a") as handle:
+                    handle.write(KPROBE + "\n")
+            except OSError as error:
+                self._record(f"kprobe nvmet_tcp_queue_response: {error}")
+            write_text(self.root / "tracing_on", "1")
+            write_text(self.root / "trace_marker", "native-tier-start")
+            self.started = time.monotonic()
+        except OSError as error:
+            self._record(f"arm: {error}")
+
+    def disarm(self):
+        if self.root is None:
+            return
+        for name, value in (("trace_marker", "native-tier-end"), ("tracing_on", "0")):
+            try:
+                write_text(self.root / name, value)
+            except OSError as error:
+                self._record(f"disarm {name}: {error}")
+
+    def cleanup(self):
+        if self.root is None:
+            return
+        for event in NVMET_EVENTS:
+            enable = self.root / "events" / "nvmet" / event / "enable"
+            if enable.is_file():
+                try:
+                    write_text(enable, "0")
+                except OSError as error:
+                    self._record(f"disable {event}: {error}")
+        try:
+            write_text(self.root / "kprobe_events", "-:nvmet_tcp_qr")
+        except OSError as error:
+            self._record(f"remove kprobe: {error}")
+
+    @staticmethod
+    def _pairs(line):
+        return dict(re.findall(r"(\w+)=([^\s,]+)", line))
+
+    def _counts(self, trace):
+        completes = {}
+        enqueues = {}
+        for line in trace.splitlines():
+            if "nvmet_req_complete:" in line:
+                fields = self._pairs(line.split("nvmet_req_complete:", 1)[1])
+                key = (fields.get("ctrl_id"), fields.get("qid"), fields.get("cid"))
+                completes[key] = completes.get(key, 0) + 1
+            elif "nvmet_tcp_qr:" in line:
+                fields = self._pairs(line.split("nvmet_tcp_qr:", 1)[1])
+                request = fields.get("req")
+                if request is not None:
+                    enqueues[request] = enqueues.get(request, 0) + 1
+        return completes, enqueues
+
+    def capture_failure(self, directory):
+        """Copy the armed trace. Never raises: the proof's own verdict wins."""
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            trace = ""
+            if self.root is not None:
+                try:
+                    trace = (self.root / "trace").read_text()
+                except OSError as error:
+                    self._record(f"read trace: {error}")
+            write_text(directory / "trace.txt", trace)
+            write_text(directory / "trace-errors.txt", "\n".join(self.errors))
+            try:
+                udev = Path("/run/udev/queue")
+                write_text(directory / "udev-queue.txt",
+                           "present" if udev.is_symlink() else "absent")
+            except OSError as error:
+                write_text(directory / "udev-queue.txt", f"unavailable: {error}")
+            if self.started is not None:
+                write_text(directory / "tracing-seconds.txt",
+                           f"{time.monotonic() - self.started:.3f}")
+            if self.root is not None:
+                for source, name in (
+                    ("kprobe_events", "kprobe_events.txt"),
+                    ("events/nvmet/nvmet_req_complete/format", "complete-format.txt"),
+                ):
+                    try:
+                        text = (self.root / source).read_text()
+                    except OSError as error:
+                        text = f"unavailable: {error}"
+                    write_text(directory / name, text)
+                try:
+                    events = sorted(
+                        path.name for path in (self.root / "events").iterdir()
+                        if path.name.startswith("nvme"))
+                except OSError:
+                    events = []
+                write_text(directory / "event-list.txt", "\n".join(events))
+            completes, enqueues = self._counts(trace)
+            complete_counts = {"|".join(str(part) for part in key): count
+                               for key, count in completes.items()}
+            duplicates = {key: count for key, count in complete_counts.items() if count > 1}
+            dump(directory / "complete-counts.json", complete_counts)
+            dump(directory / "duplicates.json", duplicates)
+            dump(directory / "enqueue-counts.json", enqueues)
+        except OSError as error:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                write_text(directory / "trace-errors.txt", f"capture: {error}")
+            except OSError:
+                pass
 
 
 def dump(path, value):
@@ -159,19 +335,39 @@ def qualify(args):
     output.mkdir(mode=0o700)
     started = time.monotonic()
     seconds = 180
-    proof, evidence = _kernel_live_worker(
-        output, args.binary, "tcp", seconds, time.time() + seconds,
-        owner_wal_file_bytes=8 * 1024**2)
-    after = inventory()
-    dump(output / "after.json", after)
-    result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
-              "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
-              "elapsed_seconds": round(time.monotonic() - started, 3)}
-    dump(root / "summary.json", {"wal_replay": result})
-    print(f"wal_replay: {json.dumps(result, sort_keys=True)}", flush=True)
-    if not result["fixture_removed"] or not result["inventory_restored"]:
-        raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed")
-    return 0 if result["complete"] and signal.getsignal(signal.SIGTERM) != signal.SIG_IGN else 1
+    trace = NvmetTrace()
+    trace.arm()
+    try:
+        try:
+            proof, evidence = _kernel_live_worker(
+                output, args.binary, "tcp", seconds, time.time() + seconds,
+                owner_wal_file_bytes=8 * 1024**2)
+        except BaseException:
+            # Capture while the buffer still holds the failing tier's events,
+            # then let the proof's own exception carry the verdict.
+            trace.disarm()
+            trace.capture_failure(root / "failure-trace")
+            raise
+        trace.disarm()
+        after = inventory()
+        dump(output / "after.json", after)
+        result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
+                  "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
+                  "elapsed_seconds": round(time.monotonic() - started, 3),
+                  "nvmet_trace": "armed" if trace.root is not None else "unavailable"}
+        dump(root / "summary.json", {"wal_replay": result})
+        print(f"wal_replay: {json.dumps(result, sort_keys=True)}", flush=True)
+        failed = (not result["complete"] or not result["fixture_removed"]
+                  or not result["inventory_restored"])
+        if failed:
+            trace.capture_failure(root / "failure-trace")
+        if not result["fixture_removed"] or not result["inventory_restored"]:
+            raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed")
+        return 0 if result["complete"] and signal.getsignal(signal.SIGTERM) != signal.SIG_IGN else 1
+    finally:
+        # Never leave the nvmet tracepoints or the kprobe armed for a later
+        # proof on the same runner, including a failed run.
+        trace.cleanup()
 
 
 def cleanup(args):

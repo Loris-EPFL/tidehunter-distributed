@@ -16,7 +16,11 @@ fn a_spent_connect_budget_does_not_quarantine_the_subsystem() {
     let grants = std::mem::take(&mut lane.cache.grants);
     let pool = Arc::new(
         LiveControllerPool::new(
-            LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+            LiveConnectionRegistry::open(
+                &lane._dir.path().join("registry"),
+                crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+            )
+            .unwrap(),
             8,
             4,
         )
@@ -96,7 +100,11 @@ fn a_namespace_attach_deadline_keeps_the_grant() {
     let database = lane.client.expected.inventory.database;
     let pool = Arc::new(
         LiveControllerPool::new(
-            LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+            LiveConnectionRegistry::open(
+                &lane._dir.path().join("registry"),
+                crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+            )
+            .unwrap(),
             8,
             4,
         )

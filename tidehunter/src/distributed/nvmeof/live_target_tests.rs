@@ -959,3 +959,64 @@ fn a_witnessed_wal_file_must_keep_its_preallocated_size() {
     fs::write(&first, [0u8; 4096]).unwrap();
     super::verify_live_epoch_sizes(&epoch, 4096, None, &[0]).expect("the witnessed size is intact");
 }
+
+/// A client must never reach a subsystem that has no enabled namespace yet.
+/// The writable export therefore links the allowed host and the public port
+/// only after `enable=1`.
+#[test]
+fn public_port_is_linked_only_after_the_namespace_is_enabled() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let configfs = f.configfs.clone();
+    let port = f.config.port_id;
+    let violations = Arc::new(AtomicUsize::new(0));
+    let hook_violations = violations.clone();
+    manager.set_configfs_hook(Box::new(move |_index| {
+        let linked = configfs
+            .join("ports")
+            .join(port.to_string())
+            .join("subsystems");
+        let Ok(entries) = fs::read_dir(&linked) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry?;
+            let subsystem = configfs.join("subsystems").join(entry.file_name());
+            let enabled = fs::read_dir(subsystem.join("namespaces"))
+                .map(|namespaces| {
+                    namespaces.flatten().any(|namespace| {
+                        optional_attribute(&namespace.path().join("enable"))
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some("1")
+                    })
+                })
+                .unwrap_or(false);
+            if !enabled {
+                hook_violations.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        Ok(())
+    }));
+    let binding = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    assert_eq!(
+        violations.load(AtomicOrdering::Relaxed),
+        0,
+        "a subsystem was linked to the public port before its namespace was enabled"
+    );
+    assert!(!binding.readonly);
+    let public_link = f
+        .configfs
+        .join("ports")
+        .join(f.config.port_id.to_string())
+        .join("subsystems")
+        .join(&binding.nqn);
+    assert!(
+        public_link.exists(),
+        "a completed writable export must be reachable from the public port"
+    );
+    manager.shutdown().unwrap();
+}
