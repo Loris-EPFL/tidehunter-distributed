@@ -8,14 +8,12 @@ reference. Every file is one `kv-research` RunConfig that another store runs by
 changing only `backend`.
 
 Value cache: every cell declares its coordinator value-cache entry count in its
-`case_id`/`namespace` as the trailing `-cacheN` tag. The campaign runs the 70
-grid cells and the native baseline with the cache off (`-cache0`), and adds one
-read-only reference pair at C=16 with 1,000 entries (`-cache1000`). The engine
-document itself cannot carry the count: kv-research builds both backends with
-`KeySpaceConfig::default()`, whose `value_cache_size` is 0, and both option
-structs deny unknown fields. The tag therefore states the intended setting
-without pretending the engine applied it; `-cache1000` is a labelled reference
-that can only be executed once kv-research exposes the value-cache option.
+`case_id`/`namespace` as the trailing `-cacheN` tag and passes the same count as
+`backend.options.value_cache_size`. kv-research applies it to the keyspace
+configuration of both the distributed and the native backend; zero disables the
+cache. The campaign runs the 70 grid cells and the native baseline with the
+cache off (`-cache0`), and adds one read-only reference pair at C=16 with 1,000
+entries (`-cache1000`).
 
 Usage: `stage3_specs.py --root DIR [--validate BINARY]`.
 """
@@ -98,6 +96,7 @@ def backend(case, root):
     if case['arm'] == 'B':
         return dict(kind='native', options=dict(
             path=str(directory / 'native'),
+            value_cache_size=case['cache'],
             durability='value_wal_barrier' if case['tier'] == 'synchronous'
             else 'page_cache'))
     return dict(kind='tidehunter', options=dict(
@@ -105,6 +104,7 @@ def backend(case, root):
         path=str(directory / 'coordinator'),
         evidence=str(Path(root) / 'stage3' / 'evidence' / case['case_id']),
         owners=2, key_count=KEYS, durability_tier=case['tier'],
+        value_cache_size=case['cache'],
         local_geometry=dict(fragment_bytes=4 << 20, wal_file_bytes=64 << 20),
         index=dict(frag_size=8 << 20, wal_file_size=32 << 20)))
 

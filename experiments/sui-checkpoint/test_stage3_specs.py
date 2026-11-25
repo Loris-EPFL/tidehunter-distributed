@@ -58,6 +58,7 @@ class StageThreeSpecs(unittest.TestCase):
                 self.assertEqual(document['namespace'], document['case_id'])
                 cache = stage3_specs.declared_cache(document['case_id'])
                 self.assertIn(f'-cache{cache}', document['namespace'])
+                self.assertEqual(document['backend']['options']['value_cache_size'], cache)
                 if '-cache1000' not in document['case_id']:
                     self.assertEqual(cache, 0)
                 # The cache is declared in the label; the engine document keeps
