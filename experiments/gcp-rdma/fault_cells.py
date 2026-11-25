@@ -507,14 +507,19 @@ class CellDriver:
         return Coordinator(binary=self.cluster.binary, spec=spec,
                            directory=self.cluster.local(name), name=run_name)
 
-    def open(self, run, name, *, receipts=None):
+    def bind_context(self, *, receipts=None):
+        """Establish the namespace, owner receipts and transport of this cell."""
         namespace = self.cluster.database()
         recorded = self.cluster.receipts(namespace)
-        receipts = receipts or recorded
+        chosen = receipts or recorded
         self.namespace = namespace
-        self.context = self.cluster.context(namespace, receipts)
+        self.context = self.cluster.context(namespace, chosen)
         self.receipt_paths = [row['path'] for row in recorded]
-        return self.launch(run, name, receipts=self.receipt_paths)
+        return chosen
+
+    def open(self, run, name, *, receipts=None):
+        chosen = self.bind_context(receipts=receipts)
+        return self.launch(run, name, receipts=chosen)
 
     def wait_for(self, child, predicate, *, timeout, label, poll=0.2):
         started = time.monotonic()
@@ -673,7 +678,8 @@ class CellDriver:
         self.parts.append(dict(record, run=run, verdict=False, observations=dict(
             role='crash', cut=cut, gate=record.get('gate'), kill=record.get('kill'))))
         self.parts.append(self.after_restart('verify', self.cell['runs'][1],
-                                            dict(cut=cut)))
+                                            dict(cut=cut, gate=record.get('gate'),
+                                                 kill=record.get('kill'))))
         return self.parts
 
     def after_restart(self, name, run, observations):
@@ -682,9 +688,9 @@ class CellDriver:
         The output directory is fresh; the coordinator database path is the one
         the killed run used, so this is a reopen of the same data.
         """
-        self.open(run, name)
+        chosen = self.bind_context()
         child = self.launch(run, name, path=self.cluster.root('measure'),
-                            receipts=self.receipt_paths)
+                            receipts=chosen)
         try:
             code = child.wait(run['deadline'] + 300)
             if code is None:
@@ -719,7 +725,8 @@ class CellDriver:
             role='crash', gate=record.get('gate'), kill=record.get('kill'),
             failure=record.get('failure'), restart=restart)))
         self.parts.append(self.after_restart('verify', self.cell['runs'][1],
-                                            dict(restart=restart)))
+                                            dict(restart=restart, gate=record.get('gate'),
+                                                 kill=record.get('kill'))))
         return self.parts
 
     def retire(self):
@@ -747,7 +754,9 @@ class CellDriver:
             role='crash', cut=cut, gate=record.get('gate'), kill=record.get('kill'),
             failure=record.get('failure'), restart=restart)))
         self.parts.append(self.after_restart('verify', self.cell['runs'][1],
-                                            dict(restart=restart, cut=cut)))
+                                            dict(restart=restart, cut=cut,
+                                                 gate=record.get('gate'),
+                                                 kill=record.get('kill'))))
         return self.parts
 
     # ---- fencing -------------------------------------------------------

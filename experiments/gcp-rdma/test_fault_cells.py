@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -371,3 +372,76 @@ class EvidenceLayout(unittest.TestCase):
         with patch.object(sys, 'argv', argv), self.assertRaises(SystemExit) as raised:
             fault_cells.main()
         self.assertIn('--allow-local-ledger', str(raised.exception))
+
+
+class ReopenPath(unittest.TestCase):
+    """The reopen of a killed coordinator: one launch, on the killed root."""
+
+    def driver(self, root, cell='S1-2S-publication-native'):
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.output = Path(root)
+        cluster.binary = Path('/bin/true')
+        cluster.owners = ['H1', 'H2']
+        cluster.remote = None
+        cluster.receipts = lambda namespace: []
+        cluster.database = lambda: 'live/checkpoints'
+        cluster.context = lambda namespace, receipts: dict(
+            transport={'kind': 'tcp'}, remote={'read_cache_bytes': 0},
+            receipts=list(receipts))
+        cluster.local = lambda name: cluster.output / name
+        cluster.root = lambda name: cluster.local(name) / 'coordinator'
+        cluster.evidence = lambda name: cluster.local(name) / 'evidence'
+        return fault_cells.CellDriver(cluster, fault_cells.mechanism.find(cell))
+
+    def test_the_verify_run_reopens_the_killed_root_exactly_once(self):
+        class Child:
+            def __init__(self, *, binary, spec, directory, name='run'):
+                self.output = Path(directory) / name
+                self.output.mkdir(parents=True, exist_ok=False)
+                (self.output / 'manifest.json').write_text('{}')
+                self.log = Path(directory) / f'{name}.log'
+                self.process = type('P', (), dict(pid=4242, returncode=0))()
+                self.started_unix_ns = 1
+
+            def wait(self, timeout):
+                return 0
+
+            def stop(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = self.driver(tmp)
+            with patch.object(fault_cells, 'Coordinator', Child):
+                part = driver.after_restart('verify', driver.cell['runs'][1], {})
+            spec = json.loads((Path(tmp) / 'verify' / 'spec.json').read_text())
+            self.assertEqual(spec['backend']['options']['path'],
+                             str(Path(tmp) / 'measure' / 'coordinator'))
+            self.assertEqual(part['output'], str(Path(tmp) / 'verify' / 'run'))
+
+    def test_the_verify_verdict_sees_the_kill_of_the_measured_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = self.driver(tmp)
+            gate = dict(reached=True, label='200 acknowledged writes')
+            kill = dict(exit_code=-9)
+            captured = {}
+
+            def after(name, run, observations):
+                captured.update(observations)
+                return dict(name=name, role=run['role'], verdict=True,
+                            output=str(Path(tmp) / name), log='', pid=1,
+                            started_unix_ns=1, finished_unix_ns=2, exit_code=0,
+                            observations=observations)
+
+            child = types.SimpleNamespace(
+                process=types.SimpleNamespace(pid=1, returncode=-9),
+                output=Path(tmp) / 'measure' / 'run',
+                log=Path(tmp) / 'measure.log', started_unix_ns=1,
+                rows=lambda: [], alive=lambda: True,
+                kill=lambda: -9, stop=lambda: None)
+            with patch.object(driver, 'open', return_value=child), \
+                    patch.object(driver, 'gate_writes', return_value=gate), \
+                    patch.object(driver, 'kill_coordinator', return_value=kill), \
+                    patch.object(driver, 'after_restart', side_effect=after):
+                driver.crash()
+            self.assertEqual(captured['gate'], gate)
+            self.assertEqual(captured['kill'], kill)

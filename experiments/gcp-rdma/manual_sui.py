@@ -319,6 +319,12 @@ class SuiLauncher:
             if not path.is_file():
                 raise ValueError(f'missing replay artifact: {path}')
             rows.append(upload_module.artifact(path, self.evidence_name(path)))
+        # Per-sample files also travel on their own so the bucket rule on raw/
+        # can expire them; the evidence bundle keeps the complete copy.
+        experiment = self.output / 'experiment'
+        for pattern in ('*.prom', '*-samples.jsonl', 'samples.csv', 'resources.csv'):
+            for path in sorted(experiment.glob(pattern)):
+                rows.append(upload_module.artifact(path, self.evidence_name(path)))
         return rows
 
     def persist(self, entry, artifacts):
