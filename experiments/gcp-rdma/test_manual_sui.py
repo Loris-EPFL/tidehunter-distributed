@@ -13,7 +13,6 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
-from unittest import mock
 
 import manual_sui
 

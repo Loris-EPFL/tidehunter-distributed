@@ -33,7 +33,6 @@ import deployment
 SAMPLE_SECONDS = 2.0
 MAX_SAMPLES = 20000
 OWNER_READY_SECONDS = 120
-RESOURCE_MARKER_SECONDS = 600
 IO_COUNTERS = ('rchar', 'wchar', 'syscr', 'syscw', 'read_bytes', 'write_bytes',
                'cancelled_write_bytes')
 BINARY_SET = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit',
@@ -411,7 +410,7 @@ class SuiLauncher:
         marker = self.stage_dir / 'resources-required.json'
         resources_written = False
         try:
-            deadline = time.monotonic() + RESOURCE_MARKER_SECONDS
+            deadline = time.monotonic() + 3 * self.deadline + 1800
             while child.poll() is None:
                 if marker.exists():
                     required = json.loads(marker.read_text())

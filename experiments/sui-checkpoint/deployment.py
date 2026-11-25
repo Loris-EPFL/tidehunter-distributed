@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resident_config import (resident_read_config, validate_destination_total,
                              software_fabric_environment)
 from portable_transport import (validate_transport, select_transports,
-                                is_trusted, is_software, is_fabric, transport_for_case)
+                                is_trusted, is_software, is_fabric)
 
 MIB = 1024 * 1024
 HARDWARE_TRANSPORTS = ('efa', 'efa-direct', 'efa-native')
