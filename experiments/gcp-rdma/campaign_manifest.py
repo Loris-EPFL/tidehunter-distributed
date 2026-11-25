@@ -54,13 +54,29 @@ def ledger_key(prefix):
     return f'{prefix}/campaign-ledger.json'
 
 
+# Per-sample files expire with the 90-day rule on `<prefix>/<stage>/raw/`; the
+# compact summaries stay under `evidence/`. The group is derived from the file
+# name so one helper decides the layout for every driver.
+RAW_NAMES = ('samples.csv', 'resources.csv', 'disk.csv')
+RAW_SUFFIXES = ('.prom', '.jsonl')
+
+
+def evidence_group(name):
+    """`raw` for a per-sample file, `evidence` for a compact summary."""
+    base = name.rsplit('/', 1)[-1]
+    if base in RAW_NAMES or base.endswith(RAW_SUFFIXES):
+        return 'raw'
+    return 'evidence'
+
+
 def evidence_key(prefix, stage, cell_id, name, attempt=1):
     """One object key; every retry writes its own attempt, never an old case."""
     if not name or name.startswith('/') or '..' in name.split('/'):
         raise ValueError(f'invalid evidence name: {name!r}')
     if type(attempt) is not int or attempt < 1:
         raise ValueError(f'invalid attempt: {attempt!r}')
-    return f'{prefix}/{stage}/{cell_id}/attempt-{attempt}/{name}'
+    return (f'{prefix}/{stage}/{evidence_group(name)}/'
+            f'{cell_id}/attempt-{attempt}/{name}')
 
 
 OWNER = dict(
@@ -286,7 +302,8 @@ def manifest(campaign_id=CAMPAIGN_ID, revisions=None):
         evidence=EVIDENCE,
         storage=dict(bucket=BUCKET, prefix=prefix, uri=bucket_prefix(),
                      ledger_key=ledger_key(prefix),
-                     evidence_layout=f'{prefix}/<stage>/<cell>/attempt-<n>/<name>',
+                     evidence_layout=(f'{prefix}/<stage>/{{evidence|raw}}/<cell>/'
+                                      'attempt-<n>/<name>'),
                      retry_rule='a retry writes attempt-<n+1>; it never overwrites a failed case',
                      account=ACCOUNT,
                      uploader='ObjectStoreLedger: generation precondition and SHA-256 receipt',

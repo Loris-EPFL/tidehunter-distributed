@@ -81,9 +81,21 @@ class BucketPrefix(unittest.TestCase):
                          'gs://mysten-research-bench-artifacts/campaign-hybrid-sui-2026-11-25')
         self.assertEqual(manifest.ledger_key('p'), 'p/campaign-ledger.json')
         self.assertEqual(manifest.evidence_key('p', 'stage1', 'S1-1', 'evidence.tar.gz'),
-                         'p/stage1/S1-1/attempt-1/evidence.tar.gz')
+                         'p/stage1/evidence/S1-1/attempt-1/evidence.tar.gz')
         self.assertEqual(manifest.evidence_key('p', 'stage1', 'S1-1', 'results.json', 2),
-                         'p/stage1/S1-1/attempt-2/results.json')
+                         'p/stage1/evidence/S1-1/attempt-2/results.json')
+        # Per-sample files expire with the bucket rule on raw/.
+        for name in ('samples.csv', 'resources.csv', 'disk.csv',
+                     'native-foreground.prom', 'native-samples.jsonl',
+                     'measure/run/samples.csv'):
+            with self.subTest(name=name):
+                self.assertIn('/raw/', manifest.evidence_key(
+                    'p', 'stage2', 'M1', name))
+        for name in ('summary.json', 'run.json', 'receipt.json',
+                     'measure/run/manifest.json'):
+            with self.subTest(name=name):
+                self.assertIn('/evidence/', manifest.evidence_key(
+                    'p', 'stage2', 'M1', name))
 
     def test_another_bucket_or_an_empty_path_is_refused(self):
         for value in ('mysten-research-bench-artifacts/campaign',
