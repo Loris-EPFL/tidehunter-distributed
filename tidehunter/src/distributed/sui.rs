@@ -1200,6 +1200,28 @@ impl Db {
                 "snapshot_latch_deferrals",
                 remote.db.snapshot_latch_deferrals(),
             );
+            // Pressure of the retained-generation table (owner streams against
+            // the control-region bound): 1 from 75 % of the bound, where the
+            // open already asked relocation to retire old generations.
+            let pressure = remote.db.stream_pressure();
+            set("retained_streams", pressure.streams as u64);
+            set("retained_stream_pressure", u64::from(pressure.is_soft()));
+            set(
+                "relocation_copy_deferrals",
+                remote.db.relocation_copy_deferrals(),
+            );
+            remote.db.visit_retirement_gauges(&mut set);
+            set(
+                "retirement_busy_replies",
+                remote.db.retirement_busy_replies(),
+            );
+            set("older_rows_without_end", remote.db.older_rows_without_end());
+            // The value reader's cache and integrity counters: a CRC or key-binding
+            // failure of a fetched member is a decode failure, counted here.
+            let reader = remote.db.value_reader();
+            set("value_cache_hits", reader.cache_hits());
+            set("value_cache_misses", reader.cache_misses());
+            set("value_decode_failures", reader.decode_failure_count());
             remote.db.try_visit_write_metrics(|snapshot| {
                 coordinator_evidence::visit_coordinator_io(&mut set);
                 let authority = snapshot.authority;

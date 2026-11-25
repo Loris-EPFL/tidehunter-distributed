@@ -2787,6 +2787,8 @@ mod relocation_tests;
 
 #[cfg(test)]
 mod pipeline_tests;
+#[cfg(test)]
+mod sui_timing_metrics_tests;
 
 #[cfg(test)]
 mod drop_cells_tests;
