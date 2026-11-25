@@ -23,9 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "model_check_concurrent.rs"]
 mod concurrent_model;
-#[path = "drop_cells_crash.rs"]
+#[path = "drop_cells_crash_tests.rs"]
 mod drop_cells_crash;
-#[path = "model_check_leased.rs"]
+#[path = "model_check_leased_tests.rs"]
 mod leased;
 const KEYS: usize = 64;
 const WAVES: usize = 4;
