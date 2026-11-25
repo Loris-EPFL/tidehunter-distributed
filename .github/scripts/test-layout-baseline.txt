@@ -5,10 +5,7 @@
 # or shrunk), if an unlisted file has inline tests, or if an entry is stale.
 # Change a line only in the change that moves the tests.
 
-benchmarks/kv-research/src/backend.rs 1 2
 benchmarks/kv-research/src/backends/cassandra/replay.rs 0 1
-benchmarks/kv-research/src/backends/native/group_barrier.rs 1 7
-benchmarks/kv-research/src/backends/replay.rs 1 2
 benchmarks/kv-research/src/backends/tidehunter.rs 1 18
 benchmarks/kv-research/src/backends/tidehunter/live_write_profile.rs 1 8
 benchmarks/kv-research/src/backends/tikv/replay.rs 1 3
