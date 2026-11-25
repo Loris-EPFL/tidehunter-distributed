@@ -5,8 +5,6 @@
 # or shrunk), if an unlisted file has inline tests, or if an entry is stale.
 # Change a line only in the change that moves the tests.
 
-tidehunter/benches/admission_options/core.rs 0 4
-tidehunter/examples/support/tcp_cluster.rs 2 3
 tidehunter/src/distributed/group_model.rs 0 2
 tidehunter/src/distributed/model.rs 0 5
 tidehunter/src/distributed/native_publication.rs 1 4
