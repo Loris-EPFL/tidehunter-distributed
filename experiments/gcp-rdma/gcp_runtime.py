@@ -268,10 +268,12 @@ def validate_runtime(config):
     if config.get('package_root') != '/mnt/tidehunter/' + config['run_id'] + '/package':
         raise RuntimeSafetyError('invalid installed package root')
     roots = config.get('guest_roots', [])
+    package_root = config['package_root']
     if (not isinstance(roots, list) or len(roots) > 8 or len(set(roots)) != len(roots)
             or any(not isinstance(value, str)
                    or not value.startswith(('/mnt/tidehunter/', '/mnt/tidehunter-kv-comparison/'))
                    or '..' in PurePosixPath(value).parts or value.endswith('/')
+                   or value == package_root or value.startswith(package_root + '/')
                    for value in roots)):
         raise RuntimeSafetyError(
             'guest roots must be distinct directories under /mnt/tidehunter or /mnt/tidehunter-kv-comparison')

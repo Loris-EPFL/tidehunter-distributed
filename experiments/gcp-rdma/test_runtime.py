@@ -891,7 +891,9 @@ class SuiRuntimeTests(unittest.TestCase):
         spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2, 'backends': ['native']}
         for roots in (['/etc'], ['/mnt/tidehunter'], ['/mnt/tidehunter/../etc'],
                       ['/mnt/tidehunter/a/'], ['/mnt/tidehunter/a', '/mnt/tidehunter/a'],
-                      ['/mnt/tidehunter/' + str(index) for index in range(9)]):
+                      ['/mnt/tidehunter/' + str(index) for index in range(9)],
+                      ['/mnt/tidehunter/bench-' + '1' * 16 + '/package'],
+                      ['/mnt/tidehunter/bench-' + '1' * 16 + '/package/source']):
             with self.subTest(roots=roots):
                 with self.assertRaises(runtime.RuntimeSafetyError):
                     self.build(spec, guest_roots=roots)

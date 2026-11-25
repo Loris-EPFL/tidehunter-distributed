@@ -276,8 +276,17 @@ class MailboxExec(host_exec.HostExecution):
                    timeout_seconds=timeout_seconds)
 
 
-def publish(store, config, state, receipt, fleet, spec, *, guest_roots=None):
-    """Stage the sealed package and the runtime the guests' bootstrap waits for."""
+def publish(store, config, state, package_dir, revision, spec, fleet, *, guest_roots=None):
+    """Stage the sealed package and the runtime the guests' bootstrap waits for.
+
+    The Sui campaign's package is the focused package plus the Sui archives, so
+    it is admitted under the focused profile while the runtime carries the Sui
+    specification. Both objects land where `gcp_bootstrap.startup_script` waits
+    for them.
+    """
+    admission = dict(spec, mode='focused') if spec.get('suite') == 'sui' else spec
+    receipt, _source = manual_campaign._admit_package(Path(package_dir).resolve(strict=True),
+                                                      revision, admission)
     package, _preparation = manual_campaign._stage(store, config['bucket'], state, receipt)
     runtime = gcp_runtime.build_runtime_config(
         dict(config, run_id=state['run_id']), fleet, package, spec, state['deadline'],
@@ -320,6 +329,8 @@ def open_executor(args):
     because the two SSH flags have different names in the existing drivers.
     """
     if args.gcloud_ssh:
+        if not args.zone:
+            raise SystemExit('--gcloud-ssh needs --zone')
         return host_exec.GcloudSsh(args.zone, iap=getattr(args, 'tunnel_through_iap', False)
                                    or getattr(args, 'iap', False))
     if args.fleet_state is None:

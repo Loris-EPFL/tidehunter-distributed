@@ -293,6 +293,10 @@ class SwapTests(unittest.TestCase):
                          ['gcloud', 'compute', 'ssh', 'run-1', '--zone', 'us-central1-a',
                           '--quiet', '--command=true', '--tunnel-through-iap'])
 
+    def test_ssh_without_a_zone_is_refused(self):
+        with self.assertRaises(SystemExit):
+            mailbox_exec.open_executor(self.args(gcloud_ssh=True, zone=None))
+
     def test_a_campaign_without_a_fleet_state_is_refused(self):
         with self.assertRaises(SystemExit):
             mailbox_exec.open_executor(self.args())
@@ -312,6 +316,69 @@ class SwapTests(unittest.TestCase):
                     self.args(fleet_state=path, fleet_config=config))
         self.assertIsInstance(remote, mailbox_exec.MailboxExec)
         self.assertEqual(remote.index_of(FLEET[2]['name']), 2)
+
+
+class PublishTests(unittest.TestCase):
+    """The package and runtime objects the guest bootstrap waits for."""
+
+    def config(self):
+        return {'project_id': 'mysten-research', 'project_number': '514867804006',
+                'bucket': 'bucket', 'machine_type': 'z4m-highmem-16'}
+
+    def state(self):
+        return {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline()}
+
+    def receipt(self):
+        return {'source_sha256': SOURCE, 'source_revision': 'd' * 40,
+                'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+                'archive_path': '/package/bundle.tar.gz'}
+
+    def test_a_sui_package_is_admitted_as_the_focused_package(self):
+        seen = {}
+
+        def admit(path, revision, spec):
+            seen['path'], seen['revision'], seen['spec'] = path, revision, spec
+            return self.receipt(), '/source'
+
+        def stage(store, bucket, state, receipt):
+            seen['bucket'], seen['staged'] = bucket, receipt
+            package = dict(receipt, object_key=f'runs/{state["run_id"]}/package.tar',
+                           generation='5')
+            return package, None
+        store = Store()
+        spec = mailbox_exec.sui_spec(2, ['native'])
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(mailbox_exec.manual_campaign, '_admit_package', side_effect=admit), \
+                    mock.patch.object(mailbox_exec.manual_campaign, '_stage', side_effect=stage):
+                runtime, reference = mailbox_exec.publish(
+                    store, self.config(), self.state(), directory, 'd' * 40, spec, FLEET,
+                    guest_roots=['/mnt/tidehunter/sui'])
+        self.assertEqual(seen['spec'], dict(spec, mode='focused'))
+        self.assertEqual(seen['revision'], 'd' * 40)
+        self.assertEqual(seen['bucket'], 'bucket')
+        self.assertEqual(runtime['spec'], spec)
+        self.assertEqual(runtime['guest_roots'], ['/mnt/tidehunter/sui'])
+        self.assertEqual(runtime['package']['generation'], '5')
+        self.assertEqual(reference['object'], f'runs/{RUN}/runtime.json')
+        self.assertEqual(json.loads(store.get(f'runs/{RUN}/runtime.json')), runtime)
+
+    def test_a_retried_publish_keeps_one_runtime_object(self):
+        store, state = Store(), self.state()
+        spec = mailbox_exec.sui_spec(2, ['native'])
+        package = dict(self.receipt(), object_key=f'runs/{RUN}/package.tar', generation='5')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(mailbox_exec.manual_campaign, '_admit_package',
+                                  return_value=(self.receipt(), '/source')), \
+                mock.patch.object(mailbox_exec.manual_campaign, '_stage',
+                                  return_value=(package, None)):
+            first, _ = mailbox_exec.publish(store, self.config(), state, directory,
+                                            'd' * 40, spec, FLEET)
+            second, reference = mailbox_exec.publish(store, self.config(), state,
+                                                     directory, 'd' * 40, spec, FLEET)
+        self.assertEqual(first, second)
+        self.assertEqual(reference['generation'], '1')
+        self.assertEqual([key for key in store.objects if key.endswith('runtime.json')],
+                         [f'runs/{RUN}/runtime.json'])
 
 
 class FleetStateTests(unittest.TestCase):
