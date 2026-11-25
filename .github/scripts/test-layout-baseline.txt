@@ -7,10 +7,6 @@
 
 tidehunter/src/distributed/group_model.rs 0 2
 tidehunter/src/distributed/model.rs 0 5
-tidehunter/src/distributed/native_publication.rs 1 4
-tidehunter/src/distributed/nvmeof/live_metrics.rs 1 1
-tidehunter/src/distributed/nvmeof/live_storage.rs 1 1
-tidehunter/src/distributed/owner_events.rs 1 5
 tidehunter/src/distributed/remote_db/drop_cells_crash.rs 0 3
 tidehunter/src/distributed/remote_db/model_check_concurrent.rs 0 6
 tidehunter/src/distributed/remote_db/model_check_leased.rs 0 2
