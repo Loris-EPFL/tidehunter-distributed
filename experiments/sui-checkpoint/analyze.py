@@ -241,20 +241,22 @@ def coordinator_stats(values):
     """
     operations = {}
     for row in _microsecond_histograms(values, 'db_op'):
-        op, ks = row['labels'].get('op'), row['labels'].get('ks')
+        db, op, ks = (row['labels'].get(name) for name in ('db', 'op', 'ks'))
         if op is None or ks is None:
             raise ValueError('db_op histogram lacks op/ks identity')
-        if op in operations.setdefault(ks, {}):
+        database = operations.setdefault(db or '', {})
+        if op in database.setdefault(ks, {}):
             raise ValueError('duplicate db_op histogram')
-        operations[ks][op] = row
+        database[ks][op] = row
     lookups = {}
     for row in _microsecond_histograms(values, 'lookup_mcs'):
-        kind, ks = row['labels'].get('type'), row['labels'].get('ks')
+        db, kind, ks = (row['labels'].get(name) for name in ('db', 'type', 'ks'))
         if kind is None or ks is None:
             raise ValueError('lookup histogram lacks type/ks identity')
-        if kind in lookups.setdefault(ks, {}):
+        database = lookups.setdefault(db or '', {})
+        if kind in database.setdefault(ks, {}):
             raise ValueError('duplicate lookup histogram')
-        lookups[ks][kind] = row
+        database[ks][kind] = row
     contention = _keyed(_microsecond_histograms(values, 'large_table_contention'), 'ks')
     cache_contention = _microsecond_histograms(values, 'index_blob_cache_contention')
     if len(cache_contention) > 1 or (cache_contention and cache_contention[0]['labels']):
@@ -280,7 +282,10 @@ def coordinator_stats(values):
             db = _labels(metric).get('db')
             if db:
                 databases.add(db)
-    keyspaces = sorted(set(operations) | set(lookups) | set(contention) | set(writes))
+    keyspaces = sorted(
+        {ks for database in operations.values() for ks in database}
+        | {ks for database in lookups.values() for ks in database}
+        | set(contention) | set(writes))
     available = bool(operations or lookups or contention or cache)
     return dict(available=available, operations=operations, lookups=lookups,
         large_table_contention=contention, index_blob_cache=cache,
@@ -300,8 +305,10 @@ def owner_fetch_fraction(live, coordinator):
     when either population is absent or empty.
     """
     reads = live.get('completed_read_ops')
-    gets = sum(row['get']['count'] for row in coordinator['operations'].values()
-               if 'get' in row and row['get']['count'] is not None)
+    gets = sum(keyspace['get']['count']
+               for database in coordinator['operations'].values()
+               for keyspace in database.values()
+               if 'get' in keyspace and keyspace['get']['count'] is not None)
     if reads is None or gets is None:
         return dict(available=False, reason='owner read or coordinator get population missing',
                     owner_read_ops=reads, api_gets=gets, fraction=None)
