@@ -4,6 +4,7 @@
 use super::*;
 use crate::distributed::tcp::host_identity::effective_host_nqn;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tempdir::TempDir;
 
@@ -720,6 +721,292 @@ fn write_protect_is_not_blocked_by_another_host_controller_on_the_subsystem() {
         "one commissioning controller serves the subsystem"
     );
     manager.shutdown().unwrap();
+}
+
+/// One step the fake commissioning controller observed, in order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AdminStep {
+    Connect { nqn: String, host: String },
+    IdentifyDescriptors { nsid: u32 },
+    SetFeatures { nsid: u32, fid: u32, value: u32 },
+    IdentifyNamespace { nsid: u32 },
+    Disconnect,
+}
+
+/// Commissioning controller double: it answers one subsystem's admin queue the
+/// way the kernel target does and records each command, so the write-protect
+/// sequence runs without root or a real controller. It applies the policy only
+/// for Set Features FID 0x84 with value 1, and its Identify Namespace reports
+/// the resulting bit.
+struct FakeCommissioning {
+    steps: Arc<Mutex<Vec<AdminStep>>>,
+    /// The namespace the admin queue answers for.
+    namespace: [u8; 16],
+    /// The UUID the target reports; `None` reports the requested one, so a
+    /// mismatch models an nsid that belongs to another namespace.
+    reported_uuid: Option<[u8; 16]>,
+    /// Whether the device applies Set Features 0x84. `false` models a device
+    /// that accepted the command and did not apply the policy.
+    applies: bool,
+    policy: bool,
+}
+
+impl FakeCommissioning {
+    fn new(steps: Arc<Mutex<Vec<AdminStep>>>) -> Self {
+        Self {
+            steps,
+            namespace: [0; 16],
+            reported_uuid: None,
+            applies: true,
+            policy: false,
+        }
+    }
+}
+
+impl super::CommissioningDouble for FakeCommissioning {
+    fn connect(
+        &mut self,
+        target: &super::super::live_connect::LiveConnectTarget,
+        host_nqn: &str,
+        _deadline: std::time::Instant,
+    ) -> io::Result<()> {
+        self.steps.lock().unwrap().push(AdminStep::Connect {
+            nqn: target.nqn.clone(),
+            host: host_nqn.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn set_read_only_member(
+        &mut self,
+        nsid: u32,
+        uuid: [u8; 16],
+        deadline: std::time::Instant,
+    ) -> io::Result<()> {
+        self.namespace = uuid;
+        super::super::live_connect::write_protect_namespace(
+            &mut FakeAdminQueue { fake: self },
+            nsid,
+            uuid,
+            deadline,
+        )
+    }
+
+    fn disconnect(&mut self, _deadline: std::time::Instant) -> io::Result<()> {
+        self.steps.lock().unwrap().push(AdminStep::Disconnect);
+        Ok(())
+    }
+}
+
+/// The fake's admin queue: one command is one recorded step.
+struct FakeAdminQueue<'a> {
+    fake: &'a mut FakeCommissioning,
+}
+
+impl super::super::live_connect::WriteProtectAdmin for FakeAdminQueue<'_> {
+    fn identify(
+        &mut self,
+        nsid: u32,
+        cns: u32,
+        _deadline: std::time::Instant,
+    ) -> io::Result<[u8; 4096]> {
+        let mut buffer = [0u8; 4096];
+        let mut steps = self.fake.steps.lock().unwrap();
+        if cns == 0x03 {
+            steps.push(AdminStep::IdentifyDescriptors { nsid });
+            buffer[0] = 0x03;
+            buffer[1] = 16;
+            let uuid = self.fake.reported_uuid.unwrap_or(self.fake.namespace);
+            buffer[4..20].copy_from_slice(&uuid);
+        } else {
+            steps.push(AdminStep::IdentifyNamespace { nsid });
+            if self.fake.policy {
+                buffer[99] |= 1;
+            }
+        }
+        Ok(buffer)
+    }
+
+    fn set_features(
+        &mut self,
+        nsid: u32,
+        fid: u32,
+        value: u32,
+        _deadline: std::time::Instant,
+    ) -> io::Result<()> {
+        self.fake
+            .steps
+            .lock()
+            .unwrap()
+            .push(AdminStep::SetFeatures { nsid, fid, value });
+        if self.fake.applies && fid == 0x84 && value == 1 {
+            self.fake.policy = true;
+        }
+        Ok(())
+    }
+}
+
+/// A fixture with a commissioning double takes the kernel write-protect path:
+/// one controller per subsystem, and per namespace the identity proof, Set
+/// Features FID 0x84, and the identify read-back that proves the policy.
+#[test]
+fn write_protect_runs_the_admin_sequence_for_every_namespace_of_a_subsystem() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let first = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let second = manager
+        .export_permanent(&f.name(1), f.extra_wal("wal-1"), false)
+        .unwrap();
+    assert_eq!(
+        first.nqn, second.nqn,
+        "the two exports must share one permanent export subsystem"
+    );
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    manager.set_commissioning_double(Box::new(FakeCommissioning::new(steps.clone())));
+    manager
+        .write_protect(&[first.clone(), second.clone()])
+        .unwrap();
+    assert_eq!(
+        *steps.lock().unwrap(),
+        vec![
+            AdminStep::Connect {
+                nqn: first.nqn.clone(),
+                host: format!("{}commission", f.scope()),
+            },
+            AdminStep::IdentifyDescriptors { nsid: first.nsid },
+            AdminStep::SetFeatures {
+                nsid: first.nsid,
+                fid: 0x84,
+                value: 1,
+            },
+            AdminStep::IdentifyNamespace { nsid: first.nsid },
+            AdminStep::IdentifyDescriptors { nsid: second.nsid },
+            AdminStep::SetFeatures {
+                nsid: second.nsid,
+                fid: 0x84,
+                value: 1,
+            },
+            AdminStep::IdentifyNamespace { nsid: second.nsid },
+            AdminStep::Disconnect,
+        ],
+        "one commissioning controller, identity then Set Features 0x84 then the read-back, per namespace"
+    );
+    let subsystem = f.configfs.join("subsystems").join(&first.nqn);
+    for nsid in [first.nsid, second.nsid] {
+        assert_eq!(
+            optional_attribute(&subsystem.join(format!("namespaces/{nsid}/write_protect")))
+                .unwrap(),
+            None,
+            "namespace {nsid} must take the kernel path, not the fixture attribute"
+        );
+    }
+    assert_eq!(
+        manager.stats.write_protect_successes, 1,
+        "the kernel path records its own success"
+    );
+    assert_eq!(
+        manager.sealed_file(&f.file.path).unwrap(),
+        Some(f.file.clone()),
+        "write protection must leave a durable sealed marker"
+    );
+    let error = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("fenced WAL cannot be exported writable again"),
+        "{error}"
+    );
+    manager.shutdown().unwrap();
+}
+
+/// A device that accepts Set Features 0x84 without applying it fails the fence:
+/// the identify read-back (byte 99 bit 0) is what proves the policy.
+#[test]
+fn write_protect_fails_when_the_device_did_not_apply_the_policy() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let binding = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let mut fake = FakeCommissioning::new(steps.clone());
+    fake.applies = false;
+    manager.set_commissioning_double(Box::new(fake));
+    let error = manager
+        .write_protect(std::slice::from_ref(&binding))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "namespace write protection not applied",
+        "an unapplied policy must fail the fence"
+    );
+    assert_eq!(
+        *steps.lock().unwrap(),
+        vec![
+            AdminStep::Connect {
+                nqn: binding.nqn.clone(),
+                host: format!("{}commission", f.scope()),
+            },
+            AdminStep::IdentifyDescriptors { nsid: binding.nsid },
+            AdminStep::SetFeatures {
+                nsid: binding.nsid,
+                fid: 0x84,
+                value: 1,
+            },
+            AdminStep::IdentifyNamespace { nsid: binding.nsid },
+            AdminStep::Disconnect,
+        ],
+        "the failed fence still proves identity, sets the feature once, and reads back"
+    );
+    assert!(manager.poisoned, "a failed fence quarantines the manager");
+    assert_eq!(
+        manager.sealed_file(&f.file.path).unwrap(),
+        None,
+        "a namespace that was not fenced keeps no sealed marker"
+    );
+    assert!(
+        manager.exports.iter().all(|export| !export.readonly),
+        "a failed fence must not mark the export read-only"
+    );
+}
+
+/// The identity proof comes before Set Features: a namespace whose UUID
+/// descriptor names another namespace is refused without a write.
+#[test]
+fn write_protect_refuses_a_namespace_whose_identify_uuids_differ() {
+    let f = Fixture::new();
+    let mut manager = f.open().unwrap();
+    let binding = manager
+        .export_permanent(&f.name(0), f.file.clone(), false)
+        .unwrap();
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let mut fake = FakeCommissioning::new(steps.clone());
+    fake.reported_uuid = Some([0x5a; 16]);
+    manager.set_commissioning_double(Box::new(fake));
+    let error = manager
+        .write_protect(std::slice::from_ref(&binding))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "namespace identify UUID mismatch",
+        "a foreign nsid must be refused"
+    );
+    assert_eq!(
+        *steps.lock().unwrap(),
+        vec![
+            AdminStep::Connect {
+                nqn: binding.nqn.clone(),
+                host: format!("{}commission", f.scope()),
+            },
+            AdminStep::IdentifyDescriptors { nsid: binding.nsid },
+            AdminStep::Disconnect,
+        ],
+        "Set Features must not be issued before the namespace identity is proven"
+    );
 }
 
 #[test]

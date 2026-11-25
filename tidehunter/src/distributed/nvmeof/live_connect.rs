@@ -650,11 +650,11 @@ impl LiveController {
         }
         self.set_read_only_admin(nsid, uuid, deadline)
     }
-    /// Runs Identify Namespace Identification Descriptor List, Set Features
-    /// (FID 0x84) and Identify Namespace on the owned controller's admin
-    /// queue. The UUID descriptor proves the nsid belongs to the expected
-    /// namespace of this subsystem, and the identify write-protect bit proves
-    /// the policy is applied.
+    /// Runs the write-protection sequence on the owned controller's admin
+    /// queue: the namespace identity proof, Set Features (FID 0x84), and the
+    /// identify read-back. The UUID descriptor proves the nsid belongs to the
+    /// expected namespace of this subsystem, and the identify write-protect
+    /// bit proves the policy is applied.
     fn set_read_only_admin(
         &mut self,
         nsid: u32,
@@ -662,35 +662,15 @@ impl LiveController {
         deadline: Instant,
     ) -> io::Result<()> {
         let (file, controller_path) = self.open_admin_device(deadline)?;
-        let descriptors = identify_namespace(&file, &controller_path, nsid, 0x03, deadline)?;
-        if namespace_uuid(&descriptors) != Some(uuid) {
-            return Err(invalid("namespace identify UUID mismatch"));
-        }
-        let ms = remaining(deadline)?.as_millis().clamp(1, u32::MAX as u128) as u32;
-        let mut cmd = NvmeAdminCommand {
-            opcode: 0x09,
+        write_protect_namespace(
+            &mut KernelWriteProtectAdmin {
+                file: &file,
+                controller_path: &controller_path,
+            },
             nsid,
-            cdw10: 0x84,
-            cdw11: 1,
-            timeout_ms: ms,
-            ..Default::default()
-        };
-        // SAFETY: the command matches nvme_passthru_cmd and remains valid for the synchronous ioctl.
-        let status = unsafe { libc::ioctl(file.as_raw_fd(), 0xc0484e41, &mut cmd) };
-        if status < 0 {
-            return Err(with_context(
-                "namespace write-protection admin command",
-                &controller_path,
-                io::Error::last_os_error(),
-            ));
-        }
-        if status != 0 {
-            return Err(invalid("namespace write protection failed"));
-        }
-        let after = identify_namespace(&file, &controller_path, nsid, 0, deadline)?;
-        if after[99] & 1 == 0 {
-            return Err(invalid("namespace write protection not applied"));
-        }
+            uuid,
+            deadline,
+        )?;
         self.verify()
     }
     /// Opens the controller's admin character device and verifies that it is
@@ -841,6 +821,86 @@ fn identify_namespace(
         return Err(invalid("namespace identify failed"));
     }
     Ok(identify)
+}
+
+/// The admin queue commands namespace write protection issues. A test double
+/// implements it, so the sequence below runs without a kernel controller.
+pub(super) trait WriteProtectAdmin {
+    /// Identify Namespace Identification Descriptor List (`cns` 0x03) or
+    /// Identify Namespace (`cns` 0).
+    fn identify(&mut self, nsid: u32, cns: u32, deadline: Instant) -> io::Result<[u8; 4096]>;
+    /// Set Features for the namespace: `fid` in CDW10, `value` in CDW11.
+    fn set_features(
+        &mut self,
+        nsid: u32,
+        fid: u32,
+        value: u32,
+        deadline: Instant,
+    ) -> io::Result<()>;
+}
+
+/// Prove the namespace identity, apply write protection, then prove the device
+/// applied it (identify byte 99 bit 0). One body serves the kernel admin queue
+/// and its test double, so a wrong order or a missing read-back fails both.
+pub(super) fn write_protect_namespace(
+    admin: &mut impl WriteProtectAdmin,
+    nsid: u32,
+    uuid: [u8; 16],
+    deadline: Instant,
+) -> io::Result<()> {
+    let descriptors = admin.identify(nsid, 0x03, deadline)?;
+    if namespace_uuid(&descriptors) != Some(uuid) {
+        return Err(invalid("namespace identify UUID mismatch"));
+    }
+    admin.set_features(nsid, 0x84, 1, deadline)?;
+    let after = admin.identify(nsid, 0, deadline)?;
+    if after[99] & 1 == 0 {
+        return Err(invalid("namespace write protection not applied"));
+    }
+    Ok(())
+}
+
+/// The kernel admin queue of one owned controller.
+struct KernelWriteProtectAdmin<'a> {
+    file: &'a File,
+    controller_path: &'a Path,
+}
+
+impl WriteProtectAdmin for KernelWriteProtectAdmin<'_> {
+    fn identify(&mut self, nsid: u32, cns: u32, deadline: Instant) -> io::Result<[u8; 4096]> {
+        identify_namespace(self.file, self.controller_path, nsid, cns, deadline)
+    }
+
+    fn set_features(
+        &mut self,
+        nsid: u32,
+        fid: u32,
+        value: u32,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let ms = remaining(deadline)?.as_millis().clamp(1, u32::MAX as u128) as u32;
+        let mut cmd = NvmeAdminCommand {
+            opcode: 0x09,
+            nsid,
+            cdw10: fid,
+            cdw11: value,
+            timeout_ms: ms,
+            ..Default::default()
+        };
+        // SAFETY: the command matches nvme_passthru_cmd and remains valid for the synchronous ioctl.
+        let status = unsafe { libc::ioctl(self.file.as_raw_fd(), 0xc0484e41, &mut cmd) };
+        if status < 0 {
+            return Err(with_context(
+                "namespace write-protection admin command",
+                self.controller_path,
+                io::Error::last_os_error(),
+            ));
+        }
+        if status != 0 {
+            return Err(invalid("namespace write protection failed"));
+        }
+        Ok(())
+    }
 }
 
 /// The namespace UUID from an Identify Namespace Identification Descriptor

@@ -12,7 +12,9 @@
 //! objects. The state directory and WAL paths must be protected from untrusted
 //! local users. The NVMe data plane assumes trusted, non-Byzantine initiators:
 //! namespace write protection can be changed by an authorized controller.
-use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry, RegistryMode};
+use super::live_connect::{
+    LiveConnectTarget, LiveConnectionRegistry, LiveController, RegistryMode,
+};
 use super::live_storage::LiveTargetBinding;
 use super::{LiveTargetConfig, LiveTargetStats, NvmeofTransport};
 use crate::distributed::tcp::host_identity::NQN_PREFIX;
@@ -77,6 +79,62 @@ struct Export {
 #[cfg(test)]
 pub(crate) type ConfigfsHook = Box<dyn FnMut(usize) -> io::Result<()> + Send>;
 
+/// Test double for the commissioning controller: it stands in for the fabrics
+/// connect and the admin queue, so a fixture test drives the kernel
+/// write-protect sequence without root or a real target.
+#[cfg(test)]
+pub(crate) trait CommissioningDouble: Send {
+    /// The fabrics connect of the controller that fences the subsystem.
+    fn connect(
+        &mut self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        deadline: Instant,
+    ) -> io::Result<()>;
+    /// Write-protect one namespace through the controller's admin queue.
+    fn set_read_only_member(
+        &mut self,
+        nsid: u32,
+        uuid: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<()>;
+    /// Give the controller back.
+    fn disconnect(&mut self, deadline: Instant) -> io::Result<()>;
+}
+
+/// One owned controller that fences a subsystem: the kernel controller of the
+/// commissioning registry, or the test double that replaces it. One body
+/// drives both, so the order `connect`, per-namespace write protection,
+/// `disconnect` is the sequence under test.
+enum CommissioningController {
+    Live(LiveController),
+    #[cfg(test)]
+    Double(Box<dyn CommissioningDouble>),
+}
+
+impl CommissioningController {
+    fn set_read_only_member(
+        &mut self,
+        nsid: u32,
+        uuid: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        match self {
+            Self::Live(controller) => controller.set_read_only_member(nsid, uuid, deadline),
+            #[cfg(test)]
+            Self::Double(double) => double.set_read_only_member(nsid, uuid, deadline),
+        }
+    }
+
+    fn disconnect(&mut self, deadline: Instant) -> io::Result<()> {
+        match self {
+            Self::Live(controller) => controller.disconnect(deadline),
+            #[cfg(test)]
+            Self::Double(double) => double.disconnect(deadline),
+        }
+    }
+}
+
 /// Open only while holding the owner node lock, before opening any WAL.
 /// `open` disables and drains every scoped namespace, removes the scoped
 /// configfs objects and then commissions the host and ports again. Any
@@ -105,6 +163,10 @@ pub struct LiveTargetManager {
     configfs_steps: std::cell::Cell<usize>,
     #[cfg(test)]
     commission_groups: std::cell::Cell<u64>,
+    /// Test controller that replaces the fabrics connect and admin queue, so a
+    /// fixture drives the kernel write-protect sequence.
+    #[cfg(test)]
+    commissioning_double: Option<Box<dyn CommissioningDouble>>,
 }
 
 fn invalid(s: &'static str) -> io::Error {
@@ -452,6 +514,8 @@ impl LiveTargetManager {
             configfs_steps: std::cell::Cell::new(0),
             #[cfg(test)]
             commission_groups: std::cell::Cell::new(0),
+            #[cfg(test)]
+            commissioning_double: None,
         };
         // Disconnect local controllers of a previous process before any
         // namespace is drained or removed.
@@ -490,6 +554,13 @@ impl LiveTargetManager {
             .configfs_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+    /// Replace the commissioning controller with a test double. A fixture with
+    /// a double runs the kernel write-protect sequence the double records,
+    /// instead of writing the ordinary-file `write_protect` attribute.
+    #[cfg(test)]
+    pub(crate) fn set_commissioning_double(&mut self, double: Box<dyn CommissioningDouble>) {
+        self.commissioning_double = Some(double);
     }
     fn configfs_step(&self) -> io::Result<()> {
         #[cfg(test)]
@@ -859,17 +930,45 @@ impl LiveTargetManager {
         // Admin-only connection: another host's controller may already be
         // attached to this subsystem, so the write-protect path must not open
         // the shared namespace block device.
-        let mut controller = self
-            .commissioning
-            .as_mut()
-            .ok_or_else(|| invalid("missing commissioning registry"))?
-            .connect_controller(&local, &host_nqn, random_id()?, deadline)?;
+        let mut controller = self.commissioning_controller(&local, &host_nqn, deadline)?;
         let checked = bindings.iter().try_for_each(|binding| {
             controller.set_read_only_member(binding.nsid, binding.uuid, deadline)
         });
         let disconnect = controller.disconnect(Instant::now() + Duration::from_secs(20));
+        // A test double outlives its failed attempt, so the next one records
+        // onto the same expectation.
+        #[cfg(test)]
+        if let CommissioningController::Double(double) = controller {
+            self.commissioning_double = Some(double);
+        }
         checked?;
         disconnect
+    }
+
+    /// The controller that fences this subsystem: the commissioning registry's
+    /// kernel controller, or the test double installed in its place.
+    fn commissioning_controller(
+        &mut self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        deadline: Instant,
+    ) -> io::Result<CommissioningController> {
+        #[cfg(test)]
+        if let Some(mut double) = self.commissioning_double.take() {
+            return match double.connect(target, host_nqn, deadline) {
+                Ok(()) => Ok(CommissioningController::Double(double)),
+                Err(error) => {
+                    self.commissioning_double = Some(double);
+                    Err(error)
+                }
+            };
+        }
+        let controller = self
+            .commissioning
+            .as_mut()
+            .ok_or_else(|| invalid("missing commissioning registry"))?
+            .connect_controller(target, host_nqn, random_id()?, deadline)?;
+        Ok(CommissioningController::Live(controller))
     }
 
     /// Write-protect every namespace of `bindings` in the device, then mark
@@ -914,7 +1013,20 @@ impl LiveTargetManager {
             self.commission_groups
                 .set(self.commission_groups.get().saturating_add(1));
             let mut failure = None;
-            if self.fixture {
+            // A fixture writes the ordinary-file attribute that stands in for
+            // the kernel policy. A fixture with a commissioning double instead
+            // runs the kernel sequence, with the double in place of the target.
+            let fixture_attribute = {
+                #[cfg(test)]
+                {
+                    self.fixture && self.commissioning_double.is_none()
+                }
+                #[cfg(not(test))]
+                {
+                    self.fixture
+                }
+            };
+            if fixture_attribute {
                 for binding in group {
                     if let Err(error) = self.put(
                         &sub.join(format!("namespaces/{}", binding.nsid))
