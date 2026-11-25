@@ -15,6 +15,7 @@ import textwrap
 import unittest
 
 import manual_sui
+from test_gcs_ledger import FakeObjectStore
 
 HERE = Path(__file__).resolve().parent
 CHECKPOINT = HERE.parent / 'sui-checkpoint'
@@ -187,8 +188,8 @@ class LauncherHandshake(unittest.TestCase):
         manual_sui.SAMPLE_SECONDS = 0.2
         self.addCleanup(setattr, manual_sui, 'SAMPLE_SECONDS', self.saved)
 
-    def launcher(self, prefix='', **overrides):
-        base = self.root / prefix if prefix else self.root
+    def launcher(self, directory='', **overrides):
+        base = self.root / directory if directory else self.root
         values = dict(
             remote=manual_sui.Remote('us-central1-a', execute=self.gcloud),
             build_root=self.build.root, fixture=self.fixture,
@@ -244,6 +245,89 @@ class LauncherHandshake(unittest.TestCase):
         self.assertIn('--external-resources', text)
         self.assertIn('--external-stage-dir', text)
         self.assertIn('--durability-tier native', text)
+
+    def test_run_command_repeats_the_shared_knobs_once_and_matches_the_config(self):
+        launcher = self.launcher(coordinator_cache_mib=0, shard_cache_mib=0)
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        launcher.run(hosts)
+        command = next(command for command in launcher.local_commands
+                       if '/run.py' in ' '.join(command))
+        for flag in ('--coordinator-cache-mib', '--shard-cache-mib'):
+            self.assertEqual(command.count(flag), 1, flag)
+        argv = launcher.run_command()
+        config = json.loads((launcher.config_dir / 'config.json').read_text())
+        manifest = json.loads((launcher.config_dir / 'external-manifest.json').read_text())
+        read_cache = {row['read_cache_bytes'] for row in config['databases'].values()}
+        self.assertEqual(read_cache, {int(argv[argv.index('--coordinator-cache-mib') + 1]) * 1024 * 1024})
+        self.assertEqual(manifest['shard_cache_bytes'],
+                         int(argv[argv.index('--shard-cache-mib') + 1]) * 1024 * 1024)
+        self.assertEqual(read_cache, {0})
+        self.assertEqual(manifest['shard_cache_bytes'], 0)
+
+    def test_profiling_and_resident_reads_reach_both_owners_and_the_runner(self):
+        policy = self.root / 'resident-reads.json'
+        policy.write_text(json.dumps(dict(
+            source_bytes=0, source_regions=0, destination_bytes=0,
+            destination_slots=0, max_read_bytes=0, max_handles=0,
+            require_device_read=False)))
+        launcher = self.launcher(write_profile_limit=5, resident_reads=policy)
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        launcher.run(hosts)
+        prepare = next(command for command in launcher.local_commands
+                       if 'prepare_external' in ' '.join(command))
+        runner = next(command for command in launcher.local_commands
+                      if '/run.py' in ' '.join(command))
+        for command in (prepare, runner):
+            text = ' '.join(command)
+            self.assertEqual(text.count('--write-profile-limit'), 1)
+            self.assertIn('--write-profile-limit 5', text)
+            self.assertEqual(text.count('--resident-reads'), 1)
+            self.assertIn(f'--resident-reads {policy.resolve()}', text)
+        config = json.loads((launcher.config_dir / 'config.json').read_text())
+        manifest = json.loads((launcher.config_dir / 'external-manifest.json').read_text())
+        self.assertEqual({row['write_profile_limit'] for row in config['databases'].values()}, {5})
+        self.assertEqual(manifest['write_profile_limit'], 5)
+
+    def test_bucket_prefix_passes_only_after_a_verified_upload(self):
+        store = FakeObjectStore()
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        launcher = self.launcher(ledger=ledger, store=store,
+                                 bucket='mysten-research-bench-artifacts',
+                                 prefix='campaign-hybrid-sui-2026-11-25')
+        receipt = launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'sui-replay'), 'passed')
+        prefix = 'campaign-hybrid-sui-2026-11-25'
+        ledger_key = f'{prefix}/campaign-ledger.json'
+        self.assertIn(ledger_key, store.objects)
+        uploaded = {key for key in store.objects if key != ledger_key}
+        self.assertEqual(len(uploaded), len(receipt['upload']['evidence']))
+        for key in uploaded:
+            self.assertTrue(key.startswith(
+                f'{prefix}/stage1/sui-replay/attempt-1/'), key)
+        for row in receipt['upload']['evidence']:
+            data, generation = store.objects[row['key']]
+            self.assertEqual(hashlib.sha256(data).hexdigest(), row['sha256'])
+            self.assertEqual(row['generation'], generation)
+        stored, generation = manual_sui.gcs_ledger.ObjectStoreLedger(store).get(ledger_key)
+        self.assertEqual(generation, receipt['upload']['ledger']['generation'])
+        self.assertEqual(stored, ledger.to_bytes())
+        mirror = json.loads((self.root / 'run/upload-receipt.json').read_text())
+        self.assertEqual(mirror['ledger']['sha256'], receipt['upload']['ledger']['sha256'])
+        self.assertTrue(all(Path(row['path']).is_file() for row in mirror['evidence']))
+
+    def test_failed_upload_never_passes_the_cell(self):
+        store = FakeObjectStore()
+        store.put = lambda *args, **kwargs: (_ for _ in ()).throw(
+            manual_sui.gcp_api.ApiError(503, 'unavailable'))
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        launcher = self.launcher(ledger=ledger, store=store,
+                                 bucket='mysten-research-bench-artifacts',
+                                 prefix='campaign-hybrid-sui-2026-11-25')
+        with self.assertRaises(manual_sui.gcp_api.ApiError):
+            launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'sui-replay'), 'failed')
+        self.assertIn('unavailable', ledger.entries[('stage1', 'sui-replay')]['failure'])
+        self.assertFalse((self.root / 'run/upload-receipt.json').exists())
 
     def test_existing_stage_marker_is_refused(self):
         stage = self.root / 'stages'

@@ -28,8 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'sui-checkpoint'))
 import build
 import campaign_ledger as ledger_module
+import campaign_manifest
 import checkpoint_support as checkpoint
 import deployment
+import gcp_api
+import gcs_ledger
 
 SAMPLE_SECONDS = 2.0
 MAX_SAMPLES = 20000
@@ -119,7 +122,9 @@ class SuiLauncher:
                  deadline=900, extra_run=(), transport='efa', live_transport='rdma',
                  coordinator_cache_mib=8, shard_cache_mib=0, schema=None,
                  disk_sample_seconds=10, port=24000, ledger=None,
-                 cell_id='sui-replay', stage='stage1', resume=False):
+                 cell_id='sui-replay', stage='stage1', resume=False,
+                 store=None, bucket=None, prefix=None, write_profile_limit=0,
+                 resident_reads=None):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -154,6 +159,11 @@ class SuiLauncher:
         self.cell_id = cell_id
         self.stage = stage
         self.resume = resume
+        self.store = store
+        self.bucket = bucket
+        self.prefix = prefix
+        self.write_profile_limit = write_profile_limit
+        self.resident_reads = Path(resident_reads).resolve() if resident_reads else None
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
@@ -198,7 +208,10 @@ class SuiLauncher:
                    '--port', str(self.port), '--transport', self.transport,
                    '--durability-tier', self.tier, '--live-transport', self.live_transport,
                    '--coordinator-cache-mib', str(self.coordinator_cache_mib),
-                   '--shard-cache-mib', str(self.shard_cache_mib)]
+                   '--shard-cache-mib', str(self.shard_cache_mib),
+                   '--write-profile-limit', str(self.write_profile_limit)]
+        if self.resident_reads is not None:
+            command += ['--resident-reads', str(self.resident_reads)]
         subprocess.run(command, check=True, timeout=600)
         self.local_commands.append(command)
         self.external = json.loads(manifest_path.read_text())
@@ -407,12 +420,25 @@ class SuiLauncher:
                        tier=self.tier, owners=self.owners,
                        fragment_mib=self.fragment_mib, run_args=self.extra_run,
                        coordinator_cache_mib=self.coordinator_cache_mib,
-                       shard_cache_mib=self.shard_cache_mib),
+                       shard_cache_mib=self.shard_cache_mib,
+                       write_profile_limit=self.write_profile_limit,
+                       resident_reads=(build.digest(self.resident_reads)
+                                       if self.resident_reads else None)),
             engine_rev=self.manifest.get('source_archive_sha256'),
             sui_rev=self.manifest.get('source_archive_sha256'),
             binary_ids=self.manifest['binaries'])
 
-    def artifacts(self):
+    def evidence_name(self, path):
+        """Stable object name of one artifact, relative to its local root."""
+        path = Path(path)
+        for base, label in ((self.output, ''), (self.config_dir, 'external/')):
+            try:
+                return label + str(path.relative_to(base))
+            except ValueError:
+                continue
+        return path.name
+
+    def artifacts(self, attempt=1):
         rows = []
         for path in (self.output / 'experiment/results.json',
                      self.output / 'receipt.json',
@@ -422,9 +448,82 @@ class SuiLauncher:
                      self.config_dir / 'external-manifest.json'):
             if not path.is_file():
                 raise ValueError(f'missing replay artifact: {path}')
-            rows.append(dict(path=str(path), size=path.stat().st_size,
-                             sha256=ledger_module.sha256_file(path)))
+            row = dict(path=str(path), size=path.stat().st_size,
+                       sha256=ledger_module.sha256_file(path))
+            if self.prefix:
+                row['key'] = campaign_manifest.evidence_key(
+                    self.prefix, self.stage, self.cell_id, self.evidence_name(path),
+                    attempt)
+            rows.append(row)
         return rows
+
+    def upload(self, artifacts):
+        """Upload each artifact once, then verify it by size and SHA-256.
+
+        An object that already exists must hold the same bytes; a different
+        object is a hard failure, never an overwrite. The local files are the
+        mirror: they are read again for the upload and must keep their hash.
+        """
+        receipts = []
+        for artifact in artifacts:
+            path = Path(artifact['path'])
+            data = path.read_bytes()
+            digest = ledger_module.sha256_bytes(data)
+            if len(data) != artifact['size'] or digest != artifact['sha256']:
+                raise ValueError(f'evidence changed before upload: {path}')
+            key = artifact['key']
+            try:
+                receipt = self.store.put(key, data, if_generation_match=0,
+                                         metadata={'kind': 'cell-evidence',
+                                                   'cell': self.cell_id})
+                generation = int(receipt['generation'])
+                if (int(receipt.get('size', -1)) != len(data)
+                        or receipt.get('metadata', {}).get('sha256') != digest):
+                    raise ValueError(f'evidence upload receipt differs: {key}')
+            except gcp_api.ApiError as error:
+                if error.status not in (409, 412):
+                    raise
+                head = self.store.head(key)
+                if (int(head.get('size', -1)) != len(data)
+                        or head.get('metadata', {}).get('sha256') != digest):
+                    raise ValueError(f'uploaded evidence differs: {key}') from None
+                generation = int(head['generation'])
+            if ledger_module.sha256_file(path) != digest:
+                raise ValueError(f'local evidence mirror changed during upload: {path}')
+            receipts.append(dict(key=key, path=str(path), size=len(data),
+                                 sha256=digest, generation=generation))
+        return receipts
+
+    def persist(self, entry, artifacts):
+        """Pass the cell only after its evidence and the ledger are verified."""
+        target = gcs_ledger.ObjectStoreLedger(self.store)
+        receipts = self.upload(artifacts)
+        self.ledger.mark_passed(entry, artifacts, store=target)
+        key = campaign_manifest.ledger_key(self.prefix)
+        generation = gcs_ledger.save_ledger(self.store, self.ledger, key)
+        payload = self.ledger.to_bytes()
+        head = target.head(key)
+        if (head['size'] != len(payload)
+                or head['sha256'] != ledger_module.sha256_bytes(payload)
+                or head['generation'] != generation):
+            raise ValueError('uploaded ledger differs from the local ledger')
+        local = (dict(path=str(self.ledger.path),
+                      sha256=ledger_module.sha256_file(self.ledger.path))
+                 if self.ledger.path is not None else None)
+        receipt = dict(
+            cell_id=self.cell_id, stage=self.stage, status='passed',
+            attempt=entry['attempts'], bucket=self.bucket, prefix=self.prefix,
+            ledger=dict(key=key, generation=generation, size=head['size'],
+                        sha256=head['sha256'], local=local),
+            evidence=receipts,
+            mirror=dict(root=str(self.output),
+                        note='the local artifact tree is the mirror; every uploaded '
+                             'object is verified by size and SHA-256 on both sides'))
+        path = self.output / 'upload-receipt.json'
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(receipt, indent=2) + '\n')
+        os.replace(temporary, path)
+        return receipt
 
     def run(self, hosts):
         identity = self.identity()
@@ -444,13 +543,44 @@ class SuiLauncher:
         self.ledger.save()
         try:
             receipt = self.execute(hosts)
-            self.ledger.mark_passed(entry, self.artifacts())
+            if self.store is None:
+                self.ledger.mark_passed(entry, self.artifacts())
+                receipt['ledger'] = dict(local=str(self.ledger.path), uploaded=False)
+            else:
+                receipt['upload'] = self.persist(entry, self.artifacts(entry['attempts']))
+                receipt['ledger'] = dict(local=str(self.ledger.path), uploaded=True,
+                                         key=receipt['upload']['ledger']['key'])
             self.ledger.save()
             return receipt
         except BaseException as error:
             self.ledger.fail(entry, error)
             self.ledger.save()
             raise
+
+    def run_command(self):
+        """The exact run.py argv; every knob the external config also carries.
+
+        The coordinator and shard cache bounds are duplicated here because
+        `run.py` refuses an external deployment whose `read_cache_bytes` or
+        `shard_cache_bytes` differ from these values. The operator gives each
+        knob once, to this launcher.
+        """
+        command = ['--build', str(self.build_root), '--fixture', str(self.fixture),
+                   '--output', str(self.output), '--deadline', str(self.deadline),
+                   '--owners', str(self.owners), '--durability-tier', self.tier,
+                   '--fragment-mib', str(self.fragment_mib),
+                   '--coordinator-cache-mib', str(self.coordinator_cache_mib),
+                   '--shard-cache-mib', str(self.shard_cache_mib),
+                   '--write-profile-limit', str(self.write_profile_limit),
+                   '--disk-sample-seconds', str(self.disk_sample_seconds),
+                   '--external-config', str(self.config_dir / 'config.json'),
+                   '--external-resources', str(self.resources),
+                   '--external-stage-dir', str(self.stage_dir),
+                   '--cell-id', self.cell_id]
+        if self.resident_reads is not None:
+            command += ['--resident-reads', str(self.resident_reads)]
+        return command + list(self.extra_run)
+
 
     def execute(self, hosts):
         self.output.parent.mkdir(parents=True, exist_ok=True)
@@ -460,16 +590,7 @@ class SuiLauncher:
         self.install()
         self.start()
         self.start_sampling()
-        command = [sys.executable, str(self.source / 'run.py'),
-                   '--build', str(self.build_root), '--fixture', str(self.fixture),
-                   '--output', str(self.output), '--deadline', str(self.deadline),
-                   '--owners', str(self.owners), '--durability-tier', self.tier,
-                   '--fragment-mib', str(self.fragment_mib),
-                   '--disk-sample-seconds', str(self.disk_sample_seconds),
-                   '--external-config', str(self.config_dir / 'config.json'),
-                   '--external-resources', str(self.resources),
-                   '--external-stage-dir', str(self.stage_dir),
-                   '--cell-id', self.cell_id, *self.extra_run]
+        command = [sys.executable, str(self.source / 'run.py'), *self.run_command()]
         self.local_commands.append(command)
         child = subprocess.Popen(command)
         marker = self.stage_dir / 'resources-required.json'
@@ -541,12 +662,33 @@ def main():
     parser.add_argument('--port', type=int, default=24000)
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
     parser.add_argument('--shard-cache-mib', type=int, default=0)
+    parser.add_argument('--write-profile-limit', type=int, default=0,
+                        help='bounded append profiling per owning connection, 0 disables')
+    parser.add_argument('--resident-reads', type=Path,
+                        help='resident-read policy forwarded to the owners and the runner')
     parser.add_argument('--tunnel-through-iap', action='store_true')
+    parser.add_argument('--bucket-prefix',
+                        help='campaign object prefix, gs://mysten-research-bench-artifacts/'
+                             '<campaign-id>; a cell passes only after its verified upload')
+    parser.add_argument('--impersonation-account', default=campaign_manifest.ACCOUNT,
+                        help='service account that writes the campaign prefix')
+    parser.add_argument('--allow-local-ledger', action='store_true',
+                        help='local rehearsal only: pass a cell without an uploaded bundle')
     parser.add_argument('run_args', nargs=argparse.REMAINDER,
                         help='extra run.py arguments after --')
     args = parser.parse_args()
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
+    if not args.bucket_prefix and not args.allow_local_ledger:
+        raise SystemExit('a passed cell needs a verified evidence upload; give '
+                         '--bucket-prefix, or --allow-local-ledger for a local rehearsal')
+    store = bucket = prefix = None
+    if args.bucket_prefix:
+        bucket, prefix = campaign_manifest.parse_bucket_prefix(args.bucket_prefix)
+        api = gcp_api.GoogleApi(campaign_manifest.PROJECT)
+        if args.impersonation_account:
+            api = api.impersonated(args.impersonation_account)
+        store = api.objects(bucket)
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
     if Path(ledger_path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
@@ -567,7 +709,9 @@ def main():
         shard_cache_mib=args.shard_cache_mib, schema=args.schema,
         disk_sample_seconds=args.disk_sample_seconds, port=args.port,
         ledger=resume_ledger, cell_id=args.cell_id, stage=args.stage,
-        resume=args.resume)
+        resume=args.resume, store=store, bucket=bucket, prefix=prefix,
+        write_profile_limit=args.write_profile_limit,
+        resident_reads=args.resident_reads)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
 
