@@ -7,4 +7,3 @@
 
 tidehunter/src/distributed/remote_db/model_check_concurrent.rs 0 6
 tidehunter/src/distributed/remote_db/pending_read.rs 0 1
-tidehunter/src/distributed/tcp/inventory.rs 1 8
