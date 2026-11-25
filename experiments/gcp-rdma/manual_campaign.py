@@ -33,6 +33,7 @@ import gcp_runtime
 import prepare
 import workflow_input
 import q0_campaign
+from q1_package import PROFILE as Q1_PROFILE
 from cloud_campaign import NVMEOF_PATH_SELECTIONS, REDRAIN_AB_SELECTION
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
@@ -375,6 +376,8 @@ def q0_quote(spec):
 
 
 def _reviewed_jobs(spec):
+    if isinstance(spec, dict) and spec.get('selection') == Q1_PROFILE:
+        raise ValueError('nvmeof_q1 is offline-only until the Q1 workload and guest adapters land; use q1_admit.py')
     if isinstance(spec, dict) and spec.get('selection') == q0_campaign.SELECTION:
         if _json(spec) != _json(q0_spec(spec.get('case_binaries'))):
             raise ValueError('an exact reviewed Q0 specification is required')
