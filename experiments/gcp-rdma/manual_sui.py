@@ -459,8 +459,8 @@ def main():
     parser.add_argument('--external-config-dir', type=Path)
     parser.add_argument('--stage-dir', type=Path)
     parser.add_argument('--resources', type=Path)
-    parser.add_argument('--transport', choices=('tcp', *deployment.HARDWARE_TRANSPORTS),
-                        default='efa')
+    parser.add_argument('--transport', choices=('tcp', 'tcp-trusted',
+                        *deployment.HARDWARE_TRANSPORTS), default='efa')
     parser.add_argument('--live-transport', choices=deployment.LIVE_TRANSPORTS,
                         default='rdma')
     parser.add_argument('--durability-tier', choices=('native', 'synchronous'),

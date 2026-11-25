@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--hosts',required=True,help='distinct private IPv4 owner addresses, comma separated (one per owner)')
     parser.add_argument('--owners',type=int,help='expected owner count; defaults to the number of --hosts')
     parser.add_argument('--port',type=int,default=24000)
-    parser.add_argument('--transport',choices=('tcp', *deployment.HARDWARE_TRANSPORTS),default='tcp')
+    parser.add_argument('--transport',choices=('tcp', 'tcp-trusted', *deployment.HARDWARE_TRANSPORTS),default='tcp')
     parser.add_argument('--durability-tier',choices=('native','synchronous'),default='synchronous',
                         help='acknowledgement tier every provisioned database must match')
     parser.add_argument('--live-transport',choices=deployment.LIVE_TRANSPORTS,
