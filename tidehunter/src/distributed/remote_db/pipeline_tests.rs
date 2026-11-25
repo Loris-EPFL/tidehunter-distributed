@@ -24,6 +24,10 @@ use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "native_parity_gates_tests.rs"]
+mod native_parity_gates;
+#[path = "schedule_sweep_tests.rs"]
+mod schedule_sweep;
 #[path = "shared_tls_tests.rs"]
 mod shared_tls;
 #[path = "../../../examples/support/tls_material.rs"]
