@@ -1903,6 +1903,15 @@ impl RemoteDatabase {
     /// fetched one refills the native per-cell LRU only when `refill` says this
     /// is a live read (see [`Self::read_value`]); a latched view passes `false`.
     ///
+    /// A keyspace whose index key is a reduction of the full key is fetched the
+    /// same way: the member's own key binds each slot, a member naming another
+    /// full key with the same reduction answers absent, and the page costs one
+    /// owner read per owner (see [`Self::get_many_with`]). A failed owner page
+    /// there re-reads every slot through the scalar reduced read even though
+    /// this is not the live read: the failure cannot be attributed to one slot,
+    /// and the scalar read is what verified the full key before the page
+    /// batched. A corrupt member still fails the call for every slot.
+    ///
     /// Every key is resolved at the one sampled `cut`: a publication landing
     /// mid-call must not let different slots observe different publication
     /// points, and the batch has no per-key cut to fall back on.
@@ -1935,7 +1944,9 @@ impl RemoteDatabase {
     /// a failed owner page: when set, every slot of the page is re-read through
     /// the scalar path, which re-resolves its key exactly once, because the
     /// batched fetch cannot attribute the failure to one slot. When clear, the
-    /// failed page fails the call.
+    /// failed page fails the call for a keyspace whose index key is the full key.
+    /// A reduced-index page always takes the scalar path on a retired member:
+    /// that read's full-key check is the behaviour the page replaced.
     fn get_many_with<K: AsRef<[u8]>>(
         &self,
         ks: KeySpace,
@@ -1966,17 +1977,6 @@ impl RemoteDatabase {
                             || full_key.as_ref() == key)
                             .then_some(value)));
                     }
-                    Ok(Some(ResolvedValue::Position(position)))
-                        if descriptor.need_check_index_key() =>
-                    {
-                        results.push(self.read_value(
-                            ks,
-                            key,
-                            cut,
-                            ResolvedValue::Position(position),
-                            refill,
-                        ));
-                    }
                     Ok(Some(ResolvedValue::Position(position))) => {
                         slots.push(results.len());
                         rows.push((
@@ -2000,11 +2000,42 @@ impl RemoteDatabase {
                 trace.event("value_fetch_started");
             }
             let fetch_started = Instant::now();
-            let fetched = match self.reader.read_many(ks, &rows) {
-                Ok(values) => {
+            let fetched = if descriptor.need_check_index_key() {
+                // A reduced index entry is shared by every full key with the same
+                // reduction, so the batch must return the member's own key: only
+                // that key binds the value, exactly as the scalar read does.
+                self.reader.read_many_entries(ks, &rows).map(|entries| {
+                    let refill = refill && descriptor.value_cache_size().is_some();
+                    for ((slot, (reduced, position)), entry) in
+                        slots.iter().copied().zip(&rows).zip(entries)
+                    {
+                        let Some((full_key, value)) = entry else {
+                            results[slot] = Ok(None);
+                            continue;
+                        };
+                        if full_key.as_ref() != keys[slot].as_ref() {
+                            // The member names another full key that shares this
+                            // reduction: this key is absent.
+                            results[slot] = Ok(None);
+                            continue;
+                        }
+                        if refill {
+                            table.refill_value(
+                                ks,
+                                reduced.clone(),
+                                *position,
+                                full_key,
+                                value.clone(),
+                            );
+                        }
+                        results[slot] = Ok(Some(value));
+                    }
+                })
+            } else {
+                self.reader.read_many(ks, &rows).map(|values| {
                     let refill = refill && descriptor.value_cache_size().is_some();
                     for ((slot, (reduced, position)), value) in
-                        slots.into_iter().zip(&rows).zip(values)
+                        slots.iter().copied().zip(&rows).zip(values)
                     {
                         if refill && let Some(value) = &value {
                             table.refill_value(
@@ -2017,28 +2048,34 @@ impl RemoteDatabase {
                         }
                         results[slot] = Ok(value);
                     }
-                    Ok(())
-                }
-                // A retired owner file is the one failure the index can
-                // repair. The batched fetch cannot say which slot held the
-                // retired member, so the per-slot batch falls back to the
-                // scalar read for this page: that read re-resolves its key
-                // exactly once and answers per slot, like native `Db::get`.
-                // The strict batch keeps its contract (a failed page fails the
-                // call).
-                Err(error) if repair_retired && pending_read::member_read_is_retired(&error) => {
-                    for (slot, (_, position)) in slots.into_iter().zip(rows) {
+                })
+            };
+            // A retired owner file is the one failure the index can repair. The
+            // batched fetch cannot say which slot held the retired member, so
+            // the page falls back to the scalar read for this page: that read
+            // re-resolves its key exactly once and answers per slot, like native
+            // `Db::get`. A reduced page always takes this path, because the
+            // scalar read is what verified the full key before this path
+            // batched, and its results must not change. The strict batch of a
+            // keyspace whose index key is the full key keeps its contract (a
+            // failed page fails the call).
+            let fetched = match fetched {
+                Err(error)
+                    if (repair_retired || descriptor.need_check_index_key())
+                        && pending_read::member_read_is_retired(&error) =>
+                {
+                    for (slot, (_, position)) in slots.iter().copied().zip(&rows) {
                         results[slot] = self.read_value(
                             ks,
                             keys[slot].as_ref(),
                             cut,
-                            ResolvedValue::Position(position),
+                            ResolvedValue::Position(*position),
                             refill,
                         );
                     }
                     Ok(())
                 }
-                Err(error) => Err(error),
+                other => other,
             };
             self.core
                 .value_read_ns
@@ -2821,3 +2858,6 @@ mod stream_bound_tests;
 
 #[cfg(test)]
 mod value_cache_tests;
+
+#[cfg(test)]
+mod reduced_key_batch_tests;

@@ -416,31 +416,9 @@ impl ValueReader {
         ks: KeySpace,
         rows: &[(Bytes, VersionPosition)],
     ) -> Result<Vec<Option<Bytes>>, LocalDbError> {
-        // One call keeps every fetched frame resident, so it is bounded like the
-        // page builder it replaced: an iterator page asks for at most this many
-        // rows, and a larger caller pages itself. This bounds value memory per
-        // call instead of letting a scan pin an unbounded frame set.
-        if rows.len() > MAX_PAGE_RECORDS {
-            return Err(LocalDbError::new(
-                "value page exceeds the bounded read page size",
-            ));
-        }
+        Self::check_page_len(rows.len())?;
         #[cfg(test)]
-        match self.read_many_fault.load(Ordering::Relaxed) {
-            0 => {}
-            1 => {
-                return Err(LocalDbError::with_kind(
-                    io::ErrorKind::NotFound,
-                    "test-injected batched fetch failure",
-                ));
-            }
-            _ => {
-                return Err(LocalDbError::with_kind(
-                    io::ErrorKind::PermissionDenied,
-                    "test-injected batched fetch failure",
-                ));
-            }
-        }
+        self.injected_read_many_fault()?;
         let mut values: Vec<Option<Bytes>> = vec![None; rows.len()];
         let mut remote: Vec<Option<VersionPosition>> = vec![None; rows.len()];
         let mut groups: Vec<Vec<(usize, VersionPosition)>> =
@@ -479,6 +457,87 @@ impl ValueReader {
             batch.values[slot] = value;
         }
         Ok(batch.values)
+    }
+
+    /// [`Self::read_many`] for a keyspace whose index key is a reduction of the
+    /// full key, returning the member's own key with its value.
+    ///
+    /// The index holds only the reduced key, so two full keys can share one
+    /// entry and the value at a position is trustworthy only against the key the
+    /// member itself carries. The caller compares that key with the one it asked
+    /// for and answers absent on a mismatch. The identity cache is not consulted
+    /// and not filled: it stores a value by position, which a shared reduction
+    /// makes ambiguous, so the scalar reduced read bypasses it too (see
+    /// `RemoteDatabase::read_value`).
+    ///
+    /// Owner grouping, the page bound, the call deadline and a test fault are the
+    /// same as [`Self::read_many`], so a page costs one owner read per owner.
+    pub(crate) fn read_many_entries(
+        &self,
+        ks: KeySpace,
+        rows: &[(Bytes, VersionPosition)],
+    ) -> Result<Vec<Option<(Bytes, Bytes)>>, LocalDbError> {
+        Self::check_page_len(rows.len())?;
+        #[cfg(test)]
+        self.injected_read_many_fault()?;
+        let mut groups: Vec<Vec<(usize, VersionPosition)>> =
+            vec![Vec::new(); self.lanes.owner_count()];
+        for (slot, (_, position)) in rows.iter().enumerate() {
+            Self::check_position(*position)?;
+            // No hit or miss is counted here: the identity cache is not part of
+            // this read, and the scalar reduced read counts neither.
+            groups[self.node(*position)?].push((slot, *position));
+        }
+        let mut batch = ReadBatch::new(
+            &self.lanes,
+            vec![None; rows.len()],
+            groups,
+            Instant::now() + self.read_timeout,
+        )?;
+        self.drain(&mut batch)?;
+        let mut entries: Vec<Option<(Bytes, Bytes)>> = vec![None; rows.len()];
+        for (slot, (indexed_key, position)) in rows.iter().enumerate() {
+            let frame = batch.values[slot]
+                .take()
+                .ok_or_else(|| LocalDbError::new("missing remote read result"))?;
+            entries[slot] = decode_member_entry(&self.shape, ks, indexed_key, *position, &frame)
+                .inspect_err(|_| {
+                    self.decode_failures.fetch_add(1, Ordering::Relaxed);
+                })?;
+        }
+        Ok(entries)
+    }
+
+    /// The page bound of every batched read: one call keeps every fetched frame
+    /// resident, so it is bounded like the page builder it replaced. An iterator
+    /// page asks for at most [`MAX_PAGE_RECORDS`] rows and a larger caller pages
+    /// itself, which bounds value memory per call instead of letting a scan pin
+    /// an unbounded frame set.
+    fn check_page_len(len: usize) -> Result<(), LocalDbError> {
+        if len > MAX_PAGE_RECORDS {
+            return Err(LocalDbError::new(
+                "value page exceeds the bounded read page size",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fault a test arms through [`Self::set_read_many_fault_for_test`]: every
+    /// batched fetch fails so a test can drive the fallback without a retired
+    /// owner file.
+    #[cfg(test)]
+    fn injected_read_many_fault(&self) -> Result<(), LocalDbError> {
+        match self.read_many_fault.load(Ordering::Relaxed) {
+            0 => Ok(()),
+            1 => Err(LocalDbError::with_kind(
+                io::ErrorKind::NotFound,
+                "test-injected batched fetch failure",
+            )),
+            _ => Err(LocalDbError::with_kind(
+                io::ErrorKind::PermissionDenied,
+                "test-injected batched fetch failure",
+            )),
+        }
     }
 
     /// Verify and decode one member frame.

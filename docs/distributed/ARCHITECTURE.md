@@ -112,7 +112,11 @@ is the price of the ordering guarantee. A Sui batch read resolves every key at
 one sampled cut with the same lookup, serves a resident value inline, and
 fetches all misses in one batched owner read per owner; a retired member is
 retried per slot through the scalar path, which re-resolves its key exactly once,
-as native `Db::multi_get`'s per-key `Db::get` does. A keyspace with a relocation
+as native `Db::multi_get`'s per-key `Db::get` does. A keyspace whose index key is
+a reduction of the full key (`KeyIndexing::Reduction`, Sui's digest keyspaces)
+takes the same batched read: the batch returns each member's own key, a slot
+whose member names another full key with the same reduction answers absent, and
+the page still costs one owner read per owner. A keyspace with a relocation
 filter keeps the same cut-checked lookup: a filtered relocation marks dropped
 keys `Removed` while deliberately leaving their resident value, and only the
 index-first lookup answers not-found for them. A latched read consults the LRU
