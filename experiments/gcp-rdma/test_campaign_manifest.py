@@ -164,3 +164,25 @@ class LocalFiles(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BuildBinding(unittest.TestCase):
+    def test_a_finished_build_rebinds_every_revision_and_binary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'build-receipt.json').write_text(json.dumps(dict(
+                bundle_sha256='b' * 64, build_manifest_sha256='m' * 64,
+                source_archive_sha256='s' * 64)))
+            (root / 'build-manifest.json').write_text(json.dumps(dict(
+                binaries={'storage-node': '1' * 64, 'sui-node-native': '2' * 64})))
+            (root / 'source-manifest.json').write_text(json.dumps(dict(
+                sui=dict(revision='3' * 40),
+                **{'tidehunter-sharded-wal': dict(revision='4' * 40)})))
+            revisions = manifest.build_revisions(root)
+            value = manifest.manifest(revisions=revisions)
+            self.assertEqual(value['revisions']['engine'], '4' * 40)
+            self.assertEqual(value['revisions']['sui'], '3' * 40)
+            self.assertEqual(value['revisions']['bundle_sha256'], 'b' * 64)
+            self.assertEqual(value['revisions']['binaries']['storage-node'], '1' * 64)
+            self.assertEqual(value['revisions']['engine_base'],
+                             manifest.REVISIONS['engine_base'])
