@@ -295,7 +295,7 @@ def command_json(command, destination, env, deadline=600):
     return read_json(destination)
 
 
-def audit(root, output, bins, schemas, native_root, remote_root, config, env):
+def audit(root, output, bins, schemas, native_root, remote_root, config, env, label=''):
     from checkpoint_support import local_rocksdb_paths, compare_local_store
     result = dict(databases={}, rocksdb={}, all_equal=True)
     for index, namespace in enumerate(schemas):
@@ -305,7 +305,7 @@ def audit(root, output, bins, schemas, native_root, remote_root, config, env):
             args = [bins / 'state-audit', mode, db_root / namespace, shape]
             if mode == 'remote':
                 args += [config, namespace]
-            reports.append(command_json(args, output / f'audit-{index}-{mode}.json', env))
+            reports.append(command_json(args, output / f'audit{label}-{index}-{mode}.json', env))
         if reports[0]['tables'] != reports[1]['tables']:
             result['all_equal'] = False
         result['databases'][namespace] = dict(equal=reports[0]['tables']==reports[1]['tables'], native=reports[0], remote=reports[1])
@@ -314,12 +314,12 @@ def audit(root, output, bins, schemas, native_root, remote_root, config, env):
     if set(inventories[0]) != set(inventories[1]) or 'epochs' not in inventories[0]:
         raise ValueError('RocksDB coverage differs or committee store absent')
     for index, name in enumerate(sorted(inventories[0])):
-        reports = [command_json([bins / 'rocksdb-audit', stores[name]], output / f'rocks-{index}-{mode}.json', env)
+        reports = [command_json([bins / 'rocksdb-audit', stores[name]], output / f'rocks{label}-{index}-{mode}.json', env)
                    for mode, stores in zip(('native','remote'), inventories)]
         comparison = compare_local_store(name, *reports)
         result['rocksdb'][name] = comparison
         result['all_equal'] &= comparison['equal']
-    build.save(output / 'audit.json', result)
+    build.save(output / f'audit{label}.json', result)
     if not result['all_equal']:
         raise RuntimeError('exact final full-state audit differs')
     return result
@@ -518,6 +518,21 @@ def validate_checkpoint_diagnostics(counters, write_limit):
                 raise ValueError('checkpoint history IO counter unavailable or malformed: ' + counter)
 
 
+def external_index_rows_error(database):
+    """The hybrid index rows must come from TH_* so both measured nodes agree.
+
+    `SUI_SHARDED_WAL_CONFIG` may state an `index` section, but that document
+    reaches the hybrid coordinator only; the native node always builds its rows
+    from the env. A stated section would therefore size the two measured nodes
+    differently, and the campaign would compare unlike caches.
+    """
+    if 'index' in database:
+        return ('SUI_SHARDED_WAL_CONFIG states an index section; the campaign sets '
+                'index rows through TH_* so the native node and the hybrid coordinator '
+                'take the same values')
+    return None
+
+
 def external_durability_error(config, tier):
     """Return why an external deployment does not state `tier`, or None."""
     if tier not in ('native', 'synchronous'):
@@ -530,11 +545,13 @@ def external_durability_error(config, tier):
     return None
 
 
+INDEX_BLOB_CACHE_ENV = 'TH_INDEX_BLOB_CACHE_BYTES'
 MANAGED_ENV = {
     'TH_SYNC_WRITES', 'TH_FRAG_SIZE', 'TH_MAX_MAPS', 'TH_MAX_INDEX_MAPS',
     'TH_DEFAULT_MUTEX_COUNT', 'TH_DEFAULT_MAX_DIRTY_KEYS',
     'TH_DEFAULT_VALUE_CACHE_SIZE', 'TH_VALUE_CACHE_SIZE',
     'TH_SNAPSHOT_WRITTEN_BYTES', 'TH_INDEX_BLOB_CACHE_MIN_BYTES',
+    INDEX_BLOB_CACHE_ENV,
     'SUI_TH_READ_PROFILE_LIMIT', 'SUI_TH_NATIVE_WRITE_PROFILE_LIMIT',
     'SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY',
     'SUI_CHECKPOINT_EXECUTION_PACING_MS',
@@ -546,7 +563,7 @@ ENGINE_PREFIXES = ('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_',
 def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, pacing_ms,
                         value_cache_size, default_value_cache_size, max_dirty_keys,
                         snapshot_written_bytes, max_maps, max_index_maps,
-                        index_blob_cache_min_bytes,
+                        index_blob_cache_min_bytes, index_blob_cache_bytes,
                         read_profile_limit, native_write_profile_limit):
     """One explicit env for the replay; unknown inherited TH_* is refused."""
     if not 3 <= max_maps <= 32 or not 3 <= max_index_maps <= 32:
@@ -575,6 +592,8 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
         env['SUI_CHECKPOINT_EXECUTION_PACING_MS'] = str(pacing_ms)
     if value_cache_size is not None:
         env['TH_VALUE_CACHE_SIZE'] = str(value_cache_size)
+    if index_blob_cache_bytes:
+        env[INDEX_BLOB_CACHE_ENV] = str(index_blob_cache_bytes)
     return env
 
 
@@ -688,6 +707,240 @@ def configure_range(config, *, mode, tip, short_run):
     return config
 
 
+DURABLE_CUT_RECORD = 'durable-cut.v1'
+
+
+def index_blob_cache_support(build_root):
+    """True only when the frozen Sui turns the env row into the index config.
+
+    The native node and the hybrid coordinator both take their index rows from
+    `thdb_config`, so the row must exist there. A built `sui-node-*` binary's
+    strings are the final proof that the row was compiled in.
+    """
+    path = (Path(build_root)
+            / 'sources/sui/crates/typed-store/src/tidehunter_util.rs')
+    if path.is_file():
+        try:
+            if INDEX_BLOB_CACHE_ENV in path.read_text():
+                return True
+        except (OSError, UnicodeError):
+            pass
+    return any(_mentions(binary, INDEX_BLOB_CACHE_ENV)
+               for binary in sorted((Path(build_root) / 'binaries').glob('sui-node-*')))
+
+
+def index_blob_cache_error(build_root):
+    """Why this build cannot size the index blob cache, or None."""
+    if index_blob_cache_support(build_root):
+        return None
+    return ('the index blob cache needs ' + INDEX_BLOB_CACHE_ENV + ' in the frozen Sui fork: '
+            'crates/typed-store/src/tidehunter_util.rs::thdb_config builds the native Config '
+            'and the hybrid coordinator Config from env rows and has no row for '
+            'index_blob_cache_bytes, so the engine keeps its None default. An "index" section '
+            'in SUI_SHARDED_WAL_CONFIG reaches the hybrid coordinator only, never the native '
+            'node, so the two measured nodes cannot be set the same way. Rebuild Sui '
+            'hybrid-tidy with the env row, then repeat this cell.')
+
+
+def durable_cut_record(path):
+    """Parse one CRC-framed `durable-cut.v1` record (engine storage format)."""
+    import zlib
+    data = Path(path).read_bytes()
+    if len(data) < 8:
+        raise ValueError(f'durable-cut record is too short: {path}')
+    length, checksum = int.from_bytes(data[:4], 'big'), int.from_bytes(data[4:8], 'big')
+    payload = data[8:]
+    if len(payload) != length:
+        raise ValueError(f'durable-cut record has trailing bytes: {path}')
+    if zlib.crc32(payload) & 0xffffffff != checksum:
+        raise ValueError(f'durable-cut record CRC differs: {path}')
+    value = yaml.safe_load(payload)
+    if not isinstance(value, dict) or value.get('format') != 2:
+        raise ValueError(f'durable-cut record format differs: {path}')
+    return value
+
+
+def durable_cut_paths(remote_root, namespaces):
+    """Locate one record per audited namespace under the coordinator root."""
+    paths = {}
+    for namespace in namespaces:
+        directory = Path(remote_root) / namespace
+        direct = directory / DURABLE_CUT_RECORD
+        if direct.is_file():
+            paths[namespace] = direct
+            continue
+        matches = sorted(directory.rglob(DURABLE_CUT_RECORD)) if directory.is_dir() else []
+        if len(matches) == 1:
+            paths[namespace] = matches[0]
+    return paths
+
+
+def durable_cut_frontier(record):
+    """The tracked cut of one namespace, or None when the tier is untracked."""
+    live = record.get('live')
+    if live is None:
+        return None
+    if not isinstance(live, dict) or set(live) != {'epoch', 'next'}:
+        raise ValueError('durable-cut live frontier is malformed')
+    return dict(epoch=int(live['epoch']), next=int(live['next']))
+
+
+def durable_cut_comparison(before, after):
+    """A clean `flush_durable` certifies the prefix; recovery must not extend it."""
+    rows = {}
+    for namespace in sorted(before):
+        prior = durable_cut_frontier(before[namespace])
+        later = durable_cut_frontier(after[namespace])
+        if (prior is None) != (later is None):
+            raise ValueError(f'durable-cut tracking changed across the reopen: {namespace}')
+        if prior is None:
+            rows[namespace] = dict(tracked=False)
+            continue
+        if later['next'] > prior['next']:
+            raise ValueError(
+                'durable cut extended after flush_durable for '
+                f'{namespace}: next {prior["next"]} -> {later["next"]}')
+        rows[namespace] = dict(tracked=True, before=prior, after=later)
+    return dict(tracked=any(row['tracked'] for row in rows.values()), namespaces=rows,
+                scope='the durable cut after the last flush_durable, before and after the '
+                      'offline state audit and the clean reopen')
+
+
+def exports_comparison(before, after):
+    """A clean reopen adopts exposed namespaces; it must not export new ones."""
+    reason = 'the aggregate tidehunter_nvmeof_live_* family is missing from one scrape'
+    if not before['available'] or not after['available']:
+        return dict(available=False, reason=reason)
+    prior, later = before['counters'], after['counters']
+    if set(prior) != set(later):
+        raise ValueError('aggregate live NVMe-oF population changed across the reopen')
+    exposed, previous = later.get('target_exposed_total'), prior.get('target_exposed_total')
+    observed, fixtures = later.get('target_observed_partitions'), later.get('target_fixture_partitions')
+    if exposed is None or previous is None or observed is None or fixtures is None:
+        return dict(available=False, reason='live target exposure counters are absent')
+    if fixtures and observed and fixtures >= observed:
+        return dict(available=False,
+                    reason='every observed partition is a fixture target; no kernel namespace is exported',
+                    before=previous, after=exposed, observed_partitions=observed,
+                    fixture_partitions=fixtures)
+    if exposed < previous:
+        raise ValueError('live target exposure counter regressed across the reopen')
+    if exposed > previous:
+        raise ValueError(f'a clean reopen created {exposed - previous} new export(s)')
+    return dict(available=True, reason=None, before=previous, after=exposed,
+                observed_partitions=observed, fixture_partitions=fixtures,
+                scope='the pre-close scrape against the post-reopen scrape; the offline '
+                      'state audit opens the same authority in between')
+
+
+def audit_comparison(before, after):
+    """The full-state audit must not change across the reopen."""
+    def canonical(value):
+        return json.dumps(value, sort_keys=True)
+    rows = {}
+    for namespace in before['databases']:
+        rows[namespace] = dict(equal=(
+            canonical(before['databases'][namespace]['native']['tables'])
+            == canonical(after['databases'][namespace]['native']['tables'])
+            and canonical(before['databases'][namespace]['remote']['tables'])
+            == canonical(after['databases'][namespace]['remote']['tables'])))
+    for name in before['rocksdb']:
+        rows['rocksdb/' + name] = dict(equal=(
+            canonical(before['rocksdb'][name]) == canonical(after['rocksdb'][name])))
+    changed = sorted(name for name, row in rows.items() if not row['equal'])
+    if changed:
+        raise ValueError('the state audit differs after the reopen: ' + ', '.join(changed))
+    return dict(equal=True, namespaces=rows)
+
+
+def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound,
+           extra, tail_checkpoints):
+    """Restart the measured node, certify the frozen tip, then stop it cleanly.
+
+    The pinned Sui schedules from `highest_executed + 1`, so a node that already
+    holds the tip re-executes nothing. The engine's open still replays the owner
+    WAL tail above the durable cut, and the last K checkpoints are read back
+    through the reopened RPC surface and compared with the producer.
+    """
+    start = time.monotonic()
+    child = owned.start('reopen', [binary, '--config-path', root / 'remote.yaml',
+                                  '--run-with-range-checkpoint', replay_bound(bound)], extra)
+    try:
+        checkpoint.wait_rpc(child, address)
+        with urllib.request.urlopen(f'http://{address}/metrics', timeout=5) as response:
+            metrics = response.read(32 << 20).decode()
+        metrics, catchup = checkpoint.wait_for_rpc_indexes(child, address, tip, metrics)
+        certified = checkpoint.rpc(address, 'sui_getCheckpoint', [str(tip)])
+        first = max(0, tip - tail_checkpoints + 1)
+        sample = []
+        for sequence in range(first, tip + 1):
+            node = checkpoint.rpc(address, 'sui_getCheckpoint', [str(sequence)])
+            source = checkpoint.rpc(producer_address, 'sui_getCheckpoint', [str(sequence)])
+            if (int(node['sequenceNumber']) != sequence or node['digest'] != source['digest']):
+                raise RuntimeError(f'tail checkpoint {sequence} differs after the reopen')
+            sample.append(dict(sequenceNumber=sequence, digest=node['digest']))
+    finally:
+        owned.stop(child)
+    if child.returncode not in (0, -signal.SIGTERM):
+        raise RuntimeError('the reopen required a forced kill or failed')
+    (owned.root / 'reopen-final.prom').write_text(metrics)
+    return dict(seconds=time.monotonic() - start, exit_code=child.returncode,
+                certified=dict(sequenceNumber=int(certified['sequenceNumber']),
+                               digest=certified['digest'], epoch=int(certified['epoch'])),
+                rpc_index_catchup=catchup,
+                tail=dict(window=[first, tip], count=len(sample), sample=sample,
+                          source='read back through the reopened RPC and compared with '
+                                 'the producer')), metrics
+
+
+def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
+                     address, producer_address, tip, digest, bound, extra,
+                     schemas, native_root, config_path, env, tier, audit_before,
+                     tail_checkpoints=64):
+    """S1-1/S1-8: clean reopen, no new export, unchanged durable cut, same state."""
+    from analyze import adapter_stats, live_nvmeof_stats, parse_metrics
+    paths = durable_cut_paths(remote_root, namespaces)
+    missing = sorted(set(namespaces) - set(paths))
+    if missing:
+        raise ValueError('durable-cut record not found for namespace(s): '
+                         + ', '.join(missing) + f' under {remote_root}')
+    before_records = {name: durable_cut_record(path) for name, path in paths.items()}
+    before_live = live_nvmeof_stats(parse_metrics((output / 'remote-final.prom').read_text()))
+    receipt, metrics = reopen(owned, binary=bins / 'sui-node-remote', root=root,
+                             address=address, producer_address=producer_address, tip=tip,
+                             digest=digest, bound=bound, extra=extra,
+                             tail_checkpoints=tail_checkpoints)
+    after_records = {name: durable_cut_record(path) for name, path in paths.items()}
+    cut = durable_cut_comparison(before_records, after_records)
+    if tier == 'native' and not cut['tracked']:
+        raise ValueError('the native tier tracks a durable cut; none was recorded')
+    exports = exports_comparison(before_live, live_nvmeof_stats(parse_metrics(metrics)))
+    counters = adapter_stats(parse_metrics(metrics))
+    if not counters:
+        raise ValueError('the reopened node published no adapter counters')
+    publishes = {name: int(stats.get('write_commit_calls', -1))
+                 for name, stats in counters.items()}
+    if set(publishes) != set(namespaces):
+        raise ValueError('reopened adapter counters do not cover the audited namespaces')
+    absent = sorted(name for name, value in publishes.items() if value < 0)
+    if absent:
+        raise ValueError('the reopened node lacks the write-commit counter for: '
+                         + ', '.join(absent))
+    if any(publishes.values()):
+        raise ValueError('the reopen published a checkpoint instead of replaying the tail')
+    audit_after = audit(root, output, bins, schemas, native_root, remote_root,
+                        config_path, env, label='-reopen')
+    return dict(
+        status='clean-reopen-verified', tail_checkpoints=tail_checkpoints,
+        reopen=receipt, no_new_export=exports, durable_cut=cut,
+        tail_replay=dict(
+            state_unchanged=True, publishes=publishes,
+            sui_rescheduled_checkpoints=0,
+            source='engine open replays the owner WAL tail above the durable cut; '
+                   'the pinned Sui schedules from highest_executed + 1'),
+        audit_reopen=audit_comparison(audit_before, audit_after))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -726,7 +979,15 @@ def main():
     parser.add_argument('--max-index-maps', type=int, default=3,
                         help='TH_MAX_INDEX_MAPS index WAL maps; the engine panics below 3')
     parser.add_argument('--index-blob-cache-min-bytes', type=int, default=0,
-                        help='TH_INDEX_BLOB_CACHE_MIN_BYTES; 0 disables the index blob cache')
+                        help='TH_INDEX_BLOB_CACHE_MIN_BYTES; 0 admits every qualifying blob')
+    parser.add_argument('--index-blob-cache-mib', type=int, default=0,
+                        help='TH_INDEX_BLOB_CACHE_BYTES in MiB; 0 keeps the engine default (cache off). '
+                             'The frozen Sui must read the row for both measured nodes')
+    parser.add_argument('--lifecycle-checks', action='store_true',
+                        help='after a full replay: clean reopen, no new export, unchanged durable '
+                             'cut, tail replay idempotence and a second audit (S1-1/S1-8)')
+    parser.add_argument('--tail-checkpoints', type=int, default=64,
+                        help='last K checkpoints read back through the reopened node')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
                         help='coordinator disk inventory interval in seconds, 0 disables collection')
     parser.add_argument('--read-profile-limit', type=int, default=0,
@@ -777,6 +1038,10 @@ def main():
         raise ValueError('snapshot written bytes must be 0..1 TiB')
     if not 0 <= args.index_blob_cache_min_bytes <= 1 << 40:
         raise ValueError('index blob cache minimum must be 0..1 TiB')
+    if not 0 <= args.index_blob_cache_mib <= 4096:
+        raise ValueError('index blob cache budget must be 0..4096 MiB')
+    if not 1 <= args.tail_checkpoints <= 1024:
+        raise ValueError('tail checkpoint sample must be 1..1024')
     if args.external_config and args.local_transport != 'tcp':
         raise ValueError('local transport cannot override an external deployment')
     resident = (deployment.resident_read_config(read_json(args.resident_reads.resolve(strict=True)))
@@ -789,6 +1054,10 @@ def main():
     if args.pacing_ms and not pacing_available:
         raise ValueError('pacing requires SUI_CHECKPOINT_EXECUTION_PACING_MS support in the frozen '
                          'Sui fork; this fork has no pacing hook, so a paced run cannot be claimed')
+    if args.index_blob_cache_mib:
+        blob_error = index_blob_cache_error(build_root)
+        if blob_error is not None:
+            raise ValueError(blob_error)
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit'}:
         raise ValueError('build manifest lacks the exact required executable set')
     if args.local_transport in deployment.SOFTWARE_TRANSPORTS and not manifest['fabric']:
@@ -814,6 +1083,9 @@ def main():
         raise ValueError('fixture does not retain the complete genesis range')
     mode_range = replay_mode(source_tip, args.checkpoints)
     tip, short_run, bound = mode_range['tip'], mode_range['short_run'], mode_range['bound']
+    if args.lifecycle_checks and short_run:
+        raise ValueError('lifecycle checks need the whole frozen range; a short replay exits at '
+                         'the bound, so a clean reopen cannot be exercised')
     replay_digest = expected_digest
     prefix_epoch = None
     # Lock original fixture DB; only the experiment lock file is created there.
@@ -855,6 +1127,7 @@ def main():
         snapshot_written_bytes=args.snapshot_written_bytes, max_maps=args.max_maps,
         max_index_maps=args.max_index_maps,
         index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
+        index_blob_cache_bytes=args.index_blob_cache_mib * deployment.MIB,
         read_profile_limit=args.read_profile_limit,
         native_write_profile_limit=args.native_write_profile_limit)
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
@@ -879,6 +1152,11 @@ def main():
                    max_maps=args.max_maps,
                    max_index_maps=args.max_index_maps,
                    index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
+                   index_blob_cache_mib=args.index_blob_cache_mib,
+                   index_blob_cache_bytes=args.index_blob_cache_mib * deployment.MIB,
+                   index_blob_cache_source=INDEX_BLOB_CACHE_ENV,
+                   lifecycle_checks=args.lifecycle_checks,
+                   tail_checkpoints=args.tail_checkpoints,
                    source='explicit runtime env; nothing is inherited from TH_*'),
         cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
         owners=args.owners,
@@ -936,6 +1214,9 @@ def main():
                     raise ValueError('external storage partition population differs from the requested owners')
                 if database['read_cache_bytes'] != result['cache']['coordinator_bytes']:
                     raise ValueError('external coordinator cache differs')
+                index_error = external_index_rows_error(database)
+                if index_error is not None:
+                    raise ValueError(index_error)
                 if (resident is not None and
                         deployment.resident_read_config(database['tls'].get('resident_reads')) != resident):
                     raise ValueError('external resident-read policy differs from requested population')
@@ -1045,6 +1326,15 @@ def main():
         result['audit']=audit(root,output,bins,schema,native_root,remote_root,config_path,env)
         result['audit_scope'] = ('re-open of both stopped stores after a short bound; shards stayed live'
                                  if short_run else 're-open of both stopped stores; shards stayed live')
+        if args.lifecycle_checks:
+            result['lifecycle'] = lifecycle_checks(
+                owned, bins=bins, root=root, output=output, remote_root=remote_root,
+                namespaces=set(schema), address=configs['remote']['json-rpc-address'],
+                producer_address=configs['producer']['json-rpc-address'],
+                tip=tip, digest=replay_digest, bound=bound, extra=remote_extra,
+                schemas=schema, native_root=native_root, config_path=config_path,
+                env=env, tier=args.durability_tier,
+                audit_before=result['audit'], tail_checkpoints=args.tail_checkpoints)
         if producer.poll() is not None or int(checkpoint.rpc(address,'sui_getLatestCheckpointSequenceNumber')) != source_tip or checkpoint.verify_source_range(address,source_tip)!=result['source_range']:
             raise RuntimeError('source changed across paired replays')
         if tip != source_tip and checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])['digest'] != replay_digest:

@@ -617,8 +617,8 @@ class RunnerKnobs(unittest.TestCase):
                       value_cache_size=None, default_value_cache_size=1000,
                       max_dirty_keys=1024, snapshot_written_bytes=8 << 30, max_maps=3,
                       max_index_maps=3,
-                      index_blob_cache_min_bytes=0, read_profile_limit=0,
-                      native_write_profile_limit=0)
+                      index_blob_cache_min_bytes=0, index_blob_cache_bytes=0,
+                      read_profile_limit=0, native_write_profile_limit=0)
         values.update(changes)
         return run.runtime_environment(
             {'PATH': '/bin', 'TH_MAX_MAPS': '99',
@@ -649,8 +649,8 @@ class RunnerKnobs(unittest.TestCase):
                 fragment_mib=8, driver_concurrency=4, pacing_ms=0, value_cache_size=None,
                 default_value_cache_size=1000, max_dirty_keys=1024,
                 snapshot_written_bytes=8 << 30, max_maps=3, max_index_maps=3,
-                index_blob_cache_min_bytes=0, read_profile_limit=0,
-                native_write_profile_limit=0)
+                index_blob_cache_min_bytes=0, index_blob_cache_bytes=0,
+                read_profile_limit=0, native_write_profile_limit=0)
 
     def test_value_and_index_map_limits_are_independent_and_never_panic(self):
         env = self.environment(max_maps=5, max_index_maps=3)
@@ -738,6 +738,236 @@ class RunnerKnobs(unittest.TestCase):
             self.assertTrue(run.pacing_support(Path(tmp)))
             binary.write_bytes(b'\0' * 8192)
             self.assertFalse(run.pacing_support(Path(tmp)))
+
+
+def durable_cut_frame(live, *, epoch=2, next_=16, format=2, crc_delta=0):
+    """One CRC-framed `durable-cut.v1` payload, as the engine writes it."""
+    import zlib
+    payload = json.dumps(dict(format=format, database=[0] * 16,
+                              live=None if live is None else
+                              dict(epoch=epoch, next=next_),
+                              owners=[], truncations=[]),
+                         sort_keys=True).encode()
+    checksum = (zlib.crc32(payload) + crc_delta) & 0xffffffff
+    return len(payload).to_bytes(4, 'big') + checksum.to_bytes(4, 'big') + payload
+
+
+class IndexRowsAgreement(unittest.TestCase):
+    def test_a_stated_index_section_would_desynchronise_the_nodes(self):
+        self.assertIsNone(run.external_index_rows_error({'endpoints': []}))
+        message = run.external_index_rows_error({'index': dict(frag_size=64 << 20)})
+        self.assertIn('index section', message)
+        self.assertIn('native node', message)
+
+
+class LifecycleChecks(unittest.TestCase):
+    def test_durable_cut_record_is_the_engine_crc_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'durable-cut.v1'
+            path.write_bytes(durable_cut_frame(True))
+            record = run.durable_cut_record(path)
+            self.assertEqual(run.durable_cut_frontier(record), dict(epoch=2, next=16))
+            untracked = path.with_name('untracked.v1')
+            untracked.write_bytes(durable_cut_frame(None))
+            self.assertIsNone(run.durable_cut_frontier(
+                run.durable_cut_record(untracked)))
+            path.write_bytes(durable_cut_frame(True, crc_delta=1))
+            with self.assertRaisesRegex(ValueError, 'CRC'):
+                run.durable_cut_record(path)
+            path.write_bytes(durable_cut_frame(True)[:-1])
+            with self.assertRaisesRegex(ValueError, 'trailing'):
+                run.durable_cut_record(path)
+            path.write_bytes(durable_cut_frame(True, format=1))
+            with self.assertRaisesRegex(ValueError, 'format'):
+                run.durable_cut_record(path)
+            with self.assertRaisesRegex(ValueError, 'malformed'):
+                run.durable_cut_frontier(dict(format=2, live=dict(epoch=1)))
+
+    def test_durable_cut_comparison_refuses_an_extension(self):
+        record = lambda next_: dict(format=2, live=dict(epoch=2, next=next_))
+        before, same, extended = (record(16), record(16), record(17))
+        compared = run.durable_cut_comparison(dict(a=before), dict(a=same))
+        self.assertTrue(compared['tracked'])
+        self.assertIn('flush_durable', compared['scope'])
+        self.assertEqual(compared['namespaces'], {'a': dict(
+            tracked=True, before=dict(epoch=2, next=16),
+            after=dict(epoch=2, next=16))})
+        with self.assertRaisesRegex(ValueError, 'extended after flush_durable'):
+            run.durable_cut_comparison(dict(a=before), dict(a=extended))
+        untracked = dict(format=2, live=None)
+        skipped = run.durable_cut_comparison(dict(a=untracked), dict(a=untracked))
+        self.assertEqual((skipped['tracked'], skipped['namespaces']),
+                         (False, {'a': dict(tracked=False)}))
+        with self.assertRaisesRegex(ValueError, 'tracking changed'):
+            run.durable_cut_comparison(dict(a=untracked), dict(a=before))
+
+    def test_durable_cut_paths_find_the_namespace_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'remote'
+            direct = root / 'live/checkpoints/durable-cut.v1'
+            direct.parent.mkdir(parents=True)
+            direct.write_bytes(durable_cut_frame(True))
+            nested = root / 'live/store/perpetual/authority/durable-cut.v1'
+            nested.parent.mkdir(parents=True)
+            nested.write_bytes(durable_cut_frame(True))
+            (root / 'live/store/epoch_0').mkdir(parents=True)
+            paths = run.durable_cut_paths(root, ['live/checkpoints', 'live/store/perpetual',
+                                                 'live/store/epoch_0'])
+            self.assertEqual(paths, {'live/checkpoints': direct,
+                                     'live/store/perpetual': nested})
+
+    def live(self, exposed, observed=2, fixtures=0):
+        return dict(available=True, counters={
+            'target_exposed_total': exposed, 'target_observed_partitions': observed,
+            'target_fixture_partitions': fixtures})
+
+    def test_exports_comparison_refuses_a_new_export(self):
+        compared = run.exports_comparison(self.live(6), self.live(6))
+        self.assertEqual({key: compared[key] for key in
+                          ('available', 'reason', 'before', 'after',
+                           'observed_partitions', 'fixture_partitions')},
+                         dict(available=True, reason=None, before=6, after=6,
+                              observed_partitions=2, fixture_partitions=0))
+        self.assertIn('post-reopen scrape', compared['scope'])
+        with self.assertRaisesRegex(ValueError, '1 new export'):
+            run.exports_comparison(self.live(6), self.live(7))
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            run.exports_comparison(self.live(7), self.live(6))
+        fixture = run.exports_comparison(self.live(0, fixtures=2), self.live(0, fixtures=2))
+        self.assertFalse(fixture['available'])
+        self.assertIn('fixture target', fixture['reason'])
+        missing = run.exports_comparison(dict(available=False, counters={}),
+                                         self.live(0))
+        self.assertFalse(missing['available'])
+
+    def audit(self, tables):
+        return dict(databases={'ns': dict(native=dict(tables=tables),
+                                         remote=dict(tables=tables))},
+                    rocksdb={'store': dict(equal=True, tables=tables)})
+
+    def test_audit_comparison_refuses_a_changed_table(self):
+        same = self.audit({'t': [1, 'a']})
+        self.assertTrue(run.audit_comparison(same, self.audit({'t': [1, 'a']}))['equal'])
+        with self.assertRaisesRegex(ValueError, 'differs after the reopen'):
+            run.audit_comparison(same, self.audit({'t': [2, 'a']}))
+
+    def test_index_blob_cache_needs_the_frozen_sui_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            engine = root / 'sources/sui/crates/typed-store/src/tidehunter_util.rs'
+            engine.parent.mkdir(parents=True)
+            engine.write_text('fn thdb_config() { Config::default() }\n')
+            self.assertFalse(run.index_blob_cache_support(root))
+            message = run.index_blob_cache_error(root)
+            self.assertIn('TH_INDEX_BLOB_CACHE_BYTES', message)
+            self.assertIn('thdb_config', message)
+            self.assertIn('native node', message)
+            engine.write_text(
+                'let v = parse_env_usize("TH_INDEX_BLOB_CACHE_BYTES", 1);\n')
+            self.assertTrue(run.index_blob_cache_support(root))
+            self.assertIsNone(run.index_blob_cache_error(root))
+            engine.unlink()
+            (root / 'binaries').mkdir()
+            binary = root / 'binaries/sui-node-remote'
+            binary.write_bytes(b'\0' * 4096 + b'TH_INDEX_BLOB_CACHE_BYTES' + b'\0' * 16)
+            self.assertTrue(run.index_blob_cache_support(root))
+            binary.write_bytes(b'\0' * 8192)
+            self.assertFalse(run.index_blob_cache_support(root))
+
+    def test_index_blob_cache_is_an_explicit_off_by_default_knob(self):
+        environment = dict(tier='native', fragment_mib=8, driver_concurrency=4,
+                           pacing_ms=0, value_cache_size=None,
+                           default_value_cache_size=1000, max_dirty_keys=1024,
+                           snapshot_written_bytes=8 << 30, max_maps=3,
+                           max_index_maps=3, index_blob_cache_min_bytes=0,
+                           read_profile_limit=0, native_write_profile_limit=0)
+        off = run.runtime_environment({'PATH': '/bin'}, index_blob_cache_bytes=0,
+                                      **environment)
+        self.assertNotIn('TH_INDEX_BLOB_CACHE_BYTES', off)
+        inherited = run.runtime_environment({'TH_INDEX_BLOB_CACHE_BYTES': '1024'},
+                                            index_blob_cache_bytes=0, **environment)
+        self.assertNotIn('TH_INDEX_BLOB_CACHE_BYTES', inherited,
+                         'an inherited budget never sizes the cache behind the runner')
+        on = run.runtime_environment({'PATH': '/bin'},
+                                     index_blob_cache_bytes=(1 << 30), **environment)
+        self.assertEqual(on['TH_INDEX_BLOB_CACHE_BYTES'], str(1 << 30))
+
+
+class ReopenWithFakes(unittest.TestCase):
+    """The reopen orchestration against a fake node, RPC and metrics server."""
+
+    class Child:
+        returncode = -signal.SIGTERM
+
+    class Owned:
+        def __init__(self, root):
+            self.root, self.commands, self.stopped = Path(root), [], []
+
+        def start(self, name, command, extra=None):
+            self.commands.append((name, [str(part) for part in command], extra))
+            return ReopenWithFakes.Child()
+
+        def stop(self, child):
+            self.stopped.append(child)
+
+    class Response:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=-1):
+            return self.data
+
+    def reopen(self, root, *, producer_delta='', tail=2):
+        owned = self.Owned(root)
+
+        def rpc(address, method, params):
+            sequence = int(params[0])
+            shift = producer_delta if address == 'producer' else ''
+            return dict(sequenceNumber=sequence, digest=f'D{sequence}{shift}', epoch=0)
+
+        with patch.object(run.checkpoint, 'wait_rpc', lambda child, address: 1775), \
+                patch.object(run.checkpoint, 'wait_for_rpc_indexes',
+                             lambda child, address, tip, metrics: (
+                                 metrics, dict(status='all-ten-committed-at-frozen-tip'))), \
+                patch.object(run.checkpoint, 'rpc', rpc), \
+                patch.object(run.urllib.request, 'urlopen',
+                             lambda *args, **kwargs: self.Response(
+                                 b'last_executed_checkpoint 1775\n')):
+            receipt, metrics = run.reopen(
+                owned, binary='sui-node-remote', root=Path(root), address='node',
+                producer_address='producer', tip=1775, digest='D1775', bound=1776,
+                extra={'SUI_SHARDED_WAL_CONFIG': 'config.json'},
+                tail_checkpoints=tail)
+        return owned, receipt, metrics
+
+    def test_reopen_certifies_the_tip_and_reads_back_the_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owned, receipt, metrics = self.reopen(tmp)
+            self.assertEqual(receipt['certified'], dict(
+                sequenceNumber=1775, digest='D1775', epoch=0))
+            self.assertEqual(receipt['tail']['window'], [1774, 1775])
+            self.assertEqual([row['digest'] for row in receipt['tail']['sample']],
+                             ['D1774', 'D1775'])
+            self.assertEqual(receipt['exit_code'], -signal.SIGTERM)
+            self.assertEqual(len(owned.stopped), 1)
+            name, command, extra = owned.commands[0]
+            self.assertEqual(name, 'reopen')
+            self.assertEqual(command[-2:], ['--run-with-range-checkpoint', '1776'],
+                             'the inclusive bound stays above the persisted watermark')
+            self.assertEqual(extra, {'SUI_SHARDED_WAL_CONFIG': 'config.json'})
+            self.assertEqual((Path(tmp) / 'reopen-final.prom').read_bytes(),
+                             b'last_executed_checkpoint 1775\n')
+
+    def test_a_changed_tail_digest_fails_the_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                self.assertRaisesRegex(RuntimeError, 'differs after the reopen'):
+            self.reopen(tmp, producer_delta='!', tail=1)
 
 
 class CampaignBuildTargets(unittest.TestCase):

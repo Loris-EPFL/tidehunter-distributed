@@ -495,6 +495,9 @@ def verified_replay(root):
                              'older schema evidence is not re-decoded')
         final_by_mode = {mode: parse_metrics(archived_bytes(
             archive, f'experiment/{mode}-final.prom').decode()) for mode in ('native', 'remote')}
+        lifecycle = result.get('lifecycle')
+        reopened = (archived_json(archive, 'experiment/audit-reopen.json')
+                    if lifecycle is not None else None)
         for mode, values in final_by_mode.items():
             cut = result[mode].get('final_metrics_freshness', {})
             namespaces = cut.get('required_namespaces', [])
@@ -527,6 +530,15 @@ def verified_replay(root):
             raise ValueError('completed replay digest differs')
     if any(comparison.get('equal') is not True for comparison in audit['databases'].values()):
         raise ValueError('selected Tidehunter database differs')
+    if result.get('lifecycle') is not None:
+        from run import audit_comparison
+        lifecycle = result['lifecycle']
+        if lifecycle.get('status') != 'clean-reopen-verified':
+            raise ValueError('lifecycle checks are present but not verified')
+        if lifecycle.get('audit_reopen') != audit_comparison(audit, reopened):
+            raise ValueError('the reopen audit record differs from the archived audit')
+        if lifecycle.get('tail_replay', {}).get('state_unchanged') is not True:
+            raise ValueError('the tail replay did not preserve state')
     cut = result['remote'].get('final_metrics_freshness', {})
     namespaces = cut.get('required_namespaces')
     if not namespaces:
@@ -547,6 +559,8 @@ def summarize_verified(verified):
         durability=result['durability'],cache=result['cache'],
         read_profile_limit=result.get('read_profile_limit', 0),
         write_profile_limit=result.get('write_profile_limit', 0),modes={},table_counts={})
+    if result.get('lifecycle') is not None:
+        summary['lifecycle'] = result['lifecycle']
     summary['native_write_profile_limit'] = result.get('native_write_profile_limit', 0)
     for mode in ('native','remote'):
         replay=result[mode]
