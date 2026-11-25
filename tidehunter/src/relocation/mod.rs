@@ -545,7 +545,16 @@ impl RelocationDriver {
         let mut terminal_position = 0;
         loop {
             let entry = wal_iterator.next();
-            if matches!(entry, Err(WalError::Crc(_) | WalError::EndOfWal)) {
+            if let Err(error @ (WalError::Crc(_) | WalError::EndOfWal)) = &entry {
+                // The scan read every frame below the processed frontier, and
+                // nothing is written at the frontier: the processed prefix is
+                // complete. A stop below the frontier, or a torn or corrupt
+                // frame at it, leaves the terminal at zero.
+                if wal_iterator.position() == upper_limit
+                    && (matches!(error, WalError::EndOfWal) || wal_iterator.is_zeroed_header())
+                {
+                    terminal_position = upper_limit;
+                }
                 break;
             }
             let (position, raw_entry) = entry?;

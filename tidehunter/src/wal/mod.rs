@@ -1337,6 +1337,24 @@ impl WalIterator {
         }
     }
 
+    /// Position of the next frame to read.
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Whether the frame header at the cursor is all zero bytes, as in space
+    /// the writer has not reached. A torn or corrupt header is not zero.
+    pub(crate) fn is_zeroed_header(&self) -> bool {
+        let (map_id, offset) = self.wal.layout.locate(self.position);
+        let start = offset as usize;
+        self.map.id == map_id
+            && self
+                .map
+                .data
+                .get(start..start + CrcFrame::CRC_HEADER_LENGTH)
+                .is_some_and(|header| header.iter().all(|byte| *byte == 0))
+    }
+
     /// Skip CRC verification when reading frames.
     /// Useful for inspection tools that prioritise speed or need to read potentially
     /// corrupted WAL files.

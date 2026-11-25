@@ -875,6 +875,11 @@ fn test_relocation_strategies_produce_identical_results() {
 
         (db_wal, db_index, ks)
     };
+    let first_wal_file = dir1.path().join(format!(
+        "wal_{:016x}",
+        db_wal.wal.min_wal_position() / config.wal_file_size
+    ));
+
     // Run different relocation strategies
     db_wal.rebuild_control_region().unwrap();
     db_index.rebuild_control_region().unwrap();
@@ -891,17 +896,25 @@ fn test_relocation_strategies_produce_identical_results() {
         assert_eq!(val_wal, val_index, "Databases differ for key {}", key);
     }
 
-    // Index-based relocation processes cells on every pass. A WAL-based pass
-    // over an idle unfiltered keyspace finds no terminal (the scan ends at the
-    // processed frontier), so it reclaims nothing: that needs the terminal
-    // fallback, which native does not have (upstream leaves `terminal_position`
-    // at zero without a `StopRelocation` marker).
+    // Both strategies must have done work: WAL-based copied live entries
+    // below its target, index-based processed cells. An idle unfiltered
+    // keyspace reaches the processed frontier as its terminal (the fallback in
+    // `relocate_wal_prefix`), so the WAL pass has a whole-file target.
+    let wal_kept = metrics_wal
+        .relocation_kept
+        .with_label_values(&["test"])
+        .get();
     let index_processed = relocation_cells_processed(&metrics_index, "test");
+    assert!(wal_kept > 0, "WAL-based should have copied live entries");
     assert!(
         index_processed > 0,
         "Index-based should have processed some cells"
     );
     db_wal.wait_for_background_threads_to_finish();
+    assert!(
+        !first_wal_file.exists(),
+        "WAL-based should have reclaimed the first WAL file"
+    );
     db_index.wait_for_background_threads_to_finish();
 }
 
