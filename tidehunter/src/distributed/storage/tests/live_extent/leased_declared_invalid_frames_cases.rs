@@ -675,11 +675,11 @@ fn leased_large_close_releases_state_and_excludes_other_extent_mutations() {
     ));
     assert!(matches!(
         log.adopt_live_extent(authority(&config), token, 8192, false),
-        Err(StorageError::Invalid(_))
+        Err(StorageError::LiveCloseInProgress)
     ));
     assert!(matches!(
         log.adopt_live_extent(authority(&config), token, 4096, true),
-        Err(StorageError::Invalid(_))
+        Err(StorageError::LiveCloseInProgress)
     ));
     log.self_adopt_live_extent().unwrap();
     assert!(log.state.lock().poison.is_none());
@@ -869,4 +869,63 @@ fn leased_seal_refuses_an_unlocked_close_without_poisoning_it() {
     assert!(close.join().unwrap().unwrap().0.closed);
     log.persist_appended().unwrap();
     log.seal_live_epoch(authority(&config), || Ok(())).unwrap();
+}
+
+/// A close this owner is still executing is a typed, retryable refusal, not a
+/// poisoned stream: the second request changes nothing, a probe at the frontier
+/// is still answered, and a retry after the close completed returns its summary.
+#[test]
+fn leased_close_in_progress_is_typed_and_retryable() {
+    let (_temp, config, log) = fixture();
+    let log = Arc::new(log);
+    let extent = log.lease_live_extent(authority(&config)).unwrap().0;
+    let (_, frame) = encoded(&config, vec![batch(&config, 0)]);
+    write(&extent, 0, &frame);
+    skip(&extent, 4096);
+    log.adopt_live_extent(authority(&config), extent.token, 4096, false)
+        .unwrap();
+    let (entered, resume) = log.pause_live(LivePausePoint::CloseSuffix);
+    let worker = log.clone();
+    let auth = authority(&config);
+    let token = extent.token;
+    let close = std::thread::spawn(move || worker.adopt_live_extent(auth, token, 4096, true));
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the close reached its suffix scan");
+    // The close dropped the state lock: its frontier is readable, its outcome is
+    // not. Both a repeated close and a probe past the frontier are the same
+    // typed refusal, and neither poisons the stream.
+    assert!(matches!(
+        log.adopt_live_extent(authority(&config), token, 4096, true),
+        Err(StorageError::LiveCloseInProgress)
+    ));
+    assert!(matches!(
+        log.adopt_live_extent(authority(&config), token, 8192, false),
+        Err(StorageError::LiveCloseInProgress)
+    ));
+    let summary = log
+        .adopt_live_extent(authority(&config), token, 4096, false)
+        .unwrap()
+        .0;
+    assert_eq!(summary.adopted_end, 4096, "the frontier is still readable");
+    assert!(!summary.closed, "the close has not finished");
+    assert!(
+        log.state.lock().poison.is_none(),
+        "an in-progress close is not a poison"
+    );
+    resume.send(()).unwrap();
+    let closed = close.join().unwrap().unwrap().0;
+    assert!(closed.closed);
+    // A coordinator whose reply was lost retries the close and is answered from
+    // the closed summary.
+    let retried = log
+        .adopt_live_extent(authority(&config), token, 4096, true)
+        .unwrap()
+        .0;
+    assert!(retried.closed, "the retry reads the completed close");
+    assert_eq!(retried.adopted_end, 4096);
+    assert!(
+        log.state.lock().poison.is_none(),
+        "the retried close changes nothing"
+    );
 }

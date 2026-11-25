@@ -116,20 +116,26 @@ fn value(db: &mut super::super::RemoteDatabase, key: u32) -> Option<Vec<u8>> {
 }
 
 /// A coordinator lease that lapses between two steps of one resume is a
-/// fail-stop: the step that runs next observes the lapse, the write that
-/// triggered the resume is never acknowledged, no later write is admitted, and
-/// the reopened database serves exactly the acknowledged prefix.
+/// fail-stop: the step that runs next observes the lapse, no resend is
+/// submitted after the lapse, the write whose completion reported the break is
+/// never acknowledged, no later write is admitted, and the reopened database
+/// serves the acknowledged prefix as a whole per batch.
 ///
 /// The step seam lapses the same stamp the production renewer would repair, and
 /// `lapse_for_test` keeps it lapsed, so the assertion never races the renewer
-/// thread or depends on a clock.
+/// thread or depends on a clock. The retained state is controlled: the batch
+/// that breaks is submitted and retained, and no durable-cut nudge adopts it
+/// behind the worker's back, so it is still owed a resend when the resume runs
+/// and the per-frame lease check is the only thing that can stop that rewrite.
 #[test]
 fn lease_lapse_between_resume_steps_fail_stops_and_recovers_a_prefix() {
     use super::super::pipeline_tests::Fixture;
     use crate::key_shape::{KeyShape, KeyType};
     // The default fixture geometry is one 4 KiB frame per extent, so every write
     // rolls over and the resume would probe a preleased extent. A 64 KiB extent
-    // keeps the break on one open extent, which is what this test measures.
+    // keeps the break on one open extent. A durable-cut lag longer than the test
+    // keeps the coordinator from nudging the owner, so the owed frame keeps its
+    // place above the owner's frontier.
     let fixture = Fixture::new_with_config(
         128,
         KeyShape::new_single(4, 1, KeyType::uniform(1)),
@@ -137,6 +143,8 @@ fn lease_lapse_between_resume_steps_fail_stops_and_recovers_a_prefix() {
         |config| {
             config.storage.fragment_bytes = 64 * 1024;
             config.storage.wal_file_bytes = 128 * 1024;
+            config.durable_cut.lag_ms = 3_600_000;
+            config.durable_cut.lag_bytes = 1 << 40;
         },
     );
     let mut db = fixture.open();
@@ -145,21 +153,57 @@ fn lease_lapse_between_resume_steps_fail_stops_and_recovers_a_prefix() {
     let acknowledged = batch(&fixture, 1, 1);
     db.write_batch(acknowledged, vec![put(1, 1), put(2, 2)])
         .expect("the first write is acknowledged before the lapse");
-    // Arm the lapse at the boundary after the extent probe, and lose the queue
-    // of the next submission: that submission enters the resume, probes the
-    // owner, and only then meets the lapsed lease.
+    // The lapse lands after the probe of the first attempt. The next write's
+    // completion reports a lost controller: its frame is submitted and retained,
+    // so the resume owes it a resend and the rewrite step is where the lapsed
+    // lease must stop it.
     let validity = db.lease.validity(1);
-    let mut client = db.core.clients[1].client.lock();
-    client.leased_test_lapse_lease_after_step(3, validity);
-    client.leased_test_fail_submit(libc::ENODEV);
-    drop(client);
+    {
+        let mut client = db.core.clients[1].client.lock();
+        client.leased_test_lapse_lease_after_step(3, validity);
+        client.leased_test_fail_write(-libc::ENODEV);
+    }
     let error = db
         .write_batch(batch(&fixture, 1, 2), vec![put(3, 3), put(4, 4)])
-        .expect_err("no write is acknowledged after the lapse");
+        .expect_err("a lost completion is never acknowledged");
     assert!(
         error.uncertain_version.is_some(),
         "the unacknowledged batch is reported as uncertain: {error}"
     );
+    // The lapse stops the first attempt at the step that rechecks the lease, and
+    // the episode's retry stops at its probe. The first attempt's exact boundary
+    // is the rewrite step when the retained frame is still owed and the
+    // declaration step when the owner's syncer already adopted it; both are
+    // inside the episode, and no resend is ever submitted after the lapse.
+    let client = db.core.clients[1].client.lock();
+    assert_eq!(
+        client.leased_test_lapse_at(),
+        Some((0, 3)),
+        "the lapse lands after the probe of the first attempt"
+    );
+    let attempts = client.leased_test_attempt_steps().to_vec();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the episode retried once, saw attempts {attempts:?}"
+    );
+    assert_eq!(
+        attempts[1], 2,
+        "the retry stops at its probe, saw attempts {attempts:?}"
+    );
+    assert!(
+        (3..=4).contains(&attempts[0]),
+        "the first attempt stops at the data or declaration step, saw {attempts:?}"
+    );
+    assert!(
+        client.leased_test_rewrites().is_empty(),
+        "no resend is submitted after the lapse"
+    );
+    assert!(
+        !client.leased_test_resume_targets().is_empty(),
+        "the resume probed an extent before the lapse"
+    );
+    drop(client);
     // The database fail-stops: no write is admitted and no read is served.
     assert!(
         db.core.ensure_healthy().is_err(),
@@ -171,21 +215,10 @@ fn lease_lapse_between_resume_steps_fail_stops_and_recovers_a_prefix() {
         "a failed database serves no read"
     );
     assert!(
-        db.write_batch(batch(&fixture, 1, 3), vec![put(5, 5)])
+        db.write_batch(batch(&fixture, 1, 4), vec![put(7, 7)])
             .is_err(),
         "a write after the lapse is refused"
     );
-    let client = db.core.clients[1].client.lock();
-    assert!(
-        !client.leased_test_resume_targets().is_empty(),
-        "the resume probed an extent before the lapse"
-    );
-    let steps = client.leased_test_resume_steps();
-    assert!(
-        (2..7).contains(&steps),
-        "the lapse must stop the resume between its steps, saw {steps} of 7"
-    );
-    drop(client);
     let first = db
         .core
         .first_failure
@@ -201,18 +234,18 @@ fn lease_lapse_between_resume_steps_fail_stops_and_recovers_a_prefix() {
     );
     drop(db);
     // The reopen replays the durable image: the acknowledged batch is served,
-    // the unacknowledged one is absent as a whole, and the database accepts
-    // new writes again.
+    // the refused batch is absent, and the batch whose completion was lost is
+    // resolved as a whole (its keys appear together or not at all) because its
+    // frame may have reached the owner without an acknowledgement.
     let mut reopened = fixture.open();
     assert_eq!(value(&mut reopened, 1), Some(vec![1; 32]));
     assert_eq!(value(&mut reopened, 2), Some(vec![2; 32]));
-    for key in [3u32, 4, 5] {
-        assert_eq!(
-            value(&mut reopened, key),
-            None,
-            "key {key} of an unacknowledged batch is not served"
-        );
-    }
+    assert_eq!(
+        value(&mut reopened, 3).is_some(),
+        value(&mut reopened, 4).is_some(),
+        "an unacknowledged batch is served as a whole or not at all"
+    );
+    assert_eq!(value(&mut reopened, 7), None, "the refused batch is absent");
     reopened
         .write_batch(batch(&fixture, 1, 9), vec![put(6, 6)])
         .expect("the reopened database accepts a new write");

@@ -99,6 +99,18 @@ fn write_extent_bytes(path: &std::path::Path, start: u64, segment_bytes: u64, by
     write_file_bytes(path, start % segment_bytes, bytes);
 }
 
+/// The owner's adopted frontier of `extent`, read with the resume's own probe.
+/// The probe asks at the extent's start, so the owner answers from memory and
+/// adopts nothing: only the bytes above the returned frontier are owed a
+/// resend, and no fixed frame count is assumed.
+fn owner_frontier(client: &mut Client, extent: &ExtentSnapshot) -> u64 {
+    client
+        .probe_live_extent(1, extent.token, extent.start)
+        .expect("the owner answers a probe at the extent's start")
+        .adoption
+        .adopted_end
+}
+
 fn counters(fixture: &Fixture) -> crate::distributed::nvmeof::live_metrics::LiveNvmeCounts {
     fixture.metrics.snapshot().counts
 }
@@ -1169,32 +1181,51 @@ fn closing_extent_is_resumed_then_current() {
         7,
         "the four closing frames and the three current frames wait for an adoption"
     );
-    // The pre-break image of both extents, then a tear of both unadopted tails,
-    // so only a byte-identical resend can restore what the coordinator
-    // acknowledged.
+    // Only what sits above the owner's frontier is owed a resend, so both the
+    // tear and the expected counts follow it instead of a fixed layout.
+    let closing_frontier = owner_frontier(&mut client, &closing);
+    let current_frontier = owner_frontier(&mut client, &current);
+    let owed_closing_bytes =
+        usize::try_from(closing.cursor - closing_frontier).expect("bounded extent");
+    let owed_current_bytes =
+        usize::try_from(current.cursor - current_frontier).expect("bounded extent");
+    assert!(
+        owed_closing_bytes.is_multiple_of(4096) && owed_current_bytes.is_multiple_of(4096),
+        "a resend tail is whole aligned frames"
+    );
+    let owed_closing = owed_closing_bytes / 4096;
+    let owed_current = owed_current_bytes / 4096;
+    assert!(
+        owed_closing + owed_current >= 1,
+        "the tear needs a frame above the owner's frontier, saw {closing_frontier}..{} and {current_frontier}..{}",
+        closing.cursor,
+        current.cursor
+    );
+    // The pre-break image of both unadopted tails, then their tear, so only a
+    // byte-identical resend can restore what the coordinator acknowledged.
     let clean_closing = extent_bytes(
         &closing.path,
-        closing.start,
+        closing_frontier,
         closing.cursor,
         closing.segment_bytes,
     );
     let clean_current = extent_bytes(
         &current.path,
-        current.start,
+        current_frontier,
         current.cursor,
         current.segment_bytes,
     );
     write_extent_bytes(
         &closing.path,
-        closing.start,
+        closing_frontier,
         closing.segment_bytes,
-        &vec![0u8; usize::try_from(closing.cursor - closing.start).expect("bounded extent")],
+        &vec![0u8; owed_closing_bytes],
     );
     write_extent_bytes(
         &current.path,
-        current.start,
+        current_frontier,
         current.segment_bytes,
-        &vec![0u8; usize::try_from(current.cursor - current.start).expect("bounded extent")],
+        &vec![0u8; owed_current_bytes],
     );
     client.leased_test_fail_submit(libc::ENODEV);
     submit(&mut client, &fixture, 11);
@@ -1205,8 +1236,9 @@ fn closing_extent_is_resumed_then_current() {
     assert_eq!(counts.resume_attempts, 1, "one resume attempt");
     assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
     assert_eq!(
-        counts.resume_frames, 7,
-        "the four closing frames and the three current frames are resent"
+        counts.resume_frames,
+        (owed_closing + owed_current) as u64,
+        "the frames above each frontier are resent"
     );
     assert_eq!(
         client.leased_test_resume_targets(),
@@ -1218,9 +1250,13 @@ fn closing_extent_is_resumed_then_current() {
         "the resume closed the closing extent and retired it"
     );
     let rewrites = client.leased_test_rewrites();
-    assert_eq!(rewrites.len(), 7, "every unadopted frame was resent once");
-    let (closing_rewrites, current_rewrites) = rewrites.split_at(4);
-    let mut expected = closing.start;
+    assert_eq!(
+        rewrites.len(),
+        owed_closing + owed_current,
+        "every unadopted frame was resent once"
+    );
+    let (closing_rewrites, current_rewrites) = rewrites.split_at(owed_closing);
+    let mut expected = closing_frontier;
     for (token, start, len, _) in closing_rewrites {
         assert_eq!(
             *token, closing.token,
@@ -1228,16 +1264,16 @@ fn closing_extent_is_resumed_then_current() {
         );
         assert_eq!(
             *start, expected,
-            "the closing resends ascend from its start"
+            "the closing resends ascend from its frontier"
         );
         assert_eq!(*len, 4096, "each resent frame is one aligned block");
         expected += u64::try_from(*len).expect("bounded frame");
     }
     assert_eq!(
         expected, closing.cursor,
-        "the closing extent's resends cover its whole written prefix"
+        "the closing extent's resends cover its unadopted suffix"
     );
-    let mut expected = current.start;
+    let mut expected = current_frontier;
     for (token, start, len, _) in current_rewrites {
         assert_ne!(
             *token, closing.token,
@@ -1245,20 +1281,20 @@ fn closing_extent_is_resumed_then_current() {
         );
         assert_eq!(
             *start, expected,
-            "the current resends ascend from its start"
+            "the current resends ascend from its frontier"
         );
         assert_eq!(*len, 4096, "each resent frame is one aligned block");
         expected += u64::try_from(*len).expect("bounded frame");
     }
     assert_eq!(
         expected, current.cursor,
-        "the current extent's resends cover its whole written prefix"
+        "the current extent's resends cover its unadopted suffix"
     );
     // Byte-identical: the tear is healed over the acknowledged image.
     assert_eq!(
         extent_bytes(
             &closing.path,
-            closing.start,
+            closing_frontier,
             closing.cursor,
             closing.segment_bytes
         ),
@@ -1268,7 +1304,7 @@ fn closing_extent_is_resumed_then_current() {
     assert_eq!(
         extent_bytes(
             &current.path,
-            current.start,
+            current_frontier,
             current.cursor,
             current.segment_bytes
         ),
@@ -1321,12 +1357,6 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         closing.cursor,
         closing.segment_bytes,
     );
-    let clean_current = extent_bytes(
-        &current.path,
-        current.start,
-        current.cursor,
-        current.segment_bytes,
-    );
     // The owner applies the close of the closing extent; the reply is received
     // here and dropped, as a session break drops the answer it produced.
     let lost = client
@@ -1342,13 +1372,33 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         7,
         "the coordinator still holds every frame of both extents"
     );
-    // Tear only the current extent: its frames are the ones that must be
-    // rewritten. The closed extent's bytes are not needed again.
+    // The close made the current extent the owner's open one, so only what sits
+    // above its frontier is owed a resend; the frontier decides the count.
+    let current_frontier = owner_frontier(&mut client, &current);
+    let owed_bytes = usize::try_from(current.cursor - current_frontier).expect("bounded extent");
+    assert!(
+        owed_bytes.is_multiple_of(4096),
+        "a resend tail is whole aligned frames"
+    );
+    let owed = owed_bytes / 4096;
+    assert!(
+        owed >= 1,
+        "the tear needs a frame above the owner's frontier, saw {current_frontier}..{}",
+        current.cursor
+    );
+    let clean_current = extent_bytes(
+        &current.path,
+        current_frontier,
+        current.cursor,
+        current.segment_bytes,
+    );
+    // Tear only the current extent's unadopted suffix: its frames are the ones
+    // that must be rewritten. The closed extent's bytes are not needed again.
     write_extent_bytes(
         &current.path,
-        current.start,
+        current_frontier,
         current.segment_bytes,
-        &vec![0u8; usize::try_from(current.cursor - current.start).expect("bounded extent")],
+        &vec![0u8; owed_bytes],
     );
     client.leased_test_fail_submit(libc::ENODEV);
     submit(&mut client, &fixture, 11);
@@ -1359,8 +1409,8 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
     assert_eq!(counts.resume_attempts, 1, "one resume attempt");
     assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
     assert_eq!(
-        counts.resume_frames, 3,
-        "only the current extent's three unadopted frames are resent"
+        counts.resume_frames, owed as u64,
+        "only the current extent's unadopted frames are resent"
     );
     assert_eq!(
         client.leased_test_resume_targets(),
@@ -1372,8 +1422,8 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         "the closed summary retired the closing extent"
     );
     let rewrites = client.leased_test_rewrites();
-    assert_eq!(rewrites.len(), 3, "only the current extent was resent");
-    let mut expected = current.start;
+    assert_eq!(rewrites.len(), owed, "only the current extent was resent");
+    let mut expected = current_frontier;
     for (token, start, len, _) in &rewrites {
         assert_ne!(
             *token, closing.token,
@@ -1381,15 +1431,19 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         );
         assert_eq!(
             *start, expected,
-            "the current resends ascend from its start"
+            "the current resends ascend from its frontier"
         );
         assert_eq!(*len, 4096, "each resent frame is one aligned block");
         expected += u64::try_from(*len).expect("bounded frame");
     }
     assert_eq!(
+        expected, current.cursor,
+        "the current extent's resends cover its unadopted suffix"
+    );
+    assert_eq!(
         extent_bytes(
             &current.path,
-            current.start,
+            current_frontier,
             current.cursor,
             current.segment_bytes
         ),
@@ -1539,17 +1593,29 @@ fn rewrite_ids_do_not_reuse_group_ids() {
     let mut seen = 0usize;
     for episode in 0..3u64 {
         let base = 4 + episode * 3;
-        // Two unadopted frames, then a tear from the owner's frontier: the
-        // resume must resend both.
+        // Two frames above the owner's frontier, then a tear of exactly that
+        // suffix: the resume must resend it, however far the frontier had run.
         for sequence in base..base + 2 {
             submit(&mut client, &fixture, sequence);
         }
         client
             .drain_leased_flights(&mut released, None)
             .expect("the two unadopted frames complete");
-        let (_, cursor, _, adopted_end) = client.leased_test_extent_ends().expect("an open extent");
-        let torn = owned_bytes(&client, adopted_end, cursor);
-        write_bytes(&client, adopted_end, &vec![0u8; torn.len()]);
+        let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+        let extent = current_snapshot(&client);
+        let frontier = owner_frontier(&mut client, &extent);
+        let owed_bytes = usize::try_from(cursor - frontier).expect("bounded extent");
+        assert!(
+            owed_bytes.is_multiple_of(4096),
+            "episode {episode}: a resend tail is whole aligned frames"
+        );
+        let owed = owed_bytes / 4096;
+        assert!(
+            owed >= 1,
+            "episode {episode} needs a frame above the owner's frontier, saw {frontier}..{cursor}"
+        );
+        let torn = owned_bytes(&client, frontier, cursor);
+        write_bytes(&client, frontier, &vec![0u8; torn.len()]);
         let entry = client.live_leased.next_flight_id;
         client.leased_test_fail_submit(libc::ENODEV);
         submit(&mut client, &fixture, base + 2);
@@ -1559,11 +1625,11 @@ fn rewrite_ids_do_not_reuse_group_ids() {
         let rewrites = client.leased_test_rewrites();
         assert_eq!(
             rewrites.len() - seen,
-            2,
-            "episode {episode} resends exactly the two unadopted frames"
+            owed,
+            "episode {episode} resends exactly the frames above the frontier"
         );
         let used = client.leased_test_submitted_ids();
-        let mut expected = adopted_end;
+        let mut expected = frontier;
         for (_, start, len, id) in &rewrites[seen..] {
             assert_eq!(
                 *start, expected,
@@ -1711,4 +1777,266 @@ fn lost_adoption_reply_is_idempotent() {
     for (sequence, (_, receipts)) in released.iter().enumerate() {
         assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
     }
+}
+
+/// A break whose declaration lands inside the owner's close of the previous
+/// extent is not a fail-stop: the owner answers the close with the typed
+/// retry-later refusal, the resume re-probes the closing frontier while the
+/// owner finishes, and the rollover completes with the current extent's
+/// unadopted frames resent byte-identically.
+#[test]
+fn close_in_progress_at_the_owner_is_awaited_then_resumed() {
+    use crate::distributed::storage::LivePausePoint;
+    use crate::distributed::test_bounds::PROGRESS_CAP;
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    let (closing, current) = rollover_with_current_frames(&fixture, &mut client, &mut released, 2);
+    let clean_closing = extent_bytes(
+        &closing.path,
+        closing.start,
+        closing.cursor,
+        closing.segment_bytes,
+    );
+    let clean_current = extent_bytes(
+        &current.path,
+        current.start,
+        current.cursor,
+        current.segment_bytes,
+    );
+    // The session that broke had sent the close of the closing extent; the
+    // owner is still executing it when the resume declares. Both helper
+    // sessions exist before the close starts: a new session waits for in-flight
+    // stream work, so it could not connect while the close is held.
+    let log = fixture.node.log_for_test(1);
+    let mut closer = fixture.client();
+    let mut probe = fixture.client();
+    let (entered, close_resume) = log.pause_live(LivePausePoint::CloseSuffix);
+    // Tear the current extent so its unadopted frames owe a resend.
+    write_extent_bytes(
+        &current.path,
+        current.start,
+        current.segment_bytes,
+        &vec![0u8; usize::try_from(current.cursor - current.start).expect("bounded extent")],
+    );
+    let (notified, notifies) = std::sync::mpsc::sync_channel(2);
+    client.leased_test_notify_close_in_progress(notified);
+    let (at_declaration, declaration) = std::sync::mpsc::sync_channel(1);
+    let (release_declaration, at_declaration_release) = std::sync::mpsc::sync_channel(1);
+    client.leased_test_pause_before_declaration(at_declaration, at_declaration_release);
+    client.leased_test_fail_submit(libc::ENODEV);
+    // Start the owner's close once the resume has probed and rewritten, hold it
+    // at its suffix scan across the declaration, and release it once the resume
+    // is waiting on it. A new session could not connect while it is held.
+    let drained = std::thread::scope(|scope| {
+        let helper = scope.spawn(move || {
+            declaration
+                .recv_timeout(PROGRESS_CAP)
+                .expect("the resume reached its declaration");
+            let close = scope.spawn(move || {
+                closer.adopt_live_extent(1, closing.token, closing.cursor, true, false)
+            });
+            entered
+                .recv_timeout(PROGRESS_CAP)
+                .expect("the owner is closing the extent");
+            release_declaration
+                .send(())
+                .expect("the resume is waiting at its declaration");
+            let met = notifies
+                .recv_timeout(PROGRESS_CAP)
+                .and_then(|()| notifies.recv_timeout(PROGRESS_CAP))
+                .is_ok();
+            close_resume.send(()).expect("the paused close is live");
+            (close.join().expect("the close thread panicked"), met)
+        });
+        submit(&mut client, &fixture, 11);
+        let drained = client.drain_leased_flights(&mut released, None);
+        let (closed, met) = helper.join().expect("the helper thread panicked");
+        // The owner answers a second close with the typed retry-later refusal
+        // while it executes the first one.
+        let refused = probe
+            .adopt_live_extent(1, closing.token, closing.cursor, true, false)
+            .expect("the finished close answers the retry");
+        assert!(
+            refused.adoption.closed,
+            "the retry reads the closed summary"
+        );
+        assert!(closed.expect("the held close is answered").adoption.closed);
+        assert!(
+            met,
+            "the resume never met the in-progress close: targets={:?} steps={:?} reprobes={} closing={} attempts={}",
+            client.leased_test_resume_targets(),
+            client.leased_test_attempt_steps(),
+            client.leased_test_close_reprobes(),
+            client.live_leased.closing.is_some(),
+            counters(&fixture).resume_attempts,
+        );
+        drained
+    });
+    drained.expect("the resume awaits the owner's close and completes");
+    let counts = counters(&fixture);
+    assert_eq!(
+        counts.resume_attempts, 1,
+        "the in-progress close is not a retry"
+    );
+    assert_eq!(counts.resume_refused, 0, "the close is not a refusal");
+    assert_eq!(
+        client.leased_test_attempt_steps(),
+        [7],
+        "one attempt completes every resume step"
+    );
+    assert!(
+        client.leased_test_close_reprobes() >= 1,
+        "the resume re-probed the closing frontier while the owner closed"
+    );
+    assert!(
+        client.live_leased.closing.is_none(),
+        "the finished close retired the closing extent"
+    );
+    assert!(
+        !client.live_write_failed,
+        "the writer stays usable after the awaited close"
+    );
+    let targets = client.leased_test_resume_targets();
+    assert_eq!(
+        targets[..2],
+        ["closing", "current"],
+        "the resume probes the closing extent before the current one"
+    );
+    assert!(
+        targets[2..].iter().all(|target| *target == "closing"),
+        "the wait re-probes only the extent being closed: {targets:?}"
+    );
+    // Byte-identical: the current extent's tear is healed over its image, and
+    // the close adopted the closing extent without rewriting it.
+    assert_eq!(
+        extent_bytes(
+            &current.path,
+            current.start,
+            current.cursor,
+            current.segment_bytes
+        ),
+        clean_current,
+        "the current extent is resent byte-identically at its own offsets"
+    );
+    assert_eq!(
+        extent_bytes(
+            &closing.path,
+            closing.start,
+            closing.cursor,
+            closing.segment_bytes
+        ),
+        clean_closing,
+        "the closed extent's bytes are unchanged"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the current extent's prefix");
+    assert_eq!(
+        client.leased_test_retained(),
+        (0, 0),
+        "nothing is left to resend"
+    );
+    let owner = fixture.node.log_for_test(1);
+    let adopted = owner.receipt_page(0, 32).expect("the owner's receipt page");
+    assert_eq!(adopted.len(), 12, "twelve frames, one receipt each");
+    for (index, receipt) in adopted.iter().enumerate() {
+        assert_eq!(
+            receipt.version().sequence,
+            index as u64,
+            "receipt {index} is the {index}th batch: no gap and no duplicate"
+        );
+    }
+    assert_eq!(released.len(), 12, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// A lapsed lease stops a rewrite between two frames: the first resend is
+/// submitted, the lapse lands, and the per-frame check refuses the next one
+/// before its command is submitted. The withheld completions keep the torn
+/// frames owed, so the rewrite step cannot skip the check.
+#[test]
+fn lapsed_lease_stops_the_rewrite_between_frames() {
+    use crate::distributed::remote_db::coordinator_lease::LeaseValidity;
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    for sequence in 0..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the four adopted frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first prefix");
+    for sequence in 4..7 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the three unadopted frames complete");
+    let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let extent = current_snapshot(&client);
+    let frontier = owner_frontier(&mut client, &extent);
+    let owed_bytes = usize::try_from(cursor - frontier).expect("bounded extent");
+    assert!(
+        owed_bytes.is_multiple_of(4096),
+        "a resend tail is whole aligned frames"
+    );
+    let owed = owed_bytes / 4096;
+    assert!(
+        owed >= 2,
+        "the test needs two frames above the owner's frontier, saw {frontier}..{cursor}"
+    );
+    let clean = owned_bytes(&client, frontier, cursor);
+    write_bytes(&client, frontier, &vec![0u8; clean.len()]);
+    // The lapse lands after the first resend, at the boundary before the second.
+    let validity = std::sync::Arc::new(LeaseValidity::fresh_for_test());
+    client.set_lease_validity(std::sync::Arc::clone(&validity));
+    client.leased_test_lapse_lease_after_rewrite(1, validity);
+    client.leased_test_fail_submit(libc::ENODEV);
+    let error = match client.submit_leased_group(
+        1,
+        vec![fixture.batch(7)],
+        &WriteTimeline::default(),
+        2,
+        true,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a lapsed lease refuses the resume"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "coordinator lease lapsed on owner partition 2",
+        "the refusal names the lapse"
+    );
+    let rewrites = client.leased_test_rewrites();
+    assert_eq!(
+        rewrites.len(),
+        1,
+        "only the frame before the lapse is resent, saw {rewrites:?}"
+    );
+    assert_eq!(
+        client.leased_test_attempt_steps(),
+        [3, 2],
+        "the first attempt stops at the rewrite step and the retry at its probe"
+    );
+    assert_eq!(
+        client.leased_test_retained().0,
+        owed,
+        "the owed frames are untouched by the refused resume"
+    );
+    // The first frame is healed; every frame after the lapse is still torn.
+    assert_eq!(
+        owned_bytes(&client, frontier, cursor),
+        [clean[..4096].to_vec(), vec![0u8; clean.len() - 4096]].concat(),
+        "no frame after the lapse is written"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 2, "one attempt and its retry");
+    assert_eq!(counts.resume_refused, 1, "the refusal is counted");
+    assert_eq!(counts.resume_rewrites, 0, "no rewrite episode completed");
 }
