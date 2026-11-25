@@ -2082,6 +2082,16 @@ fn index_based_relocation_with_key_indexing(indexing: KeyIndexing) {
                 first_half_end = db.wal_writer.position();
             }
         }
+        // A pass copies entries only below the tracker frontier, which trails
+        // the writes; a run started before the tracker caught up skips the
+        // newest keys and keeps fewer than `n` of them.
+        let last_write = db.wal_writer.position();
+        db.wal_writer.wal_tracker_barrier();
+        assert!(
+            db.wal_writer.last_processed().as_u64() >= last_write,
+            "the tracker frontier {} must cover the last write at {last_write}",
+            db.wal_writer.last_processed().as_u64()
+        );
         db.rebuild_control_region().unwrap();
         start_index_based_relocation(&db);
         // The reads below must come from the copies.
