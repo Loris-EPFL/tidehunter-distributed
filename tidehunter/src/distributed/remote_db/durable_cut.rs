@@ -565,6 +565,20 @@ struct Shared {
     /// flush frontier (plan I2). Zero means "no batch covered yet".
     consistent: AtomicU64,
     owners: Box<[OwnerShared]>,
+    /// Control wake of each owner poller, one bounded (capacity 1) channel per
+    /// owner. Sender: [`Shared`], from the nudge paths and [`DurableCut::stop`];
+    /// receiver: that owner's poller. A nudge and a stop both use it, and the
+    /// poller re-reads its stop and nudge flags on every wake, so a queued wake
+    /// stands for a pending one of either. Full queue: a wake is already
+    /// pending, so `try_send` drops the new one and no sender blocks or
+    /// allocates. Shutdown: `stopping` is set (Release) before the wakes and the
+    /// poller exits on it, so a wake that races the stop is still observed as a
+    /// stop; the senders live in `Shared`, the receivers in the pollers it
+    /// joins.
+    poller_wakes: Box<[mpsc::SyncSender<()>]>,
+    /// Set by [`DurableCut::stop`] before its wakes: the only reason a wake ends
+    /// a poller.
+    stopping: AtomicBool,
     /// Wakes `wait_through`: notified by the actor after each cut advance.
     advanced: Mutex<()>,
     advanced_cv: Condvar,
@@ -572,12 +586,36 @@ struct Shared {
     /// Test hook: every persisted cut, sent with `try_send` (capacity 4096).
     #[cfg(test)]
     persisted_events: Mutex<Option<mpsc::SyncSender<u64>>>,
+    /// Test hook: one count per completed owner-poller park, in endpoint order.
+    #[cfg(test)]
+    park_samples: Box<[AtomicU64]>,
 }
 
 impl Shared {
     fn bump(counter: &AtomicU64) {
         // Relaxed: independent diagnostic counter.
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Non-blocking wake of one owner poller. A full queue already holds a
+    /// wake for it, and the poller re-reads every flag on each wake.
+    fn wake_poller(&self, owner: usize) {
+        if let Some(wake) = self.poller_wakes.get(owner) {
+            let _ = wake.try_send(());
+        }
+    }
+
+    /// Whether a stop is in progress. Acquire pairs with the Release store in
+    /// `DurableCut::stop`, before its wakes.
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// Park until a control wake, `wait`, or a stop. True when stopping. A
+    /// wake that is not a stop is a nudge: the caller re-reads its flags.
+    fn park(&self, control: &mpsc::Receiver<()>, wait: Duration) -> bool {
+        let _ = control.recv_timeout(wait);
+        self.stopping()
     }
 }
 
@@ -621,9 +659,10 @@ struct Running {
     /// queue: senders wait (blocking `send`); none of them holds a lock. Stop:
     /// sent after every poller joined; the actor exits on it or on disconnect.
     messages: mpsc::SyncSender<Message>,
-    /// One stop channel (capacity 1, `try_send`), stop wake and handle per
-    /// poller. The wake interrupts a parked progress wait; it is never drained.
-    pollers: Vec<(mpsc::SyncSender<()>, Arc<WakeFd>, JoinHandle<()>)>,
+    /// One stop wake and handle per poller. The wake interrupts a parked
+    /// progress wait; it is never drained. A nudge reuses the poller's control
+    /// wake ([`Shared::poller_wakes`]), not this one.
+    pollers: Vec<(Arc<WakeFd>, JoinHandle<()>)>,
     actor: JoinHandle<()>,
 }
 
@@ -674,16 +713,22 @@ impl DurableCut {
             })
         })?;
         let owners = targets.len();
+        let (poller_wakes, poller_controls): (Vec<_>, Vec<_>) =
+            (0..owners).map(|_| mpsc::sync_channel(1)).unzip();
         let shared = Arc::new(Shared {
             epoch,
             published: AtomicU64::new(0),
             consistent: AtomicU64::new(0),
             owners: (0..owners).map(|_| OwnerShared::default()).collect(),
+            poller_wakes: poller_wakes.into_boxed_slice(),
+            stopping: AtomicBool::new(false),
             advanced: Mutex::new(()),
             advanced_cv: Condvar::new(),
             counters: Counters::default(),
             #[cfg(test)]
             persisted_events: Mutex::new(None),
+            #[cfg(test)]
+            park_samples: (0..owners).map(|_| AtomicU64::new(0)).collect(),
         });
         let (messages, inbox) = mpsc::sync_channel(owners + 8);
         let wait = Duration::from_millis(config.lag_ms);
@@ -710,8 +755,12 @@ impl DurableCut {
                 actor,
             })),
         };
-        for (owner, ((target, wake), client)) in targets.into_iter().zip(clients).enumerate() {
-            let (stop, stopped) = mpsc::sync_channel(1);
+        for (owner, (((target, wake), control), client)) in targets
+            .into_iter()
+            .zip(poller_controls)
+            .zip(clients)
+            .enumerate()
+        {
             let shared = shared.clone();
             let messages = messages.clone();
             let poller_wake = wake.clone();
@@ -724,13 +773,13 @@ impl DurableCut {
                         client,
                         &shared,
                         &messages,
-                        (&stopped, &poller_wake),
+                        (&control, &poller_wake),
                         wait,
                     );
                 })
                 .map_err(LocalDbError::component)?;
             if let Some(running) = cut.running.lock().as_mut() {
-                running.pollers.push((stop, wake, handle));
+                running.pollers.push((wake, handle));
             }
         }
         Ok(cut)
@@ -818,12 +867,15 @@ impl DurableCut {
                 )));
             }
             if now >= nudge_at {
-                for state in shared.owners.iter() {
+                for (owner, state) in shared.owners.iter().enumerate() {
                     // AcqRel pairs with the poller's swap. Counted only when the
                     // flag was clear, as the actor counts its own nudges.
                     if !state.nudge.swap(true, Ordering::AcqRel) {
                         Shared::bump(&shared.counters.nudges);
                     }
+                    // Wake an idle poller: the flag alone is only read when it
+                    // next runs, and an idle owner parks for a quarter lag.
+                    shared.wake_poller(owner);
                 }
                 Shared::bump(&shared.counters.targeted_syncs);
                 nudge_at = now + renudge;
@@ -839,6 +891,17 @@ impl DurableCut {
         let (sender, receiver) = mpsc::sync_channel(4096);
         *self.shared.persisted_events.lock() = Some(sender);
         receiver
+    }
+
+    /// Test hook: how many times the poller of `owner` has entered its idle
+    /// park. Relaxed: the caller polls it until it moves, and the park is what
+    /// it waits for, not the value.
+    #[cfg(test)]
+    pub(super) fn park_samples(&self, owner: usize) -> u64 {
+        self.shared
+            .park_samples
+            .get(owner)
+            .map_or(0, |samples| samples.load(Ordering::Relaxed))
     }
 
     pub(super) fn stats(&self) -> DurableCutStats {
@@ -858,19 +921,21 @@ impl DurableCut {
         }
     }
 
-    /// Stop and join every thread. Idempotent. The stop wake ends a poller's
-    /// parked progress wait at once; an idle poller sees the stop channel.
+    /// Stop and join every thread. Idempotent. The stop flag is set before the
+    /// wakes, so a poller woken by a nudge sees the stop; the stop wake ends a
+    /// parked progress wait at once, and the control wake ends an idle park.
     pub(super) fn stop(&self) {
         let Some(running) = self.running.lock().take() else {
             return;
         };
-        for (stop, wake, _) in &running.pollers {
-            let _ = stop.try_send(());
+        self.shared.stopping.store(true, Ordering::Release);
+        for owner in 0..running.pollers.len() {
+            self.shared.wake_poller(owner);
+        }
+        for (wake, poller) in running.pollers {
             // Cannot fail (a full eventfd counter is already readable); a lost
             // wake would only delay this stop to the owner's poll deadline.
             let _ = wake.signal();
-        }
-        for (_, _, poller) in running.pollers {
             if poller.join().is_err() {
                 Shared::bump(&self.shared.counters.poll_failures);
             }
@@ -890,32 +955,27 @@ impl Drop for DurableCut {
     }
 }
 
-/// True when the stop channel fired or closed within `wait`.
-fn stopped(stop: &mpsc::Receiver<()>, wait: Duration) -> bool {
-    !matches!(
-        stop.recv_timeout(wait),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    )
-}
-
-/// Service loop: runs until stop. Each turn either waits on the stop channel
-/// (idle owner, failed connection) or completes one bounded long poll. The stop
-/// wake (second part of `stop`) ends a parked poll at once; that exit takes no
-/// failed-poll path and certifies nothing. A route that cannot wait without
-/// spinning (`TcpError::is_wait_unavailable`) ends this poller: reconnecting
-/// would repeat the owner's Status sync without fixing the route, and the cut of
-/// this owner then stays at its last report, so certification reports it.
+/// Service loop: runs until stop. Each turn either parks on the control wake
+/// (idle owner, failed connection) or completes one bounded long poll. A nudge
+/// wakes the park at once through the same control wake as the stop, so an idle
+/// owner never delays a `wait_through` caller by its lag. The stop wake (second
+/// part of `stop`) ends a parked poll at once; that exit takes no failed-poll
+/// path and certifies nothing. A route that cannot wait without spinning
+/// (`TcpError::is_wait_unavailable`) ends this poller: reconnecting would repeat
+/// the owner's Status sync without fixing the route, and the cut of this owner
+/// then stays at its last report, so certification reports it.
 fn poll_owner(
     owner: usize,
     target: &PollTarget,
     client: Client,
     shared: &Shared,
     messages: &mpsc::SyncSender<Message>,
-    (stop, wake): (&mpsc::Receiver<()>, &Arc<WakeFd>),
+    (control, wake): (&mpsc::Receiver<()>, &Arc<WakeFd>),
     wait: Duration,
 ) {
-    // A quarter of the lag bound: a nudge waits at most this long behind a
-    // parked poll. Shutdown does not wait for it (stop wake).
+    // A quarter of the lag bound: an owner with nothing outstanding re-checks
+    // its flags this often. A nudge wakes it at once through `control`
+    // (see [`Shared::poller_wakes`]), so the park is never a nudge latency.
     let idle_wait = (wait / 4).max(Duration::from_millis(1));
     let max_wait = idle_wait.min(DURABLE_PROGRESS_MAX_WAIT);
     let epoch = shared.epoch;
@@ -933,16 +993,21 @@ fn poll_owner(
     let mut client = Some(client);
     let mut generation = 0;
     loop {
+        if shared.stopping() {
+            return;
+        }
         // Acquire pairs with the Release stores of the owner worker, of this
         // thread (synced) and of the actor (nudge).
         let idle = state.receipted.load(Ordering::Acquire) <= state.synced.load(Ordering::Acquire);
         if idle && !state.nudge.load(Ordering::Acquire) {
-            if stopped(stop, idle_wait) {
+            #[cfg(test)]
+            Shared::bump(&shared.park_samples[owner]);
+            if shared.park(control, idle_wait) {
                 return;
             }
             continue;
         }
-        if stopped(stop, Duration::ZERO) {
+        if shared.stopping() {
             return;
         }
         if client.is_none() {
@@ -954,7 +1019,7 @@ fn poll_owner(
                 }
                 Err(_) => {
                     Shared::bump(&shared.counters.poll_failures);
-                    if stopped(stop, wait) {
+                    if shared.park(control, wait) {
                         return;
                     }
                     continue;
@@ -969,7 +1034,7 @@ fn poll_owner(
         let report = match connection.durable_progress(epoch, epoch, generation, max_wait, sync) {
             Ok(report) => Some(report).filter(|report| valid_report(report, epoch)),
             // The stop wake ended the wait; not a failed poll.
-            Err(_) if stopped(stop, Duration::ZERO) => return,
+            Err(_) if shared.stopping() => return,
             Err(error) if error.is_wait_unavailable() => {
                 unavailable(&error);
                 return;
@@ -983,7 +1048,7 @@ fn poll_owner(
                 state.nudge.store(true, Ordering::Release);
             }
             Shared::bump(&shared.counters.poll_failures);
-            if stopped(stop, wait) {
+            if shared.park(control, wait) {
                 return;
             }
             continue;
@@ -1093,6 +1158,8 @@ fn run_actor(
                 // Release pairs with the poller's swap.
                 state.nudge.store(true, Ordering::Release);
             }
+            // Wake an idle poller at once; a full wake queue already holds one.
+            shared.wake_poller(owner);
         }
         let mut failure = None;
         if target > persisted {

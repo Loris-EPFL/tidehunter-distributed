@@ -6,6 +6,7 @@ use super::completion::DrainStop;
 use super::core::WriteCore;
 use crate::distributed::hybrid::StoredSnapshot;
 use crate::distributed::hybrid::region::OlderStream;
+use crate::distributed::tcp::DURABLE_PROGRESS_MAX_WAIT;
 use crate::distributed::types::BatchVersion;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
@@ -158,11 +159,12 @@ impl WriteCore {
             .flatten()
             .ok_or_else(|| LocalDbError::new("relocation copy version is outside this epoch"))?;
         let lag = Duration::from_millis(self.config.durable_cut.lag_ms);
-        // The cut reaches a nudged owner's sync through three stages, each at
-        // most a quarter of the lag (poller pickup, parked progress poll, actor
-        // tick), plus one failed-poll retry of one lag; the owner's own sync is
-        // bounded by the request timeout. Eight lags cover the stages with
-        // margin, so the bound is configuration-derived, not a constant.
+        // The cut reaches a nudged owner's sync through three stages the wake
+        // now bounds: the poller is woken from its idle park at once, its
+        // parked progress poll is a quarter lag capped at the progress maximum,
+        // and the actor evaluates on every report. The owner's own sync is
+        // bounded by the request timeout. The lag multiple keeps the configured
+        // scale, so a deployment whose lag is short retries faster.
         let timeout = lag
             .saturating_mul(COPY_DURABLE_LAG_MULTIPLE)
             .saturating_add(self.config.timeout)
@@ -173,8 +175,21 @@ impl WriteCore {
             .lock()
             .copy_durable_timeout
             .unwrap_or(timeout);
-        cut.wait_through(next, timeout, lag)
+        // A nudge whose poll raced the first request is retried within the
+        // progress maximum, never a whole lag: `wait_through` only raises a
+        // flag, so the retry is free of owner traffic.
+        let renudge = lag.min(DURABLE_PROGRESS_MAX_WAIT);
+        cut.wait_through(next, timeout, renudge)
             .map_err(|error| LocalDbError::copies_not_durable(next, error))
+    }
+
+    /// Test hook: how many times the poller of `owner` has entered its idle
+    /// park (a `DurableCut` is open only on the Native tier).
+    #[cfg(test)]
+    pub(in crate::distributed::remote_db) fn durable_cut_park_samples(&self, owner: usize) -> u64 {
+        self.durable_cut
+            .get()
+            .map_or(0, |cut| cut.park_samples(owner))
     }
 
     pub(in crate::distributed::remote_db) fn durable_cut_stats(

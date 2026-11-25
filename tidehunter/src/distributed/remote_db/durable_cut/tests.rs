@@ -544,10 +544,13 @@ fn saturated_inbox_handles_every_report_and_certification() {
         published: AtomicU64::new(FLOOR),
         owners: (0..OWNERS).map(|_| OwnerShared::default()).collect(),
         consistent: AtomicU64::new(0),
+        poller_wakes: (0..OWNERS).map(|_| mpsc::sync_channel(1).0).collect(),
+        stopping: AtomicBool::new(false),
         advanced: Mutex::new(()),
         advanced_cv: Condvar::new(),
         counters: Counters::default(),
         persisted_events: Mutex::new(None),
+        park_samples: (0..OWNERS).map(|_| AtomicU64::new(0)).collect(),
     };
     for owner in shared.owners.iter() {
         owner.receipted.store(FLOOR, Ordering::Relaxed);
