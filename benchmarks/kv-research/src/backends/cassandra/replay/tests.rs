@@ -38,3 +38,36 @@ fn rejects_absent_or_wrong_guardrail_receipt() {
     receipt["effective_settings"] = json!([]);
     assert!(validate_receipt(&receipt, &options).is_err());
 }
+
+#[cfg(test)]
+#[test]
+fn real_fixture_admits_full_large_row_and_guardrail_override() {
+    let trace = crate::mainnet_trace::Trace::load(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../experiments/sui-mainnet/fixture/manifest.json"),
+        "4264e79e0cbe4a1e36d94468df2f049f988eac57877c9bf2e7e175489dc922fa",
+    )
+    .unwrap();
+    let mut prepared = crate::mainnet_replay::prepare(&trace, 2).unwrap();
+    prepare_keys(&mut prepared);
+    let receipt = admit(&prepared).unwrap();
+    assert!(
+        receipt["maximum_encoded_native_batch_bytes"]
+            .as_u64()
+            .unwrap()
+            < LIMIT as u64
+    );
+    assert!(
+        receipt["maximum_cassandra_mutation_data_size"]
+            .as_u64()
+            .unwrap()
+            > 51200
+    );
+    assert!(
+        prepared
+            .iter()
+            .flat_map(|p| p.batches.iter().flat_map(|b| &b.entries))
+            .any(|r| r.value.len() == 134995)
+    );
+    assert_eq!(TABLES.len(), 17);
+}
