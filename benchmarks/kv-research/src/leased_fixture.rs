@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tidehunter::distributed::codec::BatchLimits;
-use tidehunter::distributed::durability::DurabilityTier;
+use tidehunter::distributed::durability::{DurabilityTier, DurableCutConfig};
 use tidehunter::distributed::group::GroupLimits;
 use tidehunter::distributed::nvmeof::NvmeofTransport;
 use tidehunter::distributed::remote_db::RemoteDatabaseConfig;
@@ -117,6 +117,9 @@ pub(crate) struct FixtureSpec {
     /// the native small geometry instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<FixtureIndexGeometry>,
+    /// Coordinator durable-cut tuning; `None` keeps the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_cut: Option<DurableCutConfig>,
 }
 
 /// A fresh live initiator identity: random, never all zero.
@@ -289,6 +292,9 @@ impl FixtureSpec {
         // row existed.
         if let Some(index) = &self.index {
             document["index"] = serde_json::to_value(index)?;
+        }
+        if let Some(cut) = &self.durable_cut {
+            document["durable_cut"] = serde_json::to_value(cut)?;
         }
         let config: RemoteDatabaseConfig = serde_json::from_value(document)?;
         config
@@ -692,6 +698,8 @@ pub(crate) struct BenchmarkGeometry {
     /// Coordinator index geometry; `None` keeps the hybrid's production
     /// defaults.
     pub index: Option<FixtureIndexGeometry>,
+    /// Coordinator durable-cut tuning; `None` keeps the engine default.
+    pub durable_cut: Option<DurableCutConfig>,
 }
 
 impl BenchmarkGeometry {
@@ -731,6 +739,7 @@ impl BenchmarkGeometry {
                 per_frame_fua: true,
             },
             index: self.index,
+            durable_cut: self.durable_cut,
         }
     }
 }

@@ -71,6 +71,27 @@ fn entry() -> BackendResult<()> {
             Path::new(&arguments[3]),
         );
     }
+    #[cfg(all(feature = "test-utils", target_os = "linux"))]
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--latency-replay-fixture")
+    {
+        if arguments.len() != 4 || arguments[2] != "--output" {
+            return Err(
+                "usage: kv-research --latency-replay-fixture DRIVER.json --output FRESH_DIR".into(),
+            );
+        }
+        // Owner and engine threads live in this process: a background panic must
+        // fail the case, as in the standard replay entry.
+        install_replay_panic_hook(Path::new(&arguments[3]));
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(backends::tidehunter::replay::latency_fixture::run(
+                Path::new(&arguments[1]),
+                Path::new(&arguments[3]),
+            ));
+    }
     let mut args = arguments.into_iter();
     let mut config_path = None;
     let mut output = None;

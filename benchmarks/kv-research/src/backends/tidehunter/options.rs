@@ -37,10 +37,42 @@ pub(super) struct Options {
     /// Owner acknowledgement tier. Applied inside each owner process and confirmed back by it.
     #[serde(default)]
     pub(super) durability_tier: DurabilityTier,
+    /// Local ordinary-file fixture only: coordinator durable-cut tuning.
+    /// External configurations must carry their own `durable_cut`.
+    #[serde(default)]
+    pub(super) durable_cut: Option<tidehunter::distributed::durability::DurableCutConfig>,
+    /// Local ordinary-file fixture only: owner WAL geometry (default: native).
+    #[serde(default)]
+    pub(super) local_geometry: Option<LocalGeometry>,
     /// External topology only: one owner-published `ready.durability.json` per owner, in
     /// partition order, copied to the coordinator host. Required there; a missing file fails open.
     #[serde(default)]
     pub(super) external_owner_durability_receipts: Vec<PathBuf>,
+}
+
+/// Local ordinary-file fixture owner WAL geometry. The fixture's default is the
+/// engine-native 128 MiB fragment / 10 GiB file, and the live target allocates
+/// the full file per owner; benchmarks that roll several cases must lower it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalGeometry {
+    pub(crate) fragment_bytes: u64,
+    pub(crate) wal_file_bytes: u64,
+}
+
+impl LocalGeometry {
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        if self.fragment_bytes == 0
+            || self.wal_file_bytes == 0
+            || !self.fragment_bytes.is_multiple_of(4096)
+            || !self.wal_file_bytes.is_multiple_of(self.fragment_bytes)
+        {
+            return Err(
+                "local_geometry needs a positive 4 KiB-multiple fragment_bytes that divides wal_file_bytes",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Coordinator index WAL geometry of the leased fixture, in native field names.
@@ -127,6 +159,15 @@ pub(super) fn parse_options(value: &serde_json::Value) -> BackendResult<Options>
             && options.transport == Transport::TcpTrusted
             && options.external_owner_durability_receipts.is_empty()
         {
+            if let Some(cut) = &options.durable_cut {
+                cut.validate()
+                    .map_err(|error| format!("{name} durable_cut: {error}"))?;
+            }
+            if let Some(geometry) = options.local_geometry {
+                geometry
+                    .validate()
+                    .map_err(|error| format!("{name} {error}"))?;
+            }
             return Ok(options);
         }
         return Err(format!(
@@ -134,6 +175,15 @@ pub(super) fn parse_options(value: &serde_json::Value) -> BackendResult<Options>
         )
         .into());
     };
+    if options.durable_cut.is_some() {
+        return Err(format!(
+            "{name} durable_cut is a local-fixture option; set durable_cut inside external_remote_config"
+        )
+        .into());
+    }
+    if options.local_geometry.is_some() {
+        return Err(format!("{name} local_geometry is a local-fixture option").into());
+    }
     if !options.transport.same_protocol(&config.tls.transport) {
         return Err(format!(
             "{name} requires external_remote_config.tls.transport={}",

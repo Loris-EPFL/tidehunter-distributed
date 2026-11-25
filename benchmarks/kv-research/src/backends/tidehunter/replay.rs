@@ -398,6 +398,8 @@ impl ReplayBackend for TidehunterReplayBackend {
     }
 }
 
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+pub mod latency_fixture;
 mod resources;
 #[cfg(test)]
 pub(crate) mod tests;

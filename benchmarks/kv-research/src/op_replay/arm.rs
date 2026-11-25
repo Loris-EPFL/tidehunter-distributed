@@ -298,6 +298,7 @@ pub(super) fn leased_owner(
         },
         // Owner-only fixture: the coordinator is opened elsewhere.
         index: None,
+        durable_cut: None,
     };
     LeasedOwner::start(&spec)
 }

@@ -6,7 +6,7 @@ mod options;
 use open_record::{OpenKind, OpenRecord};
 // Only the Linux test-utils fixture names the geometry outside this module.
 #[cfg(all(feature = "test-utils", target_os = "linux"))]
-pub(crate) use options::FixtureIndexGeometry;
+pub(crate) use options::{FixtureIndexGeometry, LocalGeometry};
 use options::{Options, parse_options};
 pub mod replay;
 #[allow(clippy::too_many_lines)]
@@ -676,7 +676,11 @@ async fn open_with_shape(
                 options.durability_tier,
                 options.max_batches_per_partition,
                 options.batch_limits,
-                options.index,
+                LocalFixtureTuning {
+                    durable_cut: options.durable_cut,
+                    geometry: options.local_geometry,
+                    index: options.index,
+                },
             )?;
             local_owners = children;
             config
@@ -928,6 +932,7 @@ async fn open_with_shape(
     });
     effective_configuration["durability_tier"] =
         serde_json::json!(options.durability_tier.as_str());
+    effective_configuration["durable_cut"] = serde_json::to_value(options.durable_cut)?;
     effective_configuration["durability"] = durability_receipt;
     effective_configuration["live_write"] = live_write_evidence.clone();
     effective_configuration["durability"]["live_write"] = live_write_evidence;
@@ -950,6 +955,14 @@ async fn open_with_shape(
     })
 }
 
+/// Coordinator and owner WAL tuning of the local ordinary-file fixture.
+#[cfg(all(feature = "test-utils", target_os = "linux"))]
+struct LocalFixtureTuning {
+    durable_cut: Option<tidehunter::distributed::durability::DurableCutConfig>,
+    geometry: Option<LocalGeometry>,
+    index: Option<FixtureIndexGeometry>,
+}
+
 #[cfg(all(feature = "test-utils", target_os = "linux"))]
 fn open_local_fixture(
     path: &Path,
@@ -958,7 +971,7 @@ fn open_local_fixture(
     tier: DurabilityTier,
     max_batches: usize,
     batch_limits: Option<tidehunter::distributed::codec::BatchLimits>,
-    index: Option<FixtureIndexGeometry>,
+    tuning: LocalFixtureTuning,
 ) -> BackendResult<(RemoteDatabaseConfig, Vec<crate::leased_fixture::OwnerChild>)> {
     use crate::leased_fixture::{BenchmarkGeometry, FixtureSpec, OwnerChild, fresh_owners};
 
@@ -978,10 +991,20 @@ fn open_local_fixture(
         Some(_) => return Err("local leased fixture owner count changed on reopen".into()),
         None => fresh_owners(u32::try_from(owner_count)?)?,
     };
-    let mut spec = BenchmarkGeometry {
+    let LocalFixtureTuning {
+        durable_cut,
+        geometry,
+        index,
+    } = tuning;
+    let geometry = geometry.unwrap_or(LocalGeometry {
         fragment_bytes: NATIVE_FRAGMENT_BYTES,
         wal_file_bytes: NATIVE_WAL_FILE_BYTES,
+    });
+    let mut spec = BenchmarkGeometry {
+        fragment_bytes: geometry.fragment_bytes,
+        wal_file_bytes: geometry.wal_file_bytes,
         max_admitted_batches: max_batches,
+        durable_cut,
         index,
     }
     .spec(root, tier, addresses);

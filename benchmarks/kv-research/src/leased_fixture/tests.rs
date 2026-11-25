@@ -9,6 +9,7 @@ fn spec(root: PathBuf, tier: DurabilityTier, owners: Vec<FixtureOwner>) -> Fixtu
         wal_file_bytes: 64 * MIB as u64,
         max_admitted_batches: 262_144,
         index: None,
+        durable_cut: None,
     }
     .spec(root, tier, owners)
 }
