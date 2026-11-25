@@ -260,6 +260,64 @@ fn a_native_tier_pass_syncs_its_copies_before_it_re_points() {
     db.wait_for_background_threads_to_finish().unwrap();
 }
 
+/// A nudge wakes an idle poller at once. [`fill`] certifies the data set, so the
+/// one owner's poller has nothing outstanding and parks on the fixture's
+/// hour-long lag. A write is acknowledged at the owner's page cache without
+/// nudging the cut, so the poller stays parked; a copy wait for that write must
+/// reach the cut through the wake, never through a quarter lag (15 minutes at
+/// this fixture's lag). Negative control: without the poller wake the wait ends
+/// at `COPY_WAIT` with `copies_not_durable`.
+#[test]
+fn a_nudge_wakes_an_idle_poller_out_of_its_lag_park() {
+    let fixture = fixture();
+    let db = open(&fixture);
+    let ks = fill(&db);
+    let core = db.remote_for_test().write_core();
+    // The certification left the owner idle: wait for the poller's park.
+    let deadline = Instant::now() + WAIT;
+    let parked = loop {
+        let parks = core.durable_cut_park_samples(0);
+        if parks > 0 {
+            break parks;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the poller never parked after the certification",
+        );
+        std::thread::yield_now();
+    };
+    let mut batch = db.write_batch();
+    batch.write(ks, key(9_000), fill_value(9_000));
+    batch.commit().expect("write");
+    assert_eq!(
+        core.durable_cut_park_samples(0),
+        parked,
+        "premise: an acknowledged write does not wake the parked poller",
+    );
+
+    let published = db.remote_for_test().published_cut().expect("published cut");
+    let last = BatchVersion {
+        epoch: published.epoch,
+        sequence: published
+            .sequence
+            .checked_sub(1)
+            .expect("the fixture published the write"),
+    };
+    core.test_hooks.lock().copy_durable_timeout = Some(COPY_WAIT);
+    core.await_copies_durable(last)
+        .expect("the nudge wakes the parked poller within the copy wait");
+    assert!(
+        core.durable_cut_stats().persisted_next > last.sequence,
+        "the cut covers the batch: {:?}",
+        core.durable_cut_stats(),
+    );
+    assert!(
+        core.durable_cut_park_samples(0) > parked,
+        "the park ended before the wait returned",
+    );
+    db.wait_for_background_threads_to_finish().unwrap();
+}
+
 /// A parked owner sync: the wait gives up with the typed cause, the pass
 /// applies, stores and retires nothing, and the deferral is counted. After the
 /// owner syncs, the next pass completes.
