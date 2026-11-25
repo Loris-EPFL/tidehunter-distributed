@@ -617,28 +617,50 @@ lease-ahead and polled writes. It uses the same hosts, reservation, expiry and c
 `nvmeof_path_fix`). Its first 8 cases are canaries; the fourth stops the run when its cold read is not
 device-served.
 
-### Sui replay over NVMe-oF on the compact fleet (`sui_nvmeof_compact`, manual only)
+### Sui replay over NVMe-oF on the three-host fleet (`manual_sui.py`, manual only)
 
-The manual launcher admits reviewed Sui specifications (`manual_sui.REVIEWED_SUI_SPECS`). The original compact spec uses two hosts,
-four cells (owner RPC verbs and live NVMe/RDMA, each with the `original_default` and the `harness`
-contract), `per_owner` export, default queue geometry, owner history `wal_replay`. The package is the
-focused KV package plus the Sui archive and the verification archive. Seal order: stage 1 (KV build),
-stage 2 (KV package and qualification), stage 3 (`prepare.py --sui ... --sui-nvmeof`, in the build image
-with the host Cargo and rustup homes, offline; it needs a clean engine checkout at the sealed revision).
-The launcher uploads the fixture (`checkpoint-fixtures/sui-genesis-1775/fixture.tar.gz`, SHA-256
-`7eb43b71435547939760598e541d13b9a77f722c5a9d0f8c8ee5bd583b751f15`) at staging and pins its generation
-in the runtime copy of the specification. Both guests load the NVMe and RDMA modules and revalidate the
-live pair proof before a replay. The result object is `<fleet run id>/results/sui-results.tar.gz`.
+`experiments/gcp-rdma/manual_sui.py` is the Sui launcher for one coordinator and
+two owners. It prepares the external deployment with the frozen
+`prepare_external.py`, installs each owner archive in the same absolute guest
+root on its host, starts both owner process groups through `gcloud compute ssh`,
+runs the frozen `run.py` with `--external-config`, `--external-resources` and
+`--external-stage-dir`, answers `resources-required` with sampled per-PID
+`/proc` evidence, and stops only the groups it started. The stage markers and
+the resource contract are the same ones the external flow already documents.
 
-The Sui-only retry spec `sui_nvmeof_harness_synchronous` keeps the same layout,
-fixture, export mode, queue geometry, deadlines and package qualification. It
-selects only the `harness` / `synchronous` / `engine_default` cells: r01 owner
-RPC verbs, then r02 live NVMe/RDMA. It has no KV selection, KV matrix or KV
-controller archive. The exact reviewed spec binds admission; there is no separate
-Sui matrix hash pin. Each cell exports `cell-spec.json`, and owner receipts retain
-the explicit contract and tier. Never infer the contract from the cell number.
-The local seal still verifies both contracts when it builds the Sui package;
-that qualification is not an extra cloud replay.
+Prerequisites: a frozen build (`build.py prepare` and `build.py build`), a
+native schema exported by a source-identical local run
+(`<output>/experiment/native-schema`), the fixture, three hosts in one zone, and
+the guest RDMA/kernel admission below. The run output, external config
+directory and stage directory must be fresh; the launcher refuses an existing
+stage marker and finishes with `launcher-receipt.json`.
+
+```sh
+python3 experiments/gcp-rdma/manual_sui.py \
+  --build /absolute/owned/checkpoint-build \
+  --fixture /absolute/checkpoint-fixtures/sui-genesis-1775/fixture \
+  --schema /absolute/local-run/experiment/native-schema \
+  --output /absolute/cloud-run \
+  --guest-root /mnt/tidehunter/sui-run-<run-id> \
+  --coordinator H0 --owners H1,H2 --zone us-central1-a \
+  --transport efa --live-transport rdma --durability-tier native \
+  --fragment-mib 8 --deadline 900 -- --driver-concurrency 4
+```
+
+Launcher options end at `--`; everything after it is passed to `run.py`
+unchanged, including `--driver-concurrency`, `--pacing-ms`, `--checkpoints`,
+`--value-cache-size`, `--default-value-cache-size`, `--max-dirty-keys`,
+`--snapshot-written-bytes`, `--max-maps` and
+`--index-blob-cache-min-bytes`. Pacing needs a
+`SUI_CHECKPOINT_EXECUTION_PACING_MS` hook in the frozen Sui fork; without it
+`run.py` refuses a paced cell instead of claiming one. A limited
+`--checkpoints N` replay still verifies the complete frozen source and reuses
+its digest at N for the paired native and remote replays.
+
+The retired compact six-VM Sui spec (`sui_nvmeof_compact`,
+`sui_nvmeof_harness_synchronous`) is not used by the campaign. The three-stage
+campaign uses this launcher for stages 1 and 2 and the `stage3_specs.py` set for
+stage 3.
 
 For an explicitly manual dirty checkout, keep preparation output and the
 specification outside the checkout. Generate the exact reviewed specification,

@@ -1,0 +1,235 @@
+"""The three-host Sui launcher: shape, gcloud argv and the stage handshake.
+
+The launcher runs against a fake gcloud transport that executes each command
+locally, a fake five-binary build, and a fake run.py that imports the real
+`validate_resources` contract. Owners are real processes with real /proc
+sampling; no cloud account, no engine and no nvmet are required.
+"""
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import unittest
+from unittest import mock
+
+import manual_sui
+
+HERE = Path(__file__).resolve().parent
+CHECKPOINT = HERE.parent / 'sui-checkpoint'
+EXPERIMENTS = HERE.parent
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class LocalGcloud:
+    """Executes the `--command` of each gcloud argv on this host.
+
+    Two logical hosts share one filesystem, so the single absolute guest root
+    the manifest requires is translated to a per-host directory before
+    execution. The launcher still records the manifest root.
+    """
+
+    def __init__(self, root, guest_root):
+        self.root, self.guest_root = Path(root), Path(guest_root)
+        self.calls = []
+
+    def __call__(self, argv, stdin=None):
+        self.calls.append(argv)
+        command = next((arg.split('=', 1)[1] for arg in argv
+                        if arg.startswith('--command=')), None)
+        if command is None:
+            raise AssertionError(f'not a gcloud ssh command: {argv}')
+        host = argv[3]
+        translated = command.replace(str(self.guest_root),
+                                     str(self.root / 'hosts' / host / 'guest'))
+        completed = subprocess.run(['bash', '-c', translated], input=stdin,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=120)
+        return completed.returncode, completed.stdout, completed.stderr
+
+
+class FakeBuild:
+    def __init__(self, root):
+        self.root = root
+        self.binaries = root / 'binaries'
+        self.binaries.mkdir(parents=True)
+        sources = root / 'sources/tidehunter-sharded-wal/experiments'
+        scripts = sources / 'sui-checkpoint'
+        scripts.mkdir(parents=True)
+        for name in ('build.py', 'deployment.py', 'prepare_external.py',
+                     'checkpoint_support.py', 'disk_collector.py'):
+            shutil.copy2(CHECKPOINT / name, scripts / name)
+        shutil.copy2(EXPERIMENTS / 'resident_config.py', sources / 'resident_config.py')
+        shutil.copy2(EXPERIMENTS / 'portable_transport.py', sources / 'portable_transport.py')
+        # Keep the real validator importable for the fake runner.
+        shutil.copy2(CHECKPOINT / 'run.py', scripts / 'run_contract.py')
+        for name in ('sui-node-native', 'sui-node-remote', 'state-audit', 'rocksdb-audit'):
+            (self.binaries / name).write_text('fake\n')
+        owner = self.binaries / 'storage-node'
+        owner.write_text(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import pathlib, sys, time, yaml
+            launch = pathlib.Path(sys.argv[2])
+            buffer = bytearray(1 << 20)
+            (launch.parent / 'ready').write_text('ready')
+            while True:
+                time.sleep(0.05)
+            """))
+        owner.chmod(0o755)
+        manifest = {'protocol': 9, 'fabric': True,
+                    'source_archive_sha256': 'a' * 64,
+                    'source_manifest_sha256': 'b' * 64,
+                    'binaries': {path.name: digest(path) for path in self.binaries.iterdir()}}
+        (root / 'build-manifest.json').write_text(json.dumps(manifest))
+        (scripts / 'run.py').write_text(textwrap.dedent("""\
+            import argparse, hashlib, json, time
+            from pathlib import Path
+            import run_contract
+
+            parser = argparse.ArgumentParser()
+            for name in ('--build', '--fixture', '--output', '--external-config',
+                         '--external-resources', '--external-stage-dir', '--durability-tier'):
+                parser.add_argument(name)
+            parser.add_argument('--owners', type=int)
+            parser.add_argument('--deadline', type=int)
+            parser.add_argument('--fragment-mib', type=int)
+            parser.add_argument('--disk-sample-seconds', type=int)
+            args, _ = parser.parse_known_args()
+            config = Path(args.external_config)
+            resources = Path(args.external_resources)
+            stage = Path(args.external_stage_dir)
+            build_root = Path(args.build)
+            Path(args.output).mkdir(parents=True, exist_ok=True)
+            sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            binding = dict(config_sha256=sha(config),
+                           build_manifest_sha256=sha(build_root / 'build-manifest.json'),
+                           checkpoint_digest='EhUPyfwLGDEKH5Ssg3nFbVAHwi4XA87xNKvnFEo3ZJb6')
+            stage.mkdir(parents=True, exist_ok=True)
+            def publish(name):
+                row = dict(binding, stage=name, unix_ns=time.time_ns())
+                for file in (name + '.json', 'stage.json'):
+                    temporary = stage / (file + '.tmp')
+                    temporary.write_text(json.dumps(row))
+                    temporary.replace(stage / file)
+                return row
+            start = publish('remote-starting')
+            time.sleep(1.5)
+            finish = publish('remote-finished')
+            publish('resources-required')
+            deadline = time.time() + 30
+            while not (stage / 'resources-ready').exists():
+                if time.time() > deadline:
+                    raise SystemExit(3)
+                time.sleep(0.1)
+            manifest = json.loads((config.parent / 'external-manifest.json').read_text())
+            run_contract.validate_resources(json.loads(resources.read_text()),
+                                            manifest, binding, [start, finish])
+            (Path(args.output) / 'experiment').mkdir(exist_ok=True)
+            (Path(args.output) / 'experiment/results.json').write_text(
+                json.dumps(dict(complete=True)))
+            """))
+
+    def fixture(self, root):
+        fixture = root / 'fixture'
+        fixture.mkdir()
+        (fixture / 'distributed.yaml').write_text(
+            f'db-path: {fixture}/distributed/full_node_db/94970e38de08\n')
+        return fixture
+
+    def schema(self, root):
+        schema = root / 'native-schema/live/perpetual'
+        schema.mkdir(parents=True)
+        (schema / 'manifest.json').write_text(
+            json.dumps({'namespace': 'live/perpetual', 'backend': 'native'}))
+        (schema / 'shape.json').write_text('{}')
+        (schema / 'shape.yaml').write_text('key_spaces: []\n')
+        return root / 'native-schema'
+
+
+class LauncherShape(unittest.TestCase):
+    def test_one_coordinator_and_two_distinct_owners(self):
+        self.assertEqual(manual_sui.plan('h0', ['h1', 'h2']),
+                         {'coordinator': 'h0', 'owners': ['h1', 'h2']})
+        for owners in (['h1'], ['h1', 'h2', 'h3']):
+            with self.subTest(owners=owners), self.assertRaises(ValueError):
+                manual_sui.plan('h0', owners)
+        for coordinator, owners in (('h1', ['h1', 'h2']), ('h0', ['h1', 'h1']),
+                                    ('', ['h1', 'h2'])):
+            with self.subTest(coordinator=coordinator, owners=owners), \
+                    self.assertRaises(ValueError):
+                manual_sui.plan(coordinator, owners)
+
+    def test_gcloud_argv_names_the_host_and_zone(self):
+        remote = manual_sui.Remote('us-central1-a')
+        self.assertEqual(remote.argv('owner-1', 'true'), [
+            'gcloud', 'compute', 'ssh', 'owner-1', '--zone', 'us-central1-a',
+            '--quiet', '--command=true'])
+
+
+class LauncherHandshake(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.build = FakeBuild(self.root / 'build')
+        self.fixture = self.build.fixture(self.root)
+        self.schema = self.build.schema(self.root)
+        self.gcloud = LocalGcloud(self.root, self.root / 'guest')
+        self.saved = manual_sui.SAMPLE_SECONDS
+        manual_sui.SAMPLE_SECONDS = 0.2
+        self.addCleanup(setattr, manual_sui, 'SAMPLE_SECONDS', self.saved)
+
+    def launcher(self):
+        return manual_sui.SuiLauncher(
+            remote=manual_sui.Remote('us-central1-a', execute=self.gcloud),
+            build_root=self.build.root, fixture=self.fixture,
+            output=self.root / 'run', guest_root=self.root / 'guest',
+            stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
+            resources=self.root / 'resources.json', tier='native', owners=2,
+            deadline=900, transport='efa', live_transport='rdma', schema=self.schema)
+
+    def test_handshake_satisfies_the_runner_resource_contract(self):
+        receipt = self.launcher().run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertTrue(receipt['complete'])
+        self.assertEqual(receipt['owners'], 2)
+        self.assertTrue((self.root / 'stages/resources-ready').is_file())
+        resources = json.loads((self.root / 'resources.json').read_text())
+        self.assertEqual(set(resources['hosts']), {'10.0.0.2', '10.0.0.3'})
+        for host in resources['hosts'].values():
+            self.assertTrue(host['complete'] and host['cleanup_complete'])
+            self.assertTrue(host['all_namespaces_healthy'])
+            self.assertTrue(host['namespaces'])
+            self.assertTrue(all(row['healthy'] for row in host['samples']
+                                if row['unix_ns'] >= min(
+                                    r['unix_ns'] for r in host['samples'])))
+
+    def test_prepare_names_the_two_owner_hosts_and_three_external_flags(self):
+        launcher = self.launcher()
+        launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        prepare = next(command for command in launcher.local_commands
+                       if 'prepare_external' in ' '.join(command))
+        self.assertIn('--hosts 10.0.0.2,10.0.0.3', ' '.join(prepare))
+        self.assertIn('--owners 2', ' '.join(prepare))
+        run = next(command for command in launcher.local_commands
+                   if '/run.py' in ' '.join(command))
+        text = ' '.join(run)
+        self.assertIn('--external-config', text)
+        self.assertIn('--external-resources', text)
+        self.assertIn('--external-stage-dir', text)
+        self.assertIn('--durability-tier native', text)
+
+    def test_existing_stage_marker_is_refused(self):
+        stage = self.root / 'stages'
+        stage.mkdir()
+        (stage / 'remote-starting.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            self.launcher().run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+
+
+if __name__ == '__main__':
+    unittest.main()
