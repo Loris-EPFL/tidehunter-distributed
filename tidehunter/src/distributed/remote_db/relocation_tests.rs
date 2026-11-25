@@ -756,7 +756,7 @@ fn native_position(db: &Db, keyspace: KeySpace, sequence: u64, member: u8) -> u6
         )
         .unwrap()
     {
-        crate::large_table::GetResult::WalPosition(position) => position.offset(),
+        crate::large_table::GetResult::WalPosition(position, _) => position.offset(),
         _ => panic!("native index holds no WAL position for ({sequence}, {member})"),
     }
 }

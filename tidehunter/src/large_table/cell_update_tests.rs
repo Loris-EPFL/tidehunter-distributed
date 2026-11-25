@@ -480,7 +480,7 @@ fn repoint_during_an_in_flight_flush_waits_for_it_and_survives_its_completion() 
         Some(100),
         "the flush wrote the address it snapshotted"
     );
-    let GetResult::WalPosition(position) = flight
+    let GetResult::WalPosition(position, _) = flight
         .table
         .get(flight.context(), &key(1), &flight.loader)
         .expect("the loader cannot fail")

@@ -772,7 +772,7 @@ impl TableInner {
             .table
             .get_checkpoint(context, reduced.as_ref(), cut, self.loader.as_ref())?
         {
-            GetResult::WalPosition(position) => Ok(position
+            GetResult::WalPosition(position, _) => Ok(position
                 .is_valid()
                 .then_some(ResolvedValue::Position(position))),
             GetResult::NotFound => Ok(None),
@@ -846,7 +846,7 @@ impl TableInner {
             return Ok(None);
         };
         let value = match result.value {
-            GetResult::WalPosition(position) => ResolvedValue::Position(position),
+            GetResult::WalPosition(position, _) => ResolvedValue::Position(position),
             GetResult::Value(full_key, value) => ResolvedValue::Resident { full_key, value },
             GetResult::NotFound => {
                 return Err(LocalDbError::new(

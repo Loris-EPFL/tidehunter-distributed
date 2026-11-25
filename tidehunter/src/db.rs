@@ -733,16 +733,18 @@ impl Db {
                 }
                 Ok(Some(value))
             }
-            GetResult::WalPosition(w) => {
+            GetResult::WalPosition(w, cache_refill) => {
                 let value = self.read_record_check_key(context, k, w)?;
                 let Some(value) = value else {
                     return Ok(None);
                 };
+                self.large_table.fp.fp_before_value_cache_refill();
                 self.large_table.update_lru(
                     context,
                     reduced_key.to_vec().into(),
                     Bytes::from(k.to_vec()),
                     value.clone(),
+                    cache_refill,
                 );
                 Ok(Some(value))
             }
@@ -779,7 +781,7 @@ impl Db {
             GetResult::Value(full_key, _) => {
                 Ok(!context.ks_config.need_check_index_key() || full_key.as_ref() == k)
             }
-            GetResult::WalPosition(w) => {
+            GetResult::WalPosition(w, _) => {
                 if context.ks_config.need_check_index_key() {
                     // With key reduction an index hit may be a different key that
                     // reduces to the same index key, so read the record to compare.
@@ -1325,14 +1327,16 @@ impl Db {
             };
             let (key, value) = match result.value {
                 GetResult::Value(ref full_key, ref v) => (full_key.clone(), v.clone()),
-                GetResult::WalPosition(w) => {
+                GetResult::WalPosition(w, ref cache_refill) => {
                     match self.read_record_for_indexed_key(context, w, result.key.as_ref())? {
                         Some((k, v)) => {
+                            self.large_table.fp.fp_before_value_cache_refill();
                             self.large_table.update_lru(
                                 context,
                                 result.key.clone(),
                                 k.clone(),
                                 v.clone(),
+                                cache_refill.clone(),
                             );
                             (k, v)
                         }
@@ -1672,17 +1676,19 @@ impl Db {
                     Some(value)
                 }
             }
-            GetResult::WalPosition(position) => {
+            GetResult::WalPosition(position, refill) => {
                 let began = Instant::now();
                 let value = self.read_record_check_key(context, k, position)?;
                 profile.wal_and_decode_ns =
                     u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 if let Some(value) = &value {
+                    self.large_table.fp.fp_before_value_cache_refill();
                     self.large_table.update_lru(
                         context,
                         reduced_key.to_vec().into(),
                         Bytes::from(k.to_vec()),
                         value.clone(),
+                        refill,
                     );
                 }
                 value
@@ -2657,6 +2663,10 @@ impl From<bincode::Error> for DbError {
 #[cfg(test)]
 #[path = "db_tests/generated.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db_tests/test_cache_refill.rs"]
+mod cache_refill_tests;
 
 #[cfg(test)]
 #[path = "db_tests/test_background_health.rs"]
