@@ -1,0 +1,16 @@
+[package]
+name = "sui-sharded-state-audit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+tidehunter = { path = "../../../tidehunter", features = ["experimental-distributed", "test-utils"] }
+serde_json = "1"
+sha2 = "0.10"
+prometheus = "0.14"
+
+[features]
+fabric = ["tidehunter/experimental-fabric"]

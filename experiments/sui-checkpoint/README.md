@@ -8,49 +8,6 @@ RocksDB. Every selected Tidehunter DB must export the same namespace/key shape
 and use the remote backend in the distributed run; a missing mapping or a native
 fallback fails the run.
 
-## Portable transport selection
-
-The Sui replay's shared WAL/index and record-read protocol is transport
-independent. TCP remains the default; opt-in OFI uses the same bounded engine
-transport and does not change storage locks, WAL acknowledgement, or
-durability. Configure a structured transport on each applicable endpoint:
-
-```json
-{"kind":"ofi","fabric":{"backend":"verbs","domain":"mlx5_0","source_address":"10.1.0.2"},"security":"trusted"}
-```
-
-The available provider profiles are `efa`, `efa-direct`, `verbs`, and
-`software-tcp`. Domain/source selectors are host-local and may differ between
-peers, which must agree on backend and security. Source-IP support depends on
-the provider: EFA/EFA-direct reject source IPs, verbs accepts IPv4 only because
-pinned RxM lists `FI_SOCKADDR`/`FI_SOCKADDR_IN` (despite core verbs IPv6
-support), and software-tcp accepts IPv4/IPv6 when `fi_getinfo` selects a match.
-No source selector means provider-default selection. Metadata reports a
-selected IPv4/IPv6 source only when parseable; explicit selection is checked
-against the returned address. Generic verbs supports provider-selected
-IB/RoCE/Falcon devices; these are not wire-interchangeable, and EFA SRD is
-separate. Explicit selection fails closed and does not downgrade to TCP.
-
-Generic fabric FI_READ probes are separate from Sui record reads; the engine
-does not offer registered-value grants. In a fabric probe, setting
-`require_device_read: true` requires native reads plus provider-specific
-device evidence. For verbs this includes PCI metadata matched to canonical
-sysfs PCI BDF and rejects `rxe`, `rdma_rxe`, and `siw`; it does not establish
-Falcon identity. Successful setup alone is not proof. Software-provider FI_READ
-tests demonstrate software-path correctness only, not EFA/IB/RoCE/Falcon
-hardware operation or performance.
-Hardware qualification remains pending until actual device evidence and
-parent-reviewed measurements are available. See the [fabric design](../../tidehunter-fabric/DESIGN.md#portable-transport-boundary-27-october-2026)
-for implementation symbols and primary OFI, Falcon, and native-paper sources.
-
-The build plan derives the wire protocol from the exact staged engine source
-(`tcp.rs`), not a separately maintained version in the Python builder.
-External deployment and replay results copy that frozen manifest identity. Rebuild all participants and
-regenerate configurations together. Old string-transport deployments cannot
-mix with these endpoints. Local transport checks and their hardware limits are
-recorded in the [27 October qualification](../../tidehunter-fabric/DESIGN.md#local-qualification-27-october-2026);
-no fresh full Sui replay is claimed by that check.
-
 ## 23 October local resident-read and comparison controls
 
 The active KV planner now preserves **both** 8-KiB/batch32 working sets:
@@ -92,75 +49,184 @@ A fresh diagnostic twin replaces its scalar phase with profiled calls using the
 same complete random oracle, key order, cardinality and initial prepared state;
 it no longer samples a warmed sequential 256-key prefix. Diagnostic rows remain
 separate from clean latency. Grouped reads expose widths 4 and 32 independently.
-Owners read through Linux page cache, with bounded NOWAIT attempts followed by
-asynchronous fallback; they no longer have an application value cache or
-registered-value grants. The coordinator value cache remains independently
-configurable. Neither an enlarged hot set nor a successful NOWAIT attempt
-establishes physical NVMe service time.
+The targeted shard-cache-on cases explicitly fill a 256-key hot set with
+coordinator caching disabled. `cache_hot_before_scan` is hit-only only when its
+actual owner/frontend counter deltas prove it; enlarged uniform reads are not
+assumed resident or cache hits.
 
-Local software-provider controls use canonical transport selection, for
-example `{"kind":"ofi","fabric":{"backend":"software-tcp"},"security":"trusted"}`.
+Local software-fabric controls can opt in to bounded registered reads with
+`--backend tcp --transport fabric-tcp-native --tcp-read-cache-bytes 0`
+and explicit `--rma-source-bytes`, `--rma-source-regions`,
+`--rma-destination-bytes`, `--rma-destination-slots`, `--rma-max-read-bytes`,
+`--rma-max-handles`, `--rma-require-device-read false`. All-zero defaults
+disable RMA. These limits are charged beside the explicit application caches
+and in-flight allowances. Configure both owners and client before launch;
+existing external configurations reject CLI server-control overrides.
+`resident_reads.jsonl` retains actual grant acquisition, posts, successful CQ
+completions, verified hits, errors/fallback reasons and occupancy snapshots
+at each read boundary, with coordinator-local/per-owner-connection scope.
+It does not claim to sample remote source occupancy.
 
-For raw FI_READ measurement, provide a `FabricConfig` JSON and explicit device
-read policy:
+For an explicit trusted-native resident experiment, `kv_suite.resident_reads`
+accepts the complete limits object, without adding cases to either matrix:
 
-```sh
-sharded_wal_transport_bench --rma-probe --role server --listen 127.0.0.1:PORT --fabric-config fabric.json --require-device-read false
-sharded_wal_transport_bench --rma-probe --role client --connect 127.0.0.1:PORT --fabric-config fabric.json --require-device-read false
+```json
+{
+  "source_bytes": 4194304,
+  "source_regions": 512,
+  "destination_bytes": 20971520,
+  "destination_slots": 640,
+  "max_read_bytes": 32768,
+  "max_handles": 4096,
+  "require_device_read": false
+}
 ```
 
-The probe requires both `--fabric-config` and `--require-device-read`; set the
-latter to `true` to require proven native device reads, not merely request
-them. Output includes observed provider setup metadata and capability evidence.
-A successful software-provider FI_READ comparison qualifies software
-correctness only. Configure the same provider/security on both peers, with
-host-specific `domain` and `source_address` selectors as needed. Hardware
-qualification remains pending until parent-reviewed results from actual
-devices.
+This opt-in applies only to explicitly trusted-native cases. In the usual
+TCP/EFA/EFA-direct/EFA-native matrix, TCP and TLS cases remain RPC controls;
+only EFA-native warm cases receive the distinct RMA-bound identity.
+Prepared owner and client YAML carry the exact limits,
+the case name binds their digest, and cold
+cases deliberately omit them. Hardware qualification must request
+`require_device_read: true` and retain the existing provider/hardware evidence;
+software-provider success is not hardware proof.
 
-
-For a local replay select the canonical engine transport with `--transport-config JSON_FILE`.
-TCP is the default. Local hardware OFI is rejected; local runs permit TCP or
-the software provider for correctness testing only. The transport configuration
-must be present in a fabric-enabled build. Use external deployment configuration
-for hardware providers; software-fabric results are not EFA or verbs hardware
-latency.
-
-Standalone `sharded_wal_bench` uses the same structured `Transport` file:
+After the integrated source-bound build, run these paired loopback controls
+with the **new bundle's** executable, not an older `target/release` binary.
+Both use the same 32-key control before the legacy full-oracle workloads:
 
 ```sh
-sharded_wal_bench --backend tcp --transport-config transport.json
+BUILD_ROOT=/path/to/new/source-bound/build
+"$BUILD_ROOT/binaries/storage-node" --output logs/resident-native --backend native-sync --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true
+"$BUILD_ROOT/binaries/storage-node" --output logs/resident-local --backend tcp --transport fabric-tcp-native --values 8192 --batch-sizes 32 --windows 1 --batches 320 --mixed 64 --reads 512 --read-window 32 --tcp-read-lanes 4 --native-read-cache-bytes 0 --tcp-read-cache-bytes 0 --tcp-shard-cache-bytes 0 --hot-read-pass true --read-resource-evidence true --bounded-hot-pass true --rma-source-bytes 4194304 --rma-source-regions 512 --rma-destination-bytes 20971520 --rma-destination-slots 640 --rma-max-read-bytes 32768 --rma-max-handles 4096 --rma-require-device-read false
+python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-native --mode native-sync
+python3 experiments/aws-sharded-wal/checkpoint_kv.py evidence logs/resident-local --mode tcp
 ```
 
-Note: the `sharded_wal_bench` example and its executable are removed from this
-tree. The archive tag `archive/multi-design-*` still builds them. This section
-stays as the record of earlier runs. Current builds select the transport
-through `kv-research`, as described below.
+`--bounded-hot-pass` is off by default and automatic when RMA is enabled.
+Native receives no RMA arguments and invents no RMA counters. Inspect
+`bounded_hot.service_qualified` on both sides and
+`resident_reads.registered_controls.qualified` on the remote side. Native
+qualification requires actual zero accounted reads/major faults with observed
+WAL residency and its value cache disabled. Software fabric proves correctness,
+not EFA latency. Replace `--batches 320` with `3200` on **both** sides for the
+larger working set; never combine the two denominators.
 
-Example benchmarks and `kv-research` have different selection surfaces:
-`kv-research` uses backend kind `tidehunter` and the
-`backend.options.transport` object in its run JSON.
+Source-bound pipeline identities support an explicit bounded-only comparison:
+`compare NATIVE.identity.json REMOTE.identity.json --population bounded-hot
+--compared implementation transport`. The ordinary matcher remains strict.
+Standalone CLI population evidence does not invent missing campaign provenance.
 
-Sui summaries additionally retain `shard_read_by_owner`, parsed from
-`tidehunter_shard_read{namespace,partition,stat}`. Missing families on older
-binaries or failed `shard_sample_available` observations are unavailable,
-never zero. A foreground-only snapshot is cumulative, not an invented delta;
-the strict before/after consumer preserves each owner and rejects resets or
-population drift. Coordinator-cache hits, Linux NOWAIT attempts and successes,
-async submissions and positive process physical-I/O brackets remain distinct.
-Advisory eviction and async submission alone never prove physical NVMe reads,
-and process-I/O brackets never establish one device read per key.
+The destination budget is a coordinator-wide total partitioned across read
+lanes, not multiplied per connection. At 32-KiB maximum reads, 640 slots and
+20 MiB permit a width-32 result group on each of up to 20 lanes. Smaller totals
+remain legitimate pressure controls but can force grouped-read RPC fallback;
+they must not be presented as a supported resident grouped-hit population.
+The 4,096-handle total also leaves room for session-scoped references across
+read lanes; a fitting value set alone does not prove that the handle cache fits.
+The control uses exactly the first 32 loaded keys, independent of the
+320/3200-batch oracle, immediately after load and before other read populations.
+The deterministic scalar sequence is `mix64(sample) % 32`, with
+`min(512, max(32, reads))` calls; each grouped call uses all 32 distinct keys,
+with `ceil(scalar_calls / 32)` calls. Native, RPC and RMA run the same
+`2 * read_lanes + 1` complete scalar-then-group warm passes. RMA additionally
+requires `read_lanes` consecutive fully registered-hit passes after every lane
+of each active hot-set owner has verified hits; it does not stop preparation
+early. `bounded_hot_setup` is the common CSV setup phase.
+`bounded_hot_controls.jsonl` retains the shared policy and verified populations;
+`registered_hot_setup` remains the RMA-specific preparation record inside
+`registered_controls.jsonl`. Acquisition and setup time are not hit latency.
+
+`registered_controls.jsonl` retains raw before/after lane snapshots, every
+preparation pass, the key/order/cardinality policy and both measured populations.
+For a registered experiment, only fully verified, prepared populations with
+zero Read/ReadProfiled messages, new grant acquisitions, fallbacks or errors
+may retain `cache_hot_get` / `cache_hot_get_many` rather than `*_mixed` labels.
+Accepted FI_READ posts and successful completions must equal **every** intended returned element;
+eligible reads and verified hits count complete owner groups, not elements.
+A 32-member group can therefore have one group hit and 32 posts/completions.
+Group hits must equal grouped calls times the actual hot-set owner count;
+scalar hits must equal scalar calls. Positive partial populations cannot pass.
+The consumer recomputes lane coverage and deltas, checks per-owner aggregates,
+and binds the CSV sample/operation counts. Mixed or invalid populations use
+`*_mixed` timing labels and cannot qualify the registered probe, even if some
+RMA hits occurred. Successful RPC fallback with all-zero RMA counters is not
+qualification. Inspect `resident_reads.registered_controls.qualified` in the
+`evidence` output; ordinary process success is insufficient.
+
+The original full-oracle `point_get` / `point_get_hot` and grouped populations
+retain their original counts/order. They are **not** relabeled registered-hit-only
+because the small control qualified. No server-handler clocks apply to a
+registered hit, and neither software-provider results nor these API timings
+establish hardware-only or physical-NVMe latency. Active RMA identities require
+the observed preparation policy and qualified raw controls. Older binaries
+without that policy remain unqualified unless their observed, source-bound
+all-zero resident configuration proves this preparation did not run; that
+inactive state is matched without inventing unused historical hot-set metadata.
+
+Use fresh output roots for each native/TCP/software-fabric/cache-off/cache-on
+control. Keep the same value shape, cardinality, read count/order and
+preparation controls for intentional comparisons; label the transport/RMA axis.
+The example requires Linux `test-utils` and `experimental-fabric`; use the same
+libfabric ABI as the build. Detailed clocks remain off unless explicitly enabled.
+
+`read_path_evidence.csv` additionally records nullable authority-cache counters:
+resident hits/misses, contention, history loads, entries/capacity and charged
+table bytes. Each owner retains its before/after observations; absent older
+fields or unavailable samples remain null. Authority-history loads can be
+served by page cache and never establish physical NVMe I/O.
+
+The same rebuilt real-Sui fixture/replay pipeline remains the qualification
+gate: use its existing `--local-transport fabric-tcp-native` mode and complete
+namespace/value audit before any cloud allocation. No AWS operation is needed
+to inspect these commands or qualify source binding. Loopback correctness is
+not EFA hardware latency.
+
+The 2026-11 engine removed the per-owner `tidehunter_operational_read_io`,
+`tidehunter_shard_read{namespace,partition,stat}` and adapter `shard_*`
+families. The harness now decodes two current sources instead:
+
+* `tidehunter_nvmeof_live_*` from
+  `tidehunter/src/distributed/nvmeof/live_prometheus.rs`. The family is
+  aggregate and unlabeled by design: namespace identities remain audit
+  evidence, never metric labels. `read_io_samples_total`, `read_io_seconds_total`,
+  `delivery_seconds_total`, completed read/write ops and bytes,
+  `namespace_connects_total`, `errors_total` and `target_observed_partitions`
+  are retained. `read_io_seconds` includes queue, fabric, target and storage.
+* The coordinator registry supplied through `Db::open_remote_with_metrics`:
+  `db_op`, `lookup_mcs`, `large_table_contention`, `index_blob_cache_*`
+  and the per-keyspace flush/promote counters. Lock-wait histograms sample
+  contested acquisitions only, and their bucket bounds are approximations,
+  not raw quantiles.
+
+Neither source has a per-partition counter, a sample-generation counter, or a
+per-owner availability flag, and no value-cache hit counter exists. M2 therefore
+uses `owner_fetch_fraction`: aggregate owner read operations divided by
+coordinator `get` calls. It is a request ratio, not a hit rate or byte ratio.
+The harness **does not expect, emit or fabricate** per-partition samples. The final cut needs one post-certified aggregate
+publication advance in remote mode and coordinator coverage of every audited
+live namespace. A missing family is transiently retried and then fails the
+run; it is never reported as zero. Application-cache hits, resident/page-cache
+service, async submissions and positive process physical-I/O brackets remain
+distinct. Advisory eviction and async submission alone never prove physical
+NVMe reads, and process-I/O brackets never establish one device read per key.
+
+The old closed-campaign comparator (`compare_campaign`, `verified_campaign`,
+transport/population pooling, fabric log parsing) was removed with this
+re-anchor: its `experiments/aws-sharded-wal/checkpoint_matrix.py` source no
+longer exists in this branch. Analyze each paired replay with `analyze.py RUN`;
+the campaign controller aggregates per-cell rows in
+`checkpoint-work/cluster-campaign-2026-11-25/`.
 
 Parent integration checks (not run by the implementation worker):
 
 ```sh
-(cd experiments/aws-sharded-wal && python3 -m unittest test_matched_reads test_cloud_profile_populations test_checkpoint_matrix test_local_safety)
-(cd experiments/sui-checkpoint && python3 -m unittest test_shard_read_evidence test_analysis)
+(cd experiments/sui-checkpoint && python3 -m unittest test_harness test_analysis test_checkpoint_support test_cloud_node test_disk_collector test_fault_inject)
 ```
 
 Run the existing Rust example builds/checks and bounded native/TCP/software-
 fabric controls after integration. Require actual nonempty owner populations,
-Linux NOWAIT and asynchronous fallback observations, successful value and
+separate registered acquisition/hit/fallback populations, successful value and
 reopen audits, and counter-qualified cache/physical-I/O classifications.
 The existing deadline, export reserve, process ownership and unconditional
 cleanup/termination semantics are unchanged.
@@ -178,24 +244,52 @@ cache bounded by 1 MiB of canonical serialized bytes, without a separate row cap
 Native and remote Sui use the same policy; the producer's eight-entry digest/control
 window is separate. Hits retain storage failure fencing and same-key mutations
 invalidate delayed fills. The exact Sui and engine changes are mapped in
-the archived local cache and checkpoint cutover (tag `archive/multi-design-*`,
-`docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md`).
+[the local cache and checkpoint cutover](../../docs/distributed/HOT_READS_AND_CHECKPOINT_ADMISSION_2026-10-16.md).
 Typed-store `certified_checkpoints` histograms observe backend calls only, not
 sequence-cache hits. Fewer backend observations are not end-to-end sequence-lookup
 latency or an unchanged request population.
 
-The cloud supervisor accepts `coordinator_cache_mib_by_repetition`, with one
-integer 0..128 per repetition. The budget applies per logical database, shared
-across its CFs, and is recorded in the cell receipt and replay evidence.
-Keep clean repetitions separate from timing-profiled repetitions and compare
+The cloud supervisor accepts optional `coordinator_cache_mib_by_repetition` and
+`shard_cache_mib_by_repetition` arrays, with one integer 0..128 per repetition.
+Each effective budget is bound into the cell receipt, generated deployment and
+replay evidence. An omitted schedule uses the corresponding global budget.
+Keep clean repetitions separate from timing-profiled repetitions; compare cache
 variants within the same source, hardware and transport.
+The coordinator budget applies per logical database, shared across its CFs.
+The shard budget applies per database partition, not per storage host. In the
+three-DB/five-partition campaign, coordinator 8 MiB plus shard 16 MiB means
+24 MiB coordinator + 240 MiB storage value-cache capacity, excluding metadata,
+execution caches, in-flight buffers and OS page cache. It is not an RSS cap.
 
-The 16 October targeted owner-cache cases described in the archived campaign
-are historical and cannot be rerun with the current engine.
+Use `kv_suite: {"scope": "targeted", "repetitions": 1, "diagnostics": true}`
+for ten clean paired cases per requested transport: 256-byte and 8-KiB scalar reads
+with coordinator cache off and shard cache off/on, an 8-KiB coordinator-hit
+control, bulk preparation chunks of 16 versus 32, a bulk shard-cache pressure
+case, a cache-evicted bulk case, and a 32-batch preparation control with Sui-style
+WAL geometry. Bulk cases use 3,200 batches (100 full durable windows) and 8,192
+read keys, exceeding the five 8-MiB shard caches' aggregate payload allowance.
+The Sui-style control uses 16-MiB fragments, 256-MiB files and a 12-MiB group-byte
+limit, instead of 1-MiB fragments, 128-MiB files and a 1-MiB-minus-eight-byte group
+limit. It retains the raw benchmark's 32-batch group limit, not real Sui's 64;
+it is not a complete Sui configuration. The benchmark explicitly bounds load
+batches at 4,096 and checked value history at 1 GiB; defaults remain unchanged.
+Native durability windows still synchronize all registered Value WAL files,
+whereas owners synchronize the exact containing group file. Resource rows record
+the native registered-file count outside timed operations; larger histories can
+therefore expose extra conservative native barrier work. Do not call these
+identical persistence implementations.
+With diagnostics enabled, one additional fresh 8-KiB scalar pair per transport
+collects stage clocks. It must not be pooled with the ten clean pairs. The first
+256-byte clean case also runs the rebuilt authenticated
+RAM-response executable with 256-byte/8-KiB payloads and no WAL member reads
+during that measurement. Clean and profiled RAM processes are separate. This
+floor has no invented native-storage comparator and is not physical wire RTT.
+The default `full` scope retains the historical KV matrix.
 
 Cache hits are not durability acknowledgements. No experiment may remove exact
 reference checks, client integrity verification, valid-cut checks, durable-before-
-publication barriers, or buffer/file lifetime pins.
+publication barriers, or buffer/file lifetime pins. Shard residency avoids file
+submission only after authoritative read planning; it is not one-sided RDMA.
 RF1 remains unable to survive loss of an owner NVMe device.
 
 The **completed 16 October hardware campaign** and its correctness/security
@@ -209,8 +303,7 @@ tenancy and cluster placement do not prove dedicated physical-host separation.
 Keep these results separate from the older campaigns below.
 
 The completed 13 October native/TCP/EFA matrix is recorded in
-the archived measured results and closure report §20
-(`docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md`, tag `archive/multi-design-*`).
+[the measured results and closure report](../../docs/distributed/CLUSTER_RAM_AND_READ_PATH_PLAN_2026-10-11.md#20-completed-nativetcpefa-real-checkpoint-matrix-13-october-2026).
 All four paired real-checkpoint runs passed full-state audits; both EFA cells
 proved hardware traffic on all six hosts. This is a private generated-transfer
 chain, not mainnet or a cold-NVMe capacity workload. All instances and temporary
@@ -220,8 +313,7 @@ a complete equal `experiment/audit.json` qualifies. No script in this directory
 calls AWS, launches instances, commits, pushes, or deletes old results.
 
 The **15 October local implementation and measurements** are in
-the archived current source map, correctness rules and qualified results §15
-(`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`, tag `archive/multi-design-*`).
+[the current source map, correctness rules and qualified results](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md#15-october-local-lifecycle-and-serving-path-implementation).
 They cover pooled immutable index containers, background checkpointing, pageable
 retry authority, pinned whole-file retirement, single-flight and actual Sui page
 prefetch. All five updated local native/TCP/software-fabric pairs passed state
@@ -288,7 +380,6 @@ python3 tidehunter-sharded-wal/experiments/sui-checkpoint/build.py build \
 ```
 
 Add `--fabric` to `prepare` for `sharded-wal-fabric`/`experimental-fabric` builds.
-Add `--nvmeof` with `--fabric` to build the NVMe-oF data path and state audit.
 Preparation snapshots the exact tracked and nonignored untracked working files,
 including dirty edits and tracked deletions. It refuses escaping symlinks and
 source mutation during copying. Cargo metadata resolves the new local dependency
@@ -304,11 +395,6 @@ executable is the existing
 benchmark workload runs in that mode. The new standalone `state-audit` uses the
 same adapter and the same engine sources. The existing strict
 `distributed_storage_local_audit` example is rebuilt from the same Sui sources.
-
-Note: the `sharded_wal_bench` executable is removed from this tree (see the
-note above). The `kv-research` executable now provides the same
-`--experimental-storage-node` mode. The paragraph above stays as the record of
-earlier builds.
 
 `source-manifest.json`, `sources.tar.gz`, the exact commands/log hashes,
 `build-manifest.json`, resolved lockfiles and executable hashes bind every
@@ -335,7 +421,7 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
   --build /absolute/owned/checkpoint-build \
   --fixture /absolute/repository/checkpoint-fixtures/sui-genesis-1775/fixture \
   --output /absolute/owned/checkpoint-run \
-  --deadline 900 --port 24000 --coordinator-cache-mib 8
+  --deadline 900 --port 24000 --coordinator-cache-mib 8 --shard-cache-mib 0
 
 python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experiments/sui-checkpoint/analyze.py \
   /absolute/owned/checkpoint-run
@@ -348,34 +434,17 @@ state-sync-only fullnodes bounded at tip+1, so they stay alive for final metrics
 at the frozen tip. Their certified completed tip must equal the producer.
 The producer alone receives `source_environment(prior)`: its original fragment
 size and durability policy, with historical defaults of 32 MiB and asynchronous
-writes, and the reviewed fixture's one default mutex. The measured contract must
-not reinterpret the producer's WAL or persisted key layout. In particular,
-`original_default` still uses engine defaults for the new measured DBs, not for
-the frozen producer.
+writes. Measured durable settings must never reinterpret the producer's WAL.
 The native control runs first because it exports the authoritative complete
 namespace/key-shape inventory. This fixed order is recorded, not randomized.
 
-Native replay permits at most three fresh attempts, only for the typed RPC-index
-catch-up failure (120 seconds without committed-frontier progress, 1,200 seconds
-total, or node exit during catch-up). The all-ten-at-tip gate and full audit stay
-strict. Any other error fails immediately; remote replay is never retried.
-Before a native retry the child is stopped, all attempt output is renamed with
-`native-attempt<N>-`, and observations plus the last metrics are saved in
-`native-attempt<N>-catchup.json`. The failed native database is deleted and listen
-ports must be free. The producer, inputs and canonical paths do not change.
-`native_attempts` and `native_retried` disclose the selection in results and
-analysis. Only the successful attempt supplies the canonical schema, final
-metrics and foreground timing. First-attempt failures are reported separately;
-a retried timing is not a first-attempt sample. This is an operational mitigation,
-not a proved fix for the missing-object failure inside Sui. Remote replay can
-hit the same stall and will fail without retry; existing fleet deadlines remain.
-
 For every native-exported database the runner allocates a fresh UUID and starts
-five independent physical shard processes, each with its own WAL root, bounded
-read workers and port. TLS modes also assign each node its own authenticated
-identity; explicit trusted-native modes use no certificate files. There is one local
-coordinator publication/index authority per DB, not a global WAL or NVMe-oF
-layer. Loopback is **five physical shards per selected DB**, not five processes
+`--owners` independent physical shard processes (2 by default, 2 in the
+campaign), each with its own WAL root, bounded read workers and port. TLS modes
+also assign each node its own authenticated identity; explicit trusted-native
+modes use no certificate files. There is one local coordinator
+publication/index authority per DB, not a global WAL or NVMe-oF layer.
+Loopback is **one process per requested owner per selected DB**, not processes
 shared across unrelated DB identities. It is one laptop SSD/RAM pool, not a
 multi-NVMe or RDMA performance claim.
 
@@ -476,47 +545,15 @@ exceeding its batch limits fails before writes. Dropping only a coordinator DB,
 Rocks range compaction/range tombstones, directory-copy checkpoints and secondary
 mode remain Unsupported/errors. No HA, failover or unbounded-epoch claim is made.
 
-## Five existing storage hosts / controller integration
+## Existing storage hosts / controller integration
+
+The owner count is explicit. `run.py --owners` defaults to **2** (one
+coordinator and two owners is the campaign shape); `deployment.prepare` and
+`prepare_external.py` derive the same count from `--hosts` or accept
+`--owners` and reject a mismatch. Nothing selects five partitions implicitly.
 
 After a source-identical local run has exported native shapes, prepare a fresh
 external namespace (no hosts are launched):
-
-Use the native schema from the **same measured contract**. `harness` and
-`original_default` can have different mutex counts and keyspace settings.
-The GCP package now requires two complete local replay proofs:
-`verification/` for `harness` and `verification-original-default/` for
-`original_default`. Both retain their native schemas and bound audit evidence.
-The GCP launcher selects the proof by the cell contract. A missing proof is an
-error; the launcher does not use the other contract's schema.
-
-The external manifest records `shape_sha256` for each database. After the
-native replay, the runner checks these hashes before it starts the remote
-replay. A mismatch reports the database and both SHA-256 values. The client
-also reports the request and failed status check, with both shape hashes.
-Failed GCP cells retain the stopped owners' logs in `owner-N-logs.tar.gz`
-beside the replay evidence.
-
-For live NVMe-oF cells, `cloud_node.py` creates each validated target state
-directory with mode `0700` before it starts that storage process. The target
-requires this directory to exist; it does not create or adopt it. A directory
-that appears after validation fails the launch. The local paired replay does
-not run kernel nvmet, so its success does not test this external startup step.
-Each (database, partition) also gets its own initiator NQN and host UUID.
-The coordinator selects that pair from `live_nvme.owner_identities` when it
-configures the owner connection. Ports, services, state directories and WAL
-roots stay exclusive. This allows 15 owner processes on one storage VM without
-sharing a configfs host entry. The base identity and the owner map are pinned
-in the authority manifest; a changed map cannot reopen that authority.
-The live byte allowance covers the configured write-frame and recovery limits,
-rounded up to 4 KiB. It is not a global library default.
-
-Before sealing, `prepare.py` runs `validate_deployment.py` with the built
-storage binary. It generates both contracts, both owner WAL layouts, verbs
-and live NVMe-oF, and two-VM and six-VM layouts. The binary's
-`--experimental-validate-config CONFIG.json LAUNCH.yaml...` mode deserializes
-and validates the coordinator and owner settings without starting servers,
-creating WAL files or opening nvmet. This gate does not prove kernel target
-commissioning, RDMA connectivity or checkpoint completion.
 
 ```sh
 python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experiments/sui-checkpoint/prepare_external.py \
@@ -525,13 +562,13 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
   --output /absolute/owned/external-config \
   --db-root /absolute/owned/cloud-run/remote/full_node_db/94970e38de08 \
   --guest-root /absolute/owned/unique-storage-run \
-  --hosts 10.0.1.10,10.0.1.11,10.0.1.12,10.0.1.13,10.0.1.14 \
-  --transport-config /absolute/owned/efa-transport.json --coordinator-cache-mib 8
+  --hosts 10.0.1.10,10.0.1.11 --owners 2 \
+  --transport efa --coordinator-cache-mib 8 --shard-cache-mib 0
 ```
 
 `external-manifest.json` contains every launch argv, ready/stop path, binary,
-source/config hash and per-host payload hash. The existing parent controller
-creates the fresh root on each of the **five distinct hosts**, distributes only
+source/config hash, `owners` and per-host payload hash. The existing parent
+controller creates the fresh root on each of the **requested distinct hosts**, distributes only
 that host's archive, starts the listed bounded process groups, waits for its
 ready files and retains PID ownership. TLS modes distribute only that host's leaf
 key and public CA, never the coordinator identity or CA signing key; trusted-native
@@ -555,7 +592,7 @@ bindings and a `unix_ns` no earlier than `resources-required`. The runner waits
 at most 120 seconds for this marker before reading resources.
 
 The resource JSON contains those same three bindings and `hosts`, keyed by the
-exact five IPs. Each host binds the storage binary, guest root and exact command
+exact requested owner IPs. Each host binds the storage binary, guest root and exact command
 inventory to owned PID/process-group/start-time identities; final `complete`,
 `cleanup_complete`, `all_namespaces_healthy` must be true and `failure` absent.
 Nonempty healthy `samples` must bracket remote execution with all namespace
@@ -583,6 +620,57 @@ hardware EFA and dependency admission still apply. Recheck regional capacity,
 quota, price and the absolute lifetime budget before launch. A G5/G6 change
 prevents attributing a cross-run speed difference solely to code; use each
 cell's matched native control and disclose the hardware change.
+
+### Coordinator disk collector
+
+`disk_collector.py` inventories one coordinator database root. It classifies
+`index_<16 hex>` as `index_wal`, `wal_<16 hex>` as `replay_wal` and every other
+file as `other`, then records per database and per class: file count, apparent
+bytes (`st_size`), allocated bytes (`st_blocks * 512`), apparent fragment slots
+and fully allocated fragment slots. A fragment is a `frag_size` region inside a
+WAL file, not a separate file; allocated slots are a filesystem lower bound,
+never an engine preallocation record. Symlinks and unsafe namespaces fail
+closed.
+
+`run.py --disk-sample-seconds` samples during the remote replay (default 10 s,
+0 disables) and adds one final sample. `run.py --fragment-mib` sets the engine
+fragment size used by `TH_FRAG_SIZE` (default 8; the production campaign
+geometry is 1024). `results.json` retains `disk_geometry` with
+`matches_production`, and `disk` with every sample, the final inventory and a
+`budget` row. `budget` compares the larger of apparent and allocated bytes with
+the root's free space and fails the admission above 70 %.
+
+Standalone inspection:
+
+```sh
+python3 disk_collector.py --root /owned/remote --namespace live/perpetual \
+  --namespace live/checkpoints --fragment-mib 1024 --output disk.json
+```
+
+### W1 controller-loss injector
+
+`fault_inject.py` implements the S1-4/M7 fault. It selects exactly one verified
+host controller by NQN, transport, address and service, snapshots the last
+completed checkpoint, then deletes that controller through its own sysfs
+`delete_controller` file. It never disconnects globally and never signals an
+owner process. After deletion it waits for a new controller with the same
+identity, requires the checkpoint sequence to advance, re-reads the pre-fault
+checkpoint summary and requires byte-identical canonical JSON. With
+`--metrics-url` it also requires the aggregate live family to advance without
+new data-plane errors.
+
+```sh
+python3 fault_inject.py --nqn nqn.2026-01.campaign:owner-1 --transport rdma \
+  --address 10.0.1.11 --service 4420 --sui-rpc 127.0.0.1:9000 \
+  --metrics-url http://127.0.0.1:9000/metrics \
+  --owner-pid 4242 --timeout 30 --output faults.json
+```
+
+The record retains reconnect and write-progress seconds, checkpoint hashes,
+readback equality, live counter deltas and owned-process liveness. It exits
+nonzero when any verification fails, but still writes the record.
+`duplicate_count` is `null` with an explicit reason: no host-side duplicate
+counter exists; engine reconciliation is inspected from its own logs.
 
 ### Atomic six-host startup (no human SSM call)
 
@@ -758,9 +846,8 @@ Before paid allocation, CI must rebuild and complete a same-source real-checkpoi
 `fabric-tcp-native` local replay and full-state audit. This prerequisite is wired
 but is not a claim that a new Sui replay or hardware run occurred locally.
 
-See the [implemented native message contract](../../tidehunter-fabric/DESIGN.md#trusted-native-message-mode-21-october);
-the one-sided WAL design is archived at tag `archive/multi-design-*`
-(`docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md`).
+See the [implemented native message contract](../../tidehunter-fabric/DESIGN.md#trusted-native-message-mode-21-october)
+and [one-sided WAL design](../../docs/distributed/ONE_SIDED_WAL_READS_2026-10-21.md).
 
 New cell payloads bind `fabric_preflight_transport` in expected evidence. Their
 preflight runs `fi_info -p efa -f <fabric> -t FI_EP_RDM`; `efa-native` selects
@@ -809,24 +896,27 @@ exported before the exact-owned fleet termination attempt.
 * Adapter cache gauges and engine counters are recorded by name, never inferred
   from requests. Missing instrumentation is unavailable, not a fabricated zero.
   Native value/index/page-cache state differs from bounded remote cache tiers.
-  `tidehunter_adapter{namespace,stat}` separates calls/keys/submitted read RPCs
-  from coordinator cache and authenticated cumulative owner WAL-read
-  samples. These diagnostic samples add control RPC work during scrapes.
-  `shard_sample_available=0` means unavailable; diagnostics mask stale values to
-  null, and qualification fails. WAL bytes and async submissions are not physical NVMe reads.
+  `tidehunter_adapter{namespace,stat}` retains only current local diagnostic
+  fields; any `shard_*`, `resident_*`, `authority_*` or `initiator_*` stat is
+  rejected as a removed family. Coordinator metrics come from the registry
+  supplied to `Db::open_remote_with_metrics`, and physical read evidence comes
+  from the aggregate `tidehunter_nvmeof_live_*` counters. These diagnostic
+  samples add control RPC work during scrapes. Disabled or absent diagnostics
+  are masked to null, and qualification fails. WAL bytes and async submissions
+  are not physical NVMe reads.
 * Every foreground sample records owned-PID RSS/high-water/swap and physical
   `/proc/PID/io` plus host swap/diskstats/meminfo. Host counters include desktop
   noise; OS read/write charges differ from logical WAL bytes and mapped reads.
-* Transport identity comes from the frozen engine and is incompatible with older endpoints after a wire-format change. The current
+* Transport protocol is **9**, incompatible with prior endpoints. The current
   experimental member format is batch v3 with CRC32/IEEE; whole-batch BLAKE2b,
   sealed-file retirement and separate inventory-witness counters remain.
   Response recheck wait/work/deferrals and output queue/submit/retire spans are monotonic
   local residence, may overlap existing timing and are not one-way network,
   hardware RTT or pure NVMe latency.
 * Always-on adapter stages expose cumulative `<stage>_ns`, `_calls` and
-  `_errors`: `write_gate_wait`, `scalar_read`, `bulk_read` and `write_commit`.
-  The old owner-wait fields were removed with the adapter owner mutex; the
-  four relocation member-read stages were removed with the gated relocation.
+  `_errors`: `write_gate_wait`, `scalar_read`, `bulk_read`, `write_commit`,
+  `read_submit`, `read_admission_wait`, `read_detached_wait` and `read_finish`.
+  The old owner-wait fields were removed with the adapter owner mutex.
   Ordinary remote writers hold a shared maintenance gate; maintenance takes it
   exclusively. Native retains the exclusive durability gate.
   `remote_timing_available` distinguishes unsupported remote stages.
@@ -874,12 +964,12 @@ exported before the exact-owned fleet termination attempt.
   `read_rpcs` counts submitted groups; negotiated limits can split one group into
   several wire requests. `read_profile_wire_requests` counts those wire requests
   in successful sampled profiles, not in unsampled traffic.
-* `write_append_requests` counts owner-worker groups and
-  `write_concurrent_admitted` counts admitted application batches. Admission
-  pending/queued/byte peaks expose whether application writes actually overlap.
+* `write_durable_batches` distinguishes storage progress from acknowledged
+  `write_concurrent_completed`. Admission, pending/queued/byte peaks and
+  `write_peak_inflight_nodes` expose whether application writes actually overlap.
   These peaks are cumulative, and separately scraped counters are not atomic
   snapshots. The local implementation and remaining locks are documented in
-  the archived concurrency cutover (`docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md`, tag `archive/multi-design-*`).
+  [the concurrency cutover](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md).
 * `read_profile_transport_*` covers connection progress sweeps with sampled
   requests queued/active. It can include interleaved unprofiled work. Queue,
   submit and retire spans have separate sample counts because frames can cross
