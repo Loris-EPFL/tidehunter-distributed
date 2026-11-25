@@ -1,12 +1,15 @@
 """Stage-3 driver: local arm, host arm, owner lifecycle, upload-before-pass."""
+import csv
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import stat
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 
@@ -38,8 +41,14 @@ FAKE = textwrap.dedent("""\
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     (out / 'summary.json').write_text(json.dumps({'case': case, 'complete': True}))
-    (out / 'samples.csv').write_text('sample\\n')
+    rows = ['phase,completed_ns,bytes', 'preload,0,8192']
+    rows += [f'measurement,{index * 1000000},8192' for index in range(5)]
+    (out / 'samples.csv').write_text('\\n'.join(rows) + '\\n')
     """)
+
+
+MEASUREMENT_CSV = ('phase,completed_ns,bytes\npreload,0,8192\n' + ''.join(
+    f'measurement,{index * 1000000},8192\n' for index in range(5))).encode()
 
 
 class FakeObjectStore(ObjectStore):
@@ -102,10 +111,27 @@ class FakeRemote:
     def commands(self, host=None):
         return [call for call in self.calls if host is None or call[0] == host]
 
+    def sample_payload(self):
+        """One /proc sample whose device counters advance per call."""
+        self.samples_served = getattr(self, 'samples_served', 0) + 1
+        sectors = 16 * self.samples_served
+        stat = ('4242 (kv-research) S '
+                + ' '.join(['0'] * 11 + ['100', '100'] + ['0'] * 6 + ['5'] + ['0'] * 30))
+        return ('@@vmstat\npswpin 1\npswpout 2\n@@blk\n'
+                f'sda 10 0 8 0 20 0 {sectors} 0 0 0 0\n'
+                f'@@4242\n{stat}\n'
+                'VmRSS:     1024 kB\nVmHWM:     2048 kB\nVmSwap:       0 kB\n'
+                'rchar: 10\nwchar: 20\nsyscr: 30\nsyscw: 40\n'
+                'read_bytes: 50\nwrite_bytes: 60\ncancelled_write_bytes: 0\n')
+
     def run(self, host, command, *, stdin=None, check=True):
         self.calls.append((host, command))
         tokens = shlex.split(command)
         files = self.files(host)
+        if '@@' in command:
+            return 0, self.sample_payload().encode(), b''
+        if tokens[:1] == ['pgrep']:
+            return 0, b'4242\n', b''
         if tokens[:2] == ['rm', '-rf']:
             for target in tokens[2:]:
                 if target == '&&':
@@ -137,7 +163,7 @@ class FakeRemote:
         if case in self.fail_cases:
             return 2, b'', b'boom'
         files[f'{output}/summary.json'] = json.dumps({'case': case}).encode()
-        files[f'{output}/samples.csv'] = b'sample\n'
+        files[f'{output}/samples.csv'] = MEASUREMENT_CSV
         config = Path(tokens[tokens.index('--config') + 1])
         database = config.parent.parent / 'db' / config.stem
         files[f'{database}/evidence/read.json'] = b'{"read": 1}\n'
@@ -217,10 +243,10 @@ class Driver(unittest.TestCase):
     def calls(self):
         return self.log.read_text().splitlines()
 
-    def local(self, mode='rehearsal'):
+    def local(self, mode='rehearsal', remote=None):
         return stage3_campaign.LocalRunner(
             binary=self.binary, data_root=self.root,
-            stale_root=self.root / 'stage3' / 'stale', mode=mode)
+            stale_root=self.root / 'stage3' / 'stale', mode=mode, remote=remote)
 
     def ledger(self):
         return ledger_module.Ledger(self.root / 'stage3' / 'run-ledger.json')
@@ -332,6 +358,27 @@ class Driver(unittest.TestCase):
         record = json.loads((output / 'run.json').read_text())
         self.assertEqual((record['execution'], record['host']), ('host', 'H1'))
         self.assertEqual(record['local_output'], str(output))
+
+    def test_a_host_cell_that_exceeds_its_timeout_is_killed(self):
+        class Hanging(FakeRemote):
+            def shell(self, host, command, *, stdin=None, check=True):
+                if '--config' in command and '--output' in command:
+                    self.calls.append((host, command))
+                    threading.Event().wait(2)
+                    return 0, b'', b''
+                if command.startswith('pgrep'):
+                    self.calls.append((host, command))
+                    return 0, b'4242\n', b''
+                return super().shell(host, command, stdin=stdin, check=check)
+
+        remote = Hanging()
+        runner = stage3_campaign.HostRunner(
+            remote=remote, host='H1', binary=Path('/mnt/c/storage-node'),
+            data_root=Path('/mnt/c'), mode='cluster')
+        with self.assertRaises(stage3_campaign.CellFailure) as raised:
+            runner.run(self.cells[2], output=self.base / 'out', attempt=1, timeout=0.2)
+        self.assertEqual(raised.exception.record['exit_code'], None)
+        self.assertIn('kill -KILL 4242', [command for _, command in remote.calls])
 
     def test_unsafe_archive_member_is_refused(self):
         import io
@@ -468,6 +515,137 @@ class Driver(unittest.TestCase):
         self.assertGreaterEqual(len(writes), 2)
         self.assertEqual(writes[0][1], 0)
         self.assertEqual(writes[-1][1], len(writes) - 1)
+
+
+class Phases(Driver):
+    """Phase A (probe), phase B (calibration) and the resource rows."""
+
+    def test_the_probe_runs_on_the_store_host_and_projects_the_grid(self):
+        remote = FakeRemote()
+        owners = stage3_campaign.Owners(remote, self.external(), root=self.root,
+                                       guest_root=self.base / 'guest')
+        spec = stage3_specs.write_probe(self.root, native_root=Path('/mnt/campaign'))
+        runner = stage3_campaign.HostRunner(
+            remote=remote, host='H1', binary=Path('/mnt/campaign/storage-node'),
+            data_root=Path('/mnt/campaign'), mode='cluster')
+        identity = stage3_campaign.entry_identity(
+            spec, knobs=dict(phase='probe'), engine_rev='e', sui_rev='s',
+            binary_ids={'kv': 'b'})
+        measurements = stage3_campaign.run_probe(
+            path=spec, identity=identity, runner=runner, owners=owners,
+            root=self.root, ledger=self.ledger(), bucket=None, timeout=60)
+        self.assertEqual(measurements['measurement_calls'], 5)
+        self.assertAlmostEqual(measurements['measurement_window_seconds'], 0.004)
+        self.assertAlmostEqual(measurements['calls_per_second'], 1250.0)
+        self.assertEqual(measurements['cell'], stage3_specs.PROBE_CASE)
+        saved = self.ledger().load()
+        self.assertEqual(saved.status('stage3', stage3_specs.PROBE_CASE), 'passed')
+        # The probe installed the native archive so arm B has its binary.
+        self.assertEqual(owners.installed, 'native')
+        self.assertIsNone(owners.active)
+        document = stage3_campaign.projection(
+            measurements, stage3_specs.operation_counts(50_000), counts_source='test')
+        self.assertEqual(document['grid_measurement_operations'], 50_000)
+        self.assertAlmostEqual(document['projected_grid_cell_seconds'],
+                               measurements['preload_seconds'] + 55_000 / 1250.0)
+        path = stage3_campaign.write_projection(self.root, None, document)
+        self.assertEqual(json.loads(path.read_text())['counts_source'], 'test')
+
+    def test_calibration_freezes_one_count_per_family(self):
+        remote = FakeRemote()
+        preparations = self.external()
+        owners = stage3_campaign.Owners(remote, preparations, root=self.root,
+                                       guest_root=self.base / 'guest')
+        self.seed_owner_files(remote, preparations['native'], 'native')
+        counts = stage3_campaign.calibrate(
+            root=self.root, runner=self.local(remote=remote), owners=owners,
+            ledger=self.ledger(), bucket=None, external=preparations,
+            identity_for=lambda path, knobs: stage3_campaign.entry_identity(
+                path, knobs=knobs, engine_rev='e', sui_rev='s',
+                binary_ids={'kv': 'b'}),
+            timeout=60)
+        self.assertEqual(counts, {'read': 50_000, 'mixed': 50_000, 'write': 50_000,
+                                  'get_many': 50_000, 'put_batch': 50_000})
+        frozen = json.loads((self.root / 'stage3' / 'calibration.json').read_text())
+        self.assertEqual(frozen['counts'], counts)
+        self.assertEqual(frozen['pilot_operations'],
+                         stage3_specs.CALIBRATION_OPERATIONS)
+        saved = self.ledger().load()
+        for family in ('read', 'mixed', 'write'):
+            self.assertEqual(saved.status('stage3', f'S3-CAL-{family}-c16-native'),
+                             'passed')
+        # The frozen file drives the generated specs, and a different set is refused.
+        spec_root = self.base / 'specroot'
+        paths = stage3_specs.write(spec_root, counts=counts)
+        self.assertEqual(json.loads(paths[0].read_text())['phases']
+                         ['measurement_operations'], 50_000)
+        with self.assertRaisesRegex(ValueError, 'differs from these settings'):
+            stage3_specs.write(spec_root, counts=stage3_specs.operation_counts(60_000))
+
+    def test_a_calibration_file_is_the_frozen_count_source(self):
+        path = self.root / 'stage3' / 'calibration.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(counts=dict(
+            read=21_000, mixed=22_000, write=23_000, get_many=24_000,
+            put_batch=25_000))))
+        counts = stage3_specs.read_calibration(path)
+        paths = stage3_specs.write(self.base / 'specroot', counts=counts)
+        by_family = {}
+        for spec in paths:
+            document = json.loads(spec.read_text())
+            by_family[document['case_id']] = document['phases']['measurement_operations']
+        self.assertEqual(by_family['S3-A1-c2-native-cache0'], 21_000)
+        self.assertEqual(by_family['S3-A2-c2-native-cache0'], 22_000)
+        self.assertEqual(by_family['S3-A3-c2-native-cache0'], 23_000)
+        self.assertEqual(by_family['S3-A7-c4-native-cache0'], 24_000)
+        self.assertEqual(by_family['S3-A8-c4-native-cache0'], 25_000)
+        self.assertEqual(by_family['S3-B1-c1-native-cache0'], 21_000)
+        self.assertEqual(by_family['S3-B2-c1-native-cache0'], 23_000)
+
+    def test_resource_rows_are_written_for_the_local_arm(self):
+        self.run_campaign(cells=self.cells[:1])
+        output = self.root / 'stage3' / 'out' / self.cells[0]['id']
+        with (output / 'resources.csv').open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertTrue(rows)
+        self.assertIn('coordinator', {row['role'] for row in rows})
+        summary = json.loads((output / 'resources.json').read_text())
+        self.assertEqual(summary['payload_bytes'], 5 * 8192)
+        self.assertIsNone(summary['error'])
+        self.assertEqual(summary['label'], stage3_campaign.cell_label(self.cells[0]))
+        self.assertIn(socket.gethostname(), summary['hosts'])
+
+    def test_resource_rows_come_from_the_store_host(self):
+        remote = FakeRemote()
+        runner = stage3_campaign.HostRunner(
+            remote=remote, host='H1', binary=Path('/mnt/campaign/storage-node'),
+            data_root=Path('/mnt/campaign'), mode='cluster')
+        self.run_campaign(remote=runner, cells=[self.cells[2]])
+        output = self.root / 'stage3' / 'out' / self.cells[2]['id']
+        with (output / 'resources.csv').open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        roles = {(row['host'], row['role']) for row in rows}
+        self.assertIn(('H1', 'store'), roles)
+        self.assertIn(('H1', 'host'), roles)
+        store = [row for row in rows if row['role'] == 'store'][0]
+        self.assertEqual(store['pid'], '4242')
+        self.assertEqual(store['hwm_bytes'], str(2048 * 1024))
+        summary = json.loads((output / 'resources.json').read_text())
+        self.assertEqual(summary['payload_bytes'], 5 * 8192)
+        self.assertEqual(summary['device_write_per_payload'],
+                         summary['device_write_bytes'] / (5 * 8192))
+        host = summary['hosts']['H1']
+        self.assertEqual(host['samples'], len([row for row in rows
+                                              if row['role'] == 'host']))
+        self.assertGreater(host['device_write_bytes'], 0)
+
+    def test_a_shortened_probe_window_never_projects(self):
+        document = stage3_campaign.projection(
+            dict(measurement_calls=0, measurement_window_seconds=0.0,
+                 calls_per_second=None, preload_seconds=1.0, cell='p'),
+            stage3_specs.operation_counts(20_000), counts_source='test')
+        self.assertIn('error', document)
+        self.assertNotIn('projected_grid_cell_seconds', document)
 
 
 class CommandLine(unittest.TestCase):

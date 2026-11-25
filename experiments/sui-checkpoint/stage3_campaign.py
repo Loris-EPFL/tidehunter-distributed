@@ -15,13 +15,31 @@ record says so. Before an arm-A cell the driver installs the tier's owner
 archive on each owner host, starts only the selected database's owner process
 group, waits for its ready file, and copies each owner's
 `ready.durability.json` to the coordinator host where the spec names it. Arm B
-starts only after every owner process group is stopped. Every cell's results are copied back to the campaign
-root, uploaded under the campaign prefix, and verified by size and SHA-256
-before the ledger may pass the cell: `passed` means uploaded and verified.
+starts only after every owner process group is stopped. Every cell's results are
+copied back to the campaign root, uploaded under the campaign prefix, and
+verified by size and SHA-256 before the ledger may pass the cell: `passed`
+means uploaded and verified.
 
 Rehearsal mode (`--mode rehearsal`): every cell runs the single-host trusted TCP
 ordinary-file fixture on this host. The results and the ledger entry say
 `rehearsal`; the mode is not a campaign measurement.
+
+The stage runs in the plan's phases. Phase A is one arm-B synchronous write
+probe cell (`stage3_specs.probe_case`): it installs the native owner archive,
+runs the cell on the owner host, and writes `stage3/probe.json` with the measured
+per-write barrier rate and the projection for the eight arm-B synchronous grid
+cells, so the watch sees the real cost before the grid. Phase B (`--calibrate`,
+once, when `stage3/calibration.json` is absent) runs the three point cells at
+total C=16 and freezes `measurement_operations = 40 s x rate` per operation
+family in `stage3/calibration.json`; every later run reads that file, so the
+counts never move under the grid. Phase C/D is the 72-cell grid.
+
+Every cell also gets `resources.csv` and `resources.json` in its output: per
+2 s `/proc` samples of the cell's process (CPU, RSS, VmHWM, swap, io counters)
+and of each host that ran or owned the cell (`/proc/vmstat` swap,
+`/sys/block/*/stat` device bytes), written with the same parser as
+`manual_sui`'s sampler (`manual_sui.parse_proc`), plus the cell's payload bytes
+and the device-write ratio.
 
 `--resume` skips passed cells whose config hash matches and reruns failed,
 pending, invalid and interrupted ones in plan order: arm A native and
@@ -29,7 +47,9 @@ synchronous cells first, then arm B, each tier in one owner start. `--only` and
 `--from` narrow the plan; unit members always run together.
 """
 import argparse
+import csv
 import io
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -37,6 +57,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import json
 import yaml
@@ -55,6 +76,247 @@ OWNER_READY_SECONDS = 120
 OWNER_STOP_SECONDS = 30
 COMPACT_FILES = ('summary.json', 'manifest.json', 'metrics.prom', 'live.prom', 'run.json')
 TIER_ORDER = {'native': 0, 'synchronous': 1}
+
+
+RESOURCE_COLUMNS = ('case', 'host', 'role', 'pid', 'unix_ns', 'exited', 'cpu_seconds',
+                    'rss_bytes', 'hwm_bytes', 'swap_bytes', 'rchar', 'wchar', 'syscr',
+                    'syscw', 'read_bytes', 'write_bytes', 'swap_in', 'swap_out',
+                    'device_read_bytes', 'device_write_bytes')
+CLOCK_TICKS = os.sysconf('SC_CLK_TCK')
+SECTOR_BYTES = 512
+
+
+def cpu_seconds(stat):
+    """`utime + stime` of one /proc/<pid>/stat line, in seconds."""
+    try:
+        fields = stat.rsplit(')', 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / CLOCK_TICKS
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_blocks(text):
+    """`@@name`-delimited blocks, the format manual_sui's sampler emits."""
+    blocks, current = {}, None
+    for line in text.splitlines():
+        if line.startswith('@@'):
+            current = line[2:].strip()
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return blocks
+
+
+def sample_script(pids):
+    script = ['echo @@vmstat', 'cat /proc/vmstat',
+              'echo @@blk', 'for d in /sys/block/*; do echo "$(basename $d) $(cat $d/stat)"; done']
+    for pid in pids:
+        script.extend([f'echo @@{pid}', f'cat /proc/{pid}/stat 2>/dev/null',
+                       f'cat /proc/{pid}/status 2>/dev/null',
+                       f'cat /proc/{pid}/io 2>/dev/null'])
+    # A process that exited mid-cell is a normal sample, not a sampling failure.
+    script.append('true')
+    return '; '.join(script)
+
+
+def block_rows(blocks, roles, host, unix_ns):
+    """One sample: a host row plus one row per watched process."""
+    rows = []
+    vmstat = dict(line.split() for line in blocks.get('vmstat', []) if len(line.split()) == 2)
+    read_bytes = write_bytes = 0
+    for line in blocks.get('blk', []):
+        # `<device> <18 stat fields>`: sectors read is field 3, written is 7.
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        read_bytes += int(fields[3]) * SECTOR_BYTES
+        write_bytes += int(fields[7]) * SECTOR_BYTES
+    rows.append(dict(case=None, host=host, role='host', pid='', unix_ns=unix_ns,
+                     exited=False, cpu_seconds=None, rss_bytes=None, hwm_bytes=None,
+                     swap_bytes=None, rchar=None, wchar=None, syscr=None, syscw=None,
+                     read_bytes=None, write_bytes=None,
+                     swap_in=int(vmstat.get('pswpin', 0)),
+                     swap_out=int(vmstat.get('pswpout', 0)),
+                     device_read_bytes=read_bytes, device_write_bytes=write_bytes))
+    for pid, role in roles.items():
+        raw = blocks.get(str(pid), [])
+        stat = next((line for line in raw if ') ' in line), '')
+        status = [line for line in raw if line.startswith(('VmRSS:', 'VmHWM:', 'VmSwap:'))]
+        counters = [line for line in raw if line.split(':')[0] in manual_sui.IO_COUNTERS]
+        entry = manual_sui.parse_proc((stat + '\n').encode(),
+                                      ('\n'.join(status) + '\n').encode(),
+                                      ('\n'.join(counters) + '\n').encode())
+        row = dict(case=None, host=host, role=role, pid=pid, unix_ns=unix_ns,
+                   exited=entry is None, cpu_seconds=cpu_seconds(stat),
+                   swap_in=None, swap_out=None, device_read_bytes=None,
+                   device_write_bytes=None)
+        if entry is None:
+            row.update(rss_bytes=None, hwm_bytes=None, swap_bytes=None, rchar=None,
+                       wchar=None, syscr=None, syscw=None, read_bytes=None, write_bytes=None)
+        else:
+            row.update(rss_bytes=entry['VmRSS'], hwm_bytes=entry['VmHWM'],
+                       swap_bytes=entry['VmSwap'], rchar=entry['io']['rchar'],
+                       wchar=entry['io']['wchar'], syscr=entry['io']['syscr'],
+                       syscw=entry['io']['syscw'], read_bytes=entry['io']['read_bytes'],
+                       write_bytes=entry['io']['write_bytes'])
+        rows.append(row)
+    return rows
+
+
+class Sampler:
+    """Per-host `/proc` samples during one cell, in manual_sui's sample format."""
+
+    def __init__(self, remote=None, *, interval=None):
+        self.remote = remote
+        self.interval = manual_sui.SAMPLE_SECONDS if interval is None else interval
+        self.local = {}
+        self.hosts = {}
+        self.samples = []
+        self.error = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def watch_local(self, pid, role):
+        self.local[int(pid)] = role
+
+    def watch_host(self, host, pid, role):
+        self.hosts.setdefault(host, {})[int(pid)] = role
+
+    def _sample(self):
+        stamp = time.time_ns()
+        if self.local:
+            blocks = proc_blocks(_read_local(list(self.local)))
+            self.samples.extend(block_rows(blocks, self.local, socket.gethostname(), stamp))
+        for host, roles in self.hosts.items():
+            if self.remote is None:
+                self.error = f'{host}: no transport for host sampling'
+                continue
+            code, out, err = self.remote.shell(
+                host, sample_script(list(roles)), check=False)
+            if code != 0 and not out.strip():
+                self.error = f'{host}: sampling failed: {err.decode(errors="replace")[-500:]}'
+                continue
+            self.samples.extend(block_rows(proc_blocks(out.decode()), roles, host, stamp))
+
+    def start(self):
+        self._sample()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._sample()
+            except BaseException as error:  # a dead transport is not a healthy sample
+                self.error = str(error)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+        try:
+            self._sample()
+        except BaseException as error:
+            self.error = str(error)
+        return self
+
+    # ---- evidence ------------------------------------------------------
+    def write(self, output, *, case, mode, label):
+        """`resources.csv` per sample and a compact `resources.json` per cell."""
+        output = Path(output)
+        output.mkdir(parents=True, exist_ok=True)
+        path = output / 'resources.csv'
+        with path.open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=RESOURCE_COLUMNS)
+            writer.writeheader()
+            for row in self.samples:
+                writer.writerow(dict(row, case=case))
+        hosts = {}
+        for row in self.samples:
+            entry = hosts.setdefault(row['host'], dict(
+                samples=0, device_read_bytes=None, device_write_bytes=None,
+                swap_in=None, swap_out=None, processes={}))
+            if row['role'] == 'host':
+                entry['samples'] += 1
+                entry['device_read_bytes'] = row['device_read_bytes']
+                entry['device_write_bytes'] = row['device_write_bytes']
+                entry['swap_in'] = row['swap_in']
+                entry['swap_out'] = row['swap_out']
+                if 'first_device_read_bytes' not in entry:
+                    entry['first_device_read_bytes'] = row['device_read_bytes']
+                    entry['first_device_write_bytes'] = row['device_write_bytes']
+                    entry['first_swap_in'] = row['swap_in']
+                    entry['first_swap_out'] = row['swap_out']
+            else:
+                process = entry['processes'].setdefault(row['role'], dict(
+                    pid=row['pid'], cpu_seconds=None, rss_bytes=None, hwm_bytes=None,
+                    swap_bytes=None, exited=False))
+                process.update(pid=row['pid'], exited=row['exited'])
+                for name in ('cpu_seconds', 'rss_bytes', 'hwm_bytes', 'swap_bytes'):
+                    if row[name] is not None:
+                        process[name] = row[name]
+        for entry in hosts.values():
+            entry['device_read_bytes'] = (entry.pop('device_read_bytes', 0) or 0) - (
+                entry.pop('first_device_read_bytes', 0) or 0)
+            entry['device_write_bytes'] = (entry['device_write_bytes'] or 0) - (
+                entry.pop('first_device_write_bytes', 0) or 0)
+            entry['swap_in'] = (entry['swap_in'] or 0) - (entry.pop('first_swap_in', 0) or 0)
+            entry['swap_out'] = (entry['swap_out'] or 0) - (entry.pop('first_swap_out', 0) or 0)
+        totals = sample_totals(output / 'samples.csv')
+        device_write = sum(entry['device_write_bytes'] for entry in hosts.values())
+        value = dict(case=case, mode=mode, label=label, interval_seconds=self.interval,
+                     hosts=hosts, error=self.error, payload_bytes=totals['payload_bytes'],
+                     device_write_bytes=device_write,
+                     device_write_per_payload=(device_write / totals['payload_bytes']
+                                               if totals['payload_bytes'] else None),
+                     device_bytes_source=('summed /sys/block/*/stat deltas over the '
+                                          'hosts that ran or owned the cell'),
+                     path=str(path))
+        (output / 'resources.json').write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+        return value
+
+
+def _read_local(pids):
+    """The same `@@` blocks, read from this host without a shell."""
+    lines = ['@@vmstat'] + Path('/proc/vmstat').read_text().splitlines()
+    lines += ['@@blk']
+    for device in sorted(Path('/sys/block').glob('*')):
+        try:
+            lines.append(f'{device.name} {(device / "stat").read_text().strip()}')
+        except OSError:
+            continue
+    for pid in pids:
+        lines.append(f'@@{pid}')
+        for name in ('stat', 'status', 'io'):
+            try:
+                lines.extend(Path(f'/proc/{pid}/{name}').read_text().splitlines())
+            except OSError:
+                continue
+    return '\n'.join(lines)
+
+
+def sample_totals(path):
+    """Measurement-phase calls, window and payload bytes of one samples.csv."""
+    calls, payload, first, last = 0, 0, None, None
+    path = Path(path)
+    if path.is_file():
+        with path.open(newline='') as stream:
+            for row in csv.DictReader(stream):
+                if row.get('phase') != 'measurement':
+                    continue
+                calls += 1
+                try:
+                    payload += int(row.get('bytes') or 0)
+                    completed = int(row['completed_ns'])
+                except (KeyError, ValueError):
+                    continue
+                first = completed if first is None else min(first, completed)
+                last = completed if last is None else max(last, completed)
+    window = ((last - first) / 1e9) if first is not None and last is not None else 0.0
+    return dict(calls=calls, window_seconds=window, payload_bytes=payload,
+                calls_per_second=(calls / window) if window > 0 else None)
 
 
 class CellFailure(RuntimeError):
@@ -144,35 +406,50 @@ def write_record(output, record):
 class LocalRunner:
     """`kv-research` in this process's host: arm A on the coordinator and every rehearsal cell."""
 
-    def __init__(self, *, binary, data_root, stale_root, mode='cluster'):
+    def __init__(self, *, binary, data_root, stale_root, mode='cluster', remote=None):
         self.binary = Path(binary)
         self.data_root = Path(data_root)
         self.stale_root = Path(stale_root)
         self.mode = mode
+        self.remote = remote
 
-    def run(self, cell, *, output, attempt, timeout=3600):
+    def run(self, cell, *, output, attempt, timeout=3600, watchers=()):
         database = self.data_root / 'stage3' / 'db' / cell['id']
         archived = archive_previous(database, self.stale_root, cell['id'] + '-db', attempt)
         command = [str(self.binary), '--config', cell['path'], '--output', str(output)]
+        sampler = Sampler(self.remote)
+        for host, pid, role in watchers:
+            sampler.watch_host(host, pid, role)
         started = time.time_ns()
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        sampler.watch_local(process.pid, 'coordinator' if cell['arm'] == 'A' else 'store')
+        sampler.start()
         try:
-            completed = subprocess.run(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as error:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            sampler.stop()
+            resources = sampler.write(output, case=cell['id'], mode=self.mode,
+                                      label=cell_label(cell))
             raise CellFailure(f'cell exceeded {timeout} s', self.record(
-                cell, output, command, None, started, archived,
-                stdout=error.stdout, stderr=error.stderr)) from error
-        record = self.record(cell, output, command, completed.returncode, started,
-                             archived, stdout=completed.stdout, stderr=completed.stderr)
-        if completed.returncode != 0:
-            raise CellFailure(f'exit {completed.returncode}: {record["stderr_tail"]}', record)
+                cell, output, command, None, started, archived, stdout=stdout,
+                stderr=stderr, resources=resources)) from None
+        sampler.stop()
+        resources = sampler.write(output, case=cell['id'], mode=self.mode,
+                                  label=cell_label(cell))
+        record = self.record(cell, output, command, process.returncode, started,
+                             archived, stdout=stdout, stderr=stderr, resources=resources)
+        if process.returncode != 0:
+            raise CellFailure(f'exit {process.returncode}: {record["stderr_tail"]}', record)
         collect_evidence(database / 'evidence', output / 'evidence')
         return record
 
     def record(self, cell, output, command, exit_code, started, archived, *,
-               stdout=None, stderr=None):
+               stdout=None, stderr=None, resources=None):
         return dict(cell=cell['id'], mode=self.mode, execution='local',
-                    label=cell_label(cell),
+                    label=cell_label(cell), resources=resources,
                     host=socket.gethostname(), client_host=socket.gethostname(),
                     store_host=socket.gethostname(), command=command,
                     exit_code=exit_code, started_unix_ns=started,
@@ -192,7 +469,20 @@ class HostRunner:
         self.data_root = Path(data_root)
         self.mode = mode
 
-    def run(self, cell, *, output, attempt, timeout=3600):
+    def _pid(self, remote_spec):
+        """The newest process whose command line names this cell's spec."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            code, out, _ = self.remote.shell(
+                self.host, f'pgrep -n -f -- {quote(str(remote_spec))}', check=False)
+            if code == 0:
+                text = out.decode().strip()
+                if text.isdigit():
+                    return int(text)
+            time.sleep(0.1)
+        return None
+
+    def run(self, cell, *, output, attempt, timeout=3600, watchers=()):
         spec = Path(cell['path']).read_bytes()
         remote_spec = self.data_root / 'stage3' / 'spec' / f'{cell["id"]}.json'
         database = self.data_root / 'stage3' / 'db' / cell['id']
@@ -203,13 +493,44 @@ class HostRunner:
         self.remote.shell(self.host, f'cat > {quote(remote_spec)}', stdin=spec)
         command = [str(self.binary), '--config', str(remote_spec),
                    '--output', str(remote_output)]
+        result = {}
+
+        def call():
+            result['value'] = self.remote.shell(
+                self.host, ' '.join(quote(part) for part in command), check=False)
+
+        thread = threading.Thread(target=call, daemon=True)
+        sampler = Sampler(self.remote)
         started = time.time_ns()
-        code, out, err = self.remote.shell(
-            self.host, ' '.join(quote(part) for part in command), check=False)
+        thread.start()
+        pid = self._pid(remote_spec)
+        if pid is not None:
+            sampler.watch_host(self.host, pid, 'store')
+        sampler.start()
+        thread.join(timeout)
+        timed_out = thread.is_alive()
+        if timed_out and pid is not None:
+            self.remote.shell(self.host, f'kill -KILL {pid}', check=False)
+            thread.join(60)
+        sampler.stop()
+        if timed_out:
+            resources = sampler.write(output, case=cell['id'], mode=self.mode,
+                                      label=cell_label(cell))
+            raise CellFailure(
+                f'{self.host}: cell exceeded {timeout} s', dict(
+                    cell=cell['id'], mode=self.mode, execution='host',
+                    label=cell_label(cell), resources=resources, host=self.host,
+                    client_host=self.host, store_host=self.host, command=command,
+                    sampled_pid=pid, exit_code=None, started_unix_ns=started,
+                    finished_unix_ns=time.time_ns(), archived_database='remote-fresh',
+                    database=str(database), output=str(remote_output),
+                    local_output=str(output), timeout_seconds=timeout,
+                    stdout_tail='', stderr_tail='cell timed out; the process was killed'))
+        code, out, err = result['value']
         record = dict(cell=cell['id'], mode=self.mode, execution='host',
-                      label=cell_label(cell), host=self.host,
+                      label=cell_label(cell), resources=None, host=self.host,
                       client_host=self.host, store_host=self.host, command=command,
-                      exit_code=code, started_unix_ns=started,
+                      sampled_pid=pid, exit_code=code, started_unix_ns=started,
                       finished_unix_ns=time.time_ns(), archived_database='remote-fresh',
                       database=str(database), output=str(remote_output),
                       local_output=str(output),
@@ -223,6 +544,10 @@ class HostRunner:
         archive = self.remote.run(
             self.host, f'tar -czf - -C {quote(remote_output)} .')[1]
         extract_archive(archive, output)
+        # Written after the copy-back so the payload bytes are in the output tree.
+        resources = sampler.write(output, case=cell['id'], mode=self.mode,
+                                  label=cell_label(cell))
+        record['resources'] = resources
         return record
 
 
@@ -261,6 +586,16 @@ class Bucket:
     def key(self):
         return f'{self.prefix}/campaign-ledger.json'
 
+    def publish_file(self, group, path):
+        """Upload one compact file and verify the stored size and SHA-256."""
+        path = Path(path)
+        key = f'{self.prefix}/stage3/evidence/{group}/{path.name}'
+        self.objects.upload(key, path)
+        head = self.ledger_store.head(key)
+        if head['size'] != path.stat().st_size or head['sha256'] != ledger_module.sha256_file(path):
+            raise ValueError(f'uploaded file differs: {key}')
+        return key
+
     def publish(self, case_id, produced, output):
         for artifact in produced:
             artifact['key'] = upload_key(self.prefix, case_id, artifact['path'], output)
@@ -290,6 +625,7 @@ class Owners:
         self.root = Path(root)
         self.guest_root = Path(guest_root)
         self.active = None
+        self.installed = None
         self.namespaces = {}
         self.receipts = []
 
@@ -328,13 +664,27 @@ class Owners:
                     f'owner command for partition {record["partition"]} listens on '
                     f'{listen}, not {addresses[record["partition"]]}')
 
-    def start(self, tier):
-        if self.active == tier:
-            return self.receipts
+    def install(self, tier):
+        """Put one tier's owner archive on its hosts without starting a process."""
+        if self.installed == tier:
+            return self.preparations[tier]
         self.stop()
         prepared = self.preparations[tier]
         self._verify(prepared)
         self._install(prepared)
+        self.installed = tier
+        return prepared
+
+    def watchers(self):
+        """`(host, pid, role)` for the running owner processes."""
+        return [(host, entry['pid'], 'owner')
+                for host, entry in self.namespaces.items()
+                if not entry.get('stopped')]
+
+    def start(self, tier):
+        if self.active == tier:
+            return self.receipts
+        prepared = self.install(tier)
         index = prepared['index']
         # Published per host as it starts, so a partial start is still stopped.
         self.namespaces = {}
@@ -413,17 +763,157 @@ class Owners:
         return failures
 
 
+ARM_B_SYNCHRONOUS_CELLS = 8
+CALIBRATION_FAMILIES = ('read', 'mixed', 'write')
+
+
+def calibration_case(family):
+    """Plan section 9.4: a point cell of the family at total C=16, Native."""
+    return dict(case_id=f'S3-CAL-{family}-c16-native', arm='A', mix=family, size=8192,
+                distribution='uniform', tier='native', concurrency=16, batch=None,
+                cache=stage3_specs.GRID_CACHE_ENTRIES, reference=False)
+
+
+def write_calibration_specs(root, *, external):
+    root = Path(root)
+    written = []
+    for family in CALIBRATION_FAMILIES:
+        case = calibration_case(family)
+        written.append(stage3_specs.write_one(
+            root / 'stage3' / 'calibration' / 'spec' / f'{case["case_id"]}.json',
+            stage3_specs.run_config(
+                case, root, external=external,
+                measurement_operations=stage3_specs.CALIBRATION_OPERATIONS)))
+    return written
+
+
+def entry_identity(path, *, knobs, engine_rev, sui_rev, binary_ids):
+    return ledger_module.config_hash(spec=spec_hash(path), knobs=knobs,
+                                     engine_rev=engine_rev, sui_rev=sui_rev,
+                                     binary_ids=binary_ids)
+
+
+def phase_cell(*, path, case, identity, group):
+    return dict(id=case['case_id'], stage=STAGE, unit=group, arm=case['arm'],
+                tier=case['tier'], config_hash=identity, path=str(path))
+
+
+def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout, watchers=()):
+    """One phase-A/B cell under the same ledger and upload rules as the grid."""
+    entry = ledger.begin(stage=STAGE, cell_id=cell['id'],
+                         config_hash=cell['config_hash'], unit=cell['unit'],
+                         start_from='fresh')
+    save(ledger, bucket)
+    output = Path(root) / 'stage3' / cell['unit'] / 'out' / cell['id']
+    try:
+        produced = run_cell(cell, runner, output=output, stale_root=stale_root,
+                            attempt=entry['attempts'], timeout=timeout, watchers=watchers)
+        if bucket is not None:
+            bucket.publish(cell['id'], produced, output)
+        ledger.mark_passed(entry, produced,
+                           store=None if bucket is None else bucket.ledger_store)
+        save(ledger, bucket)
+    except BaseException as error:
+        ledger.fail(entry, error)
+        save(ledger, bucket)
+        raise
+    return output
+
+
+def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout):
+    """Phase A: one arm-B synchronous write cell before anything else runs."""
+    cell = phase_cell(path=path, case=stage3_specs.probe_case(), identity=identity,
+                      group='probe')
+    # Arm B only needs the storage binary on its host; the native archive is the
+    # one the first grid tier uses, so it is installed once, not twice.
+    owners.install('native')
+    output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
+                            stale_root=Path(root) / 'stage3' / 'stale', timeout=timeout)
+    totals = sample_totals(output / 'samples.csv')
+    record = json.loads((output / 'run.json').read_text())
+    return dict(cell=cell['id'], host=record.get('host'), output=str(output),
+                wall_seconds=(record['finished_unix_ns'] - record['started_unix_ns']) / 1e9,
+                measurement_calls=totals['calls'],
+                measurement_window_seconds=totals['window_seconds'],
+                calls_per_second=totals['calls_per_second'],
+                preload_seconds=max(0.0, (record['finished_unix_ns']
+                                          - record['started_unix_ns']) / 1e9
+                                    - totals['window_seconds']))
+
+
+def projection(measurements, counts, *, counts_source):
+    """What one probe cell predicts for the synchronous arm-B grid cells."""
+    rate = measurements['calls_per_second']
+    value = dict(measurements, counts_source=counts_source,
+                 grid_measurement_operations=counts['write'],
+                 arm_b_synchronous_cells_in_plan=ARM_B_SYNCHRONOUS_CELLS,
+                 note=('arm B is one in-process native database with a per-write WAL '
+                       'barrier; the projection replaces the probe measurement window '
+                       'by 1.1 x the frozen write count at the measured rate and keeps '
+                       'the measured preload time'))
+    if not rate:
+        value['error'] = 'the probe measurement window was empty'
+        return value
+    grid_calls = counts['write'] * (1 + stage3_specs.WARMUP_FRACTION)
+    value['projected_grid_cell_seconds'] = (
+        measurements['preload_seconds'] + grid_calls / rate)
+    value['projected_arm_b_synchronous_seconds'] = (
+        value['projected_grid_cell_seconds'] * ARM_B_SYNCHRONOUS_CELLS)
+    return value
+
+
+def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
+              timeout):
+    """Phase B: three calibration cells, then the frozen per-family counts."""
+    root = Path(root)
+    paths = write_calibration_specs(root, external=external)
+    owners.start('native')
+    rates, cells = {}, []
+    for family, path in zip(CALIBRATION_FAMILIES, paths):
+        case = calibration_case(family)
+        cell = phase_cell(path=path, case=case, group='calibration',
+                          identity=identity_for(path, dict(calibration=family)))
+        output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
+                                stale_root=root / 'stage3' / 'stale', timeout=timeout,
+                                watchers=owners.watchers())
+        totals = sample_totals(output / 'samples.csv')
+        rates[family] = totals['calls_per_second']
+        cells.append(dict(cell=cell['id'], measurement_calls=totals['calls'],
+                          measurement_window_seconds=totals['window_seconds'],
+                          calls_per_second=totals['calls_per_second'],
+                          expected_window_seconds=stage3_specs.WINDOW_SECONDS))
+    counts = stage3_specs.calibration_counts(rates)
+    document = dict(schema=1, window_seconds=stage3_specs.WINDOW_SECONDS,
+                    pilot_operations=stage3_specs.CALIBRATION_OPERATIONS,
+                    family_rates=rates, counts=counts, cells=cells)
+    path = root / 'stage3' / 'calibration.json'
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n')
+    if bucket is not None:
+        bucket.publish_file('calibration', path)
+    return counts
+
+
+def write_projection(root, bucket, document):
+    root = Path(root)
+    path = root / 'stage3' / 'probe.json'
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n')
+    if bucket is not None:
+        bucket.publish_file('probe', path)
+    return path
+
+
 def schedule(cells):
     """Arm A before arm B, and one owner start per tier: native, then synchronous."""
     return sorted(cells, key=lambda cell: (cell.get('arm') == 'B',
                                            TIER_ORDER[cell['tier']]))
 
 
-def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600):
+def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600, watchers=()):
     """Run one cell from a fresh database and output; return its artifacts."""
     archive_previous(output, stale_root, cell['id'], attempt)
     try:
-        record = runner.run(cell, output=output, attempt=attempt, timeout=timeout)
+        record = runner.run(cell, output=output, attempt=attempt, timeout=timeout,
+                            watchers=watchers)
     except CellFailure as error:
         write_record(output, dict(error.record, failure=str(error)))
         raise
@@ -437,6 +927,9 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
     ledger.path = Path(ledger.path) if ledger.path else root / 'stage3' / 'run-ledger.json'
     stale_root = root / 'stage3' / 'stale'
     planned = schedule(ledger_module.plan(list(cells), ledger, only=only, from_=from_))
+    if local.remote is None and owners is not None:
+        # Owner processes are sampled through the same SSH callback.
+        local.remote = owners.remote
     results = []
     try:
         for cell in planned:
@@ -455,8 +948,10 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                 if cell['arm'] == 'A' and owners is not None:
                     owners.start(cell['tier'])
                 output = root / 'stage3' / 'out' / cell['id']
-                produced = run_cell(cell, runner, output=output, stale_root=stale_root,
-                                    attempt=entry['attempts'], timeout=timeout)
+                produced = run_cell(
+                    cell, runner, output=output, stale_root=stale_root,
+                    attempt=entry['attempts'], timeout=timeout,
+                    watchers=owners.watchers() if (owners and cell['arm'] == 'A') else ())
                 if bucket is not None:
                     bucket.publish(cell['id'], produced, output)
                 ledger.mark_passed(entry, produced,
@@ -527,7 +1022,12 @@ def main():
     parser.add_argument('--sui-rev', default='unknown')
     parser.add_argument('--timeout', type=int, default=3600)
     parser.add_argument('--measurement-operations', type=int,
-                        default=stage3_specs.MEASUREMENT_OPERATIONS)
+                        default=stage3_specs.MEASUREMENT_OPERATIONS,
+                        help='one count for every family when nothing is calibrated')
+    parser.add_argument('--calibrate', action='store_true',
+                        help='run the three phase-B calibration cells and freeze their counts')
+    parser.add_argument('--skip-probe', action='store_true',
+                        help='do not run the phase-A arm-B synchronous probe cell')
     parser.add_argument('--mode', choices=('cluster', 'rehearsal'), default='cluster')
     parser.add_argument('--external', action='append', default=[], metavar='TIER=DIR',
                         help='prepare_external.py output per tier, repeated (cluster)')
@@ -573,13 +1073,6 @@ def main():
             raise SystemExit('--binary is not the storage binary the external '
                              'preparation was built from')
     owner_hosts = plan_hosts(args.owners.split(',')) if cluster else []
-    stage3_specs.write(root, args.measurement_operations,
-                       native_root=args.native_root if cluster else None,
-                       external=external)
-    binary_ids = {name: ledger_module.sha256_file(Path(args.binary))
-                  for name in ('kv-research',)}
-    cells = cells_for(root, engine_rev=args.engine_rev, sui_rev=args.sui_rev,
-                      binary_ids=binary_ids)
     path = args.ledger or root / 'stage3' / 'run-ledger.json'
     if Path(path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {path}')
@@ -591,23 +1084,84 @@ def main():
               if args.bucket_prefix else None)
     if args.resume and bucket is not None:
         ledger = bucket.merge(ledger)
+    binary_ids = {name: ledger_module.sha256_file(Path(args.binary))
+                  for name in ('kv-research',)}
+    native_root = args.native_root if cluster else None
+
+    def identity_for(spec_path, knobs):
+        return entry_identity(spec_path, knobs=knobs, engine_rev=args.engine_rev,
+                              sui_rev=args.sui_rev, binary_ids=binary_ids)
+
     local = LocalRunner(binary=args.binary, data_root=root,
-                        stale_root=root / 'stage3' / 'stale',
-                        mode=args.mode)
+                        stale_root=root / 'stage3' / 'stale', mode=args.mode)
     remote = owners = None
     if cluster:
         remote_transport = manual_sui.Remote(args.zone, iap=args.iap)
+        local.remote = remote_transport
         remote = HostRunner(remote=remote_transport,
                             host=args.native_host or owner_hosts[0],
                             binary=args.guest_root / 'storage-node',
                             data_root=args.native_root, mode=args.mode)
         owners = Owners(remote_transport, external, root=root,
                         guest_root=args.guest_root)
+
+    # The probe only exists in cluster mode; the rehearsal set has no store host.
+    probe_spec = (stage3_specs.write_probe(root, native_root=native_root,
+                                           external=external)
+                  if cluster else None)
+    counts = None
+    calibration_path = root / 'stage3' / 'calibration.json'
+    if calibration_path.is_file():
+        counts = stage3_specs.read_calibration(calibration_path)
+    measurements = probe_note = None
+    if cluster and owners is not None and not args.skip_probe:
+        probe = phase_cell(path=probe_spec, case=stage3_specs.probe_case(),
+                           identity=identity_for(probe_spec, dict(phase='probe')),
+                           group='probe')
+        previous = ledger.entries.get((STAGE, probe['id']))
+        if (previous and previous['status'] == ledger_module.PASSED
+                and previous['config_hash'] == probe['config_hash']):
+            path = root / 'stage3' / 'probe.json'
+            measurements = json.loads(path.read_text()) if path.is_file() else None
+            if measurements is None:
+                probe_note = 'the probe already passed here but probe.json is absent'
+        else:
+            try:
+                measurements = run_probe(path=probe_spec, identity=probe['config_hash'],
+                                         runner=remote, owners=owners, root=root,
+                                         ledger=ledger, bucket=bucket,
+                                         timeout=args.timeout)
+            except BaseException as error:
+                raise SystemExit(f'the phase-A probe cell failed: {error}') from error
+    if counts is None and args.calibrate:
+        if not cluster:
+            raise SystemExit('--calibrate needs the cluster arm-A owner set')
+        try:
+            counts = calibrate(root=root, runner=local, owners=owners, ledger=ledger,
+                               bucket=bucket, external=external,
+                               identity_for=identity_for, timeout=args.timeout)
+        except BaseException as error:
+            raise SystemExit(f'the phase-B calibration failed: {error}') from error
+    if counts is None:
+        counts = stage3_specs.operation_counts(args.measurement_operations)
+    stage3_specs.write(root, args.measurement_operations, counts=counts,
+                       native_root=native_root, external=external)
+    cells = cells_for(root, engine_rev=args.engine_rev, sui_rev=args.sui_rev,
+                      binary_ids=binary_ids)
+    if measurements is not None:
+        document = projection(measurements, counts,
+                              counts_source=('frozen calibration'
+                                             if calibration_path.is_file()
+                                             else 'phase-B calibration of this run'))
+        write_projection(root, bucket, document)
     results, planned = run_campaign(
         cells, local=local, root=root, ledger=ledger, remote=remote, owners=owners,
         bucket=bucket, only=args.only or None, from_=args.from_,
         stop_on_failure=not args.continue_on_failure, timeout=args.timeout)
-    print(json.dumps(dict(mode=args.mode,
+    print(json.dumps(dict(mode=args.mode, counts=counts,
+                          probe=str(root / 'stage3' / 'probe.json')
+                          if measurements is not None else None,
+                          probe_note=probe_note if cluster else None,
                           planned=[cell['id'] for cell in planned], results=results)))
 
 

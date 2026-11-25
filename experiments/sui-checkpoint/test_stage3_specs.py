@@ -139,6 +139,68 @@ class StageThreeSpecs(unittest.TestCase):
                                check=True, stdout=subprocess.DEVNULL, timeout=60)
 
 
+class Counts(unittest.TestCase):
+    def test_family_counts_drive_the_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            counts = dict(read=21_000, mixed=22_000, write=23_000,
+                          get_many=24_000, put_batch=25_000)
+            by_family = {}
+            for path in stage3_specs.write(root, counts=counts):
+                document = json.loads(path.read_text())
+                by_family[document['case_id']] = document['phases']['measurement_operations']
+                self.assertEqual(document['phases']['warmup_operations'],
+                                 int(document['phases']['measurement_operations'] * 0.1))
+            self.assertEqual(by_family['S3-A1-c2-native-cache0'], 21_000)
+            self.assertEqual(by_family['S3-A9-get_many-c16-native-cache0'], 24_000)
+            self.assertEqual(by_family['S3-A9-put_batch-c16-native-cache0'], 25_000)
+
+    def test_one_count_for_every_family_is_the_pre_calibration_default(self):
+        self.assertEqual(set(stage3_specs.operation_counts()),
+                         set(stage3_specs.FAMILIES))
+        self.assertEqual(set(stage3_specs.operation_counts() .values()),
+                         {stage3_specs.MEASUREMENT_OPERATIONS})
+        with self.assertRaisesRegex(ValueError, 'unknown operation family'):
+            stage3_specs.operation_counts(overrides={'delete': 20_000})
+        with self.assertRaisesRegex(ValueError, 'out of range'):
+            stage3_specs.operation_counts(overrides={'read': 0})
+        with self.assertRaisesRegex(ValueError, 'out of range'):
+            stage3_specs.operation_counts(overrides={'read': stage3_specs.CEILING + 1})
+
+    def test_calibration_is_forty_seconds_bounded(self):
+        counts = stage3_specs.calibration_counts(
+            {'read': 1_000, 'mixed': 1, 'write': 100_000})
+        self.assertEqual(counts['read'], 40_000)
+        self.assertEqual(counts['get_many'], 40_000)
+        self.assertEqual(counts['mixed'], stage3_specs.FLOOR)
+        self.assertEqual(counts['write'], stage3_specs.CEILING)
+        self.assertEqual(counts['put_batch'], stage3_specs.CEILING)
+        with self.assertRaisesRegex(ValueError, 'no measured rate'):
+            stage3_specs.calibration_counts({'read': 1.0})
+
+    def test_the_probe_is_one_arm_b_synchronous_write_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = stage3_specs.write_probe(root, native_root=Path('/mnt/store'))
+            document = json.loads(path.read_text())
+            self.assertEqual(document['case_id'], stage3_specs.PROBE_CASE)
+            self.assertEqual(document['backend']['kind'], 'native')
+            self.assertEqual(document['backend']['options']['durability'],
+                             'value_wal_barrier')
+            self.assertTrue(document['backend']['options']['path'].startswith(
+                '/mnt/store/stage3/db/'))
+            self.assertEqual(document['execution']['concurrency'], 8)
+            self.assertEqual(document['workload']['mix']['put'], 100)
+            self.assertEqual(document['phases']['measurement_operations'],
+                             stage3_specs.PROBE_OPERATIONS)
+            self.assertEqual(document['dataset']['value_size'], 8192)
+            self.assertNotIn('external_remote_config',
+                             document['backend']['options'])
+            stage3_specs.write_probe(root, native_root=Path('/mnt/store'))
+            with self.assertRaisesRegex(ValueError, 'differs from these settings'):
+                stage3_specs.write_probe(root, native_root=Path('/mnt/other'))
+
+
 class ClusterSpecs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -230,7 +292,9 @@ class ClusterSpecs(unittest.TestCase):
             self.skipTest('set KV_RESEARCH_BIN to validate RunConfig admission')
         root, _ = self.documents(external=self.preparations,
                                  native_root=Path('/mnt/tidehunter/campaign'))
-        for path in sorted((root / 'stage3' / 'spec').iterdir()):
+        probe = stage3_specs.write_probe(root, native_root=Path('/mnt/tidehunter/campaign'),
+                                         external=self.preparations)
+        for path in [*sorted((root / 'stage3' / 'spec').iterdir()), probe]:
             subprocess.run([binary, '--config', str(path), '--validate-config',
                             '--output', str(root / 'stage3' / 'admission')],
                            check=True, stdout=subprocess.DEVNULL, timeout=60)

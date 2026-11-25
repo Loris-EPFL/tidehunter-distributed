@@ -29,8 +29,19 @@ cache. The campaign runs the 70 grid cells and the native baseline with the
 cache off (`-cache0`), and adds one read-only reference pair at C=16 with 1,000
 entries (`-cache1000`).
 
+Measurement sizing (plan section 9.4): `phases.measurement_operations` is one
+value per operation family (`read`, `mixed`, `write`, `get_many`, `put_batch`),
+frozen from the three phase-B calibration cells. Without a frozen calibration
+every family uses `MEASUREMENT_OPERATIONS`, the pre-calibration default. The
+counts enter every spec, so a spec written from a different calibration is
+refused instead of silently replaced.
+
+The phase-A probe (`probe_case`) is a separate arm-B synchronous write cell. It
+is not one of the 72 campaign cells; it is run once before the grid so the
+watch sees the real per-write barrier rate on the store host.
+
 Usage: `stage3_specs.py --root DIR [--rehearsal | --external TIER=DIR ...]
-[--native-root DIR] [--validate BINARY]`.
+[--native-root DIR] [--calibration FILE] [--validate BINARY]`.
 """
 import argparse
 import json
@@ -50,6 +61,16 @@ GRID_CACHE_ENTRIES = 0
 REFERENCE_CACHE_ENTRIES = 1_000
 CONTROL_TRANSPORT = {'kind': 'tcp'}
 LIVE_TRANSPORT = 'rdma'
+FAMILIES = ('read', 'mixed', 'write', 'get_many', 'put_batch')
+# A grouped call counts once per call, so it inherits the rate of its class.
+CALIBRATED_BY = {'get_many': 'read', 'put_batch': 'write'}
+FLOOR = 20_000
+GROUPED_FLOOR = 5_000
+CEILING = 3_000_000
+WINDOW_SECONDS = 40
+CALIBRATION_OPERATIONS = 20_000
+PROBE_CASE = 'S3-P1-armB-c8-synchronous-probe'
+PROBE_OPERATIONS = 5_000
 MIXES = {
     'read': dict(read=100, put=0, delete=0, missing_read=0, get_many=0, put_batch=0),
     'mixed': dict(read=70, put=30, delete=0, missing_read=0, get_many=0, put_batch=0),
@@ -65,6 +86,49 @@ def declared_cache(case_id):
     if match is None:
         raise ValueError(f'case id does not declare a value cache: {case_id}')
     return int(match.group(1))
+
+
+def operation_counts(default=MEASUREMENT_OPERATIONS, overrides=None):
+    """One measurement operation count per family; `overrides` must be complete."""
+    counts = {family: default for family in FAMILIES}
+    for family, count in (overrides or {}).items():
+        if family not in FAMILIES:
+            raise ValueError(f'unknown operation family: {family}')
+        # Rehearsal runs may use small windows; the campaign floors live in
+        # `calibration_counts` and in `read_calibration`.
+        if type(count) is not int or not 1 <= count <= CEILING:
+            raise ValueError(f'{family} measurement operations out of range: {count}')
+        counts[family] = count
+    return counts
+
+
+def count_for(case, counts):
+    return counts[case['mix']]
+
+
+def calibration_counts(rates):
+    """Plan section 9.4: 40 s of calls per family, bounded, from the measured rates."""
+    frozen = {}
+    for family in FAMILIES:
+        source = CALIBRATED_BY.get(family, family)
+        rate = rates.get(source)
+        if not isinstance(rate, (int, float)) or not rate > 0:
+            raise ValueError(f'{family} has no measured rate from its calibration cell')
+        count = round(WINDOW_SECONDS * rate)
+        frozen[family] = min(CEILING, max(FLOOR, count))
+    return frozen
+
+
+def read_calibration(path):
+    """The frozen family counts of one phase-B calibration file."""
+    document = json.loads(Path(path).read_text())
+    counts = document.get('counts')
+    if not isinstance(counts, dict) or set(counts) != set(FAMILIES):
+        raise ValueError(f'calibration file must name every family: {path}')
+    for family, count in counts.items():
+        if type(count) is not int or not GROUPED_FLOOR <= count <= CEILING:
+            raise ValueError(f'{family} measurement operations out of range: {count}')
+    return counts
 
 
 def receipt_path(root, tier, partition):
@@ -184,6 +248,13 @@ def cells():
     return rows
 
 
+def probe_case():
+    """The phase-A arm-B synchronous write probe: one full preload, 5,000 calls."""
+    return dict(case_id=PROBE_CASE, arm='B', mix='write', size=8192,
+                distribution='uniform', tier='synchronous', concurrency=8,
+                batch=None, cache=GRID_CACHE_ENTRIES, reference=False, probe=True)
+
+
 def store_root(case, root, native_root=None):
     """The absolute root of the host that runs the cell's store."""
     if native_root is not None and case['arm'] == 'B':
@@ -248,29 +319,47 @@ def run_config(case, root, *, native_root=None, external=None,
                     deadline_seconds=600, shutdown_grace_seconds=30))
 
 
-def write(root, measurement_operations=MEASUREMENT_OPERATIONS, *, native_root=None,
-          external=None):
+def write_one(path, document):
+    if Path(path).exists():
+        if json.loads(Path(path).read_text()) != document:
+            raise ValueError('the generated spec differs from these settings; '
+                             f'use a fresh root or delete {path}')
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(document, indent=2, sort_keys=True) + '\n')
+    return Path(path)
+
+
+def write(root, measurement_operations=MEASUREMENT_OPERATIONS, *, counts=None,
+          native_root=None, external=None):
     """Write every spec; a spec whose settings differ is never overwritten."""
     root = Path(root)
     if not root.is_absolute():
         raise ValueError(f'the campaign root must be absolute: {root}')
     if native_root is not None and not Path(native_root).is_absolute():
         raise ValueError(f'the native store root must be absolute: {native_root}')
+    counts = operation_counts(measurement_operations, counts)
     output = root / 'stage3' / 'spec'
     output.mkdir(parents=True, exist_ok=True)
     written = []
     for case in cells():
-        path = output / f'{case["case_id"]}.json'
-        document = run_config(case, root, native_root=native_root, external=external,
-                             measurement_operations=measurement_operations)
-        if path.exists():
-            if json.loads(path.read_text()) != document:
-                raise ValueError('the generated spec differs from these settings; '
-                                 f'use a fresh root or delete {path}')
-        else:
-            path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n')
-        written.append(path)
+        written.append(write_one(
+            output / f'{case["case_id"]}.json',
+            run_config(case, root, native_root=native_root, external=external,
+                       measurement_operations=count_for(case, counts))))
     return written
+
+
+def write_probe(root, *, native_root=None, external=None):
+    """Write the phase-A probe spec; it carries no calibrated count."""
+    root = Path(root)
+    if not root.is_absolute():
+        raise ValueError(f'the campaign root must be absolute: {root}')
+    case = probe_case()
+    return write_one(
+        root / 'stage3' / 'probe' / 'spec' / f'{case["case_id"]}.json',
+        run_config(case, root, native_root=native_root, external=external,
+                   measurement_operations=PROBE_OPERATIONS))
 
 
 def external_items(values):
@@ -288,7 +377,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True,
                         help='campaign directory that owns stage3/{db,spec,out}')
-    parser.add_argument('--measurement-operations', type=int, default=MEASUREMENT_OPERATIONS)
+    parser.add_argument('--measurement-operations', type=int, default=MEASUREMENT_OPERATIONS,
+                        help='one count for every family when no calibration is given')
+    parser.add_argument('--calibration', type=Path,
+                        help='frozen phase-B calibration file with the family counts')
     parser.add_argument('--rehearsal', action='store_true',
                         help='emit the single-host trusted TCP ordinary-file fixture')
     parser.add_argument('--external', action='append', default=[], metavar='TIER=DIR',
@@ -306,8 +398,11 @@ def main():
                          'pass --rehearsal for the labelled single-host fixture')
     external = (external_map(external_items(args.external), database=args.external_database)
                 if args.external else None)
-    paths = write(args.root, args.measurement_operations,
+    counts = read_calibration(args.calibration) if args.calibration else None
+    paths = write(args.root, args.measurement_operations, counts=counts,
                   native_root=args.native_root, external=external)
+    probe = (None if args.rehearsal else
+             write_probe(args.root, native_root=args.native_root, external=external))
     if args.validate:
         import subprocess
         for path in paths:
@@ -315,6 +410,8 @@ def main():
                             '--validate-config', '--output', str(args.root / 'stage3' / 'admission')],
                            check=True, stdout=subprocess.DEVNULL, timeout=60)
     print(json.dumps(dict(cells=len(paths), sizes=list(SIZES),
+                          probe=str(probe) if probe else None,
+                          measurement_operations=counts or args.measurement_operations,
                           mode='rehearsal' if external is None else 'cluster')))
 
 
