@@ -281,6 +281,20 @@ def cases():
     return dict(stage1=STAGE1_CASES, stage2=STAGE2_CASES, stage3=STAGE3_CASES)
 
 
+def build_revisions(build_root):
+    """Rebind the manifest to one finished `build.py` output."""
+    root = Path(build_root)
+    receipt = json.loads((root / 'build-receipt.json').read_text())
+    manifest_value = json.loads((root / 'build-manifest.json').read_text())
+    sources = json.loads((root / 'source-manifest.json').read_text())
+    return dict(engine=sources['tidehunter-sharded-wal']['revision'],
+                sui=sources['sui']['revision'],
+                bundle_sha256=receipt['bundle_sha256'],
+                build_manifest_sha256=receipt['build_manifest_sha256'],
+                source_archive_sha256=receipt['source_archive_sha256'],
+                binaries=manifest_value['binaries'])
+
+
 def manifest(campaign_id=CAMPAIGN_ID, revisions=None):
     """The whole manifest; `revisions` overrides rows of a rebuilt bundle."""
     if campaign_id != CAMPAIGN_ID:
@@ -336,14 +350,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, default=DEFAULT_DIRECTORY)
     parser.add_argument('--campaign-id', default=CAMPAIGN_ID)
+    parser.add_argument('--build', type=Path,
+                        help='finished build.py output; rebinds every revision and binary hash')
     parser.add_argument('--bundle-sha256')
     parser.add_argument('--build-manifest-sha256')
     parser.add_argument('--source-archive-sha256')
     args = parser.parse_args()
-    revisions = {key: value for key, value in (
+    revisions = build_revisions(args.build) if args.build else {}
+    revisions.update({key: value for key, value in (
         ('bundle_sha256', args.bundle_sha256),
         ('build_manifest_sha256', args.build_manifest_sha256),
-        ('source_archive_sha256', args.source_archive_sha256)) if value}
+        ('source_archive_sha256', args.source_archive_sha256)) if value})
     receipt = write(args.directory, campaign_id=args.campaign_id, revisions=revisions)
     print(json.dumps(receipt))
 

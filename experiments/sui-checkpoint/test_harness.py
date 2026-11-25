@@ -617,7 +617,7 @@ class RunnerKnobs(unittest.TestCase):
                       value_cache_size=None, default_value_cache_size=1000,
                       max_dirty_keys=1024, snapshot_written_bytes=8 << 30, max_maps=3,
                       max_index_maps=3,
-                      index_blob_cache_min_bytes=0, index_blob_cache_bytes=0,
+                      index_blob_cache_min_bytes=None, index_blob_cache_bytes=0,
                       read_profile_limit=0, native_write_profile_limit=0)
         values.update(changes)
         return run.runtime_environment(
@@ -636,7 +636,10 @@ class RunnerKnobs(unittest.TestCase):
         self.assertEqual(env['TH_SYNC_WRITES'], 'false')
         self.assertEqual(self.environment(tier='synchronous')['TH_SYNC_WRITES'], 'true')
         self.assertEqual(env['TH_SNAPSHOT_WRITTEN_BYTES'], str(8 << 30))
-        self.assertEqual(env['TH_INDEX_BLOB_CACHE_MIN_BYTES'], '0')
+        self.assertNotIn('TH_INDEX_BLOB_CACHE_MIN_BYTES', env,
+                         'the floor row stays at the engine 64 MiB default when unset')
+        explicit = self.environment(index_blob_cache_min_bytes=0)
+        self.assertEqual(explicit['TH_INDEX_BLOB_CACHE_MIN_BYTES'], '0')
 
     def test_flattened_cache_and_pacing_are_opt_in(self):
         env = self.environment(value_cache_size=0, pacing_ms=245)
@@ -851,7 +854,7 @@ class LifecycleChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differs after the reopen'):
             run.audit_comparison(same, self.audit({'t': [2, 'a']}))
 
-    def test_index_blob_cache_needs_the_frozen_sui_row(self):
+    def test_index_blob_cache_needs_both_frozen_sui_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             engine = root / 'sources/sui/crates/typed-store/src/tidehunter_util.rs'
@@ -860,18 +863,25 @@ class LifecycleChecks(unittest.TestCase):
             self.assertFalse(run.index_blob_cache_support(root))
             message = run.index_blob_cache_error(root)
             self.assertIn('TH_INDEX_BLOB_CACHE_BYTES', message)
+            self.assertIn('TH_INDEX_BLOB_CACHE_MIN_BYTES', message)
             self.assertIn('thdb_config', message)
             self.assertIn('native node', message)
             engine.write_text(
                 'let v = parse_env_usize("TH_INDEX_BLOB_CACHE_BYTES", 1);\n')
+            self.assertFalse(run.index_blob_cache_support(root),
+                             'the budget row alone is not the pair')
+            engine.write_text(
+                'let v = parse_env_usize("TH_INDEX_BLOB_CACHE_BYTES", 1);\n'
+                'let floor = parse_env_usize("TH_INDEX_BLOB_CACHE_MIN_BYTES", 64 << 20);\n')
             self.assertTrue(run.index_blob_cache_support(root))
             self.assertIsNone(run.index_blob_cache_error(root))
             engine.unlink()
             (root / 'binaries').mkdir()
             binary = root / 'binaries/sui-node-remote'
-            binary.write_bytes(b'\0' * 4096 + b'TH_INDEX_BLOB_CACHE_BYTES' + b'\0' * 16)
+            binary.write_bytes(b'\0' * 4096 + b'TH_INDEX_BLOB_CACHE_BYTES'
+                               + b'\0' * 16 + b'TH_INDEX_BLOB_CACHE_MIN_BYTES' + b'\0' * 8)
             self.assertTrue(run.index_blob_cache_support(root))
-            binary.write_bytes(b'\0' * 8192)
+            binary.write_bytes(b'\0' * 4096 + b'TH_INDEX_BLOB_CACHE_BYTES' + b'\0' * 16)
             self.assertFalse(run.index_blob_cache_support(root))
 
     def test_index_blob_cache_is_an_explicit_off_by_default_knob(self):
@@ -879,7 +889,7 @@ class LifecycleChecks(unittest.TestCase):
                            pacing_ms=0, value_cache_size=None,
                            default_value_cache_size=1000, max_dirty_keys=1024,
                            snapshot_written_bytes=8 << 30, max_maps=3,
-                           max_index_maps=3, index_blob_cache_min_bytes=0,
+                           max_index_maps=3, index_blob_cache_min_bytes=None,
                            read_profile_limit=0, native_write_profile_limit=0)
         off = run.runtime_environment({'PATH': '/bin'}, index_blob_cache_bytes=0,
                                       **environment)

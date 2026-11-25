@@ -546,6 +546,11 @@ def external_durability_error(config, tier):
 
 
 INDEX_BLOB_CACHE_ENV = 'TH_INDEX_BLOB_CACHE_BYTES'
+INDEX_BLOB_CACHE_MIN_ENV = 'TH_INDEX_BLOB_CACHE_MIN_BYTES'
+# The frozen Sui row keeps this floor when no value is given; record it as the
+# effective minimum instead of writing it back as an explicit 0.
+ENGINE_INDEX_BLOB_CACHE_MIN_BYTES = 64 << 20
+INDEX_BLOB_CACHE_ROWS = (INDEX_BLOB_CACHE_ENV, INDEX_BLOB_CACHE_MIN_ENV)
 MANAGED_ENV = {
     'TH_SYNC_WRITES', 'TH_FRAG_SIZE', 'TH_MAX_MAPS', 'TH_MAX_INDEX_MAPS',
     'TH_DEFAULT_MUTEX_COUNT', 'TH_DEFAULT_MAX_DIRTY_KEYS',
@@ -583,7 +588,6 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
                TH_DEFAULT_MAX_DIRTY_KEYS=str(max_dirty_keys),
                TH_DEFAULT_VALUE_CACHE_SIZE=str(default_value_cache_size),
                TH_SNAPSHOT_WRITTEN_BYTES=str(snapshot_written_bytes),
-               TH_INDEX_BLOB_CACHE_MIN_BYTES=str(index_blob_cache_min_bytes),
                SUI_TH_READ_PROFILE_LIMIT=str(read_profile_limit),
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(native_write_profile_limit))
     if driver_concurrency is not None:
@@ -594,6 +598,8 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
         env['TH_VALUE_CACHE_SIZE'] = str(value_cache_size)
     if index_blob_cache_bytes:
         env[INDEX_BLOB_CACHE_ENV] = str(index_blob_cache_bytes)
+    if index_blob_cache_min_bytes is not None:
+        env[INDEX_BLOB_CACHE_MIN_ENV] = str(index_blob_cache_min_bytes)
     return env
 
 
@@ -711,21 +717,23 @@ DURABLE_CUT_RECORD = 'durable-cut.v1'
 
 
 def index_blob_cache_support(build_root):
-    """True only when the frozen Sui turns the env row into the index config.
+    """True only when the frozen Sui turns both env rows into the index config.
 
     The native node and the hybrid coordinator both take their index rows from
-    `thdb_config`, so the row must exist there. A built `sui-node-*` binary's
-    strings are the final proof that the row was compiled in.
+    `thdb_config`, so the budget row and its companion floor row must exist
+    there. A built `sui-node-*` binary's strings are the final proof that both
+    rows were compiled in.
     """
     path = (Path(build_root)
             / 'sources/sui/crates/typed-store/src/tidehunter_util.rs')
     if path.is_file():
         try:
-            if INDEX_BLOB_CACHE_ENV in path.read_text():
+            text = path.read_text()
+            if all(row in text for row in INDEX_BLOB_CACHE_ROWS):
                 return True
         except (OSError, UnicodeError):
             pass
-    return any(_mentions(binary, INDEX_BLOB_CACHE_ENV)
+    return any(all(_mentions(binary, row) for row in INDEX_BLOB_CACHE_ROWS)
                for binary in sorted((Path(build_root) / 'binaries').glob('sui-node-*')))
 
 
@@ -733,13 +741,14 @@ def index_blob_cache_error(build_root):
     """Why this build cannot size the index blob cache, or None."""
     if index_blob_cache_support(build_root):
         return None
-    return ('the index blob cache needs ' + INDEX_BLOB_CACHE_ENV + ' in the frozen Sui fork: '
+    return ('the index blob cache needs ' + ' and '.join(INDEX_BLOB_CACHE_ROWS)
+            + ' in the frozen Sui fork: '
             'crates/typed-store/src/tidehunter_util.rs::thdb_config builds the native Config '
-            'and the hybrid coordinator Config from env rows and has no row for '
-            'index_blob_cache_bytes, so the engine keeps its None default. An "index" section '
-            'in SUI_SHARDED_WAL_CONFIG reaches the hybrid coordinator only, never the native '
-            'node, so the two measured nodes cannot be set the same way. Rebuild Sui '
-            'hybrid-tidy with the env row, then repeat this cell.')
+            'and the hybrid coordinator Config from env rows and has no pair of rows for '
+            'index_blob_cache_bytes and index_blob_cache_min_bytes, so the engine keeps its '
+            'None default. An "index" section in SUI_SHARDED_WAL_CONFIG reaches the hybrid '
+            'coordinator only, never the native node, so the two measured nodes cannot be set '
+            'the same way. Rebuild Sui hybrid-tidy with both env rows, then repeat this cell.')
 
 
 def durable_cut_record(path):
@@ -978,8 +987,9 @@ def main():
                         help='TH_MAX_MAPS replay/value WAL maps; the engine panics below 3')
     parser.add_argument('--max-index-maps', type=int, default=3,
                         help='TH_MAX_INDEX_MAPS index WAL maps; the engine panics below 3')
-    parser.add_argument('--index-blob-cache-min-bytes', type=int, default=0,
-                        help='TH_INDEX_BLOB_CACHE_MIN_BYTES; 0 admits every qualifying blob')
+    parser.add_argument('--index-blob-cache-min-bytes', type=int,
+                        help='TH_INDEX_BLOB_CACHE_MIN_BYTES; omit to keep the engine 64 MiB '
+                             'default, 0 admits every qualifying blob')
     parser.add_argument('--index-blob-cache-mib', type=int, default=0,
                         help='TH_INDEX_BLOB_CACHE_BYTES in MiB; 0 keeps the engine default (cache off). '
                              'The frozen Sui must read the row for both measured nodes')
@@ -1036,7 +1046,8 @@ def main():
         raise ValueError('max index maps must be 3..32; the WAL mapper panics below 3')
     if not 0 <= args.snapshot_written_bytes <= 1 << 40:
         raise ValueError('snapshot written bytes must be 0..1 TiB')
-    if not 0 <= args.index_blob_cache_min_bytes <= 1 << 40:
+    if (args.index_blob_cache_min_bytes is not None
+            and not 0 <= args.index_blob_cache_min_bytes <= 1 << 40):
         raise ValueError('index blob cache minimum must be 0..1 TiB')
     if not 0 <= args.index_blob_cache_mib <= 4096:
         raise ValueError('index blob cache budget must be 0..4096 MiB')
@@ -1054,7 +1065,7 @@ def main():
     if args.pacing_ms and not pacing_available:
         raise ValueError('pacing requires SUI_CHECKPOINT_EXECUTION_PACING_MS support in the frozen '
                          'Sui fork; this fork has no pacing hook, so a paced run cannot be claimed')
-    if args.index_blob_cache_mib:
+    if args.index_blob_cache_mib or args.index_blob_cache_min_bytes is not None:
         blob_error = index_blob_cache_error(build_root)
         if blob_error is not None:
             raise ValueError(blob_error)
@@ -1152,9 +1163,19 @@ def main():
                    max_maps=args.max_maps,
                    max_index_maps=args.max_index_maps,
                    index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
+                   index_blob_cache_min_bytes_effective=(
+                       args.index_blob_cache_min_bytes
+                       if args.index_blob_cache_min_bytes is not None
+                       else ENGINE_INDEX_BLOB_CACHE_MIN_BYTES),
+                   index_blob_cache_min_bytes_source=(
+                       INDEX_BLOB_CACHE_MIN_ENV
+                       if args.index_blob_cache_min_bytes is not None
+                       else 'engine default 64 MiB (row unset)'),
                    index_blob_cache_mib=args.index_blob_cache_mib,
                    index_blob_cache_bytes=args.index_blob_cache_mib * deployment.MIB,
-                   index_blob_cache_source=INDEX_BLOB_CACHE_ENV,
+                   index_blob_cache_source=(INDEX_BLOB_CACHE_ENV
+                                            if args.index_blob_cache_mib
+                                            else 'engine default off (row unset)'),
                    lifecycle_checks=args.lifecycle_checks,
                    tail_checkpoints=args.tail_checkpoints,
                    source='explicit runtime env; nothing is inherited from TH_*'),

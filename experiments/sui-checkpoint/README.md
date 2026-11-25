@@ -492,14 +492,16 @@ the node stays live for the final scrape and the live audit),
 `--max-maps` (`TH_MAX_MAPS`, replay/value WAL maps) and `--max-index-maps`
 (`TH_MAX_INDEX_MAPS`, index WAL maps; both default 3 and are refused below 3
 because the WAL mapper panics), `--index-blob-cache-min-bytes`
-(`TH_INDEX_BLOB_CACHE_MIN_BYTES`), and `--index-blob-cache-mib`
-(`TH_INDEX_BLOB_CACHE_BYTES`, default 0 keeps the engine's off default). The
-blob budget is refused unless the frozen Sui turns that env row into
-`index_blob_cache_bytes` (the row in
-`crates/typed-store/src/tidehunter_util.rs::thdb_config`, or the same string in
-a built `sui-node-*` binary); when it is present the runner sets the same value
-for both measured nodes and records MiB, bytes and the env row in
-`results.json:knobs`. `--lifecycle-checks` adds the clean-reopen checks of
+(`TH_INDEX_BLOB_CACHE_MIN_BYTES`; omit it to keep the engine 64 MiB floor, and
+0 admits every qualifying blob) and `--index-blob-cache-mib`
+(`TH_INDEX_BLOB_CACHE_BYTES` in MiB; 0 keeps the engine's off default, which is
+an unset row, never a written 0 because the row panics on 0 and on a
+non-numeric value). Both rows are refused unless the frozen Sui turns them into
+`index_blob_cache_bytes` and `index_blob_cache_min_bytes` (the rows in
+`crates/typed-store/src/tidehunter_util.rs::thdb_config`, or both strings in a
+built `sui-node-*` binary); when they are present the runner sets the same
+values for both measured nodes and records MiB, bytes, the effective floor and
+each env row in `results.json:knobs`. `--lifecycle-checks` adds the clean-reopen checks of
 S1-1/S1-8 after the normal replay and first audit, with `--tail-checkpoints K`
 (default 64) bounding the tail sample: the restarted measured node must
 re-commit all ten RPC index pipelines at the frozen tip, read the certified
