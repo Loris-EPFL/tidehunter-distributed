@@ -704,6 +704,9 @@ def main():
             disk_sample=disk_sample, disk_interval_seconds=args.disk_sample_seconds)
         result['disk'] = dict(geometry=result['disk_geometry'],
             samples=result['remote']['disk_samples'], final=result['remote']['disk_final'])
+        budget = (result['disk']['final'] or {}).get('budget') if result['disk']['final'] else None
+        if budget and budget.get('within_limit') is False:
+            raise RuntimeError('coordinator disk projection exceeds the configured free-space share')
         if args.external_config:
             result['external_stages'].append(publish_stage(args.external_stage_dir, 'remote-finished', binding))
         if deployment.schemas(output/'remote-schema', 'sharded-wal') != schema:
