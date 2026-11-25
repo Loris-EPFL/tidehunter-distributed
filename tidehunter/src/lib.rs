@@ -29,7 +29,6 @@ mod lock;
 pub mod lookup;
 mod math;
 pub mod metrics;
-#[cfg(feature = "experimental-distributed")]
 pub mod parallelism;
 mod position_cache;
 mod primitives;
