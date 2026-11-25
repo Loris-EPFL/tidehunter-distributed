@@ -249,7 +249,12 @@ impl OwnerReceiver {
 
 impl Drop for OwnerReceiver {
     fn drop(&mut self) {
-        self.capacity.state.lock().closed = true;
+        // Under the guard `wait_until` checks `closed` under: a parking_lot
+        // notify outside it can fall between the check and the park and be
+        // dropped, which costs the sender one full wait before it sees the
+        // close.
+        let mut state = self.capacity.state.lock();
+        state.closed = true;
         self.capacity.changed.notify_all();
     }
 }

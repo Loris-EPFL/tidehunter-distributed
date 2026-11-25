@@ -175,8 +175,12 @@ struct Stop {
 }
 
 impl Stop {
+    /// Set the stop under the guard `wait` checks it under, then notify. A
+    /// parking_lot notify outside that guard can fall between the check and the
+    /// park, where no waiter is registered yet, and is dropped.
     fn stop(&self) {
-        *self.stopped.lock() = true;
+        let mut stopped = self.stopped.lock();
+        *stopped = true;
         self.changed.notify_all();
     }
 
