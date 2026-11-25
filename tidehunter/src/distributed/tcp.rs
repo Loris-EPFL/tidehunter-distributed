@@ -75,6 +75,7 @@ pub use live_wire::{
 #[cfg(test)]
 mod connection_tests;
 #[cfg(test)]
+#[path = "tcp/probe_tests.rs"]
 mod probe;
 #[cfg(test)]
 mod tests;
