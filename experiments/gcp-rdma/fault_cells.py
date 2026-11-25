@@ -42,6 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'sui-checkpoint'))
 import build
 import campaign_ledger as ledger_module
+import campaign_manifest
+import campaign_upload
 import disk_collector
 import manual_sui
 import stage2_mechanism as mechanism
@@ -999,6 +1001,32 @@ def cell_ids():
     return [cell['id'] for cell in mechanism.cells()]
 
 
+def cell_artifacts(output, parts):
+    """Every retained file of one cell: compact records and per-sample files.
+
+    `campaign_manifest.evidence_group` sends the summaries to `evidence/` and
+    `samples.csv`, `*.prom` and `*.jsonl` to `raw/`.
+    """
+    rows, output = [], Path(output)
+
+    def add(path, name):
+        path = Path(path)
+        if path.is_file():
+            rows.append(campaign_upload.artifact(path, name))
+
+    add(output / 'receipt.json', 'receipt.json')
+    for part in parts:
+        base = Path(part['output'])
+        name = part['name']
+        add(base.parent / 'spec.json', f'{name}/spec.json')
+        for member in ('manifest.json', 'summary.json', 'samples.csv',
+                       'measurement-read-evidence.json'):
+            add(base / member, f'{name}/run/{member}')
+        for path in sorted(base.glob('*.prom')):
+            add(path, f'{name}/run/{path.name}')
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cell', required=True, choices=cell_ids())
@@ -1016,7 +1044,15 @@ def main():
     parser.add_argument('--live-transport', choices=('tcp', 'rdma'), default='rdma')
     parser.add_argument('--durability-tier', choices=('native', 'synchronous'),
                         help='default: the cell tier')
-    parser.add_argument('--ledger', type=Path)
+    parser.add_argument('--ledger', type=Path,
+                        help='campaign ledger (default: beside the output)')
+    parser.add_argument('--bucket-prefix',
+                        help='campaign object prefix, gs://mysten-research-bench-artifacts/'
+                             '<campaign-id>; a cell passes only after its verified upload')
+    parser.add_argument('--impersonation-account', default=campaign_manifest.ACCOUNT,
+                        help='service account that writes the campaign prefix')
+    parser.add_argument('--allow-local-ledger', action='store_true',
+                        help='local rehearsal only: pass a cell without an uploaded bundle')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true',
                         help='print the plan and exit; no host is touched')
@@ -1042,6 +1078,13 @@ def main():
         return
     if args.fixture is None or args.schema is None:
         raise SystemExit('--fixture and --schema bind the ledger identity; both are required')
+    if not args.bucket_prefix and not args.allow_local_ledger:
+        raise SystemExit('a passed cell needs a verified evidence upload; give '
+                         '--bucket-prefix, or --allow-local-ledger for a local rehearsal')
+    store = prefix = None
+    if args.bucket_prefix:
+        store, _, prefix = campaign_upload.open_store(
+            args.bucket_prefix, args.impersonation_account)
     hosts = manual_sui.plan(args.coordinator, args.owners.split(','))
     cluster = Cluster(remote=manual_sui.Remote(args.zone, iap=args.tunnel_through_iap),
                       build_root=args.build, output=output,
@@ -1049,13 +1092,14 @@ def main():
                       owners=hosts['owners'], tier=tier, transport=args.transport,
                       live_transport=args.live_transport, schema=args.schema)
     cluster.admit()
-    ledger = entry = None
-    if args.ledger:
-        ledger = ledger_module.Ledger(args.ledger)
-        if args.ledger.exists():
-            if not args.resume:
-                raise SystemExit(f'ledger exists; use --resume or a new --ledger: {args.ledger}')
-            ledger.load()
+    ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
+    if Path(ledger_path).exists() and not args.resume:
+        raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
+    ledger, entry = ledger_module.Ledger(ledger_path), None
+    if args.resume:
+        ledger.load()
+        if store is not None:
+            ledger = campaign_upload.Evidence(store, prefix).merge(ledger)
     identity = ledger_module.config_hash(
         spec=dict(build_manifest=digest(Path(args.build) / 'build-manifest.json'),
                   fixture=digest(Path(args.fixture) / 'experiment/results.json'),
@@ -1066,15 +1110,14 @@ def main():
         engine_rev=cluster.manifest.get('source_archive_sha256'),
         sui_rev=cluster.manifest.get('source_archive_sha256'),
         binary_ids=cluster.manifest['binaries'])
-    if ledger is not None:
-        previous = ledger.entries.get((cell['stage'], cell['id']))
-        if (args.resume and previous and previous['status'] == 'passed'
-                and previous['config_hash'] == identity):
-            print(json.dumps(dict(cell=cell['id'], skipped=True)))
-            return
-        entry = ledger.begin(stage=cell['stage'], cell_id=cell['id'],
-                             config_hash=identity, unit=cell['unit'])
-        ledger.save()
+    previous = ledger.entries.get((cell['stage'], cell['id']))
+    if (args.resume and previous and previous['status'] == 'passed'
+            and previous['config_hash'] == identity):
+        print(json.dumps(dict(cell=cell['id'], skipped=True)))
+        return
+    entry = ledger.begin(stage=cell['stage'], cell_id=cell['id'],
+                         config_hash=identity, unit=cell['unit'])
+    ledger.save()
     driver = CellDriver(cluster, cell)
     try:
         cluster.prepare()
@@ -1105,23 +1148,18 @@ def main():
                        finished_unix_ns=now_ns())
         receipt_path = output / 'receipt.json'
         receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
-        if ledger is not None:
-            artifacts = [dict(path=str(receipt_path), size=receipt_path.stat().st_size,
-                              sha256=ledger_module.sha256_file(receipt_path))]
-            for part in parts:
-                path = Path(part['output']) / 'manifest.json'
-                if path.is_file():
-                    artifacts.append(dict(path=str(path), size=path.stat().st_size,
-                                          sha256=ledger_module.sha256_file(path)))
-            if ok:
-                ledger.mark_passed(entry, artifacts)
-            else:
-                ledger.fail(entry, 'one or more cell checks failed')
+        artifacts = cell_artifacts(output, parts)
+        if not ok:
+            ledger.fail(entry, 'one or more cell checks failed')
             ledger.save()
+        elif store is not None:
+            campaign_upload.Evidence(store, prefix).persist(ledger, entry, artifacts)
+        else:
+            campaign_upload.pass_local(ledger, entry, artifacts)
         print(json.dumps(dict(cell=cell['id'], ok=ok, receipt=str(receipt_path))))
         raise SystemExit(0 if ok else 1)
     except BaseException as error:
-        if ledger is not None and entry is not None:
+        if entry is not None:
             ledger.fail(entry, error)
             ledger.save()
         raise

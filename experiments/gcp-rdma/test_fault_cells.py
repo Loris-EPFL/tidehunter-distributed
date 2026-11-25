@@ -333,3 +333,41 @@ class DryRun(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EvidenceLayout(unittest.TestCase):
+    def test_every_cell_file_uses_the_one_campaign_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'M6-w1-c16'
+            run = output / 'measure' / 'run'
+            run.mkdir(parents=True)
+            (output / 'receipt.json').write_text('{"ok": true}')
+            (output / 'measure' / 'spec.json').write_text('{}')
+            for name in ('manifest.json', 'samples.csv', 'live.prom',
+                         'measurement-read-evidence.json'):
+                (run / name).write_text('x')
+            parts = [dict(name='measure', output=str(run), log=str(output / 'measure.log'))]
+            rows = fault_cells.cell_artifacts(output, parts)
+            names = {row['name'] for row in rows}
+            self.assertEqual(names, {'receipt.json', 'measure/spec.json',
+                                     'measure/run/manifest.json', 'measure/run/samples.csv',
+                                     'measure/run/live.prom',
+                                     'measure/run/measurement-read-evidence.json'})
+            evidence = {fault_cells.campaign_manifest.evidence_key(
+                'p', 'stage2', 'M6-w1-c16', row['name']) for row in rows}
+            self.assertIn('p/stage2/evidence/M6-w1-c16/attempt-1/measure/run/manifest.json',
+                          evidence)
+            self.assertIn('p/stage2/raw/M6-w1-c16/attempt-1/measure/run/samples.csv',
+                          evidence)
+            self.assertIn('p/stage2/raw/M6-w1-c16/attempt-1/measure/run/live.prom',
+                          evidence)
+
+    def test_a_pass_needs_the_upload_or_the_rehearsal_escape(self):
+        argv = ['fault_cells.py', '--cell', 'S1-2S-publication-native',
+                '--build', str(ROOT), '--output', '/tmp/mech-out',
+                '--guest-root', '/var/tmp/guest', '--coordinator', 'H0',
+                '--owners', 'H1,H2', '--zone', 'us-central1-a',
+                '--fixture', '/tmp/fixture', '--schema', '/tmp/schema']
+        with patch.object(sys, 'argv', argv), self.assertRaises(SystemExit) as raised:
+            fault_cells.main()
+        self.assertIn('--allow-local-ledger', str(raised.exception))
