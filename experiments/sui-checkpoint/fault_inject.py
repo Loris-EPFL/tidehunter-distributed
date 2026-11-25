@@ -95,24 +95,32 @@ def live_counters(text):
     return live_nvmeof_stats(parse_metrics(text))
 
 
-def controller_present(inventory, *, nqn, transport, address, service, excluded_inode):
-    for identity in inventory.values():
-        if (identity['nqn'] == nqn and identity['transport'] == transport
-                and identity['inode'] != excluded_inode
-                and manage.controller_matches(identity, nqn, transport, address, service)):
-            return True
-    return False
+def matching_controllers(inventory, *, nqn, transport, address, service):
+    return [identity for identity in inventory.values()
+            if identity['nqn'] == nqn and identity['transport'] == transport
+            and manage.controller_matches(identity, nqn, transport, address, service)]
 
 
 def wait_for_reconnect(*, nqn, transport, address, service, removed_inode, timeout, snapshot=None, clock=time.monotonic, sleep=time.sleep):
+    """Accept a new inode or a matching controller after observed absence.
+
+    sysfs inode numbers can be reused. A different inode proves a new object;
+    otherwise the identity must disappear completely and then reappear.
+    """
     snapshot = snapshot or manage.controller_snapshot
     start = clock()
     observations = []
+    absent = False
     while True:
         inventory = snapshot()
-        present = controller_present(inventory, nqn=nqn, transport=transport,
-            address=address, service=service, excluded_inode=removed_inode)
-        observations.append(dict(seconds=clock() - start, controllers=sorted(inventory), present=present))
+        matches = matching_controllers(inventory, nqn=nqn, transport=transport,
+                                       address=address, service=service)
+        fresh = any(identity['inode'] != removed_inode for identity in matches)
+        present = fresh or (absent and bool(matches))
+        if not matches:
+            absent = True
+        observations.append(dict(seconds=clock() - start, controllers=sorted(inventory),
+                                 matching=len(matches), present=present))
         if present:
             return clock() - start, observations
         if clock() - start >= timeout:

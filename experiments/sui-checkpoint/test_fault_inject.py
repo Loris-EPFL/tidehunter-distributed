@@ -43,6 +43,19 @@ class ControllerSelection(unittest.TestCase):
             fault_inject.select_controller(wrong, nqn=NQN, transport='rdma',
                                            address=ADDRESS, service=SERVICE)
 
+    def test_reconnect_accepts_a_reused_inode_after_observed_absence(self):
+        clock = FakeClock()
+        views = iter([{}, inventory()])
+        def snapshot():
+            return next(views)
+        seconds, observations = fault_inject.wait_for_reconnect(
+            nqn=NQN, transport='rdma', address=ADDRESS, service=SERVICE,
+            removed_inode=1, timeout=5, snapshot=snapshot,
+            clock=clock.monotonic, sleep=clock.sleep)
+        self.assertGreaterEqual(seconds, 0)
+        self.assertEqual(observations[0]['matching'], 0)
+        self.assertTrue(observations[-1]['present'])
+
     def test_canonical_JSON_ignores_mapping_order(self):
         self.assertEqual(fault_inject.canonical({'a': 1, 'b': 2}),
                          fault_inject.canonical({'b': 2, 'a': 1}))
