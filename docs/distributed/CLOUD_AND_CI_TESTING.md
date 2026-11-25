@@ -79,6 +79,11 @@ when its dependencies, selected tests or software provider are unavailable.
 A reduced environment may intentionally request a smaller profile set, but must
 report exactly that coverage rather than claim `all` passed.
 
+Hosted runs split a profile with `--shards N --index I`. Each shard lists the
+live test names of every cargo test target, runs every Nth name with `--exact`
+and fails when it runs fewer tests than it selected. Local runs omit both flags
+and keep the whole profile. A shard with no assigned name runs nothing.
+
 Python 3.11 or newer is required. Setup prepares PyYAML and boto3 for the exact
 interpreter used by the runner. `TIDEHUNTER_SETUP_SKIP_APT=1` is only for a machine
 with the required native/Python dependencies already available; it is not a

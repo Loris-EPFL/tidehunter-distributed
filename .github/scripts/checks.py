@@ -12,7 +12,9 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "experiments"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from resident_config import software_fabric_environment
+from shard_tests import run_shard
 TOOLCHAIN = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
 PROFILES = ("format", "lint", "native", "distributed", "fabric", "software-fabric", "harness",
             "test-layout", "lint-backends", "all")
@@ -59,6 +61,14 @@ def cargo(env, subcommand, *args, capture=False):
     # fmt has no dependency resolution and does not accept --locked/--offline.
     flags = [] if subcommand == "fmt" else ["--locked", "--offline"]
     return run(["cargo", f"+{TOOLCHAIN}", subcommand, *flags, *args], env, capture)
+
+
+def cargo_test(env, target, shard):
+    """Run one cargo test target; `shard` = (index, shards) splits it by name."""
+    if shard is None:
+        return cargo(env, "test", *target)
+    prefix = ["cargo", f"+{TOOLCHAIN}", "test", "--locked", "--offline"]
+    return run_shard(prefix, list(target), shard[0], shard[1], env, ROOT)
 
 
 def fabric_environment(env):
@@ -280,7 +290,7 @@ def check_test_layout(root=ROOT, baseline_path=TEST_LAYOUT_BASELINE):
 
 
 
-def check(profile, env):
+def check(profile, env, shard=None):
     print(f"\n=== {profile}: correctness only; no hardware/performance claim ===", flush=True)
     if profile == "format":
         cargo(env, "fmt", "--all", "--", "--check")
@@ -307,12 +317,12 @@ def check(profile, env):
             cargo(env, "clippy", "-p", "kv-research", "--all-targets", "--features", features,
                   "--", "-D", "warnings")
     elif profile == "native":
-        cargo(env, "test", "-p", "tidehunter")
+        cargo_test(env, ("-p", "tidehunter"), shard)
     elif profile == "distributed":
         # test_methods adds only test-facing items (observed relocation); it enables relocation_tests.
-        cargo(env, "test", "-p", "tidehunter", "--features",
-              "experimental-distributed,test-utils,test_methods")
-        cargo(env, "test", "-p", "kv-research", "--features", "test-utils")
+        cargo_test(env, ("-p", "tidehunter", "--features",
+                         "experimental-distributed,test-utils,test_methods"), shard)
+        cargo_test(env, ("-p", "kv-research", "--features", "test-utils"), shard)
     elif profile == "fabric":
         fabric = fabric_environment(env)
         cargo(fabric, "clippy", "-p", "tidehunter", "--all-targets", "--features",
@@ -324,7 +334,7 @@ def check(profile, env):
                                   ("kv-research", "fabric,test-utils")):
             cargo(fabric, "clippy", "-p", package, "--all-targets", "--features", features,
                   "--", "-D", "warnings")
-            cargo(fabric, "test", "-p", package, "--features", features)
+            cargo_test(fabric, ("-p", package, "--features", features), shard)
     elif profile == "software-fabric":
         fabric = software_fabric_environment(fabric_environment(env), software=True)
         stream = ("-p", "tidehunter-fabric", "--features", "native", "--test", "software_provider")
@@ -345,7 +355,15 @@ def main():
         "all includes software-fabric and fails if tcp;ofi_rxm cannot execute. "
         "lint-backends runs only on a GitHub-hosted runner (see kv-comparison.yaml) and is not part of all."))
     parser.add_argument("profile", choices=PROFILES)
+    parser.add_argument("--shards", type=int, default=1,
+                        help="Split each cargo test target into this many shards.")
+    parser.add_argument("--index", type=int, default=0,
+                        help="Shard to run, in [0, --shards).")
     args = parser.parse_args()
+    if args.shards < 1 or not 0 <= args.index < args.shards:
+        parser.error("--index must be in [0, --shards) with --shards at least 1")
+    # One shard is the unsharded run: exact-name selection is only for splits.
+    shard = None if args.shards == 1 else (args.index, args.shards)
     env = os.environ.copy()
     env.setdefault("CARGO_TERM_COLOR", "always" if sys.stdout.isatty() else "never")
     # Keep concurrent five-node fixtures bounded on a single local SSD.
@@ -354,7 +372,7 @@ def main():
     env["RUSTUP_AUTO_INSTALL"] = "0"
     try:
         for profile in ALL_PROFILES if args.profile == "all" else (args.profile,):
-            check(profile, env)
+            check(profile, env, shard)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"checks: {error}", file=sys.stderr)
         return 1

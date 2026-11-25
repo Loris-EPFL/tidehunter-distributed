@@ -328,9 +328,12 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    # Leased Distributed needs ~73 minutes alone; 90 hit the wall under
-    # contention with every test passing.
-    timeout-minutes: 120
+    # Each profile carries its own cap. The leased profiles split their test
+    # suites into four name shards: the measured longest shard is 19 minutes
+    # against 72 minutes for the whole profile. The old 120-minute wall killed
+    # both jobs with every test passing (runs 45472973711 and 45478909841,
+    # attempt 1).
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -339,23 +342,80 @@ jobs:
           - profile: format
             name: Format
             setup: core
+            shard: 0
+            shards: 1
+            timeout: 20
           - profile: lint
             name: Lint
             setup: core
+            shard: 0
+            shards: 1
+            timeout: 60
           - profile: native
             name: Run Tests
             setup: core
+            shard: 0
+            shards: 1
+            timeout: 40
           - profile: distributed
-            name: Leased Distributed Tests
+            name: Leased Distributed Tests shard 0
             setup: core
+            shard: 0
+            shards: 4
+            timeout: 75
+          - profile: distributed
+            name: Leased Distributed Tests shard 1
+            setup: core
+            shard: 1
+            shards: 4
+            timeout: 75
+          - profile: distributed
+            name: Leased Distributed Tests shard 2
+            setup: core
+            shard: 2
+            shards: 4
+            timeout: 75
+          - profile: distributed
+            name: Leased Distributed Tests shard 3
+            setup: core
+            shard: 3
+            shards: 4
+            timeout: 75
           - profile: fabric
-            name: Leased OFI Tests
+            name: Leased OFI Tests shard 0
             setup: fabric
+            shard: 0
+            shards: 4
+            timeout: 75
+          - profile: fabric
+            name: Leased OFI Tests shard 1
+            setup: fabric
+            shard: 1
+            shards: 4
+            timeout: 75
+          - profile: fabric
+            name: Leased OFI Tests shard 2
+            setup: fabric
+            shard: 2
+            shards: 4
+            timeout: 75
+          - profile: fabric
+            name: Leased OFI Tests shard 3
+            setup: fabric
+            shard: 3
+            shards: 4
+            timeout: 75
           - profile: software-fabric
             name: Software OFI Tests
             setup: fabric
+            shard: 0
+            shards: 1
+            timeout: 20
           - profile: harness
             name: Harness Tests
+            shard: 0
+            shards: 1
+            timeout: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -432,7 +492,12 @@ jobs:
       # Software providers and deterministic fixtures are correctness checks,
       # not evidence of RDMA hardware activity or network performance.
       - name: Run selected profile
-        run: python3 .github/scripts/checks.py "${{ matrix.profile }}"
+        # The longest measured shard is 19 minutes and the rest stay under 13;
+        # the cap covers runner contention, not a slow suite.
+        timeout-minutes: 55
+        run: >-
+          python3 .github/scripts/checks.py "${{ matrix.profile }}"
+          --shards "${{ matrix.shards }}" --index "${{ matrix.shard }}"
 
       - name: Run the lint profile at every stack tip
         if: matrix.profile == 'lint' && github.event_name == 'pull_request'
@@ -453,6 +518,7 @@ jobs:
           python3 -B .github/scripts/checks.py test-layout
           python3 -B -m unittest discover -s .github/scripts -p 'test_checks.py' -v
           python3 -B -m unittest discover -s .github/scripts -p 'test_lint_stack.py' -v
+          python3 -B -m unittest discover -s .github/scripts -p 'test_shard_tests.py' -v
 
       - name: Prepare Darwin standard library for boundary check
         if: matrix.profile == 'lint'
@@ -471,7 +537,8 @@ jobs:
         if: matrix.profile == 'native'
         run: cargo +1.90 test --locked --offline -p kv-research --no-default-features
       - name: Gate leased distributed mainnet replay on local files
-        if: matrix.profile == 'distributed'
+        # The replay gate and the oracle run once per profile, not per shard.
+        if: matrix.profile == 'distributed' && matrix.shard == 0
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -483,7 +550,7 @@ jobs:
         # One Rust test replays the committed Sui trace through the native engine
         # and the leased hybrid fixture, then compares per-key reads and final
         # state before and after a restart. No cluster and no kernel target.
-        if: matrix.profile == 'distributed'
+        if: matrix.profile == 'distributed' && matrix.shard == 0
         timeout-minutes: 12
         run: |
           set -euo pipefail
@@ -492,7 +559,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/distributed-mainnet/hybrid-oracle.log"
 
       - name: Retain distributed replay failures
-        if: always() && matrix.profile == 'distributed'
+        if: always() && matrix.profile == 'distributed' && matrix.shard == 0
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distributed-mainnet-${{ github.run_id }}-${{ github.run_attempt }}
@@ -501,7 +568,7 @@ jobs:
           retention-days: 7
 
       - name: Report hardware-only exclusions
-        if: always() && (matrix.profile == 'distributed' || matrix.profile == 'fabric')
+        if: always() && matrix.shard == 0 && (matrix.profile == 'distributed' || matrix.profile == 'fabric')
         run: |
           echo "::notice::Kernel NVMe-oF/RDMA campaigns are excluded: they need an owned nvmet target, initiator modules and RDMA hardware."
           echo "Local-file LiveIo and write_model exercise leased I/O; no kernel target is needed." >> "$GITHUB_STEP_SUMMARY"
