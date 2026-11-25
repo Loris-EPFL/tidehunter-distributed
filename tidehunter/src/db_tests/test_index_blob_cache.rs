@@ -358,6 +358,16 @@ fn test_index_blob_cache_differential_sharded() {
     run_differential(true);
 }
 
+/// `snapshot_forced_relocation` counted for keyspace `walk` on each database.
+fn forced_relocations(metrics: &[Arc<Metrics>; 2]) -> [u64; 2] {
+    std::array::from_fn(|i| {
+        metrics[i]
+            .snapshot_forced_relocation
+            .with_label_values(&["walk"])
+            .get()
+    })
+}
+
 fn run_differential(sharded: bool) {
     const SEED: u64 = 0x1de_b10b;
     const ROUNDS: usize = 12;
@@ -423,7 +433,23 @@ fn run_differential(sharded: bool) {
     let mut models: [Model; 2] = Default::default();
     let mut rng = StdRng::seed_from_u64(SEED);
 
-    for round in 0..ROUNDS {
+    // A snapshot force-relocates an entry only when one of its positions
+    // lives in a file below the occupancy floor, and where the asynchronous
+    // flusher leaves the round's blobs decides whether any such file exists
+    // at a snapshot point. Run the differential for `ROUNDS` rounds, then
+    // keep running identical rounds until every database has force-relocated
+    // once, so the forced path is always exercised. `MAX_ROUNDS` is only a
+    // hang guard: reaching it means this workload can no longer exercise the
+    // path, and the test fails instead of looping.
+    const MAX_ROUNDS: usize = 40;
+    let mut round = 0;
+    loop {
+        assert!(
+            round < MAX_ROUNDS,
+            "no index file below the occupancy floor was force-relocated within \
+             {MAX_ROUNDS} rounds; forced relocation counts per database: {:?}",
+            forced_relocations(&metrics)
+        );
         let what = format!("round {round}");
         // Checkpoints taken before the round's writes must keep reading the
         // pre-round state while the live databases move on.
@@ -507,6 +533,10 @@ fn run_differential(sharded: bool) {
                 KEY_POOL,
                 &format!("{what} ks {ks_idx}"),
             );
+        }
+        round += 1;
+        if round >= ROUNDS && forced_relocations(&metrics).iter().all(|&count| count > 0) {
+            break;
         }
     }
 
