@@ -100,12 +100,9 @@ impl IndexPosition for TestPosition {
 
 /// A [`Loader`] for the replay and cadence tests: no disk, no flushing. Its
 /// `flushed_at_bytes` is the supplied mapping, so a test chooses a cadence
-/// that is distinguishable from the cut's own byte position. Its
-/// `last_processed` (the insertion bound an `Empty` cell anchors its first
-/// write on) defaults to [`IndexCut::NONE`].
+/// that is distinguishable from the cut's own byte position.
 pub(crate) struct CadenceLoader<P: IndexPosition> {
     cadence: fn(P::Cut) -> u64,
-    last_processed: P::Cut,
     position: PhantomData<fn() -> P>,
 }
 
@@ -113,16 +110,8 @@ impl<P: IndexPosition> CadenceLoader<P> {
     pub(crate) fn new(cadence: fn(P::Cut) -> u64) -> Self {
         Self {
             cadence,
-            last_processed: P::Cut::NONE,
             position: PhantomData,
         }
-    }
-
-    /// Sets the loader's frontier, hence the insertion bound that caps an
-    /// `Empty` cell's first anchor.
-    pub(crate) fn with_last_processed(mut self, cut: P::Cut) -> Self {
-        self.last_processed = cut;
-        self
     }
 }
 
@@ -151,7 +140,7 @@ impl<P: IndexPosition> Loader for CadenceLoader<P> {
     }
 
     fn last_processed(&self) -> P::Cut {
-        self.last_processed
+        P::Cut::NONE
     }
 
     fn current(&self) -> P::Cut {

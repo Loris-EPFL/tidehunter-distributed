@@ -530,7 +530,7 @@ impl<P: IndexPosition> LargeTable<P> {
             v,
             full_key,
             Some(value),
-            |cut| loader.flushed_at_bytes(cut),
+            || loader.flushed_at_bytes(v.frontier()),
             || loader.insert_anchor_bound(),
         );
 
@@ -576,7 +576,7 @@ impl<P: IndexPosition> LargeTable<P> {
         entry.remove(
             k.clone(),
             v,
-            |cut| loader.flushed_at_bytes(cut),
+            || loader.flushed_at_bytes(v.frontier()),
             || loader.insert_anchor_bound(),
         );
         Ok(())
@@ -2459,37 +2459,19 @@ impl<P: IndexPosition> LargeTableEntry<P> {
     /// the store ran, or was a committed batch op the store promoted itself;
     /// a store never records more than the frontier. A write allocated after
     /// a store sits above the WAL tail of that time.
-    ///
-    /// The byte cadence (`flushed_at`) is the loader's value for the cut the
-    /// write stores. A native [`LastProcessed`] cut is its own byte position,
-    /// so the cadence follows every change of it and the snapshot's flush gate
-    /// compares the same number upstream compared (`last_processed`). A
-    /// version-carrying cut has no byte meaning: its engine seeds the cadence
-    /// on the `Empty` edge and owns it afterwards, so a later write to the
-    /// same dirty cell leaves it alone.
     fn mark_dirty(
         &mut self,
         v: P,
-        flushed_at: impl FnOnce(P::Cut) -> u64,
+        flushed_at: impl FnOnce() -> u64,
         anchor_bound: impl FnOnce() -> P::Cut,
     ) {
-        let was_empty = self.state.is_empty();
-        let cut = if was_empty {
-            P::anchor_cut(v, anchor_bound)
+        if self.state.is_empty() {
+            let cut = P::anchor_cut(v, anchor_bound);
+            self.set_last_processed(cut, flushed_at());
         } else {
-            cmp::min(self.last_processed, v.frontier())
-        };
-        // A native `LastProcessed` cut is the byte offset itself, and
-        // `from_byte_position` is `Some` exactly for such a cut: its cadence
-        // is the loader's value for the frontier the write stores, which is
-        // what upstream's flush gate compared. A version-carrying cut has no
-        // byte meaning: keep the counter its engine seeded or restored.
-        let cadence = if was_empty || P::Cut::from_byte_position(cut.byte_position()).is_some() {
-            flushed_at(cut)
-        } else {
-            self.flushed_at
-        };
-        self.set_last_processed(cut, cadence);
+            let cut = cmp::min(self.last_processed, v.frontier());
+            self.set_last_processed(cut, self.flushed_at);
+        }
         self.state.mark_dirty();
     }
 
@@ -2501,7 +2483,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
         v: P,
         full_key: Bytes,
         lru_value: Option<&Bytes>,
-        flushed_at: impl FnOnce(P::Cut) -> u64,
+        flushed_at: impl FnOnce() -> u64,
         anchor_bound: impl FnOnce() -> P::Cut,
     ) {
         self.invalidate_cache_refills();
@@ -2528,7 +2510,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
         &mut self,
         k: Bytes,
         v: P,
-        flushed_at: impl FnOnce(P::Cut) -> u64,
+        flushed_at: impl FnOnce() -> u64,
         anchor_bound: impl FnOnce() -> P::Cut,
     ) {
         self.invalidate_cache_refills();
@@ -2597,7 +2579,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
             // created by replay is not left looking never-flushed.
             self.mark_dirty(
                 first_position,
-                |cut| loader.flushed_at_bytes(cut),
+                || loader.flushed_at_bytes(first_position.frontier()),
                 || first_position.frontier(),
             );
         } else {
@@ -2652,16 +2634,14 @@ impl<P: IndexPosition> LargeTableEntry<P> {
                 let (full_key, lru_value) =
                     split_lru_update(&committed_change.key, committed_change.lru_update);
                 // The pending (transaction) table has no loader to ask, so the
-                // cadence value is the stored cut's own byte position: for the
-                // native position this is exactly what the live insert stores
-                // (upstream's `last_processed`), and it follows the cut down
-                // when the batch bound lowers it. The anchor bound is the
-                // tracker's externally observed frontier, read here under the
-                // row lock: a batch drops its guards at commit, so the
-                // frontier can pass these ops before they are applied, and
-                // anchoring at the write alone would sit the cell above a
-                // lower op of the same batch. A version-carrying engine never
-                // fills the pending table (it commits through
+                // cadence value is the write's own frontier: for the native
+                // position this is exactly what the live insert stores. The
+                // anchor bound is the tracker's externally observed frontier,
+                // read here under the row lock: a batch drops its guards at
+                // commit, so the frontier can pass these ops before they are
+                // applied, and anchoring at the write alone would sit the cell
+                // above a lower op of the same batch. A version-carrying
+                // engine never fills the pending table (it commits through
                 // `LargeTable::insert`/`remove` with its loader), and its cut
                 // has no byte position, so the bound falls back to the write's
                 // own frontier there.
@@ -2674,7 +2654,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
                     committed_change.value,
                     full_key,
                     lru_value.as_ref(),
-                    |cut| cut.byte_position(),
+                    || frontier.byte_position(),
                     || bound,
                 );
             } else {
@@ -2685,7 +2665,7 @@ impl<P: IndexPosition> LargeTableEntry<P> {
                 self.remove(
                     committed_change.key,
                     committed_change.value,
-                    |cut| cut.byte_position(),
+                    || frontier.byte_position(),
                     || bound,
                 );
             }

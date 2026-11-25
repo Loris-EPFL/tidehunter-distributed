@@ -121,8 +121,7 @@ fn set_flushed_at_restores_a_reopened_versioned_cell() {
 #[test]
 fn live_insert_takes_the_loader_cadence_on_first_dirtying_only() {
     let shape = shape();
-    let loader = CadenceLoader::<TestPosition>::new(|cut| cut.0 * 1_000 + 7)
-        .with_last_processed(TestCut(u64::MAX));
+    let loader = CadenceLoader::<TestPosition>::new(|cut| cut.0 * 1_000 + 7);
     let table = LargeTable::<TestPosition>::from_unloaded(
         &shape,
         &LargeTableContainer::new_from_key_shape(&shape, SnapshotEntryData::empty()),
@@ -153,59 +152,6 @@ fn live_insert_takes_the_loader_cadence_on_first_dirtying_only() {
         only_cadence(&table),
         100 * 1_000 + 7,
         "a second write to a dirty cell does not move the cadence"
-    );
-}
-
-/// Native parity: the cadence is the stored frontier itself, so a fresh cell's
-/// first write is capped by the loader's insertion bound (upstream's
-/// `min(write, tracker frontier)`), and a later lower write lowers it again.
-#[test]
-fn native_cadence_follows_the_stored_frontier() {
-    let shape = shape();
-    let loader = CadenceLoader::<WalPosition>::new(|cut| cut.byte_position())
-        .with_last_processed(LastProcessed::new(150));
-    let table = LargeTable::<WalPosition>::from_unloaded(
-        &shape,
-        &LargeTableContainer::new_from_key_shape(&shape, SnapshotEntryData::empty()),
-        Arc::new(Config::small()),
-        IndexFlusher::new_unstarted_for_test(),
-        Metrics::new(),
-        SharedLastProcessed::default(),
-        &loader,
-        Arc::default(),
-    );
-    let context = table.ks_context(KeySpace::first());
-    let cell = context.ks_config.cell_id(&key(1));
-    let write = |offset| {
-        table
-            .insert(
-                context,
-                key(1),
-                key(1),
-                WalPosition::test_value(offset),
-                &Bytes::from_static(b"v"),
-                &loader,
-            )
-            .expect("the cadence loader cannot fail")
-    };
-
-    write(200);
-    assert_eq!(
-        only_cadence(&table),
-        150,
-        "a fresh cell is anchored at the insertion bound, not at the write above it"
-    );
-    assert_eq!(
-        table.last_processed_for_test(context, &cell),
-        Some(LastProcessed::new(150)),
-        "the flush gate compares the same frontier the cadence mirrors"
-    );
-
-    write(120);
-    assert_eq!(
-        only_cadence(&table),
-        120,
-        "a lower write to the dirty cell lowers the cadence with the frontier"
     );
 }
 
