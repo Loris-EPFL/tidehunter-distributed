@@ -407,6 +407,10 @@ pub(super) struct LeasedWriter {
     resume_failed: bool,
     #[cfg(test)]
     resume_retain_bytes: Option<usize>,
+    /// The window a session resume grants outstanding work instead of one I/O
+    /// deadline, so a test can observe the probe's escalation without waiting.
+    #[cfg(test)]
+    retime_window: Option<std::time::Duration>,
     #[cfg(test)]
     next_write_result: Option<i32>,
     #[cfg(test)]
@@ -5485,6 +5489,12 @@ impl super::Client {
     /// Shrink the retained-frame budget so one frame fills it.
     pub(crate) fn leased_test_set_resume_retention(&mut self, bytes: usize) {
         self.live_leased.resume_retain_bytes = Some(bytes);
+    }
+    /// Replace the window a session resume grants the outstanding work, so a
+    /// test reaches the next expiry without waiting on it. `None` keeps
+    /// `io_timeout_ms`.
+    pub(crate) fn leased_test_set_retime_window(&mut self, window: std::time::Duration) {
+        self.live_leased.retime_window = Some(window);
     }
     /// `(retained frames, retained bytes)`.
     pub(crate) fn leased_test_retained(&self) -> (usize, usize) {

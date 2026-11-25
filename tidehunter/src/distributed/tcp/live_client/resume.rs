@@ -642,6 +642,14 @@ impl Client {
         let Some(timeout_ms) = self.live_config.as_ref().map(|config| config.io_timeout_ms) else {
             return;
         };
+        // A test grants the probe an exhausted window so it observes the
+        // escalation on its next pass instead of waiting it out on the clock.
+        #[cfg(test)]
+        let window = self
+            .live_leased
+            .retime_window
+            .unwrap_or(Duration::from_millis(timeout_ms));
+        #[cfg(not(test))]
         let window = Duration::from_millis(timeout_ms);
         let now = Instant::now();
         if let Some(deadline) = now.checked_add(window) {

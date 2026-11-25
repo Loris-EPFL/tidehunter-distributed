@@ -752,13 +752,12 @@ fn pending_flush_survives_a_session_break() {
 fn timeout_probe_escalates_to_the_data_path_when_the_queue_stalls() {
     let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
     let mut client = resumed_writer(&fixture);
-    // Short enough that the test waits one bounded window, long enough for the
-    // resume's session setup on its own budget.
-    client
-        .live_config
-        .as_mut()
-        .expect("a configured writer")
-        .io_timeout_ms = 250;
+    // Both expiries this test reports are deadlines it sets: the flight's own
+    // below, and the probe's retimed window here. The window is therefore
+    // empty, so the escalation is observed on the next pass rather than by
+    // waiting it out, and the resume keeps the suite's wide hang guard instead
+    // of a short budget a parallel debug run can outrun.
+    client.leased_test_set_retime_window(std::time::Duration::ZERO);
     // The frame reaches the device, and its CQE is reaped but never delivered:
     // the queue stalls with a frame outstanding and nothing to harvest.
     client.leased_test_hold_next_completion();
@@ -781,8 +780,8 @@ fn timeout_probe_escalates_to_the_data_path_when_the_queue_stalls() {
         1,
         "the withheld completion leaves the flight outstanding"
     );
-    // Expire the flight outright: the first pass probes, and the probe's retimed
-    // window then runs out without a CQE, which is the escalation.
+    // Expire the flight outright: the first pass probes, and the probe's
+    // retimed window is already spent, which is the escalation.
     client
         .live_leased
         .flights
