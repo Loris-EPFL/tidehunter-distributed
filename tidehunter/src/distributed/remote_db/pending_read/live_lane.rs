@@ -205,6 +205,38 @@ pub(super) fn run(
         }
     }
     drop(driver);
+    // Open this lane's live exports once, before its first request, so its
+    // first read does not pay the exchange while a caller waits. Lanes start
+    // after the fence and before activation, so this overlaps the rest of
+    // open. A failure is counted and named but not fatal: the lane stays
+    // usable and the first read retries the exchange with its own deadline.
+    // Lock: the lane client lock is held across the exchange. An inline
+    // caller that arrives meanwhile waits for it, but it would otherwise run
+    // this same exchange itself (the result is cached in the client), so the
+    // prefetch adds no wait.
+    {
+        let mut client = lane.client.lock();
+        if client.live_nvme_configured() {
+            // Relaxed: independent diagnostic counters. A lane has finished
+            // its prefetch once either counter has moved.
+            match client.open_live_exports(epoch) {
+                Ok(_) => {
+                    state
+                        .diagnostics
+                        .live_exports_prefetched
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    // Counted by class: the lane stays usable and the first
+                    // read retries the exchange, reporting its own error text.
+                    state
+                        .diagnostics
+                        .live_exports_prefetch_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
     let mut sleeping_cache = None;
     let mut pin_pending = state.pin_read_lanes;
     'lane: loop {

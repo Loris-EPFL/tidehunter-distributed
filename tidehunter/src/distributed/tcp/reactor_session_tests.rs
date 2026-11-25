@@ -380,7 +380,13 @@ fn lease_triggers_file_preparation_and_fence_joins_its_worker() {
         let result = rx.recv_timeout(Duration::from_secs(5));
         fence.join().unwrap();
         result.unwrap().unwrap();
-        assert_eq!(fixture.node.control.preparer_count(), 0);
+        // The fence starts the new epoch's first-file preparation before it
+        // replies (`prepare_fenced_epoch`), which registers that epoch's
+        // preparer slot; the preparation itself runs in the background worker.
+        // So one slot (the fenced epoch's) outlives the fence. The old epoch's
+        // slot was joined and removed; the paused case waits for that above,
+        // before it releases the worker.
+        assert_eq!(fixture.node.control.preparer_count(), 1);
     }
 }
 

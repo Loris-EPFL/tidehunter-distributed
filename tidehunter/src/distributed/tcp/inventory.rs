@@ -262,6 +262,22 @@ fn revoke_bindings<'a>(
     Ok(())
 }
 
+/// Test-only: the owner's half of a serving-retirement park, between its
+/// revoke and its root: it signals "entered", then waits for "resume".
+#[cfg(test)]
+type RevokeParkOwner = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+/// Test-only: the test's half of the same park: wait for "entered", then send
+/// "resume".
+#[cfg(test)]
+pub(crate) type RevokeParkTest = (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+);
+
 pub struct NodeInventory {
     pub(super) config: NodeConfig,
     pub(super) shape: KeyShape,
@@ -284,6 +300,10 @@ pub struct NodeInventory {
     trim_detach_pause: Option<generations::TrimPause>,
     #[cfg(test)]
     trim_delete_pause: Option<generations::TrimPause>,
+    /// Test hook: parks a serving retirement between its revoke and its root,
+    /// the window in which a victim's binding is gone but its file still exists.
+    #[cfg(test)]
+    after_revoke: Option<RevokeParkOwner>,
     /// Value WAL files passed to a successful retirement unlink step by this
     /// process. Read by the R0 inventory page; R0 asserts it does not move.
     value_wal_unlinks: u64,
@@ -678,6 +698,8 @@ impl NodeInventory {
             trim_detach_pause: None,
             #[cfg(test)]
             trim_delete_pause: None,
+            #[cfg(test)]
+            after_revoke: None,
             value_wal_unlinks: 0,
             file_maintenance: FileMaintenanceStats::default(),
             r1_events: None,
@@ -695,6 +717,20 @@ impl NodeInventory {
             lock,
         })
     }
+
+    /// Test-only: file indexes with an installed live binding for `epoch`.
+    #[cfg(test)]
+    pub(crate) fn live_binding_files(&self, epoch: u64) -> Vec<u64> {
+        let mut files: Vec<u64> = self
+            .live_bindings
+            .keys()
+            .filter(|(binding_epoch, _)| *binding_epoch == epoch)
+            .map(|(_, file)| *file)
+            .collect();
+        files.sort_unstable();
+        files
+    }
+
     fn ensure_healthy(&self) -> Result<(), TcpError> {
         if self.healthy && !self.terminal.load(Ordering::Acquire) {
             Ok(())

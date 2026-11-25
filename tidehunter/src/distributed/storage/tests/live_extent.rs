@@ -615,6 +615,52 @@ fn prepared_live_file_grant_does_no_namespace_work() {
     assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
 }
 
+/// A fenced epoch starts with no published namespace. Preparation must publish
+/// the allocator's file itself (allocation, file sync, directory witness), so
+/// the epoch's first lease is memory work instead of two syncs under the
+/// writer's deadline.
+#[test]
+fn first_live_file_is_prepared_before_any_grant() {
+    // The lease returns when the owner makes progress; a broken
+    // implementation parks it behind the paused persist until `resume` drops.
+    const PROGRESS_WAIT: Duration = Duration::from_secs(60);
+    let (_temp, config, log) = fixture();
+    assert!(log.state.lock().namespace_synced_file.is_none());
+    assert_eq!(log.prepare_next_live_file().unwrap(), Some(0));
+    assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 0);
+    assert_eq!(log.live_file_preparation_stats().live_files_prepared, 1);
+    let syncs = log.stats().namespace_syncs;
+    let (entered, resume) = log.pause_next_persist();
+    let log = Arc::new(log);
+    let owner = log.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let auth = authority(&config);
+    let worker = std::thread::spawn(move || tx.send(owner.lease_live_extent(auth)).unwrap());
+    let result = rx.recv_timeout(PROGRESS_WAIT);
+    let hook_entered = entered.try_recv().is_ok();
+    drop(resume); // Unblock a broken implementation before reporting failure.
+    worker.join().unwrap();
+    let (first, profile) = result
+        .expect("the first lease waited on file preparation")
+        .unwrap();
+    assert!(
+        !hook_entered,
+        "the first lease ran the inline file persistence"
+    );
+    assert_eq!(first.segment.file_index, 0);
+    assert_eq!(first.start, 0);
+    assert_eq!(profile.namespace_sync_ns, 0);
+    assert_eq!(log.stats().namespace_syncs, syncs);
+    assert_eq!(
+        log.state
+            .lock()
+            .live_test_diagnostics
+            .lease
+            .persistence_wait_ns,
+        0
+    );
+}
+
 #[test]
 fn live_file_preparation_waits_until_near_file_end() {
     let temp = tempdir::TempDir::new("live-preparation-distance").unwrap();
@@ -905,6 +951,102 @@ fn prepared_file_crash_cuts_recover_acknowledged_state_in_both_tiers() {
             .unwrap();
             assert!(next.lease_live_extent(authority(&next_config)).is_ok());
         }
+    }
+}
+
+/// The first file of a fenced epoch is prepared in the background, so its
+/// allocation, file sync, namespace sync and inventory witness run outside the
+/// first lease. Cut each durable boundary before the in-memory publication: the
+/// stream must recover, no acknowledged state exists, and the next epoch's
+/// first lease succeeds. A cut inside the witness poisons the owner, exactly as
+/// the inline path does (`leased_namespace_or_witness_failure_never_grants_an_extent`).
+#[test]
+fn first_file_preparation_crash_cuts_recover_and_grant_the_next_epoch() {
+    use crate::wal::position::WalFileId;
+    for cut in 0..5 {
+        let (temp, config, log) = fixture();
+        match cut {
+            // 0: allocated only. 1: allocated and file synced; no namespace or
+            // witness work has started.
+            0 | 1 => {
+                let preparer = log
+                    .state
+                    .lock()
+                    .writer
+                    .as_ref()
+                    .unwrap()
+                    .external_file_preparer();
+                preparer.ensure(WalFileId::from_u64(0)).unwrap();
+                if cut == 1 {
+                    log.wal.persist_frame_file(WalPosition::new(0, 1)).unwrap();
+                }
+            }
+            // 4: the file is prepared and its namespace is published (in memory
+            // and on disk) with no extent granted.
+            4 => {
+                assert_eq!(log.prepare_next_live_file().unwrap(), Some(0));
+                assert_eq!(log.state.lock().namespace_synced_file.unwrap().as_u64(), 0);
+            }
+            // 2: cut after the namespace sync, before the witness. 3: cut after
+            // the witness, without publishing the prepared highwater.
+            _ => {
+                log.fail_next_inventory_witness(cut == 3);
+                assert!(log.prepare_next_live_file().is_err());
+                assert_eq!(log.live_file_preparation_stats().live_files_prepared, 0);
+                let state = log.state.lock();
+                assert!(state.namespace_synced_file.is_none());
+                assert!(matches!(state.poison, Some(WriterPoison::Fatal)));
+            }
+        }
+        let image = temp.path().join("crash-image");
+        fs::create_dir(&image).unwrap();
+        for entry in fs::read_dir(temp.path().join("stream")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                fs::copy(entry.path(), image.join(entry.file_name())).unwrap();
+            }
+        }
+        // The durable namespace highwater never precedes its witness, and the
+        // witness is what a crash cut leaves for file 0.
+        let witnessed =
+            crate::distributed::storage::file_inventory::witnessed_files(&image).unwrap();
+        assert_eq!(
+            witnessed.contains(&0),
+            cut >= 3,
+            "cut {cut} left witnesses {witnessed:?}"
+        );
+        if cut < 2 {
+            // Nothing was published and nothing is durable: the inline path
+            // still grants file 0 on the running log.
+            assert!(log.state.lock().namespace_synced_file.is_none());
+            let (first, profile) = log.lease_live_extent(authority(&config)).unwrap();
+            assert_eq!(first.segment.file_index, 0, "cut {cut}");
+            assert_eq!(first.start, 0, "cut {cut}");
+            assert!(
+                profile.namespace_sync_ns > 0,
+                "cut {cut}: the inline path did no namespace work"
+            );
+        }
+        let recovered =
+            PartitionLog::recover_live_sealed(&image, &config, metrics(), || Ok(())).unwrap();
+        assert!(
+            recovered.receipt_page(0, 16).unwrap().is_empty(),
+            "cut {cut}"
+        );
+        assert_eq!(recovered.appended_frontier(), 0, "cut {cut}");
+        let mut next_config = config.clone();
+        next_config.inventory.epoch += 1;
+        let next = PartitionLog::create_live(
+            &temp.path().join("next-epoch"),
+            next_config.clone(),
+            &shape(),
+            metrics(),
+        )
+        .unwrap();
+        let (extent, _) = next.lease_live_extent(authority(&next_config)).unwrap();
+        assert_eq!(extent.segment.file_index, 0, "cut {cut}");
+        assert_eq!(extent.start, 0, "cut {cut}");
+        assert_eq!(extent.end, next_config.fragment_bytes, "cut {cut}");
     }
 }
 

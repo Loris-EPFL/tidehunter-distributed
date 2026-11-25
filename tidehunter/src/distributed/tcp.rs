@@ -1053,6 +1053,10 @@ impl StorageNode {
             coordinator_lease: Arc::new(coordinator_lease::CoordinatorLeaseCell::new()),
             #[cfg(test)]
             before_fence: Mutex::new(None),
+            #[cfg(test)]
+            before_open_live_exports: Mutex::new(None),
+            #[cfg(test)]
+            live_exports_served: AtomicUsize::new(0),
         });
         let control = control::ControlOwner::start(control_context.clone())?;
         Ok(Arc::new(Self {
@@ -1274,6 +1278,28 @@ impl StorageNode {
             .map_err(TcpError::component)?;
         Ok(log.pause_next_persist())
     }
+
+    /// Test-only: live export exchanges this owner began serving.
+    #[cfg(test)]
+    pub(crate) fn live_exports_served(&self) -> usize {
+        // Relaxed, like the counter it reads: test evidence, not a barrier.
+        self.control_context
+            .live_exports_served
+            .load(Ordering::Relaxed)
+    }
+
+    /// Test-only: owner-wide flush barriers this owner enqueued so far.
+    #[cfg(test)]
+    pub(crate) fn flush_barriers_sent(&self) -> u64 {
+        self.control.flush_barriers_sent()
+    }
+
+    /// Test-only: park the next serving retirement between its revoke and its
+    /// root. Returns `(entered, resume)`.
+    #[cfg(test)]
+    pub(crate) fn pause_retirement_after_revoke(&self) -> inventory::RevokeParkTest {
+        self.inventory.lock().pause_after_revoke()
+    }
     #[cfg(test)]
     pub(crate) fn contains_batch(&self, epoch: u64, id: BatchId) -> Result<bool, TcpError> {
         let log = self
@@ -1284,6 +1310,12 @@ impl StorageNode {
         log.lookup(id)
             .map(|batch| batch.is_some())
             .map_err(TcpError::component)
+    }
+
+    /// Test-only: file indexes with an installed live binding for `epoch`.
+    #[cfg(test)]
+    pub(crate) fn live_binding_files(&self, epoch: u64) -> Vec<u64> {
+        self.inventory.lock().live_binding_files(epoch)
     }
 
     /// Serve this one database directly: protocol tests only. Production

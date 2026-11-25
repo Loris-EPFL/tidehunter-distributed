@@ -901,6 +901,165 @@ fn fence_waits_for_a_parked_serving_retirement() {
     drop(db);
 }
 
+/// A serving retirement revokes a victim's binding under the lifecycle and
+/// inventory guard, then commits its root with neither held. An export in
+/// that window would still find the present-but-tombstoned file and
+/// republish it, so exports and serving retirements exclude each other: the
+/// export waits, and no binding comes back.
+#[test]
+fn live_exports_wait_for_a_retirement_parked_after_its_revoke() {
+    let fixture = Fixture::new(DurabilityTier::Native);
+    let db = fixture.open();
+    let generation = db.epoch;
+    churn(&db, 0, INITIAL_WRITES);
+    let mut written = INITIAL_WRITES;
+    let mut checked = false;
+    for _ in 0..ROUNDS {
+        churn(&db, written, ROUND_WRITES);
+        written += ROUND_WRITES;
+        // Connected before the park: a connection's own Status control would
+        // also wait behind the parked retirement.
+        let config = &fixture.config;
+        let endpoint = &config.endpoints[0];
+        let mut client = Client::connect_shared(
+            &endpoint.address,
+            &config.tls,
+            config.tls.client_config_with_identity().unwrap(),
+            config.timeout,
+            config.partition_config(1, endpoint.partition),
+            &fixture.shape,
+        )
+        .unwrap();
+        client
+            .configure_live_nvme(&config.live_nvme, config.effective_owner_append_occupancy())
+            .unwrap();
+        let (entered, resume) = fixture.node().pause_retirement_after_revoke();
+        thread::scope(|scope| {
+            let retirement = scope.spawn(|| retire(&db));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !retirement.is_finished() {
+                if entered.recv_timeout(Duration::from_millis(10)).is_ok() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "pass never finished");
+            }
+            if retirement.is_finished() {
+                retirement.join().unwrap().unwrap();
+                return;
+            }
+            // Parked between the revoke and the root: the export must wait,
+            // because a victim's binding is gone while its file is present.
+            let (exported, exports) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                exported
+                    .send(client.open_live_exports(generation))
+                    .expect("test receiver dropped");
+            });
+            assert!(
+                matches!(
+                    exports.recv_timeout(Duration::from_millis(500)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "the export ran between a retirement's revoke and its root"
+            );
+            resume.send(()).unwrap();
+            retirement.join().unwrap().unwrap();
+            exports
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .expect("the export failed after the retirement");
+            checked = true;
+        });
+        if checked {
+            break;
+        }
+    }
+    assert!(checked, "no retirement reached the pause");
+    db.shutdown().unwrap();
+}
+
+/// After a retirement root is durable but before its unlinks, the owner holds
+/// a `cleanup_pending` entry for a file that still exists. `OpenLiveExports`
+/// must not export such a file again (it would hand out a binding for an inode
+/// the owner is about to unlink), while it still exports the live files. The
+/// scheduler keeps a running retirement and an export apart, so this is the
+/// state that survives the retirement request itself: a crash cut after the
+/// root, here with the owner kept running.
+#[test]
+fn live_exports_skip_a_file_with_a_pending_retirement() {
+    let fixture = Fixture::new(DurabilityTier::Native);
+    let db = fixture.open();
+    let generation = db.epoch;
+    churn(&db, 0, INITIAL_WRITES);
+    let mut written = INITIAL_WRITES;
+    let log = fixture.node().source_log_for_test(generation, generation);
+    log.arm_crash_cut(CrashCut::BeforeUnlink);
+    let mut fired = false;
+    for _ in 0..ROUNDS {
+        churn(&db, written, ROUND_WRITES);
+        written += ROUND_WRITES;
+        match retire(&db) {
+            Ok(()) => {}
+            Err(error) => {
+                assert!(
+                    error
+                        .message()
+                        .contains("injected seal or retirement crash"),
+                    "{error:?}"
+                );
+                fired = true;
+                break;
+            }
+        }
+    }
+    assert!(fired, "no retirement reached the boundary");
+    let pending = log.pending_file_retirements();
+    assert!(!pending.is_empty(), "the cut left no pending retirement");
+    for entry in &pending {
+        assert!(
+            log.wal_file_path(entry.start).exists(),
+            "the pending file was already unlinked"
+        );
+    }
+    let config = &fixture.config;
+    let endpoint = &config.endpoints[0];
+    let mut client = Client::connect_shared(
+        &endpoint.address,
+        &config.tls,
+        config.tls.client_config_with_identity().unwrap(),
+        config.timeout,
+        config.partition_config(1, endpoint.partition),
+        &fixture.shape,
+    )
+    .unwrap();
+    client
+        .configure_live_nvme(&config.live_nvme, config.effective_owner_append_occupancy())
+        .unwrap();
+    client.open_live_exports(generation).unwrap();
+    let exported = fixture.node().live_binding_files(generation);
+    for entry in &pending {
+        assert!(
+            !exported.contains(&(entry.start / FILE_BYTES)),
+            "exported file {} while its retirement is pending",
+            entry.start
+        );
+    }
+    // The lookup finds exports: the newest live file, which is not pending,
+    // is exported.
+    let newest = *fixture.wal_files(generation).last().unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|entry| entry.start != newest * FILE_BYTES)
+    );
+    assert!(
+        exported.contains(&newest),
+        "the newest live file is not exported: {exported:?}"
+    );
+    drop(log);
+    drop(db);
+}
+
 /// The overlap itself: a real serving-stream retirement is parked after its
 /// durable root and detach, before its unlink, with no lock held. Writes
 /// must still be acknowledged and roll into a later file within a bounded

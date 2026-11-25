@@ -1160,9 +1160,11 @@ impl PartitionLog {
         Some((next.extent.clone(), next.lease))
     }
 
-    /// Prepare after the durable namespace highwater: at most one file beyond the
-    /// allocator-position file (two beyond the last grant with two-fragment files).
-    /// Allocation/file sync run unlocked; publication uses persistence -> state.
+    /// Prepare the file after the durable namespace highwater, or the file the
+    /// allocator is in when no namespace is published yet (the first file of a
+    /// fenced epoch). At most one file beyond the allocator-position file (two
+    /// beyond the last grant with two-fragment files). Allocation/file sync run
+    /// unlocked; publication uses persistence -> state.
     pub fn prepare_next_live_file(&self) -> Result<Option<u64>, StorageError> {
         use crate::wal::position::WalFileId;
         let config = self.config();
@@ -1173,27 +1175,31 @@ impl PartitionLog {
                 && state.poison.is_none()
                 && state.writer.is_some()
         };
+        // The target file and the namespace publication it extends.
         let eligible_target = |state: &State| {
             if !live(state) {
                 return None;
             }
-            let target = state.namespace_synced_file?.as_u64() + 1;
             let position = state.writer.as_ref()?.position();
             let file = position / config.wal_file_bytes;
-            let near_end = file == target - 1
+            let Some(synced) = state.namespace_synced_file else {
+                return Some((file, None));
+            };
+            let target = synced.as_u64() + 1;
+            let near_end = file == synced.as_u64()
                 && target * config.wal_file_bytes - position <= 2 * config.fragment_bytes;
-            (near_end || file == target).then_some(target)
+            (near_end || file == target).then_some((target, Some(synced)))
         };
         // State alone; never wait for the mapper while holding either owner lock.
-        let (target, preparer) = {
+        let (target, previous, preparer) = {
             let state = self.state.lock();
-            let Some(target) = eligible_target(&state) else {
+            let Some((target, previous)) = eligible_target(&state) else {
                 return Ok(None);
             };
             let Some(writer) = state.writer.as_ref() else {
                 return Ok(None);
             };
-            (target, writer.external_file_preparer())
+            (target, previous, writer.external_file_preparer())
         };
         let prepare_ensure_span = super::owner_events::OwnerEventSpan::new(
             super::owner_events::OwnerEventKind::PrepareEnsureStart,
@@ -1235,8 +1241,7 @@ impl PartitionLog {
             let state = self.state.lock();
             // A prelease can move position into target while its name remains
             // unpublished. Only a newer durable namespace publication obsoletes us.
-            if !live(&state) || state.namespace_synced_file != Some(WalFileId::from_u64(target - 1))
-            {
+            if !live(&state) || state.namespace_synced_file != previous {
                 return Ok(None);
             }
         }
@@ -1249,15 +1254,18 @@ impl PartitionLog {
             target,
             0,
         );
-        if let Err(error) =
-            self.persist_namespace_witnesses(target, Some(target - 1), &mut timing, &mut witnesses)
-        {
+        if let Err(error) = self.persist_namespace_witnesses(
+            target,
+            previous.map(WalFileId::as_u64),
+            &mut timing,
+            &mut witnesses,
+        ) {
             self.state.lock().poison = Some(WriterPoison::Fatal);
             return Err(StorageError::Unknown(WalError::Io(error)));
         }
         prepare_witness_span.end_at(target);
         let mut state = self.state.lock();
-        if !live(&state) || state.namespace_synced_file != Some(WalFileId::from_u64(target - 1)) {
+        if !live(&state) || state.namespace_synced_file != previous {
             return Ok(None);
         }
         state.namespace_synced_file = Some(WalFileId::from_u64(target));

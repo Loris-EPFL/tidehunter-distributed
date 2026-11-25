@@ -51,6 +51,12 @@ read_diagnostics!(
     live_lane_depth_max,
     live_lane_pending_max,
     live_pending_wait_ns,
+    // Lane-start live export prefetches: completed, and failed. A failed one
+    // leaves the lane usable and the first read retries the exchange; the
+    // first error text is exported by
+    // `ReadProfileMonitor::live_exports_prefetch_error`.
+    live_exports_prefetched,
+    live_exports_prefetch_failures,
     live_inline,
     live_inline_fallback_drain,
     live_inline_fallback_busy,

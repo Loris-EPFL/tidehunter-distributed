@@ -111,6 +111,14 @@ pub(super) struct ControlContext {
     pub(super) coordinator_lease: Arc<coordinator_lease::CoordinatorLeaseCell>,
     #[cfg(test)]
     pub(super) before_fence: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test hook: parks an admitted `OpenLiveExports` inside its handler.
+    #[cfg(test)]
+    pub(super) before_open_live_exports: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only: `OpenLiveExports` requests this owner began serving, so a
+    /// test can prove a read sent its own export exchange instead of reusing
+    /// a covering reply (see `StorageNode::live_exports_served`).
+    #[cfg(test)]
+    pub(super) live_exports_served: AtomicUsize,
 }
 
 pub(super) struct ControlWork {
@@ -137,6 +145,10 @@ struct Queue {
     flush_failed: bool,
     // Stream operations between dequeue and completion/flush hand-off.
     active_appends: usize,
+    // Live exports and serving-stream retirements in flight. They exclude each
+    // other; both count in `active_appends`, so a fence or seal waits for them.
+    active_exports: usize,
+    active_retirements: usize,
     // An exclusive control is executing; nothing else may start.
     control_active: bool,
 }
@@ -178,6 +190,10 @@ struct Shared {
     before_stream_request: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     session_barrier_waits: std::sync::atomic::AtomicU64,
+    /// Test-only: owner-wide flush barriers this owner enqueued, so a test can
+    /// see that a request took no flush instead of inferring it from a timing.
+    #[cfg(test)]
+    flush_barriers_sent: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     grant_profiles: Mutex<(Vec<TestGrantProfile>, u64)>,
     #[cfg(test)]
@@ -232,6 +248,30 @@ impl Shared {
         let mut queue = self.queue.lock();
         queue.stopped = true;
         self.ready.notify_all();
+    }
+
+    /// Prepare the first live file of a fenced epoch in the background, as the
+    /// native mapper pre-allocates at open: allocation, file and directory
+    /// durability, then the permanent export. The epoch's first lease then takes
+    /// the ready (memory-only) grant path instead of syncing under its deadline.
+    ///
+    /// Skipped on a sealing, poisoned or closed owner: the preparer would only
+    /// fail, and `lease_live_extent_impl` keeps the inline path as the fallback.
+    /// No live root is published here; that stays with the frontier and the cut.
+    fn prepare_fenced_epoch(&self, epoch: u64) {
+        if self.context.terminal.load(Ordering::Acquire)
+            || self.context.poison_pending.load(Ordering::Acquire)
+        {
+            return;
+        }
+        // `active` also rejects a stale or sealed authority and an unhealthy
+        // inventory, so a poisoned or closing owner is skipped cleanly. The
+        // log handle is taken first: `trigger_file_preparation` takes the
+        // preparer registry (a leaf lock) and must not run under the inventory.
+        let log = self.context.inventory.lock().active(epoch);
+        if let Ok(log) = log {
+            self.trigger_file_preparation(&log);
+        }
     }
 
     /// One worker owns each log's preparation triggers. Capacity one: a full
@@ -447,6 +487,8 @@ impl ControlOwner {
                 stopped: false,
                 flush_failed: false,
                 active_appends: 0,
+                active_exports: 0,
+                active_retirements: 0,
                 control_active: false,
             }),
             ready: Condvar::new(),
@@ -475,6 +517,8 @@ impl ControlOwner {
             before_target_shutdown: Mutex::new(None),
             #[cfg(test)]
             session_barrier_waits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            flush_barriers_sent: std::sync::atomic::AtomicU64::new(0),
         });
         let flush_shared = shared.clone();
         let flush_thread = thread::Builder::new()
@@ -704,6 +748,11 @@ impl ControlOwner {
     pub(super) fn preparer_count(&self) -> usize {
         self.shared.preparers.lock().len()
     }
+
+    /// Owner-wide flush barriers this owner enqueued so far.
+    pub(super) fn flush_barriers_sent(&self) -> u64 {
+        self.shared.flush_barriers_sent.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -770,16 +819,12 @@ impl ControlOwner {
 /// appends queued behind a control can start.
 struct Slot<'a> {
     shared: &'a Shared,
-    append: bool,
+    class: WorkClass,
 }
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         let mut queue = self.shared.queue.lock();
-        if self.append {
-            queue.active_appends -= 1;
-        } else {
-            queue.control_active = false;
-        }
+        self.class.leave(&mut queue);
         self.shared.ready.notify_all();
     }
 }
@@ -802,6 +847,14 @@ pub(super) fn is_stream_request(request: &Request) -> bool {
     )
 }
 
+/// Live export creation. It overlaps stream work, so a read never waits for a
+/// close scan, but it is mutually exclusive with file maintenance: a serving
+/// retirement revokes a victim's binding before its retirement root is
+/// durable, and an export in that window would republish a tombstoned file.
+pub(super) fn is_export_request(request: &Request) -> bool {
+    matches!(request, Request::OpenLiveExports { .. })
+}
+
 /// File maintenance of the serving stream and read-only file inventory. They
 /// overlap stream requests like a position proof (no append ticket, no flush
 /// barrier) and never take control's exclusive slot, so writes, grants and
@@ -809,14 +862,77 @@ pub(super) fn is_stream_request(request: &Request) -> bool {
 /// seal and shutdown still wait for them as active stream work. An older
 /// sealed stream's retirement stays an exclusive lifecycle control.
 pub(super) fn is_maintenance_request(request: &Request) -> bool {
-    match request {
+    is_retirement_request(request)
+        || matches!(
+            request,
+            Request::FileInventoryPage { .. } | Request::RelocationPage { .. }
+        )
+}
+
+/// Maintenance that revokes and unlinks files of the serving stream. Only this
+/// maintenance excludes live export creation; the read-only inventory and
+/// relocation pages overlap exports like any stream work.
+fn is_retirement_request(request: &Request) -> bool {
+    matches!(
+        request,
         Request::RetireWalFiles {
             authority_epoch,
             epoch,
             ..
-        } => epoch == authority_epoch,
-        Request::FileInventoryPage { .. } | Request::RelocationPage { .. } => true,
-        _ => false,
+        } if epoch == authority_epoch
+    )
+}
+
+/// How a dequeued command holds the owner.
+#[derive(Clone, Copy)]
+enum WorkClass {
+    /// Appends, grants, adoptions, position proofs and record resolution.
+    Stream,
+    /// Read-only file inventory and relocation pages.
+    Maintenance,
+    /// Serving-stream retirement: maintenance that revokes and unlinks files.
+    Retirement,
+    /// Live export creation.
+    Export,
+    /// Everything else: an exclusive barrier for the whole owner.
+    Control,
+}
+
+impl WorkClass {
+    /// Count a dequeued command. Lock: the queue lock, held by the caller.
+    /// Exports and retirements also count in `active_appends`, so a fence or
+    /// seal waits for them; `enter` and `leave` must stay paired.
+    fn enter(self, queue: &mut Queue) {
+        match self {
+            Self::Stream | Self::Maintenance => queue.active_appends += 1,
+            Self::Retirement => {
+                queue.active_appends += 1;
+                queue.active_retirements += 1;
+            }
+            Self::Export => {
+                queue.active_appends += 1;
+                queue.active_exports += 1;
+            }
+            Self::Control => queue.control_active = true,
+        }
+        debug_assert!(queue.active_exports + queue.active_retirements <= queue.active_appends);
+    }
+
+    /// Undo `enter` when the command completes or unwinds.
+    fn leave(self, queue: &mut Queue) {
+        match self {
+            Self::Stream | Self::Maintenance => queue.active_appends -= 1,
+            Self::Retirement => {
+                queue.active_appends -= 1;
+                queue.active_retirements -= 1;
+            }
+            Self::Export => {
+                queue.active_appends -= 1;
+                queue.active_exports -= 1;
+            }
+            Self::Control => queue.control_active = false,
+        }
+        debug_assert!(queue.active_exports + queue.active_retirements <= queue.active_appends);
     }
 }
 
@@ -830,9 +946,12 @@ pub(super) fn is_sealed_replay_page(request: &Request) -> bool {
     matches!(request, Request::ReplayLiveWal { .. })
 }
 
-/// Stream requests overlap; the log orders their state changes. Exclusive
-/// controls wait for all earlier stream operations, including position proofs,
-/// and block later work until completion. Returns `None` once stopped and empty.
+/// Stream requests overlap; the log orders their state changes. Exports
+/// overlap stream work and read-only file pages, but not a serving retirement,
+/// and that retirement waits for an export that has not started. Exclusive
+/// controls wait for all earlier stream, maintenance and export operations,
+/// including position proofs, and block later work until completion. Returns
+/// `None` once stopped and empty.
 fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>)> {
     let mut queue = shared.queue.lock();
     loop {
@@ -840,25 +959,27 @@ fn next_work(shared: &Shared) -> Option<(ControlWork, Slot<'_>)> {
             None if queue.stopped => return None,
             None => None,
             Some(_) if queue.control_active => None,
-            Some(front)
-                if is_stream_request(&front.request) || is_maintenance_request(&front.request) =>
-            {
-                Some(true)
+            Some(front) if is_stream_request(&front.request) => Some(WorkClass::Stream),
+            Some(front) if is_maintenance_request(&front.request) => {
+                if is_retirement_request(&front.request) {
+                    (queue.active_exports == 0).then_some(WorkClass::Retirement)
+                } else {
+                    Some(WorkClass::Maintenance)
+                }
             }
-            Some(front) if is_sealed_replay_page(&front.request) => Some(false),
-            Some(_) => (queue.active_appends == 0).then_some(false),
+            Some(front) if is_export_request(&front.request) => {
+                (queue.active_retirements == 0).then_some(WorkClass::Export)
+            }
+            Some(front) if is_sealed_replay_page(&front.request) => Some(WorkClass::Control),
+            Some(_) => (queue.active_appends == 0).then_some(WorkClass::Control),
         };
-        let Some(append) = runnable else {
+        let Some(class) = runnable else {
             shared.ready.wait(&mut queue);
             continue;
         };
         let work = queue.work.pop_front()?;
-        if append {
-            queue.active_appends += 1;
-        } else {
-            queue.control_active = true;
-        }
-        return Some((work, Slot { shared, append }));
+        class.enter(&mut queue);
+        return Some((work, Slot { shared, class }));
     }
 }
 
@@ -1099,8 +1220,13 @@ fn run(shared: &Shared) {
         // Lifecycle controls still drain the ordered flush queue.
         // File maintenance needs no flush: a sealed file's bytes are already
         // covered by the durable position root.
+        // Live export creation reads file names and inodes and grants no
+        // bytes: an owner-wide flush would only delay a read. So despite its
+        // name, `read_owned_barrier` means "takes no owner-wide flush".
         let read_owned_barrier = match &request {
-            Request::CheckpointPosition { .. } | Request::ResolveLiveRecords { .. } => true,
+            Request::CheckpointPosition { .. }
+            | Request::ResolveLiveRecords { .. }
+            | Request::OpenLiveExports { .. } => true,
             request => is_maintenance_request(request),
         };
         let (barrier_ok, barrier_wait_ns, barrier_expired) = if read_owned_barrier {
@@ -1123,6 +1249,11 @@ fn run(shared: &Shared) {
                     }
                 }
             };
+            #[cfg(test)]
+            if matches!(enqueued, BarrierEnqueue::Sent) {
+                // Relaxed: test observation only, not a synchronization hand-off.
+                shared.flush_barriers_sent.fetch_add(1, Ordering::Relaxed);
+            }
             if matches!(enqueued, BarrierEnqueue::Full) {
                 // The flusher is slower than the whole queue. Nothing was
                 // touched, so only this control fails; the worker continues and
@@ -1202,6 +1333,10 @@ fn run(shared: &Shared) {
         if matches!(&request, Request::Fence { .. } | Request::Seal { .. }) {
             shared.progress.retire_parked();
         }
+        let fenced_epoch = match &request {
+            Request::Fence { epoch } => Some(*epoch),
+            _ => None,
+        };
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             shared.context.handle_profiled_draining(
                 request,
@@ -1216,6 +1351,11 @@ fn run(shared: &Shared) {
                 "log control owner panicked; outcome may be unknown; reopen authority",
             ))
         });
+        if let (Some(epoch), Ok(_)) = (fenced_epoch, &response) {
+            // The epoch is live and its first lease will come soon: prepare its
+            // first file while the coordinator replays and loads its index.
+            shared.prepare_fenced_epoch(epoch);
+        }
         if measured {
             profile.control_execution_ns =
                 began.map_or(0, elapsed_ns).saturating_sub(barrier_wait_ns);
@@ -1746,6 +1886,17 @@ impl ControlContext {
         }
         match request {
             Request::OpenLiveExports { authority_epoch } => {
+                // Relaxed: a test-only counter of served exchanges. It is
+                // evidence, not a synchronization point.
+                #[cfg(test)]
+                self.live_exports_served.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                {
+                    let before_export = self.before_open_live_exports.lock().take();
+                    if let Some(before_export) = before_export {
+                        before_export();
+                    }
+                }
                 let mut lifecycle = self.lifecycle.lock();
                 let mut inventory = self.inventory.lock();
                 let log = inventory.active(authority_epoch)?;
@@ -1754,7 +1905,16 @@ impl ControlContext {
                     .ok_or_else(|| TcpError::new("live target not configured"))?;
                 let (address, service, transport) = target.endpoint();
                 let count = log.live_file_count().map_err(TcpError::component)?;
+                // A retirement root is durable but its unlinks may not be:
+                // never export a file whose inode this owner is retiring or
+                // still has to unlink. The scheduler keeps a live retirement
+                // and an export apart; this covers the restart case. Read in
+                // place, once per file: no list is materialized.
+                let file_bytes = log.config().wal_file_bytes;
                 for file in 0..count {
+                    if log.is_pending_file_retirement(file * file_bytes) {
+                        continue;
+                    }
                     let segment = match log.live_segment(file) {
                         Ok(segment) => segment,
                         Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {

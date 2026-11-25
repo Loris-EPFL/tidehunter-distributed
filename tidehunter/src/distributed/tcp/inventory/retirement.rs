@@ -146,6 +146,8 @@ impl NodeInventory {
         // seals are reported before their first retirement step (the
         // preparer reports seals only after a whole kick).
         let seals = log.file_retirement_state().0;
+        #[cfg(test)]
+        let parked: Option<RevokeParkOwner>;
         {
             let mut slot = lifecycle.lock();
             let mut guard = inventory.lock();
@@ -207,6 +209,20 @@ impl NodeInventory {
                         &serde_json::json!({"tombstone_durable": true}),
                     );
                 }
+            }
+            #[cfg(test)]
+            {
+                parked = guard.after_revoke.take();
+            }
+        }
+        #[cfg(test)]
+        if let Some((entered, resumed)) = parked {
+            // Test hook. This runs on an owner control thread, which must not
+            // panic: a hook left installed by an early return or a failed
+            // assertion has a dropped test end, and that means "do not park".
+            if entered.send(()).is_ok() {
+                // Err only when the test dropped its resume sender: proceed.
+                let _ = resumed.recv();
             }
         }
         let authorized = log
@@ -340,6 +356,17 @@ impl NodeInventory {
                 }
             }
         }
+    }
+
+    /// Test hook: park the next serving retirement between its revoke and its
+    /// retirement root. Nothing marks a victim in that window except the
+    /// scheduler's exclusion of exports, so a test can observe it.
+    #[cfg(test)]
+    pub(in crate::distributed::tcp) fn pause_after_revoke(&mut self) -> RevokeParkTest {
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let (release, resumed) = std::sync::mpsc::sync_channel(1);
+        self.after_revoke = Some((entered, resumed));
+        (waiting, release)
     }
 
     /// Any record lease on a victim defers the request. Pins on other files

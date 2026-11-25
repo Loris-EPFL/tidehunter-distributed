@@ -295,14 +295,15 @@ fn owner_exports(fixture: &Fixture) -> Vec<(u64, u64, u64)> {
 }
 
 /// D26: after a clean close the reopen extends the persisted durable cut over
-/// no batch and creates no owner export; it only re-merges the tail above the
-/// stored cell frontier. The stored region names that frontier, which lies
-/// below the last batch, so the tail re-merges idempotently by version (paper
-/// 3.3-3.4). The sealed files keep the permanent exports of the write path, so
-/// neither the reopen nor the reads of the sealed generation create an owner
-/// export. `flush` certifies every batch at the owners before the close on the
-/// native tier; the synchronous tier has nothing unsynced, so it needs none and
-/// never tracks a durable cut.
+/// no batch and its reads create no owner export; it only re-merges the tail
+/// above the stored cell frontier. The stored region names that frontier, which
+/// lies below the last batch, so the tail re-merges idempotently by version
+/// (paper 3.3-3.4). The sealed files keep the permanent exports of the write
+/// path, so neither the reopen nor the reads of the sealed generation create an
+/// owner export beyond the fence's own first-file preparation. `flush` certifies
+/// every batch at the owners before the close on the native tier; the
+/// synchronous tier has nothing unsynced, so it needs none and never tracks a
+/// durable cut.
 fn clean_restart(fixture: Fixture, flush: bool, track_cut: bool, label: &str) {
     let db = fixture.open();
     let epoch = db.epoch();
@@ -346,11 +347,34 @@ fn clean_restart(fixture: Fixture, flush: bool, track_cut: bool, label: &str) {
         recovery.below_cut_skipped, 0,
         "{label}: every re-merged batch lies above the stored frontier: {recovery:?}"
     );
-    assert_eq!(
-        owner_exports(&fixture),
-        sealed,
-        "{label}: the reopen created no export beyond the permanent ones"
-    );
+    // The fence starts each owner's first-file preparation in the background,
+    // and the reopen returns before its export is published. Wait for the
+    // observed publication so the counts below cannot race it; the shared cap
+    // is a hang guard, not a deadline the pass depends on.
+    for node in &fixture.nodes {
+        let log = node.log_for_test(db.epoch());
+        let deadline = Instant::now() + crate::distributed::test_bounds::PROGRESS_CAP;
+        while log.live_file_preparation_stats().live_files_published == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the reopen fence did not publish its first live file"
+            );
+            thread::yield_now();
+        }
+    }
+    let reopened = owner_exports(&fixture);
+    // The reopen fences each owner to a new epoch, and the fence prepares and
+    // exports that epoch's first file (native pre-allocation at open). No
+    // resolve or replay request created an export.
+    for (after, (before, _, _)) in reopened.iter().zip(sealed.iter()) {
+        let (exposed, resolve, replay) = *after;
+        assert_eq!(
+            exposed,
+            before + 1,
+            "{label}: the reopen fence exported each owner's first file, and nothing else: {reopened:?} from {sealed:?}"
+        );
+        assert_eq!((resolve, replay), (0, 0), "{label}: {reopened:?}");
+    }
 
     for key in 0..KEYS {
         assert_eq!(
@@ -364,7 +388,7 @@ fn clean_restart(fixture: Fixture, flush: bool, track_cut: bool, label: &str) {
     }
     assert_eq!(
         owner_exports(&fixture),
-        sealed,
+        reopened,
         "{label}: reads of the sealed generation reused the permanent exports"
     );
 }

@@ -698,28 +698,38 @@ pub(super) mod live_fencing {
             extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 });
             let log = node.inventory.lock().active(1).unwrap();
             wait_prepared(&log, 1);
-            assert_eq!(
-                node.with_live_target(|target| target.stats())
-                    .unwrap()
-                    .owned_namespace_count,
-                2
-            );
+            let owned = node
+                .with_live_target(|target| target.stats())
+                .unwrap()
+                .owned_namespace_count;
+            assert_eq!(owned, 2, "the epoch exported both live files");
             drop(log);
             if seal {
                 shutdown(&node, 1);
+                assert_eq!(node.control.preparer_count(), 0);
+                assert_eq!(
+                    node.with_live_target(|target| target.stats())
+                        .unwrap()
+                        .owned_namespace_count,
+                    0
+                );
             } else {
                 fence(&node, 2).unwrap();
+                // A permanent export lives as long as its file: the fence
+                // write-protects it instead of removing it. The fenced epoch
+                // prepares and exports its own first file, so the count grows
+                // by exactly that one.
+                let next = node.log_for_test(2);
+                wait_prepared(&next, 1);
+                drop(next);
+                assert_eq!(node.control.preparer_count(), 1);
+                assert_eq!(
+                    node.with_live_target(|target| target.stats())
+                        .unwrap()
+                        .owned_namespace_count,
+                    owned + FENCED_FIRST_FILE_EXPORT
+                );
             }
-            assert_eq!(node.control.preparer_count(), 0);
-            // A permanent export lives as long as its file: a fence
-            // write-protects it instead of removing it, while a shutdown
-            // reconciles every scoped object away.
-            assert_eq!(
-                node.with_live_target(|target| target.stats())
-                    .unwrap()
-                    .owned_namespace_count,
-                if seal { 0 } else { 2 }
-            );
         }
     }
 
@@ -1114,6 +1124,323 @@ pub(super) mod live_fencing {
         shutdown(&node, 1);
     }
 
+    /// A fenced epoch starts with no file and no published namespace. The
+    /// owner prepares the first file (allocation, file sync, directory
+    /// witness, permanent export) in the background after the fence, so the
+    /// epoch's first lease is memory work instead of two syncs under its
+    /// deadline.
+    #[test]
+    fn fence_prepares_the_first_live_file_in_the_background() {
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let temp = tempdir::TempDir::new("fence-first-file").unwrap();
+            let (config, node) = open_live(temp.path(), tier);
+            assert!(matches!(fence(&node, 2).unwrap(), Response::Status(_)));
+            let log = node.log_for_test(2);
+            wait_prepared(&log, 1);
+            let (entered, resume) = log.pause_next_persist();
+            let (tx, rx) = mpsc::sync_channel(1);
+            let lease_node = node.clone();
+            let worker = std::thread::spawn(move || {
+                let leased = extent_exchange(&lease_node, Request::LeaseLiveExtent { epoch: 2 });
+                tx.send(leased).expect("test receiver dropped");
+            });
+            let parked = entered.recv_timeout(Duration::from_millis(500)).is_ok();
+            drop(resume); // Unblock a broken implementation before reporting failure.
+            let response = rx.recv_timeout(PROGRESS_CAP).unwrap();
+            worker.join().unwrap();
+            assert!(!parked, "the first lease synced the prepared file itself");
+            let Response::LiveLeased(leased) = response else {
+                panic!("expected lease")
+            };
+            assert_eq!(leased.profile.namespace_sync_ns, 0);
+            assert_eq!(leased.extent.segment.file_index, 0);
+            assert_eq!(config.partition.wal_file_bytes, 32 * 1024);
+            drop(log);
+            shutdown(&node, 2);
+        }
+    }
+
+    /// The trigger skips an owner that is sealing (`terminal`) or has a
+    /// pending poison, even while its inventory still answers `active`, and
+    /// starts a preparer for a healthy owner: the third call is the positive
+    /// control that the first two skip because of the guard. A failed fence
+    /// must not prepare either: terminal publication may land between its
+    /// reply and the trigger.
+    #[test]
+    fn fence_time_preparation_skips_a_terminal_or_poison_pending_owner() {
+        let temp = tempdir::TempDir::new("fence-prepare-guard").unwrap();
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let context = &node.control_context;
+        context.terminal.store(true, Ordering::Release);
+        node.control.shared.prepare_fenced_epoch(1);
+        assert_eq!(
+            node.control.preparer_count(),
+            0,
+            "a terminal owner started a preparer"
+        );
+        context.terminal.store(false, Ordering::Release);
+        context.poison_pending.store(true, Ordering::Release);
+        node.control.shared.prepare_fenced_epoch(1);
+        assert_eq!(
+            node.control.preparer_count(),
+            0,
+            "a poison-pending owner started a preparer"
+        );
+        context.poison_pending.store(false, Ordering::Release);
+        node.control.shared.prepare_fenced_epoch(1);
+        assert_eq!(node.control.preparer_count(), 1);
+        // A poisoned owner's fence fails, and the trigger after it prepares
+        // nothing for the epoch it never fenced.
+        node.control_context.poison_readers();
+        assert!(fence(&node, 2).is_err());
+        node.control.shared.prepare_fenced_epoch(2);
+        assert_eq!(
+            node.control.preparer_count(),
+            1,
+            "a poisoned owner prepared a first file for an unfenced epoch"
+        );
+    }
+
+    /// The first read on a fresh lane sends `OpenLiveExports`. It must not wait
+    /// for an in-flight adoption scan, and it must not run the owner-wide flush
+    /// barrier: a read would stall for the whole scan and the flush otherwise.
+    #[test]
+    fn live_exports_are_served_while_an_adoption_is_parked() {
+        use crate::distributed::storage::LivePausePoint;
+        for tier in [DurabilityTier::Native, DurabilityTier::Synchronous] {
+            let temp = tempdir::TempDir::new("exports-during-adoption").unwrap();
+            let (config, node) = open_live(temp.path(), tier);
+            let Response::LiveLeased(leased) =
+                extent_exchange(&node, Request::LeaseLiveExtent { epoch: 1 })
+            else {
+                panic!("expected leased extent")
+            };
+            let group = CompleteGroup::new_live(
+                &append_shape(&node),
+                vec![batch(&config, 1, 0)],
+                config.partition.batch_limits,
+                config.partition.group_limits,
+            )
+            .unwrap();
+            let (_, frame) = LiveGroupDescriptor::from_group(&group).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&leased.extent.segment.path)
+                .unwrap()
+                .write_all_at(&frame, 0)
+                .unwrap();
+            let through = leased.extent.start + frame.len() as u64;
+            let token = leased.extent.token;
+            let log = node.log_for_test(1);
+            let (entered, resume) = log.pause_live(LivePausePoint::ValidateUnlocked);
+            let (adopted, adoption) = mpsc::sync_channel(1);
+            let (exported, exports) = mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let adopter = node.clone();
+                scope.spawn(move || {
+                    let response = extent_exchange(
+                        &adopter,
+                        Request::AdoptLiveExtent {
+                            epoch: 1,
+                            token,
+                            through,
+                            close: false,
+                            lease_next: false,
+                        },
+                    );
+                    adopted.send(response).expect("test receiver dropped");
+                });
+                entered.recv_timeout(PROGRESS_CAP).unwrap();
+                let barriers = node.flush_barriers_sent();
+                let exporter = node.clone();
+                scope.spawn(move || {
+                    let response =
+                        extent_exchange(&exporter, Request::OpenLiveExports { authority_epoch: 1 });
+                    exported.send(response).expect("test receiver dropped");
+                });
+                let response = exports.recv_timeout(PROGRESS_CAP);
+                resume.send(()).unwrap();
+                let pending_adoption = adoption.recv_timeout(PROGRESS_CAP);
+                let response = response.expect("the export waited for the parked adoption");
+                let Response::LiveExports(info) = response else {
+                    panic!("expected exports")
+                };
+                assert_eq!(info.wal_file_bytes, config.partition.wal_file_bytes);
+                assert_eq!(info.exported_files, 1);
+                assert_eq!(
+                    node.flush_barriers_sent(),
+                    barriers,
+                    "the export ran the owner-wide flush barrier"
+                );
+                assert!(pending_adoption.is_ok());
+            });
+            drop(log);
+            shutdown(&node, 1);
+        }
+    }
+
+    /// An export in flight counts as stream work: a fence or seal waits for it
+    /// instead of revoking the exports it is installing.
+    #[test]
+    fn a_fence_or_seal_waits_for_an_in_flight_live_export() {
+        for seal in [false, true] {
+            let temp = tempdir::TempDir::new("fence-during-export").unwrap();
+            let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+            let (entered, parked) = mpsc::sync_channel(1);
+            let (resume, released) = mpsc::sync_channel(1);
+            *node.control_context.before_open_live_exports.lock() = Some(Box::new(move || {
+                // Runs on an owner control thread, which must not panic: a
+                // test that failed early dropped its ends, and that means
+                // "do not park".
+                if entered.send(()).is_ok() {
+                    released.recv_timeout(PROGRESS_CAP).ok();
+                }
+            }));
+            let (completed, completions) = mpsc::sync_channel(2);
+            assert!(
+                command(
+                    &node,
+                    1,
+                    Request::OpenLiveExports { authority_epoch: 1 },
+                    4096,
+                    &completed,
+                )
+                .is_ok()
+            );
+            parked.recv_timeout(PROGRESS_CAP).unwrap();
+            let barrier = if seal {
+                Request::Seal { epoch: 1 }
+            } else {
+                Request::Fence { epoch: 2 }
+            };
+            assert!(command(&node, 2, barrier, 1, &completed).is_ok());
+            {
+                let queue = node.control.shared.queue.lock();
+                // Positive queue state: the export holds the owner, and the
+                // barrier waits behind it instead of racing its installation.
+                assert_eq!(
+                    queue.active_exports, 1,
+                    "seal {seal}: the export left the owner before the barrier"
+                );
+                assert!(
+                    queue.work.iter().any(|work| work.id == 2
+                        && matches!(work.request, Request::Fence { .. } | Request::Seal { .. })),
+                    "seal {seal}: the barrier started while an export was in flight"
+                );
+            }
+            // The barrier may not be served while the export holds the owner:
+            // no completion at all may arrive before the export returns. This
+            // is a negative check, so a slow machine only makes it more certain.
+            assert!(
+                matches!(
+                    completions.recv_timeout(Duration::from_millis(500)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "seal {seal}: the barrier completed while an export was in flight"
+            );
+            resume.send(()).unwrap();
+            let Response::LiveExports(_) = receive(&completions, 1).response.unwrap() else {
+                panic!("expected exports")
+            };
+            let response = receive(&completions, 2).response.unwrap();
+            if seal {
+                assert!(
+                    matches!(response, Response::Sealed),
+                    "seal 1: expected the seal reply, not an export"
+                );
+            } else {
+                let Response::Status(StatusReply::Database(status)) = response else {
+                    panic!("expected fence")
+                };
+                assert_eq!(status.active_epoch, Some(2));
+            }
+            shutdown(&node, if seal { 1 } else { 2 });
+        }
+    }
+
+    /// The other direction of the same exclusion: a serving retirement must
+    /// not start while an export is installing bindings, because the export
+    /// could republish a victim the retirement is about to tombstone.
+    #[test]
+    fn a_serving_retirement_waits_for_an_in_flight_live_export() {
+        let temp = tempdir::TempDir::new("retirement-during-export").unwrap();
+        let (_, node) = open_live(temp.path(), DurabilityTier::Native);
+        let (entered, parked) = mpsc::sync_channel(1);
+        let (resume, released) = mpsc::sync_channel(1);
+        *node.control_context.before_open_live_exports.lock() = Some(Box::new(move || {
+            if entered.send(()).is_ok() {
+                released.recv_timeout(PROGRESS_CAP).ok();
+            }
+        }));
+        let (completed, completions) = mpsc::sync_channel(3);
+        assert!(
+            command(
+                &node,
+                1,
+                Request::OpenLiveExports { authority_epoch: 1 },
+                4096,
+                &completed,
+            )
+            .is_ok()
+        );
+        parked.recv_timeout(PROGRESS_CAP).unwrap();
+        // No witness: this test asserts the scheduler's class gate, not a
+        // retirement's durable effect. The handler refuses it by name, and only
+        // after the export it must not overlap has finished.
+        assert!(
+            command(
+                &node,
+                2,
+                Request::RetireWalFiles {
+                    authority_epoch: 1,
+                    epoch: 1,
+                    files: Vec::new(),
+                    witness: None,
+                },
+                1,
+                &completed,
+            )
+            .is_ok()
+        );
+        {
+            let queue = node.control.shared.queue.lock();
+            assert_eq!(
+                queue.active_exports, 1,
+                "the export left before the retirement was queued"
+            );
+            assert!(
+                queue.work.iter().any(|work| work.id == 2),
+                "the retirement started while an export was in flight"
+            );
+            assert_eq!(queue.active_retirements, 0);
+        }
+        // The retirement may not be served while the export holds the owner: no
+        // completion at all may arrive before the export returns. This is a
+        // negative check, so a slow machine only makes it more certain, and it
+        // is the same window the dead-WAL park test uses.
+        assert!(
+            matches!(
+                completions.recv_timeout(Duration::from_millis(500)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the retirement completed while an export was in flight"
+        );
+        resume.send(()).unwrap();
+        let Response::LiveExports(_) = receive(&completions, 1).response.unwrap() else {
+            panic!("expected exports")
+        };
+        assert!(
+            receive(&completions, 2)
+                .response
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires an Exact witness"),
+            "the retirement did not reach its handler after the export"
+        );
+        shutdown(&node, 1);
+    }
+
     #[test]
     fn permanent_owner_rejects_active_record_resolution() {
         let temp = tempdir::TempDir::new("permanent-controls").unwrap();
@@ -1269,8 +1596,21 @@ pub(super) mod live_fencing {
             }
         }
         let end = node.inventory.lock().active(1).unwrap().appended_frontier();
-        fence(node, 2).unwrap();
+        fence_prepared(node, 2);
         end
+    }
+
+    /// Exports the owner holds for a fenced epoch's first file, which the
+    /// fence prepares and exports in the background. `owned_namespace_count`
+    /// includes it until that epoch ends.
+    const FENCED_FIRST_FILE_EXPORT: u64 = 1;
+
+    /// Fence `epoch`, then wait until its first prepared file is published,
+    /// so export counts do not depend on the background preparation's timing.
+    fn fence_prepared(node: &StorageNode, epoch: u64) {
+        fence(node, epoch).unwrap();
+        let log = node.log_for_test(epoch);
+        wait_prepared(&log, 1);
     }
 
     fn history_page(
@@ -1458,9 +1798,10 @@ pub(super) mod live_fencing {
             );
             assert_eq!(target_stats(&node).namespaces_exposed, exposed);
             release_history_page(&node, &second);
-            // A higher-epoch fence write-protects the exports; they remain
-            // readable until their files are retired or the owner shuts down.
-            fence(&node, 3).unwrap();
+            // A higher-epoch fence write-protects the sealed exports; they
+            // remain readable until their files are retired or the owner shuts
+            // down. The fenced epoch adds only its own prepared first file.
+            fence_prepared(&node, 3);
             assert!(target_stats(&node).owned_namespace_count > 0);
             shutdown(&node, 3);
         }
@@ -2002,7 +2343,15 @@ pub(super) mod live_fencing {
             );
             assert_eq!(old.receipt_count(), published);
             assert_eq!(old.appended_frontier(), frame.len() as u64);
-            assert_eq!(node.control.preparer_count(), 0);
+            // The fence retired the old epoch's preparer and started the new
+            // epoch's first-file preparation.
+            let active = node.inventory.lock().active(2).unwrap();
+            {
+                let slots = node.control.shared.preparers.lock();
+                assert_eq!(slots.len(), 1);
+                assert!(Arc::ptr_eq(&slots[0].log, &active));
+            }
+            drop(active);
             assert!(node.control.shared.syncers.lock().is_empty());
             drop(old);
             shutdown(&node, 2);

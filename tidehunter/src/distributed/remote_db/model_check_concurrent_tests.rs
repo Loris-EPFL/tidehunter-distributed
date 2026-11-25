@@ -513,3 +513,133 @@ fn write_model_cold_live_read_returns_acknowledged_unadopted_value() {
     assert_eq!(value.unwrap().as_ref(), 2u64.to_le_bytes().repeat(512));
     shutdown.unwrap();
 }
+
+/// A fresh lane must not wait for an adoption close scan, and its first read
+/// must not run the owner-wide flush barrier. Its lane-start prefetch has
+/// already cached the exports, so the read adds neither an exclusive-slot wait
+/// nor a flush; the scheduler test
+/// `live_exports_are_served_while_an_adoption_is_parked` pins the export's own
+/// class when a read has to send it. The lane is not warmed here.
+#[test]
+fn write_model_first_read_on_a_fresh_lane_does_not_wait_for_the_adoption_close() {
+    use crate::distributed::storage::LivePausePoint;
+    // Waits that follow another thread's progress. The lane and write
+    // deadline under test is `config.timeout` below, not these.
+    const PROGRESS_WAIT: Duration = Duration::from_secs(60);
+    let fixture = Fixture::new_with_root(
+        tempdir::TempDir::new("fresh-lane-cold-read").unwrap(),
+        1,
+        128,
+        KeyShape::new_single(4, 8, KeyType::uniform(8)),
+        1,
+        |config| {
+            config.storage.batch_limits.max_operations = 57;
+            config.timeout = Duration::from_secs(5);
+            leased::configure(config, leased::profile(4));
+            // Publication can cache an acknowledged frame before owner adoption.
+            // This test must read that frame through the live lane instead.
+            config.read_cache_bytes = 0;
+            // One read lane, never warmed: its first request is the read below.
+            config.read_lanes = Some(1);
+        },
+        |_| {},
+    )
+    .synchronous();
+    let original = fixture.open();
+    let log = fixture.nodes[0].log_for_test(original.epoch());
+    let db = ConcurrentRemoteDatabase::new(original).unwrap();
+    // The lane opens its exports once when it starts. Wait for that exchange
+    // to finish so this test does not read the counters while the prefetch is
+    // still running; a failure is named by its counter.
+    let monitor = db.read_profile_monitor();
+    let prefetch_deadline = Instant::now() + PROGRESS_WAIT;
+    let (prefetched, failures) = loop {
+        let (mut prefetched, mut failures) = (0, 0);
+        monitor.visit(&mut |name, value| {
+            if name == "read_profile_live_exports_prefetched" {
+                prefetched += value;
+            } else if name == "read_profile_live_exports_prefetch_failures" {
+                failures += value;
+            }
+        });
+        if prefetched + failures >= 1 {
+            break (prefetched, failures);
+        }
+        assert!(
+            Instant::now() < prefetch_deadline,
+            "the lane did not finish its export prefetch"
+        );
+        thread::yield_now();
+    };
+    assert_eq!(
+        (prefetched, failures),
+        (1, 0),
+        "the lane's start-time export prefetch must succeed"
+    );
+    let first: Vec<_> = (0..57)
+        .map(|key| Edit {
+            key,
+            value: Some(1),
+        })
+        .collect();
+    db.write_batch(fixture.operation(0, 500), mutations(&first, 4096))
+        .unwrap();
+    let (entered, release) = log.pause_live(LivePausePoint::CloseSuffix);
+    let second: Vec<_> = (32..54)
+        .map(|key| Edit {
+            key,
+            value: Some(2),
+        })
+        .collect();
+    let operation = fixture.operation(0, 501);
+    let (written, result) = mpsc::sync_channel(1);
+    let (read, barriers, exports_opened) = thread::scope(|scope| {
+        let db = &db;
+        scope.spawn(|| {
+            written
+                .send(db.write_batch(operation, mutations(&second, 4096)))
+                .unwrap()
+        });
+        let paused = entered.recv_timeout(PROGRESS_WAIT);
+        let acknowledged = result.recv_timeout(PROGRESS_WAIT);
+        let observed = if acknowledged.as_ref().is_ok_and(|result| result.is_ok()) {
+            let served = fixture.nodes[0].live_exports_served();
+            let barriers = fixture.nodes[0].flush_barriers_sent();
+            // The frame is acknowledged but not adopted: the close that
+            // would adopt it is paused before its scan, so the read is cold.
+            let value = db.get(KeySpace(0), &key_bytes(32));
+            let barriers = fixture.nodes[0].flush_barriers_sent() - barriers;
+            let opened = fixture.nodes[0].live_exports_served() - served;
+            Some((value, barriers, opened))
+        } else {
+            None
+        };
+        // Always unblock the adoption worker before assertions or shutdown.
+        release.send(()).unwrap();
+        paused.unwrap();
+        acknowledged.unwrap().unwrap();
+        observed.unwrap()
+    });
+    let shutdown = db.shutdown();
+    // The value first: without the fix the first read waits behind the parked
+    // adoption close and fails by its deadline, and that is the failure to
+    // report; the owner has not counted its export request by then.
+    let value = read.expect("a cold live read must return the acknowledged value");
+    assert_eq!(
+        value
+            .expect("the first read waited for the parked adoption close")
+            .as_ref(),
+        2u64.to_le_bytes().repeat(512)
+    );
+    assert_eq!(
+        barriers, 0,
+        "the first read on a fresh lane ran an owner-wide flush barrier"
+    );
+    // The prefetch may serve it, or the read may send its own exchange; both
+    // are one owner exchange. Never more.
+    assert!(
+        exports_opened <= 1,
+        "the first read opened {exports_opened} export exchanges"
+    );
+    shutdown.unwrap();
+}

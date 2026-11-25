@@ -243,6 +243,18 @@ impl PartitionLog {
         root.map_or_else(Vec::new, |root| root.cleanup_pending.clone())
     }
 
+    /// Whether a durable retirement root still lists the file at `start` for
+    /// cleanup. Reads the root in place: no allocation, unlike
+    /// `pending_file_retirements`, so a live export can ask per file.
+    pub(crate) fn is_pending_file_retirement(&self, start: u64) -> bool {
+        let state = self.state.lock();
+        state.wal_root.as_ref().is_some_and(|root| {
+            root.cleanup_pending
+                .iter()
+                .any(|entry| entry.start == start)
+        })
+    }
+
     /// Pending entries whose unlink this process's recovery repeated, with
     /// what it found. Returned once; later calls return nothing.
     pub(crate) fn take_recovered_cleanup(&self) -> Vec<(PendingRetirement, UnlinkOutcome)> {
