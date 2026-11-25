@@ -21,7 +21,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Barrier;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[path = "model_check_concurrent.rs"]
+#[path = "model_check_concurrent_tests.rs"]
 mod concurrent_model;
 #[path = "drop_cells_crash_tests.rs"]
 mod drop_cells_crash;
