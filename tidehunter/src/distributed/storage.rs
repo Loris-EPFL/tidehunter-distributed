@@ -1899,6 +1899,16 @@ impl PartitionLog {
                 Err(StorageError::Invalid("closed live extent"))
             };
         }
+        // A preleased extent has adopted nothing, so a probe at or below its
+        // start is its real fresh state. A resume reaches this while the extent
+        // it replaces is still the open one. A probe past its start is refused
+        // below: only the open extent's scan may adopt frames.
+        if let Some(next) = &state.next_live_extent
+            && next.extent.token == token
+            && through <= next.extent.start
+        {
+            return Ok(Some(next.adoption.clone()));
+        }
         let open = state
             .open_live_extent
             .as_ref()

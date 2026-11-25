@@ -357,6 +357,17 @@ struct RetainedFrame {
     frame: crate::distributed::group::LiveFrame,
 }
 
+/// One frame a resume resent, as the test observes it: the grant it belongs to,
+/// its absolute start, its length and the completion id the resend used.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct ResumeRewrite {
+    token: [u8; 16],
+    start: u64,
+    len: usize,
+    id: u64,
+}
+
 /// The existing per-owner worker owns this state, with no additional lock.
 #[derive(Default)]
 pub(super) struct LeasedWriter {
@@ -411,6 +422,25 @@ pub(super) struct LeasedWriter {
     /// deadline, so a test can observe the probe's escalation without waiting.
     #[cfg(test)]
     retime_window: Option<std::time::Duration>,
+    /// Resume steps completed by the resume now running, so a test can act at
+    /// a step boundary.
+    #[cfg(test)]
+    resume_steps: u32,
+    /// The lease stamp to lapse once `resume_steps` reaches the given count.
+    #[cfg(test)]
+    lapse_lease_after: Option<(
+        u32,
+        std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
+    )>,
+    /// Extents a resume probed, in probe order.
+    #[cfg(test)]
+    resume_targets: Vec<PendingTarget>,
+    /// Frames a resume resent, in submission order.
+    #[cfg(test)]
+    rewrites: Vec<ResumeRewrite>,
+    /// Every completion id a write command used, in submission order.
+    #[cfg(test)]
+    submitted_ids: Vec<u64>,
     #[cfg(test)]
     next_write_result: Option<i32>,
     #[cfg(test)]
@@ -898,11 +928,20 @@ impl ExtentState {
         let current = &self.lease;
         let adoption = &reply.adoption;
         let submitted_end = self.prefixes.back().map_or(self.adopted.end, |p| p.end);
+        // A probe of the closing extent can meet a close the owner already
+        // applied, whose reply died with the old session. That is the rollover
+        // completing, not a mismatch, but only when the owner adopted the whole
+        // prefix this coordinator wrote: anything less would retire an extent
+        // whose retained frames still owe a resend.
+        let rollover_completed = adoption.closed && !pending.close;
         if adoption.token != current.extent.token
             || adoption.adopted_end < pending.through
             || adoption.adopted_end > submitted_end
             || adoption.adopted_end > current.extent.end
-            || adoption.closed != pending.close
+            || (adoption.closed != pending.close && !rollover_completed)
+            || (rollover_completed
+                && (pending.target != PendingTarget::Closing
+                    || adoption.adopted_end != self.written_end))
             || reply.next.is_some() != pending.lease_next
         {
             return Err(super::TcpError::new(
@@ -1041,6 +1080,18 @@ impl super::Client {
         }
     }
 
+    /// Retire a closing extent the owner closed. The harvest path and the
+    /// resume's declaration both run this one bookkeeping.
+    fn recycle_closing(&mut self) -> Result<(), super::TcpError> {
+        let closing = self
+            .live_leased
+            .closing
+            .take()
+            .ok_or_else(|| super::TcpError::new("closed extent missing"))?;
+        self.live_leased.recycle(closing);
+        Ok(())
+    }
+
     /// Harvest only; the worker drives the shared reactor before this call.
     pub(crate) fn harvest_leased_adoption(&mut self) -> Result<bool, super::TcpError> {
         self.ensure_leased_healthy()?;
@@ -1111,12 +1162,7 @@ impl super::Client {
                 );
             }
             if pending.target == PendingTarget::Closing && pending.close {
-                let closing = self
-                    .live_leased
-                    .closing
-                    .take()
-                    .ok_or_else(|| super::TcpError::new("closed extent missing"))?;
-                self.live_leased.recycle(closing);
+                self.recycle_closing()?;
             } else if pending.target != PendingTarget::Prelease {
                 let extent = match pending.target {
                     PendingTarget::Current => self.live_leased.current.as_mut(),
@@ -1769,6 +1815,8 @@ impl super::Client {
                 );
             }
         }
+        #[cfg(test)]
+        self.live_leased.submitted_ids.push(id);
         #[cfg(test)]
         if std::mem::take(&mut self.live_leased.delay_write) {
             let timeout_ms = self
@@ -5502,6 +5550,44 @@ impl super::Client {
             self.live_leased.retained.len(),
             self.live_leased.retained_bytes,
         )
+    }
+    /// Extents the last resumes probed, in probe order, as `"closing"` or
+    /// `"current"`.
+    pub(crate) fn leased_test_resume_targets(&self) -> Vec<&'static str> {
+        self.live_leased
+            .resume_targets
+            .iter()
+            .map(|target| match target {
+                PendingTarget::Closing => "closing",
+                PendingTarget::Current | PendingTarget::Prelease => "current",
+            })
+            .collect()
+    }
+    /// `(grant token, absolute start, length, completion id)` of every frame a
+    /// resume resent, in submission order.
+    pub(crate) fn leased_test_rewrites(&self) -> Vec<([u8; 16], u64, usize, u64)> {
+        self.live_leased
+            .rewrites
+            .iter()
+            .map(|rewrite| (rewrite.token, rewrite.start, rewrite.len, rewrite.id))
+            .collect()
+    }
+    /// Every completion id a write command used, in submission order.
+    pub(crate) fn leased_test_submitted_ids(&self) -> &[u64] {
+        &self.live_leased.submitted_ids
+    }
+    /// Resume steps the last resume completed before it returned or failed.
+    pub(crate) fn leased_test_resume_steps(&self) -> u32 {
+        self.live_leased.resume_steps
+    }
+    /// Lapse `validity` once `steps` resume steps of one resume have completed,
+    /// so the test decides the step that must observe the lapse.
+    pub(crate) fn leased_test_lapse_lease_after_step(
+        &mut self,
+        steps: u32,
+        validity: std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
+    ) {
+        self.live_leased.lapse_lease_after = Some((steps, validity));
     }
     /// `(offset, len)` of every write this queue accepted, in order.
     pub(crate) fn leased_test_write_submissions(&self) -> Vec<(u64, usize)> {

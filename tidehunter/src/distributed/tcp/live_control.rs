@@ -157,7 +157,32 @@ impl Client {
             close,
             lease_next,
         })?;
-        self.validate_live_adoption(response, epoch, token, through, close, lease_next)
+        self.validate_live_adoption(response, epoch, token, through, close, lease_next, false)
+    }
+
+    /// The write-resume probe of one extent's frontier.
+    ///
+    /// A probe asks for `through` at or below the extent's adopted end, so the
+    /// owner may answer from memory. When the extent being probed is closing,
+    /// the answer can be the summary of a close the owner already applied whose
+    /// reply died with the old session: that is the rollover completing, not a
+    /// reply that disagrees with the request. The caller checks the frontier it
+    /// can retire against its own written end; this exchange only proves the
+    /// reply names the requested grant.
+    pub(crate) fn probe_live_extent(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+        through: u64,
+    ) -> Result<LiveAdopted, TcpError> {
+        let response = self.request(Request::AdoptLiveExtent {
+            epoch,
+            token,
+            through,
+            close: false,
+            lease_next: false,
+        })?;
+        self.validate_live_adoption(response, epoch, token, through, false, false, true)
     }
 
     pub(crate) fn submit_adopt_live_extent(
@@ -187,10 +212,18 @@ impl Client {
         lease_next: bool,
     ) -> Option<Result<LiveAdopted, TcpError>> {
         self.take_control().map(|response| {
-            self.validate_live_adoption(response?, epoch, token, through, close, lease_next)
+            self.validate_live_adoption(response?, epoch, token, through, close, lease_next, false)
         })
     }
 
+    /// `allow_closed` admits a closed summary for a request that did not ask to
+    /// close: only the write-resume probe of a closing extent passes it, and
+    /// that caller then requires the closed frontier to equal its own written
+    /// end before the extent is retired.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the check mirrors the five request fields plus the caller's policy, so a wrapper would copy them"
+    )]
     fn validate_live_adoption(
         &mut self,
         response: Response,
@@ -199,6 +232,7 @@ impl Client {
         through: u64,
         close: bool,
         lease_next: bool,
+        allow_closed: bool,
     ) -> Result<LiveAdopted, TcpError> {
         match response {
             Response::LiveAdopted(reply)
@@ -206,7 +240,7 @@ impl Client {
                     && reply.adoption.adopted_end >= through
                     && reply.adoption.adopted_end.is_multiple_of(4096)
                     && (!close || reply.adoption.adopted_end == through)
-                    && reply.adoption.closed == close
+                    && (reply.adoption.closed == close || (allow_closed && reply.adoption.closed))
                     && reply.next.is_some() == lease_next
                     && (!lease_next || close)
                     && reply

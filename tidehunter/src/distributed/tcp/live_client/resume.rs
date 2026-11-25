@@ -155,6 +155,10 @@ impl Client {
         }
         self.live_leased.resuming = true;
         self.live_leased.resume_failed = false;
+        #[cfg(test)]
+        {
+            self.live_leased.resume_steps = 0;
+        }
         let result = self.resume_episode(kind, deadline);
         self.live_leased.resuming = false;
         match result {
@@ -236,14 +240,20 @@ impl Client {
         // Steps 1-2: a fresh control session on the same authenticated route,
         // then the decision checks.
         self.rebuild_session(deadline)?;
+        #[cfg(test)]
+        self.after_resume_step();
         // Step 3: only the state the old session owned is reset. The flight
         // deque, the receipts and the leased replies belong to the worker.
         self.live_leased.pending = None;
         self.live_leased.pending_started = None;
+        #[cfg(test)]
+        self.after_resume_step();
         // Step 4: the owner is the oracle for each extent's real frontier. The
         // probe declares `through = adopted.end`, which is always at or below
         // the owner's frontier, so the owner answers from memory without a scan.
         self.probe_leased_extents(deadline)?;
+        #[cfg(test)]
+        self.after_resume_step();
         // Step 5: rebuild the data path, or keep a live queue as it is.
         match kind {
             BreakKind::Data => {
@@ -257,20 +267,42 @@ impl Client {
             }
             BreakKind::Session => self.retime_leased_work(),
         }
+        #[cfg(test)]
+        self.after_resume_step();
         // Step 6: declare what the owner can now prove, and settle the flights
         // it covers. Nothing is popped and nothing is reordered.
         self.declare_resumed_adoption(kind == BreakKind::Data, deadline)?;
+        #[cfg(test)]
+        self.after_resume_step();
         // Step 7: a detached queue left the settled flights without a device to
         // report on. Reopen one so their release, and the covering flush the
         // synchronous tier needs, run on a live namespace.
         if kind == BreakKind::Data {
             self.reopen_detached_queue(deadline)?;
         }
+        #[cfg(test)]
+        self.after_resume_step();
         // The lease is the authority on the right to write, and the budget is
         // the bound the caller was promised: neither may have lapsed while the
         // last exchange ran.
         self.remaining_resume(deadline)?;
+        #[cfg(test)]
+        self.after_resume_step();
         Ok(())
+    }
+
+    /// Count one completed resume step and let a test lapse the coordinator
+    /// lease at a chosen boundary. The lapse lands between two steps, so the
+    /// step that runs next is the one that must observe it.
+    #[cfg(test)]
+    fn after_resume_step(&mut self) {
+        self.live_leased.resume_steps += 1;
+        let Some((after, validity)) = self.live_leased.lapse_lease_after.as_ref() else {
+            return;
+        };
+        if *after == self.live_leased.resume_steps {
+            validity.lapse_for_test();
+        }
     }
 
     /// The budget left for the next resume step, after rechecking the right to
@@ -409,9 +441,17 @@ impl Client {
                 target,
             };
             let reply = self.within_resume_budget(deadline, |client| {
-                client.adopt_live_extent(epoch, token, through, false, false)
+                client.probe_live_extent(epoch, token, through)
             })?;
             self.check_leased_adoption(pending, &reply)?;
+            #[cfg(test)]
+            self.live_leased.resume_targets.push(target);
+            if reply.adoption.closed {
+                // The owner applied the close whose reply died with the old
+                // session: the rollover is complete, so retire the closing
+                // extent with the harvest path's own bookkeeping.
+                self.recycle_closing()?;
+            }
             if let Some(extent) = self.extent_mut(target) {
                 // The owner's frontier is the only truth: a declaration whose
                 // reply died with the old session must not be claimed done.
@@ -572,6 +612,13 @@ impl Client {
             &|buffer| frame.frame.encode_into(buffer).map_err(TcpError::component),
             None,
         )?;
+        #[cfg(test)]
+        self.live_leased.rewrites.push(super::ResumeRewrite {
+            token: frame.token,
+            start: frame.start,
+            len: frame.frame.len(),
+            id,
+        });
         self.harvest_rewrite(id, frame_deadline)
     }
 
@@ -699,24 +746,35 @@ impl Client {
                 extent.lease.extent.start,
                 extent.declared_through,
             );
+            // A closing extent is closed at its whole written prefix: the close
+            // is what moves the owner's open extent to the current one, so the
+            // current extent's own declaration is accepted. It is idempotent:
+            // when the owner already applied the close, the reply is the closed
+            // summary and the extent is retired here.
+            let close = target == PendingTarget::Closing;
+            let declare = if close { extent.cursor } else { through };
             // `declared_through` is the owner's validated frontier (the probe
             // set it), so a skip below it proves the same prefix the request
-            // would have.
-            if through > declared {
+            // would have. A close never skips: nothing else retires the extent.
+            if declare > declared || close {
                 let pending = PendingAdoption {
-                    through,
-                    close: false,
+                    through: declare,
+                    close,
                     lease_next: false,
                     target,
                 };
                 let reply = self.within_resume_budget(deadline, |client| {
-                    client.adopt_live_extent(epoch, token, through, false, false)
+                    client.adopt_live_extent(epoch, token, declare, close, false)
                 })?;
                 self.check_leased_adoption(pending, &reply)?;
-                let Some(extent) = self.extent_mut(target) else {
-                    continue;
-                };
-                extent.declared_through = extent.declared_through.max(through);
+                if close {
+                    self.recycle_closing()?;
+                } else {
+                    let Some(extent) = self.extent_mut(target) else {
+                        continue;
+                    };
+                    extent.declared_through = extent.declared_through.max(declare);
+                }
             }
             // Adoption reads the file on the owner, independently of this
             // coordinator's CQEs. Marking is not release: the deque still

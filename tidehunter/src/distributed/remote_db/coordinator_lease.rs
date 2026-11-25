@@ -48,6 +48,11 @@ pub(crate) struct LeaseValidity {
     /// `base`-relative nanoseconds at which the holder's right ends.
     valid_until_ns: AtomicU64,
     state: AtomicU8,
+    /// Set by [`Self::lapse_for_test`]: a later renewal cannot repair the
+    /// lapse, so a test that injects one never races the renewer thread for
+    /// the failure it asserts.
+    #[cfg(test)]
+    terminal: AtomicBool,
 }
 
 impl LeaseValidity {
@@ -56,6 +61,8 @@ impl LeaseValidity {
             base,
             valid_until_ns: AtomicU64::new(0),
             state: AtomicU8::new(VALID),
+            #[cfg(test)]
+            terminal: AtomicBool::new(false),
         }
     }
 
@@ -66,7 +73,21 @@ impl LeaseValidity {
             base: Instant::now(),
             valid_until_ns: AtomicU64::new(0),
             state: AtomicU8::new(VALID),
+            terminal: AtomicBool::new(false),
         }
+    }
+
+    /// Lapse this owner's lease from a test and keep it lapsed.
+    ///
+    /// A resume step runs on the worker thread while the renewer of the same
+    /// owner runs on its own, so a lapse that a renewal could repair would make
+    /// the assertion time-dependent. `terminal` is `Release`-stored first and
+    /// `Acquire`-loaded by every lease check, so the lapse is visible to the
+    /// worker at its next step boundary.
+    #[cfg(test)]
+    pub(crate) fn lapse_for_test(&self) {
+        self.terminal.store(true, Ordering::Release);
+        self.state.store(FAILED, Ordering::Release);
     }
 
     /// The submission-time gate of a leased frame. A lapsed lease refuses the
@@ -85,6 +106,10 @@ impl LeaseValidity {
     /// stamped deadline, and one of the terminal state, in that order: a grant
     /// that lands between the two loads only makes the check more permissive.
     fn lapsed(&self) -> bool {
+        #[cfg(test)]
+        if self.terminal.load(Ordering::Acquire) {
+            return true;
+        }
         if self.state.load(Ordering::Acquire) == FAILED {
             return true;
         }
