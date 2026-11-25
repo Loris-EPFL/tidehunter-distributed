@@ -480,9 +480,10 @@ in `results.json:knobs` and `results.json:environment`:
 the frozen Sui executor, detected under `checkpoint_executor/` or in the built
 node's strings; refused otherwise rather than claimed), `--checkpoints N`
 (a short cell replays exactly N checkpoints 0..N-1: its inclusive bound is
-N-1, so Sui exits 0 at the bound; the runner accepts only that watermark, keeps
-the last live scrape as final metrics and runs the state audit by reopening the
-stopped stores. A full-range cell uses the unreachable `source_tip + 1` bound so
+N-1, so Sui exits 0 at the bound; the runner accepts only that watermark from
+the last successful scrape's `last_executed_checkpoint` gauge (this fork logs
+only seq 0), keeps that scrape as final metrics and runs the state audit by
+reopening the stopped stores. A full-range cell uses the unreachable `source_tip + 1` bound so
 the node stays live for the final scrape and the live audit),
 `--value-cache-size` (`TH_VALUE_CACHE_SIZE`),
 `--default-value-cache-size` (`TH_DEFAULT_VALUE_CACHE_SIZE`, default 1000),

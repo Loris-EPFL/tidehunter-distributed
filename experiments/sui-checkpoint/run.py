@@ -207,7 +207,7 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                                if p.get('exited') or p.get('core_dumping')), None)
                 if failed is not None:
                     if short_run and failed.get('exited') and failed.get('exit_code') == 0:
-                        require_short_exit(log_path, tip, mode=mode)
+                        require_short_watermark(metrics, tip, mode=mode)
                         progress.append(dict(seconds=time.monotonic()-start,
                                              completed_checkpoint=tip, exited_at_bound=True))
                         break
@@ -647,12 +647,19 @@ def producer_command(binary, config_path):
     return [binary, '--config-path', config_path]
 
 
-def require_short_exit(log_path, tip, *, mode='replay'):
-    """A short run may exit 0 only after executing the requested last checkpoint."""
-    watermark = checkpoint.log_executed_watermark(log_path)
+def require_short_watermark(metrics, tip, *, mode='replay'):
+    """A short run may exit 0 only after the last scrape saw the requested tip.
+
+    This fork does not log every executed checkpoint, so the last successful
+    scrape's `last_executed_checkpoint` gauge is the watermark of record.
+    """
+    try:
+        watermark = checkpoint.completed_checkpoint(metrics)
+    except ValueError:
+        watermark = None
     if watermark != tip:
-        raise RuntimeError(f'{mode}: short replay exited 0 after checkpoint '
-                           f'{watermark}, expected {tip}')
+        raise RuntimeError(f'{mode}: short replay exited 0 after the last scrape saw '
+                           f'checkpoint {watermark}, expected {tip}')
     return watermark
 
 

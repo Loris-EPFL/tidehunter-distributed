@@ -382,18 +382,31 @@ class CheckpointCompletionHistogram(unittest.TestCase):
             analyze.checkpoint_completion_observation(values, required=True)
 
 
+DATABASES = ['checkpoint', 'epoch', 'perpetual']
+
+
 class CoordinatorPerDatabase(unittest.TestCase):
     def test_three_databases_do_not_pool_or_collide(self):
         values = {}
-        for database in ('epoch', 'perpetual', 'checkpoint'):
+        for database in DATABASES:
             for kind, value in (('count', 2), ('sum', 20)):
                 values[f'db_op_{kind}{{db="{database}",ks="live/store",op="get"}}'] = value
                 values[f'lookup_mcs_{kind}{{db="{database}",ks="live/store",type="lookup"}}'] = value
+                values[f'large_table_contention_{kind}{{db="{database}",ks="live/store"}}'] = value
+                values[f'index_blob_cache_contention_{kind}{{db="{database}"}}'] = value
+                values[f'flush_count{{db="{database}",ks="live/store"}}'] = value
         stats = analyze.coordinator_stats(values)
         self.assertTrue(stats['available'])
         self.assertEqual(sorted(stats['operations']), ['checkpoint', 'epoch', 'perpetual'])
         for database in stats['operations'].values():
             self.assertEqual(database['live/store']['get']['mean_us'], 10)
+        self.assertEqual(sorted(stats['large_table_contention']), DATABASES)
+        self.assertEqual(sorted(stats['index_blob_cache_contention']), DATABASES)
+        self.assertEqual(sorted(stats['writes']), DATABASES)
+        for database in stats['writes'].values():
+            self.assertIn('flush_count', database['live/store'])
+        for database in stats['large_table_contention'].values():
+            self.assertEqual(database['live/store']['mean_us'], 10)
         self.assertEqual(stats['keyspaces'], ['live/store'])
         self.assertEqual(stats['databases'], ['checkpoint', 'epoch', 'perpetual'])
         fraction = analyze.owner_fetch_fraction(

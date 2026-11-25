@@ -681,21 +681,13 @@ class RunnerKnobs(unittest.TestCase):
             run.configure_range(config, mode=mode, tip=short['tip'],
                                 short_run=short['short_run'])
             self.assertEqual(int(config['run-with-range']), 7)
-        with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / 'node.log'
-            log.write_text('INFO Finished syncing and executing checkpoint 6\n'
-                           'INFO Finished syncing and executing checkpoint 7\n')
-            self.assertEqual(run.checkpoint.log_executed_watermark(log), 7)
-            log.write_text('INFO checkpoint 7 without the watermark marker\n')
-            self.assertIsNone(run.checkpoint.log_executed_watermark(log))
-            log.write_text('INFO Finished syncing and executing checkpoint 7\n')
-            self.assertEqual(run.require_short_exit(log, 7), 7)
-            for tip in (6, 8):
-                with self.subTest(tip=tip), self.assertRaisesRegex(RuntimeError, 'expected'):
-                    run.require_short_exit(log, tip)
-            log.write_text('nothing executed\n')
-            with self.assertRaisesRegex(RuntimeError, 'None'):
-                run.require_short_exit(log, 7)
+        scrape = 'last_executed_checkpoint 7\n'
+        self.assertEqual(run.require_short_watermark(scrape, 7), 7)
+        for tip in (6, 8):
+            with self.subTest(tip=tip), self.assertRaisesRegex(RuntimeError, 'expected'):
+                run.require_short_watermark(scrape, tip)
+        with self.assertRaisesRegex(RuntimeError, 'None'):
+            run.require_short_watermark('no gauge\n', 7)
 
     def test_checkpoint_limit_is_an_inclusive_count(self):
         for requested, expected in ((None, 1775), (1, 0), (8, 7), (100, 99),
@@ -935,7 +927,7 @@ class AggregateMetricCut(unittest.TestCase):
         self.assertEqual(baseline['live']['observed_partitions'], 2)
         self.assertEqual(baseline['coordinator']['databases'], ['store'])
         self.assertEqual(baseline['coordinator']['keyspaces'], ['store'])
-        contention = baseline['coordinator']['large_table_contention']['store']
+        contention = baseline['coordinator']['large_table_contention']['']['store']
         self.assertEqual(contention['count'], 2)
         self.assertEqual(contention['mean_us'], 10)
         self.assertEqual(baseline['coordinator']['index_blob_cache']['hits'], 5)

@@ -257,10 +257,19 @@ def coordinator_stats(values):
         if kind in database.setdefault(ks, {}):
             raise ValueError('duplicate lookup histogram')
         database[ks][kind] = row
-    contention = _keyed(_microsecond_histograms(values, 'large_table_contention'), 'ks')
-    cache_contention = _microsecond_histograms(values, 'index_blob_cache_contention')
-    if len(cache_contention) > 1 or (cache_contention and cache_contention[0]['labels']):
-        raise ValueError('ambiguous index blob cache contention population')
+    contention = {}
+    for row in _microsecond_histograms(values, 'large_table_contention'):
+        database = contention.setdefault(row['labels'].get('db') or '', {})
+        ks = row['labels'].get('ks')
+        if ks is None or ks in database:
+            raise ValueError('ambiguous or duplicate coordinator histogram ks identity')
+        database[ks] = row
+    cache_contention = {}
+    for row in _microsecond_histograms(values, 'index_blob_cache_contention'):
+        database = row['labels'].get('db') or ''
+        if set(row['labels']) - {'db'} or database in cache_contention:
+            raise ValueError('ambiguous index blob cache contention population')
+        cache_contention[database] = row
     cache = {name[len('index_blob_cache_'):]: value for name, value in values.items()
              if re.fullmatch(r'index_blob_cache_[a-z0-9_]+', name)}
     writes = {}
@@ -273,9 +282,10 @@ def coordinator_stats(values):
             ks = labels.get('ks')
             if ks is None or set(labels) - {'ks', 'db'}:
                 raise ValueError(f'{name} lacks ks identity')
-            if name in writes.setdefault(ks, {}):
+            database = writes.setdefault(labels.get('db') or '', {})
+            if name in database.setdefault(ks, {}):
                 raise ValueError(f'duplicate {name} counter')
-            writes[ks][name] = value
+            database[ks][name] = value
     databases = set()
     for metric in values:
         if metric.startswith(('db_op_', 'lookup_mcs_')):
@@ -285,11 +295,12 @@ def coordinator_stats(values):
     keyspaces = sorted(
         {ks for database in operations.values() for ks in database}
         | {ks for database in lookups.values() for ks in database}
-        | set(contention) | set(writes))
+        | {ks for database in contention.values() for ks in database}
+        | {ks for database in writes.values() for ks in database})
     available = bool(operations or lookups or contention or cache)
     return dict(available=available, operations=operations, lookups=lookups,
         large_table_contention=contention, index_blob_cache=cache,
-        index_blob_cache_contention=cache_contention[0] if cache_contention else None,
+        index_blob_cache_contention=cache_contention,
         writes=writes, keyspaces=keyspaces, databases=sorted(databases),
         scope='coordinator-local cumulative histograms and counters; lock wait samples only record contended waits; '
               'bucket bounds are approximations, not raw quantiles')
@@ -326,7 +337,12 @@ def coordinator_covers(stats, namespace):
     if not stats['available']:
         return False
     if stats['databases']:
-        return any(namespace == db or namespace.endswith('/' + db) for db in stats['databases'])
+        # Sui registers `epoch`, `perpetual` and `checkpoint`, while audited
+        # namespaces are `live/store/epoch_0`, `live/store/perpetual` and
+        # `live/checkpoints`; match the short registry label on the tail.
+        tail = namespace.rsplit('/', 1)[-1]
+        return any(namespace == db or namespace.endswith('/' + db)
+                   or tail.startswith(db) for db in stats['databases'])
     return bool(stats['keyspaces'])
 
 
