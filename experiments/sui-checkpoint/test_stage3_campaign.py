@@ -256,7 +256,7 @@ class Driver(unittest.TestCase):
         return stage3_campaign.run_campaign(
             cells or self.cells, local=self.local(), root=self.root,
             ledger=ledger or self.ledger(), remote=remote, owners=owners,
-            bucket=bucket, stop_on_failure=stop)
+            bucket=bucket, stop_on_failure=stop, allow_local_ledger=bucket is None)
 
     # ---- local arm -----------------------------------------------------
     def test_failed_cell_is_retried_and_passed_cells_are_skipped(self):
@@ -304,7 +304,7 @@ class Driver(unittest.TestCase):
         saved = self.ledger().load()
         _, planned = stage3_campaign.run_campaign(
             self.cells, local=self.local(), root=self.root, ledger=saved,
-            from_=self.cells[2]['id'])
+            from_=self.cells[2]['id'], allow_local_ledger=True)
         self.assertEqual(planned, [])
 
     def test_previous_database_and_output_are_archived_not_reused(self):
@@ -471,12 +471,12 @@ class Driver(unittest.TestCase):
         results, _ = self.run_campaign(cells=self.cells[:1], bucket=self.bucket(store))
         self.assertEqual(results[0]['status'], 'passed')
         case = self.cells[0]['id']
-        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/evidence/{case}/summary.json',
-                      store.objects)
-        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/evidence/{case}/run.json',
-                      store.objects)
-        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/raw/{case}/samples.csv',
-                      store.objects)
+        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/evidence/{case}/'
+                      'attempt-1/summary.json', store.objects)
+        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/evidence/{case}/'
+                      'attempt-1/run.json', store.objects)
+        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/raw/{case}/'
+                      'attempt-1/samples.csv', store.objects)
         self.assertIn('campaign-hybrid-sui-2026-11-25/campaign-ledger.json', store.objects)
         saved = ledger_module.Ledger.from_bytes(
             store.objects['campaign-hybrid-sui-2026-11-25/campaign-ledger.json'][0])
@@ -485,7 +485,7 @@ class Driver(unittest.TestCase):
     def test_an_upload_that_does_not_verify_never_passes(self):
         store = FakeObjectStore()
         store.corrupt.add('campaign-hybrid-sui-2026-11-25/stage3/evidence/'
-                          f'{self.cells[0]["id"]}/summary.json')
+                          f'{self.cells[0]["id"]}/attempt-1/summary.json')
         results, _ = self.run_campaign(cells=self.cells[:1], bucket=self.bucket(store))
         self.assertEqual(results[0]['status'], 'failed')
         saved = self.ledger().load()
@@ -533,7 +533,8 @@ class Phases(Driver):
             binary_ids={'kv': 'b'})
         measurements = stage3_campaign.run_probe(
             path=spec, identity=identity, runner=runner, owners=owners,
-            root=self.root, ledger=self.ledger(), bucket=None, timeout=60)
+            root=self.root, ledger=self.ledger(), bucket=None, timeout=60,
+            allow_local_ledger=True)
         self.assertEqual(measurements['measurement_calls'], 5)
         self.assertAlmostEqual(measurements['measurement_window_seconds'], 0.004)
         self.assertAlmostEqual(measurements['calls_per_second'], 1250.0)
@@ -563,7 +564,7 @@ class Phases(Driver):
             identity_for=lambda path, knobs: stage3_campaign.entry_identity(
                 path, knobs=knobs, engine_rev='e', sui_rev='s',
                 binary_ids={'kv': 'b'}),
-            timeout=60)
+            timeout=60, allow_local_ledger=True)
         self.assertEqual(counts, {'read': 50_000, 'mixed': 50_000, 'write': 50_000,
                                   'get_many': 50_000, 'put_batch': 50_000})
         frozen = json.loads((self.root / 'stage3' / 'calibration.json').read_text())

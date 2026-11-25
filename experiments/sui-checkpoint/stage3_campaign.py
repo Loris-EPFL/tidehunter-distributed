@@ -49,7 +49,6 @@ synchronous cells first, then arm B, each tier in one owner start. `--only` and
 import argparse
 import csv
 import io
-import os
 from pathlib import Path
 import shlex
 import shutil
@@ -66,257 +65,16 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
+import campaign_upload
 import gcp_manual_storage
-import gcs_ledger
 import manual_sui
+import proc_sampler
 import stage3_specs
 
 STAGE = 'stage3'
 OWNER_READY_SECONDS = 120
 OWNER_STOP_SECONDS = 30
-COMPACT_FILES = ('summary.json', 'manifest.json', 'metrics.prom', 'live.prom', 'run.json')
 TIER_ORDER = {'native': 0, 'synchronous': 1}
-
-
-RESOURCE_COLUMNS = ('case', 'host', 'role', 'pid', 'unix_ns', 'exited', 'cpu_seconds',
-                    'rss_bytes', 'hwm_bytes', 'swap_bytes', 'rchar', 'wchar', 'syscr',
-                    'syscw', 'read_bytes', 'write_bytes', 'swap_in', 'swap_out',
-                    'device_read_bytes', 'device_write_bytes')
-CLOCK_TICKS = os.sysconf('SC_CLK_TCK')
-SECTOR_BYTES = 512
-
-
-def cpu_seconds(stat):
-    """`utime + stime` of one /proc/<pid>/stat line, in seconds."""
-    try:
-        fields = stat.rsplit(')', 1)[1].split()
-        return (int(fields[11]) + int(fields[12])) / CLOCK_TICKS
-    except (IndexError, ValueError):
-        return None
-
-
-def proc_blocks(text):
-    """`@@name`-delimited blocks, the format manual_sui's sampler emits."""
-    blocks, current = {}, None
-    for line in text.splitlines():
-        if line.startswith('@@'):
-            current = line[2:].strip()
-            blocks[current] = []
-        elif current is not None:
-            blocks[current].append(line)
-    return blocks
-
-
-def sample_script(pids):
-    script = ['echo @@vmstat', 'cat /proc/vmstat',
-              'echo @@blk', 'for d in /sys/block/*; do echo "$(basename $d) $(cat $d/stat)"; done']
-    for pid in pids:
-        script.extend([f'echo @@{pid}', f'cat /proc/{pid}/stat 2>/dev/null',
-                       f'cat /proc/{pid}/status 2>/dev/null',
-                       f'cat /proc/{pid}/io 2>/dev/null'])
-    # A process that exited mid-cell is a normal sample, not a sampling failure.
-    script.append('true')
-    return '; '.join(script)
-
-
-def block_rows(blocks, roles, host, unix_ns):
-    """One sample: a host row plus one row per watched process."""
-    rows = []
-    vmstat = dict(line.split() for line in blocks.get('vmstat', []) if len(line.split()) == 2)
-    read_bytes = write_bytes = 0
-    for line in blocks.get('blk', []):
-        # `<device> <18 stat fields>`: sectors read is field 3, written is 7.
-        fields = line.split()
-        if len(fields) < 8:
-            continue
-        read_bytes += int(fields[3]) * SECTOR_BYTES
-        write_bytes += int(fields[7]) * SECTOR_BYTES
-    rows.append(dict(case=None, host=host, role='host', pid='', unix_ns=unix_ns,
-                     exited=False, cpu_seconds=None, rss_bytes=None, hwm_bytes=None,
-                     swap_bytes=None, rchar=None, wchar=None, syscr=None, syscw=None,
-                     read_bytes=None, write_bytes=None,
-                     swap_in=int(vmstat.get('pswpin', 0)),
-                     swap_out=int(vmstat.get('pswpout', 0)),
-                     device_read_bytes=read_bytes, device_write_bytes=write_bytes))
-    for pid, role in roles.items():
-        raw = blocks.get(str(pid), [])
-        stat = next((line for line in raw if ') ' in line), '')
-        status = [line for line in raw if line.startswith(('VmRSS:', 'VmHWM:', 'VmSwap:'))]
-        counters = [line for line in raw if line.split(':')[0] in manual_sui.IO_COUNTERS]
-        entry = manual_sui.parse_proc((stat + '\n').encode(),
-                                      ('\n'.join(status) + '\n').encode(),
-                                      ('\n'.join(counters) + '\n').encode())
-        row = dict(case=None, host=host, role=role, pid=pid, unix_ns=unix_ns,
-                   exited=entry is None, cpu_seconds=cpu_seconds(stat),
-                   swap_in=None, swap_out=None, device_read_bytes=None,
-                   device_write_bytes=None)
-        if entry is None:
-            row.update(rss_bytes=None, hwm_bytes=None, swap_bytes=None, rchar=None,
-                       wchar=None, syscr=None, syscw=None, read_bytes=None, write_bytes=None)
-        else:
-            row.update(rss_bytes=entry['VmRSS'], hwm_bytes=entry['VmHWM'],
-                       swap_bytes=entry['VmSwap'], rchar=entry['io']['rchar'],
-                       wchar=entry['io']['wchar'], syscr=entry['io']['syscr'],
-                       syscw=entry['io']['syscw'], read_bytes=entry['io']['read_bytes'],
-                       write_bytes=entry['io']['write_bytes'])
-        rows.append(row)
-    return rows
-
-
-class Sampler:
-    """Per-host `/proc` samples during one cell, in manual_sui's sample format."""
-
-    def __init__(self, remote=None, *, interval=None):
-        self.remote = remote
-        self.interval = manual_sui.SAMPLE_SECONDS if interval is None else interval
-        self.local = {}
-        self.hosts = {}
-        self.samples = []
-        self.error = None
-        self._stop = threading.Event()
-        self._thread = None
-
-    def watch_local(self, pid, role):
-        self.local[int(pid)] = role
-
-    def watch_host(self, host, pid, role):
-        self.hosts.setdefault(host, {})[int(pid)] = role
-
-    def _sample(self):
-        stamp = time.time_ns()
-        if self.local:
-            blocks = proc_blocks(_read_local(list(self.local)))
-            self.samples.extend(block_rows(blocks, self.local, socket.gethostname(), stamp))
-        for host, roles in self.hosts.items():
-            if self.remote is None:
-                self.error = f'{host}: no transport for host sampling'
-                continue
-            code, out, err = self.remote.shell(
-                host, sample_script(list(roles)), check=False)
-            if code != 0 and not out.strip():
-                self.error = f'{host}: sampling failed: {err.decode(errors="replace")[-500:]}'
-                continue
-            self.samples.extend(block_rows(proc_blocks(out.decode()), roles, host, stamp))
-
-    def start(self):
-        self._sample()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        return self
-
-    def _loop(self):
-        while not self._stop.wait(self.interval):
-            try:
-                self._sample()
-            except BaseException as error:  # a dead transport is not a healthy sample
-                self.error = str(error)
-
-    def stop(self):
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10)
-            self._thread = None
-        try:
-            self._sample()
-        except BaseException as error:
-            self.error = str(error)
-        return self
-
-    # ---- evidence ------------------------------------------------------
-    def write(self, output, *, case, mode, label):
-        """`resources.csv` per sample and a compact `resources.json` per cell."""
-        output = Path(output)
-        output.mkdir(parents=True, exist_ok=True)
-        path = output / 'resources.csv'
-        with path.open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=RESOURCE_COLUMNS)
-            writer.writeheader()
-            for row in self.samples:
-                writer.writerow(dict(row, case=case))
-        hosts = {}
-        for row in self.samples:
-            entry = hosts.setdefault(row['host'], dict(
-                samples=0, device_read_bytes=None, device_write_bytes=None,
-                swap_in=None, swap_out=None, processes={}))
-            if row['role'] == 'host':
-                entry['samples'] += 1
-                entry['device_read_bytes'] = row['device_read_bytes']
-                entry['device_write_bytes'] = row['device_write_bytes']
-                entry['swap_in'] = row['swap_in']
-                entry['swap_out'] = row['swap_out']
-                if 'first_device_read_bytes' not in entry:
-                    entry['first_device_read_bytes'] = row['device_read_bytes']
-                    entry['first_device_write_bytes'] = row['device_write_bytes']
-                    entry['first_swap_in'] = row['swap_in']
-                    entry['first_swap_out'] = row['swap_out']
-            else:
-                process = entry['processes'].setdefault(row['role'], dict(
-                    pid=row['pid'], cpu_seconds=None, rss_bytes=None, hwm_bytes=None,
-                    swap_bytes=None, exited=False))
-                process.update(pid=row['pid'], exited=row['exited'])
-                for name in ('cpu_seconds', 'rss_bytes', 'hwm_bytes', 'swap_bytes'):
-                    if row[name] is not None:
-                        process[name] = row[name]
-        for entry in hosts.values():
-            entry['device_read_bytes'] = (entry.pop('device_read_bytes', 0) or 0) - (
-                entry.pop('first_device_read_bytes', 0) or 0)
-            entry['device_write_bytes'] = (entry['device_write_bytes'] or 0) - (
-                entry.pop('first_device_write_bytes', 0) or 0)
-            entry['swap_in'] = (entry['swap_in'] or 0) - (entry.pop('first_swap_in', 0) or 0)
-            entry['swap_out'] = (entry['swap_out'] or 0) - (entry.pop('first_swap_out', 0) or 0)
-        totals = sample_totals(output / 'samples.csv')
-        device_write = sum(entry['device_write_bytes'] for entry in hosts.values())
-        value = dict(case=case, mode=mode, label=label, interval_seconds=self.interval,
-                     hosts=hosts, error=self.error, payload_bytes=totals['payload_bytes'],
-                     device_write_bytes=device_write,
-                     device_write_per_payload=(device_write / totals['payload_bytes']
-                                               if totals['payload_bytes'] else None),
-                     device_bytes_source=('summed /sys/block/*/stat deltas over the '
-                                          'hosts that ran or owned the cell'),
-                     path=str(path))
-        (output / 'resources.json').write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
-        return value
-
-
-def _read_local(pids):
-    """The same `@@` blocks, read from this host without a shell."""
-    lines = ['@@vmstat'] + Path('/proc/vmstat').read_text().splitlines()
-    lines += ['@@blk']
-    for device in sorted(Path('/sys/block').glob('*')):
-        try:
-            lines.append(f'{device.name} {(device / "stat").read_text().strip()}')
-        except OSError:
-            continue
-    for pid in pids:
-        lines.append(f'@@{pid}')
-        for name in ('stat', 'status', 'io'):
-            try:
-                lines.extend(Path(f'/proc/{pid}/{name}').read_text().splitlines())
-            except OSError:
-                continue
-    return '\n'.join(lines)
-
-
-def sample_totals(path):
-    """Measurement-phase calls, window and payload bytes of one samples.csv."""
-    calls, payload, first, last = 0, 0, None, None
-    path = Path(path)
-    if path.is_file():
-        with path.open(newline='') as stream:
-            for row in csv.DictReader(stream):
-                if row.get('phase') != 'measurement':
-                    continue
-                calls += 1
-                try:
-                    payload += int(row.get('bytes') or 0)
-                    completed = int(row['completed_ns'])
-                except (KeyError, ValueError):
-                    continue
-                first = completed if first is None else min(first, completed)
-                last = completed if last is None else max(last, completed)
-    window = ((last - first) / 1e9) if first is not None and last is not None else 0.0
-    return dict(calls=calls, window_seconds=window, payload_bytes=payload,
-                calls_per_second=(calls / window) if window > 0 else None)
 
 
 class CellFailure(RuntimeError):
@@ -384,18 +142,6 @@ def archive_previous(path, stale_root, case, attempt):
     return str(target)
 
 
-def upload_group(relative):
-    """Raw per-call samples expire with the bucket rule; summaries do not."""
-    if relative.parts[0] == 'evidence' or relative.name in COMPACT_FILES:
-        return 'evidence'
-    return 'raw'
-
-
-def upload_key(prefix, case_id, path, output):
-    relative = Path(path).relative_to(output)
-    return f'{prefix}/stage3/{upload_group(relative)}/{case_id}/{relative.as_posix()}'
-
-
 def write_record(output, record):
     output.mkdir(parents=True, exist_ok=True)
     path = Path(output) / 'run.json'
@@ -417,7 +163,7 @@ class LocalRunner:
         database = self.data_root / 'stage3' / 'db' / cell['id']
         archived = archive_previous(database, self.stale_root, cell['id'] + '-db', attempt)
         command = [str(self.binary), '--config', cell['path'], '--output', str(output)]
-        sampler = Sampler(self.remote)
+        sampler = proc_sampler.Sampler(self.remote)
         for host, pid, role in watchers:
             sampler.watch_host(host, pid, role)
         started = time.time_ns()
@@ -500,7 +246,7 @@ class HostRunner:
                 self.host, ' '.join(quote(part) for part in command), check=False)
 
         thread = threading.Thread(target=call, daemon=True)
-        sampler = Sampler(self.remote)
+        sampler = proc_sampler.Sampler(self.remote)
         started = time.time_ns()
         thread.start()
         pid = self._pid(remote_spec)
@@ -581,39 +327,36 @@ class Bucket:
     def __init__(self, objects, prefix):
         self.objects = objects
         self.prefix = prefix
-        self.ledger_store = gcs_ledger.ObjectStoreLedger(objects)
+        self.evidence = campaign_upload.Evidence(objects, prefix)
+        self.ledger_store = self.evidence.ledger_store
 
     def key(self):
-        return f'{self.prefix}/campaign-ledger.json'
+        return self.evidence.ledger_key
 
-    def publish_file(self, group, path):
+    def publish_file(self, cell_id, path, attempt=1):
         """Upload one compact file and verify the stored size and SHA-256."""
         path = Path(path)
-        key = f'{self.prefix}/stage3/evidence/{group}/{path.name}'
-        self.objects.upload(key, path)
-        head = self.ledger_store.head(key)
-        if head['size'] != path.stat().st_size or head['sha256'] != ledger_module.sha256_file(path):
-            raise ValueError(f'uploaded file differs: {key}')
-        return key
+        row = campaign_upload.artifact(path, path.name)
+        receipts = self.evidence.upload([row], stage=STAGE, cell_id=cell_id,
+                                        attempt=attempt)
+        return receipts[0]['key']
 
-    def publish(self, case_id, produced, output):
+    def publish(self, case_id, produced, output, attempt=1):
         for artifact in produced:
-            artifact['key'] = upload_key(self.prefix, case_id, artifact['path'], output)
-            self.objects.upload(artifact['key'], artifact['path'])
+            artifact['name'] = Path(artifact['path']).relative_to(output).as_posix()
+        receipts = self.evidence.upload(produced, stage=STAGE, cell_id=case_id,
+                                        attempt=attempt)
+        keys = {row['path']: row['key'] for row in receipts}
+        for artifact in produced:
+            artifact['key'] = keys[artifact['path']]
         return produced
 
     def save(self, ledger):
-        return gcs_ledger.save_ledger(self.objects, ledger, self.key())
+        return self.evidence.save(ledger)[0]
 
     def merge(self, ledger):
         """Read the campaign ledger so a resume on another host starts from it."""
-        try:
-            data, _ = self.ledger_store.get(self.key())
-        except KeyError:
-            return ledger
-        merged = ledger.merge(ledger_module.Ledger.from_bytes(data))
-        merged.path = ledger.path
-        return merged
+        return self.evidence.merge(ledger)
 
 
 class Owners:
@@ -798,8 +541,12 @@ def phase_cell(*, path, case, identity, group):
                 tier=case['tier'], config_hash=identity, path=str(path))
 
 
-def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout, watchers=()):
+def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
+                   watchers=(), allow_local_ledger=False):
     """One phase-A/B cell under the same ledger and upload rules as the grid."""
+    if bucket is None and not allow_local_ledger:
+        raise ValueError('a passed cell needs a verified evidence upload; '
+                         'add --bucket-prefix, or --allow-local-ledger for a rehearsal')
     entry = ledger.begin(stage=STAGE, cell_id=cell['id'],
                          config_hash=cell['config_hash'], unit=cell['unit'],
                          start_from='fresh')
@@ -809,9 +556,10 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout, w
         produced = run_cell(cell, runner, output=output, stale_root=stale_root,
                             attempt=entry['attempts'], timeout=timeout, watchers=watchers)
         if bucket is not None:
-            bucket.publish(cell['id'], produced, output)
-        ledger.mark_passed(entry, produced,
-                           store=None if bucket is None else bucket.ledger_store)
+            bucket.publish(cell['id'], produced, output, attempt=entry['attempts'])
+            ledger.mark_passed(entry, produced, store=bucket.ledger_store)
+        else:
+            campaign_upload.pass_local(ledger, entry, produced)
         save(ledger, bucket)
     except BaseException as error:
         ledger.fail(entry, error)
@@ -820,7 +568,8 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout, w
     return output
 
 
-def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout):
+def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout,
+              allow_local_ledger=False):
     """Phase A: one arm-B synchronous write cell before anything else runs."""
     cell = phase_cell(path=path, case=stage3_specs.probe_case(), identity=identity,
                       group='probe')
@@ -828,8 +577,9 @@ def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout):
     # one the first grid tier uses, so it is installed once, not twice.
     owners.install('native')
     output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
-                            stale_root=Path(root) / 'stage3' / 'stale', timeout=timeout)
-    totals = sample_totals(output / 'samples.csv')
+                            stale_root=Path(root) / 'stage3' / 'stale', timeout=timeout,
+                            allow_local_ledger=allow_local_ledger)
+    totals = proc_sampler.sample_totals(output / 'samples.csv')
     record = json.loads((output / 'run.json').read_text())
     return dict(cell=cell['id'], host=record.get('host'), output=str(output),
                 wall_seconds=(record['finished_unix_ns'] - record['started_unix_ns']) / 1e9,
@@ -863,7 +613,7 @@ def projection(measurements, counts, *, counts_source):
 
 
 def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
-              timeout):
+              timeout, allow_local_ledger=False):
     """Phase B: three calibration cells, then the frozen per-family counts."""
     root = Path(root)
     paths = write_calibration_specs(root, external=external)
@@ -875,8 +625,9 @@ def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
                           identity=identity_for(path, dict(calibration=family)))
         output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
                                 stale_root=root / 'stage3' / 'stale', timeout=timeout,
-                                watchers=owners.watchers())
-        totals = sample_totals(output / 'samples.csv')
+                                watchers=owners.watchers(),
+                                allow_local_ledger=allow_local_ledger)
+        totals = proc_sampler.sample_totals(output / 'samples.csv')
         rates[family] = totals['calls_per_second']
         cells.append(dict(cell=cell['id'], measurement_calls=totals['calls'],
                           measurement_window_seconds=totals['window_seconds'],
@@ -922,9 +673,13 @@ def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600, watcher
 
 
 def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket=None,
-                 only=None, from_=None, stop_on_failure=True, timeout=3600):
+                 only=None, from_=None, stop_on_failure=True, timeout=3600,
+                 allow_local_ledger=False):
+    if bucket is None and not allow_local_ledger:
+        raise ValueError('a passed cell needs a verified evidence upload; '
+                         'add --bucket-prefix, or --allow-local-ledger for a rehearsal')
     root = Path(root)
-    ledger.path = Path(ledger.path) if ledger.path else root / 'stage3' / 'run-ledger.json'
+    ledger.path = Path(ledger.path) if ledger.path else root / 'campaign-ledger.json'
     stale_root = root / 'stage3' / 'stale'
     planned = schedule(ledger_module.plan(list(cells), ledger, only=only, from_=from_))
     if local.remote is None and owners is not None:
@@ -953,9 +708,10 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                     attempt=entry['attempts'], timeout=timeout,
                     watchers=owners.watchers() if (owners and cell['arm'] == 'A') else ())
                 if bucket is not None:
-                    bucket.publish(cell['id'], produced, output)
-                ledger.mark_passed(entry, produced,
-                                   store=None if bucket is None else bucket.ledger_store)
+                    bucket.publish(cell['id'], produced, output, attempt=entry['attempts'])
+                    ledger.mark_passed(entry, produced, store=bucket.ledger_store)
+                else:
+                    campaign_upload.pass_local(ledger, entry, produced)
                 save(ledger, bucket)
                 results.append(dict(id=cell['id'], status='passed', mode=runner.mode))
             except BaseException as error:
@@ -1044,6 +800,9 @@ def main():
                         help='gs://mysten-research-bench-artifacts/<campaign prefix>')
     parser.add_argument('--impersonate-service-account', default=gcp_manual_storage.ACCOUNT)
     parser.add_argument('--bucket-deadline-seconds', type=int, default=7200)
+    parser.add_argument('--allow-local-ledger', action='store_true',
+                        help='labelled local rehearsal only: pass a cell without an '
+                             'uploaded bundle')
     args = parser.parse_args()
     root = args.root.resolve()
     cluster = args.mode == 'cluster'
@@ -1063,6 +822,9 @@ def main():
     elif args.external or args.guest_root or args.owners or args.native_root:
         raise SystemExit('rehearsal mode runs the local fixture and takes no '
                          '--external, --guest-root, --owners or --native-root')
+    elif not args.allow_local_ledger:
+        raise SystemExit('a passed cell needs a verified evidence upload; give '
+                         '--bucket-prefix, or --allow-local-ledger for a labelled rehearsal')
     external = (stage3_specs.external_map(stage3_specs.external_items(args.external),
                                           database=args.external_database)
                 if cluster else None)
@@ -1073,7 +835,7 @@ def main():
             raise SystemExit('--binary is not the storage binary the external '
                              'preparation was built from')
     owner_hosts = plan_hosts(args.owners.split(',')) if cluster else []
-    path = args.ledger or root / 'stage3' / 'run-ledger.json'
+    path = args.ledger or root / 'campaign-ledger.json'
     if Path(path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {path}')
     ledger = ledger_module.Ledger(path)
@@ -1130,7 +892,8 @@ def main():
                 measurements = run_probe(path=probe_spec, identity=probe['config_hash'],
                                          runner=remote, owners=owners, root=root,
                                          ledger=ledger, bucket=bucket,
-                                         timeout=args.timeout)
+                                         timeout=args.timeout,
+                                         allow_local_ledger=args.allow_local_ledger)
             except BaseException as error:
                 raise SystemExit(f'the phase-A probe cell failed: {error}') from error
     if counts is None and args.calibrate:
@@ -1139,7 +902,8 @@ def main():
         try:
             counts = calibrate(root=root, runner=local, owners=owners, ledger=ledger,
                                bucket=bucket, external=external,
-                               identity_for=identity_for, timeout=args.timeout)
+                               identity_for=identity_for, timeout=args.timeout,
+                               allow_local_ledger=args.allow_local_ledger)
         except BaseException as error:
             raise SystemExit(f'the phase-B calibration failed: {error}') from error
     if counts is None:
@@ -1157,7 +921,8 @@ def main():
     results, planned = run_campaign(
         cells, local=local, root=root, ledger=ledger, remote=remote, owners=owners,
         bucket=bucket, only=args.only or None, from_=args.from_,
-        stop_on_failure=not args.continue_on_failure, timeout=args.timeout)
+        stop_on_failure=not args.continue_on_failure, timeout=args.timeout,
+        allow_local_ledger=args.allow_local_ledger)
     print(json.dumps(dict(mode=args.mode, counts=counts,
                           probe=str(root / 'stage3' / 'probe.json')
                           if measurements is not None else None,

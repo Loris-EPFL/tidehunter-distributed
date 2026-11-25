@@ -29,16 +29,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'sui-checkpoint'))
 import build
 import campaign_ledger as ledger_module
 import campaign_manifest
+import campaign_upload as upload_module
 import checkpoint_support as checkpoint
 import deployment
-import gcp_api
-import gcs_ledger
+import proc_sampler
 
-SAMPLE_SECONDS = 2.0
-MAX_SAMPLES = 20000
 OWNER_READY_SECONDS = 120
-IO_COUNTERS = ('rchar', 'wchar', 'syscr', 'syscw', 'read_bytes', 'write_bytes',
-               'cancelled_write_bytes')
 BINARY_SET = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit',
               'rocksdb-audit'}
 
@@ -97,25 +93,6 @@ class Remote:
         return code == 0
 
 
-def parse_proc(stat, status, io):
-    """One live process sample; a missing stream is an exited process."""
-    if not stat or not status or not io:
-        return None
-    try:
-        fields = stat.rsplit(b')', 1)[1].split()
-        starttime = int(fields[19])
-        values = {line.split(':')[0]: int(line.split()[1]) * 1024 for line in
-                  status.decode().splitlines() if line.startswith(('VmRSS:', 'VmHWM:', 'VmSwap:'))}
-        counters = {line.split(':')[0]: int(line.split()[1]) for line in
-                    io.decode().splitlines()}
-    except (IndexError, ValueError, UnicodeError):
-        return None
-    if set(values) != {'VmRSS', 'VmHWM', 'VmSwap'} or not set(IO_COUNTERS) <= set(counters):
-        return None
-    return dict(starttime_ticks=starttime, **values,
-                io={key: counters[key] for key in IO_COUNTERS})
-
-
 class SuiLauncher:
     def __init__(self, *, remote, build_root, fixture, output, guest_root, stage_dir,
                  config_dir, resources, tier='native', owners=2, fragment_mib=8,
@@ -124,7 +101,7 @@ class SuiLauncher:
                  disk_sample_seconds=10, port=24000, ledger=None,
                  cell_id='sui-replay', stage='stage1', resume=False,
                  store=None, bucket=None, prefix=None, write_profile_limit=0,
-                 resident_reads=None):
+                 resident_reads=None, allow_local_ledger=False):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -164,6 +141,7 @@ class SuiLauncher:
         self.prefix = prefix
         self.write_profile_limit = write_profile_limit
         self.resident_reads = Path(resident_reads).resolve() if resident_reads else None
+        self.allow_local_ledger = allow_local_ledger
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
@@ -261,76 +239,33 @@ class SuiLauncher:
                     time.sleep(0.2)
         self.started = True
 
-    def sample_host(self, host):
-        namespaces = self.namespaces[host]
-        script = ['echo @@vmstat; cat /proc/vmstat', 'echo @@diskstats; cat /proc/diskstats']
-        for namespace in namespaces:
-            pid = namespace['pid']
-            script.extend([
-                f'echo @@{pid}', f'cat /proc/{pid}/stat 2>/dev/null',
-                f'cat /proc/{pid}/status 2>/dev/null', f'cat /proc/{pid}/io 2>/dev/null'])
-        code, out, err = self.remote.shell(host, '; '.join(script), check=False)
-        stamp = time.time_ns()
-        if code != 0:
-            return dict(unix_ns=stamp, healthy=False,
-                        reason=err.decode(errors='replace'))
-        blocks, current = {}, None
-        for line in out.decode().splitlines():
-            if line.startswith('@@'):
-                current = line[2:].strip()
-                blocks[current] = []
-            elif current is not None:
-                blocks[current].append(line)
-        processes, healthy = [], True
-        for namespace in namespaces:
-            pid = namespace['pid']
-            raw = blocks.get(str(pid), [])
-            stat = next((line for line in raw if ') ' in line), '')
-            status = [line for line in raw if line.startswith(('VmRSS:', 'VmHWM:', 'VmSwap:'))]
-            io = [line for line in raw if line.split(':')[0] in IO_COUNTERS]
-            entry = parse_proc((stat + '\n').encode(),
-                               ('\n'.join(status) + '\n').encode(),
-                               ('\n'.join(io) + '\n').encode())
-            if entry is None:
-                healthy = False
-                processes.append(dict(pid=pid, index=namespace['index'], exited=True))
-                continue
-            if namespace.setdefault('starttime_ticks', entry['starttime_ticks']) != entry['starttime_ticks']:
-                healthy = False
-            processes.append(dict(pid=pid, index=namespace['index'], exited=False,
-                                  unavailable={}, **entry))
-        vmstat = dict(line.split() for line in blocks.get('vmstat', []))
-        swap = ({key: int(vmstat[key]) for key in ('pswpin', 'pswpout')}
-                if vmstat else None)
-        return dict(unix_ns=stamp, healthy=healthy, processes=processes, swap=swap,
-                    diskstats='\n'.join(blocks.get('diskstats', [])))
-
     def sampling_loop(self):
         while not self.sample_stop.is_set():
             for host in self.namespaces:
                 try:
-                    row = self.sample_host(host)
+                    row = proc_sampler.sample_host(self.remote, host, self.namespaces[host])
                 except BaseException as error:  # a dead transport is not a healthy sample
                     row = dict(unix_ns=time.time_ns(), healthy=False, reason=str(error))
                 rows = self.samples.setdefault(host, [])
                 if rows and row['unix_ns'] <= rows[-1]['unix_ns']:
                     row['unix_ns'] = rows[-1]['unix_ns'] + 1
-                if len(rows) < MAX_SAMPLES:
+                if len(rows) < proc_sampler.MAX_SAMPLES:
                     rows.append(row)
-            self.sample_stop.wait(SAMPLE_SECONDS)
+            self.sample_stop.wait(proc_sampler.SAMPLE_SECONDS)
 
     def start_sampling(self):
         # One synchronous sample before run.py starts anchors healthy[0] before
         # the remote-starting marker; the loop then covers the replay.
         for host in self.namespaces:
-            self.samples.setdefault(host, []).append(self.sample_host(host))
+            self.samples.setdefault(host, []).append(
+                proc_sampler.sample_host(self.remote, host, self.namespaces[host]))
         self.sample_thread = threading.Thread(target=self.sampling_loop, daemon=True)
         self.sample_thread.start()
 
     def final_sample(self):
         for host in self.namespaces:
             rows = self.samples.setdefault(host, [])
-            row = self.sample_host(host)
+            row = proc_sampler.sample_host(self.remote, host, self.namespaces[host])
             if rows and row['unix_ns'] <= rows[-1]['unix_ns']:
                 row['unix_ns'] = rows[-1]['unix_ns'] + 1
             rows.append(row)
@@ -364,40 +299,11 @@ class SuiLauncher:
         self.started = False
 
     # ---- host evidence -------------------------------------------------
-    def host_evidence(self, binding):
-        rows = {}
-        for record in self.external['hosts']:
-            host = record['host']
-            namespaces = self.namespaces.get(host, [])
-            samples = self.samples.get(host, [])
-            with_swap = [row for row in samples if row.get('swap')]
-            before = with_swap[0] if with_swap else None
-            after = with_swap[-1] if with_swap else None
-            healthy = [row for row in samples if row['healthy']]
-            rows[host] = dict(binding,
-                storage_binary_sha256=self.manifest['binaries']['storage-node'],
-                root=str(self.guest_root),
-                complete=(len(namespaces) == len(record['commands'])
-                          and all(n.get('stopped') for n in namespaces)),
-                cleanup_complete=True,
-                all_namespaces_healthy=bool(healthy) and all(
-                    len(row['processes']) == len(namespaces) for row in healthy),
-                failure=None, samples_dropped=0,
-                namespaces=[dict(index=n['index'], command=n['command'], pid=n['pid'],
-                                 process_group=n['process_group'],
-                                 starttime_ticks=n.get('starttime_ticks', 0),
-                                 reaped=bool(n.get('stopped')))
-                            for n in namespaces],
-                swap_before=before['swap'] if before else None,
-                diskstats_before=before['diskstats'] if before else None,
-                swap_after=after['swap'] if after else None,
-                diskstats_after=after['diskstats'] if after else None,
-                samples=[dict(unix_ns=row['unix_ns'], healthy=row['healthy'],
-                              processes=row.get('processes', [])) for row in samples])
-        return dict(binding, hosts=rows)
-
     def write_resources(self, binding):
-        value = self.host_evidence(binding)
+        value = proc_sampler.host_evidence(
+            self.external['hosts'], self.namespaces, self.samples, binding,
+            binary_sha256=self.manifest['binaries']['storage-node'],
+            guest_root=self.guest_root)
         self.resources.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.resources.with_name(self.resources.name + '.tmp')
         temporary.write_text(json.dumps(value, indent=2) + '\n')
@@ -448,74 +354,17 @@ class SuiLauncher:
                      self.config_dir / 'external-manifest.json'):
             if not path.is_file():
                 raise ValueError(f'missing replay artifact: {path}')
-            row = dict(path=str(path), size=path.stat().st_size,
-                       sha256=ledger_module.sha256_file(path))
-            if self.prefix:
-                row['key'] = campaign_manifest.evidence_key(
-                    self.prefix, self.stage, self.cell_id, self.evidence_name(path),
-                    attempt)
-            rows.append(row)
+            rows.append(upload_module.artifact(path, self.evidence_name(path)))
         return rows
-
-    def upload(self, artifacts):
-        """Upload each artifact once, then verify it by size and SHA-256.
-
-        An object that already exists must hold the same bytes; a different
-        object is a hard failure, never an overwrite. The local files are the
-        mirror: they are read again for the upload and must keep their hash.
-        """
-        receipts = []
-        for artifact in artifacts:
-            path = Path(artifact['path'])
-            data = path.read_bytes()
-            digest = ledger_module.sha256_bytes(data)
-            if len(data) != artifact['size'] or digest != artifact['sha256']:
-                raise ValueError(f'evidence changed before upload: {path}')
-            key = artifact['key']
-            try:
-                receipt = self.store.put(key, data, if_generation_match=0,
-                                         metadata={'kind': 'cell-evidence',
-                                                   'cell': self.cell_id})
-                generation = int(receipt['generation'])
-                if (int(receipt.get('size', -1)) != len(data)
-                        or receipt.get('metadata', {}).get('sha256') != digest):
-                    raise ValueError(f'evidence upload receipt differs: {key}')
-            except gcp_api.ApiError as error:
-                if error.status not in (409, 412):
-                    raise
-                head = self.store.head(key)
-                if (int(head.get('size', -1)) != len(data)
-                        or head.get('metadata', {}).get('sha256') != digest):
-                    raise ValueError(f'uploaded evidence differs: {key}') from None
-                generation = int(head['generation'])
-            if ledger_module.sha256_file(path) != digest:
-                raise ValueError(f'local evidence mirror changed during upload: {path}')
-            receipts.append(dict(key=key, path=str(path), size=len(data),
-                                 sha256=digest, generation=generation))
-        return receipts
 
     def persist(self, entry, artifacts):
         """Pass the cell only after its evidence and the ledger are verified."""
-        target = gcs_ledger.ObjectStoreLedger(self.store)
-        receipts = self.upload(artifacts)
-        self.ledger.mark_passed(entry, artifacts, store=target)
-        key = campaign_manifest.ledger_key(self.prefix)
-        generation = gcs_ledger.save_ledger(self.store, self.ledger, key)
-        payload = self.ledger.to_bytes()
-        head = target.head(key)
-        if (head['size'] != len(payload)
-                or head['sha256'] != ledger_module.sha256_bytes(payload)
-                or head['generation'] != generation):
-            raise ValueError('uploaded ledger differs from the local ledger')
-        local = (dict(path=str(self.ledger.path),
-                      sha256=ledger_module.sha256_file(self.ledger.path))
-                 if self.ledger.path is not None else None)
+        evidence = upload_module.Evidence(self.store, self.prefix)
+        upload = evidence.persist(self.ledger, entry, artifacts)
         receipt = dict(
             cell_id=self.cell_id, stage=self.stage, status='passed',
             attempt=entry['attempts'], bucket=self.bucket, prefix=self.prefix,
-            ledger=dict(key=key, generation=generation, size=head['size'],
-                        sha256=head['sha256'], local=local),
-            evidence=receipts,
+            ledger=upload['ledger'], evidence=upload['evidence'],
             mirror=dict(root=str(self.output),
                         note='the local artifact tree is the mirror; every uploaded '
                              'object is verified by size and SHA-256 on both sides'))
@@ -544,8 +393,12 @@ class SuiLauncher:
         try:
             receipt = self.execute(hosts)
             if self.store is None:
-                self.ledger.mark_passed(entry, self.artifacts())
-                receipt['ledger'] = dict(local=str(self.ledger.path), uploaded=False)
+                if not self.allow_local_ledger:
+                    raise ValueError('a passed cell needs a verified evidence upload; '
+                                     'add --bucket-prefix, or --allow-local-ledger for a '
+                                     'local rehearsal')
+                receipt['ledger'] = upload_module.pass_local(
+                    self.ledger, entry, self.artifacts())
             else:
                 receipt['upload'] = self.persist(entry, self.artifacts(entry['attempts']))
                 receipt['ledger'] = dict(local=str(self.ledger.path), uploaded=True,
@@ -684,17 +537,16 @@ def main():
                          '--bucket-prefix, or --allow-local-ledger for a local rehearsal')
     store = bucket = prefix = None
     if args.bucket_prefix:
-        bucket, prefix = campaign_manifest.parse_bucket_prefix(args.bucket_prefix)
-        api = gcp_api.GoogleApi(campaign_manifest.PROJECT)
-        if args.impersonation_account:
-            api = api.impersonated(args.impersonation_account)
-        store = api.objects(bucket)
+        store, bucket, prefix = upload_module.open_store(
+            args.bucket_prefix, args.impersonation_account)
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
     if Path(ledger_path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
     resume_ledger = ledger_module.Ledger(ledger_path)
     if args.resume:
         resume_ledger.load()
+        if store is not None:
+            resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
     launcher = SuiLauncher(
         remote=Remote(args.zone, iap=args.tunnel_through_iap),
         build_root=args.build, fixture=args.fixture, output=output,
@@ -711,7 +563,8 @@ def main():
         ledger=resume_ledger, cell_id=args.cell_id, stage=args.stage,
         resume=args.resume, store=store, bucket=bucket, prefix=prefix,
         write_profile_limit=args.write_profile_limit,
-        resident_reads=args.resident_reads)
+        resident_reads=args.resident_reads,
+        allow_local_ledger=args.allow_local_ledger)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
 

@@ -14,6 +14,8 @@ import tempfile
 import textwrap
 import unittest
 
+import gcp_api
+import gcs_ledger
 import manual_sui
 from test_gcs_ledger import FakeObjectStore
 
@@ -184,9 +186,9 @@ class LauncherHandshake(unittest.TestCase):
         self.fixture = self.build.fixture(self.root)
         self.schema = self.build.schema(self.root)
         self.gcloud = LocalGcloud(self.root, self.root / 'guest')
-        self.saved = manual_sui.SAMPLE_SECONDS
-        manual_sui.SAMPLE_SECONDS = 0.2
-        self.addCleanup(setattr, manual_sui, 'SAMPLE_SECONDS', self.saved)
+        self.saved = manual_sui.proc_sampler.SAMPLE_SECONDS
+        manual_sui.proc_sampler.SAMPLE_SECONDS = 0.2
+        self.addCleanup(setattr, manual_sui.proc_sampler, 'SAMPLE_SECONDS', self.saved)
 
     def launcher(self, directory='', **overrides):
         base = self.root / directory if directory else self.root
@@ -203,18 +205,28 @@ class LauncherHandshake(unittest.TestCase):
     def test_resume_skips_a_passed_cell_and_reruns_a_stale_one(self):
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
         hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
-        first = self.launcher(ledger=ledger).run(hosts)
+        first = self.launcher(ledger=ledger, allow_local_ledger=True).run(hosts)
         self.assertTrue(first['complete'])
         self.assertEqual(ledger.status('stage1', 'sui-replay'), 'passed')
+        self.assertFalse(first['ledger']['uploaded'])
         calls = len(self.gcloud.calls)
-        skipped = self.launcher(ledger=ledger, resume=True).run(hosts)
+        skipped = self.launcher(ledger=ledger, resume=True,
+                                allow_local_ledger=True).run(hosts)
         self.assertTrue(skipped['skipped'])
         self.assertEqual(len(self.gcloud.calls), calls)
         # A changed knob hashes differently and reruns in a fresh output.
-        stale = self.launcher('stale', ledger=ledger, resume=True, fragment_mib=16).run(hosts)
+        stale = self.launcher('stale', ledger=ledger, resume=True, fragment_mib=16,
+                              allow_local_ledger=True).run(hosts)
         self.assertTrue(stale['complete'])
         self.assertNotIn('skipped', stale)
         self.assertEqual(ledger.entries[('stage1', 'sui-replay')]['attempts'], 2)
+
+    def test_a_local_pass_needs_the_explicit_rehearsal_escape(self):
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        with self.assertRaises(ValueError):
+            self.launcher(ledger=ledger).run(hosts)
+        self.assertEqual(ledger.status('stage1', 'sui-replay'), 'failed')
 
     def test_handshake_satisfies_the_runner_resource_contract(self):
         receipt = self.launcher().run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
@@ -303,12 +315,12 @@ class LauncherHandshake(unittest.TestCase):
         self.assertEqual(len(uploaded), len(receipt['upload']['evidence']))
         for key in uploaded:
             self.assertTrue(key.startswith(
-                f'{prefix}/stage1/sui-replay/attempt-1/'), key)
+                f'{prefix}/stage1/evidence/sui-replay/attempt-1/'), key)
         for row in receipt['upload']['evidence']:
             data, generation = store.objects[row['key']]
             self.assertEqual(hashlib.sha256(data).hexdigest(), row['sha256'])
             self.assertEqual(row['generation'], generation)
-        stored, generation = manual_sui.gcs_ledger.ObjectStoreLedger(store).get(ledger_key)
+        stored, generation = gcs_ledger.ObjectStoreLedger(store).get(ledger_key)
         self.assertEqual(generation, receipt['upload']['ledger']['generation'])
         self.assertEqual(stored, ledger.to_bytes())
         mirror = json.loads((self.root / 'run/upload-receipt.json').read_text())
@@ -318,12 +330,12 @@ class LauncherHandshake(unittest.TestCase):
     def test_failed_upload_never_passes_the_cell(self):
         store = FakeObjectStore()
         store.put = lambda *args, **kwargs: (_ for _ in ()).throw(
-            manual_sui.gcp_api.ApiError(503, 'unavailable'))
+            gcp_api.ApiError(503, 'unavailable'))
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
         launcher = self.launcher(ledger=ledger, store=store,
                                  bucket='mysten-research-bench-artifacts',
                                  prefix='campaign-hybrid-sui-2026-11-25')
-        with self.assertRaises(manual_sui.gcp_api.ApiError):
+        with self.assertRaises(gcp_api.ApiError):
             launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
         self.assertEqual(ledger.status('stage1', 'sui-replay'), 'failed')
         self.assertIn('unavailable', ledger.entries[('stage1', 'sui-replay')]['failure'])
