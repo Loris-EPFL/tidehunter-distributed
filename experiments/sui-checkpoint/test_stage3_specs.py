@@ -2,16 +2,59 @@
 
 Every case declares its coordinator value cache in its `-cacheN` tag. The 70
 grid cells and the native baseline declare 0; the two reference cells (one per
-tier, read-only C=16) declare 1,000.
+tier, read-only C=16) declare 1,000. The cluster set carries the external
+NVMe-oF deployment of the cell's tier; the rehearsal set keeps the single-host
+trusted TCP fixture.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
+import deployment
 import stage3_specs
+
+
+def preparation(root, tier, *, hosts=('10.20.0.2', '10.20.0.3'), guest=None):
+    """A synthetic `prepare_external.py` output for one acknowledgement tier."""
+    root = Path(root)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    schema = {'checkpoints': {'key_spaces': []}}
+    guest = Path(guest) if guest is not None else root / 'guest'
+    _, nodes = deployment.prepare(
+        root, schema, root / 'remote',
+        shape_yamls={name: 'key_spaces: []\n' for name in schema},
+        hosts=list(hosts), owners=len(hosts), port=24000, transport='tcp',
+        coordinator_cache=0, shard_cache=0, guest_root=guest,
+        owner_tier=tier, live_transport='rdma')
+    records = []
+    for partition, host in enumerate(hosts):
+        selected = [node for node in nodes if node['partition'] == partition]
+        archive = root / f'host-{partition}.tar.gz'
+        with tarfile.open(archive, 'w:gz') as handle:
+            for node in selected:
+                handle.add(node['launch'],
+                           arcname=str(Path(node['launch']).relative_to(root)))
+        records.append(dict(
+            host=host, partition=partition, archive=str(archive),
+            archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+            commands=[[str(guest / 'storage-node'), '--experimental-storage-node',
+                       str(guest / Path(node['launch']).relative_to(root))]
+                      for node in selected],
+            ready_files=[node['ready'] for node in selected],
+            stop_files=[node['stop'] for node in selected]))
+    manifest = dict(schema=1, protocol=9, transport={'kind': 'tcp'},
+                    owners=len(hosts), durability_tier=tier, live_transport='rdma',
+                    owner_wal='harness',
+                    config_sha256=hashlib.sha256(
+                        (root / 'config.json').read_bytes()).hexdigest(),
+                    storage_binary_sha256='0' * 64, hosts=records)
+    (root / 'external-manifest.json').write_text(json.dumps(manifest, indent=2))
+    return root
 
 
 class StageThreeSpecs(unittest.TestCase):
@@ -55,7 +98,7 @@ class StageThreeSpecs(unittest.TestCase):
                 self.assertEqual(document['dataset']['keys'], 65536)
                 self.assertEqual(document['seed'], 1775)
                 self.assertEqual(document['limits']['max_operations'], 3_000_000)
-                self.assertEqual(document['namespace'], document['case_id'])
+                self.assertEqual(document['namespace'], 'stage3-' + document['case_id'])
                 cache = stage3_specs.declared_cache(document['case_id'])
                 self.assertIn(f'-cache{cache}', document['namespace'])
                 self.assertEqual(document['backend']['options']['value_cache_size'], cache)
@@ -77,6 +120,11 @@ class StageThreeSpecs(unittest.TestCase):
                     self.assertEqual(document['backend']['options']['owners'], 2)
                     self.assertIn(document['backend']['options']['durability_tier'],
                                   ('native', 'synchronous'))
+                    # Rehearsal keeps the single-host trusted TCP fixture.
+                    self.assertEqual(document['backend']['options']['transport'],
+                                     {'kind': 'tcp-trusted'})
+                    self.assertNotIn('external_remote_config',
+                                     document['backend']['options'])
                 self.assertIn(document['workload']['distribution'],
                               ('uniform', {'zipf': {'exponent': 1.0}}))
 
@@ -89,6 +137,103 @@ class StageThreeSpecs(unittest.TestCase):
                 subprocess.run([binary, '--config', str(path), '--validate-config',
                                 '--output', str(Path(tmp) / 'admission')],
                                check=True, stdout=subprocess.DEVNULL, timeout=60)
+
+
+class ClusterSpecs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.preparations = {
+            tier: stage3_specs.load_external(
+                preparation(self.base / tier, tier), tier=tier)
+            for tier in stage3_specs.TIERS}
+
+    def documents(self, **kwargs):
+        root = self.base / 'root'
+        paths = stage3_specs.write(root, 2_000, **kwargs)
+        return root, {path.stem: json.loads(path.read_text()) for path in paths}
+
+    def test_distributed_cells_carry_the_external_nvmeof_deployment(self):
+        root, documents = self.documents(external=self.preparations)
+        distributed = [document for document in documents.values()
+                       if document['backend']['kind'] == 'tidehunter']
+        self.assertEqual(len(distributed), 56)
+        for document in distributed:
+            options = document['backend']['options']
+            tier = options['durability_tier']
+            self.assertEqual(options['transport'], {'kind': 'tcp'})
+            self.assertNotIn('index', options)
+            self.assertNotIn('local_geometry', options)
+            self.assertNotIn('durable_cut', options)
+            self.assertEqual(options['coordinator_read_cache_bytes'], 0)
+            self.assertEqual(options['owners'], 2)
+            remote = options['external_remote_config']
+            self.assertEqual(remote, self.preparations[tier]['document'])
+            self.assertEqual(remote['live_nvme']['leased_durability'], tier)
+            self.assertEqual(remote['read_cache_bytes'], 0)
+            self.assertEqual([endpoint['partition'] for endpoint in remote['endpoints']],
+                             [0, 1])
+            self.assertEqual(
+                options['external_owner_durability_receipts'],
+                [str(stage3_specs.receipt_path(root, tier, partition))
+                 for partition in (0, 1)])
+            self.assertEqual(
+                options['evidence'],
+                str(root / 'stage3' / 'db' / document['case_id'] / 'evidence'))
+            self.assertEqual(options['value_cache_size'],
+                             stage3_specs.declared_cache(document['case_id']))
+
+    def test_arm_b_keeps_the_native_store_root_of_the_owner_host(self):
+        native = Path('/mnt/tidehunter/campaign')
+        _, documents = self.documents(external=self.preparations, native_root=native)
+        native_cells = [document for document in documents.values()
+                        if document['backend']['kind'] == 'native']
+        self.assertEqual(len(native_cells), 16)
+        for document in native_cells:
+            options = document['backend']['options']
+            self.assertTrue(options['path'].startswith(f'{native}/stage3/db/'))
+            self.assertEqual(options['durability'],
+                             'value_wal_barrier'
+                             if 'synchronous' in document['case_id'] else 'page_cache')
+        reachable = [document for document in documents.values()
+                     if document['backend']['kind'] == 'tidehunter']
+        for document in reachable:
+            self.assertTrue(document['backend']['options']['path'].startswith(
+                str(self.base / 'root')))
+
+    def test_a_preparation_must_match_the_cell_tier_and_the_control_transport(self):
+        native = preparation(self.base / 'mismatch', 'native')
+        with self.assertRaisesRegex(ValueError, 'is not'):
+            stage3_specs.load_external(native, tier='synchronous')
+        manifest_path = native / 'external-manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['transport'] = {'kind': 'tcp-trusted'}
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'mTLS TCP'):
+            stage3_specs.load_external(native, tier='native')
+        with self.assertRaisesRegex(ValueError, 'missing synchronous'):
+            stage3_specs.external_map([
+                ('native', preparation(self.base / 'only', 'native'))])
+
+    def test_a_changed_setting_is_never_overwritten(self):
+        root, _ = self.documents(external=self.preparations)
+        stage3_specs.write(root, 2_000, external=self.preparations)
+        with self.assertRaisesRegex(ValueError, 'differs from these settings'):
+            stage3_specs.write(root, 3_000, external=self.preparations)
+        with self.assertRaisesRegex(ValueError, 'differs from these settings'):
+            stage3_specs.write(root, 2_000)
+
+    def test_the_cluster_set_passes_runconfig_admission(self):
+        binary = os.environ.get('KV_RESEARCH_BIN')
+        if not binary:
+            self.skipTest('set KV_RESEARCH_BIN to validate RunConfig admission')
+        root, _ = self.documents(external=self.preparations,
+                                 native_root=Path('/mnt/tidehunter/campaign'))
+        for path in sorted((root / 'stage3' / 'spec').iterdir()):
+            subprocess.run([binary, '--config', str(path), '--validate-config',
+                            '--output', str(root / 'stage3' / 'admission')],
+                           check=True, stdout=subprocess.DEVNULL, timeout=60)
 
 
 if __name__ == '__main__':

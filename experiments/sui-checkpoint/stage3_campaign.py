@@ -1,30 +1,81 @@
 #!/usr/bin/env python3
-"""Stage-3 cell driver with a resumable ledger.
+"""Stage-3 cell driver: the cluster campaign and the labelled local rehearsal.
 
 Each cell is one `kv-research` process on a fresh database and a fresh output
-directory. Before a rerun, the previous output and database are moved to
-`stage3/stale/<case>-attempt-<n>` (never reused). The ledger is saved after
-every transition; a cell is `passed` only after every produced artifact's size
-and SHA-256 is recorded and checked.
+directory. Before a rerun, the previous output (and every local database) is
+moved to `stage3/stale/<case>-attempt-<n>`; never reused. The ledger is saved
+after every transition, locally and, when `--bucket-prefix` is given, to the
+campaign ledger key in the bucket.
+
+Cluster mode (default): arm A runs on the coordinator host against the two
+NVMe-oF owners of the tier's `prepare_external.py` preparation; arm B runs on
+the owner host, whose Local SSD holds the native database. The `kv-research`
+native backend is in-process, so arm B's driver shares that host; every arm-B
+record says so. Before an arm-A cell the driver installs the tier's owner
+archive on each owner host, starts only the selected database's owner process
+group, waits for its ready file, and copies each owner's
+`ready.durability.json` to the coordinator host where the spec names it. Arm B
+starts only after every owner process group is stopped. Every cell's results are copied back to the campaign
+root, uploaded under the campaign prefix, and verified by size and SHA-256
+before the ledger may pass the cell: `passed` means uploaded and verified.
+
+Rehearsal mode (`--mode rehearsal`): every cell runs the single-host trusted TCP
+ordinary-file fixture on this host. The results and the ledger entry say
+`rehearsal`; the mode is not a campaign measurement.
 
 `--resume` skips passed cells whose config hash matches and reruns failed,
-pending, invalid and interrupted ones in plan order. `--only` and `--from`
-narrow the plan; unit members always run together.
+pending, invalid and interrupted ones in plan order: arm A native and
+synchronous cells first, then arm B, each tier in one owner start. `--only` and
+`--from` narrow the plan; unit members always run together.
 """
 import argparse
-import json
-import os
+import io
 from pathlib import Path
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tarfile
 import time
+import json
+import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
+import gcp_manual_storage
+import gcs_ledger
+import manual_sui
 import stage3_specs
 
 STAGE = 'stage3'
+OWNER_READY_SECONDS = 120
+OWNER_STOP_SECONDS = 30
+COMPACT_FILES = ('summary.json', 'manifest.json', 'metrics.prom', 'live.prom', 'run.json')
+TIER_ORDER = {'native': 0, 'synchronous': 1}
+
+
+class CellFailure(RuntimeError):
+    """A cell process failed; the record carries what did run."""
+
+    def __init__(self, message, record):
+        super().__init__(message)
+        self.record = record
+
+
+def quote(value):
+    return shlex.quote(str(value))
+
+
+def cell_label(cell):
+    """What the run record states about where the drivers and the store ran."""
+    if cell['arm'] == 'B':
+        return ('native arm: the native backend is in-process, so the driver and '
+                'the store share the owner host')
+    return ('distributed arm: coordinator and callers on the coordinator host; '
+            'two owners on their own hosts over RDMA NVMe-oF')
 
 
 def spec_hash(path):
@@ -40,7 +91,7 @@ def cells_for(root, *, engine_rev, sui_rev, binary_ids, spec_dir=None):
         if not path.is_file():
             raise ValueError(f'missing generated spec: {path}')
         cells.append(dict(id=case['case_id'], stage=STAGE,
-                          unit=case['case_id'],
+                          unit=case['case_id'], arm=case['arm'], tier=case['tier'],
                           config_hash=ledger_module.config_hash(
                               spec=spec_hash(path), knobs=dict(case=case),
                               engine_rev=engine_rev, sui_rev=sui_rev,
@@ -71,54 +122,402 @@ def archive_previous(path, stale_root, case, attempt):
     return str(target)
 
 
-def run_cell(cell, *, binary, root, stale_root, attempt, timeout=3600):
+def upload_group(relative):
+    """Raw per-call samples expire with the bucket rule; summaries do not."""
+    if relative.parts[0] == 'evidence' or relative.name in COMPACT_FILES:
+        return 'evidence'
+    return 'raw'
+
+
+def upload_key(prefix, case_id, path, output):
+    relative = Path(path).relative_to(output)
+    return f'{prefix}/stage3/{upload_group(relative)}/{case_id}/{relative.as_posix()}'
+
+
+def write_record(output, record):
+    output.mkdir(parents=True, exist_ok=True)
+    path = Path(output) / 'run.json'
+    path.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+    return path
+
+
+class LocalRunner:
+    """`kv-research` in this process's host: arm A on the coordinator and every rehearsal cell."""
+
+    def __init__(self, *, binary, data_root, stale_root, mode='cluster'):
+        self.binary = Path(binary)
+        self.data_root = Path(data_root)
+        self.stale_root = Path(stale_root)
+        self.mode = mode
+
+    def run(self, cell, *, output, attempt, timeout=3600):
+        database = self.data_root / 'stage3' / 'db' / cell['id']
+        archived = archive_previous(database, self.stale_root, cell['id'] + '-db', attempt)
+        command = [str(self.binary), '--config', cell['path'], '--output', str(output)]
+        started = time.time_ns()
+        try:
+            completed = subprocess.run(command, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise CellFailure(f'cell exceeded {timeout} s', self.record(
+                cell, output, command, None, started, archived,
+                stdout=error.stdout, stderr=error.stderr)) from error
+        record = self.record(cell, output, command, completed.returncode, started,
+                             archived, stdout=completed.stdout, stderr=completed.stderr)
+        if completed.returncode != 0:
+            raise CellFailure(f'exit {completed.returncode}: {record["stderr_tail"]}', record)
+        collect_evidence(database / 'evidence', output / 'evidence')
+        return record
+
+    def record(self, cell, output, command, exit_code, started, archived, *,
+               stdout=None, stderr=None):
+        return dict(cell=cell['id'], mode=self.mode, execution='local',
+                    label=cell_label(cell),
+                    host=socket.gethostname(), client_host=socket.gethostname(),
+                    store_host=socket.gethostname(), command=command,
+                    exit_code=exit_code, started_unix_ns=started,
+                    finished_unix_ns=time.time_ns(), archived_database=archived,
+                    database=str(self.data_root / 'stage3' / 'db' / cell['id']),
+                    output=str(output),
+                    stdout_tail=(stdout or '')[-4000:], stderr_tail=(stderr or '')[-4000:])
+
+
+class HostRunner:
+    """`kv-research` on one cluster host; the output tree is copied back here."""
+
+    def __init__(self, *, remote, host, binary, data_root, mode='cluster'):
+        self.remote = remote
+        self.host = host
+        self.binary = Path(binary)
+        self.data_root = Path(data_root)
+        self.mode = mode
+
+    def run(self, cell, *, output, attempt, timeout=3600):
+        spec = Path(cell['path']).read_bytes()
+        remote_spec = self.data_root / 'stage3' / 'spec' / f'{cell["id"]}.json'
+        database = self.data_root / 'stage3' / 'db' / cell['id']
+        remote_output = self.data_root / 'stage3' / 'out' / cell['id']
+        self.remote.shell(self.host,
+                          f'rm -rf {quote(database)} {quote(remote_output)} && '
+                          f'mkdir -p {quote(remote_spec.parent)} {quote(remote_output)}')
+        self.remote.shell(self.host, f'cat > {quote(remote_spec)}', stdin=spec)
+        command = [str(self.binary), '--config', str(remote_spec),
+                   '--output', str(remote_output)]
+        started = time.time_ns()
+        code, out, err = self.remote.shell(
+            self.host, ' '.join(quote(part) for part in command), check=False)
+        record = dict(cell=cell['id'], mode=self.mode, execution='host',
+                      label=cell_label(cell), host=self.host,
+                      client_host=self.host, store_host=self.host, command=command,
+                      exit_code=code, started_unix_ns=started,
+                      finished_unix_ns=time.time_ns(), archived_database='remote-fresh',
+                      database=str(database), output=str(remote_output),
+                      local_output=str(output),
+                      stdout_tail=out.decode(errors='replace')[-4000:],
+                      stderr_tail=err.decode(errors='replace')[-4000:])
+        if code != 0:
+            raise CellFailure(f'{self.host}: exit {code}: {record["stderr_tail"]}', record)
+        self.remote.shell(
+            self.host, f'if [ -d {quote(database / "evidence")} ]; then '
+                       f'mv {quote(database / "evidence")} {quote(remote_output / "evidence")}; fi')
+        archive = self.remote.run(
+            self.host, f'tar -czf - -C {quote(remote_output)} .')[1]
+        extract_archive(archive, output)
+        return record
+
+
+def collect_evidence(source, target):
+    """Move the backend's read-evidence export into the uploaded output tree."""
+    if Path(source).is_dir():
+        shutil.move(str(source), str(target))
+    return Path(target)
+
+
+def extract_archive(data, target):
+    """Extract a regular-file-only tar held in memory under `target`."""
+    target = Path(target)
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+        for member in archive.getmembers():
+            relative = Path(member.name)
+            if (relative.is_absolute() or '..' in relative.parts
+                    or not (member.isfile() or member.isdir())):
+                raise ValueError(f'unsafe archive member: {member.name}')
+        if hasattr(tarfile, 'data_filter'):
+            archive.extractall(target, filter='data')
+        else:
+            archive.extractall(target)
+    return target
+
+
+class Bucket:
+    """Verified artifact upload under the campaign prefix; passed means uploaded."""
+
+    def __init__(self, objects, prefix):
+        self.objects = objects
+        self.prefix = prefix
+        self.ledger_store = gcs_ledger.ObjectStoreLedger(objects)
+
+    def key(self):
+        return f'{self.prefix}/campaign-ledger.json'
+
+    def publish(self, case_id, produced, output):
+        for artifact in produced:
+            artifact['key'] = upload_key(self.prefix, case_id, artifact['path'], output)
+            self.objects.upload(artifact['key'], artifact['path'])
+        return produced
+
+    def save(self, ledger):
+        return gcs_ledger.save_ledger(self.objects, ledger, self.key())
+
+    def merge(self, ledger):
+        """Read the campaign ledger so a resume on another host starts from it."""
+        try:
+            data, _ = self.ledger_store.get(self.key())
+        except KeyError:
+            return ledger
+        merged = ledger.merge(ledger_module.Ledger.from_bytes(data))
+        merged.path = ledger.path
+        return merged
+
+
+class Owners:
+    """The stage-3 owner process groups of one tier's external preparation."""
+
+    def __init__(self, remote, preparations, *, root, guest_root):
+        self.remote = remote
+        self.preparations = preparations
+        self.root = Path(root)
+        self.guest_root = Path(guest_root)
+        self.active = None
+        self.namespaces = {}
+        self.receipts = []
+
+    def _install(self, prepared):
+        for record in prepared['manifest']['hosts']:
+            archive = Path(record['archive'])
+            if ledger_module.sha256_file(archive) != record['archive_sha256']:
+                raise ValueError(f'owner archive changed after preparation: {archive}')
+            host = record['host']
+            self.remote.shell(host, f'rm -rf {quote(self.guest_root)} && '
+                                    f'mkdir -p {quote(self.guest_root)}')
+            self.remote.shell(host, f'tar -xzf - -C {quote(self.guest_root)}',
+                              stdin=archive.read_bytes())
+            self.remote.shell(host, f'chmod +x {quote(self.guest_root / "storage-node")}')
+
+    def _verify(self, prepared):
+        """The selected commands start the selected database's owners.
+
+        `prepare_external.py` writes one command and one ready file per host in
+        database order, so the database's index selects them. Its launch file's
+        `listen` address must be that database's endpoint for the partition.
+        """
+        index = prepared['index']
+        addresses = {endpoint['partition']: endpoint['address']
+                     for endpoint in prepared['document']['endpoints']}
+        for record in prepared['manifest']['hosts']:
+            command = record['commands'][index]
+            launch = Path(command[2])
+            try:
+                local = prepared['directory'] / launch.relative_to(self.guest_root)
+            except ValueError:
+                raise ValueError(f'owner command is outside the guest root: {launch}') from None
+            listen = yaml.safe_load(local.read_text())['listen']
+            if listen != addresses[record['partition']]:
+                raise ValueError(
+                    f'owner command for partition {record["partition"]} listens on '
+                    f'{listen}, not {addresses[record["partition"]]}')
+
+    def start(self, tier):
+        if self.active == tier:
+            return self.receipts
+        self.stop()
+        prepared = self.preparations[tier]
+        self._verify(prepared)
+        self._install(prepared)
+        index = prepared['index']
+        # Published per host as it starts, so a partial start is still stopped.
+        self.namespaces = {}
+        for record in prepared['manifest']['hosts']:
+            host = record['host']
+            command = record['commands'][index]
+            partition = record['partition']
+            pidfile = self.guest_root / f'owner-{partition}.pid'
+            log = self.guest_root / f'owner-{partition}.log'
+            quoted = ' '.join(quote(part) for part in command)
+            self.remote.shell(host, f'cd {quote(self.guest_root)} && '
+                                    f'setsid sh -c {quote(f"echo $$ > {pidfile}; exec {quoted}")} '
+                                    f'</dev/null >>{quote(log)} 2>&1 &')
+            deadline = time.monotonic() + 30
+            while not self.remote.exists(host, pidfile):
+                if time.monotonic() > deadline:
+                    raise manual_sui.LaunchError(f'{host}: owner did not publish a PID')
+                time.sleep(0.1)
+            pid = int(self.remote.read_bytes(host, pidfile).strip())
+            self.namespaces[host] = dict(partition=partition, command=command, pid=pid,
+                                         process_group=pid, log=str(log), stopped=False)
+        for record in prepared['manifest']['hosts']:
+            ready = record['ready_files'][index]
+            deadline = time.monotonic() + OWNER_READY_SECONDS
+            while not self.remote.exists(record['host'], ready):
+                if time.monotonic() > deadline:
+                    raise manual_sui.LaunchError(f'{record["host"]}: owner readiness expired')
+                time.sleep(0.2)
+        self.active = tier
+        self.receipts = self._copy_receipts(prepared)
+        return self.receipts
+
+    def _copy_receipts(self, prepared):
+        index = prepared['index']
+        rows = []
+        for record in prepared['manifest']['hosts']:
+            host = record['host']
+            partition = record['partition']
+            published = str(record['ready_files'][index]) + '.durability.json'
+            data = self.remote.read_bytes(host, published)
+            receipt = json.loads(data)
+            if (receipt.get('partition') != partition
+                    or receipt.get('durability', {}).get('tier') != self.active
+                    or not receipt.get('launch_nonce')):
+                raise ValueError(f'{host}: owner receipt differs from partition/tier')
+            target = stage3_specs.receipt_path(self.root, self.active, partition)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            rows.append(dict(host=host, partition=partition, published=published,
+                             path=str(target), sha256=ledger_module.sha256_bytes(data),
+                             launch_nonce=receipt['launch_nonce']))
+        return rows
+
+    def stop(self):
+        failures = []
+        for host, entry in self.namespaces.items():
+            if entry.get('stopped'):
+                continue
+            self.remote.shell(host, f'kill -TERM -{entry["process_group"]}', check=False)
+            deadline = time.monotonic() + OWNER_STOP_SECONDS
+            while self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.2)
+            if self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                self.remote.shell(host, f'kill -KILL -{entry["process_group"]}', check=False)
+                deadline = time.monotonic() + 10
+                while self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.1)
+            entry['stopped'] = not self.remote.exists(host, f'/proc/{entry["pid"]}')
+            if not entry['stopped']:
+                failures.append(host)
+        self.active = None if not failures else self.active
+        return failures
+
+
+def schedule(cells):
+    """Arm A before arm B, and one owner start per tier: native, then synchronous."""
+    return sorted(cells, key=lambda cell: (cell.get('arm') == 'B',
+                                           TIER_ORDER[cell['tier']]))
+
+
+def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600):
     """Run one cell from a fresh database and output; return its artifacts."""
-    database = Path(root) / 'stage3' / 'db' / cell['id']
-    output = Path(root) / 'stage3' / 'out' / cell['id']
-    archive_previous(database, stale_root, cell['id'] + '-db', attempt)
     archive_previous(output, stale_root, cell['id'], attempt)
-    command = [str(binary), '--config', cell['path'], '--output', str(output)]
-    completed = subprocess.run(command, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, timeout=timeout)
-    if completed.returncode != 0:
-        tail = (completed.stderr or completed.stdout or '')[-4000:]
-        raise RuntimeError(f'exit {completed.returncode}: {tail}')
+    try:
+        record = runner.run(cell, output=output, attempt=attempt, timeout=timeout)
+    except CellFailure as error:
+        write_record(output, dict(error.record, failure=str(error)))
+        raise
+    write_record(output, record)
     return artifacts(output)
 
 
-def run_campaign(cells, *, binary, root, ledger, only=None,
-                 from_=None, stop_on_failure=True, timeout=3600):
+def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket=None,
+                 only=None, from_=None, stop_on_failure=True, timeout=3600):
     root = Path(root)
     ledger.path = Path(ledger.path) if ledger.path else root / 'stage3' / 'run-ledger.json'
     stale_root = root / 'stage3' / 'stale'
-    planned = ledger_module.plan(list(cells), ledger, only=only, from_=from_)
+    planned = schedule(ledger_module.plan(list(cells), ledger, only=only, from_=from_))
     results = []
-    for cell in planned:
-        entry = ledger.begin(stage=cell['stage'], cell_id=cell['id'],
-                             config_hash=cell['config_hash'], unit=cell.get('unit'),
-                             start_from='fresh')
-        ledger.save()
-        try:
-            produced = run_cell(cell, binary=binary, root=root,
-                                stale_root=stale_root, attempt=entry['attempts'],
-                                timeout=timeout)
-            ledger.mark_passed(entry, produced)
-            ledger.save()
-            results.append(dict(id=cell['id'], status='passed'))
-        except BaseException as error:
-            ledger.fail(entry, error)
-            ledger.save()
-            results.append(dict(id=cell['id'], status='failed', failure=str(error)))
-            if stop_on_failure:
-                break
+    try:
+        for cell in planned:
+            entry = ledger.begin(stage=cell['stage'], cell_id=cell['id'],
+                                 config_hash=cell['config_hash'], unit=cell.get('unit'),
+                                 start_from='fresh')
+            save(ledger, bucket)
+            runner = local if cell['arm'] == 'A' else remote
+            if runner is None and local.mode == 'rehearsal':
+                runner = local
+            try:
+                if runner is None:
+                    raise ValueError(f'arm {cell["arm"]} cell {cell["id"]} has no runner')
+                if cell['arm'] == 'B' and owners is not None:
+                    owners.stop()
+                if cell['arm'] == 'A' and owners is not None:
+                    owners.start(cell['tier'])
+                output = root / 'stage3' / 'out' / cell['id']
+                produced = run_cell(cell, runner, output=output, stale_root=stale_root,
+                                    attempt=entry['attempts'], timeout=timeout)
+                if bucket is not None:
+                    bucket.publish(cell['id'], produced, output)
+                ledger.mark_passed(entry, produced,
+                                   store=None if bucket is None else bucket.ledger_store)
+                save(ledger, bucket)
+                results.append(dict(id=cell['id'], status='passed', mode=runner.mode))
+            except BaseException as error:
+                ledger.fail(entry, error)
+                save(ledger, bucket)
+                results.append(dict(id=cell['id'], status='failed', mode=runner.mode,
+                                    failure=str(error)))
+                if stop_on_failure:
+                    break
+    finally:
+        if owners is not None:
+            failed = owners.stop()
+            results.append(dict(id='owner-processes',
+                                status='failed' if failed else 'stopped',
+                                detail=sorted(failed)))
     return results, planned
+
+
+def save(ledger, bucket):
+    if bucket is None:
+        ledger.save()
+    else:
+        bucket.save(ledger)
+
+
+def bucket_store(prefix, account, deadline_seconds):
+    """One reviewed credential path: the delegated guest ObjectStore."""
+    if account != gcp_manual_storage.ACCOUNT:
+        raise SystemExit('only the reviewed guest identity is delegated: '
+                         + gcp_manual_storage.ACCOUNT)
+    if not prefix.startswith('gs://'):
+        raise SystemExit('--bucket-prefix must be gs://<bucket>/<campaign prefix>')
+    bucket, _, key_prefix = prefix[len('gs://'):].partition('/')
+    if bucket != gcp_manual_storage.BUCKET or not key_prefix.strip('/'):
+        raise SystemExit('--bucket-prefix must name '
+                         f'gs://{gcp_manual_storage.BUCKET}/<campaign prefix>')
+    if type(deadline_seconds) is not int or deadline_seconds <= 0:
+        raise SystemExit('--bucket-deadline-seconds must be a positive integer')
+    store = gcp_manual_storage.DelegatedArtifacts(
+        bucket, deadline=time.time() + deadline_seconds)
+    return Bucket(store, key_prefix.strip('/'))
+
+
+def plan_hosts(owners):
+    if owners is None or len(owners) != stage3_specs.OWNERS:
+        raise SystemExit(f'--owners needs exactly {stage3_specs.OWNERS} owner hosts')
+    if len(set(owners)) != len(owners):
+        raise SystemExit('owner hosts must be distinct')
+    return list(owners)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True,
                         help='campaign root with stage3/{spec,db,out,stale}')
-    parser.add_argument('--binary', type=Path, required=True, help='kv-research')
+    parser.add_argument('--binary', type=Path, required=True,
+                        help='kv-research (the campaign bundle calls it storage-node)')
     parser.add_argument('--ledger', type=Path)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--only', action='append', default=[])
@@ -127,11 +526,56 @@ def main():
     parser.add_argument('--engine-rev', default='unknown')
     parser.add_argument('--sui-rev', default='unknown')
     parser.add_argument('--timeout', type=int, default=3600)
+    parser.add_argument('--measurement-operations', type=int,
+                        default=stage3_specs.MEASUREMENT_OPERATIONS)
+    parser.add_argument('--mode', choices=('cluster', 'rehearsal'), default='cluster')
+    parser.add_argument('--external', action='append', default=[], metavar='TIER=DIR',
+                        help='prepare_external.py output per tier, repeated (cluster)')
+    parser.add_argument('--external-database', help='config.json database key every cell uses')
+    parser.add_argument('--native-root', type=Path,
+                        help='absolute store root of the owner host (cluster arm B)')
+    parser.add_argument('--guest-root', type=Path,
+                        help='absolute external deployment root, identical on every host')
+    parser.add_argument('--owners', help='owner hosts, comma separated (H1,H2)')
+    parser.add_argument('--native-host', help='owner host that runs arm B; defaults to owners[0]')
+    parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
+    parser.add_argument('--iap', action='store_true', help='tunnel remote commands through IAP')
+    parser.add_argument('--bucket-prefix',
+                        help='gs://mysten-research-bench-artifacts/<campaign prefix>')
+    parser.add_argument('--impersonate-service-account', default=gcp_manual_storage.ACCOUNT)
+    parser.add_argument('--bucket-deadline-seconds', type=int, default=7200)
     args = parser.parse_args()
     root = args.root.resolve()
-    spec_dir = root / 'stage3' / 'spec'
-    if not spec_dir.exists():
-        stage3_specs.write(root)
+    cluster = args.mode == 'cluster'
+    if cluster:
+        required = dict(external=args.external, guest_root=args.guest_root,
+                        owners=args.owners, zone=args.zone, native_root=args.native_root,
+                        bucket_prefix=args.bucket_prefix)
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise SystemExit('cluster mode needs --' + ', --'.join(
+                name.replace('_', '-') for name in missing)
+                + '; pass --mode rehearsal for the labelled single-host fixture')
+        if not args.guest_root.is_absolute() or not args.native_root.is_absolute():
+            raise SystemExit('--guest-root and --native-root must be absolute')
+        if args.bucket_prefix and not args.bucket_prefix.startswith('gs://'):
+            raise SystemExit('--bucket-prefix must be gs://<bucket>/<campaign prefix>')
+    elif args.external or args.guest_root or args.owners or args.native_root:
+        raise SystemExit('rehearsal mode runs the local fixture and takes no '
+                         '--external, --guest-root, --owners or --native-root')
+    external = (stage3_specs.external_map(stage3_specs.external_items(args.external),
+                                          database=args.external_database)
+                if cluster else None)
+    if external is not None:
+        expected = {preparation['manifest']['storage_binary_sha256']
+                    for preparation in external.values()}
+        if len(expected) != 1 or ledger_module.sha256_file(args.binary) not in expected:
+            raise SystemExit('--binary is not the storage binary the external '
+                             'preparation was built from')
+    owner_hosts = plan_hosts(args.owners.split(',')) if cluster else []
+    stage3_specs.write(root, args.measurement_operations,
+                       native_root=args.native_root if cluster else None,
+                       external=external)
     binary_ids = {name: ledger_module.sha256_file(Path(args.binary))
                   for name in ('kv-research',)}
     cells = cells_for(root, engine_rev=args.engine_rev, sui_rev=args.sui_rev,
@@ -142,11 +586,29 @@ def main():
     ledger = ledger_module.Ledger(path)
     if args.resume:
         ledger.load()
+    bucket = (bucket_store(args.bucket_prefix, args.impersonate_service_account,
+                           args.bucket_deadline_seconds)
+              if args.bucket_prefix else None)
+    if args.resume and bucket is not None:
+        ledger = bucket.merge(ledger)
+    local = LocalRunner(binary=args.binary, data_root=root,
+                        stale_root=root / 'stage3' / 'stale',
+                        mode=args.mode)
+    remote = owners = None
+    if cluster:
+        remote_transport = manual_sui.Remote(args.zone, iap=args.iap)
+        remote = HostRunner(remote=remote_transport,
+                            host=args.native_host or owner_hosts[0],
+                            binary=args.guest_root / 'storage-node',
+                            data_root=args.native_root, mode=args.mode)
+        owners = Owners(remote_transport, external, root=root,
+                        guest_root=args.guest_root)
     results, planned = run_campaign(
-        cells, binary=args.binary, root=root, ledger=ledger,
-        only=args.only or None, from_=args.from_,
+        cells, local=local, root=root, ledger=ledger, remote=remote, owners=owners,
+        bucket=bucket, only=args.only or None, from_=args.from_,
         stop_on_failure=not args.continue_on_failure, timeout=args.timeout)
-    print(json.dumps(dict(planned=[cell['id'] for cell in planned], results=results)))
+    print(json.dumps(dict(mode=args.mode,
+                          planned=[cell['id'] for cell in planned], results=results)))
 
 
 if __name__ == '__main__':
