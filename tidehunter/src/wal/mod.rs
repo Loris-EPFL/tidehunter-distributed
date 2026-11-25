@@ -67,12 +67,16 @@ pub struct Wal {
     #[cfg(feature = "experimental-distributed")]
     external_preparation: Arc<external::ExternalPreparation>,
     /// Files below this id hold only finished writes and are synced; see
-    /// `sync_files_through`. Read only when the distributed feature is on: the
-    /// coordinator's index snapshot persists the index WAL files it names; a
-    /// single-node `Db` syncs each WAL's current file instead.
-    #[cfg_attr(not(feature = "experimental-distributed"), allow(dead_code))]
+    /// `sync_files_through`. The snapshot uses it before it stores a control
+    /// region that names those files.
     synced_below: AtomicU64,
+    #[cfg(test)]
+    file_sync_hook: parking_lot::Mutex<Option<FileSyncHook>>,
 }
+
+/// Test hook run after a file sync, with the synced file id.
+#[cfg(test)]
+type FileSyncHook = Box<dyn Fn(position::WalFileId) + Send>;
 
 /// Sampled native benchmark barrier work, not isolated device latency.
 /// Counts include failed attempts; nanoseconds cover the same attempts.
@@ -498,6 +502,8 @@ impl Wal {
             #[cfg(feature = "experimental-distributed")]
             external_preparation,
             synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         };
         Ok(Arc::new(wal))
     }
@@ -524,6 +530,8 @@ impl Wal {
             #[cfg(feature = "experimental-distributed")]
             external_preparation: Arc::new(external::ExternalPreparation::new(false)),
             synced_below: AtomicU64::new(0),
+            #[cfg(test)]
+            file_sync_hook: Default::default(),
         }))
     }
 
@@ -1044,6 +1052,8 @@ impl Wal {
     pub fn fsync(&self) -> io::Result<()> {
         let files = self.files.load();
         files.current_file().sync_all()?;
+        #[cfg(test)]
+        self.run_file_sync_hook(files.current_file_id());
         Ok(())
     }
 
@@ -1055,11 +1065,6 @@ impl Wal {
     /// Every write below `complete_below` has finished, so files below it are
     /// never written again. A later call skips the files this call syncs below
     /// that id; the others it syncs again.
-    ///
-    /// Native `Db` syncs each WAL's current file (`fsync`); this is the
-    /// coordinator's index-snapshot path, hence the dead-code allowance in a
-    /// build without the distributed feature.
-    #[cfg_attr(not(feature = "experimental-distributed"), allow(dead_code))]
     pub(crate) fn sync_files_through(
         &self,
         last: position::WalFileId,
@@ -1072,12 +1077,28 @@ impl Wal {
         if floor <= last {
             for (_id, file) in files.files.range(floor..=last) {
                 file.sync_all()?;
+                #[cfg(test)]
+                self.run_file_sync_hook(*_id);
             }
         }
         File::open(&files.base_path)?.sync_all()?;
         let synced_below = complete_below.0.min(last.0.saturating_add(1));
         self.synced_below.fetch_max(synced_below, Ordering::Release);
         Ok(())
+    }
+
+    /// Installs a hook that runs after each file sync by `fsync` or
+    /// `sync_files_through`.
+    #[cfg(test)]
+    pub(crate) fn set_file_sync_hook(&self, hook: FileSyncHook) {
+        *self.file_sync_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_file_sync_hook(&self, id: position::WalFileId) {
+        if let Some(hook) = self.file_sync_hook.lock().as_ref() {
+            hook(id);
+        }
     }
 
     /// Complete deletion authorized by a durable distributed recovery root.
