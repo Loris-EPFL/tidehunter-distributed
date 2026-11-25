@@ -1,7 +1,6 @@
 """Operator driver tests: parsing, gates, receipts and the dry-run CLI."""
 import io
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -317,7 +316,6 @@ class FenceVerdict(unittest.TestCase):
 
 class DryRun(unittest.TestCase):
     def test_the_plan_names_every_run_without_touching_a_host(self):
-        import contextlib
         argv = ['fault_cells.py', '--cell', 'M13-batch132-synchronous',
                 '--build', str(ROOT), '--output', '/tmp/mech-out',
                 '--guest-root', '/var/tmp/guest', '--coordinator', 'H0',
