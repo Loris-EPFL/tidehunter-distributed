@@ -1,6 +1,8 @@
 use crate::WalPosition;
 use crate::batch::RelocatedWriteBatch;
-use crate::db::{BackgroundThread, Db, DbResult, WalEntry};
+#[cfg(feature = "experimental-distributed")]
+use crate::db::BackgroundThread;
+use crate::db::{Db, DbResult, WalEntry};
 use crate::flusher::RelocationFlush;
 use crate::key_shape::KeySpace;
 use crate::metrics::Metrics;
@@ -256,6 +258,7 @@ impl RelocationDriver {
         receiver: mpsc::Receiver<RelocationCommand>,
         metrics: Arc<Metrics>,
     ) -> JoinHandle<()> {
+        #[cfg(feature = "experimental-distributed")]
         let health = Arc::clone(
             &db.upgrade()
                 .expect("opener keeps the database alive")
@@ -267,9 +270,12 @@ impl RelocationDriver {
             receiver,
             metrics,
         };
+        let run = move || driver.run();
+        #[cfg(feature = "experimental-distributed")]
+        let run = move || health.run(BackgroundThread::Relocator, run);
         std::thread::Builder::new()
             .name("relocator".to_string())
-            .spawn(move || health.run(BackgroundThread::Relocator, || driver.run()))
+            .spawn(run)
             .unwrap()
     }
 

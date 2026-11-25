@@ -14,6 +14,7 @@ pub(crate) mod test_position;
 pub(crate) mod tracker;
 pub(crate) mod tracking_mmap;
 
+#[cfg(feature = "experimental-distributed")]
 use crate::background_health::BackgroundHealth;
 use crate::context::ReadType;
 use crate::crc::{CrcFrame, CrcReadError, IntoBytesFixed};
@@ -59,6 +60,7 @@ pub struct Wal {
     layout: WalLayout,
     maps: Arc<ArcSwap<WalMaps>>,
     metrics: Arc<Metrics>,
+    #[cfg(feature = "experimental-distributed")]
     background_health: Arc<BackgroundHealth>,
     #[cfg(feature = "experimental-distributed")]
     retained: bool,
@@ -414,9 +416,20 @@ impl Wal {
         layout: WalLayout,
         metrics: Arc<Metrics>,
     ) -> io::Result<Arc<Self>> {
-        Self::open_with_background_health(base_path, layout, metrics, Arc::default())
+        Self::open_inner(
+            base_path,
+            layout,
+            metrics,
+            #[cfg(feature = "experimental-distributed")]
+            Arc::default(),
+            #[cfg(feature = "experimental-distributed")]
+            false,
+            #[cfg(feature = "experimental-distributed")]
+            false,
+        )
     }
 
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) fn open_with_background_health(
         base_path: &Path,
         layout: WalLayout,
@@ -451,7 +464,7 @@ impl Wal {
         base_path: &Path,
         layout: WalLayout,
         metrics: Arc<Metrics>,
-        background_health: Arc<BackgroundHealth>,
+        #[cfg(feature = "experimental-distributed")] background_health: Arc<BackgroundHealth>,
         #[cfg(feature = "experimental-distributed")] prewrite: bool,
         #[cfg(feature = "experimental-distributed")] pin_reads: bool,
     ) -> io::Result<Arc<Self>> {
@@ -478,6 +491,7 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            #[cfg(feature = "experimental-distributed")]
             background_health,
             #[cfg(feature = "experimental-distributed")]
             retained: false,
@@ -504,6 +518,7 @@ impl Wal {
             layout,
             maps: Default::default(),
             metrics,
+            #[cfg(feature = "experimental-distributed")]
             background_health: Arc::default(),
             retained: true,
             #[cfg(feature = "experimental-distributed")]
@@ -1468,6 +1483,7 @@ impl WalIterator {
         let syncer = WalSyncer::start(
             self.wal.metrics.clone(),
             self.wal.layout.kind.name(),
+            #[cfg(feature = "experimental-distributed")]
             self.wal.background_health.clone(),
         );
         self.wal.maps.store(Arc::new(self.maps));
@@ -1477,6 +1493,7 @@ impl WalIterator {
             self.wal.layout.clone(),
             syncer,
             self.wal.metrics.clone(),
+            #[cfg(feature = "experimental-distributed")]
             self.wal.background_health.clone(),
             #[cfg(feature = "experimental-distributed")]
             self.wal.external_preparation.clone(),
@@ -1493,6 +1510,7 @@ impl WalIterator {
             mapper,
             LastProcessed::new(position),
             self.wal.metrics.clone(),
+            #[cfg(feature = "experimental-distributed")]
             self.wal.background_health.clone(),
             last_processed,
         );

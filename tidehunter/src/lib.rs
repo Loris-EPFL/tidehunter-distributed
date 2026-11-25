@@ -1,3 +1,4 @@
+#[cfg(feature = "experimental-distributed")]
 mod background_health;
 pub mod batch;
 mod cell;

@@ -4,6 +4,7 @@ use super::layout::WalLayout;
 use super::position::{MapId, WalFileId};
 use super::tracking_mmap::TrackingMMapMut;
 use super::{Map, Wal, WalFiles};
+#[cfg(feature = "experimental-distributed")]
 use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::metrics::{MetricIntCounter, MetricIntGauge, Metrics, TimerExt};
 use crate::wal::syncer::WalSyncer;
@@ -149,25 +150,30 @@ struct UnlinkMessage {
 }
 
 impl UnlinkWorker {
-    fn start(metrics: Arc<Metrics>, kind: &'static str, health: Arc<BackgroundHealth>) -> Self {
+    fn start(
+        metrics: Arc<Metrics>,
+        kind: &'static str,
+        #[cfg(feature = "experimental-distributed")] health: Arc<BackgroundHealth>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel::<UnlinkMessage>();
         let time_mcs = metrics.wal_unlinker_time_mcs.with_label_values(&[kind]);
         let retry_count = metrics
             .wal_unlinker_close_retry_count
             .with_label_values(&[kind]);
+        let run = move || {
+            for msg in receiver {
+                let _timer = time_mcs.clone().mcs_timer();
+                drop_arc_file(msg.file, &msg.path, &retry_count);
+                if msg.path.exists() {
+                    std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
+                }
+            }
+        };
+        #[cfg(feature = "experimental-distributed")]
+        let run = move || health.run(BackgroundThread::WalUnlinker, run);
         let jh = thread::Builder::new()
             .name("wal-unlinker".to_string())
-            .spawn(move || {
-                health.run(BackgroundThread::WalUnlinker, || {
-                    for msg in receiver {
-                        let _timer = time_mcs.clone().mcs_timer();
-                        drop_arc_file(msg.file, &msg.path, &retry_count);
-                        if msg.path.exists() {
-                            std::fs::remove_file(&msg.path).expect("Failed to remove wal file");
-                        }
-                    }
-                });
-            })
+            .spawn(run)
             .expect("failed to start wal-unlinker thread");
         Self {
             sender: Some(sender),
@@ -251,7 +257,7 @@ impl WalMapper {
         layout: WalLayout,
         syncer: WalSyncer,
         metrics: Arc<Metrics>,
-        health: Arc<BackgroundHealth>,
+        #[cfg(feature = "experimental-distributed")] health: Arc<BackgroundHealth>,
         #[cfg(feature = "experimental-distributed")] external_preparation: Arc<ExternalPreparation>,
     ) -> Self {
         let maps = maps_arc.load();
@@ -270,7 +276,12 @@ impl WalMapper {
         #[cfg(feature = "experimental-distributed")]
         let this_files = files.clone();
         let (sender, receiver) = mpsc::sync_channel(5);
-        let unlinker = UnlinkWorker::start(metrics.clone(), layout.kind.name(), health.clone());
+        let unlinker = UnlinkWorker::start(
+            metrics.clone(),
+            layout.kind.name(),
+            #[cfg(feature = "experimental-distributed")]
+            health.clone(),
+        );
         let this = WalMapperThread {
             maps,
             maps_arc,
@@ -287,18 +298,23 @@ impl WalMapper {
             #[cfg(all(test, feature = "experimental-distributed"))]
             map_pause: None,
         };
+        #[cfg(not(feature = "experimental-distributed"))]
+        let run = move || {
+            // `make_map` panics on failure in this build, as upstream does.
+            this.run();
+        };
+        #[cfg(feature = "experimental-distributed")]
+        let run = move || {
+            health.run(BackgroundThread::WalMapper, || {
+                if let Err(error) = this.run() {
+                    health
+                        .record_error(BackgroundThread::WalMapper, &crate::db::DbError::Io(error));
+                }
+            });
+        };
         let jh = thread::Builder::new()
             .name("wal-mapper".to_string())
-            .spawn(move || {
-                health.run(BackgroundThread::WalMapper, || {
-                    if let Err(error) = this.run() {
-                        health.record_error(
-                            BackgroundThread::WalMapper,
-                            &crate::db::DbError::Io(error),
-                        );
-                    }
-                });
-            })
+            .spawn(run)
             .expect("failed to start wal-mapper thread");
         let sender = Some(sender);
         let jh = Some(jh);
@@ -408,7 +424,24 @@ impl Drop for WalMapper {
 }
 
 impl WalMapperThread {
-    pub fn run(mut self) -> std::io::Result<()> {
+    #[cfg(feature = "experimental-distributed")]
+    pub fn run(self) -> std::io::Result<()> {
+        self.run_loop()
+    }
+
+    /// Upstream `make_map` panics on a failed file create or extend, so a
+    /// native build has no error to return.
+    #[cfg(not(feature = "experimental-distributed"))]
+    #[allow(
+        clippy::expect_used,
+        reason = "the native loop cannot fail: make_map panics on create or extend"
+    )]
+    pub fn run(self) {
+        self.run_loop()
+            .expect("the native WAL mapper loop has no fallible step");
+    }
+
+    fn run_loop(mut self) -> std::io::Result<()> {
         let mut map_id = *self
             .maps
             .maps
@@ -642,7 +675,15 @@ impl WalMapperThread {
         if file_id > files.current_file_id() {
             assert_eq!(file_id, WalFileId(files.current_file_id().0 + 1));
             let new_file_path = self.layout.wal_file_name(&files.base_path, file_id);
-            let new_file = Wal::open_file(&new_file_path, &self.layout)?;
+            let opened = Wal::open_file(&new_file_path, &self.layout);
+            #[cfg(not(feature = "experimental-distributed"))]
+            #[allow(
+                clippy::expect_used,
+                reason = "upstream make_map panics when the WAL file cannot be created"
+            )]
+            let new_file = opened.expect("Failed to create new wal file");
+            #[cfg(feature = "experimental-distributed")]
+            let new_file = opened?;
             let new_wal_files = files.with_file(file_id, Arc::new(new_file));
             self.files.store(Arc::new(new_wal_files));
             files = self.files.load();
@@ -656,7 +697,15 @@ impl WalMapperThread {
             files = self.files.load();
         }
         let file = files.get(file_id);
-        Wal::extend_to_map_id(&self.layout, file, map_id)?;
+        let extended = Wal::extend_to_map_id(&self.layout, file, map_id);
+        #[cfg(not(feature = "experimental-distributed"))]
+        #[allow(
+            clippy::expect_used,
+            reason = "upstream make_map panics when the WAL file cannot be extended"
+        )]
+        extended.expect("Failed to extend wal file");
+        #[cfg(feature = "experimental-distributed")]
+        extended?;
         self.maps.map(
             file,
             &self.layout,

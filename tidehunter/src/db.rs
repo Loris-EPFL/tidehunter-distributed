@@ -1,4 +1,6 @@
+#[cfg(feature = "experimental-distributed")]
 use crate::background_health::BackgroundHealth;
+#[cfg(feature = "experimental-distributed")]
 pub use crate::background_health::{BackgroundFailure, BackgroundFailureReason, BackgroundThread};
 use crate::batch::{PendingOp, RelocatedWriteBatch, WriteBatch};
 use crate::cell::CellId;
@@ -99,6 +101,7 @@ pub struct Db {
     /// One handle per pending-promotion shard, for waking threads after batch commits.
     /// Index `i` owns mutex shards where `mutex_idx % len == i`.
     pending_promotion_threads: Box<[OnceLock<thread::Thread>]>,
+    #[cfg(feature = "experimental-distributed")]
     pub(crate) background_health: Arc<BackgroundHealth>,
     _lock: Mutex<Option<DbLock>>,
 }
@@ -141,24 +144,6 @@ impl Db {
         metrics: Arc<Metrics>,
         check_benchmark_geometry: bool,
     ) -> DbResult<Arc<Self>> {
-        Self::open_with_background_health(
-            path,
-            key_shape,
-            config,
-            metrics,
-            check_benchmark_geometry,
-            Arc::default(),
-        )
-    }
-
-    fn open_with_background_health(
-        path: &Path,
-        key_shape: KeyShape,
-        config: Arc<Config>,
-        metrics: Arc<Metrics>,
-        check_benchmark_geometry: bool,
-        background_health: Arc<BackgroundHealth>,
-    ) -> DbResult<Arc<Self>> {
         config.validate();
         let path = path.canonicalize()?;
         let lock = DbLock::acquire(&path, config.open_lock_retry_timeout)?;
@@ -167,18 +152,26 @@ impl Db {
         }
         let (key_shape, keyspaces, registry_dirty) = Self::reconcile_key_shape(&path, key_shape)?;
         Self::maybe_create_config_file(&path, &config)?;
+        #[cfg(feature = "experimental-distributed")]
+        let background_health: Arc<BackgroundHealth> = Arc::default();
+        #[cfg(feature = "experimental-distributed")]
         let wal = Wal::open_with_background_health(
             &path,
             config.wal_layout(WalKind::Replay),
             metrics.clone(),
             background_health.clone(),
         )?;
+        #[cfg(not(feature = "experimental-distributed"))]
+        let wal = Wal::open(&path, config.wal_layout(WalKind::Replay), metrics.clone())?;
+        #[cfg(feature = "experimental-distributed")]
         let indexes = Wal::open_with_background_health(
             &path,
             config.wal_layout(WalKind::Index),
             metrics.clone(),
             background_health.clone(),
         )?;
+        #[cfg(not(feature = "experimental-distributed"))]
+        let indexes = Wal::open(&path, config.wal_layout(WalKind::Index), metrics.clone())?;
         let (control_region_store, control_region) =
             Self::read_or_create_control_region(path.join(CONTROL_REGION_FILE), &key_shape)?;
         if registry_dirty {
@@ -286,6 +279,7 @@ impl Db {
             index_blob_cache,
             commit_pool,
             pending_promotion_threads,
+            #[cfg(feature = "experimental-distributed")]
             background_health,
             _lock: Mutex::new(Some(lock)),
         };
@@ -329,6 +323,7 @@ impl Db {
     /// A failure permanently rejects subsequent mutations and commits on this
     /// instance. Close and reopen the database to recover from the WAL.
     /// Operations already in flight when a worker fails can still complete.
+    #[cfg(feature = "experimental-distributed")]
     #[inline]
     pub fn check_background_health(&self) -> DbResult<()> {
         self.background_health.check()
@@ -528,13 +523,21 @@ impl Db {
         // todo account number of bytes read during wal replay
         let position = self.wal_writer.position();
         let weak = Arc::downgrade(self);
+        #[cfg(feature = "experimental-distributed")]
         let health = Arc::clone(&self.background_health);
         thread::Builder::new()
             .name("snapshot".to_string())
             .spawn(move || {
-                health.run(BackgroundThread::Snapshot, || {
+                #[cfg(feature = "experimental-distributed")]
+                {
+                    health.run(BackgroundThread::Snapshot, || {
+                        Self::periodic_snapshot_thread(weak, position)
+                    })
+                }
+                #[cfg(not(feature = "experimental-distributed"))]
+                {
                     Self::periodic_snapshot_thread(weak, position)
-                })
+                }
             })
             .unwrap();
     }
@@ -1871,6 +1874,7 @@ impl Db {
         shard_idx: usize,
         num_shards: usize,
     ) -> thread::JoinHandle<()> {
+        #[cfg(feature = "experimental-distributed")]
         let health = Arc::clone(
             &db.upgrade()
                 .expect("opener keeps the database alive")
@@ -1879,7 +1883,7 @@ impl Db {
         thread::Builder::new()
             .name(format!("pending-promotion-{shard_idx}"))
             .spawn(move || {
-                health.run(BackgroundThread::PendingPromotion, || {
+                let run = move || {
                     loop {
                         thread::park();
                         let Some(db) = db.upgrade() else { break };
@@ -1892,12 +1896,17 @@ impl Db {
                             db.large_table
                                 .promote_dirty_pending(db.as_ref(), shard_idx, num_shards)
                         {
+                            #[cfg(feature = "experimental-distributed")]
                             db.background_health
                                 .record_error(BackgroundThread::PendingPromotion, &e);
                             eprintln!("Error in pending promotion job: {:?}", e);
                         }
                     }
-                });
+                };
+                #[cfg(feature = "experimental-distributed")]
+                health.run(BackgroundThread::PendingPromotion, run);
+                #[cfg(not(feature = "experimental-distributed"))]
+                run();
             })
             .unwrap()
     }
@@ -1905,6 +1914,7 @@ impl Db {
     /// Starts a background thread that compacts BTreeMap index entries into flat arrays.
     /// Runs on a 10-second polling cadence, independently of the pending-promotion thread.
     fn start_flat_promotion_job(db: Weak<Db>) -> thread::JoinHandle<()> {
+        #[cfg(feature = "experimental-distributed")]
         let health = Arc::clone(
             &db.upgrade()
                 .expect("opener keeps the database alive")
@@ -1913,19 +1923,24 @@ impl Db {
         thread::Builder::new()
             .name("flat-promotion".to_string())
             .spawn(move || {
-                health.run(BackgroundThread::FlatPromotion, || {
+                let run = move || {
                     loop {
                         thread::sleep(Duration::from_secs(10));
                         // Plain drop is asynchronous; use wait_for_background_threads_to_finish for synchronous close.
                         let Some(db) = db.upgrade() else { break };
                         let _timer = db.metrics.flat_promotion_job_time_mcs.clone().mcs_timer();
                         if let Err(e) = db.large_table.promote_flat_job(db.as_ref()) {
+                            #[cfg(feature = "experimental-distributed")]
                             db.background_health
                                 .record_error(BackgroundThread::FlatPromotion, &e);
                             eprintln!("Error in flat promotion job: {:?}", e);
                         }
                     }
-                });
+                };
+                #[cfg(feature = "experimental-distributed")]
+                health.run(BackgroundThread::FlatPromotion, run);
+                #[cfg(not(feature = "experimental-distributed"))]
+                run();
             })
             .unwrap()
     }
@@ -2332,6 +2347,7 @@ impl FlusherHost<WalPosition> for Db {
         self.large_table.fp.fp_flush_before_completion();
     }
 
+    #[cfg(feature = "experimental-distributed")]
     fn background_health(&self) -> Arc<crate::background_health::BackgroundHealth> {
         Arc::clone(&self.background_health)
     }
@@ -2410,6 +2426,7 @@ pub enum DbError {
     CrCorrupted,
     WalError(WalError),
     CorruptedIndexEntry(bincode::Error),
+    #[cfg(feature = "experimental-distributed")]
     BackgroundFailure(Arc<BackgroundFailure>),
 }
 

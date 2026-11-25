@@ -1,5 +1,6 @@
 use super::Map;
 use super::tracking_mmap::TrackingMMapMut;
+#[cfg(feature = "experimental-distributed")]
 use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::metrics::Metrics;
 use std::sync::{Arc, mpsc};
@@ -23,16 +24,23 @@ struct SyncRequest {
 }
 
 impl WalSyncer {
-    pub fn start(metrics: Arc<Metrics>, kind: &'static str, health: Arc<BackgroundHealth>) -> Self {
+    pub fn start(
+        metrics: Arc<Metrics>,
+        kind: &'static str,
+        #[cfg(feature = "experimental-distributed")] health: Arc<BackgroundHealth>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let syncer_thread = WalSyncerThread {
             receiver,
             metrics,
             kind,
         };
+        let run = move || syncer_thread.run();
+        #[cfg(feature = "experimental-distributed")]
+        let run = move || health.run(BackgroundThread::WalSyncer, run);
         let jh = thread::Builder::new()
             .name("wal-syncer".to_string())
-            .spawn(move || health.run(BackgroundThread::WalSyncer, || syncer_thread.run()))
+            .spawn(run)
             .unwrap();
         let sender = Some(sender);
         let jh = Some(jh);
