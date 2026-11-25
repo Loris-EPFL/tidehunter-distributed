@@ -28,6 +28,7 @@ from pathlib import Path
 import re
 import shlex
 import time
+import uuid
 
 import gcp_api
 import gcp_runtime
@@ -126,7 +127,7 @@ class MailboxExec(host_exec.HostExecution):
     # ---- requests ------------------------------------------------------
     def next_operation(self):
         self.operations += 1
-        return f'cmd-{self.operations:06d}-{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:12]}'
+        return f'cmd-{self.operations:06d}-{uuid.uuid4().hex[:12]}'
 
     def index_of(self, host):
         if not isinstance(host, str) or host not in self.hosts:
@@ -271,7 +272,10 @@ class MailboxExec(host_exec.HostExecution):
                                        if record.get('fleet')]
         if len(fleet) != state.get('host_count'):
             raise ValueError('fleet state does not describe every host')
-        return cls(api, bucket=bucket or state['bucket'], run_id=state['run_id'], fleet=fleet,
+        bucket = bucket or state.get('bucket')
+        if not isinstance(bucket, str) or not bucket:
+            raise ValueError('fleet state names no artifact bucket')
+        return cls(api, bucket=bucket, run_id=state['run_id'], fleet=fleet,
                    source_sha256=state['source_sha256'], deadline_utc=state['deadline'],
                    timeout_seconds=timeout_seconds)
 

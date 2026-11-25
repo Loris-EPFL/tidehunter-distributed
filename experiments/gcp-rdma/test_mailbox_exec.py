@@ -393,6 +393,19 @@ class FleetStateTests(unittest.TestCase):
             client = mailbox_exec.MailboxExec.from_state(path, Api())
         self.assertEqual(client.index_of(FLEET[1]['internal_ip']), 1)
 
+    def test_a_fleet_state_without_a_bucket_needs_one(self):
+        state = {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline(),
+                 'host_count': 3,
+                 'instances': [{'name': f'{RUN}-{index}', 'fleet': host}
+                               for index, host in enumerate(FLEET)]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            path.write_text(json.dumps(state))
+            with self.assertRaises(ValueError):
+                mailbox_exec.MailboxExec.from_state(path, Api())
+            self.assertEqual(mailbox_exec.MailboxExec.from_state(
+                path, Api(), bucket='bucket').run_id, RUN)
+
     def test_a_fleet_state_with_a_missing_host_is_refused(self):
         state = {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline(),
                  'host_count': 3, 'bucket': 'bucket',
