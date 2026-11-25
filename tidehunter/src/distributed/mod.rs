@@ -39,8 +39,10 @@ pub mod types;
 pub mod write_timeline;
 
 #[cfg(test)]
+#[path = "group_model_tests.rs"]
 mod group_model;
 #[cfg(test)]
+#[path = "model_tests.rs"]
 mod model;
 #[cfg(test)]
 pub(crate) mod test_bounds;
