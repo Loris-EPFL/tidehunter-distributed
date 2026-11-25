@@ -37,6 +37,8 @@ from q1_package import PROFILE as Q1_PROFILE
 from cloud_campaign import NVMEOF_PATH_SELECTIONS, REDRAIN_AB_SELECTION
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'sui-checkpoint'))
+import campaign_ledger as ledger_module
 
 PREPARATION_SECONDS = 900
 PAIR_SECONDS = 1200
@@ -1343,6 +1345,33 @@ def _start_lease(store, parent, path, *, max_runs=3, ceiling_cents=CEILING_CENTS
         raise
 
 
+def campaign_identity(spec, revision, receipt):
+    """Hash of the campaign suite's behaviour bindings."""
+    return ledger_module.config_hash(
+        spec=ledger_module.sha256_bytes(_json(spec)),
+        knobs=dict(mode=spec.get('mode'), suite=spec.get('suite'),
+                   owner_hosts=spec.get('owner_hosts'),
+                   reservation_hours=spec.get('reservation_hours')),
+        engine_rev=revision, sui_rev=revision,
+        binary_ids=dict(manifest=receipt.get('manifest_sha256'),
+                        source=receipt.get('source_sha256')))
+
+
+def should_resume(ledger, identity, resume):
+    entry = ledger.entries.get(('campaign', 'suite'))
+    return bool(resume and entry and entry['status'] == 'passed'
+                and entry['config_hash'] == identity)
+
+
+def output_artifacts(root):
+    rows = []
+    for path in sorted(Path(root).rglob('*')):
+        if path.is_file() and not path.is_symlink():
+            rows.append(dict(path=str(path), size=path.stat().st_size,
+                             sha256=ledger_module.sha256_file(path)))
+    return rows
+
+
 async def _finish_campaign(config, parent, path, store, execute, output, error):
     """Use early teardown only after a terminal, durably bound export."""
     failures = [error] if error is not None else []
@@ -1390,7 +1419,8 @@ async def _finish_campaign(config, parent, path, store, execute, output, error):
 
 async def run(config, *, package_dir, revision, spec, wheels, base_image,
               base_image_id, rdma_device, output, execute, artifacts=None,
-              surcharge_cents, preflight_api=None):
+              surcharge_cents, preflight_api=None, ledger_path=None,
+              resume=False):
     """Run one reviewed campaign; never creates a replacement on failure.
 
     ``execute`` is an async callback accepting gcloud argv without ``gcloud``.
@@ -1418,6 +1448,13 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     receipt, frozen_source = await _blocking(_admit_package, package_dir, revision, spec)
     if receipt.get('source_revision') != revision or not re.fullmatch(r'[0-9a-f]{64}', receipt.get('manifest_sha256', '')):
         raise ValueError('package source or sealed manifest mismatch')
+    ledger = ledger_module.Ledger(ledger_path or Path(output) / 'campaign-ledger.json')
+    if resume:
+        ledger.load()
+    identity = campaign_identity(spec, revision, receipt)
+    if should_resume(ledger, identity, resume):
+        return {'parent_run_id': None, 'resumed': True, 'cell': 'suite',
+                'ledger': str(ledger.path)}
     spec['hard_deadline_seconds'] = duration
     observer_qualification = await _blocking(_qualify_observer, package_dir, spec)
     source = receipt['source_sha256']
@@ -1455,6 +1492,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     await _blocking(campaign.save, path, parent)
     error = None
     result = None
+    entry = None
     try:
         try:
             quotas = await gcp_manual_preflight.quota_preflight(config, execute)
@@ -1579,11 +1617,20 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_record, path, parent, 'suite')
 
         await _blocking(_lease_owned, store, parent)
+        entry = ledger.begin(stage='campaign', cell_id='suite', config_hash=identity,
+                             unit='suite')
+        ledger.save()
         result = await _suite(store, admitted_config, fleet_state, fleet_path, fleet, package, spec, out, rdma_device)
         await _blocking(_record, path, parent, 'complete')
     except BaseException as exc:
         error = exc
     await _finish_campaign(config, parent, path, store, execute, out, error)
+    if entry is not None:
+        if error is None:
+            ledger.mark_passed(entry, output_artifacts(out))
+        else:
+            ledger.fail(entry, error)
+        ledger.save()
     return {'parent_run_id': parent['run_id'], 'children': parent['children'],
             'observer_qualification': observer_qualification,
             'image_qualification': reference, 'terminal': result}

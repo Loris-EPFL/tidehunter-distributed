@@ -615,6 +615,7 @@ def main():
     parser.add_argument('--external-config', type=Path)
     parser.add_argument('--external-resources', type=Path, help='controller-owned final per-host resource evidence')
     parser.add_argument('--external-stage-dir', type=Path, help='controller handshake directory, required in external mode')
+    parser.add_argument('--cell-id', help='campaign ledger cell identity (recorded, not interpreted)')
     args = parser.parse_args()
     if any((args.external_config, args.external_resources, args.external_stage_dir)) and not all(
             (args.external_config, args.external_resources, args.external_stage_dir)):
@@ -731,7 +732,7 @@ def main():
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,metrics_schema=3,protocol=9,backend='tidehunter-sharded-wal',
+    result=dict(schema=1,metrics_schema=3,protocol=9,backend='tidehunter-sharded-wal',cell_id=args.cell_id,
         durability=('synchronous durable whole-batch publication' if args.durability_tier == 'synchronous'
                     else 'native appended-frontier acknowledgement (RAM ack, Sui production tier)'),
         durability_tier=args.durability_tier,

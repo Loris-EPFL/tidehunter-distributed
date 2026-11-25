@@ -106,6 +106,34 @@ def publish_export(store, state, status='incomplete'):
     return package
 
 
+class CampaignLedgerGate(unittest.TestCase):
+    def test_resume_requires_a_matching_passed_suite(self):
+        receipt = dict(manifest_sha256='a' * 64, source_sha256='b' * 64)
+        spec = dict(mode='focused', suite='kv', owner_hosts=2, reservation_hours=6)
+        identity = manual.campaign_identity(spec, 'c' * 40, receipt)
+        ledger = manual.ledger_module.Ledger()
+        entry = ledger.begin(stage='campaign', cell_id='suite', config_hash=identity)
+        ledger.mark_passed(entry, [])
+        self.assertTrue(manual.should_resume(ledger, identity, True))
+        self.assertFalse(manual.should_resume(ledger, identity, False))
+        changed = spec | {'reservation_hours': 5}
+        self.assertFalse(manual.should_resume(
+            ledger, manual.campaign_identity(changed, 'c' * 40, receipt), True))
+        self.assertFalse(manual.should_resume(
+            ledger, manual.campaign_identity(spec, 'd' * 40, receipt), True))
+
+    def test_output_artifacts_bind_size_and_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'nested/result.json'
+            path.parent.mkdir()
+            path.write_text('result\n')
+            rows = manual.output_artifacts(tmp)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['size'], path.stat().st_size)
+            self.assertEqual(rows[0]['sha256'],
+                             manual.ledger_module.sha256_file(path))
+
+
 class ManualCampaignTest(unittest.TestCase):
     def test_larger_reviewed_machine_uses_its_compute_allowance(self):
         config = {**CONFIG, 'machine_type': 'z4m-highmem-32'}

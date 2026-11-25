@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'sui-checkpoint'))
 import build
+import campaign_ledger as ledger_module
 import checkpoint_support as checkpoint
 import deployment
 
@@ -117,7 +118,8 @@ class SuiLauncher:
                  config_dir, resources, tier='native', owners=2, fragment_mib=8,
                  deadline=900, extra_run=(), transport='efa', live_transport='rdma',
                  coordinator_cache_mib=8, shard_cache_mib=0, schema=None,
-                 disk_sample_seconds=10, port=24000):
+                 disk_sample_seconds=10, port=24000, ledger=None,
+                 cell_id='sui-replay', stage='stage1', resume=False):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -148,6 +150,10 @@ class SuiLauncher:
         self.local_commands = []
         self.sample_thread = None
         self.sample_stop = threading.Event()
+        self.ledger = ledger
+        self.cell_id = cell_id
+        self.stage = stage
+        self.resume = resume
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
@@ -389,8 +395,66 @@ class SuiLauncher:
         os.replace(temporary, self.stage_dir / 'resources-ready')
 
     # ---- orchestration -------------------------------------------------
+    def identity(self):
+        """Hash of every binding that can change this Sui replay's behaviour."""
+        schema_files = {str(path.relative_to(self.schema)): build.digest(path)
+                        for path in sorted(self.schema.rglob('*')) if path.is_file()}
+        return ledger_module.config_hash(
+            spec=dict(build_manifest=build.digest(self.build_root / 'build-manifest.json'),
+                      fixture=build.digest(self.fixture / 'experiment/results.json'),
+                      schema=schema_files),
+            knobs=dict(transport=self.transport, live_transport=self.live_transport,
+                       tier=self.tier, owners=self.owners,
+                       fragment_mib=self.fragment_mib, run_args=self.extra_run,
+                       coordinator_cache_mib=self.coordinator_cache_mib,
+                       shard_cache_mib=self.shard_cache_mib),
+            engine_rev=self.manifest.get('source_archive_sha256'),
+            sui_rev=self.manifest.get('source_archive_sha256'),
+            binary_ids=self.manifest['binaries'])
+
+    def artifacts(self):
+        rows = []
+        for path in (self.output / 'experiment/results.json',
+                     self.output / 'receipt.json',
+                     self.output / 'evidence.tar.gz',
+                     self.resources,
+                     self.config_dir / 'config.json',
+                     self.config_dir / 'external-manifest.json'):
+            if not path.is_file():
+                raise ValueError(f'missing replay artifact: {path}')
+            rows.append(dict(path=str(path), size=path.stat().st_size,
+                             sha256=ledger_module.sha256_file(path)))
+        return rows
+
     def run(self, hosts):
+        identity = self.identity()
+        if self.ledger is None:
+            self.admit(hosts)
+            return self.execute(hosts)
+        previous = self.ledger.entries.get((self.stage, self.cell_id))
+        if (self.resume and previous and previous['status'] == 'passed'
+                and previous['config_hash'] == identity):
+            receipt = dict(complete=True, skipped=True, cell_id=self.cell_id,
+                           tier=self.tier, owners=self.owners)
+            print(json.dumps(receipt))
+            return receipt
         self.admit(hosts)
+        entry = self.ledger.begin(stage=self.stage, cell_id=self.cell_id,
+                                  config_hash=identity, unit=self.cell_id)
+        self.ledger.save()
+        try:
+            receipt = self.execute(hosts)
+            self.ledger.mark_passed(entry, self.artifacts())
+            self.ledger.save()
+            return receipt
+        except BaseException as error:
+            self.ledger.fail(entry, error)
+            self.ledger.save()
+            raise
+
+    def execute(self, hosts):
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self.config_dir.parent.mkdir(parents=True, exist_ok=True)
         self.hosts = hosts['owners']
         self.prepare()
         self.install()
@@ -404,7 +468,8 @@ class SuiLauncher:
                    '--disk-sample-seconds', str(self.disk_sample_seconds),
                    '--external-config', str(self.config_dir / 'config.json'),
                    '--external-resources', str(self.resources),
-                   '--external-stage-dir', str(self.stage_dir), *self.extra_run]
+                   '--external-stage-dir', str(self.stage_dir),
+                   '--cell-id', self.cell_id, *self.extra_run]
         self.local_commands.append(command)
         child = subprocess.Popen(command)
         marker = self.stage_dir / 'resources-required.json'
@@ -458,6 +523,12 @@ def main():
     parser.add_argument('--external-config-dir', type=Path)
     parser.add_argument('--stage-dir', type=Path)
     parser.add_argument('--resources', type=Path)
+    parser.add_argument('--ledger', type=Path,
+                        help='campaign ledger (default: beside the run output)')
+    parser.add_argument('--resume', action='store_true',
+                        help='skip this cell if the ledger has it passed with the same binding')
+    parser.add_argument('--cell-id', default='sui-replay')
+    parser.add_argument('--stage', default='stage1')
     parser.add_argument('--transport', choices=('tcp', 'tcp-trusted',
                         *deployment.HARDWARE_TRANSPORTS), default='efa')
     parser.add_argument('--live-transport', choices=deployment.LIVE_TRANSPORTS,
@@ -476,6 +547,12 @@ def main():
     args = parser.parse_args()
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
+    ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
+    if Path(ledger_path).exists() and not args.resume:
+        raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
+    resume_ledger = ledger_module.Ledger(ledger_path)
+    if args.resume:
+        resume_ledger.load()
     launcher = SuiLauncher(
         remote=Remote(args.zone, iap=args.tunnel_through_iap),
         build_root=args.build, fixture=args.fixture, output=output,
@@ -488,7 +565,9 @@ def main():
         transport=args.transport, live_transport=args.live_transport,
         coordinator_cache_mib=args.coordinator_cache_mib,
         shard_cache_mib=args.shard_cache_mib, schema=args.schema,
-        disk_sample_seconds=args.disk_sample_seconds, port=args.port)
+        disk_sample_seconds=args.disk_sample_seconds, port=args.port,
+        ledger=resume_ledger, cell_id=args.cell_id, stage=args.stage,
+        resume=args.resume)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
 

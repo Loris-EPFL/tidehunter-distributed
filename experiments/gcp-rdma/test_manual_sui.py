@@ -131,11 +131,15 @@ class FakeBuild:
             (Path(args.output) / 'experiment').mkdir(exist_ok=True)
             (Path(args.output) / 'experiment/results.json').write_text(
                 json.dumps(dict(complete=True)))
+            (Path(args.output) / 'receipt.json').write_text(json.dumps(dict(complete=True)))
+            (Path(args.output) / 'evidence.tar.gz').write_bytes(b'evidence')
             """))
 
     def fixture(self, root):
         fixture = root / 'fixture'
         fixture.mkdir()
+        (fixture / 'experiment').mkdir()
+        (fixture / 'experiment/results.json').write_text('{"frozen": true}\n')
         (fixture / 'distributed.yaml').write_text(
             f'db-path: {fixture}/distributed/full_node_db/94970e38de08\n')
         return fixture
@@ -183,14 +187,33 @@ class LauncherHandshake(unittest.TestCase):
         manual_sui.SAMPLE_SECONDS = 0.2
         self.addCleanup(setattr, manual_sui, 'SAMPLE_SECONDS', self.saved)
 
-    def launcher(self):
-        return manual_sui.SuiLauncher(
+    def launcher(self, prefix='', **overrides):
+        base = self.root / prefix if prefix else self.root
+        values = dict(
             remote=manual_sui.Remote('us-central1-a', execute=self.gcloud),
             build_root=self.build.root, fixture=self.fixture,
-            output=self.root / 'run', guest_root=self.root / 'guest',
-            stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
-            resources=self.root / 'resources.json', tier='native', owners=2,
+            output=base / 'run', guest_root=self.root / 'guest',
+            stage_dir=base / 'stages', config_dir=base / 'external-config',
+            resources=base / 'resources.json', tier='native', owners=2,
             deadline=900, transport='efa', live_transport='rdma', schema=self.schema)
+        values.update(overrides)
+        return manual_sui.SuiLauncher(**values)
+
+    def test_resume_skips_a_passed_cell_and_reruns_a_stale_one(self):
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        first = self.launcher(ledger=ledger).run(hosts)
+        self.assertTrue(first['complete'])
+        self.assertEqual(ledger.status('stage1', 'sui-replay'), 'passed')
+        calls = len(self.gcloud.calls)
+        skipped = self.launcher(ledger=ledger, resume=True).run(hosts)
+        self.assertTrue(skipped['skipped'])
+        self.assertEqual(len(self.gcloud.calls), calls)
+        # A changed knob hashes differently and reruns in a fresh output.
+        stale = self.launcher('stale', ledger=ledger, resume=True, fragment_mib=16).run(hosts)
+        self.assertTrue(stale['complete'])
+        self.assertNotIn('skipped', stale)
+        self.assertEqual(ledger.entries[('stage1', 'sui-replay')]['attempts'], 2)
 
     def test_handshake_satisfies_the_runner_resource_contract(self):
         receipt = self.launcher().run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))

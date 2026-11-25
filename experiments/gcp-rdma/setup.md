@@ -657,6 +657,31 @@ unchanged, including `--driver-concurrency`, `--pacing-ms`, `--checkpoints`,
 `--checkpoints N` replay still verifies the complete frozen source and reuses
 its digest at N for the paired native and remote replays.
 
+Resume: pass a stable `--ledger /absolute/campaign-ledger.json` and `--resume`.
+The launcher records the cell (`--cell-id`, default `sui-replay`) as running
+before it prepares or installs anything, and marks it passed only after the
+results, receipt and evidence files exist and their sizes and SHA-256 values are
+verified. A passed cell whose build, fixture, schema or knob hash still matches
+is skipped before any host is touched; a changed hash or a failed/interrupted
+entry reruns in a fresh output. Use a new `--output` for a rerun and the same
+ledger. `run.py` records the cell id in `results.json`.
+
+Stage 3 uses `experiments/sui-checkpoint/stage3_campaign.py` with the same
+ledger. It regenerates the 72 specs when they are absent, archives any previous
+database and output under `stage3/stale/`, and runs only planned cells:
+
+```sh
+python3 experiments/sui-checkpoint/stage3_campaign.py \
+  --root /absolute/stage3-campaign --binary /absolute/kv-research \
+  --ledger /absolute/stage3-campaign/stage3/run-ledger.json --resume \
+  --only S3-A1-c16-native-cache0
+```
+
+`--from <cell-id>` shifts the plan, `--continue-on-failure` keeps measuring
+after a failed cell (the default stops), and every non-reference spec is
+`-cache0`; the two `-cache1000` read-only C=16 cells are the labelled cache-on
+reference pair.
+
 The retired compact six-VM Sui spec (`sui_nvmeof_compact`,
 `sui_nvmeof_harness_synchronous`) is not used by the campaign. The three-stage
 campaign uses this launcher for stages 1 and 2 and the `stage3_specs.py` set for
