@@ -7,11 +7,22 @@ distributed two-owner grid; arm B is the native single-node equal-load
 reference. Every file is one `kv-research` RunConfig that another store runs by
 changing only `backend`.
 
-Usage: `stage3_specs.py --output DIR [--root DIR] [--validate BINARY]`.
+Value cache: every cell declares its coordinator value-cache entry count in its
+`case_id`/`namespace` as the trailing `-cacheN` tag. The campaign runs the 70
+grid cells and the native baseline with the cache off (`-cache0`), and adds one
+read-only reference pair at C=16 with 1,000 entries (`-cache1000`). The engine
+document itself cannot carry the count: kv-research builds both backends with
+`KeySpaceConfig::default()`, whose `value_cache_size` is 0, and both option
+structs deny unknown fields. The tag therefore states the intended setting
+without pretending the engine applied it; `-cache1000` is a labelled reference
+that can only be executed once kv-research exposes the value-cache option.
+
+Usage: `stage3_specs.py --root DIR [--validate BINARY]`.
 """
 import argparse
 import json
 from pathlib import Path
+import re
 
 KEYS = 65536
 SEED = 1775
@@ -21,6 +32,8 @@ TIERS = ('native', 'synchronous')
 CALLERS = (2, 4, 8, 16)
 MEASUREMENT_OPERATIONS = 200_000
 WARMUP_FRACTION = 0.10
+GRID_CACHE_ENTRIES = 0
+REFERENCE_CACHE_ENTRIES = 1_000
 MIXES = {
     'read': dict(read=100, put=0, delete=0, missing_read=0, get_many=0, put_batch=0),
     'mixed': dict(read=70, put=30, delete=0, missing_read=0, get_many=0, put_batch=0),
@@ -30,18 +43,28 @@ MIXES = {
 }
 
 
-def _cells(arm, family, mix, size, distribution, tiers, callers, *, batch=None):
+def declared_cache(case_id):
+    """The value-cache entry count a case id states, e.g. `-cache0`."""
+    match = re.search(r'-cache([0-9]+)$', case_id)
+    if match is None:
+        raise ValueError(f'case id does not declare a value cache: {case_id}')
+    return int(match.group(1))
+
+
+def _cells(arm, family, mix, size, distribution, tiers, callers, *, batch=None,
+           cache=GRID_CACHE_ENTRIES, reference=False):
     suffix = '' if family in ('A1', 'A2', 'A3', 'A7', 'A8', 'B1', 'B2') else '-' + mix
     for tier in tiers:
         for concurrency in callers:
-            case = f'S3-{family}{suffix}-c{concurrency}-{tier}'
+            case = f'S3-{family}{suffix}-c{concurrency}-{tier}-cache{cache}'
             yield dict(case_id=case, arm=arm, mix=mix, size=size,
                        distribution=distribution, tier=tier,
-                       concurrency=concurrency, batch=batch)
+                       concurrency=concurrency, batch=batch, cache=cache,
+                       reference=reference)
 
 
 def cells():
-    """The 70 campaign cells, exactly as section 9.3 lists them."""
+    """The 72 campaign cells: the 70-cell grid at cache 0 plus a cache-on pair."""
     rows = []
     for family, mix in (('A1', 'read'), ('A2', 'mixed'), ('A3', 'write')):
         rows += list(_cells('A', family, mix, 8192, 'uniform', TIERS, CALLERS))
@@ -61,9 +84,12 @@ def cells():
     for family, mix in (('B1', 'read'), ('B2', 'write')):
         for tier in TIERS:
             for callers in (1, 2, 4, 8):
-                rows.append(dict(case_id=f'S3-{family}-c{callers}-{tier}', arm='B',
-                                 mix=mix, size=8192, distribution='uniform',
-                                 tier=tier, concurrency=callers, batch=None))
+                rows.append(dict(case_id=f'S3-{family}-c{callers}-{tier}-cache0',
+                                 arm='B', mix=mix, size=8192, distribution='uniform',
+                                 tier=tier, concurrency=callers, batch=None,
+                                 cache=GRID_CACHE_ENTRIES, reference=False))
+    rows += list(_cells('A', 'A1', 'read', 8192, 'uniform', TIERS, (16,),
+                        cache=REFERENCE_CACHE_ENTRIES, reference=True))
     return rows
 
 
