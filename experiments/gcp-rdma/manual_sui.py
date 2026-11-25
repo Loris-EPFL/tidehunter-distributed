@@ -31,7 +31,7 @@ import checkpoint_support as checkpoint
 import deployment
 
 SAMPLE_SECONDS = 2.0
-MAX_SAMPLES = 2048
+MAX_SAMPLES = 20000
 OWNER_READY_SECONDS = 120
 RESOURCE_MARKER_SECONDS = 600
 IO_COUNTERS = ('rchar', 'wchar', 'syscr', 'syscw', 'read_bytes', 'write_bytes',
@@ -336,7 +336,13 @@ class SuiLauncher:
                 if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
                     self.remote.shell(host, f'kill -KILL -{namespace["process_group"]}',
                                       check=False)
-                namespace['stopped'] = True
+                deadline = time.monotonic() + 10
+                while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.1)
+                namespace['stopped'] = not self.remote.exists(
+                    host, f'/proc/{namespace["pid"]}')
         self.started = False
 
     # ---- host evidence -------------------------------------------------
@@ -403,6 +409,7 @@ class SuiLauncher:
         self.local_commands.append(command)
         child = subprocess.Popen(command)
         marker = self.stage_dir / 'resources-required.json'
+        resources_written = False
         try:
             deadline = time.monotonic() + RESOURCE_MARKER_SECONDS
             while child.poll() is None:
@@ -413,6 +420,7 @@ class SuiLauncher:
                     self.final_sample()
                     self.stop()
                     self.write_resources(binding)
+                    resources_written = True
                     break
                 if time.monotonic() > deadline:
                     raise TimeoutError('run.py did not request resource evidence')
@@ -425,6 +433,8 @@ class SuiLauncher:
                 code = child.wait()
         if code != 0:
             raise LaunchError(f'run.py failed with exit status {code}')
+        if not resources_written:
+            raise LaunchError('run.py exited without requesting resource evidence')
         receipt = dict(complete=True, exit_code=code, tier=self.tier,
                        owners=self.owners,
                        build_manifest_sha256=build.digest(
