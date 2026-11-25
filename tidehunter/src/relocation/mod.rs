@@ -469,14 +469,18 @@ impl RelocationDriver {
     }
 
     fn wal_based_relocation(&mut self, db: Arc<Db>) -> DbResult<()> {
-        let Some(target_position) = self.relocate_wal_prefix(&db)? else {
-            return Ok(());
-        };
-        Self::reclaim_wal_prefix(&db, target_position)
+        // The stripe loop already persists the index after every stripe and
+        // reclaims the files below it, ending with a snapshot at the target;
+        // upstream ends here too.
+        let _ = self.relocate_wal_prefix(&db)?;
+        Ok(())
     }
 
     /// Persists the index after `relocate_wal_prefix`, then reclaims the WAL
-    /// files below `target_position`.
+    /// files below `target_position`. Only the test entry point
+    /// (`observe_wal_relocation`) needs this standalone sequence; the native
+    /// relocation run persists and reclaims inside its stripe loop.
+    #[cfg(feature = "test_methods")]
     fn reclaim_wal_prefix(db: &Db, target_position: u64) -> DbResult<()> {
         db.rebuild_control_region_from(target_position)?;
         db.wal_writer.gc(std::cmp::min(
