@@ -11,9 +11,6 @@ tidehunter/src/distributed/remote_db/drop_cells_crash.rs 0 3
 tidehunter/src/distributed/remote_db/model_check_concurrent.rs 0 6
 tidehunter/src/distributed/remote_db/model_check_leased.rs 0 2
 tidehunter/src/distributed/remote_db/pending_read.rs 0 1
-tidehunter/src/distributed/remote_db/pending_read/read_trace.rs 1 4
-tidehunter/src/distributed/sui.rs 1 1
 tidehunter/src/distributed/tcp/inventory.rs 1 8
 tidehunter/src/distributed/tcp/live_client.rs 3 59
 tidehunter/src/distributed/tcp/probe.rs 0 1
-tidehunter/src/distributed/write_timeline.rs 1 1
