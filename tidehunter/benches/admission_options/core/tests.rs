@@ -1,7 +1,9 @@
-use super::*;
-
+// The bench target sets `harness = false`, so `#[test]` bodies are not
+// type-checked by `cargo check --all-targets`; keep the parent imports inside
+// each test so the module compiles clean without a module-level unused import.
 #[test]
 fn concurrent_prefix_completion() {
+    use super::*;
     prefix_stress(100_000);
     let tracker = Tracker::new(2, false);
     tracker.reserve(); // H retains this initial credit across many wraps.
@@ -43,6 +45,7 @@ fn concurrent_prefix_completion() {
 
 #[test]
 fn parking_and_credit_cancellation() {
+    use super::*;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -107,6 +110,7 @@ fn parking_and_credit_cancellation() {
 
 #[test]
 fn targeted_slot_and_frontier_notifications() {
+    use super::*;
     struct WakeCount(AtomicU64);
     impl std::task::Wake for WakeCount {
         fn wake(self: Arc<Self>) {
@@ -153,6 +157,7 @@ fn targeted_slot_and_frontier_notifications() {
 
 #[test]
 fn concurrent_slot_reuse() {
+    use super::*;
     let tracker = Tracker::new(64, false);
     thread::scope(|scope| {
         for worker in 0..4 {
