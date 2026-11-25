@@ -455,6 +455,21 @@ fn an_index_based_byte_limit_processes_only_the_reclaimable_prefix() {
             .all(|stream| stream.rounded_target <= 2 * OWNER_FILE),
         "every stream's target must stay inside the limit: {report:?}"
     );
+    // The unfiltered shape makes every callback a read entry, so the callbacks
+    // are exactly what the walk touched. One above the configured limit means
+    // the walk ignored its stream's target.
+    assert!(
+        !report.callbacks.is_empty(),
+        "premise: the walk records the entries it read: {report:?}"
+    );
+    for callback in &report.callbacks {
+        assert!(
+            callback.wal_position < 2 * OWNER_FILE,
+            "the walk must read only below the configured per-stream limit \
+             {}: {callback:?}",
+            2 * OWNER_FILE
+        );
+    }
     let files_after: usize = (0..fixture.nodes.len())
         .map(|owner| owner_wal_files(&fixture, owner))
         .sum();
@@ -919,6 +934,130 @@ fn a_write_between_the_copy_and_the_re_point_survives_an_index_based_pass() {
         Some(rewrite.as_slice()),
         "a later pass keeps the newer write"
     );
+    hybrid.wait_for_background_threads_to_finish().unwrap();
+}
+
+/// A `Remove` decision that loses its compare-and-set keeps the newer write:
+/// the arm compares the live row with the scanned expectation
+/// (`same_physical`), shadows the removal and lets the newer row win, so the
+/// rewrite stays readable and its file is kept. Every other removed key of the
+/// same cell is still gone. A removal that acted on the key alone would erase
+/// the concurrent write.
+#[test]
+fn a_remove_that_loses_the_compare_and_set_keeps_the_newer_write() {
+    let seed = 0x5a_1e_0b_u64;
+    let index_config = index_arm_config(None);
+    let shape = parity_shape();
+    let fixture = small_file_fixture(&index_config, shape.clone());
+    let hybrid = open_hybrid(&fixture);
+    let ks = hybrid.ks(KS_NAME);
+    let pad_ks = hybrid.ks(PAD_KS);
+    let (removed, kept, pad) = removal_plan();
+    puts(&hybrid, ks, &rows(seed, &removed));
+    puts(&hybrid, pad_ks, &rows(seed, &pad));
+    puts(&hybrid, ks, &rows(seed, &kept));
+    hybrid.flush().expect("flush before the pass");
+
+    // The first removed key is the first frame of its stream and below every
+    // target, so the pass's removal list names it.
+    let rewritten = removed[0].clone();
+    let rewrite = value(seed, &rewritten, 9);
+    let core = hybrid.remote_for_test().write_core();
+    let (entered, paused) = std::sync::mpsc::sync_channel(1);
+    let (release, resume) = std::sync::mpsc::sync_channel(1);
+    core.test_hooks.lock().relocation_copy_pause = Some((entered, resume));
+    let cancel = AtomicBool::new(false);
+    let report = std::thread::scope(|scope| {
+        // A failing premise drops the release sender: the parked pass resumes
+        // and the test fails instead of hanging.
+        let release = release;
+        let pass = scope.spawn(|| {
+            hybrid
+                .remote_for_test()
+                .relocation_pass(true, &cancel)
+                .expect("index-based pass")
+        });
+        let (parked_ks, first) = paused
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the pass parked on a Keep chunk");
+        assert_eq!(
+            parked_ks, ks,
+            "premise: the parked chunk is the filtered keyspace"
+        );
+        assert!(
+            first.is_some(),
+            "premise: the parked chunk names a survivor"
+        );
+        // The rewrite lands after the view was read and before this cell's
+        // removals run.
+        put_batch(&hybrid, ks, &[(rewritten.clone(), rewrite.clone())]);
+        assert_eq!(
+            read_one(&hybrid, ks, &rewritten).as_deref(),
+            Some(rewrite.as_slice()),
+            "premise: the rewrite is readable while the pass is parked"
+        );
+        release.send(()).expect("release the parked pass");
+        pass.join().expect("the pass thread")
+    });
+    assert!(!report.deferred, "{report:?}");
+    assert!(
+        report.copied_survivors > 0,
+        "premise: the pass copied the parked cell's survivors: {report:?}"
+    );
+
+    // The newer write survives; every other removed key is absent.
+    assert_eq!(
+        read_one(&hybrid, ks, &rewritten).as_deref(),
+        Some(rewrite.as_slice()),
+        "the removal must not erase the newer write"
+    );
+    for key in &removed {
+        if *key == rewritten {
+            continue;
+        }
+        assert_eq!(
+            read_one(&hybrid, ks, key),
+            None,
+            "the removed key {} must be absent",
+            hex(key)
+        );
+    }
+    for key in &kept {
+        assert_eq!(
+            read_one(&hybrid, ks, key).as_deref(),
+            Some(value(seed, key, 0).as_slice()),
+            "the kept key {} must read its value",
+            hex(key)
+        );
+    }
+    for key in &pad {
+        assert_eq!(
+            read_one(&hybrid, pad_ks, key).as_deref(),
+            Some(value(seed, key, 0).as_slice()),
+            "the padding key {} must read its value",
+            hex(key)
+        );
+    }
+
+    // The store persisted both the removals and the newer write.
+    close_arm(hybrid, "hybrid before reopen");
+    let hybrid = open_hybrid(&fixture);
+    assert_eq!(
+        read_one(&hybrid, ks, &rewritten).as_deref(),
+        Some(rewrite.as_slice()),
+        "the newer write survives the reopen"
+    );
+    for key in &removed {
+        if *key == rewritten {
+            continue;
+        }
+        assert_eq!(
+            read_one(&hybrid, ks, key),
+            None,
+            "the persisted removal of {} must survive the reopen",
+            hex(key)
+        );
+    }
     hybrid.wait_for_background_threads_to_finish().unwrap();
 }
 
