@@ -4880,6 +4880,28 @@ mod tests {
             .expect("create the result directory")
     }
 
+    /// Hang guard for a test task that waits on a marker file another task
+    /// writes. The measurement gate bounds its own release wait with
+    /// `timeout_seconds`, so this cap only stops a stuck test: it is never the
+    /// expected wait and it must stay far above the gate timeout.
+    const MARKER_WAIT_HANG_GUARD: Duration = Duration::from_secs(120);
+
+    /// Wait until another task creates `marker`. The poll observes progress
+    /// (the file appears); only the cap treats a missing file as a failure.
+    async fn wait_for_marker(marker: &Path) {
+        let waited = tokio::time::timeout(MARKER_WAIT_HANG_GUARD, async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "marker {} was not created within {MARKER_WAIT_HANG_GUARD:?}",
+            marker.display()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_health_failure_at_each_boundary_fails_and_preserves_reason() {
         for boundary in 0..3 {
@@ -6254,17 +6276,19 @@ mod tests {
             timeout_seconds: 2,
         });
         let controller = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !ready.exists() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert_eq!(gate_snapshot_calls.load(Ordering::Relaxed), 1);
-                assert_eq!(gate_finish_calls.load(Ordering::Relaxed), 0);
-                counter.store(19, Ordering::Relaxed);
-                std::fs::write(release, b"observed").unwrap();
-            })
-            .await
-            .unwrap();
+            wait_for_marker(&ready).await;
+            assert_eq!(
+                gate_snapshot_calls.load(Ordering::Relaxed),
+                1,
+                "the gate must observe exactly the pre-gate snapshot"
+            );
+            assert_eq!(
+                gate_finish_calls.load(Ordering::Relaxed),
+                0,
+                "the profile must not finish before the gate releases"
+            );
+            counter.store(19, Ordering::Relaxed);
+            std::fs::write(release, b"observed").unwrap();
         });
         run(backend, config, &output, prometheus::Registry::new())
             .await
@@ -6618,14 +6642,8 @@ mod tests {
             timeout_seconds: 2,
         };
         let controller = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while !ready_file.exists() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                std::fs::write(release_file, b"observed\n").unwrap();
-            })
-            .await
-            .unwrap();
+            wait_for_marker(&ready_file).await;
+            std::fs::write(release_file, b"observed\n").unwrap();
         });
         wait_for_measurement_gate(&gate, Instant::now() + Duration::from_secs(3))
             .await
