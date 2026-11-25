@@ -667,14 +667,31 @@ entry reruns in a fresh output. Use a new `--output` for a rerun and the same
 ledger. `run.py` records the cell id in `results.json`.
 
 Stage 3 uses `experiments/sui-checkpoint/stage3_campaign.py` with the same
-ledger. It regenerates the 72 specs when they are absent, archives any previous
-database and output under `stage3/stale/`, and runs only planned cells:
+campaign ledger and the same bucket prefix. It regenerates the 72 specs when
+they are absent, archives any previous database and output under
+`stage3/stale/`, and runs only planned cells. `--mode cluster` needs
+`--bucket-prefix`, the two tier preparations and the owner hosts; phase A (the
+arm-B synchronous probe) runs first, `--calibrate` runs the three phase-B cells
+once and freezes the counts, and `--skip-probe` skips phase A explicitly.
+`--mode rehearsal` runs the local fixture and needs `--allow-local-ledger`.
+`--allow-local-ledger` is the only local-rehearsal escape; it never uploads.
 
 ```sh
 python3 experiments/sui-checkpoint/stage3_campaign.py \
-  --root /absolute/stage3-campaign --binary /absolute/kv-research \
-  --ledger /absolute/stage3-campaign/stage3/run-ledger.json --resume \
+  --mode rehearsal --root /absolute/stage3-campaign \
+  --binary /absolute/kv-research --allow-local-ledger \
   --only S3-A1-c16-native-cache0
+
+python3 experiments/sui-checkpoint/stage3_campaign.py \
+  --mode cluster --root /absolute/stage3root \
+  --binary /absolute/build/binaries/storage-node \
+  --external native=/absolute/external-native \
+  --external synchronous=/absolute/external-synchronous \
+  --external-database live/checkpoints \
+  --guest-root /mnt/tidehunter/$CAMPAIGN --native-root /mnt/tidehunter/$CAMPAIGN \
+  --owners H1,H2 --native-host H1 --zone us-central1-a \
+  --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
+  --ledger /absolute/campaign-ledger.json --calibrate --resume
 ```
 
 `--from <cell-id>` shifts the plan, `--continue-on-failure` keeps measuring
@@ -685,8 +702,10 @@ the distributed and native keyspace configuration.
 
 The Sui campaign's three stages do not use `manual_campaign.py`. That module
 remains the KV/NVMe-oF fleet orchestrator. Stage 1 and stage 2 are driven by
-`manual_sui.py` on the three Sui hosts, and stage 3 is driven by
-`stage3_campaign.py` on the same hosts; both use the shared campaign ledger.
+`manual_sui.py` on the three Sui hosts (fault and mechanism cells by
+`fault_cells.py`), and stage 3 is driven by `stage3_campaign.py` on the same
+hosts; every driver writes the one campaign ledger at
+`<prefix>/campaign-ledger.json`.
 
 The retired compact six-VM Sui spec (`sui_nvmeof_compact`,
 `sui_nvmeof_harness_synchronous`) is not used by the campaign. The three-stage
@@ -846,19 +865,58 @@ python3 experiments/gcp-rdma/manual_sui.py \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 --zone us-central1-a \
   --transport tcp --live-transport rdma --durability-tier native \
   --fragment-mib 1024 --coordinator-cache-mib 0 --shard-cache-mib 0 --deadline 900 \
+  --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
   --ledger $CAMPAIGN_ROOT/campaign-ledger.json --cell-id S1-0 --stage stage1 \
-  -- --owners 2 --driver-concurrency 4 --disk-sample-seconds 10 --checkpoints 4 \
-     --coordinator-cache-mib 0 --shard-cache-mib 0
+  -- --driver-concurrency 4 --disk-sample-seconds 10 --checkpoints 4
 ```
 
-8. Delete the fleet. This step deletes the three hosts, their boot disks and
+   Every knob is given once, to the launcher. Do not repeat `--owners`,
+   `--durability-tier`, `--fragment-mib`, `--coordinator-cache-mib`,
+   `--shard-cache-mib`, `--write-profile-limit` or `--resident-reads` after
+   `--`; those forward to both `prepare_external.py` and `run.py`. The cell
+   passes only after its upload is verified and the campaign ledger is written
+   under the bucket prefix. Lagging S1-1/S1-8 cells add `--lifecycle-checks
+   --tail-checkpoints 64` after `--`.
+
+   The mechanism and fault cells use `experiments/gcp-rdma/fault_cells.py`
+   with the same prefix, the same ledger and `--resume`. `--dry-run` prints
+   one cell's plan without a host.
+
+```sh
+python3 experiments/gcp-rdma/fault_cells.py \
+  --cell S1-2S-publication-native --build $CAMPAIGN_ROOT/build \
+  --fixture /absolute/checkpoint-fixtures/sui-genesis-1775/fixture \
+  --schema $CAMPAIGN_ROOT/schema-run/experiment/native-schema \
+  --output $CAMPAIGN_ROOT/stage1/S1-2S-publication-native \
+  --guest-root /mnt/tidehunter/$CAMPAIGN \
+  --coordinator $RUN-0 --owners $RUN-1,$RUN-2 --zone us-central1-a \
+  --transport tcp --live-transport rdma \
+  --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
+  --ledger $CAMPAIGN_ROOT/campaign-ledger.json --resume
+```
+
+9. Resume from another machine. The bucket ledger is authoritative; download
+   it before `--resume`, then merge happens again on every save.
+
+```sh
+gcloud storage cp gs://mysten-research-bench-artifacts/$CAMPAIGN/campaign-ledger.json \
+  $CAMPAIGN_ROOT/campaign-ledger.json \
+  --impersonate-service-account=bench-guest@mysten-research.iam.gserviceaccount.com
+```
+
+   The evidence layout is
+   `<prefix>/<stage>/evidence/<cell>/attempt-<n>/<name>` for summaries and
+   `<prefix>/<stage>/raw/<cell>/attempt-<n>/<name>` for samples. Apply the
+   90-day lifecycle rule to `raw/`; keep `evidence/` and the ledger.
+
+10. Delete the fleet. This step deletes the three hosts, their boot disks and
    the placement policy, then proves each absence.
 
 ```sh
 python3 experiments/gcp-rdma/gcp_manual_compute.py delete --state $STATE
 ```
 
-8. Verify deletion independently of the state file. All four commands must
+11. Verify deletion independently of the state file. All four commands must
    return no row.
 
 ```sh

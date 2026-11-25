@@ -491,8 +491,21 @@ the node stays live for the final scrape and the live audit),
 `--snapshot-written-bytes` (`TH_SNAPSHOT_WRITTEN_BYTES`),
 `--max-maps` (`TH_MAX_MAPS`, replay/value WAL maps) and `--max-index-maps`
 (`TH_MAX_INDEX_MAPS`, index WAL maps; both default 3 and are refused below 3
-because the WAL mapper panics), and `--index-blob-cache-min-bytes`
-(`TH_INDEX_BLOB_CACHE_MIN_BYTES`). The forced map-pressure mechanism cell uses
+because the WAL mapper panics), `--index-blob-cache-min-bytes`
+(`TH_INDEX_BLOB_CACHE_MIN_BYTES`), and `--index-blob-cache-mib`
+(`TH_INDEX_BLOB_CACHE_BYTES`, default 0 keeps the engine's off default). The
+blob budget is refused unless the frozen Sui turns that env row into
+`index_blob_cache_bytes` (the row in
+`crates/typed-store/src/tidehunter_util.rs::thdb_config`, or the same string in
+a built `sui-node-*` binary); when it is present the runner sets the same value
+for both measured nodes and records MiB, bytes and the env row in
+`results.json:knobs`. `--lifecycle-checks` adds the clean-reopen checks of
+S1-1/S1-8 after the normal replay and first audit, with `--tail-checkpoints K`
+(default 64) bounding the tail sample: the restarted measured node must
+re-commit all ten RPC index pipelines at the frozen tip, read the certified
+`getCheckpoint(tip)` digest, match the producer's last K digests, add no new
+live-target export, not extend the CRC-framed `durable-cut.v1` record, and pass
+the second audit. The forced map-pressure mechanism cell uses
 `--max-maps 3 --max-index-maps 3`: the lowest non-panicking value for both, so
 value-map pressure is maximal without touching the index minimum.
 Native
@@ -1122,3 +1135,51 @@ not readiness. SSM `Online` alone does not prove that the runner is installed.
 The bundle-ready marker follows the storage agent restart, so controller probes
 cannot race extraction or that restart. Keep the original absolute expiry armed.
 
+
+## Campaign drivers (stages 1-3)
+
+Three drivers run the cluster campaign. They share one evidence layout, one
+campaign ledger and one `/proc` sampler.
+
+* `experiments/gcp-rdma/manual_sui.py` runs one Sui replay cell (stages 1 and 2).
+  It prepares the external NVMe-oF deployment, installs the owner archives,
+  starts and stops only its own owner process groups, runs the frozen `run.py`,
+  and answers the `resources-required` handshake with sampled `/proc` evidence.
+* `experiments/sui-checkpoint/stage3_campaign.py` runs the synthetic
+  `kv-research` cells (stage 3). `--mode cluster` runs arm A against the two
+  NVMe-oF owners and arm B in process on the owner host. `--mode rehearsal` runs
+  the single-host trusted-TCP ordinary-file fixture and labels every result
+  `rehearsal`. Phase A is one arm-B synchronous probe cell that measures the
+  per-write barrier rate; `--calibrate` runs the three phase-B point cells once
+  and freezes the per-family operation counts in `stage3/calibration.json`.
+  Both phases pass through the same ledger and upload rules as the grid.
+* `experiments/gcp-rdma/fault_cells.py` runs the crash, fence, lease, resume,
+  retirement and mechanism cells. The cells are M6 (`multi_get` width sweep
+  {1,4,8,26,256}), M9 (owner WAL roll by volume), M13 (`put_batch` frame above
+  65,536 B), S1-2S (coordinator `kill -9` and reopen), S1-3S (owner `kill -9`
+  and restart), S1-5S (two coordinators on one owner database: contend, lapse,
+  stale, sealed) and S1-6S (owner `kill -9` at a WAL unlink or a retirement root
+  rewrite). `--dry-run` prints the plan and touches no host.
+
+Every driver gives these flags the same meaning. `--bucket-prefix
+gs://mysten-research-bench-artifacts/<campaign-id>` selects the campaign prefix.
+A cell passes only after each object is uploaded with `ifGenerationMatch=0`,
+verified by stored size and SHA-256, `mark_passed(..., store=ObjectStoreLedger)`
+re-verifies every key, and `<prefix>/campaign-ledger.json` is written with a
+generation precondition and merged on 412. `--allow-local-ledger` is the only
+local-rehearsal escape and never uploads.
+
+The one layout is `<prefix>/<stage>/evidence/<cell>/attempt-<n>/<name>` for
+compact summaries and `<prefix>/<stage>/raw/<cell>/attempt-<n>/<name>` for
+per-sample files (`samples.csv`, `resources.csv`, `disk.csv`, `*.prom`,
+`*.jsonl`). `campaign_manifest.evidence_key` decides the split from the file
+name, so a bucket lifecycle rule on `raw/` expires samples after 90 days.
+`campaign_manifest.ledger_key` names the one ledger.
+
+Give each runner knob once, to the launcher. `manual_sui.py` forwards
+`--owners`, `--durability-tier`, `--fragment-mib`, `--coordinator-cache-mib`,
+`--shard-cache-mib`, `--write-profile-limit` and `--resident-reads` to both
+`prepare_external.py` and `run.py`; do not repeat them after `--`.
+`--` carries only `run.py` arguments such as `--driver-concurrency`,
+`--disk-sample-seconds`, `--checkpoints`, `--index-blob-cache-mib`,
+`--lifecycle-checks` and `--tail-checkpoints`.
