@@ -469,14 +469,19 @@ inherited `TH_*` variable it does not manage; every effective value is recorded
 in `results.json:knobs` and `results.json:environment`:
 `--driver-concurrency` (`SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY`, default 4),
 `--pacing-ms` (valid only with a `SUI_CHECKPOINT_EXECUTION_PACING_MS` hook in
-the frozen Sui fork; refused otherwise rather than claimed), `--checkpoints`
-(replay 0..N after the complete source digest is verified),
+the frozen Sui executor, detected under `checkpoint_executor/` or in the built
+node's strings; refused otherwise rather than claimed), `--checkpoints N`
+(replay exactly N checkpoints 0..N-1; Sui's RunWithRange bound is inclusive),
 `--value-cache-size` (`TH_VALUE_CACHE_SIZE`),
 `--default-value-cache-size` (`TH_DEFAULT_VALUE_CACHE_SIZE`, default 1000),
 `--max-dirty-keys` (`TH_DEFAULT_MAX_DIRTY_KEYS`, default 1024),
-`--snapshot-written-bytes` (`TH_SNAPSHOT_WRITTEN_BYTES`), `--max-maps`
-(`TH_MAX_MAPS` and `TH_MAX_INDEX_MAPS`) and `--index-blob-cache-min-bytes`
-(`TH_INDEX_BLOB_CACHE_MIN_BYTES`).
+`--snapshot-written-bytes` (`TH_SNAPSHOT_WRITTEN_BYTES`),
+`--max-maps` (`TH_MAX_MAPS`, replay/value WAL maps) and `--max-index-maps`
+(`TH_MAX_INDEX_MAPS`, index WAL maps; both default 3 and are refused below 3
+because the WAL mapper panics), and `--index-blob-cache-min-bytes`
+(`TH_INDEX_BLOB_CACHE_MIN_BYTES`). The forced map-pressure mechanism cell uses
+`--max-maps 3 --max-index-maps 3`: the lowest non-panicking value for both, so
+value-map pressure is maximal without touching the index minimum.
 Native
 fragment size is 8 MiB, mapped windows three (perpetual multiplies that in Sui),
 index maps three. Shard fragments are 16 MiB to contain the bounded 12 MiB group

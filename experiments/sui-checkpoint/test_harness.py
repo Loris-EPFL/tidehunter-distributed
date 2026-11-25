@@ -616,6 +616,7 @@ class RunnerKnobs(unittest.TestCase):
         values = dict(tier='native', fragment_mib=8, driver_concurrency=4, pacing_ms=0,
                       value_cache_size=None, default_value_cache_size=1000,
                       max_dirty_keys=1024, snapshot_written_bytes=8 << 30, max_maps=3,
+                      max_index_maps=3,
                       index_blob_cache_min_bytes=0, read_profile_limit=0,
                       native_write_profile_limit=0)
         values.update(changes)
@@ -647,26 +648,51 @@ class RunnerKnobs(unittest.TestCase):
             run.runtime_environment({'TH_UNDOCUMENTED': '1'}, tier='native',
                 fragment_mib=8, driver_concurrency=4, pacing_ms=0, value_cache_size=None,
                 default_value_cache_size=1000, max_dirty_keys=1024,
-                snapshot_written_bytes=8 << 30, max_maps=3,
+                snapshot_written_bytes=8 << 30, max_maps=3, max_index_maps=3,
                 index_blob_cache_min_bytes=0, read_profile_limit=0,
                 native_write_profile_limit=0)
 
-    def test_checkpoint_limit_is_first_n_and_bounded(self):
-        for requested, expected in ((None, 1775), (1, 1), (100, 100), (1775, 1775)):
+    def test_value_and_index_map_limits_are_independent_and_never_panic(self):
+        env = self.environment(max_maps=5, max_index_maps=3)
+        self.assertEqual(env['TH_MAX_MAPS'], '5')
+        self.assertEqual(env['TH_MAX_INDEX_MAPS'], '3')
+        for field in ('max_maps', 'max_index_maps'):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'panics below 3'):
+                self.environment(**{field: 2})
+
+    def test_checkpoint_limit_is_an_inclusive_count(self):
+        for requested, expected in ((None, 1775), (1, 0), (8, 7), (100, 99),
+                                    (1776, 1775)):
             self.assertEqual(run.requested_checkpoint(1775, requested), expected)
-        for requested in (0, 1776, -1, True, 1.0, '10'):
+            if requested is not None:
+                self.assertEqual(expected + 1, requested)
+        self.assertEqual(run.replay_bound(run.requested_checkpoint(1775, 8)) + 1, 8)
+        for requested in (0, 1777, -1, True, 1.0, '10'):
             with self.subTest(requested=requested), self.assertRaises(ValueError):
                 run.requested_checkpoint(1775, requested)
 
     def test_pacing_needs_the_frozen_sui_hook(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'sources/sui/crates'
-            module = root / 'sui-core/src/checkpoints/checkpoint_executor/mod.rs'
+            executor = root / 'sui-core/src/checkpoints/checkpoint_executor'
+            module = executor / 'mod.rs'
             module.parent.mkdir(parents=True)
             module.write_text('let concurrency = 4;\n')
-            self.assertFalse(run.pacing_support(Path(tmp)))
-            module.write_text('SUI_CHECKPOINT_EXECUTION_PACING_MS\n')
+            config = root / 'sui-config/src/node.rs'
+            config.parent.mkdir(parents=True)
+            config.write_text('SUI_CHECKPOINT_EXECUTION_PACING_MS\n')
+            self.assertFalse(run.pacing_support(Path(tmp)),
+                             'only the executor tree or a built binary counts')
+            pacing = executor / 'pacing.rs'
+            pacing.write_text('pub const HOOK: &str = "SUI_CHECKPOINT_EXECUTION_PACING_MS";\n')
             self.assertTrue(run.pacing_support(Path(tmp)))
+            pacing.unlink()
+            (Path(tmp) / 'binaries').mkdir()
+            binary = Path(tmp) / 'binaries/sui-node-native'
+            binary.write_bytes(b'\0' * 4096 + b'SUI_CHECKPOINT_EXECUTION_PACING_MS' + b'\0' * 16)
+            self.assertTrue(run.pacing_support(Path(tmp)))
+            binary.write_bytes(b'\0' * 8192)
+            self.assertFalse(run.pacing_support(Path(tmp)))
 
 
 class CampaignBuildTargets(unittest.TestCase):

@@ -175,7 +175,7 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
     config = checkpoint.configuration(root, mode)
     start = time.monotonic()
     child = owned.start(mode, [binary, '--config-path', root / f'{mode}.yaml',
-                              '--run-with-range-checkpoint', tip+1], extra)
+                              '--run-with-range-checkpoint', replay_bound(tip)], extra)
     progress, samples, disk_samples, final_count = [], [], [], 0
     next_disk = time.monotonic() if disk_sample else float('inf')
     metrics = ''
@@ -521,9 +521,13 @@ ENGINE_PREFIXES = ('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_',
 
 def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, pacing_ms,
                         value_cache_size, default_value_cache_size, max_dirty_keys,
-                        snapshot_written_bytes, max_maps, index_blob_cache_min_bytes,
+                        snapshot_written_bytes, max_maps, max_index_maps,
+                        index_blob_cache_min_bytes,
                         read_profile_limit, native_write_profile_limit):
     """One explicit env for the replay; unknown inherited TH_* is refused."""
+    if not 3 <= max_maps <= 32 or not 3 <= max_index_maps <= 32:
+        raise ValueError('TH_MAX_MAPS and TH_MAX_INDEX_MAPS must be 3..32; '
+                         'the WAL mapper panics below 3')
     unknown = {key for key in os_environ if key.startswith('TH_') and key not in MANAGED_ENV}
     if unknown:
         raise ValueError('unknown TH_ runner knob(s): ' + ', '.join(sorted(unknown)))
@@ -532,7 +536,8 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
     env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
                TH_SYNC_WRITES='true' if tier == 'synchronous' else 'false',
                TH_FRAG_SIZE=str(fragment_mib*deployment.MIB),
-               TH_MAX_MAPS=str(max_maps), TH_MAX_INDEX_MAPS=str(max_maps),
+               TH_MAX_MAPS=str(max_maps),
+               TH_MAX_INDEX_MAPS=str(max_index_maps),
                TH_DEFAULT_MUTEX_COUNT='1',
                TH_DEFAULT_MAX_DIRTY_KEYS=str(max_dirty_keys),
                TH_DEFAULT_VALUE_CACHE_SIZE=str(default_value_cache_size),
@@ -549,22 +554,56 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
     return env
 
 
+PACING_ENV = 'SUI_CHECKPOINT_EXECUTION_PACING_MS'
+
+
+def _mentions(path, needle):
+    value = needle.encode()
+    with Path(path).open('rb') as stream:
+        tail = b''
+        while chunk := stream.read(1 << 20):
+            window = tail + chunk
+            if value in window:
+                return True
+            tail = window[-len(value):]
+    return False
+
+
 def pacing_support(build_root):
-    """True only when the frozen Sui sources read the pacing hook."""
-    root = Path(build_root) / 'sources/sui/crates'
-    candidates = (root / 'sui-core/src/checkpoints/checkpoint_executor/mod.rs',
-                  root / 'sui-config/src/node.rs')
-    return any(path.is_file() and 'SUI_CHECKPOINT_EXECUTION_PACING_MS' in path.read_text()
-               for path in candidates)
+    """True only when the frozen Sui executor reads the pacing hook.
+
+    The hook lives in `checkpoint_executor/pacing.rs`, so scan that directory,
+    not two fixed files. A built `sui-node-*` binary's strings are the final
+    proof that the hook was compiled in.
+    """
+    root = Path(build_root) / 'sources/sui/crates/sui-core/src/checkpoints/checkpoint_executor'
+    if root.is_dir():
+        for path in root.rglob('*.rs'):
+            try:
+                if PACING_ENV in path.read_text():
+                    return True
+            except (OSError, UnicodeError):
+                continue
+    return any(_mentions(path, PACING_ENV)
+               for path in sorted((Path(build_root) / 'binaries').glob('sui-node-*')))
 
 
 def requested_checkpoint(limit, requested):
-    """The highest replayed sequence, or a refusal for an impossible request."""
+    """Highest replayed sequence for a requested checkpoint count.
+
+    Sui's RunWithRange checkpoint bound is inclusive, so a request for N
+    checkpoints starting at 0 ends at N-1. `None` keeps the frozen range.
+    """
     if requested is None:
         return limit
-    if type(requested) is not int or not 1 <= requested <= limit:
-        raise ValueError(f'checkpoint range limit must be 1..{limit}')
-    return requested
+    if type(requested) is not int or not 1 <= requested <= limit + 1:
+        raise ValueError(f'checkpoint count must be 1..{limit + 1}')
+    return requested - 1
+
+
+def replay_bound(highest):
+    """Sui's RunWithRange checkpoint bound is inclusive; pass the sequence."""
+    return highest
 
 
 def main():
@@ -591,7 +630,7 @@ def main():
     parser.add_argument('--pacing-ms', type=int, default=0,
                         help='minimum milliseconds between checkpoints; 0 disables pacing')
     parser.add_argument('--checkpoints', type=int,
-                        help='replay only checkpoints 0..N inclusive (default: the whole fixture range)')
+                        help='replay exactly N checkpoints 0..N-1 (default: the whole fixture range)')
     parser.add_argument('--value-cache-size', type=int,
                         help='TH_VALUE_CACHE_SIZE flattened per-keyspace override; unset keeps Sui values')
     parser.add_argument('--default-value-cache-size', type=int, default=1000,
@@ -601,7 +640,9 @@ def main():
     parser.add_argument('--snapshot-written-bytes', type=int, default=8 << 30,
                         help='TH_SNAPSHOT_WRITTEN_BYTES native snapshot threshold')
     parser.add_argument('--max-maps', type=int, default=3,
-                        help='TH_MAX_MAPS native data maps; TH_MAX_INDEX_MAPS follows it')
+                        help='TH_MAX_MAPS replay/value WAL maps; the engine panics below 3')
+    parser.add_argument('--max-index-maps', type=int, default=3,
+                        help='TH_MAX_INDEX_MAPS index WAL maps; the engine panics below 3')
     parser.add_argument('--index-blob-cache-min-bytes', type=int, default=0,
                         help='TH_INDEX_BLOB_CACHE_MIN_BYTES; 0 disables the index blob cache')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
@@ -646,8 +687,10 @@ def main():
         raise ValueError('default value cache size must be 0..1000000 entries')
     if not 1 <= args.max_dirty_keys <= 1000000:
         raise ValueError('max dirty keys must be 1..1000000')
-    if not 1 <= args.max_maps <= 32:
-        raise ValueError('max maps must be 1..32')
+    if not 3 <= args.max_maps <= 32:
+        raise ValueError('max maps must be 3..32; the WAL mapper panics below 3')
+    if not 3 <= args.max_index_maps <= 32:
+        raise ValueError('max index maps must be 3..32; the WAL mapper panics below 3')
     if not 0 <= args.snapshot_written_bytes <= 1 << 40:
         raise ValueError('snapshot written bytes must be 0..1 TiB')
     if not 0 <= args.index_blob_cache_min_bytes <= 1 << 40:
@@ -715,7 +758,7 @@ def main():
         config['db-path']=str(root/mode/relative)
         config['consensus-config']=None
         config['fullnode-sync-mode']='state-sync-only'
-        config['run-with-range']=checkpoint.CheckpointBound((source_tip if mode == 'producer' else tip)+1)
+        config['run-with-range']=checkpoint.CheckpointBound(replay_bound(source_tip if mode == 'producer' else tip))
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
@@ -726,6 +769,7 @@ def main():
         default_value_cache_size=args.default_value_cache_size,
         max_dirty_keys=args.max_dirty_keys,
         snapshot_written_bytes=args.snapshot_written_bytes, max_maps=args.max_maps,
+        max_index_maps=args.max_index_maps,
         index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
         read_profile_limit=args.read_profile_limit,
         native_write_profile_limit=args.native_write_profile_limit)
@@ -749,6 +793,7 @@ def main():
                    max_dirty_keys=args.max_dirty_keys,
                    snapshot_written_bytes=args.snapshot_written_bytes,
                    max_maps=args.max_maps,
+                   max_index_maps=args.max_index_maps,
                    index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
                    source='explicit runtime env; nothing is inherited from TH_*'),
         cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
@@ -764,7 +809,7 @@ def main():
     signal.signal(signal.SIGTERM,interrupted)
     signal.signal(signal.SIGINT,interrupted)
     try:
-        producer=owned.start('producer',[bins/'sui-node-native','--config-path',root/'producer.yaml','--run-with-range-checkpoint',source_tip+1], producer_env)
+        producer=owned.start('producer',[bins/'sui-node-native','--config-path',root/'producer.yaml','--run-with-range-checkpoint',replay_bound(source_tip)], producer_env)
         address=configs['producer']['json-rpc-address']
         if int(checkpoint.wait_rpc(producer,address)) != source_tip:
             raise ValueError('producer tip differs')
