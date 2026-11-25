@@ -222,40 +222,31 @@ fn a_default_shard_threshold_must_fit_the_fragment_it_is_derived_from() {
         .expect("disabling auto-sharding has no ceiling");
 }
 
-/// The hybrid runs one WAL-based pass, so a configuration that asks for
-/// native's index-based cell walk is refused at open rather than silently
-/// running the other strategy. The default and an explicit `WalBased` open.
+/// Both native strategies open. `IndexBased` names native's cell walk and the
+/// coordinator implements it, so it is configuration the hybrid runs, not a
+/// request it substitutes or refuses.
 #[test]
-fn index_based_relocation_is_refused_at_open() {
+fn both_relocation_strategies_are_accepted_at_open() {
     use crate::relocation::RelocationStrategy;
-    use std::io;
 
-    for target in [None, Some(4096)] {
+    for target in [
+        RelocationStrategy::WalBased,
+        RelocationStrategy::IndexBased(None),
+        RelocationStrategy::IndexBased(Some(4096)),
+    ] {
         let config = HybridIndexConfig {
-            relocation_strategy: RelocationStrategy::IndexBased(target),
+            relocation_strategy: target,
             ..HybridIndexConfig::default()
         };
-        let error = config
+        config
             .validate()
-            .expect_err("IndexBased must be refused, not substituted by WalBased");
+            .unwrap_or_else(|error| panic!("{target:?} must open, got: {error:?}"));
         assert_eq!(
-            error.kind(),
-            io::ErrorKind::InvalidInput,
-            "the refusal is a configuration error: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("index relocation_strategy IndexBased is not supported"),
-            "the error names the refused field: {error:?}"
+            HybridIndexConfig::from_native(&config.to_native_config()).relocation_strategy,
+            target,
+            "the strategy survives the native configuration round trip"
         );
     }
-    HybridIndexConfig {
-        relocation_strategy: RelocationStrategy::WalBased,
-        ..HybridIndexConfig::default()
-    }
-    .validate()
-    .expect("WalBased is the only supported strategy");
 }
 
 #[test]

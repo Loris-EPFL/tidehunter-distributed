@@ -451,7 +451,8 @@ fn unexamined_shadowing(expected: BatchVersion, published: BatchVersion) -> Batc
 
 /// One relocation operation on a cell: native's two filter-driven flush kinds
 /// (`RelocationFlush::Updates` for a copied survivor, `RelocationFlush::Cutoff`
-/// for a filtered keyspace).
+/// for a filtered keyspace), plus the per-entry removal of native's
+/// index-based pass.
 pub(crate) enum RelocationApply<'a> {
     /// Compare-and-set re-point of the entries a pass copied, on their exact
     /// scanned positions.
@@ -464,6 +465,17 @@ pub(crate) enum RelocationApply<'a> {
     /// `RelocationFlush::Cutoff`) and never a deeper level, so a key that
     /// lives only in a promoted L1 blob stays readable, as it does natively.
     Drop,
+    /// Remove the listed entries, each named by its exact scanned position.
+    ///
+    /// An index-based pass decides per entry, so it cannot use the whole-cell
+    /// cutoff: a `Remove` decision on one key must not drop its neighbours.
+    /// The key's whole version vector is replaced with one `Removed` entry at
+    /// the scanned position, which is native's rule
+    /// (`IndexTable::retain_above_position` drops every position below the
+    /// cutoff and keeps the live one), so no read cut resolves the key. A key
+    /// the cell holds only in a promoted L1 blob gets the same tombstone in
+    /// the live table; it shadows the blob without rewriting it.
+    Remove(&'a [(Bytes, VersionPosition)]),
 }
 
 impl TableInner {
@@ -977,6 +989,14 @@ impl TableInner {
     ///   `retain_above_position` does. The key's other versions below its
     ///   target go with it, and one tombstone at the dropped live position
     ///   keeps a deeper level from resurfacing the key.
+    /// * Remove ([`RelocationApply::Remove`]): the same rule for the named
+    ///   keys only, on their exact scanned position. Native's index-based
+    ///   pass marks a `Remove` decision removed and lets WAL GC make the
+    ///   frame unreachable; a hybrid live read of a retired frame is the
+    ///   typed eviction error, not absent, so the entry itself must go. A key
+    ///   whose live row is no longer the scanned one keeps it (a newer write
+    ///   is above every target), and a key only a deeper level holds gets the
+    ///   tombstone in the live table, which shadows that level.
     ///
     /// A stale expectation is skipped, never forced. The cell is only marked for
     /// flush when something changed; the next covering store persists it.
@@ -1009,9 +1029,10 @@ impl TableInner {
         targets: &[(u32, u64, u64)],
     ) -> Result<Vec<(VersionPosition, BatchVersion)>, LocalDbError> {
         self.check_background_health()?;
-        let (updates, drop_entries) = match mode {
-            RelocationApply::Repoint(updates) => (updates, false),
-            RelocationApply::Drop => (&[][..], true),
+        let (updates, removals, drop_entries) = match mode {
+            RelocationApply::Repoint(updates) => (updates, &[][..], false),
+            RelocationApply::Remove(removals) => (&[][..], removals, false),
+            RelocationApply::Drop => (&[][..], &[][..], true),
         };
         let below_target = |position: VersionPosition| {
             let address = position.address;
@@ -1163,6 +1184,111 @@ impl TableInner {
                         }
                     }
                 }
+                if !removals.is_empty() {
+                    // The live row each removal replaces, by its exact scanned
+                    // position. A row that changed since the view (a newer
+                    // write) is left alone: its version is above the pass's
+                    // target, so the retirement cannot pass it.
+                    let mut doomed: Vec<VersionPosition> = Vec::new();
+                    // Rows only a deeper level holds. The live table gets the
+                    // same tombstone, which shadows that level at every cut
+                    // without rewriting its blob.
+                    let mut shadows: Vec<(Bytes, VersionPosition)> = Vec::new();
+                    let mut shard_rows: Vec<(WalPosition, usize)> = Vec::new();
+                    let mut blob_rows: Vec<usize> = Vec::new();
+                    for (idx, (key, expected)) in removals.iter().enumerate() {
+                        if !below_target(*expected) {
+                            continue;
+                        }
+                        match index.get_update_position(key) {
+                            // The latest row is still the entry the view
+                            // scanned (a tombstone at the same position is
+                            // already removed, and re-replacing it is
+                            // idempotent).
+                            Some(current) if current.same_physical(expected) => {
+                                doomed.push(*expected);
+                            }
+                            Some(current) => shadowed.push((*expected, current.batch)),
+                            None if levels.is_sharded() => match levels.shard_for(key) {
+                                Some(shard) => shard_rows.push((shard.position, idx)),
+                                None => shadowed.push((
+                                    *expected,
+                                    unexamined_shadowing(expected.batch, self.current()),
+                                )),
+                            },
+                            None => blob_rows.push(idx),
+                        }
+                    }
+                    if !doomed.is_empty() {
+                        // Replaces each key's whole version vector with one
+                        // tombstone at the scanned position (D30), which is
+                        // why the cutoff helper is the right primitive: it
+                        // drops the key on both sides of the overlay and
+                        // leaves the row that no read cut may resolve.
+                        drop_index_rows_preserving_resident_values(
+                            index,
+                            &|position: VersionPosition| {
+                                doomed
+                                    .iter()
+                                    .any(|expected| expected.same_physical(&position))
+                            },
+                            &mut changed,
+                        );
+                    }
+                    shard_rows.sort_unstable_by_key(|&(position, idx)| (position, idx));
+                    let mut cached: Option<(WalPosition, IndexTable<VersionPosition>)> = None;
+                    for (shard_pos, idx) in shard_rows {
+                        let (key, expected) = &removals[idx];
+                        if cached
+                            .as_ref()
+                            .is_none_or(|(cached_pos, _)| *cached_pos != shard_pos)
+                        {
+                            let loaded = loader.load(&context.ks_config, shard_pos)?;
+                            cached = Some((shard_pos, loaded));
+                        }
+                        match cached.as_ref().and_then(|(_, table)| table.get(key)) {
+                            Some(current)
+                                if current.same_physical(expected) && below_target(current) =>
+                            {
+                                shadows.push((key.clone(), *expected));
+                            }
+                            Some(current) => shadowed.push((*expected, current.batch)),
+                            None => shadowed.push((
+                                *expected,
+                                unexamined_shadowing(expected.batch, self.current()),
+                            )),
+                        }
+                    }
+                    if !blob_rows.is_empty() {
+                        let l1 = levels.l1();
+                        let loaded = match l1 {
+                            Some(position) => Some(loader.load(&context.ks_config, position)?),
+                            None => None,
+                        };
+                        for idx in blob_rows {
+                            let (key, expected) = &removals[idx];
+                            match loaded.as_ref().and_then(|table| table.get(key)) {
+                                Some(current)
+                                    if current.same_physical(expected) && below_target(current) =>
+                                {
+                                    shadows.push((key.clone(), *expected));
+                                }
+                                Some(current) => shadowed.push((*expected, current.batch)),
+                                None => shadowed.push((
+                                    *expected,
+                                    unexamined_shadowing(expected.batch, self.current()),
+                                )),
+                            }
+                        }
+                    }
+                    for (key, position) in shadows {
+                        // `key` is absent from the live table (checked above),
+                        // so this adds no flat row and cannot resurrect a
+                        // disk-derived entry behind the offset filters.
+                        let _ = index.remove(key, position);
+                        changed = true;
+                    }
+                }
                 if drop_entries {
                     drop_index_rows_preserving_resident_values(index, &below_target, &mut changed);
                 }
@@ -1183,10 +1309,10 @@ impl TableInner {
                 let published = self.current();
                 updates
                     .iter()
-                    .filter(|(_, expected, _)| below_target(*expected))
-                    .map(|(_, expected, _)| {
-                        (*expected, unexamined_shadowing(expected.batch, published))
-                    })
+                    .map(|(_, expected, _)| expected)
+                    .chain(removals.iter().map(|(_, expected)| expected))
+                    .filter(|expected| below_target(**expected))
+                    .map(|expected| (*expected, unexamined_shadowing(expected.batch, published)))
                     .collect()
             }
         })

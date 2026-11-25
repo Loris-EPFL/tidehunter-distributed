@@ -1,8 +1,21 @@
-//! R1 relocation pass: native `WalBased` relocation semantics on leased owner
-//! WALs (paper §2.3 principle 3 and §4.4: relocation never blocks writes).
+//! R1 relocation pass: native relocation semantics on leased owner WALs
+//! (paper §2.3 principle 3 and §4.4: relocation never blocks writes).
 //!
 //! Convention (A13): cuts are exclusive (`below(cut)` is `version < cut`),
 //! starts are inclusive and ends are exclusive.
+//!
+//! `HybridIndexConfig::relocation_strategy` selects one of native's two
+//! strategies. Steps 1, 3, 5 and the whole-file rule are shared; steps 2 and 4
+//! differ.
+//!
+//! * `WalBased` (default, native's): scan every owner batch in version order,
+//!   decide per record with the filter, and copy only the latest live entry
+//!   per key below each stream's target.
+//! * `IndexBased(t)`: walk the coordinator index at `Q`, decide per live
+//!   entry, copy each survivor below its own stream's target, and remove the
+//!   entries the filter marks removed (native lets WAL GC make those frames
+//!   unreachable; a hybrid live read of a retired frame is the typed eviction
+//!   error, so the entry itself must go).
 //!
 //! One pass:
 //! 1. Freeze the scan cut `Q` = `Loader::last_processed()` (`min` of the
@@ -10,19 +23,22 @@
 //!    checkpoint latch) and, per retained stream `(partition, fencing
 //!    generation)`, the scan interval `[callback start, durable end)`.
 //! 2. Page each stream's original batches from its owner (`RelocationPage`,
-//!    metadata only) and merge them in global
+//!    metadata only). `WalBased` merges them in global
 //!    `(generation, batch sequence, member)` order with one page and one head
 //!    per stream. Every authenticated put of a filtered keyspace is read
 //!    through the ordinary position read and passed to the filter once,
 //!    including puts the index no longer holds. The first `Stop` ends all
 //!    callbacks, later members of its batch included. `Keep` is not a copy
 //!    decision: like native at the parity tip, a filtered keyspace copies
-//!    nothing.
+//!    nothing. `IndexBased` reads no value here and calls no filter: the pages
+//!    only name each stream's first unprocessed byte, which bounds every
+//!    callback start.
 //! 3. Per stream: the scan stops at the first batch at or above `Q` (cuts are
 //!    exclusive, so that batch is not read) and otherwise at the durable end.
 //!    Terminal = the `Stop` batch, the first batch after `Stop` (other
-//!    streams) or the durable end. This fork's D27 rule gives the hybrid that
-//!    end even without a `Stop`: its leased scan completes only adopted
+//!    streams), the durable end, or (`IndexBased`) the configured byte limit
+//!    min the first unprocessed byte. This fork's D27 rule gives the hybrid
+//!    that end even without a `Stop`: its leased scan completes only adopted
 //!    groups, so no torn frame lies below the end it reports. Native falls
 //!    back to its upper limit only when the scan ends exactly there on
 //!    `EndOfWal` or a zeroed header; an end below that limit, or a torn frame
@@ -32,8 +48,8 @@
 //!    target the pass is `NoWork`: no copy, no start, no snapshot. It still
 //!    runs retirement when a stream has a non-zero whole-file target, as
 //!    native re-runs its gc against a target that did not advance.
-//! 4. `DidWork`: a filtered keyspace copies nothing and drops every entry
-//!    below its stream's TERMINAL unread, as native's cutoff
+//! 4. `DidWork`: `WalBased` drops a filtered keyspace's entries below its
+//!    stream's TERMINAL unread, as native's cutoff
 //!    (`relocation/mod.rs` `relocate_stripe`, `RelocationFlush::Cutoff`) does;
 //!    entries from the target to the terminal go with them. Every other
 //!    keyspace copies each live entry below its own stream's target to the
@@ -41,7 +57,13 @@
 //!    its exact expected position (never `insert`: equal order would be
 //!    dropped, I4b). A copy keeps the logical version and operation index of
 //!    the position it re-points and gets a new address and payload CRC, so the
-//!    winner never changes by version.
+//!    winner never changes by version. `IndexBased` walks the index cells
+//!    instead (L0 merged over the overlay, a promoted L1 blob loaded on
+//!    demand), skips entries at or above `Q` (`offset >= effective_limit` in
+//!    native), copies `Keep` and removes `Remove` and unreachable entries. Its
+//!    `Stop` ends the current cell's walk, as native's loop does, and caps that
+//!    stream's target at the file below the lowest skipped byte so no start
+//!    ever passes a value the filter told the pass to keep.
 //! 5. Make it durable: one snapshot stores the re-pointed index and the
 //!    control region (per-stream `replay_from`), one manifest replacement
 //!    raises the callback starts monotonically, then retirement runs under the
@@ -61,7 +83,8 @@ use crate::cell::CellId;
 use crate::distributed::hybrid::RelocationApply;
 use crate::distributed::hybrid::StoredSnapshot;
 use crate::distributed::hybrid::position::VersionPosition;
-use crate::distributed::storage::RelocationBatch;
+use crate::distributed::storage::{RelocationBatch, RelocationPage};
+use crate::relocation::RelocationStrategy;
 use crate::wal::position::IndexCut;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,6 +239,14 @@ fn at_or_above_cut(version: BatchVersion, q: BatchVersion) -> bool {
 /// version the copy re-points.
 type RelocatedValue = (Bytes, Bytes, BatchVersion);
 
+/// Streams a pass may no longer target, keyed by `(partition, generation)`: a
+/// survivor the pass could not verify or remove keeps its bytes.
+type BlockedStreams = BTreeSet<(u32, u64)>;
+
+/// The lowest byte a `Stop` skipped, per `(partition, generation)` stream: the
+/// stream's target may not pass it.
+type StopHolds = BTreeMap<(u32, u64), u64>;
+
 fn cancelled() -> LocalDbError {
     LocalDbError::new("relocation pass cancelled by shutdown")
 }
@@ -321,15 +352,32 @@ impl ConcurrentRemoteDatabase {
         }
     }
 
-    /// Run one relocation pass. `observe` records every callback with its key
-    /// and value (test observation only; production keeps none). `cancel` is
-    /// checked between merged batches and owner polls, before any copy.
+    /// Run one relocation pass with the strategy the configuration names.
+    /// `observe` records every callback with its key and value (test
+    /// observation only; production keeps none). `cancel` is checked between
+    /// merged batches and owner polls, before any copy.
     pub(crate) fn relocation_pass(
         &self,
         observe: bool,
         cancel: &AtomicBool,
     ) -> Result<RelocationReport, LocalDbError> {
         self.ensure_healthy()?;
+        match self.write_core().config.index.relocation_strategy {
+            RelocationStrategy::WalBased => self.wal_based_relocation_pass(observe, cancel),
+            RelocationStrategy::IndexBased(target) => {
+                self.index_based_relocation_pass(target, observe, cancel)
+            }
+        }
+    }
+
+    /// Native's WAL-based pass: scan each owner stream in version order, stop
+    /// at the first `StopRelocation`, copy every live entry below its own
+    /// stream's whole-file target, store, adopt the starts and retire.
+    fn wal_based_relocation_pass(
+        &self,
+        observe: bool,
+        cancel: &AtomicBool,
+    ) -> Result<RelocationReport, LocalDbError> {
         let core = self.write_core();
         let (cut, streams) = self.freeze_relocation_scan()?;
         let file = core.config.storage.wal_file_bytes;
@@ -438,32 +486,7 @@ impl ConcurrentRemoteDatabase {
         let reports = stream_reports(&cursors, stop, file, pct, core.epoch)?;
         // One exclusive byte end per stream below which its files are
         // reclaimed: the native whole-file target.
-        let mut targets: Vec<(u32, u64, u64)> = reports
-            .iter()
-            .map(|stream| {
-                (
-                    stream.partition,
-                    stream.fencing_generation,
-                    stream.rounded_target,
-                )
-            })
-            .collect();
-        targets.retain(|&(partition, generation, target)| {
-            let lo = reports
-                .iter()
-                .find(|stream| {
-                    stream.partition == partition && stream.fencing_generation == generation
-                })
-                .map_or(0, |stream| stream.lo);
-            if generation < core.epoch {
-                // A sealed stream only needs progress past its oldest live
-                // byte; its last file may be partial.
-                target > lo
-            } else {
-                // Native: one whole completed file before its bytes move.
-                target >= lo.saturating_add(file)
-            }
-        });
+        let targets = whole_file_targets(&reports, file, core.epoch);
         if targets.is_empty() {
             // Native runs its GC with the whole-file target on every run that
             // has one, including a target that did not advance; the hybrid
@@ -511,6 +534,32 @@ impl ConcurrentRemoteDatabase {
         let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
         let (copied, rejected, blocked) =
             self.relocate_cells(q, &targets, &drop_targets, cancel, &mut shadowed)?;
+        self.finish_relocation_pass(
+            q, reports, callbacks, copied, rejected, targets, &blocked, shadowed,
+        )
+    }
+
+    /// The durable ladder every pass shares, whichever strategy decided what
+    /// to copy: merge the shadow witness, store a region that covers the scan
+    /// cut, adopt the file-aligned callback starts, then retire. A pass that
+    /// cannot prove a stored region at its cut adopts nothing and retires
+    /// nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site per strategy; the arguments are that pass's own report fields"
+    )]
+    fn finish_relocation_pass(
+        &self,
+        q: BatchVersion,
+        reports: Vec<StreamReport>,
+        callbacks: Vec<CallbackRecord>,
+        copied: u64,
+        rejected: u64,
+        mut targets: Vec<(u32, u64, u64)>,
+        blocked: &BTreeSet<(u32, u64)>,
+        shadowed: Vec<(VersionPosition, BatchVersion)>,
+    ) -> Result<RelocationReport, LocalDbError> {
+        let core = self.write_core();
         // A survivor this pass could not verify or copy keeps its stream's
         // start where it was: advancing it would let retirement reclaim bytes
         // that still hold a live value. The copy of that key is not applied.
@@ -621,6 +670,345 @@ impl ConcurrentRemoteDatabase {
             promotion_cut: Some(promotion_cut),
             deferred: false,
         })
+    }
+
+    /// Native's index-based pass (`relocation/mod.rs`
+    /// `index_based_relocation`): walk the coordinator index at the frozen
+    /// scan cut `q`, copy every live value below its own stream's whole-file
+    /// target to the serving generation, remove the entries its filter marks
+    /// removed, then store, adopt the starts and retire.
+    ///
+    /// Recorded differences from native (D33 register):
+    /// * `IndexBased(t)` is a per-stream byte limit. Owner WAL offsets have no
+    ///   shared order, so one number applies to each stream's own offsets, as
+    ///   `relocation_max_reclaim_pct` already does; one owner reduces to
+    ///   native's single WAL. `None` processes every live entry below `q`.
+    /// * The pass copies only what a whole-file target can reclaim, so a limit
+    ///   below one owner file is `NoWork` and copies nothing. Native copies
+    ///   below the raw limit and reclaims nothing; no read observes the
+    ///   difference.
+    /// * `StopRelocation` ends the current cell's walk, as native's loop does,
+    ///   but no start advances past a skipped entry: that stream's target is
+    ///   capped at the file below the lowest skipped byte. Native's single GC
+    ///   watermark can reclaim bytes the filter told it to keep.
+    fn index_based_relocation_pass(
+        &self,
+        target: Option<u64>,
+        observe: bool,
+        cancel: &AtomicBool,
+    ) -> Result<RelocationReport, LocalDbError> {
+        let core = self.write_core();
+        let file = core.config.storage.wal_file_bytes;
+        let pct = core.config.index.relocation_max_reclaim_pct;
+        let (cut, streams) = self.freeze_relocation_scan()?;
+        let empty =
+            |streams: Vec<StreamReport>, callbacks: Vec<CallbackRecord>, scan_cut: BatchVersion| {
+                RelocationReport {
+                    gate: RelocationGate::NoWork,
+                    streams,
+                    callbacks,
+                    copied_survivors: 0,
+                    rejected_survivors: 0,
+                    scan_cut,
+                    stored_target: None,
+                    stored_forced: false,
+                    promotion_cut: None,
+                    deferred: false,
+                }
+            };
+        let Some(q) = cut else {
+            return Ok(empty(Vec::new(), Vec::new(), BatchVersion::NONE));
+        };
+        let mut clients = self.relocation_clients()?;
+        let mut reports: Vec<StreamReport> = Vec::with_capacity(streams.len());
+        for scan in &streams {
+            let (lo, processed_end) =
+                self.stream_scan_bound(&mut clients[scan.node], scan, q, cancel)?;
+            // Every batch of a stream past its durable end reports no boundary,
+            // which is the durable end itself.
+            let processed_end = processed_end.unwrap_or(scan.required_end);
+            reports.push(StreamReport {
+                partition: scan.partition,
+                fencing_generation: scan.generation,
+                lo,
+                processed_upper: processed_end,
+                stream_end: scan.required_end,
+                // Native's `effective_limit = min(target, last_processed)`; the
+                // stream's own first unprocessed byte is the second term.
+                terminal_position: target.map_or(processed_end, |limit| limit.min(processed_end)),
+                rounded_target: 0,
+            });
+        }
+        finalize_stream_targets(&mut reports, file, pct, core.epoch)?;
+        let mut targets = whole_file_targets(&reports, file, core.epoch);
+        if targets.is_empty() {
+            // Native re-runs its GC against a target that did not advance; the
+            // hybrid retries the retirement under the already adopted
+            // watermark, and nothing is copied, dropped or stored.
+            if reports.iter().any(|stream| stream.rounded_target > 0) {
+                let mut gate = core.retirement.lock();
+                core_retire_dead_wal_files(core, &mut gate)?;
+            }
+            return Ok(empty(reports, Vec::new(), q));
+        }
+        let mut callbacks = Vec::new();
+        let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
+        let mut rejected = 0u64;
+        let (copied, blocked, holds) = self.relocate_index_cells(
+            q,
+            &targets,
+            observe,
+            &mut callbacks,
+            cancel,
+            &mut rejected,
+            &mut shadowed,
+        )?;
+        if !holds.is_empty() {
+            // A cell's `Stop` skipped entries the pass did not copy. Their
+            // bytes must stay: cap each stream's target at the file below the
+            // lowest skipped byte and re-derive the whole-file gate.
+            for stream in &mut reports {
+                if let Some(&hold) = holds.get(&(stream.partition, stream.fencing_generation)) {
+                    stream.terminal_position = stream.terminal_position.min(hold);
+                }
+            }
+            finalize_stream_targets(&mut reports, file, pct, core.epoch)?;
+            targets = whole_file_targets(&reports, file, core.epoch);
+        }
+        self.finish_relocation_pass(
+            q, reports, callbacks, copied, rejected, targets, &blocked, shadowed,
+        )
+    }
+
+    /// `lo` (the stream's oldest unretired file start) and the offset of the
+    /// first batch at or above `q`, from metadata pages only. No filter runs
+    /// and no value is read. `None` means every batch of the stream is below
+    /// `q`, so its processed end is its durable end.
+    fn stream_scan_bound(
+        &self,
+        client: &mut Client,
+        scan: &StreamScan,
+        q: BatchVersion,
+        cancel: &AtomicBool,
+    ) -> Result<(u64, Option<u64>), LocalDbError> {
+        let file = self.config.storage.wal_file_bytes;
+        let mut from = Some(scan.from);
+        let mut start = None;
+        while let Some(cursor) = from {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            let page = self.fetch_relocation_page(client, scan, cursor, cancel)?;
+            let page_start = *start.get_or_insert(page.start);
+            if let Some(batch) = page
+                .batches
+                .iter()
+                .find(|batch| at_or_above_cut(batch.version, q))
+            {
+                return Ok((page_start - page_start % file, Some(batch.address.offset)));
+            }
+            from = page.next;
+        }
+        let start = start.unwrap_or(scan.from);
+        Ok((start - start % file, None))
+    }
+
+    /// Walk every cell of every live keyspace at the scan cut `q` and copy,
+    /// remove and observe. Returns the survivors re-pointed, the streams a
+    /// rejection blocked, and the lowest skipped byte per stream (a `Stop`
+    /// ended that cell's walk).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one internal call site; the accumulators are the pass's own outputs"
+    )]
+    fn relocate_index_cells(
+        &self,
+        q: BatchVersion,
+        targets: &[(u32, u64, u64)],
+        observe: bool,
+        callbacks: &mut Vec<CallbackRecord>,
+        cancel: &AtomicBool,
+        rejected: &mut u64,
+        shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
+    ) -> Result<(u64, BlockedStreams, StopHolds), LocalDbError> {
+        let mut copied = 0u64;
+        let mut blocked = BlockedStreams::new();
+        let mut holds = StopHolds::new();
+        for descriptor in self.shape.iter_ks() {
+            let keyspace = descriptor.id();
+            if descriptor.destroyed() {
+                continue;
+            }
+            let mut cell = descriptor.first_cell();
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(cancelled());
+                }
+                copied += self.relocate_index_cell(
+                    keyspace,
+                    descriptor,
+                    &cell,
+                    q,
+                    targets,
+                    observe,
+                    callbacks,
+                    cancel,
+                    rejected,
+                    &mut blocked,
+                    &mut holds,
+                    shadowed,
+                )?;
+                let Some(next) = self.write_core().table.next_cell(descriptor, &cell, false) else {
+                    break;
+                };
+                cell = next;
+            }
+        }
+        Ok((copied, blocked, holds))
+    }
+
+    /// One cell: copy its live survivors in bounded chunks, remove the entries
+    /// the filter or an unreachable frame marks removed, and record a `Stop`'s
+    /// skipped bytes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one internal call site; the accumulators are the pass's own outputs"
+    )]
+    fn relocate_index_cell(
+        &self,
+        keyspace: KeySpace,
+        descriptor: &crate::key_shape::KeySpaceDesc,
+        cell: &CellId,
+        q: BatchVersion,
+        targets: &[(u32, u64, u64)],
+        observe: bool,
+        callbacks: &mut Vec<CallbackRecord>,
+        cancel: &AtomicBool,
+        rejected: &mut u64,
+        blocked: &mut BlockedStreams,
+        holds: &mut StopHolds,
+        shadowed: &mut Vec<(VersionPosition, BatchVersion)>,
+    ) -> Result<u64, LocalDbError> {
+        let (view, latch) = self.write_core().table.relocation_view(keyspace, cell, q)?;
+        let limit = self.relocation_batch_max_bytes();
+        let mut chunk: Vec<RelocatedValue> = Vec::new();
+        let mut expected: Vec<(Bytes, VersionPosition)> = Vec::new();
+        let mut removals: Vec<(Bytes, VersionPosition)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut copied = 0u64;
+        let mut stopped = false;
+        for (reduced_key, position) in view.iter() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            // A promoted level can expose an entry the cut has not processed;
+            // native skips it (`offset >= effective_limit`), and its version is
+            // ours to leave alone.
+            if at_or_above_cut(position.batch, q) {
+                continue;
+            }
+            let stream = (
+                position.address.partition,
+                position.address.segment_generation,
+            );
+            if stopped {
+                // Native ends the cell's walk here. This pass ends it too, but
+                // it must not then reclaim a byte the filter told it to keep.
+                let hold = holds.entry(stream).or_insert(position.address.offset);
+                *hold = (*hold).min(position.address.offset);
+                continue;
+            }
+            if !below_target(&position, targets) || blocked.contains(&stream) {
+                continue;
+            }
+            let value = match self
+                .value_reader()
+                .read_indexed(descriptor, &reduced_key, position)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    *rejected += 1;
+                    blocked.insert(stream);
+                    continue;
+                }
+            };
+            let Some((key, value)) = value else {
+                // An unreachable frame: native marks the entry removed.
+                removals.push((reduced_key, position));
+                continue;
+            };
+            let decision = match descriptor.relocation_filter() {
+                Some(filter) => match filter(&key, &value) {
+                    crate::Decision::Keep => CallbackDecision::Keep,
+                    crate::Decision::Remove => CallbackDecision::Remove,
+                    crate::Decision::StopRelocation => CallbackDecision::Stop,
+                },
+                None => CallbackDecision::Keep,
+            };
+            if observe {
+                callbacks.push(CallbackRecord {
+                    keyspace,
+                    key: key.clone(),
+                    value: value.clone(),
+                    wal_position: position.address.offset,
+                    decision,
+                });
+            }
+            match decision {
+                CallbackDecision::Keep => {
+                    bytes = bytes.saturating_add(value.len());
+                    chunk.push((key, value, position.batch));
+                    expected.push((reduced_key, position));
+                    if bytes >= limit {
+                        copied += self.flush_relocated(
+                            keyspace,
+                            cell,
+                            &mut chunk,
+                            &mut expected,
+                            targets,
+                            rejected,
+                            blocked,
+                            shadowed,
+                        )?;
+                        bytes = 0;
+                    }
+                }
+                CallbackDecision::Remove => removals.push((reduced_key, position)),
+                CallbackDecision::Stop => {
+                    // The Stop entry itself is not copied (native breaks before
+                    // it), so its bytes stay too.
+                    let hold = holds.entry(stream).or_insert(position.address.offset);
+                    *hold = (*hold).min(position.address.offset);
+                    stopped = true;
+                }
+            }
+        }
+        copied += self.flush_relocated(
+            keyspace,
+            cell,
+            &mut chunk,
+            &mut expected,
+            targets,
+            rejected,
+            blocked,
+            shadowed,
+        )?;
+        if !removals.is_empty() {
+            let live: Vec<(u32, u64, u64)> = targets
+                .iter()
+                .copied()
+                .filter(|&(partition, generation, _)| !blocked.contains(&(partition, generation)))
+                .collect();
+            let not_applied = self.write_core().table.relocation_apply(
+                keyspace,
+                cell,
+                RelocationApply::Remove(&removals),
+                &live,
+            )?;
+            shadowed.extend(not_applied);
+        }
+        drop(latch);
+        Ok(copied)
     }
 
     /// Drop every entry of a filtered keyspace below its stream's terminal,
@@ -984,6 +1372,47 @@ impl ConcurrentRemoteDatabase {
             .collect()
     }
 
+    /// One metadata page of `scan`'s stream from `from`, after waiting for the
+    /// owner to adopt the scan's required end. The wait is bounded by the
+    /// configured timeout; `cancel` ends it early.
+    fn fetch_relocation_page(
+        &self,
+        client: &mut Client,
+        scan: &StreamScan,
+        from: u64,
+        cancel: &AtomicBool,
+    ) -> Result<RelocationPage, LocalDbError> {
+        let deadline = Instant::now() + self.config.timeout;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            let page = client
+                .relocation_page(
+                    self.epoch,
+                    scan.generation,
+                    from,
+                    scan.required_end,
+                    PAGE_BATCHES,
+                )
+                .map_err(|error| {
+                    LocalDbError::new(format!(
+                        "relocation page of partition {} generation {} failed: {error}",
+                        scan.partition, scan.generation
+                    ))
+                })?;
+            if page.available_end >= scan.required_end {
+                return Ok(page);
+            }
+            if Instant::now() >= deadline {
+                return Err(LocalDbError::new(
+                    "relocation scan: owner adoption stays below the published cut",
+                ));
+            }
+            std::thread::sleep(BEHIND_POLL);
+        }
+    }
+
     /// Give `cursor` a head batch or mark it ended. Batches above `Q` end
     /// the stream at their offset. Waits, bounded by the configured timeout,
     /// while the owner has not adopted the required end.
@@ -994,7 +1423,6 @@ impl ConcurrentRemoteDatabase {
         q: BatchVersion,
         cancel: &AtomicBool,
     ) -> Result<(), LocalDbError> {
-        let deadline = Instant::now() + self.config.timeout;
         while cursor.buffer.is_empty() && cursor.upper.is_none() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(cancelled());
@@ -1003,30 +1431,8 @@ impl ConcurrentRemoteDatabase {
                 cursor.upper = Some(cursor.scan.required_end);
                 break;
             };
-            let page = client
-                .relocation_page(
-                    self.epoch,
-                    cursor.scan.generation,
-                    from,
-                    cursor.scan.required_end,
-                    PAGE_BATCHES,
-                )
-                .map_err(|error| {
-                    LocalDbError::new(format!(
-                        "relocation page of partition {} generation {} failed: {error}",
-                        cursor.scan.partition, cursor.scan.generation
-                    ))
-                })?;
+            let page = self.fetch_relocation_page(client, &cursor.scan, from, cancel)?;
             cursor.start.get_or_insert(page.start);
-            if page.available_end < cursor.scan.required_end {
-                if Instant::now() >= deadline {
-                    return Err(LocalDbError::new(
-                        "relocation scan: owner adoption stays below the published cut",
-                    ));
-                }
-                std::thread::sleep(BEHIND_POLL);
-                continue;
-            }
             for batch in page.batches {
                 if at_or_above_cut(batch.version, q) {
                     cursor.upper = Some(batch.address.offset);
@@ -1053,6 +1459,35 @@ impl ConcurrentRemoteDatabase {
             .read_indexed(descriptor, reduced_key, position)?
             .ok_or_else(|| LocalDbError::new("relocation member is not a put"))
     }
+}
+
+/// One exclusive byte end per stream below which its files may be reclaimed:
+/// the native whole-file target. A sealed stream only needs progress past its
+/// oldest live byte (its last file may be partial); a serving stream needs one
+/// whole completed file before its bytes move.
+fn whole_file_targets(reports: &[StreamReport], file: u64, serving: u64) -> Vec<(u32, u64, u64)> {
+    let mut targets: Vec<(u32, u64, u64)> = reports
+        .iter()
+        .map(|stream| {
+            (
+                stream.partition,
+                stream.fencing_generation,
+                stream.rounded_target,
+            )
+        })
+        .collect();
+    targets.retain(|&(partition, generation, target)| {
+        let lo = reports
+            .iter()
+            .find(|stream| stream.partition == partition && stream.fencing_generation == generation)
+            .map_or(0, |stream| stream.lo);
+        if generation < serving {
+            target > lo
+        } else {
+            target >= lo.saturating_add(file)
+        }
+    });
+    targets
 }
 
 /// Per-stream lo, terminal and native whole-file target. `stop` names the
@@ -1106,6 +1541,21 @@ fn stream_reports(
             }
         })
         .collect();
+    finalize_stream_targets(&mut reports, file, pct, serving)?;
+    Ok(reports)
+}
+
+/// Native's whole-file rounding and the per-owner percentage budget, applied
+/// to each stream's `terminal_position`. Shared by the WAL-based pass (the
+/// terminal is the scan's) and the index-based pass (the terminal is the
+/// configured byte limit bounded by the stream's processed end), so both
+/// propose file-aligned callback starts by one rule.
+fn finalize_stream_targets(
+    reports: &mut [StreamReport],
+    file: u64,
+    pct: u8,
+    serving: u64,
+) -> Result<(), LocalDbError> {
     // Per owner: budget over its streams, oldest generation first.
     let mut partitions: Vec<u32> = reports.iter().map(|stream| stream.partition).collect();
     partitions.dedup();
@@ -1154,7 +1604,7 @@ fn stream_reports(
             };
         }
     }
-    Ok(reports)
+    Ok(())
 }
 
 #[cfg(test)]

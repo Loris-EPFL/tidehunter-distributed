@@ -24,6 +24,8 @@ use crate::key_shape::KeyType;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "index_based_relocation_tests.rs"]
+mod index_based_relocation;
 #[path = "native_parity_gates_tests.rs"]
 mod native_parity_gates;
 #[path = "schedule_sweep_tests.rs"]

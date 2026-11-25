@@ -63,9 +63,11 @@ pub struct HybridIndexConfig {
     pub direct_io: bool,
     pub sync_flush: bool,
     pub wal_file_size: u64,
-    /// Accepted for configuration parity only: the hybrid runs the WAL-based
-    /// pass, so [`Self::validate`] refuses `IndexBased` instead of silently
-    /// substituting `WalBased`. Sui leaves it at the default.
+    /// Which relocation pass the coordinator runs. `WalBased` (native's
+    /// default) walks the owner WALs; `IndexBased(t)` walks the coordinator
+    /// index at the frozen scan cut and copies every live value below `t`, the
+    /// per-stream byte limit, the way native's `index_based_relocation` does.
+    /// Sui leaves it at the default.
     pub relocation_strategy: RelocationStrategy,
     pub relocation_max_reclaim_pct: u8,
     pub relocation_batch_max_bytes: Option<usize>,
@@ -164,17 +166,6 @@ impl HybridIndexConfig {
         }
         if self.relocation_max_reclaim_pct > 100 {
             return invalid("index relocation_max_reclaim_pct must be in 0..=100".to_owned());
-        }
-        if matches!(self.relocation_strategy, RelocationStrategy::IndexBased(_)) {
-            // The coordinator runs one WAL-based pass over the owner streams;
-            // its index is a native `LargeTable` fed by that pass, not the
-            // single-node cell walk `IndexBased` names. Running `WalBased`
-            // instead would silently drop a requested native capability.
-            return invalid(
-                "index relocation_strategy IndexBased is not supported by the hybrid \
-                 coordinator: use WalBased"
-                    .to_owned(),
-            );
         }
         if let Some(cache_bytes) = self.index_blob_cache_bytes {
             // Same two invariants, and the same text, as native `Config::validate`.

@@ -302,11 +302,14 @@ while the database is open.
 
 ## 8. Capacity
 
-Relocation uses the native `WalBased` strategy (`RelocationStrategy` in
-`tidehunter/src/relocation/mod.rs`). It walks the WAL in order from the oldest
-position. It runs asynchronously on one background worker per database
-(`sui/relocation.rs` `RemoteRelocator`, `Db::start_relocation` in `sui.rs`).
-A pass has six steps:
+Relocation runs the strategy `HybridIndexConfig::relocation_strategy` names
+(`RelocationStrategy` in `tidehunter/src/relocation/mod.rs`). It runs
+asynchronously on one background worker per database (`sui/relocation.rs`
+`RemoteRelocator`, `Db::start_relocation` in `sui.rs`).
+
+### WalBased (native default)
+
+It walks the WAL in order from the oldest position. A pass has six steps:
 
 1. Scan each owner stream and stop at the first `StopRelocation` decision.
 2. A filtered keyspace (Sui's shape) copies nothing and drops every entry
@@ -317,6 +320,35 @@ A pass has six steps:
    physical position.
 5. Store a control region.
 6. Retire the dead sealed files.
+
+### IndexBased
+
+It walks the coordinator index at the frozen scan cut `Q`, as native's
+`index_based_relocation` walks its cells. Steps 3-6 above are shared; the
+differences are:
+
+1. Per stream, the metadata pages give the first byte `Q` has not processed.
+   No value is read and no filter runs in this step.
+2. Each cell's as-of view at `Q` (L0 over the overlay, a promoted L1 blob
+   loaded on demand) is walked. Entries at or above `Q` are left alone. Every
+   live entry below its own stream's whole-file target is copied; a filter
+   `Remove`, or an unreachable frame, removes the entry's whole version vector
+   and leaves one tombstone at its position, so no read cut resolves it (a
+   hybrid live read of a retired frame is the typed eviction, not absent).
+   `StopRelocation` ends that cell's walk, as native's loop does.
+
+Recorded differences from native (`D33` in the upstream audit register):
+
+- `IndexBased(t)` is a per-stream byte limit. Owner WAL offsets have no shared
+  order, so one number bounds each stream's own offsets, as
+  `relocation_max_reclaim_pct` already does; one owner reduces to native.
+- The pass copies and removes only below a whole-file, pct-budgeted target.
+  A limit below one owner file is `NoWork` and copies nothing, where native
+  copies below the raw limit and reclaims nothing. No read sees the
+  difference; owner write cost stays proportional to reclaimed bytes.
+- No start advances past a `Stop`'s skipped entries: that stream's target is
+  capped at the file below the lowest skipped byte. Native's single GC
+  watermark can reclaim bytes the filter told it to keep.
 
 A pass that cannot prove a stored region at its cut retires nothing. A pass
 takes no exclusive write gate. Foreground writes keep the shared gate.
