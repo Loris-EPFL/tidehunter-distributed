@@ -445,3 +445,56 @@ class ReopenPath(unittest.TestCase):
                 driver.crash()
             self.assertEqual(captured['gate'], gate)
             self.assertEqual(captured['kill'], kill)
+
+
+class UploadedPass(unittest.TestCase):
+    def cell_tree(self, root):
+        output = Path(root) / 'M6-w1-c16'
+        run = output / 'measure' / 'run'
+        run.mkdir(parents=True)
+        (output / 'receipt.json').write_text('{"ok": true}')
+        (output / 'measure' / 'spec.json').write_text('{}')
+        for name in ('manifest.json', 'summary.json', 'samples.csv',
+                     'measurement-read-evidence.json', 'live.prom'):
+            (run / name).write_text(name)
+        parts = [dict(name='measure', output=str(run), log=str(output / 'measure.log'))]
+        return output, fault_cells.cell_artifacts(output, parts)
+
+    def entry(self, root):
+        ledger = fault_cells.ledger_module.Ledger(Path(root) / 'campaign-ledger.json')
+        entry = ledger.begin(stage='stage2', cell_id='M6-w1-c16',
+                             config_hash='hash', unit='M6-w1-c16')
+        ledger.save()
+        return ledger, entry
+
+    def test_a_cell_passes_only_after_every_object_verifies(self):
+        from test_gcs_ledger import FakeObjectStore
+        with tempfile.TemporaryDirectory() as tmp:
+            output, artifacts = self.cell_tree(tmp)
+            ledger, entry = self.entry(tmp)
+            store = FakeObjectStore()
+            receipt = fault_cells.campaign_upload.Evidence(
+                store, 'campaign-hybrid-sui-2026-11-25').persist(
+                    ledger, entry, artifacts)
+            self.assertEqual(ledger.status('stage2', 'M6-w1-c16'), 'passed')
+            keys = {row['key'] for row in receipt['evidence']}
+            self.assertIn('campaign-hybrid-sui-2026-11-25/stage2/evidence/M6-w1-c16/'
+                          'attempt-1/receipt.json', keys)
+            self.assertIn('campaign-hybrid-sui-2026-11-25/stage2/raw/M6-w1-c16/'
+                          'attempt-1/measure/run/samples.csv', keys)
+            stored = ledger.to_bytes()
+            self.assertEqual(store.objects[
+                'campaign-hybrid-sui-2026-11-25/campaign-ledger.json'][0], stored)
+
+    def test_a_corrupt_upload_never_passes_the_cell(self):
+        from test_gcs_ledger import FakeObjectStore
+        with tempfile.TemporaryDirectory() as tmp:
+            output, artifacts = self.cell_tree(tmp)
+            ledger, entry = self.entry(tmp)
+            store = FakeObjectStore()
+            store.receipt_size_delta = 1
+            with self.assertRaises(ValueError):
+                fault_cells.campaign_upload.Evidence(
+                    store, 'campaign-hybrid-sui-2026-11-25').persist(
+                        ledger, entry, artifacts)
+            self.assertEqual(ledger.status('stage2', 'M6-w1-c16'), 'running')
