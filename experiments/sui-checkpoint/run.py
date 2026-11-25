@@ -737,6 +737,21 @@ def index_blob_cache_support(build_root):
                for binary in sorted((Path(build_root) / 'binaries').glob('sui-node-*')))
 
 
+def index_blob_cache_floor_error(min_bytes, budget_mib):
+    """Why this floor cannot be used with this budget, or None.
+
+    An unset floor keeps the engine's 64 MiB default and a budget of 0 keeps the
+    cache off, so neither is compared. The engine refuses a floor above the
+    budget when both rows are set; refuse it here, before a host is touched.
+    """
+    if min_bytes is None or not budget_mib:
+        return None
+    if min_bytes > budget_mib * deployment.MIB:
+        return ('index blob cache floor exceeds its budget: '
+                f'{min_bytes} > {budget_mib * deployment.MIB} bytes')
+    return None
+
+
 def index_blob_cache_error(build_root):
     """Why this build cannot size the index blob cache, or None."""
     if index_blob_cache_support(build_root):
@@ -1051,6 +1066,10 @@ def main():
         raise ValueError('index blob cache minimum must be 0..1 TiB')
     if not 0 <= args.index_blob_cache_mib <= 4096:
         raise ValueError('index blob cache budget must be 0..4096 MiB')
+    floor_error = index_blob_cache_floor_error(args.index_blob_cache_min_bytes,
+                                               args.index_blob_cache_mib)
+    if floor_error is not None:
+        raise ValueError(floor_error)
     if not 1 <= args.tail_checkpoints <= 1024:
         raise ValueError('tail checkpoint sample must be 1..1024')
     if args.external_config and args.local_transport != 'tcp':

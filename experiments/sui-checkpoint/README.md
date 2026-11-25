@@ -493,11 +493,13 @@ the node stays live for the final scrape and the live audit),
 (`TH_MAX_INDEX_MAPS`, index WAL maps; both default 3 and are refused below 3
 because the WAL mapper panics), `--index-blob-cache-min-bytes`
 (`TH_INDEX_BLOB_CACHE_MIN_BYTES`; omit it to keep the engine 64 MiB floor, and
-0 admits every qualifying blob) and `--index-blob-cache-mib`
-(`TH_INDEX_BLOB_CACHE_BYTES` in MiB; 0 keeps the engine's off default, which is
-an unset row, never a written 0 because the row panics on 0 and on a
-non-numeric value). Both rows are refused unless the frozen Sui turns them into
-`index_blob_cache_bytes` and `index_blob_cache_min_bytes` (the rows in
+an explicit 0 is written and admits every qualifying blob) and
+`--index-blob-cache-mib` (`TH_INDEX_BLOB_CACHE_BYTES` in MiB; 0 keeps the
+engine's off default, which is an unset row, never a written 0 because the
+budget row panics on 0 and on a non-numeric value). A floor above the budget is
+refused at admission before a host is touched. Both rows are refused unless the
+frozen Sui turns them into `index_blob_cache_bytes` and
+`index_blob_cache_min_bytes` (the rows in
 `crates/typed-store/src/tidehunter_util.rs::thdb_config`, or both strings in a
 built `sui-node-*` binary); when they are present the runner sets the same
 values for both measured nodes and records MiB, bytes, the effective floor and

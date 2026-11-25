@@ -884,6 +884,16 @@ class LifecycleChecks(unittest.TestCase):
             binary.write_bytes(b'\0' * 4096 + b'TH_INDEX_BLOB_CACHE_BYTES' + b'\0' * 16)
             self.assertFalse(run.index_blob_cache_support(root))
 
+    def test_the_floor_is_accepted_at_zero_and_never_exceeds_the_budget(self):
+        self.assertIsNone(run.index_blob_cache_floor_error(None, 1024))
+        self.assertIsNone(run.index_blob_cache_floor_error(0, 1024))
+        self.assertIsNone(run.index_blob_cache_floor_error(64 << 20, 1024))
+        self.assertIsNone(run.index_blob_cache_floor_error(64 << 20, 64))
+        self.assertIsNone(run.index_blob_cache_floor_error(1 << 30, 0))
+        self.assertIn('exceeds its budget',
+                      run.index_blob_cache_floor_error((1 << 30) + 1, 1024))
+        self.assertIsNone(run.index_blob_cache_floor_error((1 << 30) - 1, 1024))
+
     def test_index_blob_cache_is_an_explicit_off_by_default_knob(self):
         environment = dict(tier='native', fragment_mib=8, driver_concurrency=4,
                            pacing_ms=0, value_cache_size=None,
