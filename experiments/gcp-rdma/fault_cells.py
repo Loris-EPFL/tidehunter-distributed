@@ -173,7 +173,8 @@ class Cluster:
                    str(self.build_root / 'sources/tidehunter-sharded-wal/experiments/'
                        'sui-checkpoint/prepare_external.py'),
                    '--build', str(self.build_root), '--schema', str(self.schema),
-                   '--output', str(self.config_dir), '--db-root', str(self.root('coordinator-db')),
+                   '--output', str(self.config_dir),
+                   '--db-root', str(self.root('measure')),
                    '--guest-root', str(self.guest_root),
                    '--hosts', ','.join(self.owners), '--owners', str(len(self.owners)),
                    '--port', str(self.port), '--transport', self.transport,
@@ -195,12 +196,39 @@ class Cluster:
             self.remote.shell(host, f'chmod +x {quote(self.guest_root / BINARY)}')
 
     # ---- owner lifecycle ----------------------------------------------
-    def _start_group(self, record, index, *, truncate):
-        host = record['host']
-        pidfile = self.guest_root / f'owner-{record["partition"]}-{index}.pid'
-        log = self.guest_root / f'owner-{record["partition"]}-{index}.log'
+    def nodes(self):
+        return json.loads((self.config_dir / 'nodes.json').read_text())
+
+    def bind(self, namespace):
+        """Scope this cell to one coordinator database of the deployment."""
+        self.namespace = namespace
+        self.owner_nodes = {}
+        for node in self.nodes():
+            if node['namespace'] != namespace:
+                continue
+            base = Path(node['launch']).relative_to(self.config_dir)
+            guest = self.guest_root / base
+            # `launch` is a controller path (the archive member); `ready` and
+            # `stop` are guest paths because the owner writes them (deployment.prepare).
+            ready = Path(node['ready'])
+            entry = dict(node, guest_launch=str(guest),
+                         guest_ready=str(ready),
+                         guest_storage=str(guest.parent / 'storage'),
+                         command=[str(self.guest_root / BINARY),
+                                  '--experimental-storage-node', str(guest)])
+            self.owner_nodes.setdefault(node['host'], []).append(entry)
+        for host, rows in self.owner_nodes.items():
+            rows.sort(key=lambda row: row['partition'])
+            if len(rows) != 1:
+                raise CellError(f'{host}: expected one owner node for {namespace}')
+        if set(self.owner_nodes) != set(self.owners):
+            raise CellError('the deployment does not cover every owner host')
+
+    def _start_group(self, host, node, *, truncate):
+        pidfile = self.guest_root / f'owner-{node["partition"]}.pid'
+        log = self.guest_root / f'owner-{node["partition"]}.log'
         command = ' '.join(quote(part) for part in
-                           ['env', 'TIDEHUNTER_OWNER_EVENTS=1', *record['commands'][index]])
+                           ['env', 'TIDEHUNTER_OWNER_EVENTS=1', *node['command']])
         redirect = '>' if truncate else '>>'
         self.remote.shell(host,
             f'cd {quote(self.guest_root)} && rm -f {quote(pidfile)} && '
@@ -214,14 +242,17 @@ class Cluster:
         return int(self.remote.read_bytes(host, pidfile).strip())
 
     def start(self):
-        for record in self.external['hosts']:
+        if getattr(self, 'namespace', None) is None:
+            raise CellError('bind a namespace before starting owners')
+        for host, rows in self.owner_nodes.items():
             started = []
-            for index in range(len(record['commands'])):
-                pid = self._start_group(record, index, truncate=True)
-                started.append(dict(index=index, pid=pid, process_group=pid, stopped=False))
-            self.namespaces[record['host']] = started
-            for ready in record['ready_files']:
-                self._wait_ready(record['host'], ready)
+            for node in rows:
+                pid = self._start_group(host, node, truncate=True)
+                started.append(dict(partition=node['partition'], pid=pid,
+                                    process_group=pid, stopped=False))
+            self.namespaces[host] = started
+            for node in rows:
+                self._wait_ready(host, node['guest_ready'])
 
     def _wait_ready(self, host, ready):
         deadline = time.monotonic() + OWNER_READY_SECONDS
@@ -231,31 +262,30 @@ class Cluster:
             time.sleep(0.2)
 
     def restart_owner(self, host):
-        """Start a new incarnation of every owner group on one host."""
-        record = next(row for row in self.external['hosts'] if row['host'] == host)
+        """Start a new incarnation of the owner group on one host."""
+        rows = self.owner_nodes[host]
         previous = [row['pid'] for row in self.namespaces.get(host, [])]
         for namespace in self.namespaces.get(host, []):
             if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
                 raise CellError(f'{host}: owner {namespace["pid"]} is still alive before restart')
-        for ready in record['ready_files']:
-            self.remote.shell(host, f'rm -f {quote(ready)}')
+        for node in rows:
+            self.remote.shell(host, f'rm -f {quote(node["guest_ready"])}')
         started = []
-        for index in range(len(record['commands'])):
-            pid = self._start_group(record, index, truncate=False)
+        for node in rows:
+            pid = self._start_group(host, node, truncate=False)
             if pid in previous:
                 raise CellError(f'{host}: restarted owner reused PID {pid}')
-            started.append(dict(index=index, pid=pid, process_group=pid, stopped=False))
+            started.append(dict(partition=node['partition'], pid=pid,
+                                process_group=pid, stopped=False))
         self.namespaces[host] = started
-        for ready in record['ready_files']:
-            self._wait_ready(host, ready)
+        for node in rows:
+            self._wait_ready(host, node['guest_ready'])
         return dict(host=host, previous=previous, current=[row['pid'] for row in started],
                     restarted_unix_ns=now_ns())
 
     def receipts(self, namespace):
         """Copy one owner durability receipt per partition to the controller."""
-        nodes = [node for node in
-                 json.loads((self.config_dir / 'nodes.json').read_text())
-                 if node['namespace'] == namespace]
+        nodes = [node for node in self.nodes() if node['namespace'] == namespace]
         nodes.sort(key=lambda node: node['partition'])
         directory = self.config_dir / 'receipts'
         directory.mkdir(parents=True, exist_ok=True)
@@ -291,9 +321,13 @@ class Cluster:
         self.namespaces = {}
 
     # ---- host evidence -------------------------------------------------
+    def owner_root(self, host):
+        """The guest storage root of this namespace's owner on one host."""
+        return self.owner_nodes[host][0]['guest_storage']
+
     def owner_databases(self, host):
         code, out, _ = self.remote.shell(
-            host, f'ls -1 {quote(self.guest_root)} 2>/dev/null | cat', check=False)
+            host, f'ls -1 {quote(self.owner_root(host))} 2>/dev/null | cat', check=False)
         if code != 0:
             return []
         return sorted(name for name in out.decode().splitlines()
@@ -301,10 +335,11 @@ class Cluster:
 
     def disk(self, host):
         """`disk_collector` over stdin, one convention, no guest copy."""
+        root = self.owner_root(host)
         names = self.owner_databases(host)
         if not names:
             return dict(unix_ns=now_ns(), databases={}, unavailable='no owner database yet')
-        arguments = ['--root', str(self.guest_root)]
+        arguments = ['--root', str(root)]
         for name in names:
             arguments += ['--namespace', name]
         code, out, err = self.remote.run(
@@ -326,7 +361,7 @@ class Cluster:
                   'find "$d" -maxdepth 1 -name "wal_*" -printf "%p %s %T@\\n" 2>/dev/null; '
                   'stat -c "%n %s %Y" "$d/partition-wal-root-v1" 2>/dev/null; done')
         code, out, err = self.remote.shell(
-            host, f'sh -c {quote(script)} -- {quote(self.guest_root)}', check=False)
+            host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
             raise CellError(f'{host}: cannot list the owner WAL: '
                             f'{err.decode(errors="replace")[-300:]}')
@@ -351,7 +386,7 @@ class Cluster:
                   'n=$(ls -1 "$d/live-target/sealed" 2>/dev/null | wc -l); '
                   's=$(ls -1 "$d"/partition-seal-v5 2>/dev/null | wc -l); echo "$d $n $s"; done')
         code, out, err = self.remote.shell(
-            host, f'sh -c {quote(script)} -- {quote(self.guest_root)}', check=False)
+            host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
             raise CellError(f'{host}: cannot read the sealed markers')
         databases = sealed = 0
@@ -365,8 +400,7 @@ class Cluster:
 
     def owner_events(self, host):
         """The owner event log, written when the owner shuts down or is asked."""
-        record = next(row for row in self.external['hosts'] if row['host'] == host)
-        launch = Path(record['commands'][0][-1])
+        launch = Path(self.owner_nodes[host][0]['guest_launch'])
         events = launch.with_name(launch.stem + '.owner-events.json')
         if not self.remote.exists(host, events):
             return None
@@ -640,8 +674,14 @@ class CellDriver:
         return self.parts
 
     def after_restart(self, name, run, observations):
-        """Reopen the same roots as a new coordinator and run the audit."""
-        child = self.open(run, name)
+        """Reopen the killed coordinator's roots and run the audit.
+
+        The output directory is fresh; the coordinator database path is the one
+        the killed run used, so this is a reopen of the same data.
+        """
+        self.open(run, name)
+        child = self.launch(run, name, path=self.cluster.root('measure'),
+                            receipts=self.receipt_paths)
         try:
             code = child.wait(run['deadline'] + 300)
             if code is None:
@@ -1038,6 +1078,7 @@ def main():
     driver = CellDriver(cluster, cell)
     try:
         cluster.prepare()
+        cluster.bind(cluster.database())
         cluster.install()
         cluster.start()
         try:

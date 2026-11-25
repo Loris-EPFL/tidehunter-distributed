@@ -226,7 +226,7 @@ class Receipts(unittest.TestCase):
             })
             cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
             cluster.config_dir, cluster.remote = config, remote
-            cluster.owners = ['h1', 'h2']
+            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
             rows = cluster.receipts('ns')
         self.assertEqual([row['partition'] for row in rows], [0, 1])
         self.assertEqual(rows[0]['receipt'], {'partition': 0})
@@ -240,7 +240,7 @@ class Receipts(unittest.TestCase):
             cluster.config_dir = config
             cluster.remote = FakeRemote(files={
                 '/guest/node-0/ready.durability.json': b'{}'})
-            cluster.owners = ['h1', 'h2']
+            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
             with self.assertRaisesRegex(fault_cells.CellError, 'do not cover'):
                 cluster.receipts('ns')
 
@@ -328,7 +328,8 @@ class DryRun(unittest.TestCase):
         plan = json.loads(stream.getvalue())
         self.assertEqual(plan['cell'], 'M13-batch132-synchronous')
         self.assertTrue(plan['synthetic'])
-        self.assertEqual(plan['runs'][0]['batch'], 32)
+        self.assertEqual(plan['runs'][0]['batch'], 2)
+        self.assertEqual(plan['runs'][0]['value'], 65_536)
         self.assertEqual(plan['tier'], 'synchronous')
 
 

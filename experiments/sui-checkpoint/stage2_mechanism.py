@@ -13,10 +13,10 @@ Two limits decide the shape of this table, and both are properties of the
 frozen binary, not of the plan:
 
 * `dataset.value_size` is one of 64, 256, 512, 1024, 4096, 8192, 16384, 65536,
-  so the plan's 132,462 B mainnet value cannot be written literally. M13 uses
-  32 x 4,096 B `put_batch` members, whose encoded batch is 133,216 B: the same
-  132 KB class, 754 B above the plan's figure and 67,800 B above the 64 KiB
-  `leased_flush_min_frame_bytes` threshold it is meant to cross.
+  so the plan's 132,462 B mainnet value cannot be written literally. M13 uses a
+  two-member `put_batch` of 65,536 B values, whose encoded frame is 131,296 B:
+  the same 132 KB class, 1,166 B below the plan's figure and 65,760 B above the
+  64 KiB `leased_flush_min_frame_bytes` threshold it is meant to cross.
 * the coordinator's native registry (`flush_pending`, `large_table_contention`,
   `flush_count`, `snapshot_written_bytes`) is created by the engine with a
   throwaway `Registry`, so a `kv-research` cell exports only the
@@ -40,10 +40,12 @@ SEED = 1775
 OWNERS = 2
 TIERS = ('native', 'synchronous')
 UNIFORM = 'uniform'
-# 32 x (4096 + KEY_BYTES(32) + 32) + 96 = 133,216 B; the plan's mainnet batch is
-# 132,462 B and the covering-flush threshold is 65,536 B.
-BATCH_132KB = 32
-VALUE_132KB = 4096
+# 2 x (65,536 + KEY_BYTES(32) + 32) + 96 = 131,296 B: the plan's mainnet batch is
+# 132,462 B and the covering-flush threshold (`leased_flush_min_frame_bytes`)
+# is 65,536 B. 65,536 B is the largest legal `dataset.value_size`, so a
+# two-member batch is the closest frame the frozen binary can build.
+BATCH_132KB = 2
+VALUE_132KB = 65_536
 ENCODED_132KB = (VALUE_132KB + 32 + 32) * BATCH_132KB + 96
 FUA_THRESHOLD = 64 << 10
 # Synthetic cells reuse one namespace per unit so a restart, a second
@@ -149,9 +151,10 @@ def cells():
         unit='M13-batch132-synchronous', family='M13', synthetic=True,
         tier='synchronous',
         plan=dict(cells='1', batch_bytes=132_462),
-        note=f'put_batch {BATCH_132KB} x {VALUE_132KB} B = {ENCODED_132KB} B encoded',
+        note=f'put_batch {BATCH_132KB} x {VALUE_132KB} B = {ENCODED_132KB} B encoded; '
+             'concurrency 16 keeps frames overlapping so the group flush can cover them',
         runs=[_run('measure', mix=_mix(put_batch=100), value=VALUE_132KB,
-                   batch=BATCH_132KB, concurrency=4, measurement=20_000)]))
+                   batch=BATCH_132KB, concurrency=16, measurement=20_000)]))
 
     # S1-2S / S1-3S / S1-6S: write, inject, restart, verify. The verify run is
     # the plan's audit: it reads every key and compares the deterministic
@@ -308,9 +311,39 @@ def _manifest(output):
 
 
 def _counts(output):
-    """`{phase.operation: offered}` from the run summary."""
-    return {key: row['offered'] for key, row in
-            _summary(output)['phase_counts'].items()}
+    """`{phase.operation: offered}` from the run summary's realized mix."""
+    phase = _summary(output)['phase_counts']
+    mix = phase.get('realized_mix')
+    if mix is None:
+        raise ValueError('summary lacks phase_counts.realized_mix')
+    return {key: row['offered'] for key, row in mix.items()}
+
+
+def evidence(output):
+    """The measurement read evidence: open record and coordinator read delta.
+
+    `measurement-read-evidence.json` carries the measurement boundary start/end
+    snapshots; `read-evidence.json` is the close-time fallback. A missing
+    diagnostics counter is null, never zero.
+    """
+    output = Path(output)
+    measured = output / 'measurement-read-evidence.json'
+    if measured.is_file():
+        value = _json(measured)
+        start = value.get('start') or {}
+        deltas = (value.get('deltas') or {}).get('coordinator') or {}
+        opened = start.get('coordinator_open')
+        rpc = (deltas.get('counters') or {}).get('read_rpc_count')
+        return dict(source=str(measured), open=opened, read_rpc_count=rpc,
+                    available=bool(deltas.get('available', True)))
+    closed = output / 'read-evidence.json'
+    if closed.is_file():
+        value = _json(closed)
+        coordinator = value.get('coordinator') or {}
+        return dict(source=str(closed), open=value.get('coordinator_open'),
+                    read_rpc_count=coordinator.get('read_rpc_count'),
+                    available=coordinator.get('read_rpc_count') is not None)
+    return dict(source=None, open=None, read_rpc_count=None, available=False)
 
 
 def _distribution(output, phase, operation, metric, outcome='success'):
@@ -319,6 +352,43 @@ def _distribution(output, phase, operation, metric, outcome='success'):
     if row is None:
         raise ValueError(f'summary lacks the distribution {key}')
     return row
+
+
+def _sample_rows(output, phase='measurement', operation=None, outcome='success'):
+    path = Path(output) / 'samples.csv'
+    if not path.is_file():
+        return []
+    lines = path.read_text(errors='replace').splitlines()
+    if not lines:
+        return []
+    header = lines[0].split(',')
+    result = []
+    for line in lines[1:]:
+        values = line.split(',')
+        if len(values) != len(header):
+            continue
+        row = dict(zip(header, values))
+        if row.get('phase') != phase or row.get('outcome') != outcome:
+            continue
+        if operation is not None and row.get('operation') != operation:
+            continue
+        result.append(row)
+    return result
+
+
+def _quantiles(output, operation, *, field='api_ns'):
+    """Exact per-sample quantiles; `summary.json` holds coarse histogram bounds."""
+    values = sorted(int(row[field]) for row in _sample_rows(output, operation=operation)
+                    if row.get(field))
+    if not values:
+        return None
+
+    def pick(fraction):
+        return values[min(len(values) - 1, int(fraction * len(values)))]
+
+    return dict(count=len(values), p50_ns=pick(0.5), p99_ns=pick(0.99),
+                p999_ns=pick(0.999),
+                source='samples.csv api_ns; the summary histogram is an upper bound')
 
 
 def _check(name, ok, detail):
@@ -346,8 +416,8 @@ def verify(cell, output, *, observations=None):
     if cell['family'] == 'M6':
         calls = sum(int(value) for key, value in counts.items()
                     if key in ('measurement.get_many', 'measurement.read'))
-        evidence = _json(output / 'read-evidence.json')
-        rpc = (evidence.get('coordinator') or {}).get('read_rpc_count')
+        read = evidence(output)
+        rpc = read['read_rpc_count']
         checks.append(_check('no wrong value or read error', errors == 0, errors))
         checks.append(_check('every read call answered',
                              calls > 0 and manifest['completed_operations'] >= calls,
@@ -360,11 +430,13 @@ def verify(cell, output, *, observations=None):
                                       per_call=rpc / calls, owners=OWNERS)))
         operation = 'get_many' if cell['id'].startswith(('M6-w4', 'M6-w8', 'M6-w26',
                                                          'M6-page')) else 'read'
-        latency = _distribution(output, 'measurement', operation, 'api_ns')
+        latency = _distribution(output, 'measurement', operation, 'api')
+        exact = _quantiles(output, operation) or {}
         checks.append(_check('api latency recorded', latency['count'] > 0,
                              dict(count=latency['count'],
-                                  p50_upper_bound_ns=latency.get('p50_upper_bound_ns'),
-                                  p99_upper_bound_ns=latency.get('p99_upper_bound_ns'))))
+                                  histogram_p50_upper_bound_ns=latency.get('p50_upper_bound_ns'),
+                                  histogram_p99_upper_bound_ns=latency.get('p99_upper_bound_ns'),
+                                  samples=exact)))
         checks.append(_check('native contention counter is not claimed', True,
                              'kv-research creates the engine registry privately; '
                              'large_table_contention is Sui-tier only'))
@@ -401,8 +473,8 @@ def verify(cell, output, *, observations=None):
         checks.append(_check('no write error', errors == 0, errors))
 
     if role == 'verify':
-        evidence = _json(output / 'read-evidence.json')
-        opened = evidence.get('coordinator_open') or {}
+        read = evidence(output)
+        opened = read.get('open') or {}
         recovery = opened.get('recovery') or {}
         checks.append(_check('coordinator reopened the existing database',
                              opened.get('kind') == 'reopen', opened.get('kind')))

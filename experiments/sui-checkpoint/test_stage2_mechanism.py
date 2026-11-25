@@ -24,7 +24,7 @@ def write_run(directory, *, status='completed', completed=1000, errors=0,
     (directory / 'summary.json').write_text(json.dumps(dict(
         status=status, durability={}, started_unix_seconds=0.0,
         finished_unix_seconds=1.0, backend={}, execution={},
-        phase_counts=phase_counts or {},
+        phase_counts=phase_counts or {'realized_mix': {}},
         distributions=distributions or {}, limitations=[])))
     (directory / 'manifest.json').write_text(json.dumps(dict(
         status=status, completed_operations=completed,
@@ -32,12 +32,14 @@ def write_run(directory, *, status='completed', completed=1000, errors=0,
     live_lines = [f'tidehunter_nvmeof_live_{name} {value}'
                   for name, value in (live or {}).items()]
     (directory / 'live.prom').write_text('\n'.join(live_lines) + '\n')
-    (directory / 'read-evidence.json').write_text(json.dumps(dict(
-        coordinator=dict(read_rpc_count=read_rpc),
-        coordinator_open=dict(kind=open_kind,
-                              recovery=recovery or dict(tail_batches=3, tail_bytes=4096,
-                                                        below_cut_skipped=0,
-                                                        fencing_ns=10)))))
+    (directory / 'measurement-read-evidence.json').write_text(json.dumps(dict(
+        start=dict(coordinator=dict(read_rpc_count=read_rpc),
+                   coordinator_open=dict(kind=open_kind,
+                                         recovery=recovery or dict(
+                                             tail_batches=3, tail_bytes=4096,
+                                             below_cut_skipped=0, fencing_ns=10))),
+        deltas=dict(coordinator=dict(available=True,
+                                     counters=dict(read_rpc_count=read_rpc))))))
     return directory
 
 
@@ -61,10 +63,11 @@ class CellTable(unittest.TestCase):
     def test_m13_batch_crosses_the_covering_flush_threshold(self):
         cell = mechanism.find('M13-batch132-synchronous')
         self.assertEqual(cell['runs'][0]['batch'] * cell['runs'][0]['value'],
-                         32 * 4096)
+                         2 * 65_536)
         self.assertGreater(mechanism.ENCODED_132KB,
                            mechanism.FUA_THRESHOLD + 64 * 1024)
-        self.assertGreater(mechanism.ENCODED_132KB, 132_000)
+        # Within 1% of the plan's 132,462 B mainnet batch and above the threshold.
+        self.assertLess(abs(mechanism.ENCODED_132KB - 132_462) / 132_462, 0.01)
 
     def test_m6_covers_every_plan_width_once(self):
         widths = {run['batch'] for cell in mechanism.cells()
@@ -146,9 +149,9 @@ class Verification(unittest.TestCase):
         cell = mechanism.find('M6-w26-c16')
         with tempfile.TemporaryDirectory() as directory:
             write_run(directory, completed=20_000, read_rpc=40_000,
-                      phase_counts={'measurement.get_many': {'offered': 20_000,
-                                                             'fraction': 1.0}},
-                      distributions={'measurement.get_many.api_ns.success':
+                      phase_counts={'realized_mix': {
+                          'measurement.get_many': {'offered': 20_000, 'fraction': 1.0}}},
+                      distributions={'measurement.get_many.api.success':
                                      {'count': 20_000, 'p50_upper_bound_ns': 10,
                                       'p99_upper_bound_ns': 20}})
             record = mechanism.verify(cell, directory)
