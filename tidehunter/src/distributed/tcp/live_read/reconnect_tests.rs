@@ -22,7 +22,11 @@ fn cached_permanent_pool(lane: &Lane) -> (Arc<LiveControllerPool>, LiveExportInf
         .live_config
         .as_ref()
         .expect("the lane client is configured");
-    let registry = LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap();
+    let registry = LiveConnectionRegistry::open(
+        &lane._dir.path().join("registry"),
+        crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+    )
+    .unwrap();
     let pool = Arc::new(LiveControllerPool::new(registry, 8, 4).unwrap());
     let mut first = None;
     for file in 0..2 {

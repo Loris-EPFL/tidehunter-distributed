@@ -1,9 +1,11 @@
 use super::super::NvmeofTransport;
 use super::*;
+use crate::distributed::nvmeof::live_connect::RegistryMode;
 use crate::distributed::test_bounds::PROGRESS_CAP;
 
 fn local_resolver(dir: &std::path::Path) -> Arc<LiveNamespaceResolver> {
-    let registry = LiveConnectionRegistry::open(&dir.join("resolver-registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.join("resolver-registry"), RegistryMode::Retire).unwrap();
     let target = LiveConnectTarget {
         nqn: "nqn.2026-01.test:wal".into(),
         uuid: [1; 16],
@@ -24,7 +26,8 @@ fn local_resolver(dir: &std::path::Path) -> Arc<LiveNamespaceResolver> {
 fn strict_and_shared_acquisitions_share_one_subsystem_controller() {
     const HOST: &str = "nqn.2026-01.test:host";
     let dir = tempdir::TempDir::new("live-pool-shared").unwrap();
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:shared");
     let mut other = target.clone();
@@ -177,13 +180,16 @@ fn reopen_of_a_sealed_subsystem_with_two_namespaces_connects_one_controller() {
     let first = fixture_target(NQN, 1, [1; 16], BYTES);
     let second = fixture_target(NQN, 2, [3; 16], BYTES);
     {
-        let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+        let registry =
+            LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire)
+                .unwrap();
         let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
         acquire_two_sealed_namespaces(&pool, HOST, &first, &second, &first_path, &second_path);
     }
     // Graceful close removed the controller. The reopen reuses the sealed
     // subsystem NQN and still needs exactly one controller for both members.
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     acquire_two_sealed_namespaces(&pool, HOST, &first, &second, &first_path, &second_path);
 }
@@ -191,7 +197,8 @@ fn reopen_of_a_sealed_subsystem_with_two_namespaces_connects_one_controller() {
 #[test]
 fn pending_and_capacity_are_bounded_without_connecting() {
     let dir = tempdir::TempDir::new("live-pool").unwrap();
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 1, 1).unwrap();
     let target = LiveConnectTarget {
         nqn: "nqn.2026-01.test:one".into(),
@@ -356,7 +363,8 @@ fn ready_idle(pool: &LiveControllerPool, dir: &std::path::Path, nqn: &str) -> Li
 #[test]
 fn eviction_defers_a_busy_subsystem_controller_and_retires_it_idle() {
     let dir = tempdir::TempDir::new("live-pool-exact-evict").unwrap();
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:evict");
     let deadline = Instant::now() + PROGRESS_CAP;
@@ -411,7 +419,8 @@ fn eviction_defers_a_busy_subsystem_controller_and_retires_it_idle() {
 #[test]
 fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
     let dir = tempdir::TempDir::new("live-pool-close").unwrap();
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:one");
     let deadline = Instant::now() + PROGRESS_CAP;
@@ -465,7 +474,8 @@ fn delete_runs_without_the_pool_lock_and_failure_keeps_an_unusable_entry() {
 fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempdir::TempDir::new("live-pool-wait").unwrap();
-    let registry = LiveConnectionRegistry::open(&dir.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
     let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
     let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:two");
     let key = target.nqn.clone();

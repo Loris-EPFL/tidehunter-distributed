@@ -725,7 +725,11 @@ fn shared_grant_route_names_the_opened_member() {
     lane.client.live_metrics = Some(lane.metrics.clone());
     let pool = Arc::new(
         LiveControllerPool::new(
-            LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+            LiveConnectionRegistry::open(
+                &lane._dir.path().join("registry"),
+                crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+            )
+            .unwrap(),
             8,
             4,
         )
@@ -920,7 +924,11 @@ fn healthy_subsystem_retirement_does_not_block_later_use() {
     use crate::distributed::nvmeof::{
         NvmeofTransport, live_connect::LiveConnectionRegistry, live_pool::LiveControllerPool,
     };
-    let registry = LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap();
+    let registry = LiveConnectionRegistry::open(
+        &lane._dir.path().join("registry"),
+        crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+    )
+    .unwrap();
     let pool = Arc::new(LiveControllerPool::new(registry, 8, 4).unwrap());
     let config = lane.client.live_config.as_ref().unwrap();
     let name = wal_export_name(1024, lane.client.expected.inventory.database, 2, 1, 0);
@@ -1393,7 +1401,11 @@ fn pooled_file_grants() -> (
     lane.cache.grants.clear();
     let pool = Arc::new(
         LiveControllerPool::new(
-            LiveConnectionRegistry::open(&lane._dir.path().join("registry")).unwrap(),
+            LiveConnectionRegistry::open(
+                &lane._dir.path().join("registry"),
+                crate::distributed::nvmeof::live_connect::RegistryMode::Retire,
+            )
+            .unwrap(),
             8,
             4,
         )

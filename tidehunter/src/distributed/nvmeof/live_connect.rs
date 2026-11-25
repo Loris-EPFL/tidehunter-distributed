@@ -23,6 +23,7 @@ mod sysfs;
 mod tests;
 
 pub use registry::LiveConnectionRegistry;
+pub(crate) use registry::RegistryMode;
 pub(crate) use sysfs::{pin_current_thread, queue_cpus};
 
 use registry::*;
@@ -47,7 +48,7 @@ pub struct LiveConnectTarget {
 fn connect_options(target: &LiveConnectTarget, host_nqn: &str, host_id: [u8; 16]) -> String {
     let geometry = target.geometry;
     let mut options = format!(
-        "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},duplicate_connect,ctrl_loss_tmo=0,nr_io_queues={},queue_size={}",
+        "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},ctrl_loss_tmo=0,nr_io_queues={},queue_size={}",
         target.nqn,
         transport(target.transport),
         target.address,
@@ -91,6 +92,66 @@ fn connect_error_after_cleanup(primary: io::Error, cleanup: io::Result<()>) -> i
             format!("{primary}; controller cleanup failed: {error}"),
         ),
     }
+}
+
+/// The kernel rejects a second controller for an identity it still tracks with
+/// `-EALREADY` once `duplicate_connect` is no longer requested.
+fn already_connected(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EALREADY)
+}
+
+/// The fabrics control write is the call that returns `-EALREADY`. Keep that
+/// errno so the bounded reconcile and the typed fail-stop can recognise it;
+/// every other failure gets the control-device path context.
+fn fabrics_connect_error(error: io::Error) -> io::Error {
+    if already_connected(&error) {
+        error
+    } else {
+        with_context(
+            "connect fabrics control",
+            Path::new("/dev/nvme-fabrics"),
+            error,
+        )
+    }
+}
+
+fn write_connect_options(control: &mut impl Write, options: &str) -> io::Result<()> {
+    control
+        .write_all(options.as_bytes())
+        .map_err(fabrics_connect_error)
+}
+
+/// Fresh-path fabrics identity validation. Adoption runs the same check first,
+/// so a bad request can never retire an existing controller.
+fn validate_connect_target(
+    target: &LiveConnectTarget,
+    host_nqn: &str,
+    host_id: [u8; 16],
+) -> io::Result<()> {
+    target.geometry.validate().map_err(invalid)?;
+    if !valid_nqn(&target.nqn)
+        || !valid_nqn(host_nqn)
+        || host_id == [0; 16]
+        || target.uuid == [0; 16]
+        || target.nsid == 0
+        || target.service == 0
+        || target.address.parse::<IpAddr>().is_err()
+    {
+        return Err(invalid("invalid fabrics identity"));
+    }
+    Ok(())
+}
+
+/// Operator-visible fail-stop: a controller for this exact identity exists but
+/// no durable intent authorizes adopting it, so only an operator can resolve it.
+fn unowned_identity(target: &LiveConnectTarget, host_nqn: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "unowned NVMe controller for {} at {}:{} with host {}; refusing to create a second controller",
+            target.nqn, target.address, target.service, host_nqn
+        ),
+    )
 }
 
 fn uuid_string(u: [u8; 16]) -> String {
@@ -151,6 +212,10 @@ pub(crate) struct LiveNamespaceResolver {
     device: u64,
     /// Queue count and submission queue size read from sysfs by the geometry check.
     queue: OnceLock<(u32, u32)>,
+    /// Controller sysfs root; `/sys/class/nvme` in production.
+    controller_root: PathBuf,
+    /// systemd-udevd queue path; `/run/udev/queue` in production.
+    udev_queue: PathBuf,
 }
 impl LiveController {
     /// Controller instance returned by the Linux fabrics control response.
@@ -159,6 +224,10 @@ impl LiveController {
     }
     /// Creates a distinct controller with explicit host identity. The kernel's
     /// control response, not a sysfs inventory difference, establishes ownership.
+    ///
+    /// In `Adopt` mode a durable intent's live controller is reused instead of
+    /// deleted and recreated. A declined adoption is retired with its intent
+    /// before the fresh connect, so a live blocker is never left behind.
     fn connect(
         registry: &LiveConnectionRegistry,
         target: &LiveConnectTarget,
@@ -167,6 +236,24 @@ impl LiveController {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(Self, LiveNamespaceBinding)> {
+        // Reject an invalid request before it can be compared against a durable
+        // intent: a bad request must not retire a healthy controller.
+        validate_connect_target(target, host_nqn, host_id)?;
+        if registry.adopts() {
+            match registry.try_adopt_controller(target, host_nqn, host_id, deadline) {
+                Ok(Some(mut controller)) => match controller.resolve_verified(access, deadline) {
+                    Ok(binding) => return Ok((controller, binding)),
+                    Err(error) => {
+                        let cleanup = controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT);
+                        if cleanup.is_err() {
+                            return Err(connect_error_after_cleanup(error, cleanup));
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut controller =
             Self::connect_controller(registry, target, host_nqn, host_id, deadline)?;
         match controller.resolve_verified(access, deadline) {
@@ -188,17 +275,29 @@ impl LiveController {
         host_id: [u8; 16],
         deadline: Instant,
     ) -> io::Result<Self> {
-        target.geometry.validate().map_err(invalid)?;
-        if !valid_nqn(&target.nqn)
-            || !valid_nqn(host_nqn)
-            || host_id == [0; 16]
-            || target.uuid == [0; 16]
-            || target.nsid == 0
-            || target.service == 0
-            || target.address.parse::<IpAddr>().is_err()
-        {
-            return Err(invalid("invalid fabrics identity"));
+        match Self::connect_controller_once(registry, target, host_nqn, host_id, deadline) {
+            Ok(controller) => Ok(controller),
+            Err(error) if already_connected(&error) => {
+                // One bounded reconcile, then retry once only when the kernel
+                // no longer tracks any controller for this identity.
+                if let Some(failure) =
+                    registry.already_connected_outcome(target, host_nqn, host_id, deadline)?
+                {
+                    return Err(failure);
+                }
+                Self::connect_controller_once(registry, target, host_nqn, host_id, deadline)
+            }
+            Err(error) => Err(error),
         }
+    }
+    fn connect_controller_once(
+        registry: &LiveConnectionRegistry,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        validate_connect_target(target, host_nqn, host_id)?;
         remaining(deadline)?;
         let intent = Intent {
             target: target.clone(),
@@ -206,14 +305,19 @@ impl LiveController {
             host_id,
         };
         let intent_path = registry.reserve(&intent)?;
-        let registry = registry.clone();
+        // Kept after the worker takes its own copy: an `-EALREADY` means no
+        // controller was created and the durable intent must not block the
+        // bounded retry.
+        let intent_cleanup = intent_path.clone();
+        let worker_registry = registry.clone();
         let target_copy = intent.target;
         let host_nqn = intent.host_nqn;
         let (tx, rx) = mpsc::sync_channel(0);
         std::thread::Builder::new()
             .name("live-nvme-connect".into())
             .spawn(move || {
-                let result = Self::create(target_copy, host_nqn, host_id, registry, intent_path);
+                let result =
+                    Self::create(target_copy, host_nqn, host_id, worker_registry, intent_path);
                 if let Err(mpsc::SendError(Ok(mut controller))) = tx.send(result)
                     && let Err(error) =
                         controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT)
@@ -222,7 +326,13 @@ impl LiveController {
                 }
             })?;
         let mut controller = match rx.recv_timeout(remaining(deadline)?) {
-            Ok(result) => result?,
+            Ok(Ok(controller)) => controller,
+            Ok(Err(error)) => {
+                if already_connected(&error) {
+                    registry.remove_intent(&intent_cleanup)?;
+                }
+                return Err(error);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(timeout()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(invalid("connection worker failed"));
@@ -255,13 +365,7 @@ impl LiveController {
                 )
             })?;
         let options = connect_options(&target, &host_nqn, host_id);
-        control.write_all(options.as_bytes()).map_err(|error| {
-            with_context(
-                "connect fabrics control",
-                Path::new("/dev/nvme-fabrics"),
-                error,
-            )
-        })?;
+        write_connect_options(&mut control, &options)?;
         let mut response = String::new();
         control.read_to_string(&mut response).map_err(|error| {
             with_context(
@@ -293,6 +397,8 @@ impl LiveController {
                 inode: metadata.ino(),
                 device: metadata.dev(),
                 queue: OnceLock::new(),
+                controller_root: PathBuf::from("/sys/class/nvme"),
+                udev_queue: PathBuf::from("/run/udev/queue"),
             }),
             instance,
             deletion: DeletionState::NotStarted,
@@ -332,7 +438,7 @@ impl LiveNamespaceResolver {
         if meta.ino() != self.inode || meta.dev() != self.device {
             return Err(invalid("controller inode changed"));
         }
-        let current = std::fs::metadata(Path::new("/sys/class/nvme").join(&self.name))?;
+        let current = std::fs::metadata(self.controller_root.join(&self.name))?;
         if current.ino() != self.inode
             || current.dev() != self.device
             || attr(&p.join("subsysnqn"))? != self.target.nqn
@@ -464,7 +570,7 @@ impl LiveNamespaceResolver {
     /// Locks every visible namespace disk of this controller for teardown. A
     /// controller already gone has no paths left whose removal a scan could race.
     fn lock_owned_disks(&self, deadline: Instant) -> io::Result<Vec<File>> {
-        let controller = Path::new("/sys/class/nvme").join(&self.name);
+        let controller = self.controller_root.join(&self.name);
         if original_removed(&controller, self.device, self.inode)? {
             return Ok(Vec::new());
         }
@@ -619,7 +725,7 @@ impl LiveController {
         self.disconnect_inner(deadline)
     }
     fn delete_owned(&mut self, deadline: Instant) -> io::Result<()> {
-        let controller_path = Path::new("/sys/class/nvme").join(&self.resolver.name);
+        let controller_path = self.resolver.controller_root.join(&self.resolver.name);
         let delete_path = self.pinned().join("delete_controller");
         let mut state = self.deletion;
         let result = retire_controller(
@@ -654,7 +760,7 @@ impl LiveController {
             || {
                 // A namespace change can leave a probe reading block 0 after
                 // the admin command returned. Let udev finish before locking.
-                wait_for_udev_idle(deadline)?;
+                wait_for_udev_idle_at(&resolver.udev_queue, deadline)?;
                 resolver.lock_owned_disks(deadline)
             },
             || self.delete_owned(deadline),
@@ -688,6 +794,8 @@ impl LiveController {
                 device: metadata.dev(),
                 directory,
                 queue: OnceLock::new(),
+                controller_root: PathBuf::from("/sys/class/nvme"),
+                udev_queue: PathBuf::from("/run/udev/queue"),
             }),
             instance: 0,
             deletion: DeletionState::Gone,

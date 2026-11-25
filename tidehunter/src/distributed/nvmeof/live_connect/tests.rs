@@ -138,7 +138,7 @@ fn old_connect_target_defaults_geometry_and_pins_connect_options() {
     }))
     .unwrap();
     assert_eq!(target.geometry, LiveQueueGeometry::default());
-    let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,duplicate_connect,ctrl_loss_tmo=0,nr_io_queues=4,queue_size=128";
+    let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,ctrl_loss_tmo=0,nr_io_queues=4,queue_size=128";
     assert_eq!(
         connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
         expected
@@ -251,8 +251,8 @@ fn queue_geometry_admission_requires_exact_readable_kernel_attributes() {
 fn registry_excludes_duplicate_intents_and_holds_lock() {
     let temp = tempdir::TempDir::new("live-connect").unwrap();
     let path = temp.path().join("registry");
-    let registry = LiveConnectionRegistry::open(&path).unwrap();
-    assert!(LiveConnectionRegistry::open(&path).is_err());
+    let registry = LiveConnectionRegistry::open(&path, RegistryMode::Retire).unwrap();
+    assert!(LiveConnectionRegistry::open(&path, RegistryMode::Retire).is_err());
     let intent = Intent {
         target: LiveConnectTarget {
             nqn: "nqn.2026-01.test:wal".into(),
@@ -291,7 +291,7 @@ fn registry_excludes_duplicate_intents_and_holds_lock() {
             .unwrap()
     );
     drop(registry);
-    let registry = LiveConnectionRegistry::open(&path).unwrap();
+    let registry = LiveConnectionRegistry::open(&path, RegistryMode::Retire).unwrap();
     assert!(registry.reserve(&intent).is_ok());
 }
 
@@ -988,7 +988,8 @@ fn disk_lock_waits_for_udev_probe_and_never_outlives_its_deadline() {
 #[test]
 fn controller_evidence_is_the_geometry_the_check_observed_and_is_recorded_once() {
     let temp = tempdir::TempDir::new("controller-evidence").unwrap();
-    let registry = LiveConnectionRegistry::open(&temp.path().join("registry")).unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&temp.path().join("registry"), RegistryMode::Retire).unwrap();
     let target = LiveConnectTarget {
         nqn: "nqn.2026-01.test:wal".into(),
         uuid: [1; 16],
@@ -1102,4 +1103,532 @@ fn namespace_uuid_rejects_a_list_without_a_uuid_descriptor() {
         None,
         "zero padding ends the descriptor list"
     );
+}
+
+const ADOPT_HOST: &str = "nqn.2026-01.test:host";
+const ADOPT_HOST_ID: [u8; 16] = [2; 16];
+
+fn adoption_target(nqn: &str, nsid: u32) -> LiveConnectTarget {
+    LiveConnectTarget {
+        nqn: nqn.into(),
+        uuid: [1; 16],
+        nsid,
+        bytes: 4096,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: LiveQueueGeometry {
+            io_queues: 1,
+            queue_size: 32,
+            poll_queues: 0,
+        },
+    }
+}
+
+fn adoption_registry(temp: &Path) -> (LiveConnectionRegistry, PathBuf) {
+    let controllers = temp.join("controllers");
+    std::fs::create_dir_all(&controllers).unwrap();
+    let registry = LiveConnectionRegistry::open_at(
+        &temp.join("registry"),
+        &controllers,
+        &temp.join("no-udev-queue"),
+        RegistryMode::Adopt,
+    )
+    .unwrap();
+    (registry, controllers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_controller(
+    root: &Path,
+    instance: u32,
+    target: &LiveConnectTarget,
+    host_nqn: &str,
+    host_id: [u8; 16],
+    state: &str,
+    geometry: LiveQueueGeometry,
+) -> PathBuf {
+    let path = root.join(format!("nvme{instance}"));
+    std::fs::create_dir(&path).unwrap();
+    let host_id = uuid_string(host_id);
+    for (name, value) in [
+        ("subsysnqn", target.nqn.as_str()),
+        ("hostnqn", host_nqn),
+        ("hostid", host_id.as_str()),
+        ("transport", "tcp"),
+        (
+            "address",
+            "traddr=127.0.0.1,trsvcid=4420,src_addr=127.0.0.1",
+        ),
+        ("state", state),
+    ] {
+        std::fs::write(path.join(name), value).unwrap();
+    }
+    std::fs::write(
+        path.join("queue_count"),
+        (geometry.io_queues + geometry.poll_queues + 1).to_string(),
+    )
+    .unwrap();
+    std::fs::write(path.join("sqsize"), (geometry.queue_size - 1).to_string()).unwrap();
+    path
+}
+
+fn adoption_intent(target: &LiveConnectTarget) -> Intent {
+    Intent {
+        target: target.clone(),
+        host_nqn: ADOPT_HOST.into(),
+        host_id: ADOPT_HOST_ID,
+    }
+}
+
+/// Remove a fixture controller once its delete store appears, as the kernel
+/// would remove the sysfs object. The loop follows observed progress; the
+/// deadline is only a hang guard.
+fn remove_controller_when_deleted(path: PathBuf) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + PROGRESS_CAP;
+        while Instant::now() < deadline {
+            if path.join("delete_controller").exists() {
+                let _ = std::fs::remove_dir_all(&path);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })
+}
+
+#[test]
+fn adopt_reuses_the_live_controller_and_keeps_its_intent() {
+    let temp = tempdir::TempDir::new("adopt-live").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let controller_dir = fixture_controller(
+        &root,
+        7,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    assert!(
+        controller_dir.exists(),
+        "a live matching controller is kept across reconcile"
+    );
+    assert!(
+        intent_path.exists(),
+        "a kept controller keeps its durable intent"
+    );
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let mut controller = registry
+        .try_adopt_controller(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .unwrap()
+        .expect("a live matching controller is adoptable");
+    assert_eq!(
+        controller.instance(),
+        7,
+        "adoption must reuse the existing controller, never create one"
+    );
+    let evidence = controller
+        .resolver()
+        .evidence()
+        .expect("adoption records the geometry it verified");
+    assert_eq!(
+        evidence.queue_count,
+        target.geometry.io_queues + 1,
+        "the adopted controller's observed queue count is recorded"
+    );
+    assert!(
+        intent_path.exists(),
+        "the adopted controller keeps its durable intent until disconnect"
+    );
+    let remover = remove_controller_when_deleted(controller_dir.clone());
+    controller.disconnect(deadline).unwrap();
+    remover.join().unwrap();
+    assert!(
+        !controller_dir.exists(),
+        "disconnect retires the controller"
+    );
+    assert!(
+        !intent_path.exists(),
+        "disconnect removes the adopted intent"
+    );
+}
+
+#[test]
+fn geometry_mismatch_at_reconcile_retires_the_controller_and_removes_the_intent() {
+    let temp = tempdir::TempDir::new("adopt-geometry-reconcile").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let controller_dir = fixture_controller(
+        &root,
+        3,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        LiveQueueGeometry {
+            io_queues: 2,
+            queue_size: 64,
+            poll_queues: 0,
+        },
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    let remover = remove_controller_when_deleted(controller_dir.clone());
+    registry.reconcile().unwrap();
+    remover.join().unwrap();
+    assert!(
+        !controller_dir.exists(),
+        "a geometry mismatch retires the recorded controller"
+    );
+    assert!(
+        !intent_path.exists(),
+        "a declined adoption removes the intent so a fresh connect is not blocked"
+    );
+}
+
+#[test]
+fn caller_geometry_change_declines_adoption_and_unblocks_the_next_connect() {
+    let temp = tempdir::TempDir::new("adopt-geometry-connect").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let controller_dir = fixture_controller(
+        &root,
+        4,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    assert!(
+        controller_dir.exists(),
+        "the live controller survives the initial reconcile"
+    );
+    // The operator changed `queue_geometry` between the two opens. The
+    // controller still matches the intent, so the intent-vs-target comparison
+    // must decline before any resolver is built.
+    let mut changed = target.clone();
+    changed.geometry = LiveQueueGeometry {
+        io_queues: 2,
+        queue_size: 64,
+        poll_queues: 0,
+    };
+    let remover = remove_controller_when_deleted(controller_dir.clone());
+    let deadline = Instant::now() + PROGRESS_CAP;
+    assert!(
+        registry
+            .try_adopt_controller(&changed, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+            .unwrap()
+            .is_none(),
+        "a caller geometry change is declined, not adopted"
+    );
+    remover.join().unwrap();
+    assert!(
+        !controller_dir.exists(),
+        "the declined controller is retired with the intent's old geometry"
+    );
+    assert!(
+        !intent_path.exists(),
+        "a declined adoption removed the intent"
+    );
+    let fresh = adoption_intent(&changed);
+    let path = registry
+        .reserve(&fresh)
+        .expect("a declined adoption must not leave a blocking intent");
+    registry.remove_intent(&path).unwrap();
+}
+
+#[test]
+fn two_matching_controllers_adopt_the_lowest_and_retire_the_other() {
+    let temp = tempdir::TempDir::new("adopt-two").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let low = fixture_controller(
+        &root,
+        2,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let high = fixture_controller(
+        &root,
+        5,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    let remover = remove_controller_when_deleted(high.clone());
+    registry.reconcile().unwrap();
+    remover.join().unwrap();
+    assert!(low.exists(), "the lowest instance is kept");
+    assert!(!high.exists(), "the extra live match is retired");
+    assert!(
+        intent_path.exists(),
+        "the kept controller still owns its intent"
+    );
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let controller = registry
+        .try_adopt_controller(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .unwrap()
+        .expect("the kept controller is adoptable");
+    assert_eq!(controller.instance(), 2, "adoption is deterministic");
+    let remover = remove_controller_when_deleted(low.clone());
+    let mut controller = controller;
+    controller.disconnect(deadline).unwrap();
+    remover.join().unwrap();
+    assert!(
+        !low.exists(),
+        "the adopted controller is retired at disconnect"
+    );
+}
+
+#[test]
+fn non_live_controller_is_retired_and_its_intent_removed() {
+    let temp = tempdir::TempDir::new("adopt-non-live").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let controller_dir = fixture_controller(
+        &root,
+        6,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "resetting",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    let remover = remove_controller_when_deleted(controller_dir.clone());
+    registry.reconcile().unwrap();
+    remover.join().unwrap();
+    assert!(!controller_dir.exists(), "a non-live controller is retired");
+    assert!(
+        !intent_path.exists(),
+        "a non-live controller's intent is removed"
+    );
+}
+
+#[test]
+fn a_controller_of_another_host_is_never_adopted_or_retired() {
+    let temp = tempdir::TempDir::new("adopt-foreign-host").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let foreign = fixture_controller(
+        &root,
+        8,
+        &target,
+        "nqn.2026-01.test:other-host",
+        [3; 16],
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    assert!(
+        foreign.exists(),
+        "a controller of another host identity is not ours to retire"
+    );
+    assert!(
+        !intent_path.exists(),
+        "an intent with no matching controller is stale and removed"
+    );
+}
+
+#[test]
+fn a_crash_after_reconcile_leaves_the_adoptable_controller_and_intent() {
+    let temp = tempdir::TempDir::new("adopt-crash").unwrap();
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let (registry, root) = adoption_registry(temp.path());
+    let controller_dir = fixture_controller(
+        &root,
+        9,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    // Simulate a crash between reconcile and the pool's connect: no adoption
+    // record is kept in memory, only the controller and its durable intent.
+    drop(registry);
+    let registry = LiveConnectionRegistry::open_at(
+        &temp.path().join("registry"),
+        &root,
+        &temp.path().join("no-udev-queue"),
+        RegistryMode::Adopt,
+    )
+    .unwrap();
+    assert!(
+        controller_dir.exists(),
+        "the pre-crash controller survives the first reconcile"
+    );
+    assert!(intent_path.exists(), "the pre-crash intent remains durable");
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let mut controller = registry
+        .try_adopt_controller(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .unwrap()
+        .expect("the recovered state is still adoptable");
+    assert_eq!(controller.instance(), 9);
+    let remover = remove_controller_when_deleted(controller_dir);
+    controller.disconnect(deadline).unwrap();
+    remover.join().unwrap();
+    assert!(
+        !intent_path.exists(),
+        "the recovered adoption removes its intent at disconnect"
+    );
+}
+
+#[test]
+fn already_connected_outcome_retries_only_when_no_controller_remains() {
+    let temp = tempdir::TempDir::new("adopt-ealready").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let deadline = Instant::now() + PROGRESS_CAP;
+    // Nothing for this identity: a retry is safe.
+    assert!(
+        registry
+            .already_connected_outcome(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+            .unwrap()
+            .is_none()
+    );
+    // The bounded reconcile never runs past the caller's acquisition deadline.
+    assert_eq!(
+        registry
+            .already_connected_outcome(&target, ADOPT_HOST, ADOPT_HOST_ID, Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut,
+        "an expired caller deadline bounds the reconcile"
+    );
+    let live = fixture_controller(
+        &root,
+        1,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let error = registry
+        .already_connected_outcome(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .unwrap()
+        .expect("an unowned live controller is a typed fail-stop");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("unowned NVMe controller"),
+        "the fail-stop names the unowned identity: {error}"
+    );
+    // A controller the kernel is already deleting does not block a retry.
+    std::fs::write(live.join("state"), "deleting").unwrap();
+    assert!(
+        registry
+            .already_connected_outcome(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_options_never_request_a_duplicate_controller() {
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let options = connect_options(&target, ADOPT_HOST, ADOPT_HOST_ID);
+    assert!(
+        !options.contains("duplicate_connect"),
+        "a second controller for one identity must be rejected by the kernel: {options}"
+    );
+    assert!(
+        options.contains("ctrl_loss_tmo=0"),
+        "reconnect policy stays ours: {options}"
+    );
+    assert!(
+        already_connected(&io::Error::from_raw_os_error(libc::EALREADY)),
+        "the kernel's -EALREADY is recognised as a tracked identity"
+    );
+    assert!(
+        !already_connected(&io::Error::from_raw_os_error(libc::EIO)),
+        "an unrelated I/O error is not retried as an identity conflict"
+    );
+}
+
+/// Fails the real `write_all` call with one OS errno, so the test exercises the
+/// production error mapping rather than a hand-built `io::Error`.
+struct ErrnoWriter(i32);
+
+impl Write for ErrnoWriter {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn fabrics_connect_write_preserves_ealready_through_the_context_wrap() {
+    let error = write_connect_options(&mut ErrnoWriter(libc::EALREADY), "nqn=test")
+        .expect_err("the failing writer must fail the connect write");
+    assert!(
+        already_connected(&error),
+        "the real write_all path must preserve -EALREADY for the bounded retry: {error}"
+    );
+    let error = write_connect_options(&mut ErrnoWriter(libc::EIO), "nqn=test")
+        .expect_err("a non-EALREADY write failure must fail the connect");
+    assert_eq!(
+        error.raw_os_error(),
+        None,
+        "other write failures keep the control-device context: {error}"
+    );
+    assert!(
+        error.to_string().contains("connect fabrics control"),
+        "other write failures name the operation: {error}"
+    );
+}
+
+#[test]
+fn changed_endpoint_declines_adoption_and_still_retires_the_controller() {
+    let temp = tempdir::TempDir::new("adopt-endpoint").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let controller_dir = fixture_controller(
+        &root,
+        4,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let intent_path = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    assert!(controller_dir.exists());
+    let mut moved = target.clone();
+    moved.service = 4421;
+    let remover = remove_controller_when_deleted(controller_dir.clone());
+    let deadline = Instant::now() + PROGRESS_CAP;
+    assert!(
+        registry
+            .try_adopt_controller(&moved, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+            .unwrap()
+            .is_none(),
+        "a changed endpoint must not adopt the old controller"
+    );
+    remover.join().unwrap();
+    assert!(
+        !controller_dir.exists(),
+        "the declined controller is retired with the intent's own endpoint"
+    );
+    assert!(!intent_path.exists());
 }

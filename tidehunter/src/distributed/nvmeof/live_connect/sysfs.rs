@@ -439,18 +439,11 @@ pub(super) fn owned_visible_disks(
     Ok(disks)
 }
 
-/// systemd-udevd keeps this file while it has queued or running events. A
-/// namespace change can still be probing the block device after the admin
-/// command returns; deleting the controller then fails those reads.
-const UDEV_QUEUE: &str = "/run/udev/queue";
-
-/// Waits for systemd-udevd to drain its queue. A host without udev has no
-/// queue file and needs no wait. This runs before the teardown disk locks, so
-/// a probe that is already reading can finish instead of losing its paths.
-pub(super) fn wait_for_udev_idle(deadline: Instant) -> io::Result<()> {
-    wait_for_udev_idle_at(Path::new(UDEV_QUEUE), deadline)
-}
-
+/// Waits for systemd-udevd to drain its queue at `queue`. A host without udev
+/// has no queue file and needs no wait. This runs before the teardown disk
+/// locks, so a probe that is already reading can finish instead of losing its
+/// paths. Production passes `/run/udev/queue`; the path is injectable so a
+/// fixture teardown never waits on the host's queue.
 pub(super) fn wait_for_udev_idle_at(queue: &Path, deadline: Instant) -> io::Result<()> {
     loop {
         match std::fs::symlink_metadata(queue) {
