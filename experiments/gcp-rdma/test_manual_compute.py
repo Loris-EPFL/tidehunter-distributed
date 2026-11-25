@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import copy
 import datetime as dt
+import io
 import json
 import subprocess
 import tempfile
@@ -8,6 +10,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+import gcp_manual_compute
 from gcp_campaign import GUEST_SERVICE_ACCOUNT
 from gcp_manual_compute import Compute, ComputeError
 
@@ -756,3 +759,270 @@ class ManualComputeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ComputeError):
             await self.compute.cleanup()
         self.assertFalse(any(m[1] == 'delete' for m in self.api.mutations))
+
+
+CAMPAIGN = 'campaign-hybrid-sui-2026-11-25'
+SOURCE = 'c' * 64
+IMAGE = 'projects/mysten-research/global/images/bench-img-3012611b9ce24218-image'
+
+
+class OperatorFleetTests(unittest.TestCase):
+    """The two- and three-host operator CLI, with the reviewed request bodies."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state_path = Path(self.temp.name) / 'fleet.json'
+        self.config = {'version': 1, 'project_id': 'mysten-research', 'bucket': 'mysten-research-bench-artifacts',
+                       'service_account': GUEST_SERVICE_ACCOUNT, 'machine_type': 'z4m-highmem-16',
+                       'image': IMAGE, 'image_qualification': None, 'max_distance': 3,
+                       'qualification_profile': 'focused', 'candidates': [{
+                           'zone': 'us-central1-a',
+                           'ordinary_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/default',
+                           'rdma_subnet': 'projects/mysten-research/regions/us-central1/subnetworks/falcon-rdma-us-central1-a'}]}
+        self.config_path = Path(self.temp.name) / 'config.json'
+        self.config_path.write_text(json.dumps(self.config))
+        self.api = FakeMcp(None, self.config, self.state_path)
+
+    def cli(self, action, *extra, state=None):
+        return [action, *extra, '--config', str(self.config_path),
+                '--state', str(self.state_path if state is None else state)]
+
+    def create(self, *extra):
+        return gcp_manual_compute.main(self.cli(
+            'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+            '--source-sha256', SOURCE, *extra))
+
+    def output(self, argv):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = gcp_manual_compute.main(argv)
+        self.assertEqual(code, 0)
+        return json.loads(stream.getvalue())
+
+    def live(self, state):
+        api = FakeMcp(state, self.config, self.state_path)
+        return api
+
+    def test_dry_run_prints_the_three_bodies_and_the_policy(self):
+        report = self.output(self.cli(
+            'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+            '--source-sha256', SOURCE, '--dry-run'))
+        run_id = 'bench-' + __import__('hashlib').sha256(
+            ('tidehunter-campaign:' + CAMPAIGN).encode()).hexdigest()[:16]
+        self.assertEqual(report['run_id'], run_id)
+        self.assertEqual(report['policy']['name'], run_id + '-placement')
+        self.assertEqual(report['policy']['groupPlacementPolicy'],
+                         {'collocation': 'COLLOCATED', 'maxDistance': 3})
+        self.assertEqual([body['name'] for body in report['instances']],
+                         [run_id + '-' + str(index) for index in range(3)])
+        for index, body in enumerate(report['instances']):
+            self.assertEqual(body['machineType'], 'zones/us-central1-a/machineTypes/z4m-highmem-16')
+            self.assertEqual([nic['nicType'] for nic in body['networkInterfaces']], ['GVNIC', 'IRDMA'])
+            self.assertEqual([nic['subnetwork'] for nic in body['networkInterfaces']],
+                             [self.config['candidates'][0]['ordinary_subnet'],
+                              self.config['candidates'][0]['rdma_subnet']])
+            self.assertTrue(all('accessConfigs' not in nic for nic in body['networkInterfaces']))
+            disk = body['disks'][0]
+            self.assertEqual((disk['boot'], disk['autoDelete'], disk['interface']), (True, True, 'NVME'))
+            self.assertEqual(disk['initializeParams']['diskSizeGb'], '80')
+            self.assertEqual(disk['initializeParams']['diskType'], 'zones/us-central1-a/diskTypes/hyperdisk-balanced')
+            self.assertEqual(disk['initializeParams']['sourceImage'], IMAGE)
+            self.assertEqual(body['labels']['campaign'], CAMPAIGN)
+            self.assertEqual(body['resourcePolicies'], ['regions/us-central1/resourcePolicies/' + run_id + '-placement'])
+            self.assertEqual(body['scheduling']['instanceTerminationAction'], 'DELETE')
+            self.assertEqual(body['scheduling']['automaticRestart'], False)
+            self.assertNotEqual(body['scheduling']['terminationTime'], '')
+        self.assertFalse(self.state_path.exists())
+
+    def test_dry_run_refuses_a_two_host_fleet_size(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '4', '--hours', '5',
+                '--source-sha256', SOURCE, '--dry-run'))
+
+    def test_launch_command_carries_every_reviewed_body_field(self):
+        state = gcp_manual_compute.new_state(
+            self.config, campaign=CAMPAIGN, run_id=gcp_manual_compute.fleet_run_id(CAMPAIGN),
+            deadline=gcp_manual_compute.fleet_deadline(5), hosts=3,
+            source_sha256=SOURCE, owner_nonce='b' * 32)
+        state['policy'] = {'name': state['run_id'] + '-placement'}
+        for index in range(3):
+            argv, body = gcp_manual_compute.launch_spec(
+                self.config, self.config['candidates'][0], state, index, IMAGE,
+                gcp_manual_compute.STARTUP_SCRIPT, 'd' * 32, state['policy']['name'])
+            self.assertEqual(argv[3], body['name'])
+            disk, params = body['disks'][0], body['disks'][0]['initializeParams']
+            self.assertEqual(dictionary(flag(argv, '--create-disk')), {
+                'name': params['diskName'], 'description': params['description'],
+                'image': params['sourceImage'], 'size': params['diskSizeGb'] + 'GB',
+                'type': 'hyperdisk-balanced', 'interface': 'NVME', 'boot': 'yes', 'auto-delete': 'yes'})
+            self.assertEqual(dictionary(flag(argv, '--labels')), body['labels'])
+            self.assertEqual(dictionary(flag(argv, '--metadata')),
+                             {item['key']: item['value'] for item in body['metadata']['items']})
+            self.assertEqual([arg for arg in argv if arg.startswith('--network-interface=')],
+                             ['--network-interface=nic-type=GVNIC,subnet=' + body['networkInterfaces'][0]['subnetwork'] + ',no-address',
+                              '--network-interface=nic-type=IRDMA,subnet=' + body['networkInterfaces'][1]['subnetwork'] + ',no-address'])
+            self.assertIn('--termination-time=' + body['scheduling']['terminationTime'], argv)
+            self.assertIn('--instance-termination-action=DELETE', argv)
+            self.assertIn('--no-restart-on-failure', argv)
+            self.assertNotIn('--maintenance-policy=STOP', argv)
+            self.assertEqual(flag(argv, '--machine-type'), 'z4m-highmem-16')
+            self.assertEqual(flag(argv, '--resource-policies'), state['policy']['name'])
+        with self.assertRaises(ValueError):
+            gcp_manual_compute.launch_spec(self.config, self.config['candidates'][0], state, 3, IMAGE,
+                                           gcp_manual_compute.STARTUP_SCRIPT, 'd' * 32, state['policy']['name'])
+
+    def test_three_host_create_verify_and_delete(self):
+        calls = []
+        holder = {}
+
+        class Recorded(FakeMcp):
+            async def __call__(self, argv):
+                calls.append(argv)
+                return await super().__call__(argv)
+
+        async def transport(argv):
+            if holder.get('api') is None:
+                holder['api'] = Recorded(None, self.config, self.state_path)
+            return await holder['api'](argv)
+
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1937849582956621267'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=transport):
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', SOURCE))
+        self.assertEqual(len(report['hosts']), 3)
+        self.assertEqual([host['role'] for host in report['hosts']], ['coordinator', 'owner', 'owner'])
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state['campaign'], CAMPAIGN)
+        self.assertEqual(state['host_count'], 3)
+        self.assertEqual(state['policy']['name'], state['run_id'] + '-placement')
+        self.assertEqual(len(state['instances']), 3)
+        self.assertEqual([verb for kind, verb, name in holder['api'].mutations if kind == 'instance'],
+                         ['create', 'create', 'create'])
+        for argv in calls:
+            if argv[:3] == ['compute', 'instances', 'create']:
+                self.assertEqual(dictionary(flag(argv, '--labels'))['campaign'], CAMPAIGN)
+                self.assertIn('--termination-time=' + state['deadline'], argv)
+                self.assertIn('--instance-termination-action=DELETE', argv)
+        async def replay(argv):
+            return await holder['api'](argv)
+        with mock.patch.object(gcp_manual_compute, 'gcloud', new=replay):
+            verified = self.output(self.cli('verify'))
+            self.assertEqual(verified['placement']['collocation'], 'COLLOCATED')
+            self.assertEqual(verified['placement']['max_distance'], 3)
+            self.assertEqual(len(verified['hosts']), 3)
+            self.assertEqual([host['name'] for host in verified['hosts']],
+                             [state['run_id'] + '-' + str(index) for index in range(3)])
+            deletion = self.output(self.cli('delete'))
+        self.assertEqual(deletion['cleanup']['errors'], [])
+        self.assertEqual(len(holder['api'].resources['instance']), 0)
+        self.assertEqual(len(holder['api'].resources['disk']), 0)
+        self.assertEqual(len(holder['api'].resources['policy']), 0)
+        state = json.loads(self.state_path.read_text())
+        self.assertTrue(all(item['deleted'] and item['disk_deleted'] for item in state['instances']))
+        self.assertTrue(state['policy']['deleted'])
+
+    def test_recorded_fleet_refuses_a_different_campaign_or_size(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.output(self.cli('create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                                 '--source-sha256', SOURCE))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.create('--hosts', '2'), 1)
+                self.assertEqual(gcp_manual_compute.main(self.cli('delete', '--campaign', 'campaign-other')), 1)
+        self.assertEqual(len(json.loads(self.state_path.read_text())['instances']), 3)
+
+    def test_qualification_role_admits_a_ready_image_only(self):
+        ready = {'status': 'READY', 'id': '1937849582956621267',
+                 'selfLink': 'https://www.googleapis.com/compute/v1/' + IMAGE, 'diskSizeGb': '80'}
+        with mock.patch('gcp_api.GoogleApi') as api, \
+             mock.patch.object(gcp_manual_compute, 'admit_image') as receipt_admission, \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            api.return_value.request.return_value = ready
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN + '-qualify',
+                '--hosts', '2', '--hours', '1', '--role', 'qualification', '--image', IMAGE,
+                '--source-sha256', SOURCE))
+            receipt_admission.assert_not_called()
+        self.assertEqual(report['role'], 'qualification')
+        self.assertEqual(len(report['hosts']), 2)
+        self.assertEqual(json.loads(self.state_path.read_text())['role'], 'qualification')
+        with mock.patch('gcp_api.GoogleApi') as api:
+            api.return_value.request.return_value = dict(ready, status='PENDING')
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gcp_manual_compute.main(self.cli(
+                    'create', '--campaign', CAMPAIGN + '-other',
+                    '--hosts', '2', '--hours', '1', '--role', 'qualification', '--image', IMAGE,
+                    '--source-sha256', SOURCE, state=Path(self.temp.name) / 'second.json')), 1)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN + '-third', '--hosts', '3', '--hours', '1',
+                '--role', 'qualification', '--image', IMAGE, '--source-sha256', SOURCE,
+                state=Path(self.temp.name) / 'third.json'))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN + '-fourth', '--hosts', '2', '--hours', '1',
+                '--role', 'qualification', '--source-sha256', SOURCE,
+                state=Path(self.temp.name) / 'fourth.json'))
+
+    def test_campaign_role_requires_the_receipt(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               side_effect=ValueError('image qualification is not configured')), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.create(), 1)
+        self.assertFalse(self.state_path.exists())
+
+    def test_qualification_role_is_limited_to_two_hosts(self):
+        with self.assertRaises(ValueError):
+            gcp_manual_compute.new_state(
+                self.config, campaign=CAMPAIGN, run_id=gcp_manual_compute.fleet_run_id(CAMPAIGN),
+                deadline=gcp_manual_compute.fleet_deadline(1), hosts=3,
+                source_sha256=SOURCE, owner_nonce='a' * 32, role='qualification')
+
+    def test_fleet_identity_and_deadline_are_derived(self):
+        run_id = gcp_manual_compute.fleet_run_id(CAMPAIGN)
+        self.assertRegex(run_id, r'^bench-[0-9a-f]{16}$')
+        self.assertEqual(run_id, gcp_manual_compute.fleet_run_id(CAMPAIGN))
+        self.assertNotEqual(run_id, gcp_manual_compute.fleet_run_id('campaign-other'))
+        with self.assertRaises(ValueError):
+            gcp_manual_compute.fleet_run_id('Campaign Upper')
+        with self.assertRaises(ValueError):
+            gcp_manual_compute.fleet_run_id(None)
+        now = dt.datetime(2026, 11, 26, 12, 0, 0, 500000, tzinfo=dt.timezone.utc)
+        self.assertEqual(gcp_manual_compute.fleet_deadline(5, now=now), '2026-11-26T17:00:00Z')
+        for hours in (0, 7):
+            with self.assertRaises(ValueError):
+                gcp_manual_compute.fleet_deadline(hours, now=now)
+        state = gcp_manual_compute.new_state(
+            self.config, campaign=CAMPAIGN, run_id=run_id,
+            deadline=gcp_manual_compute.fleet_deadline(2, now=now), hosts=2,
+            source_sha256=SOURCE, owner_nonce='a' * 32)
+        self.assertEqual((state['host_count'], state['campaign'], state['instances']), (2, CAMPAIGN, []))
+        with self.assertRaises(ValueError):
+            gcp_manual_compute.new_state(self.config, campaign=CAMPAIGN, run_id=run_id,
+                                         deadline=gcp_manual_compute.fleet_deadline(2, now=now), hosts=4,
+                                         source_sha256=SOURCE, owner_nonce='a' * 32)
+
+    def test_campaign_additions_never_replace_reviewed_keys(self):
+        state = gcp_manual_compute.new_state(
+            self.config, campaign=CAMPAIGN, run_id=gcp_manual_compute.fleet_run_id(CAMPAIGN),
+            deadline=gcp_manual_compute.fleet_deadline(5), hosts=3,
+            source_sha256=SOURCE, owner_nonce='b' * 32)
+        state['policy'] = {'name': state['run_id'] + '-placement'}
+        for extra in ({'extra_labels': {'bench-run': 'other'}},
+                      {'extra_metadata': {'bench-expiry': 'other'}},
+                      {'extra_labels': {'': 'empty'}}):
+            with self.assertRaises(ValueError):
+                gcp_manual_compute.instance_body(self.config, self.config['candidates'][0], state,
+                                                 0, 'startup', 'd' * 32, **extra)
+        body = gcp_manual_compute.instance_body(
+            self.config, self.config['candidates'][0], state, 0, 'startup', 'd' * 32,
+            extra_labels={'campaign': CAMPAIGN})
+        self.assertEqual(body['labels']['campaign'], CAMPAIGN)
+        self.assertEqual(body['labels']['bench-run'], state['run_id'])

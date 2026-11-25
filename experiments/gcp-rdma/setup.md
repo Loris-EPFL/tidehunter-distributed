@@ -693,6 +693,333 @@ The retired compact six-VM Sui spec (`sui_nvmeof_compact`,
 campaign uses this launcher for stages 1 and 2 and the `stage3_specs.py` set for
 stage 3.
 
+### Three-host fleet lifecycle for the Sui campaign (`gcp_manual_compute.py`)
+
+`gcp_manual_compute.py` owns the fleet that `manual_sui.py` assumes exists. It
+creates one placement policy and two or three hosts, then verifies or deletes
+exactly those resources. It never retries a create that has an unknown outcome.
+
+The fleet run identity is derived from the campaign, never chosen:
+
+```sh
+python3 -c 'import sys; sys.path.insert(0,"experiments/gcp-rdma"); import gcp_manual_compute as m; print(m.fleet_run_id(sys.argv[1]))' campaign-hybrid-sui-2026-11-25
+# bench-68bbf96a569f1513
+```
+
+Hosts are `<run_id>-0` (H0: coordinator, Sui node, producer, driver), `-1` and
+`-2` (H1, H2: owners and NVMe-oF targets). Every host carries the labels
+`campaign`, `bench-run` and `bench-source` and the boot disk carries a token in
+its description, so a delete cannot remove a foreign resource.
+
+The fixed body of each host, printed by `--dry-run`:
+
+| Field | Value |
+| --- | --- |
+| Machine | `z4m-highmem-16` with its mandatory bundled Local SSD |
+| Boot disk | one 80 GiB `hyperdisk-balanced`, `NVME`, `boot`, `autoDelete` |
+| Network | `default` (GVNIC) and `falcon-rdma-us-central1-a` (IRDMA), no external address |
+| Service account | `bench-guest@mysten-research.iam.gserviceaccount.com`, `cloud-platform` |
+| Placement | `<run_id>-placement`, `COLLOCATED`, `maxDistance 3` |
+| Lifetime | `terminationTime` = deadline, `instanceTerminationAction` = `DELETE`, no restart on failure |
+
+Example shell setup for the campaign:
+
+```sh
+CAMPAIGN=campaign-hybrid-sui-2026-11-25
+RUN=bench-68bbf96a569f1513
+CAMPAIGN_ROOT=/absolute/checkpoint-work/cluster-campaign-2026-11-25
+STATE=$CAMPAIGN_ROOT/fleet-state.json
+IMAGE=projects/mysten-research/global/images/bench-img-3012611b9ce24218-image
+BUNDLE=c7b69b8bd942a119bcced33e0e5dbc4222ee47650306f03471c8b42ad0230fa9
+```
+
+1. Print the request bodies. This step makes no call and writes no file.
+
+```sh
+python3 experiments/gcp-rdma/gcp_manual_compute.py create \
+  --campaign $CAMPAIGN --state $STATE --hosts 3 --hours 5 \
+  --source-sha256 $BUNDLE --image $IMAGE --dry-run
+```
+
+   The output holds `policy` (the placement body) and one insert body per host.
+   The command exits without a state file, so the next step starts clean.
+
+2. Create the policy and the three hosts. The command admits the image first
+   and refuses to create a fleet when `config.json` has no current receipt
+   (see "Image requalification" below).
+
+```sh
+python3 experiments/gcp-rdma/gcp_manual_compute.py create \
+  --campaign $CAMPAIGN --state $STATE --hosts 3 --hours 5 \
+  --source-sha256 $BUNDLE
+```
+
+   `--hours 1..6` sets the absolute deadline; `--deadline <UTC ISO 8601>`
+   pins an exact time instead. A lost watcher cannot leak cost past that
+   deadline, because the provider deletes the instance itself. The command
+   prints the fleet with the internal and RDMA address of each host.
+
+3. Verify the placement and the fleet identity. This step reads only.
+
+```sh
+python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE
+```
+
+   It checks `COLLOCATED` with `maxDistance 3`, the DELETE expiry, both network
+   interfaces, the boot disk identity and the guest-visible readback. A second
+   `create` on the same state reuses verified hosts and refuses any other
+   campaign, host count, source or deadline.
+
+4. Stage the frozen build and the fixture in the bucket once, then pull them on
+   H0. One workstation upload and one datacenter-speed download replace two
+   slow transfers through the tunnel.
+
+```sh
+STAGE=gs://mysten-research-bench-artifacts/$CAMPAIGN/stage
+gcloud storage cp --recursive /absolute/cluster-campaign-2026-11-25/build $STAGE/build \
+  --impersonate-service-account=bench-guest@mysten-research.iam.gserviceaccount.com
+gcloud storage cp --recursive /absolute/checkpoint-fixtures/sui-genesis-1775/fixture $STAGE/fixture \
+  --impersonate-service-account=bench-guest@mysten-research.iam.gserviceaccount.com
+gcloud compute ssh $RUN-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo mkdir -p /mnt/tidehunter/'$CAMPAIGN' && sudo chown $USER /mnt/tidehunter/'$CAMPAIGN' && \
+             gcloud storage cp --recursive '$STAGE'/build /mnt/tidehunter/'$CAMPAIGN'/ && \
+             gcloud storage cp --recursive '$STAGE'/fixture /mnt/tidehunter/'$CAMPAIGN'/'
+```
+
+   The build is 1.1 GB and the fixture is 752 MB. `manual_sui.py` starts
+   `run.py` on the machine that runs the launcher and reads both paths there,
+   so the copy is needed only when the replay is driven from H0, for example
+   across a long cell: pass `--build /mnt/tidehunter/$CAMPAIGN/build` and
+   `--fixture /mnt/tidehunter/$CAMPAIGN/fixture` from that session. The owner
+   hosts need no copy; the launcher installs each owner archive in the guest
+   root.
+
+   The guests have no external address, so every session needs IAP TCP
+   forwarding. Check the prerequisite before the paid create:
+
+```sh
+gcloud services list --enabled --format='value(config.name)' | grep iap
+```
+
+   An empty result blocks every SSH step, because `iap.googleapis.com` is
+   disabled in this project. Enabling it, and holding
+   `iap.tunnelInstances.accessViaIAP`, is a project change outside this
+   launcher. The firewall rule `default-allow-ssh` already covers the IAP
+   source range `35.235.240.0/20`.
+
+5. Identify the bundled Local SSD and mount it at the guest root on all three
+   hosts. Do not assume the alias from another image.
+
+```sh
+gcloud compute ssh $RUN-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'ls -l /dev/disk/by-id/google-local-ssd-* && lsblk -o NAME,SIZE,MODEL'
+```
+
+   The `z4m-highmem-16` shape has one 14,000 GiB Local SSD. Create the
+   filesystem once, then mount it at `/mnt/tidehunter/$CAMPAIGN` on each host
+   with the same `mkfs` and `mount` commands. A stopped host loses the Local SSD
+   content, so never place the ledger or a receipt there.
+
+6. Load the pinned `nvmet.ko` on all three guests, as root, before any owner
+   starts. The command prints its proof; `already_loaded` is not a failure.
+
+```sh
+gcloud compute ssh $RUN-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo /opt/tidehunter-python/bin/python3 /mnt/tidehunter/'$CAMPAIGN'/pinned-artifacts/nvmet-fix/kernel_fix.py --prefix /mnt/tidehunter/'$CAMPAIGN'/pinned-artifacts/nvmet-fix'
+```
+
+   Repeat for `$RUN-1` and `$RUN-2`. The prefix holds exactly `nvmet.ko`,
+   `abi-admission.json`, `source.json` and `partial-nowait-read.patch`, and the
+   module SHA-256 prefix is `5ba7b96c3b232e7f`. S1-0 is the first case that
+   exercises this path.
+
+7. Run the cell from the workstation. The launcher owns the owner processes,
+   the external config and the ledger entry.
+
+```sh
+python3 experiments/gcp-rdma/manual_sui.py \
+  --build $CAMPAIGN_ROOT/build \
+  --fixture /absolute/checkpoint-fixtures/sui-genesis-1775/fixture \
+  --schema $CAMPAIGN_ROOT/schema-run/experiment/native-schema \
+  --output $CAMPAIGN_ROOT/stage1/S1-0 \
+  --guest-root /mnt/tidehunter/$CAMPAIGN \
+  --coordinator $RUN-0 --owners $RUN-1,$RUN-2 --zone us-central1-a \
+  --transport tcp --live-transport rdma --durability-tier native \
+  --fragment-mib 1024 --coordinator-cache-mib 0 --shard-cache-mib 0 --deadline 900 \
+  --ledger $CAMPAIGN_ROOT/campaign-ledger.json --cell-id S1-0 --stage stage1 \
+  -- --owners 2 --driver-concurrency 4 --disk-sample-seconds 10 --checkpoints 4 \
+     --coordinator-cache-mib 0 --shard-cache-mib 0
+```
+
+8. Delete the fleet. This step deletes the three hosts, their boot disks and
+   the placement policy, then proves each absence.
+
+```sh
+python3 experiments/gcp-rdma/gcp_manual_compute.py delete --state $STATE
+```
+
+8. Verify deletion independently of the state file. All four commands must
+   return no row.
+
+```sh
+gcloud compute instances list --filter="name~^$RUN-" --format='value(name)'
+gcloud compute disks list --filter="name~^$RUN-" --format='value(name)'
+gcloud beta compute resource-policies list --regions=us-central1 \
+  --filter="name=$RUN-placement" --format='value(name)'
+gcloud compute instances list --filter="labels.campaign=$CAMPAIGN" --format='value(name)'
+```
+
+   A `cleanup incomplete` error is not success. Keep the state file: the next
+   `delete` resumes from the recorded intents and finishes the deletion.
+
+### Image requalification for the campaign fleet
+
+`config.json` pins `qualification_profile: "focused"`. The image
+`bench-img-3012611b9ce24218-image` (numeric ID `1937849582956621267`) carries a
+focused receipt whose recipe hashes are older than the current
+`gcp_image_prepare.py`, `gcp_image_qualify.py` and `gcp_worker.py`, so
+`gcp_image.admit_image` rejects it. Admission needs two fresh reciprocal
+diagnostics from that exact image.
+
+The cheapest correct path uses two hosts and no campaign workload:
+
+1. Seal the focused package from this exact checkout. The guest computes the
+   recipe hashes from the package copies of `gcp_image_prepare.py`,
+   `gcp_image_qualify.py` and `gcp_worker.py`, so an older package fails
+   admission again.
+2. Create a two-host fleet for the pair, with a 30 minute deadline.
+3. Run `gcp_image_qualify.py --qualification-profile focused` on both guests.
+4. Upload the two diagnostics, mint the receipt, upload the receipt.
+5. Write the receipt reference into `config.json` with `--config`.
+6. Delete the two hosts.
+
+```sh
+python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.REVIEWED_SPECS["nvmeof_path_compact"],open(sys.argv[1],"x"),sort_keys=True,indent=2)' /absolute/qualify/focused-spec.json
+docker build -f experiments/gcp-rdma/Dockerfile.build -t tidehunter-gcp-build experiments/gcp-rdma
+python3 experiments/gcp-rdma/prepare.py --engine "$PWD" --revision "$(git rev-parse HEAD)" \
+  --output /absolute/qualify/package --spec /absolute/qualify/focused-spec.json \
+  --deadline 14400 --build-container tidehunter-gcp-build
+cp /absolute/qualify/focused-spec.json /absolute/qualify/package/spec.json
+sha256sum /absolute/qualify/package/manifest.json
+```
+
+The last line prints the `--manifest-sha256` value the guest command needs: the
+manifest identity is the SHA-256 of the manifest file itself.
+Preparation is a local Cargo build; it allocates no cloud resource.
+
+The pair fleet uses its own campaign id, so its host names cannot collide with
+the campaign fleet. `--role qualification` admits a READY image without a
+receipt, because the receipt is what this fleet produces; it is refused for a
+campaign fleet. The deadline is the leak guard, not the expected run time.
+
+```sh
+PAIR_CAMPAIGN=$CAMPAIGN-qualify
+PAIR=bench-$(python3 -c 'import hashlib,sys; print(hashlib.sha256(("tidehunter-campaign:" + sys.argv[1]).encode()).hexdigest()[:16])' $PAIR_CAMPAIGN)
+python3 experiments/gcp-rdma/gcp_manual_compute.py create \
+  --campaign $PAIR_CAMPAIGN --state /absolute/qualify/pair-state.json \
+  --hosts 2 --hours 1 --role qualification --image $IMAGE --source-sha256 $BUNDLE
+python3 experiments/gcp-rdma/gcp_manual_compute.py verify \
+  --state /absolute/qualify/pair-state.json
+```
+
+Creation prints the two hosts with their internal and RDMA addresses; those are
+the peer values below. Delete the pair with the same state file when the receipt
+exists:
+
+```sh
+python3 experiments/gcp-rdma/gcp_manual_compute.py delete --state /absolute/qualify/pair-state.json
+```
+
+The guest command runs on each host with the other host as the peer. Replace
+the peer address, the peer instance name, the RDMA device and the package
+digest with the values from `verify` and the seal. Copy the sealed package to
+both hosts first; it is about 106 MB.
+
+```sh
+gcloud compute ssh $PAIR-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo mkdir -p /mnt/tidehunter/qualify'
+gcloud compute scp --recurse --zone us-central1-a --tunnel-through-iap \
+  /absolute/qualify/package $PAIR-0:/tmp/qualify-package
+gcloud compute ssh $PAIR-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo cp -a /tmp/qualify-package /mnt/tidehunter/qualify/package'
+```
+
+Repeat both commands for `$PAIR-1`. The reciprocal perftest servers must listen
+on both hosts before either client starts; each host is a client to the other.
+
+```sh
+gcloud compute ssh $PAIR-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo nohup ib_read_lat -R -d <irdma device> -p 18515 -s 1024 -n 1000 >/tmp/ib-read.log 2>&1 &
+             sudo nohup ib_send_lat -R -d <irdma device> -p 18516 -s 1024 -n 1000 >/tmp/ib-send.log 2>&1 &
+             sleep 5'
+gcloud compute ssh $PAIR-1 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo nohup ib_read_lat -R -d <irdma device> -p 18515 -s 1024 -n 1000 >/tmp/ib-read.log 2>&1 &
+             sudo nohup ib_send_lat -R -d <irdma device> -p 18516 -s 1024 -n 1000 >/tmp/ib-send.log 2>&1 &
+             sleep 5'
+gcloud compute ssh $PAIR-0 --zone us-central1-a --tunnel-through-iap \
+  --command 'sudo /opt/tidehunter-python/bin/python3 \
+    /mnt/tidehunter/qualify/package/source/experiments/gcp-rdma/gcp_image_qualify.py \
+    --package /mnt/tidehunter/qualify/package \
+    --manifest-sha256 <package manifest sha256> \
+    --peer <peer RDMA address> --peer-instance <peer name> \
+    --rdma-device <irdma device> --qualification-profile focused \
+    --output /mnt/tidehunter/qualify/diagnostic.json'
+```
+
+   Run the same client command on `$PAIR-1` with the addresses and the instance
+   name swapped, then stop the four servers with
+   `pkill -f 'ib_(read|send)_lat'`. Each diagnostic is about 200 KB and records
+   the two perftest command lines, the kernel modules, the container digests,
+   the io_uring read and the sealed runtime linkage.
+
+Then, on the workstation. The receipt input names the exact image, the sealed
+runtime manifest and the two uploaded evidence objects; the tool verifies every
+file digest against its reference.
+
+```json
+{
+  "image": {"path": "projects/mysten-research/global/images/bench-img-3012611b9ce24218-image",
+            "id": "1937849582956621267"},
+  "runtime_sha256": "<sha256 of the sealed manifest.json>",
+  "service_account": "bench-guest@mysten-research.iam.gserviceaccount.com",
+  "evidence": [
+    {"file": "/absolute/qualify/diagnostic-0.json",
+     "reference": {"bucket": "mysten-research-bench-artifacts",
+                   "object": "runs/<pair run id>/qualification/0/diagnostic.json",
+                   "generation": "<uploaded generation>", "sha256": "<file sha256>"}},
+    {"file": "/absolute/qualify/diagnostic-1.json",
+     "reference": {"bucket": "mysten-research-bench-artifacts",
+                   "object": "runs/<pair run id>/qualification/1/diagnostic.json",
+                   "generation": "<uploaded generation>", "sha256": "<file sha256>"}}
+  ]
+}
+```
+
+```sh
+gcloud storage cp /absolute/qualify/diagnostic-0.json \
+  gs://mysten-research-bench-artifacts/runs/$PAIR/qualification/0/diagnostic.json
+gcloud storage cp /absolute/qualify/diagnostic-1.json \
+  gs://mysten-research-bench-artifacts/runs/$PAIR/qualification/1/diagnostic.json
+python3 experiments/gcp-rdma/gcp_image_receipt.py \
+  --spec /absolute/qualify/receipt-input.json \
+  --output /absolute/qualify/image-receipt.json --qualification-profile focused
+gcloud storage cp /absolute/qualify/image-receipt.json \
+  gs://mysten-research-bench-artifacts/runs/$PAIR/qualification/image-receipt.json
+python3 experiments/gcp-rdma/gcp_image_receipt.py \
+  --spec /absolute/qualify/receipt-input.json \
+  --output /absolute/qualify/image-receipt.json --qualification-profile focused \
+  --config experiments/gcp-rdma/config.json \
+  --bucket mysten-research-bench-artifacts \
+  --object runs/$PAIR/qualification/image-receipt.json \
+  --generation <uploaded generation>
+```
+
+`--config` writes `image`, `image_qualification` and `qualification_profile`
+from the receipt and refuses stale recipes, a foreign bucket, a different
+image or a malformed generation. `$PAIR` is the two-host fleet run id. The
+receipt binds the two guest instance IDs, so the pair must stay alive until the
+receipt is written.
+
 For an explicitly manual dirty checkout, keep preparation output and the
 specification outside the checkout. Generate the exact reviewed specification,
 then build the image and seal the package (replace both absolute paths):

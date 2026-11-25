@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -352,6 +353,89 @@ class ImageAdmissionTests(unittest.TestCase):
                 gcp_image.validate_pair(records, identity, runtime, self.config['service_account'])
 
 
+
+class QualificationCliTests(unittest.TestCase):
+    """The direct two-guest qualification and the receipt-to-config step."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.image = {'path': 'projects/mysten-research/global/images/bench-image', 'id': '1937849582956621267'}
+
+    def receipt(self, **changes):
+        value = {'schema_version': 1, 'image': self.image, 'recipes': gcp_image.recipe_hashes(),
+                 'runtime_sha256': 'a' * 64,
+                 'evidence': [{'bucket': 'artifacts', 'object': 'one', 'generation': '1', 'sha256': 'b' * 64},
+                              {'bucket': 'artifacts', 'object': 'two', 'generation': '2', 'sha256': 'c' * 64}],
+                 'qualification_profile': 'focused',
+                 'qualification_proofs': list(gcp_image.FOCUSED_PROOFS)}
+        return {**value, **changes}
+
+    def config(self, **changes):
+        value = {'version': 1, 'project_id': 'mysten-research', 'bucket': 'artifacts',
+                 'service_account': 'bench-guest@mysten-research.iam.gserviceaccount.com',
+                 'machine_type': 'z4m-highmem-16', 'image': '', 'image_qualification': None,
+                 'max_distance': 3, 'candidates': [{'zone': 'us-central1-a'}]}
+        path = self.root / 'config.json'
+        path.write_text(json.dumps({**value, **changes}))
+        return path
+
+    def test_qualification_profile_reaches_the_guest(self):
+        seen = {}
+
+        def guest(package, peer, peer_instance, device, manifest, **kwargs):
+            seen.update({'package': package, 'peer': peer, 'peer_instance': peer_instance,
+                         'device': device, 'manifest': manifest, **kwargs})
+            return {'kind': 'guest-diagnostic'}
+        output = self.root / 'diagnostic.json'
+        with patch.object(gcp_image_qualify, 'guest', side_effect=guest):
+            argv = ['--package', '/pkg', '--manifest-sha256', 'a' * 64, '--peer', '10.20.0.3',
+                    '--peer-instance', 'bench-1', '--rdma-device', 'irdma0', '--output', str(output),
+                    '--qualification-profile', 'focused']
+            with patch.object(sys, 'argv', ['gcp_image_qualify.py', *argv]):
+                gcp_image_qualify.main()
+        self.assertEqual(seen['qualification_profile'], 'focused')
+        self.assertEqual(seen['peer'], '10.20.0.3')
+        self.assertEqual(json.loads(output.read_text()), {'kind': 'guest-diagnostic'})
+        output.unlink()
+        with patch.object(gcp_image_qualify, 'guest', side_effect=guest):
+            with patch.object(sys, 'argv', ['gcp_image_qualify.py', *[a for a in argv
+                                                                     if a != 'focused'][:-1]]):
+                gcp_image_qualify.main()
+        self.assertEqual(seen['qualification_profile'], 'full')
+
+    def test_apply_config_writes_the_pinned_entries(self):
+        path = self.config()
+        digest = 'd' * 64
+        reference = gcp_image_receipt.apply_config(
+            path, self.receipt(), bucket='artifacts', object_name='runs/bench-1/qualification/image-receipt.json',
+            generation='1795640685113402', sha256=digest)
+        self.assertEqual(reference, {'bucket': 'artifacts', 'object': 'runs/bench-1/qualification/image-receipt.json',
+                                     'generation': '1795640685113402', 'sha256': digest})
+        stored = json.loads(path.read_text())
+        self.assertEqual(stored['image'], self.image['path'])
+        self.assertEqual(stored['image_qualification'], reference)
+        self.assertEqual(stored['qualification_profile'], 'focused')
+        self.assertEqual(stored['machine_type'], 'z4m-highmem-16')
+
+    def test_apply_config_refuses_stale_or_foreign_receipts(self):
+        path = self.config()
+        arguments = {'bucket': 'artifacts', 'object_name': 'runs/bench-1/qualification/image-receipt.json',
+                     'generation': '7', 'sha256': 'd' * 64}
+        with self.assertRaisesRegex(ValueError, 'recipe hashes'):
+            gcp_image_receipt.apply_config(path, self.receipt(recipes={'prepare_sha256': 'e' * 64}), **arguments)
+        with self.assertRaisesRegex(ValueError, 'proof list'):
+            gcp_image_receipt.apply_config(path, self.receipt(qualification_proofs=['valkey']), **arguments)
+        with self.assertRaisesRegex(ValueError, 'configured bucket'):
+            gcp_image_receipt.apply_config(path, self.receipt(), **{**arguments, 'bucket': 'other'})
+        with self.assertRaisesRegex(ValueError, 'already pins'):
+            gcp_image_receipt.apply_config(self.config(image='projects/mysten-research/global/images/other'),
+                                           self.receipt(), **arguments)
+        for generation in ('0', 'latest', ''):
+            with self.assertRaisesRegex(ValueError, 'generation'):
+                gcp_image_receipt.apply_config(path, self.receipt(), **{**arguments, 'generation': generation})
+        self.assertIsNone(json.loads(path.read_text())['image_qualification'])
 
 
 if __name__ == '__main__':

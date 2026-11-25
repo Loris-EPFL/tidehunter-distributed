@@ -269,8 +269,11 @@ def main():
     parser.add_argument('--peer-instance', required=True)
     parser.add_argument('--rdma-device', required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--qualification-profile', choices=('focused', 'full'), default='full',
+                        help='focused admits the TideHunter-only runtime and records its proof list')
     args = parser.parse_args()
-    result = guest(args.package, args.peer, args.peer_instance, args.rdma_device, args.manifest_sha256)
+    result = guest(args.package, args.peer, args.peer_instance, args.rdma_device, args.manifest_sha256,
+                   qualification_profile=args.qualification_profile)
     with args.output.open('x') as output:
         json.dump(result, output, sort_keys=True, indent=2)
         output.write('\n')

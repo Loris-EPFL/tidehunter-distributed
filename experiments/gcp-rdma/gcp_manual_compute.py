@@ -3,24 +3,45 @@
 Deletes are by name: even an immediately preceding ID/ownership GET cannot
 prevent replacement between that GET and the delete (a residual TOCTOU race).
 An uncertain create is never retried and an empty list cannot resolve it.
+
+The module also carries the operator CLI for the reviewed two- and three-host
+fleets. ``create --dry-run`` prints the exact request bodies without a call.
 """
+import argparse
 import asyncio
 import datetime as dt
 import hashlib
 import ipaddress
 import json
+from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 import uuid
 
-from gcp_campaign import (BOOT_DISK_GIB, GUEST_SERVICE_ACCOUNT, has_delete_expiry,
+from gcp_campaign import (BOOT_DISK_GIB, GUEST_SERVICE_ACCOUNT, campaign_mark,
+                          campaign_identity, has_delete_expiry, instance_body,
                           owned_disk, owned_instance, parse_time, save)
 
 ZONE = 'us-central1-a'
 REGION = 'us-central1'
 PROJECT = 'mysten-research'
 MCP_CALL_SECONDS = 30
+# The operator CLI runs one gcloud process per call; the absolute deadline and
+# the per-call wait below still bound it.
+GCLOUD_SECONDS = 600
+FLEET_HOSTS = (2, 3)
+FLEET_ROLES = ('campaign', 'qualification')
+MAX_FLEET_HOURS = 6
+# The guests carry no workload bootstrap: the operator copies the build and the
+# fixture and starts the launcher over SSH. This line identifies the host on the
+# serial console after a lost watcher.
+STARTUP_SCRIPT = (
+    '#!/bin/bash\n'
+    'set -euo pipefail\n'
+    'echo "tidehunter campaign host ${HOSTNAME} ready"\n')
+IMAGE_PATH = re.compile(r'projects/[a-z0-9-]+/global/images/[a-z0-9-]+')
 # F7 attempts 4/5: at most 146.140965 s from delete to observed absence.
 # Allow 153.859035 s margin; the whole cleanup remains bounded by 600 s.
 DELETE_CALL_SECONDS = 300
@@ -152,6 +173,136 @@ def _dict_flag(values):
     return '^' + delimiter + '^' + delimiter.join(k + '=' + str(v) for k, v in values.items())
 
 
+def fleet_run_id(campaign):
+    """Return the stable run identity of one campaign fleet.
+
+    The name is derived, never chosen, so a retry reuses the same host and disk
+    names and the cleanup proof can filter by the exact prefix.
+    """
+    campaign = campaign_identity(campaign)
+    if campaign is None:
+        raise ValueError('the operator fleet requires a campaign id')
+    return 'bench-' + hashlib.sha256(('tidehunter-campaign:' + campaign).encode()).hexdigest()[:16]
+
+
+def fleet_deadline(hours, now=None):
+    """Return the absolute UTC deadline of one fleet, at most six hours ahead."""
+    if type(hours) is not int or not 1 <= hours <= MAX_FLEET_HOURS:
+        raise ValueError('fleet duration must be one to ' + str(MAX_FLEET_HOURS) + ' whole hours')
+    start = now or dt.datetime.now(dt.timezone.utc)
+    return (start + dt.timedelta(hours=hours)).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+
+def new_state(config, *, campaign, run_id, deadline, hosts, source_sha256, owner_nonce,
+              role='campaign'):
+    """Build the persisted fleet identity before any cloud mutation."""
+    campaign = campaign_identity(campaign)
+    if campaign is None:
+        raise ValueError('the operator fleet requires a campaign id')
+    if role not in FLEET_ROLES:
+        raise ValueError('the fleet role must be campaign or qualification')
+    if type(hosts) is not int or hosts not in FLEET_HOSTS:
+        raise ValueError('the operator fleet must have two or three hosts')
+    if role == 'qualification' and hosts != 2:
+        raise ValueError('the qualification fleet must have exactly two hosts')
+    if not isinstance(run_id, str) or not re.fullmatch(r'bench-[0-9a-f]{16}', run_id):
+        raise ValueError('the fleet run id must match bench-[0-9a-f]{16}')
+    if not isinstance(source_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', source_sha256):
+        raise ValueError('the fleet source sha256 must be a full lowercase SHA256')
+    if not isinstance(owner_nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', owner_nonce):
+        raise ValueError('the fleet owner nonce must be 128 random bits')
+    parse_time(deadline)
+    return {'run_id': run_id, 'campaign': campaign, 'role': role, 'source_sha256': source_sha256,
+            'owner_nonce': owner_nonce, 'deadline': deadline, 'host_count': hosts,
+            'instances': []}
+
+
+def launch_spec(config, candidate, state, index, image, startup, disk_token, policy):
+    """Return the reviewed insert body and the exact gcloud command for one host.
+
+    Both come from this function so the printed body and the executed command
+    cannot describe different resources.
+    """
+    if not isinstance(image, str) or not IMAGE_PATH.fullmatch(image):
+        raise ValueError('a pinned image path is required')
+    if type(index) is not int or not 0 <= index < state.get('host_count', 0):
+        raise ValueError('invalid VM index')
+    if not isinstance(startup, str) or not startup:
+        raise ValueError('a startup script is required')
+    if parse_time(state['deadline']) <= dt.datetime.now(dt.timezone.utc):
+        raise ComputeError('absolute deadline already passed')
+    labels, metadata = campaign_mark(state)
+    metadata['bench-owner'] = state['owner_nonce']
+    body = instance_body(dict(config, image=image), candidate, state, index, startup, disk_token,
+                         extra_labels=labels, extra_metadata=metadata)
+    disk, params = body['disks'][0], body['disks'][0]['initializeParams']
+    command = ['compute', 'instances', 'create', body['name'], '--zone=' + ZONE,
+               '--machine-type=' + body['machineType'].rsplit('/', 1)[-1],
+               '--create-disk=' + _dict_flag({
+                   'name': params['diskName'], 'description': params['description'],
+                   'image': params['sourceImage'], 'size': params['diskSizeGb'] + 'GB',
+                   'type': params['diskType'].rsplit('/', 1)[-1], 'interface': disk['interface'],
+                   'boot': 'yes' if disk['boot'] else 'no',
+                   'auto-delete': 'yes' if disk['autoDelete'] else 'no'})]
+    for nic in body['networkInterfaces']:
+        command.append('--network-interface=nic-type=' + nic['nicType'] + ',subnet=' + nic['subnetwork']
+                       + ('' if nic.get('accessConfigs') else ',no-address'))
+    command.append('--resource-policies=' + body['resourcePolicies'][0].rsplit('/', 1)[-1])
+    account = body['serviceAccounts'][0]
+    command.extend(['--service-account=' + account['email'],
+                    '--scopes=' + account['scopes'][0].rsplit('/', 1)[-1],
+                    '--labels=' + ','.join(key + '=' + value for key, value in body['labels'].items()),
+                    '--metadata=' + _dict_flag({item['key']: item['value'] for item in body['metadata']['items']})])
+    scheduling = body['scheduling']
+    command.extend(['--termination-time=' + scheduling['terminationTime'],
+                    '--instance-termination-action=' + scheduling['instanceTerminationAction'],
+                    '--maintenance-policy=' + scheduling['onHostMaintenance']])
+    if not scheduling['automaticRestart']:
+        command.append('--no-restart-on-failure')
+    command.append('--async')
+    if body['resourcePolicies'] != ['regions/' + REGION + '/resourcePolicies/' + policy]:
+        raise ComputeError('launch body does not carry the reviewed placement policy')
+    return command, body
+
+
+def policy_body(state):
+    """Return the reviewed placement-policy body of one fleet."""
+    description = json.dumps({'run': state['run_id'], 'source': state['source_sha256'],
+                              'expiry': state['deadline'], 'owner': state['owner_nonce']}, sort_keys=True)
+    return {'name': state['run_id'] + '-placement', 'description': description,
+            'groupPlacementPolicy': {'collocation': 'COLLOCATED', 'maxDistance': 3}}
+
+
+def admit_ready_image(config, image, api=None):
+    """Admit one READY custom image of the configured project and its size."""
+    import gcp_api
+    if (not isinstance(image, str) or not IMAGE_PATH.fullmatch(image)
+            or not image.startswith('projects/' + config.get('project_id', '') + '/global/images/')):
+        raise ValueError('image must be a pinned image of the configured project')
+    api = api or gcp_api.GoogleApi(config['project_id'])
+    info = api.request('GET', 'global/images/' + image.rsplit('/', 1)[-1])
+    if not isinstance(info, dict) or info.get('status') != 'READY' or not str(info.get('id', '')).isdigit():
+        raise ValueError('configured image is not READY with a numeric ID')
+    if not str(info.get('selfLink', '')).endswith('/' + image):
+        raise ValueError('configured image identity mismatch')
+    size = str(info.get('diskSizeGb', ''))
+    if not size.isascii() or not size.isdecimal() or not 0 < int(size) <= BOOT_DISK_GIB:
+        raise ValueError('configured image boot disk exceeds the reviewed size')
+    return info
+
+
+def admit_image(config, api=None):
+    """Refuse to create a campaign fleet unless the image carries a current receipt."""
+    import gcp_api
+    import gcp_image
+    image = config.get('image', '')
+    info = admit_ready_image(config, image, api=api)
+    api = api or gcp_api.GoogleApi(config['project_id'])
+    qualification = gcp_image.admit_image(api, config, info)
+    gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])
+    return {'path': image, 'id': str(info['id'])}
+
+
 class Compute:
     def __init__(self, config, state, state_path, execute):
         self.config, self.state, self.state_path, self.execute = config, state, state_path, execute
@@ -165,11 +316,15 @@ class Compute:
             raise ValueError('invalid source identity')
         if not re.fullmatch(r'[0-9a-f]{32}', state.get('owner_nonce', '')):
             raise ValueError('independent 128-bit owner nonce required')
+        campaign_identity(state.get('campaign'))
+        if state.get('role', 'campaign') not in FLEET_ROLES:
+            raise ValueError('invalid persisted fleet role')
         from gcp_runtime import owner_host_counts
         count = state.get('host_count', 6)
         if type(count) is not int or count - 1 not in owner_host_counts():
             raise ValueError('invalid persisted fleet host count')
         self.host_count = count
+        state['host_count'] = count
         parse_time(state['deadline'])
         candidates = [c for c in config.get('candidates', []) if c.get('zone') == ZONE]
         if len(candidates) != 1:
@@ -524,7 +679,7 @@ class Compute:
             raise ValueError('invalid VM index or startup')
         if parse_time(deadline) != parse_time(self.state['deadline']):
             raise ValueError('VM deadline must equal persisted absolute deadline')
-        if not isinstance(image, str) or not re.fullmatch(r'projects/[a-z0-9-]+/global/images/[a-z0-9-]+', image):
+        if not isinstance(image, str) or not IMAGE_PATH.fullmatch(image):
             raise ValueError('a pinned image path is required')
         policy = self.state.get('policy')
         if not policy or policy.get('uncertain') or not policy.get('id'):
@@ -546,23 +701,8 @@ class Compute:
                                'rdma_subnet': self.candidate['rdma_subnet']}}
         self.state['instances'].append(rec)
         self._save()
-        description = json.dumps({'run': self.state['run_id'], 'source': self.state['source_sha256'],
-                                  'expiry': self.state['deadline'], 'token': rec['disk_token']}, sort_keys=True)
-        disk = _dict_flag({'name': name, 'description': description, 'image': image, 'size': str(BOOT_DISK_GIB) + 'GB',
-                           'type': 'hyperdisk-balanced', 'interface': 'NVME', 'boot': 'yes', 'auto-delete': 'yes'})
-        metadata = _dict_flag({'startup-script': startup, 'bench-run': self.state['run_id'],
-                               'bench-source': self.state['source_sha256'], 'bench-expiry': self.state['deadline'],
-                               'bench-owner': self.state['owner_nonce'],
-                               'tidehunter-run-id': self.state['run_id'], 'tidehunter-source-sha256': self.state['source_sha256'],
-                               'tidehunter-deadline-utc': self.state['deadline']})
-        argv = ['compute', 'instances', 'create', name, '--zone=' + ZONE,
-                '--machine-type=' + self.config['machine_type'], '--create-disk=' + disk,
-                '--network-interface=nic-type=GVNIC,subnet=' + self.candidate['ordinary_subnet'] + ',no-address',
-                '--network-interface=nic-type=IRDMA,subnet=' + self.candidate['rdma_subnet'] + ',no-address',
-                '--resource-policies=' + policy['name'], '--service-account=' + GUEST_SERVICE_ACCOUNT,
-                '--scopes=cloud-platform', '--labels=bench-run=' + self.state['run_id'] + ',bench-source=' + self.state['source_sha256'][:63],
-                '--metadata=' + metadata, '--termination-time=' + deadline, '--instance-termination-action=DELETE',
-                '--maintenance-policy=TERMINATE', '--no-restart-on-failure', '--async']
+        argv, _body = launch_spec(self.config, self.candidate, self.state, index, image,
+                                  startup, rec['disk_token'], policy['name'])
         error = None
         response = None
         try:
@@ -772,3 +912,183 @@ class Compute:
         if errors:
             raise ComputeError('cleanup incomplete: ' + '; '.join(errors) + ' ' + TOCTOU)
         return {'errors': errors, 'toctou': TOCTOU}
+
+
+async def gcloud(argv):
+    """Run one reviewed gcloud argument list and return its bounded result."""
+    process = await asyncio.create_subprocess_exec(
+        'gcloud', *argv, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=GCLOUD_SECONDS)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    return {'exit_code': process.returncode,
+            'stdout': stdout.decode('utf-8', 'replace'),
+            'stderr': stderr.decode('utf-8', 'replace')}
+
+
+def _recorded_fleet(config, args):
+    state = json.loads(args.state.read_text())
+    args.campaign = args.campaign or state.get('campaign')
+    args.hosts = args.hosts or state.get('host_count')
+    args.role = args.role or state.get('role', 'campaign')
+    if state.get('campaign') != args.campaign or state.get('host_count') != args.hosts:
+        raise ValueError('recorded fleet campaign or host count differs from this command')
+    if state.get('role', 'campaign') != args.role:
+        raise ValueError('recorded fleet role differs from this command')
+    if args.source_sha256 is not None and state.get('source_sha256') != args.source_sha256:
+        raise ValueError('recorded fleet source differs from this command')
+    if args.deadline is not None and parse_time(state['deadline']) != parse_time(args.deadline):
+        raise ValueError('recorded fleet deadline differs from this command')
+    Compute(config, state, args.state, gcloud)
+    return state
+
+
+async def create(config, args):
+    """Create the placement policy and every owned host of one reviewed fleet."""
+    if args.state.exists():
+        state = _recorded_fleet(config, args)
+    else:
+        state = new_state(config, campaign=args.campaign, run_id=args.run_id,
+                          deadline=args.deadline, hosts=args.hosts,
+                          source_sha256=args.source_sha256, owner_nonce=uuid.uuid4().hex,
+                          role=args.role)
+        Compute(config, state, args.state, gcloud)
+    image_path = args.image or config.get('image')
+    policy = policy_body(state)
+    if args.dry_run:
+        preview = dict(state, policy={'name': policy['name']})
+        bodies = [launch_spec(config, candidate(config), preview, index, image_path,
+                              STARTUP_SCRIPT, '0' * 32, policy['name'])[1]
+                  for index in range(state['host_count'])]
+        print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
+                          'role': state.get('role', 'campaign'), 'host_count': state['host_count'],
+                          'deadline': state['deadline'], 'policy': policy,
+                          'instances': bodies}, sort_keys=True, indent=2))
+        return 0
+
+    if args.role == 'qualification':
+        image = {'path': image_path, 'id': str(admit_ready_image(config, image_path)['id'])}
+    else:
+        if args.image is not None and args.image != config.get('image'):
+            raise ValueError('--image must equal the admitted config image')
+        image = admit_image(config)
+    compute = Compute(config, state, args.state, gcloud)
+    if not state.get('policy'):
+        save(args.state, state)
+        await compute.create_policy()
+    fleet = []
+    for index in range(state['host_count']):
+        record = next((item for item in state['instances'] if item.get('name') == state['run_id'] + '-' + str(index)), None)
+        if record is not None and record.get('fleet') and not record.get('uncertain'):
+            fleet.append(record['fleet'])
+            continue
+        fleet.append(await compute.create_vm(index, image['path'], state['deadline'], STARTUP_SCRIPT))
+    if await compute.admit_guests() != fleet:
+        raise ComputeError('guest fleet identity changed before admission')
+    print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
+                      'role': state.get('role', 'campaign'), 'image': image, 'policy': policy['name'],
+                      'hosts': fleet}, sort_keys=True, indent=2))
+    return 0
+
+
+async def verify(config, args):
+    """Read back the owned placement policy, hosts and boot disks; change nothing."""
+    state = _recorded_fleet(config, args)
+    compute = Compute(config, state, args.state, gcloud)
+    policy = state.get('policy')
+    if not policy or policy.get('uncertain'):
+        raise ComputeError('no verified placement policy is recorded')
+    actual = await compute._describe('policy', policy['name'])
+    if not compute._policy_owned(actual, policy):
+        raise ComputeError('placement identity changed')
+    hosts = []
+    for record in state['instances']:
+        vm = await compute._describe('instance', record['name'])
+        if not compute._vm_owned(vm, record):
+            raise ComputeError('instance ownership mismatch for ' + record['name'])
+        disk = await compute._boot(dict(record), vm)
+        hosts.append({**compute._fleet(vm, record), 'disk_id': _id(disk['id']),
+                      'disk_size_gb': disk.get('sizeGb'), 'status': vm.get('status')})
+    if len(hosts) != state['host_count']:
+        raise ComputeError('recorded host count differs from the fleet size')
+    print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
+                      'placement': {'name': actual['name'], 'id': _id(actual['id']),
+                                    'collocation': actual['groupPlacementPolicy']['collocation'],
+                                    'max_distance': actual['groupPlacementPolicy']['maxDistance']},
+                      'hosts': hosts}, sort_keys=True, indent=2))
+    return 0
+
+
+async def delete(config, args):
+    """Delete the recorded hosts, their boot disks and the placement policy."""
+    state = _recorded_fleet(config, args)
+    result = await Compute(config, state, args.state, gcloud).cleanup()
+    print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
+                      'cleanup': result, 'hosts': len(state['instances'])},
+                     sort_keys=True, indent=2))
+    return 0
+
+
+def candidate(config):
+    candidates = [item for item in config.get('candidates', []) if item.get('zone') == ZONE]
+    if len(candidates) != 1:
+        raise ValueError('exactly one us-central1-a candidate is required')
+    return candidates[0]
+
+
+def parse(argv=None):
+    parser = argparse.ArgumentParser(description='Owned two- or three-host campaign fleet.')
+    parser.add_argument('action', choices=('create', 'verify', 'delete'))
+    parser.add_argument('--config', type=Path, default=Path(__file__).with_name('config.json'))
+    parser.add_argument('--state', type=Path, required=True)
+    parser.add_argument('--campaign')
+    parser.add_argument('--hosts', type=int, choices=FLEET_HOSTS)
+    parser.add_argument('--hours', type=int)
+    parser.add_argument('--deadline')
+    parser.add_argument('--image')
+    parser.add_argument('--role', choices=FLEET_ROLES)
+    parser.add_argument('--source-sha256')
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args(argv)
+    if args.dry_run and args.action != 'create':
+        parser.error('--dry-run applies to create only')
+    if args.action == 'create':
+        if args.campaign is None:
+            parser.error('create requires --campaign')
+        if args.hosts is None:
+            parser.error('create requires --hosts')
+        if (args.deadline is None) == (args.hours is None):
+            parser.error('create requires exactly one of --hours or --deadline')
+        if not args.state.exists():
+            args.role = args.role or 'campaign'
+            if args.role == 'qualification' and args.hosts != 2:
+                parser.error('a qualification fleet has exactly two hosts')
+            if args.role == 'qualification' and args.image is None:
+                parser.error('a qualification fleet requires --image')
+        args.run_id = fleet_run_id(args.campaign)
+        args.deadline = args.deadline or fleet_deadline(args.hours)
+        if parse_time(args.deadline) <= dt.datetime.now(dt.timezone.utc):
+            parser.error('the fleet deadline must be in the future')
+        if args.source_sha256 is None and not args.state.exists():
+            parser.error('create requires --source-sha256')
+    return args
+
+
+def main(argv=None):
+    args = parse(argv)
+    config = json.loads(args.config.read_text())
+    action = {'create': create, 'verify': verify, 'delete': delete}[args.action]
+    try:
+        return asyncio.run(action(config, args))
+    except (ComputeError, ValueError, TimeoutError, OSError) as exc:
+        print('error: ' + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+

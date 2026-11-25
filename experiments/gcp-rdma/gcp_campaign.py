@@ -344,7 +344,40 @@ def preflight(api, config, receipt, spec):
     next(iter(api.objects(config['bucket']).list('runs/__preflight__/')), None)
 
 
-def instance_body(config, c, state, i, startup, disk_token):
+CAMPAIGN_LABEL = 'campaign'
+CAMPAIGN_METADATA = 'tidehunter-campaign'
+
+
+def campaign_identity(value):
+    """Return one reviewed campaign label value, or None when the run has none."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,62}', value):
+        raise ValueError('campaign id must be a lowercase label value of at most 63 characters')
+    return value
+
+
+def campaign_mark(state):
+    """Return the campaign label and metadata additions for one owned resource."""
+    campaign = campaign_identity(state.get('campaign'))
+    if campaign is None:
+        return {}, {}
+    return {CAMPAIGN_LABEL: campaign}, {CAMPAIGN_METADATA: campaign}
+
+
+def _reviewed_extra(values, reserved, kind):
+    if values is None:
+        return {}
+    if not isinstance(values, dict) or any(not isinstance(key, str) or not key
+                                          or not isinstance(value, str) or not value
+                                          for key, value in values.items()):
+        raise ValueError(kind + ' additions must be nonempty name and value strings')
+    if set(values) & reserved:
+        raise ValueError(kind + ' additions must not replace reviewed keys')
+    return dict(values)
+
+
+def instance_body(config, c, state, i, startup, disk_token, *, extra_labels=None, extra_metadata=None):
     if not isinstance(config.get('machine_type'), str) or config['machine_type'] not in LOCAL_SSD_COUNTS:
         raise ValueError('machine type must have an admitted local SSD layout')
     if config.get('service_account') != GUEST_SERVICE_ACCOUNT:
@@ -355,6 +388,10 @@ def instance_body(config, c, state, i, startup, disk_token):
     name = f'{run_id}-{i}'
     if not re.fullmatch(r'[0-9a-f]{32}', disk_token):
         raise ValueError('invalid boot disk creation token')
+    extra_labels = _reviewed_extra(extra_labels, {'bench-run', 'bench-source'}, 'label')
+    extra_metadata = _reviewed_extra(extra_metadata, {
+        'startup-script', 'bench-run', 'bench-source', 'bench-expiry',
+        'tidehunter-run-id', 'tidehunter-source-sha256', 'tidehunter-deadline-utc'}, 'metadata')
     disk_description = json.dumps({'run': run_id, 'source': source, 'expiry': deadline, 'token': disk_token}, sort_keys=True)
     return {'name': name, 'machineType': f'zones/{zone}/machineTypes/{config["machine_type"]}',
             'networkInterfaces': [{'subnetwork': c['ordinary_subnet'], 'nicType': 'GVNIC'}, {'subnetwork': c['rdma_subnet'], 'nicType': 'IRDMA'}],
@@ -363,8 +400,12 @@ def instance_body(config, c, state, i, startup, disk_token):
             'disks': [{'boot': True, 'autoDelete': True, 'interface': 'NVME', 'initializeParams': {'diskName': name, 'sourceImage': config['image'], 'diskType': f'zones/{zone}/diskTypes/hyperdisk-balanced', 'diskSizeGb': str(BOOT_DISK_GIB), 'description': disk_description}}],
             'serviceAccounts': [{'email': config['service_account'], 'scopes': ['https://www.googleapis.com/auth/cloud-platform']}],
             'resourcePolicies': [f'regions/{zone.rsplit("-", 1)[0]}/resourcePolicies/{state["policy"]["name"]}'],
-            'labels': {'bench-run': run_id, 'bench-source': source[:63]},
-            'metadata': {'items': [{'key': 'startup-script', 'value': startup}, {'key': 'bench-run', 'value': run_id}, {'key': 'bench-source', 'value': source}, {'key': 'bench-expiry', 'value': deadline}, {'key': 'tidehunter-run-id', 'value': run_id}, {'key': 'tidehunter-source-sha256', 'value': source}, {'key': 'tidehunter-deadline-utc', 'value': deadline}]},
+            'labels': {'bench-run': run_id, 'bench-source': source[:63], **extra_labels},
+            'metadata': {'items': [{'key': key, 'value': value} for key, value in {
+                'startup-script': startup, 'bench-run': run_id, 'bench-source': source,
+                'bench-expiry': deadline, 'tidehunter-run-id': run_id,
+                'tidehunter-source-sha256': source, 'tidehunter-deadline-utc': deadline,
+                **extra_metadata}.items()]},
             'scheduling': {'onHostMaintenance': 'TERMINATE', 'automaticRestart': False, 'terminationTime': deadline, 'instanceTerminationAction': 'DELETE'}}
 
 

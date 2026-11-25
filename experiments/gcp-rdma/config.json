@@ -7,6 +7,7 @@
   "machine_type": "z4m-highmem-16",
   "image": "",
   "image_qualification": null,
+  "qualification_profile": "focused",
   "max_distance": 3,
   "candidates": [
     {
