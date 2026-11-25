@@ -209,17 +209,37 @@ fn data_break_rewrites_only_the_unadopted_suffix() {
         "the two unadopted frames are retained"
     );
     let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let extent = current_snapshot(&client);
+    // Only the frames above the owner's frontier are owed a resend, so the tear
+    // and the expected counts follow that frontier instead of a fixed layout.
+    let frontier = owner_frontier(&mut client, &extent);
+    let owed_bytes = usize::try_from(cursor - frontier).expect("bounded extent");
+    assert!(
+        owed_bytes.is_multiple_of(4096),
+        "a resend tail is whole aligned frames"
+    );
+    let owed = owed_bytes / 4096;
+    assert!(
+        owed >= 1,
+        "the tear needs a frame above the owner's frontier, saw {frontier}..{cursor}"
+    );
     let clean = owned_bytes(&client, start, cursor);
     let retained_layout: Vec<(u64, usize)> = client
         .live_leased
         .retained
         .iter()
+        .filter(|frame| frame.start >= frontier)
         .map(|frame| (frame.start, frame.frame.len()))
         .collect();
-    // Tear the first unadopted frame: the owner can prove only the prefix below
-    // it, so the resume has to rewrite both unadopted frames.
-    let torn = owned_bytes(&client, adopted_end, cursor);
-    write_bytes(&client, adopted_end, &vec![0u8; torn.len()]);
+    assert_eq!(
+        retained_layout.len(),
+        owed,
+        "the retained frames above the frontier are exactly the owed ones"
+    );
+    // Tear the first owed frame: the owner can prove only the prefix below it,
+    // so the resume has to rewrite every owed frame.
+    let torn = owned_bytes(&client, frontier, cursor);
+    write_bytes(&client, frontier, &vec![0u8; torn.len()]);
     // The next submission loses its queue before any SQE.
     client.leased_test_fail_submit(libc::ENODEV);
     submit(&mut client, &fixture, 6);
@@ -230,7 +250,7 @@ fn data_break_rewrites_only_the_unadopted_suffix() {
     assert_eq!(counts.resume_attempts, 1, "one resume attempt");
     assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
     assert_eq!(
-        counts.resume_frames, 2,
+        counts.resume_frames, owed as u64,
         "only the frames below the owner's frontier are rewritten"
     );
     assert_eq!(
@@ -252,8 +272,8 @@ fn data_break_rewrites_only_the_unadopted_suffix() {
     let submissions = client.leased_test_write_submissions();
     assert_eq!(
         submissions.len(),
-        3,
-        "the new queue saw two rewrites and the retried frame"
+        owed + 1,
+        "the new queue saw the rewrites and the retried frame"
     );
     let segment = client
         .live_leased
@@ -269,12 +289,12 @@ fn data_break_rewrites_only_the_unadopted_suffix() {
         .map(|(frame_start, len)| (frame_start % segment, *len))
         .collect();
     assert_eq!(
-        submissions[..2],
+        submissions[..owed],
         expected[..],
         "the rewrite reuses the recorded offsets in ascending order"
     );
     assert_eq!(
-        submissions[2].0,
+        submissions[owed].0,
         cursor % segment,
         "the retried frame follows the rewrite"
     );
@@ -881,10 +901,24 @@ fn fua_frame_stays_fua_on_resend() {
         "the two unadopted frames are retained for a resend"
     );
     let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
-    // Tearing the first unadopted frame keeps the owner's frontier below it, so
-    // the resume must resend both frames instead of declaring them adopted.
-    let torn = owned_bytes(&client, adopted_end, cursor);
-    write_bytes(&client, adopted_end, &vec![0u8; torn.len()]);
+    let extent = current_snapshot(&client);
+    // Only what sits above the owner's frontier is owed a resend, so the tear
+    // and the expected counts follow that frontier.
+    let frontier = owner_frontier(&mut client, &extent);
+    let owed_bytes = usize::try_from(cursor - frontier).expect("bounded extent");
+    assert!(
+        owed_bytes.is_multiple_of(4096),
+        "a resend tail is whole aligned frames"
+    );
+    let owed = owed_bytes / 4096;
+    assert!(
+        owed >= 1,
+        "the tear needs a frame above the owner's frontier, saw {frontier}..{cursor}"
+    );
+    // Tearing the first owed frame keeps the owner's frontier below it, so the
+    // resume must resend every owed frame instead of declaring them adopted.
+    let torn = owned_bytes(&client, frontier, cursor);
+    write_bytes(&client, frontier, &vec![0u8; torn.len()]);
     client.leased_test_fail_submit(libc::ENODEV);
     submit(&mut client, &fixture, 4);
     client
@@ -892,12 +926,15 @@ fn fua_frame_stays_fua_on_resend() {
         .expect("the resumed submission completes");
     assert_eq!(
         client.leased_test_write_syncs(),
-        vec![true, true, true],
-        "the two resends and the retried frame all carry FUA"
+        vec![true; owed + 1],
+        "the resends and the retried frame all carry FUA"
     );
     let counts = counters(&fixture);
     assert_eq!(counts.resume_rewrites, 1, "one rewrite episode");
-    assert_eq!(counts.resume_frames, 2, "both unadopted frames were resent");
+    assert_eq!(
+        counts.resume_frames, owed as u64,
+        "every owed frame was resent"
+    );
     assert_eq!(released.len(), 5, "every frame was released once");
     for (sequence, (_, receipts)) in released.iter().enumerate() {
         assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
@@ -1357,23 +1394,9 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         closing.cursor,
         closing.segment_bytes,
     );
-    // The owner applies the close of the closing extent; the reply is received
-    // here and dropped, as a session break drops the answer it produced.
-    let lost = client
-        .adopt_live_extent(1, closing.token, closing.cursor, true, false)
-        .expect("the owner adopts and closes the closing extent");
-    assert_eq!(
-        lost.adoption.adopted_end, closing.cursor,
-        "the owner closed the whole written prefix"
-    );
-    assert!(lost.adoption.closed, "the owner reports the extent closed");
-    assert_eq!(
-        client.leased_test_retained().0,
-        7,
-        "the coordinator still holds every frame of both extents"
-    );
-    // The close made the current extent the owner's open one, so only what sits
-    // above its frontier is owed a resend; the frontier decides the count.
+    // The current extent is still preleased, so the owner cannot adopt it and its
+    // frontier is its start. Tear the owed suffix now, before the close below
+    // makes the extent open: the torn first frame then pins the frontier there.
     let current_frontier = owner_frontier(&mut client, &current);
     let owed_bytes = usize::try_from(current.cursor - current_frontier).expect("bounded extent");
     assert!(
@@ -1392,13 +1415,31 @@ fn closing_extent_with_a_lost_close_reply_is_resumed_then_current() {
         current.cursor,
         current.segment_bytes,
     );
-    // Tear only the current extent's unadopted suffix: its frames are the ones
-    // that must be rewritten. The closed extent's bytes are not needed again.
     write_extent_bytes(
         &current.path,
         current_frontier,
         current.segment_bytes,
         &vec![0u8; owed_bytes],
+    );
+    // The owner applies the close of the closing extent; the reply is received
+    // here and dropped, as a session break drops the answer it produced.
+    let lost = client
+        .adopt_live_extent(1, closing.token, closing.cursor, true, false)
+        .expect("the owner adopts and closes the closing extent");
+    assert_eq!(
+        lost.adoption.adopted_end, closing.cursor,
+        "the owner closed the whole written prefix"
+    );
+    assert!(lost.adoption.closed, "the owner reports the extent closed");
+    assert_eq!(
+        client.leased_test_retained().0,
+        7,
+        "the coordinator still holds every frame of both extents"
+    );
+    assert_eq!(
+        owner_frontier(&mut client, &current),
+        current_frontier,
+        "the torn first frame pins the current extent's frontier"
     );
     client.leased_test_fail_submit(libc::ENODEV);
     submit(&mut client, &fixture, 11);
