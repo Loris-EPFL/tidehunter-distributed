@@ -21,6 +21,14 @@ def main():
     parser.add_argument('--owners',type=int,help='expected owner count; defaults to the number of --hosts')
     parser.add_argument('--port',type=int,default=24000)
     parser.add_argument('--transport',choices=('tcp', *deployment.HARDWARE_TRANSPORTS),default='tcp')
+    parser.add_argument('--durability-tier',choices=('native','synchronous'),default='synchronous',
+                        help='acknowledgement tier every provisioned database must match')
+    parser.add_argument('--live-transport',choices=deployment.LIVE_TRANSPORTS,
+                        help='NVMe-oF transport of the owner targets; EFA defaults to rdma, TCP to tcp')
+    parser.add_argument('--live-io-queues',type=int,default=deployment.DEFAULT_QUEUE_GEOMETRY['io_queues'])
+    parser.add_argument('--live-queue-size',type=int,default=deployment.DEFAULT_QUEUE_GEOMETRY['queue_size'])
+    parser.add_argument('--live-poll-queues',type=int,default=deployment.DEFAULT_QUEUE_GEOMETRY['poll_queues'])
+    parser.add_argument('--owner-wal',choices=('harness','engine_default'),default='harness')
     parser.add_argument('--coordinator-cache-mib',type=int,default=8)
     parser.add_argument('--shard-cache-mib',type=int,default=0)
     parser.add_argument('--resident-reads',type=Path,
@@ -45,20 +53,26 @@ def main():
         raise ValueError('storage binary/source binding differs')
     if args.transport!='tcp' and not manifest['fabric']:
         raise ValueError('hardware/fabric transport requires a fabric-enabled frozen build')
+    transport = deployment.canonical_transport(args.transport)
+    trusted = deployment.is_trusted(transport)
+    geometry = dict(io_queues=args.live_io_queues, queue_size=args.live_queue_size,
+                    poll_queues=args.live_poll_queues)
     output=args.output.resolve()
     schema=deployment.schemas(args.schema, 'native')
     config,nodes=deployment.prepare(output,schema,args.db_root,
         shape_yamls={name:(args.schema/name/'shape.yaml').read_text() for name in schema},hosts=hosts,port=args.port,
-        transport=args.transport,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
+        transport=transport,coordinator_cache=args.coordinator_cache_mib*deployment.MIB,
         shard_cache=args.shard_cache_mib*deployment.MIB,guest_root=args.guest_root,
-        write_profile_limit=args.write_profile_limit,resident_reads=resident,owners=owners)
+        write_profile_limit=args.write_profile_limit,resident_reads=resident,owners=owners,
+        owner_tier=args.durability_tier, live_transport=args.live_transport,
+        live_geometry=geometry, owner_wal=args.owner_wal)
     host_records=[]
     for partition,host in enumerate(hosts):
         selected=[node for node in nodes if node['partition']==partition]
         archive_path=output/f'host-{partition}.tar.gz'
         with tarfile.open(archive_path,'w:gz') as archive:
             archive.add(binary,arcname='storage-node')
-            if args.transport not in deployment.TRUSTED_TRANSPORTS:
+            if not trusted:
                 for name in ('ca.der',f'node-{partition}.der',f'node-{partition}.pk8'):
                     archive.add(output/'tls'/name,arcname='tls/'+name)
             for node in selected:
@@ -69,14 +83,16 @@ def main():
             commands=[[str(args.guest_root/'storage-node'),'--experimental-storage-node',
                        str(args.guest_root/Path(n['launch']).relative_to(output))] for n in selected],
             ready_files=[n['ready'] for n in selected],stop_files=[n['stop'] for n in selected]))
-    build.save(output/'external-manifest.json',dict(schema=1,protocol=9,transport=args.transport,owners=owners,
+    build.save(output/'external-manifest.json',dict(schema=1,protocol=9,transport=transport,owners=owners,
+        durability_tier=args.durability_tier,live_transport=args.live_transport or
+            deployment.live_transport_for(transport, None),owner_wal=args.owner_wal,
         config_sha256=build.digest(output/'config.json'),build_manifest_sha256=build.digest(args.build/'build-manifest.json'),
         source_archive_sha256=manifest['source_archive_sha256'],storage_binary_sha256=manifest['binaries']['storage-node'],
         shard_cache_bytes=args.shard_cache_mib*deployment.MIB,write_profile_limit=args.write_profile_limit,hosts=host_records,
         resident_reads=deployment.resident_read_config(resident),
         ownership='controller creates each fresh guest root, starts only listed process groups, bounds deadlines, collects /proc IO/RSS/swap and stops only owned groups',
         security=('trusted isolated cluster; no application TLS or certificate files'
-                  if args.transport in deployment.TRUSTED_TRANSPORTS else
+                  if trusted else
                   'each host receives its own leaf key plus public CA; no coordinator key or CA signing key')))
     print(output/'external-manifest.json')
 
