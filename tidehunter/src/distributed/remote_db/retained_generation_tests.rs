@@ -64,9 +64,10 @@ pub(super) const WAIT: Duration = Duration::from_secs(120);
 pub(super) fn shape() -> KeyShape {
     let mut builder = KeyShapeBuilder::new();
     builder.add_key_space_config("a", 8, 1, KeyType::uniform(1), KeySpaceConfig::new());
-    // The pass stops at the first record of this filtered keyspace, so the
-    // unfiltered data set gets a whole-file target: a pass with no Stop and no
-    // record at or above its scan cut does nothing, as native does.
+    // The pass stops at the first record of this filtered keyspace. The extras
+    // branch also relocates to the clean tail without a Stop (D27); these
+    // fixtures write the Stop in the serving generation so a pass still
+    // exercises a record terminal as well.
     builder.add_key_space_config(
         "s",
         8,

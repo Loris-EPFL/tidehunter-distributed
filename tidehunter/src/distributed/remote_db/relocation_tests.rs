@@ -786,6 +786,13 @@ fn readable(db: &Db, keyspace: KeySpace, writes: u64) -> Vec<(u64, u8)> {
         .collect()
 }
 
+/// Both visibility views (`exists` and value reads) of one arm equal the
+/// expected surviving rows.
+fn assert_arm_state(case: &str, db: &Db, keyspace: KeySpace, writes: u64, expected: &[(u64, u8)]) {
+    assert_eq!(visible(db, keyspace, writes), expected, "{case}: exists");
+    assert_eq!(readable(db, keyspace, writes), expected, "{case}: get");
+}
+
 /// Both visibility views (`exists` and value reads) on both arms equal the
 /// expected surviving rows.
 fn assert_state(
@@ -976,15 +983,18 @@ fn one_owner_matches_native_gate_callbacks_frontiers_and_state() {
     }
 }
 
-/// No `StopRelocation` in the window: native's scan reaches `EndOfWal` and
-/// leaves its terminal at 0, so the pass performs no stripe (no copy, no
-/// cutoff, no retirement, no callback past the scan). The hybrid must do the
-/// same; the clean tail at the durable end is the fork's D27 rule, extras-only.
+/// No `StopRelocation` in the window: both arms fall back to the processed
+/// frontier, so both passes have a whole-file target and drop every key.
+/// Native reaches `EndOfWal` exactly at its upper limit and takes it as its
+/// terminal (the extras D27 fallback). The fork's D27 rule gives the hybrid
+/// its clean tail (the durable end), rounded down to a whole file.
 ///
-/// Both arms call the same filters, copy nothing, drop nothing and keep every
-/// key after the pass and after a reopen.
+/// Both arms call the same filters and copy nothing. The cutoff at the
+/// terminal applies on a filtered keyspace, so each arm drops every entry
+/// below its terminal. Every written entry lies below the durable end, so no
+/// key survives the pass or the reopen in either arm.
 #[test]
-fn no_stop_matches_native_and_leaves_every_key() {
+fn no_stop_relocates_up_to_the_durable_end_on_both_arms() {
     const WRITES: u64 = 130;
     let leased_policy = Policy::new();
     let fixture = Fixture::new(1, shape(&leased_policy, &["a"]));
@@ -1030,12 +1040,18 @@ fn no_stop_matches_native_and_leaves_every_key() {
     }
     let leased_pass = observe(&leased);
     let native_pass = observe(&native);
+    // Both arms keep a target with no Stop: the hybrid's clean tail and
+    // native's processed-frontier fallback.
     assert_eq!(
         leased_pass.gate,
-        crate::RelocationGate::NoWork,
-        "no Stop leaves the hybrid pass with nothing to do: {leased_pass:?}"
+        crate::RelocationGate::DidWork,
+        "the clean tail gives the hybrid a target: {leased_pass:?}"
     );
-    assert_eq!(native_pass.gate, leased_pass.gate);
+    assert_eq!(
+        native_pass.gate,
+        crate::RelocationGate::DidWork,
+        "the processed-frontier fallback gives native a target: {native_pass:?}"
+    );
     let rows = |observation: &RelocationObservation| -> Vec<_> {
         observation
             .callbacks
@@ -1059,26 +1075,65 @@ fn no_stop_matches_native_and_leaves_every_key() {
     assert_eq!(native_pass.copied_survivors, 0);
     for (arm, pass) in [("leased", &leased_pass), ("native", &native_pass)] {
         assert_eq!(pass.streams.len(), 1, "{arm}");
-        assert_eq!(pass.streams[0].terminal_position, 0, "{arm}");
-        assert_eq!(pass.streams[0].rounded_target, 0, "{arm}");
     }
-    // The hybrid reached the durable end (a clean tail past one file), so the
-    // fork's clean-tail rule would have relocated here.
+    // Both terminals are their processed frontier, rounded down to a whole
+    // file: the hybrid's clean tail and native's upper-limit fallback.
+    assert_eq!(
+        leased_pass.streams[0].terminal_position,
+        leased_pass.streams[0].processed_upper
+    );
     assert!(
         leased_pass.streams[0].processed_upper > FILE,
         "premise: the hybrid's clean tail lies past one whole file: {leased_pass:?}"
     );
-    let all: Vec<(u64, u8)> = (0..WRITES)
-        .flat_map(|sequence| (0..2).map(move |member| (sequence, member)))
-        .collect();
-    let arms = (leased.as_ref(), native.as_ref());
-    assert_state("no Stop, after the pass", arms, a, WRITES, &all);
+    assert_eq!(
+        leased_pass.streams[0].rounded_target,
+        leased_pass.streams[0].processed_upper - leased_pass.streams[0].processed_upper % FILE
+    );
+    assert_eq!(
+        native_pass.streams[0].terminal_position, native_pass.streams[0].processed_upper,
+        "native takes its processed frontier as the terminal: {native_pass:?}"
+    );
+    assert_eq!(
+        native_pass.streams[0].rounded_target,
+        native_pass.streams[0].processed_upper - native_pass.streams[0].processed_upper % FILE
+    );
+    // Both terminals are their durable end: every written entry lies below it,
+    // so each arm's cutoff drops every key of the filtered keyspace.
+    let dropped: Vec<(u64, u8)> = Vec::new();
+    assert_arm_state(
+        "no Stop, after the pass, leased",
+        &leased,
+        a,
+        WRITES,
+        &dropped,
+    );
+    assert_arm_state(
+        "no Stop, after the pass, native",
+        &native,
+        a,
+        WRITES,
+        &dropped,
+    );
     leased.wait_for_background_threads_to_finish().unwrap();
     native.wait_for_background_threads_to_finish().unwrap();
     let leased = fixture.open();
     let native = open_native(native_root.path(), &native_policy, &config);
-    let arms = (leased.as_ref(), native.as_ref());
-    assert_state("no Stop, after reopen", arms, a, WRITES, &all);
+    // The pass stored the drop, so both reopened arms keep the same state.
+    assert_arm_state(
+        "no Stop, after reopen, leased",
+        &leased,
+        a,
+        WRITES,
+        &dropped,
+    );
+    assert_arm_state(
+        "no Stop, after reopen, native",
+        &native,
+        a,
+        WRITES,
+        &dropped,
+    );
     leased.wait_for_background_threads_to_finish().unwrap();
     native.wait_for_background_threads_to_finish().unwrap();
 }

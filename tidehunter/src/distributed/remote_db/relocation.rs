@@ -21,10 +21,13 @@
 //! 3. Per stream: the scan stops at the first batch at or above `Q` (cuts are
 //!    exclusive, so that batch is not read) and otherwise at the durable end.
 //!    Terminal = the `Stop` batch, the first batch after `Stop` (other
-//!    streams) or the clean tail at the durable end; the clean tail is a
-//!    terminal only when the pass saw a `Stop` or a record at or above `Q`,
-//!    and without either the pass reports `NoWork`. The target is the native
-//!    rule `round_down_to_file(min(terminal, lo + budget))` with the per-owner
+//!    streams) or the durable end. This fork's D27 rule gives the hybrid that
+//!    end even without a `Stop`: its leased scan completes only adopted
+//!    groups, so no torn frame lies below the end it reports. Native falls
+//!    back to its upper limit only when the scan ends exactly there on
+//!    `EndOfWal` or a zeroed header; an end below that limit, or a torn frame
+//!    at it, leaves native's terminal at 0. The target is the native rule
+//!    `round_down_to_file(min(terminal, lo + budget))` with the per-owner
 //!    `relocation_max_reclaim_pct` budget. Without one complete file before a
 //!    target the pass is `NoWork`: no copy, no start, no snapshot. It still
 //!    runs retirement when a stream has a non-zero whole-file target, as
@@ -200,11 +203,6 @@ struct Cursor {
     start: Option<u64>,
     /// Set once nothing more will be fetched.
     upper: Option<u64>,
-    /// True when a scanned batch's version is at or above the scan cut `Q`:
-    /// native's scan stops at its first record at or above its upper limit.
-    /// A stream that ends without one ended at its durable end, where native
-    /// reaches `EndOfWal` and stops with terminal 0.
-    above_cut: bool,
 }
 
 /// Whether `version` is at or above the scan cut `q`. Cuts are exclusive, so
@@ -368,7 +366,6 @@ impl ConcurrentRemoteDatabase {
                 buffer: VecDeque::new(),
                 start: None,
                 upper: None,
-                above_cut: false,
             })
             .collect();
         let mut clients = self.relocation_clients()?;
@@ -1033,7 +1030,6 @@ impl ConcurrentRemoteDatabase {
             for batch in page.batches {
                 if at_or_above_cut(batch.version, q) {
                     cursor.upper = Some(batch.address.offset);
-                    cursor.above_cut = true;
                     break;
                 }
                 cursor.buffer.push_back(batch);
@@ -1082,15 +1078,12 @@ fn stream_reports(
             // there, as the native clean tail does: the leased scan only
             // completes adopted groups, so no torn frame lies below.
             let ended = || processed_upper;
-            // No `Stop` and no record at or above `Q` anywhere in the scan:
-            // native's scan reaches `EndOfWal` and leaves the terminal at 0, so
-            // the pass performs no stripe (no copy, no cutoff, no retirement).
-            // The clean tail only becomes a terminal once some stream stopped
-            // at a record at or above `Q`, which is the position native stops
-            // at when its frontier lags the written data.
-            let no_stop = stop.is_none() && !cursors.iter().any(|cursor| cursor.above_cut);
+            // A stream that reached its durable end without a Stop ends there:
+            // the leased scan only completes adopted groups, so no torn frame
+            // lies below. This is the fork's D27 rule: the hybrid reclaims up
+            // to the durable end, where native takes its frontier only when
+            // the scan ends exactly there.
             let terminal_position = match stop {
-                _ if no_stop => 0,
                 Some((stream, _, offset)) if stream == index => offset,
                 // Every unconsumed head is after the Stop in logical order, so
                 // this stream stops at its first record, the position native's
