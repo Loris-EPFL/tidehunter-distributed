@@ -109,6 +109,17 @@ class CheckpointDiagnosticContract(unittest.TestCase):
             self.assertIsNone(stats['write_checkpoint_diagnostic_' + counter])
 
 
+class DurabilityTierContract(unittest.TestCase):
+    def test_external_config_must_state_the_selected_tier(self):
+        config = {'databases': {'db': {'live_nvme': {'leased_durability': 'native'}}}}
+        self.assertIsNone(run.external_durability_error(config, 'native'))
+        self.assertIn("states 'native'", run.external_durability_error(config, 'synchronous'))
+        config['databases']['db']['live_nvme'] = {}
+        self.assertIsNone(run.external_durability_error(config, 'synchronous'))
+        with self.assertRaises(ValueError):
+            run.external_durability_error(config, 'eventual')
+
+
 class DeploymentContract(unittest.TestCase):
     def test_each_namespace_gets_the_requested_physical_nodes(self):
         for owners in (2, 5):

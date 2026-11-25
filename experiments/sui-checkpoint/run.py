@@ -490,6 +490,18 @@ def validate_checkpoint_diagnostics(counters, write_limit):
                 raise ValueError('checkpoint history IO counter unavailable or malformed: ' + counter)
 
 
+def external_durability_error(config, tier):
+    """Return why an external deployment does not state `tier`, or None."""
+    if tier not in ('native', 'synchronous'):
+        raise ValueError('durability tier must be native or synchronous')
+    for name, database in config['databases'].items():
+        stated = (database.get('live_nvme') or {}).get('leased_durability')
+        if stated is not None and stated != tier:
+            return (f'TH_SYNC_WRITES={tier} requires live_nvme.leased_durability '
+                    f'{tier!r}, but the external config states {stated!r} for {name}')
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -505,6 +517,8 @@ def main():
                         help='bounded per-database registered-read JSON policy; requires trusted-native fabric')
     parser.add_argument('--owners', type=int, default=2,
                         help='distinct RF1 owner processes/hosts per database (default 2; no five-owner assumption)')
+    parser.add_argument('--durability-tier', choices=('native', 'synchronous'), default='synchronous',
+                        help='store acknowledgement tier; native is the Sui production default (db sync disabled)')
     parser.add_argument('--fragment-mib', type=int, default=8,
                         help='engine fragment size in MiB; the production campaign geometry is 1024')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
@@ -601,14 +615,18 @@ def main():
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
     env={k:v for k,v in os.environ.items() if not k.startswith(('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_', 'DISTRIBUTED_TIDEHUNTER_', 'TIDEHUNTER_'))}
     env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
-               TH_SYNC_WRITES='true', TH_FRAG_SIZE=str(args.fragment_mib*deployment.MIB), TH_MAX_MAPS='3', TH_MAX_INDEX_MAPS='3',
+               TH_SYNC_WRITES='true' if args.durability_tier == 'synchronous' else 'false',
+               TH_FRAG_SIZE=str(args.fragment_mib*deployment.MIB), TH_MAX_MAPS='3', TH_MAX_INDEX_MAPS='3',
                TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128', TH_DEFAULT_VALUE_CACHE_SIZE='1000',
                SUI_TH_READ_PROFILE_LIMIT=str(args.read_profile_limit),
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
-    result=dict(schema=1,metrics_schema=3,protocol=9,backend='tidehunter-sharded-wal',durability='synchronous durable whole-batch publication',
+    result=dict(schema=1,metrics_schema=3,protocol=9,backend='tidehunter-sharded-wal',
+        durability=('synchronous durable whole-batch publication' if args.durability_tier == 'synchronous'
+                    else 'native appended-frontier acknowledgement (RAM ack, Sui production tier)'),
+        durability_tier=args.durability_tier,
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
@@ -642,7 +660,10 @@ def main():
             config=read_json(config_path)
             if Path(config['root']) != remote_root or set(config['databases']) != set(schema):
                 raise ValueError('external namespace/root coverage differs')
-            for database in config['databases'].values():
+            mismatch = external_durability_error(config, args.durability_tier)
+            if mismatch is not None:
+                raise ValueError(mismatch)
+            for name, database in config['databases'].items():
                 if database['tls']['transport'] in deployment.SOFTWARE_TRANSPORTS:
                     raise ValueError('external software fabric is loopback-only in the native engine')
                 if (len(database['endpoints']) != args.owners

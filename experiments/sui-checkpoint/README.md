@@ -456,7 +456,12 @@ they validate correctness, not EFA hardware or RDMA speed.
 The runtime must find the same libfabric ABI used for the build.
 
 `TH_SYNC_WRITES=true` requests a real durable barrier for each native write/batch;
-remote whole-batch publication follows durable shard acknowledgments. Native
+remote whole-batch publication follows durable shard acknowledgments.
+`run.py --durability-tier native|synchronous` (default `synchronous`) selects it:
+`native` writes `TH_SYNC_WRITES=false` and is Sui's production tier, because Sui
+runs with db sync disabled; in external mode a stated
+`live_nvme.leased_durability` must name the same tier or the run is refused
+before replay. Native
 fragment size is 8 MiB, mapped windows three (perpetual multiplies that in Sui),
 index maps three. Shard fragments are 16 MiB to contain the bounded 12 MiB group
 and framing; maximum encoded batch is 8 MiB. Remote pending memory is 128 MiB,
