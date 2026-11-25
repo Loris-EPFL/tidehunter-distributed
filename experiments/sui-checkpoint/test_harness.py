@@ -133,12 +133,19 @@ class DeploymentContract(unittest.TestCase):
                     coordinator_cache=0,shard_cache=0)
                 self.assertEqual(len(nodes),owners*len(schema))
                 self.assertEqual(len(set(node['launch'] for node in nodes)),owners*len(schema))
-                identities=[db['storage']['database'] for db in config['databases'].values()]
+                identities=[json.dumps(db['live_nvme']['owner_identities'],sort_keys=True)
+                            for db in config['databases'].values()]
                 self.assertNotEqual(*identities)
                 for db in config['databases'].values():
                     self.assertEqual(db['storage']['partitions'],list(range(owners)))
+                    self.assertNotIn('database',db['storage'])
                     self.assertEqual(len(db['endpoints']),owners)
                     self.assertEqual([row['partition'] for row in db['endpoints']],list(range(owners)))
+                    for node in (row for row in nodes if row['namespace']
+                                 in config['databases']):
+                        pool=node['live_target_pool']
+                        self.assertEqual(pool['public_service_base'],
+                                         4420+64*node['partition'])
 
     def test_two_owner_host_inventory_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,6 +342,8 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                     shutil.copy2(path, scripts / path.name)
                 shutil.copy2(Path(deployment.__file__).resolve().parent.parent / 'resident_config.py',
                              base / 'experiments/resident_config.py')
+                shutil.copy2(Path(deployment.__file__).resolve().parent.parent / 'portable_transport.py',
+                             base / 'experiments/portable_transport.py')
             else:
                 (base / 'Cargo.toml').write_text('[workspace]\n')
             identities[owner] = dict(revision='frozen', files={
@@ -600,6 +609,64 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                     build.build(SimpleNamespace(output=root, target=root / 'target', deadline=60))
                 cargo.assert_not_called()
             self.assertFalse((root / 'binaries').exists())
+
+
+class RunnerKnobs(unittest.TestCase):
+    def environment(self, **changes):
+        values = dict(tier='native', fragment_mib=8, driver_concurrency=4, pacing_ms=0,
+                      value_cache_size=None, default_value_cache_size=1000,
+                      max_dirty_keys=1024, snapshot_written_bytes=8 << 30, max_maps=3,
+                      index_blob_cache_min_bytes=0, read_profile_limit=0,
+                      native_write_profile_limit=0)
+        values.update(changes)
+        return run.runtime_environment(
+            {'PATH': '/bin', 'TH_MAX_MAPS': '99',
+             'SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY': '16'}, **values)
+
+    def test_explicit_values_override_inherited_engine_knobs(self):
+        env = self.environment()
+        self.assertEqual(env['TH_MAX_MAPS'], '3')
+        self.assertEqual(env['TH_MAX_INDEX_MAPS'], '3')
+        self.assertEqual(env['TH_DEFAULT_MAX_DIRTY_KEYS'], '1024')
+        self.assertEqual(env['TH_DEFAULT_VALUE_CACHE_SIZE'], '1000')
+        self.assertEqual(env['SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY'], '4')
+        self.assertNotIn('TH_VALUE_CACHE_SIZE', env)
+        self.assertNotIn('SUI_CHECKPOINT_EXECUTION_PACING_MS', env)
+        self.assertEqual(env['TH_SYNC_WRITES'], 'false')
+        self.assertEqual(self.environment(tier='synchronous')['TH_SYNC_WRITES'], 'true')
+        self.assertEqual(env['TH_SNAPSHOT_WRITTEN_BYTES'], str(8 << 30))
+        self.assertEqual(env['TH_INDEX_BLOB_CACHE_MIN_BYTES'], '0')
+
+    def test_flattened_cache_and_pacing_are_opt_in(self):
+        env = self.environment(value_cache_size=0, pacing_ms=245)
+        self.assertEqual(env['TH_VALUE_CACHE_SIZE'], '0')
+        self.assertEqual(env['SUI_CHECKPOINT_EXECUTION_PACING_MS'], '245')
+
+    def test_unknown_inherited_th_knob_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'TH_UNDOCUMENTED'):
+            run.runtime_environment({'TH_UNDOCUMENTED': '1'}, tier='native',
+                fragment_mib=8, driver_concurrency=4, pacing_ms=0, value_cache_size=None,
+                default_value_cache_size=1000, max_dirty_keys=1024,
+                snapshot_written_bytes=8 << 30, max_maps=3,
+                index_blob_cache_min_bytes=0, read_profile_limit=0,
+                native_write_profile_limit=0)
+
+    def test_checkpoint_limit_is_first_n_and_bounded(self):
+        for requested, expected in ((None, 1775), (1, 1), (100, 100), (1775, 1775)):
+            self.assertEqual(run.requested_checkpoint(1775, requested), expected)
+        for requested in (0, 1776, -1, True, 1.0, '10'):
+            with self.subTest(requested=requested), self.assertRaises(ValueError):
+                run.requested_checkpoint(1775, requested)
+
+    def test_pacing_needs_the_frozen_sui_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'sources/sui/crates'
+            module = root / 'sui-core/src/checkpoints/checkpoint_executor/mod.rs'
+            module.parent.mkdir(parents=True)
+            module.write_text('let concurrency = 4;\n')
+            self.assertFalse(run.pacing_support(Path(tmp)))
+            module.write_text('SUI_CHECKPOINT_EXECUTION_PACING_MS\n')
+            self.assertTrue(run.pacing_support(Path(tmp)))
 
 
 class CampaignBuildTargets(unittest.TestCase):

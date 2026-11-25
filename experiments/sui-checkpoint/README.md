@@ -464,7 +464,20 @@ remote whole-batch publication follows durable shard acknowledgments.
 `native` writes `TH_SYNC_WRITES=false` and is Sui's production tier, because Sui
 runs with db sync disabled; in external mode a stated
 `live_nvme.leased_durability` must name the same tier or the run is refused
-before replay. Native
+before replay. The runner sets the campaign knobs explicitly and refuses an
+inherited `TH_*` variable it does not manage; every effective value is recorded
+in `results.json:knobs` and `results.json:environment`:
+`--driver-concurrency` (`SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY`, default 4),
+`--pacing-ms` (valid only with a `SUI_CHECKPOINT_EXECUTION_PACING_MS` hook in
+the frozen Sui fork; refused otherwise rather than claimed), `--checkpoints`
+(replay 0..N after the complete source digest is verified),
+`--value-cache-size` (`TH_VALUE_CACHE_SIZE`),
+`--default-value-cache-size` (`TH_DEFAULT_VALUE_CACHE_SIZE`, default 1000),
+`--max-dirty-keys` (`TH_DEFAULT_MAX_DIRTY_KEYS`, default 1024),
+`--snapshot-written-bytes` (`TH_SNAPSHOT_WRITTEN_BYTES`), `--max-maps`
+(`TH_MAX_MAPS` and `TH_MAX_INDEX_MAPS`) and `--index-blob-cache-min-bytes`
+(`TH_INDEX_BLOB_CACHE_MIN_BYTES`).
+Native
 fragment size is 8 MiB, mapped windows three (perpetual multiplies that in Sui),
 index maps three. Shard fragments are 16 MiB to contain the bounded 12 MiB group
 and framing; maximum encoded batch is 8 MiB. Remote pending memory is 128 MiB,
@@ -513,7 +526,15 @@ The remote node receives a JSON envelope with an absolute `root` and a
 `databases` map from exact relative namespaces to complete
 `RemoteDatabaseConfig` values. `deployment.py` writes the full engine serde
 structure from the native-exported `shape.json`; no hand-written partial
-configuration is needed. Names are **exact paths relative to root**, never
+configuration is needed. Every database also carries the required `live_nvme`
+section: the coordinator initiator identity, one identity per partition, bounded
+in-flight bytes, queue geometry and `leased_durability`. `storage` carries the
+geometry only; the provisioned database identity is never written into a remote
+document. Each owner launch uses the current `OwnerHost` shape (`host`,
+`live_target_pool`, `durability`, `launch_nonce`), not the pre-NVMe-oF `node`
+shape. `test_deployment.py` regenerates the transport/owner matrix and re-parses
+every document with `kv-research --experimental-validate-config`. Names are
+**exact paths relative to root**, never
 basename guesses. `SUI_SHARDED_WAL_SCHEMA_OUTPUT` exports
 `<namespace>/{shape.json,shape.yaml,manifest.json}`. `shape.yaml` is the engine's
 canonical serde-YAML-0.9 string, preserved byte-for-byte in node configuration

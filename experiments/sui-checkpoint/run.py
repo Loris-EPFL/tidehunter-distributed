@@ -403,6 +403,10 @@ def validate_resources(resources, manifest, binding, stages):
             raise ValueError('external healthy samples do not span remote replay')
 
 
+def is_fabric_transport(value):
+    return deployment.canonical_transport(value)['kind'] == 'ofi'
+
+
 def validate_profiles(counters, databases, read_limit, write_limit):
     for name, stats in counters.items():
         if read_limit:
@@ -418,7 +422,7 @@ def validate_profiles(counters, databases, read_limit, write_limit):
                     or stats.get('read_profile_server_available') != 1
                     or stats.get('read_profile_transport_progress_available') != 1):
                 raise ValueError('bounded read profile lacks successful RPC/server/transport observations')
-            if (databases[name]['tls']['transport'] != 'tcp' and stats['read_rpcs'] > 0
+            if (is_fabric_transport(databases[name]['tls']['transport']) and stats['read_rpcs'] > 0
                     and (stats.get('read_profile_transport_cq_available') != 1
                          or (stats.get('read_profile_transport_cq_timed_calls') or 0) <= 0)):
                 raise ValueError('fabric completion-queue profiling is unavailable')
@@ -439,7 +443,7 @@ def validate_profiles(counters, databases, read_limit, write_limit):
                 or any(stats.get('write_profile_storage_' + field) != 0
                        for field in ('append_errors', 'persist_errors'))):
             raise ValueError(f'bounded write profile lacks complete successful append/persistence coverage: {name}')
-        if (databases[name]['tls']['transport'] != 'tcp'
+        if (is_fabric_transport(databases[name]['tls']['transport'])
                 and any((stats.get(prefix + 'cq_timed_calls') or 0) <= 0
                         for prefix in ('write_profile_client_transport_', 'write_profile_transport_'))):
             raise ValueError('fabric write completion-queue profiling is unavailable')
@@ -502,6 +506,67 @@ def external_durability_error(config, tier):
     return None
 
 
+MANAGED_ENV = {
+    'TH_SYNC_WRITES', 'TH_FRAG_SIZE', 'TH_MAX_MAPS', 'TH_MAX_INDEX_MAPS',
+    'TH_DEFAULT_MUTEX_COUNT', 'TH_DEFAULT_MAX_DIRTY_KEYS',
+    'TH_DEFAULT_VALUE_CACHE_SIZE', 'TH_VALUE_CACHE_SIZE',
+    'TH_SNAPSHOT_WRITTEN_BYTES', 'TH_INDEX_BLOB_CACHE_MIN_BYTES',
+    'SUI_TH_READ_PROFILE_LIMIT', 'SUI_TH_NATIVE_WRITE_PROFILE_LIMIT',
+    'SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY',
+    'SUI_CHECKPOINT_EXECUTION_PACING_MS',
+}
+ENGINE_PREFIXES = ('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_',
+                   'DISTRIBUTED_TIDEHUNTER_', 'TIDEHUNTER_', 'SUI_CHECKPOINT_')
+
+
+def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, pacing_ms,
+                        value_cache_size, default_value_cache_size, max_dirty_keys,
+                        snapshot_written_bytes, max_maps, index_blob_cache_min_bytes,
+                        read_profile_limit, native_write_profile_limit):
+    """One explicit env for the replay; unknown inherited TH_* is refused."""
+    unknown = {key for key in os_environ if key.startswith('TH_') and key not in MANAGED_ENV}
+    if unknown:
+        raise ValueError('unknown TH_ runner knob(s): ' + ', '.join(sorted(unknown)))
+    env = {key: value for key, value in os_environ.items()
+           if not key.startswith(ENGINE_PREFIXES)}
+    env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
+               TH_SYNC_WRITES='true' if tier == 'synchronous' else 'false',
+               TH_FRAG_SIZE=str(fragment_mib*deployment.MIB),
+               TH_MAX_MAPS=str(max_maps), TH_MAX_INDEX_MAPS=str(max_maps),
+               TH_DEFAULT_MUTEX_COUNT='1',
+               TH_DEFAULT_MAX_DIRTY_KEYS=str(max_dirty_keys),
+               TH_DEFAULT_VALUE_CACHE_SIZE=str(default_value_cache_size),
+               TH_SNAPSHOT_WRITTEN_BYTES=str(snapshot_written_bytes),
+               TH_INDEX_BLOB_CACHE_MIN_BYTES=str(index_blob_cache_min_bytes),
+               SUI_TH_READ_PROFILE_LIMIT=str(read_profile_limit),
+               SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(native_write_profile_limit))
+    if driver_concurrency is not None:
+        env['SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY'] = str(driver_concurrency)
+    if pacing_ms:
+        env['SUI_CHECKPOINT_EXECUTION_PACING_MS'] = str(pacing_ms)
+    if value_cache_size is not None:
+        env['TH_VALUE_CACHE_SIZE'] = str(value_cache_size)
+    return env
+
+
+def pacing_support(build_root):
+    """True only when the frozen Sui sources read the pacing hook."""
+    root = Path(build_root) / 'sources/sui/crates'
+    candidates = (root / 'sui-core/src/checkpoints/checkpoint_executor/mod.rs',
+                  root / 'sui-config/src/node.rs')
+    return any(path.is_file() and 'SUI_CHECKPOINT_EXECUTION_PACING_MS' in path.read_text()
+               for path in candidates)
+
+
+def requested_checkpoint(limit, requested):
+    """The highest replayed sequence, or a refusal for an impossible request."""
+    if requested is None:
+        return limit
+    if type(requested) is not int or not 1 <= requested <= limit:
+        raise ValueError(f'checkpoint range limit must be 1..{limit}')
+    return requested
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -521,6 +586,24 @@ def main():
                         help='store acknowledgement tier; native is the Sui production default (db sync disabled)')
     parser.add_argument('--fragment-mib', type=int, default=8,
                         help='engine fragment size in MiB; the production campaign geometry is 1024')
+    parser.add_argument('--driver-concurrency', type=int, default=4,
+                        help='Sui checkpoint-execution-max-concurrency; the fixture value is 4')
+    parser.add_argument('--pacing-ms', type=int, default=0,
+                        help='minimum milliseconds between checkpoints; 0 disables pacing')
+    parser.add_argument('--checkpoints', type=int,
+                        help='replay only checkpoints 0..N inclusive (default: the whole fixture range)')
+    parser.add_argument('--value-cache-size', type=int,
+                        help='TH_VALUE_CACHE_SIZE flattened per-keyspace override; unset keeps Sui values')
+    parser.add_argument('--default-value-cache-size', type=int, default=1000,
+                        help='TH_DEFAULT_VALUE_CACHE_SIZE per-cell default (Sui uses 1000)')
+    parser.add_argument('--max-dirty-keys', type=int, default=1024,
+                        help='TH_DEFAULT_MAX_DIRTY_KEYS base; Sui multiplies it per keyspace')
+    parser.add_argument('--snapshot-written-bytes', type=int, default=8 << 30,
+                        help='TH_SNAPSHOT_WRITTEN_BYTES native snapshot threshold')
+    parser.add_argument('--max-maps', type=int, default=3,
+                        help='TH_MAX_MAPS native data maps; TH_MAX_INDEX_MAPS follows it')
+    parser.add_argument('--index-blob-cache-min-bytes', type=int, default=0,
+                        help='TH_INDEX_BLOB_CACHE_MIN_BYTES; 0 disables the index blob cache')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
                         help='coordinator disk inventory interval in seconds, 0 disables collection')
     parser.add_argument('--read-profile-limit', type=int, default=0,
@@ -552,6 +635,22 @@ def main():
         raise ValueError('write profile limit must be 0..65536')
     if not 0 <= args.native_write_profile_limit <= 65536:
         raise ValueError('native write profile limit must be 0..65536')
+    if not 1 <= args.driver_concurrency <= 64:
+        raise ValueError('driver concurrency must be 1..64')
+    if not 0 <= args.pacing_ms <= 10000:
+        raise ValueError('pacing must be 0..10000 ms per checkpoint')
+    if args.value_cache_size is not None and not 0 <= args.value_cache_size <= 1000000:
+        raise ValueError('value cache size must be 0..1000000 entries')
+    if not 0 <= args.default_value_cache_size <= 1000000:
+        raise ValueError('default value cache size must be 0..1000000 entries')
+    if not 1 <= args.max_dirty_keys <= 1000000:
+        raise ValueError('max dirty keys must be 1..1000000')
+    if not 1 <= args.max_maps <= 32:
+        raise ValueError('max maps must be 1..32')
+    if not 0 <= args.snapshot_written_bytes <= 1 << 40:
+        raise ValueError('snapshot written bytes must be 0..1 TiB')
+    if not 0 <= args.index_blob_cache_min_bytes <= 1 << 40:
+        raise ValueError('index blob cache minimum must be 0..1 TiB')
     if args.external_config and args.local_transport != 'tcp':
         raise ValueError('local transport cannot override an external deployment')
     resident = (deployment.resident_read_config(read_json(args.resident_reads.resolve(strict=True)))
@@ -560,6 +659,10 @@ def main():
     manifest = read_json(build_root / 'build-manifest.json')
     if manifest['protocol'] != 9 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
         raise ValueError('wrong protocol or source archive binding')
+    pacing_available = pacing_support(build_root)
+    if args.pacing_ms and not pacing_available:
+        raise ValueError('pacing requires SUI_CHECKPOINT_EXECUTION_PACING_MS support in the frozen '
+                         'Sui fork; this fork has no pacing hook, so a paced run cannot be claimed')
     if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit'}:
         raise ValueError('build manifest lacks the exact required executable set')
     if args.local_transport in deployment.SOFTWARE_TRANSPORTS and not manifest['fabric']:
@@ -580,9 +683,10 @@ def main():
     prior = read_json(fixture/'experiment/results.json')
     if not prior.get('source_frozen') or prior.get('failure'):
         raise ValueError('fixture is not a completed frozen producer')
-    tip, expected_digest = prior['checkpoint_limit'], prior['checkpoint_digest']
-    if not 0 < tip < 5000:
+    source_tip, expected_digest = prior['checkpoint_limit'], prior['checkpoint_digest']
+    if not 0 < source_tip < 5000:
         raise ValueError('fixture does not retain the complete genesis range')
+    tip = requested_checkpoint(source_tip, args.checkpoints)
     # Lock original fixture DB; only the experiment lock file is created there.
     lock = (fixture/'experiment/.sharded-replay.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -609,17 +713,20 @@ def main():
         config['db-path']=str(root/mode/relative)
         config['consensus-config']=None
         config['fullnode-sync-mode']='state-sync-only'
-        config['run-with-range']=checkpoint.CheckpointBound(tip+1)
+        config['run-with-range']=checkpoint.CheckpointBound((source_tip if mode == 'producer' else tip)+1)
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
-    env={k:v for k,v in os.environ.items() if not k.startswith(('TH_', 'SUI_SHARDED_WAL_', 'SUI_DISTRIBUTED_', 'DISTRIBUTED_TIDEHUNTER_', 'TIDEHUNTER_'))}
-    env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
-               TH_SYNC_WRITES='true' if args.durability_tier == 'synchronous' else 'false',
-               TH_FRAG_SIZE=str(args.fragment_mib*deployment.MIB), TH_MAX_MAPS='3', TH_MAX_INDEX_MAPS='3',
-               TH_DEFAULT_MUTEX_COUNT='1', TH_DEFAULT_MAX_DIRTY_KEYS='128', TH_DEFAULT_VALUE_CACHE_SIZE='1000',
-               SUI_TH_READ_PROFILE_LIMIT=str(args.read_profile_limit),
-               SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(args.native_write_profile_limit))
+    env = runtime_environment(os.environ,
+        tier=args.durability_tier, fragment_mib=args.fragment_mib,
+        driver_concurrency=args.driver_concurrency, pacing_ms=args.pacing_ms,
+        value_cache_size=args.value_cache_size,
+        default_value_cache_size=args.default_value_cache_size,
+        max_dirty_keys=args.max_dirty_keys,
+        snapshot_written_bytes=args.snapshot_written_bytes, max_maps=args.max_maps,
+        index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
+        read_profile_limit=args.read_profile_limit,
+        native_write_profile_limit=args.native_write_profile_limit)
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
@@ -630,7 +737,17 @@ def main():
         fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
-        environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','LD_LIBRARY_PATH','FI_'))},
+        environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','SUI_CHECKPOINT_','LD_LIBRARY_PATH','FI_'))},
+        knobs=dict(driver_concurrency=args.driver_concurrency, pacing_ms=args.pacing_ms,
+                   pacing_available=pacing_available, checkpoints=args.checkpoints,
+                   checkpoint_limit=tip, source_checkpoint_limit=source_tip,
+                   fragment_mib=args.fragment_mib, value_cache_size=args.value_cache_size,
+                   default_value_cache_size=args.default_value_cache_size,
+                   max_dirty_keys=args.max_dirty_keys,
+                   snapshot_written_bytes=args.snapshot_written_bytes,
+                   max_maps=args.max_maps,
+                   index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
+                   source='explicit runtime env; nothing is inherited from TH_*'),
         cache=dict(coordinator_bytes=args.coordinator_cache_mib*deployment.MIB,shard_bytes=args.shard_cache_mib*deployment.MIB),
         owners=args.owners,
         topology=f'{args.owners} physical owners per database; '+('external hosts' if args.external_config else 'loopback, one SSD/shared host memory'),
@@ -644,15 +761,23 @@ def main():
     signal.signal(signal.SIGTERM,interrupted)
     signal.signal(signal.SIGINT,interrupted)
     try:
-        producer=owned.start('producer',[bins/'sui-node-native','--config-path',root/'producer.yaml','--run-with-range-checkpoint',tip+1], producer_env)
+        producer=owned.start('producer',[bins/'sui-node-native','--config-path',root/'producer.yaml','--run-with-range-checkpoint',source_tip+1], producer_env)
         address=configs['producer']['json-rpc-address']
-        if int(checkpoint.wait_rpc(producer,address)) != tip:
+        if int(checkpoint.wait_rpc(producer,address)) != source_tip:
             raise ValueError('producer tip differs')
-        result['source_range']=checkpoint.verify_source_range(address,tip)
+        producer_tip = checkpoint.rpc(address,'sui_getCheckpoint',[str(source_tip)])
+        if producer_tip['digest'] != expected_digest:
+            raise ValueError('producer tip digest differs from the frozen fixture')
+        result['source_range']=checkpoint.verify_source_range(address,source_tip)
         if result['source_range'] != prior['verified_source_range']:
             raise ValueError('complete source digest range differs')
+        replay_digest = expected_digest
+        if tip != source_tip:
+            replay_digest = checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])['digest']
+            result['source_range_prefix'] = checkpoint.verify_source_range(address, tip)
+        result['source_checkpoint_limit'] = source_tip
         native_extra=dict(SUI_SHARDED_WAL_ROOT=str(native_root), SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(output/'native-schema'))
-        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,expected_digest,native_extra,[],args.deadline)
+        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,replay_digest,native_extra,[],args.deadline)
         schema=deployment.schemas(output/'native-schema', 'native')
         shards=[]
         if args.external_config:
@@ -664,7 +789,7 @@ def main():
             if mismatch is not None:
                 raise ValueError(mismatch)
             for name, database in config['databases'].items():
-                if database['tls']['transport'] in deployment.SOFTWARE_TRANSPORTS:
+                if deployment.is_software(database['tls']['transport']):
                     raise ValueError('external software fabric is loopback-only in the native engine')
                 if (len(database['endpoints']) != args.owners
                         or len(set(e['address'].rsplit(':',1)[0] for e in database['endpoints'])) != args.owners):
@@ -691,7 +816,8 @@ def main():
                 hosts=['127.0.0.1']*args.owners, owners=args.owners,
                 port=args.port,transport=args.local_transport,coordinator_cache=result['cache']['coordinator_bytes'],
                 shard_cache=result['cache']['shard_bytes'],write_profile_limit=args.write_profile_limit,
-                resident_reads=resident)
+                resident_reads=resident, owner_tier=args.durability_tier,
+                live_transport='tcp')
             for index,node in enumerate(nodes):
                 child=owned.start(f'storage-{index}',[bins/'storage-node','--experimental-storage-node',node['launch']])
                 shards.append(child)
@@ -777,8 +903,10 @@ def main():
             if not checkpoint_sequence_cache_stats(metrics(output / f'{mode}-foreground.prom')):
                 raise ValueError('checkpoint sequence-cache counters are unavailable')
         result['audit']=audit(root,output,bins,schema,native_root,remote_root,config_path,env)
-        if producer.poll() is not None or int(checkpoint.rpc(address,'sui_getLatestCheckpointSequenceNumber')) != tip or checkpoint.verify_source_range(address,tip)!=result['source_range']:
+        if producer.poll() is not None or int(checkpoint.rpc(address,'sui_getLatestCheckpointSequenceNumber')) != source_tip or checkpoint.verify_source_range(address,source_tip)!=result['source_range']:
             raise RuntimeError('source changed across paired replays')
+        if tip != source_tip and checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])['digest'] != replay_digest:
+            raise RuntimeError('source checkpoint prefix changed across paired replays')
         if args.external_config:
             result['external_stages'].append(publish_stage(args.external_stage_dir, 'resources-required', binding))
             wait_resources(args.external_stage_dir, binding)
