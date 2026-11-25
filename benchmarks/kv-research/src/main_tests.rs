@@ -28,5 +28,5 @@ fn replay_panic_hook_aborts_on_a_background_panic() {
     assert!(String::from_utf8_lossy(&child.stderr).contains("replay background health regression"));
     let error = std::fs::read_to_string(output.join("panic.txt")).unwrap();
     assert!(error.contains("replay background health regression"));
-    assert!(error.contains("src/main.rs:"));
+    assert!(error.contains("src/main_tests.rs:"));
 }
