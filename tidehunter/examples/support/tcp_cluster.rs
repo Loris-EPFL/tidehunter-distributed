@@ -604,7 +604,9 @@ pub fn maybe_run_storage_node() -> Result<bool> {
 }
 
 #[cfg(test)]
+#[path = "tcp_cluster/durability_receipt_tests.rs"]
 mod durability_receipt_tests;
 
 #[cfg(test)]
+#[path = "tcp_cluster/live_shutdown_tests.rs"]
 mod live_shutdown_tests;
