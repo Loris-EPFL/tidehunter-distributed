@@ -220,7 +220,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                     public_port_base=1000 + base, public_service_base=4420 + base,
                     commissioning_port_base=1016 + base,
                     commissioning_service_base=4436 + base),
-                wal_member_read_policy='async', wal_prewrite=False,
+                wal_member_read_policy='async', wal_prewrite=True,
                 max_device_reads_per_status=128,
                 durability=dict(max_unsynced_age_ms=None,
                                 max_pending_completions=OWNER_MAX_PENDING_COMPLETIONS))
