@@ -687,6 +687,7 @@ def main():
     if not 0 < source_tip < 5000:
         raise ValueError('fixture does not retain the complete genesis range')
     tip = requested_checkpoint(source_tip, args.checkpoints)
+    replay_digest = expected_digest
     # Lock original fixture DB; only the experiment lock file is created there.
     lock = (fixture/'experiment/.sharded-replay.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -734,7 +735,8 @@ def main():
         durability=('synchronous durable whole-batch publication' if args.durability_tier == 'synchronous'
                     else 'native appended-frontier acknowledgement (RAM ack, Sui production tier)'),
         durability_tier=args.durability_tier,
-        fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,checkpoint_digest=expected_digest,
+        fixture=str(fixture),fixture_files=fixture_files,checkpoint_limit=tip,
+        checkpoint_digest=replay_digest,source_checkpoint_digest=expected_digest,
         build_manifest_sha256=build.digest(build_root/'build-manifest.json'),source_archive_sha256=manifest['source_archive_sha256'],
         binaries=manifest['binaries'],configurations=configs,
         environment={k:v for k,v in env.items() if k.startswith(('RUST_LOG','TOKIO_','USE_TIDEHUNTER','TH_','SUI_TH_','SUI_CHECKPOINT_','LD_LIBRARY_PATH','FI_'))},
