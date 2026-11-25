@@ -377,9 +377,11 @@ def build(args):
     compile_one('sui-node-native', sui, ['-p', 'sui-node', '--features', ','.join(plan['native_features'])], 'sui-node')
     compile_one('sui-node-remote', sui, ['-p', 'sui-node', '--features', ','.join(plan['remote_features'])], 'sui-node')
     compile_one('rocksdb-audit', sui, ['-p', 'sui-node', '--features', ','.join([*plan['native_features'], 'sui-node/testing']), '--example', 'distributed_storage_local_audit'], 'examples/distributed_storage_local_audit')
-    features = 'experimental-distributed,test-utils' + (',experimental-fabric' if plan['fabric'] else '')
-    compile_one('storage-node', engine, ['-p', 'tidehunter', '--example', 'sharded_wal_bench', '--features', features], 'examples/sharded_wal_bench')
-    compile_one('transport-floor', engine, ['-p', 'tidehunter', '--example', 'sharded_wal_transport_bench', '--features', features], 'examples/sharded_wal_transport_bench')
+    owner_features = ['test-utils'] + (['fabric'] if plan['fabric'] else [])
+    compile_one('storage-node', engine, ['-p', 'kv-research', '--bin', 'kv-research',
+                '--features', ','.join(owner_features)], 'kv-research')
+    # The transport floor example was deleted by the NVMe-oF-only refactor and
+    # has no current equivalent; the owner role is a kv-research mode.
     compile_one('state-audit', engine / 'experiments/sui-checkpoint/audit', ['--features', 'fabric'] if plan['fabric'] else [], 'sui-sharded-state-audit')
     verify_staged(root, identities)
     portability = {}

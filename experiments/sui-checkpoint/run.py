@@ -560,7 +560,7 @@ def main():
     manifest = read_json(build_root / 'build-manifest.json')
     if manifest['protocol'] != 9 or build.digest(build_root/'sources.tar.gz') != manifest['source_archive_sha256']:
         raise ValueError('wrong protocol or source archive binding')
-    if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit','transport-floor'}:
+    if set(manifest['binaries']) != {'sui-node-native','sui-node-remote','storage-node','state-audit','rocksdb-audit'}:
         raise ValueError('build manifest lacks the exact required executable set')
     if args.local_transport in deployment.SOFTWARE_TRANSPORTS and not manifest['fabric']:
         raise ValueError('software fabric validation requires a fabric-enabled build')

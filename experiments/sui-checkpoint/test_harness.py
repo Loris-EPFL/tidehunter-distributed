@@ -559,7 +559,7 @@ class CheckpointSourceBoundaries(unittest.TestCase):
             source_archive_sha256=build.digest(root / 'sources.tar.gz'),
             source_manifest_sha256=build.digest(root / 'source-manifest.json'),
             binaries={name: 'unused' for name in ('sui-node-native', 'sui-node-remote',
-                'storage-node', 'state-audit', 'rocksdb-audit', 'transport-floor')})
+                'storage-node', 'state-audit', 'rocksdb-audit')})
         build.save(root / 'build-manifest.json', manifest)
         return identities, manifest
 
@@ -600,6 +600,50 @@ class CheckpointSourceBoundaries(unittest.TestCase):
                     build.build(SimpleNamespace(output=root, target=root / 'target', deadline=60))
                 cargo.assert_not_called()
             self.assertFalse((root / 'binaries').exists())
+
+
+class CampaignBuildTargets(unittest.TestCase):
+    source_tree = CheckpointSourceBoundaries.source_tree
+    replay_binding = CheckpointSourceBoundaries.replay_binding
+
+    support_relative = 'experiments/sui-checkpoint/checkpoint_support.py'
+
+    def test_owner_is_a_kv_research_binary_and_transport_floor_is_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identities, manifest = self.replay_binding(root)
+            artifact = root / 'cargo-artifact'
+            artifact.parent.mkdir(exist_ok=True)
+            for owner in ('sui', 'tidehunter-sharded-wal'):
+                path = root / 'sources' / owner / 'Cargo.lock'
+                path.write_text('# frozen\n')
+                identities[owner]['files']['Cargo.lock'] = {
+                    'sha256': build.digest(path), 'mode': 0o644}
+            build.save(root / 'source-manifest.json', identities)
+            manifest['source_manifest_sha256'] = build.digest(root / 'source-manifest.json')
+            build.save(root / 'plan.json', dict(manifest, fabric=False, jobs=2,
+                native_features=['typed-store/tidehunter'],
+                remote_features=['sui-node/sharded-wal']))
+
+            def emitted(log, name, kind):
+                artifact.write_bytes(name.encode())
+                return artifact
+            with patch.object(build, 'bounded'), \
+                    patch.object(build, 'compiler_identity', return_value={}), \
+                    patch.object(build, 'cargo_executable', side_effect=emitted), \
+                    patch.object(build.subprocess, 'check_output', return_value=b''):
+                build.build(SimpleNamespace(output=root, target=root / 'target', deadline=60))
+            receipt = json.loads((root / 'build-manifest.json').read_text())
+            labels = [command['label'] for command in receipt['commands']]
+            self.assertEqual(labels, ['sui-node-native', 'sui-node-remote', 'rocksdb-audit',
+                                      'storage-node', 'state-audit'])
+            owner = next(c for c in receipt['commands'] if c['label'] == 'storage-node')
+            for argument in ('-p', 'kv-research', '--bin', 'kv-research', '--features', 'test-utils'):
+                self.assertIn(argument, owner['command'])
+            self.assertFalse(any('sharded_wal_bench' in argument
+                                 or 'sharded_wal_transport_bench' in argument
+                                 for c in receipt['commands'] for argument in c['command']))
+            self.assertEqual(set(receipt['binaries']), set(labels))
 
 
 class ReplaySamplingLifecycle(unittest.TestCase):

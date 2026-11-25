@@ -234,10 +234,12 @@ cleanup/termination semantics are unchanged.
 
 ## 16 October targeted metadata and residency experiment
 
-The integrated build now includes six source-bound executables: native and
-remote Sui nodes, the storage benchmark/server, both state auditors, and
-`transport-floor` (`sharded_wal_transport_bench`). All six are rebuilt by Cargo
-from the same frozen sources; old five-executable bundles are not admitted.
+The integrated build now includes five source-bound executables: native and
+remote Sui nodes, the `kv-research` owner/server binary, and both state auditors
+(`state-audit`, `rocksdb-audit`). All five are rebuilt by Cargo from the same
+frozen sources; old six-executable bundles are not admitted. The former
+`transport-floor` example (`sharded_wal_transport_bench`) was deleted by the
+NVMe-oF-only refactor and has no current equivalent.
 
 `CheckpointStore::get_checkpoint_by_sequence_number` uses a separate demand-read
 cache bounded by 1 MiB of canonical serialized bytes, without a separate row cap.
@@ -390,11 +392,12 @@ Builds run serially with bounded jobs/deadlines, `USE_TIDEHUNTER=1`, `--locked`,
 and `GIT_REVISION` set to the frozen Sui revision (Git metadata is not copied).
 The native Sui node and RocksDB auditor both enable `typed-store/tidehunter`;
 the remote node enables `sui-node/sharded-wal` (or `-fabric`). The storage
-executable is the existing
-`sharded_wal_bench` executable's real `--experimental-storage-node` mode; no
-benchmark workload runs in that mode. The new standalone `state-audit` uses the
-same adapter and the same engine sources. The existing strict
-`distributed_storage_local_audit` example is rebuilt from the same Sui sources.
+executable is the `kv-research` binary
+(`-p kv-research --bin kv-research --features test-utils`) in its real
+`--experimental-storage-node` mode; no benchmark workload runs in that mode. The
+new standalone `state-audit` uses the same adapter and the same engine sources.
+The existing strict `distributed_storage_local_audit` example is rebuilt from
+the same Sui sources.
 
 `source-manifest.json`, `sources.tar.gz`, the exact commands/log hashes,
 `build-manifest.json`, resolved lockfiles and executable hashes bind every
