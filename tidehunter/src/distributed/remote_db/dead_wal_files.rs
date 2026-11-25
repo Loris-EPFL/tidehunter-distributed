@@ -8,10 +8,10 @@
 //!    native two-term watermark `min(adopted relocation callback start,
 //!    durable control-region replay_from)`. Bytes below `replay_from` are
 //!    represented by the stored index, so recovery never replays them; bytes
-//!    below the callback start hold no live value, because every survivor of
-//!    an unfiltered keyspace was copied to the serving generation and
-//!    re-pointed before the start moved past it, and a filtered keyspace
-//!    dropped the entries below the start.
+//!    below the callback start hold no live value, because a `Keep` survivor
+//!    was copied to the serving generation and re-pointed before the start
+//!    moved past it. A held checkpoint clamps the control-region frontier
+//!    (I6), so its files stay.
 //! 2. Serving stream: page the owner inventory over a dedicated authenticated
 //!    session, never the owner worker's control lane. A victim needs an exact
 //!    durable seal of the observed inode, its file end at or below the
@@ -25,12 +25,16 @@
 //!    runs its sealed-stream path. Readiness to trim a generation is a
 //!    separate check (see `fencing_generations`).
 //!
-//! A held checkpoint does not keep owner WAL files, exactly as native
-//! `Db::checkpoint` does not (its docs: "does not itself hold WAL files from
-//! being reclaimed, so it is intended for short-lived reads"). The watermark
-//! is the two stored terms alone. A read through a checkpoint whose frame a
-//! pass reclaimed answers as native answers for an unreachable position:
-//! absent (`hybrid::read` maps the retired member to `None` on a latched view).
+//! In-flight reads need no extra file guard here: a read holds the checkpoint
+//! latch of its cut (I6), which clamps `Loader::last_processed`, which clamps
+//! the durable flush target and so the control-region frontier. Retirement
+//! therefore never passes a cut a read can still use. `take_snapshot` adds the
+//! explicit cap (no stream retires while a latch is below the stored cut: a
+//! stale relocation latch or the transient NONE latch of `pin_checkpoint`) and
+//! counts it as `retirement_latch_caps`. A position the relocation pass copied
+//! but could not re-point is capped per stream from the pass's own witness (the
+//! file below the lowest position a held read cut can still name) and counted as
+//! `retirement_pin_caps` / `retirement_pin_streams`.
 //!
 //! Nothing here is fatal for the authority: a failed or refused request made
 //! no coordinator state change, and the next pass re-pages the owner.
@@ -39,10 +43,13 @@ use super::file_inventory::{
     FileInventoryReply, FileUseState, MAX_FILE_INVENTORY_PAGE, OwnerSpan, WalFileObservation,
     span_budget_end,
 };
+use super::relocation::shadow_needs_cap;
 use super::write_core::core::WriteCore;
 use super::{Client, LocalDbError};
+use crate::distributed::hybrid::position::VersionPosition;
 use crate::distributed::storage::{RetireProof, RetirementWitness, WalInode};
 use crate::distributed::tcp::checkpoint::RetirementResult;
+use crate::distributed::types::BatchVersion;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
@@ -64,6 +71,97 @@ struct StreamWatermark {
     /// whatever the shape. An unfiltered shape still copies every record it
     /// reclaims, so this term is never vacuous.
     callback_from: u64,
+}
+
+/// One stream's shadowed as-of position that a held read cut can still name.
+#[derive(Clone, Copy, Debug)]
+struct ShadowWitness {
+    /// Lowest owner WAL offset of a position whose re-point did not land.
+    floor: u64,
+    /// Highest version of a cell entry that shadowed such a re-point.
+    shadowing: BatchVersion,
+}
+
+/// The relocation shadow witness kept between passes.
+///
+/// A relocation pass copies the as-of value of an overwritten key but cannot
+/// re-point the cell, because the cell's latest entry is a newer version. A
+/// read cut at or below that newer version still resolves the old position, so
+/// the file that holds it must not be retired while such a cut can exist. The
+/// pass that copied the position is not necessarily the pass that retires its
+/// file: a later pass can have no target for this stream (another stream's work
+/// is what makes it run retirement) and then produces no shadowed expectation
+/// at all. The witness therefore lives here, is merged on every pass and is
+/// re-evaluated on every retirement (`take_snapshot`; paper 4.4: the GC
+/// watermark tracks the oldest position that may still be referenced).
+///
+/// Shared state without a new lock: it lives inside the existing
+/// `WriteCore::retirement` mutex, which already serialises retirement and
+/// callback-start adoption, and every merge and every retirement decision runs
+/// in that one critical section. It is never persisted: a latch exists only in
+/// memory, and after a reopen every cut is in the new generation and above
+/// every old version, so no new latch can name an old position.
+///
+/// Bound: one entry per `(partition, fencing generation)` stream whose
+/// re-point was shadowed, so at most the retained stream bound
+/// (`region::MAX_REGION_STREAMS`). An entry is dropped as soon as no read cut
+/// can name its shadowing version and that version is published.
+#[derive(Default)]
+pub(in crate::distributed::remote_db) struct RetirementGate {
+    shadows: BTreeMap<(u32, u64), ShadowWitness>,
+}
+
+impl RetirementGate {
+    /// Merges one pass's shadowed expectations: per stream the lowest floor
+    /// and the highest shadowing version. Conservative: the highest shadowing
+    /// version decides whether any latch can still name the lowest position,
+    /// so a cap can outlive the pass that needed it but never lapses early.
+    /// `O(shadowed)` time and memory, bounded by the stream bound.
+    pub(in crate::distributed::remote_db) fn merge(
+        &mut self,
+        shadowed: &[(VersionPosition, BatchVersion)],
+    ) {
+        for &(position, shadowing) in shadowed {
+            let address = position.address;
+            let witness = self
+                .shadows
+                .entry((address.partition, address.segment_generation))
+                .or_insert(ShadowWitness {
+                    floor: address.offset,
+                    shadowing,
+                });
+            witness.floor = witness.floor.min(address.offset);
+            witness.shadowing = witness.shadowing.max(shadowing);
+        }
+        debug_assert!(
+            self.shadows.len() <= crate::distributed::hybrid::region::MAX_REGION_STREAMS,
+            "retirement witness grew past the control-region stream bound"
+        );
+    }
+
+    /// Drops every witness no held read cut can still name, then returns the
+    /// file-aligned cap of the rest: the file that holds the lowest referenced
+    /// position and every file above it stay.
+    ///
+    /// `published` must be read before `held`: the SeqCst Dekker pair at
+    /// `CutLatches::publish_min` / `min_held` (loader.rs) makes a racing pin
+    /// either visible in `held` or sampled at or above `published`.
+    fn caps(
+        &mut self,
+        held: Option<BatchVersion>,
+        published: BatchVersion,
+        file: u64,
+    ) -> BTreeMap<(u32, u64), u64> {
+        self.shadows
+            .retain(|_, witness| shadow_needs_cap(held, published, witness.shadowing));
+        self.shadows
+            .iter()
+            .map(|(&stream, witness)| {
+                let floor = witness.floor;
+                (stream, floor - floor % file)
+            })
+            .collect()
+    }
 }
 
 /// Frozen per-pass evidence: one watermark per retained stream plus the
@@ -92,8 +190,9 @@ struct Snapshot {
 /// no decision; the next pass retries.
 pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     core: &WriteCore,
+    gate: &mut RetirementGate,
 ) -> Result<(), LocalDbError> {
-    let snapshot = take_snapshot(core);
+    let snapshot = take_snapshot(core, gate);
     let tls_config = core
         .config
         .tls
@@ -160,7 +259,7 @@ pub(in crate::distributed::remote_db) fn core_retire_dead_wal_files(
     Ok(())
 }
 
-fn take_snapshot(core: &WriteCore) -> Snapshot {
+fn take_snapshot(core: &WriteCore, gate: &mut RetirementGate) -> Snapshot {
     // Two guards of the deleted Exact design are replaced, not lost:
     // `install_seq`/the installed-cut bound existed to freeze one image while
     // walking its references, and `referenced_files` existed because a file
@@ -204,12 +303,46 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
     for front in &core.table.stored_fronts() {
         fronts.insert((front.partition, front.generation), front.replay_from);
     }
-    // Native's rule: `min(adopted callback start, stored replay_from)` per
-    // stream, with no latch term. A held checkpoint therefore never keeps a
-    // file, and a read through it whose frame a pass reclaimed answers absent,
-    // as native's unreachable-position read does.
+    // The retirement witness never passes the lowest held latch. A latch below
+    // the stored control-region cut holds a view whose older versions of
+    // overwritten keys are still in the index overlay and name bytes the
+    // relocation pass did not copy (it copies the newest entry at its scan
+    // cut), so no stream retires while one is held. `held < stored_cut()`
+    // compares two exclusive cuts (`BatchVersion`: below(cut) = version < cut).
+    //
+    // Which latches can be below the stored cut:
+    // - Checkpoint, iterator and snapshot latches are pinned at a cut at or
+    //   above the stored one (`pin_checkpoint` pins the publication cut,
+    //   table.rs `pin_checkpoint`; the snapshot pass pins its head), and
+    //   `stored_target` is `max(previous, min(durable, applied, lowest held))`
+    //   (table.rs `stored_target`), so a held latch only stops the stored cut
+    //   from advancing: by induction they are never below it.
+    // - A relocation latch pins the cut `q` that the pass froze ONCE
+    //   (`freeze_relocation_scan`, relocation.rs) and re-pins per cell
+    //   (`relocation_view` -> `pin_cut(q)`). Between two cells no latch at `q`
+    //   exists, so the cadence store may pass `q`; a stale-`q` latch can then
+    //   be below the stored cut. This is harmless today only because the one
+    //   caller (`relocation.rs`, under `core.retirement`) runs on the
+    //   relocation worker after that pass's per-cell latches are dropped. A
+    //   second caller on another thread would meet a stale-`q` latch and be
+    //   capped: fail closed, counted, retried by the next pass.
+    // - The transient NONE latch of `pin_checkpoint` (cut `{0,0}`: "no cut is
+    //   known yet") is always below it; the check refuses retirement for
+    //   exactly that window.
+    //
+    // The latch is read before the stored cut and the stored cut never moves
+    // back, so a store between the two reads can only add refusals.
+    let held_below_stored = core
+        .table
+        .cuts()
+        .lowest_held()
+        .is_some_and(|held| held < core.table.stored_cut());
+    if held_below_stored {
+        // Relaxed: a diagnostic count; nothing is ordered against it.
+        core.retirement_latch_caps.fetch_add(1, Ordering::Relaxed);
+    }
     let mut watermark = BTreeMap::new();
-    for (&key, &callback_from) in &starts {
+    for (&key, &callback_from) in starts.iter().filter(|_| !held_below_stored) {
         // A stream the durable control region never covered has no replay
         // floor yet: no byte of it can be proven dead.
         let Some(&replay_from) = fronts.get(&key) else {
@@ -223,6 +356,39 @@ fn take_snapshot(core: &WriteCore) -> Snapshot {
                 callback_from,
             },
         );
+    }
+    // A read cut no pass satisfied: the stream's end drops to the file below
+    // the lowest position such a cut can still name, so no victim holds a byte
+    // it resolves. The witness is re-evaluated on every retirement, whatever
+    // this pass targeted: a pass whose own stream had no target still runs this
+    // decision for every retained stream (a cap that only existed on the pass
+    // that copied the position lapses exactly when another stream's work makes
+    // retirement run). Read the publication floor first and the latch mirror
+    // second: the SeqCst Dekker pair at `CutLatches::publish_min` / `min_held`
+    // (loader.rs) makes a racing pin either appear in the latch read or sample
+    // a cut at or above the floor. The pass's store already waited for the
+    // publisher critical section that inserted each shadowing entry
+    // (`publisher.rs` `publish_durable` advances the published front in that
+    // section, `WriteCore::older_streams` takes the same lock), so a covered
+    // shadowing version cannot be named by a latch created later.
+    let published = core.table.current();
+    let held = core.table.cuts().lowest_held();
+    let caps = gate.caps(held, published, core.config.storage.wal_file_bytes);
+    let mut pinned_streams = 0u64;
+    for (key, cap) in &caps {
+        let Some(stream) = watermark.get_mut(key) else {
+            continue;
+        };
+        if *cap < stream.end {
+            stream.end = *cap;
+            pinned_streams = pinned_streams.saturating_add(1);
+        }
+    }
+    if pinned_streams != 0 {
+        // Relaxed: diagnostic counts; nothing is ordered against them.
+        core.retirement_pin_caps.fetch_add(1, Ordering::Relaxed);
+        core.retirement_pin_streams
+            .fetch_add(pinned_streams, Ordering::Relaxed);
     }
     let persisted_cut_next = match core.durable_cut.get() {
         None => None,

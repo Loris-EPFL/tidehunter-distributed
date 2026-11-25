@@ -136,7 +136,6 @@ impl DistributedIterSource for HybridIterSource {
         self.db.validate_cached_read().map_err(remote_error)?;
         let table = self.db.hybrid_table();
         let reader = self.db.value_reader();
-        let latched = self.cut.is_some();
         // A live scan refills the LRU from the record it read, as native
         // `Db::next_entry` does; a latched scan never does (native
         // `DbCheckpoint::next_entry`). Without a value cache there is nothing to
@@ -178,8 +177,7 @@ impl DistributedIterSource for HybridIterSource {
                 // row needs no owner contact, exactly as native `Db::next_entry`.
                 ResolvedValue::Resident { full_key, value } => Ok(Some((full_key, value))),
                 ResolvedValue::Position(position) => {
-                    let row =
-                        reader.read_entry_with_resolve(ks, key, position, resolve, latched)?;
+                    let row = reader.read_entry_with_resolve(ks, key, position, resolve)?;
                     if let Some((full_key, value)) = &row
                         && let Some((walked_cell, stamp)) = epoch.borrow().clone()
                         && found_cell == Some(&walked_cell)

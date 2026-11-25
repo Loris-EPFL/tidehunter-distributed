@@ -498,13 +498,9 @@ pub(super) fn live_rows(db: &RemoteDatabase, ks: KeySpace) -> Vec<(Bytes, Bytes)
             }
             ResolvedValue::Position(position) => db
                 .reader
-                .read_entry_with_resolve(
-                    ks,
-                    &key,
-                    position,
-                    || Ok(table.get(ks, &key, cut)?.map(ResolvedValue::Position)),
-                    true,
-                )
+                .read_entry_with_resolve(ks, &key, position, || {
+                    Ok(table.get(ks, &key, cut)?.map(ResolvedValue::Position))
+                })
                 .unwrap(),
         };
         rows.extend(row);
@@ -558,7 +554,7 @@ pub(super) fn read_at_cut(
     };
     let reader = db.value_reader();
     let resolve = || Ok(table.get(ks, key, cut)?.map(ResolvedValue::Position));
-    let row = reader.read_entry_with_resolve(ks, key, position, resolve, true)?;
+    let row = reader.read_entry_with_resolve(ks, key, position, resolve)?;
     Ok(row.map(|(_, value)| value))
 }
 

@@ -1126,9 +1126,37 @@ impl ConcurrentRemoteDatabase {
         self.write_core().copy_deferrals.load(Ordering::Relaxed)
     }
 
-    /// Exports the retirement gauge through the caller's sink: the streams a
-    /// pass found without a stored row.
+    /// Retirement passes that refused every stream because a reader latch was
+    /// below the stored cut; exported as the `retirement_latch_caps` gauge.
+    pub(crate) fn retirement_latch_caps(&self) -> u64 {
+        self.write_core()
+            .retirement_latch_caps
+            .load(Ordering::Relaxed)
+    }
+
+    /// Retirement passes whose per-stream watermark a shadowed relocation
+    /// re-point capped; exported as the `retirement_pin_caps` gauge.
+    pub(crate) fn retirement_pin_caps(&self) -> u64 {
+        self.write_core()
+            .retirement_pin_caps
+            .load(Ordering::Relaxed)
+    }
+
+    /// Stream watermarks lowered by that cap, summed over passes; exported as
+    /// the `retirement_pin_streams` gauge.
+    pub(crate) fn retirement_pin_streams(&self) -> u64 {
+        self.write_core()
+            .retirement_pin_streams
+            .load(Ordering::Relaxed)
+    }
+
+    /// Exports the retirement gauges through the caller's sink: the latch
+    /// deferrals, the two shadow-witness caps and the streams a pass found
+    /// without a stored row.
     pub(crate) fn visit_retirement_gauges(&self, set: &mut impl FnMut(&'static str, u64)) {
+        set("retirement_latch_caps", self.retirement_latch_caps());
+        set("retirement_pin_caps", self.retirement_pin_caps());
+        set("retirement_pin_streams", self.retirement_pin_streams());
         set("retirement_missing_rows", self.retirement_missing_rows());
     }
 

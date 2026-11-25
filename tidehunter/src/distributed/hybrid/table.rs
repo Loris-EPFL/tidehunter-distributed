@@ -423,6 +423,32 @@ impl HybridTable {
     }
 }
 
+/// The version that bounds the retirement of an expectation
+/// [`TableInner::relocation_apply`] could not examine: no shard owns its key
+/// (gap or outside the cell), the owning shard holds no entry for the key, or
+/// the cell was dropped.
+///
+/// A region may be retired once no read view can still resolve the expected
+/// position. No live entry holds it, so only views taken while this pass runs
+/// can. The retirement witness is consumed as a *cut*
+/// (`relocation::shadow_needs_cap`): a latch at cut `C` needs the file when
+/// `C <= shadowing`, and every latch samples the publication watermark
+/// ([`TableInner::current`]) no later than the `published` read here, so
+/// `published` itself is the smallest cut that covers all of them. One sequence
+/// less is not enough: `DropCells` mutates the index before it advances
+/// `published`, so this pass can read `published` equal to the drop's own
+/// version, and a latch pinned at that cut can still resolve the removed
+/// position. The bound `max(expected.batch, published)` therefore covers every
+/// view that can resolve the position, and it still releases: the removal's own
+/// publication advances `published` past the stored value, after this pass's
+/// store waits for that publisher critical section. With nothing published
+/// (`sequence == 0`, the start of a serving epoch) a latch can hold cut
+/// `(epoch, 0)`, so the same bound keeps the expectation's batch only when it
+/// is above that cut.
+fn unexamined_shadowing(expected: BatchVersion, published: BatchVersion) -> BatchVersion {
+    expected.max(published)
+}
+
 /// One relocation operation on a cell: native's two filter-driven flush kinds
 /// (`RelocationFlush::Updates` for a copied survivor, `RelocationFlush::Cutoff`
 /// for a filtered keyspace).
@@ -952,9 +978,16 @@ impl TableInner {
     ///   target go with it, and one tombstone at the dropped live position
     ///   keeps a deeper level from resurfacing the key.
     ///
-    /// A stale expectation is skipped, never forced: a newer overwrite keeps
-    /// its own position. The cell is only marked for flush when something
-    /// changed; the next covering store persists it.
+    /// A stale expectation is skipped, never forced. The cell is only marked for
+    /// flush when something changed; the next covering store persists it.
+    ///
+    /// Returns the expectations the compare-and-set did not apply, each with the
+    /// version of the entry that shadowed it. Such a position is still what a
+    /// read cut at or below that version resolves, so a retirement must keep the
+    /// file that holds it (`relocation_pass`). The vec is complete: every listed
+    /// below-target expectation is either applied or in the vec, including an
+    /// expectation whose key has no live entry or whose cell was dropped
+    /// ([`unexamined_shadowing`]).
     ///
     /// Before the compare-and-set, on-disk L1 data is consulted only for
     /// below-target keys absent from the in-memory table:
@@ -966,15 +999,15 @@ impl TableInner {
     ///   owning missing keys (at most once per shard, one shard in memory at a
     ///   time) and lifts only re-pointed entries into `index`, matching native
     ///   `flusher.rs` `lift_shard_entries`. Untouched shards are never read and
-    ///   never copied into live `index`; `RelocationApply::Drop` scans `index`
-    ///   (L0 plus overlay) alone.
+    ///   never copied into live `index`; `drop_removed` scans `index` (L0 plus
+    ///   overlay).
     pub(crate) fn relocation_apply(
         &self,
         ks: KeySpace,
         cell: &CellId,
         mode: RelocationApply<'_>,
         targets: &[(u32, u64, u64)],
-    ) -> Result<(), LocalDbError> {
+    ) -> Result<Vec<(VersionPosition, BatchVersion)>, LocalDbError> {
         self.check_background_health()?;
         let (updates, drop_entries) = match mode {
             RelocationApply::Repoint(updates) => (updates, false),
@@ -994,7 +1027,8 @@ impl TableInner {
                               key: &[u8],
                               expected: &VersionPosition,
                               new: &VersionPosition,
-                              changed: &mut bool|
+                              changed: &mut bool,
+                              shadowed: &mut Vec<(VersionPosition, BatchVersion)>|
          -> bool {
             let mut examined = false;
             index.apply_update(key, |tagged| {
@@ -1006,13 +1040,21 @@ impl TableInner {
                 {
                     *tagged = new.tag(kind);
                     *changed = true;
+                } else if below_target(*expected) {
+                    // The entry the pass copied is no longer the cell's
+                    // latest one, so the compare-and-set cannot carry the
+                    // re-point: a read cut at or below the shadowing
+                    // version still resolves the old position.
+                    shadowed.push((*expected, current.batch));
                 }
             });
             examined
         };
-        self.table
+        let result = self
+            .table
             .update_cell_index(context, cell, loader, |index, levels| {
                 let mut changed = false;
+                let mut shadowed: Vec<(VersionPosition, BatchVersion)> = Vec::new();
                 if levels.is_sharded() {
                     // Sharded cell: inspect L0/overlay first and load only the
                     // L1 shards owning below-target keys absent from `index`,
@@ -1025,12 +1067,23 @@ impl TableInner {
                     for (idx, item) in updates.iter().enumerate() {
                         let (key, expected, new) = item;
                         if index.get_update_position(key).is_some() {
-                            let examined = apply_in_index(index, key, expected, new, &mut changed);
+                            let examined = apply_in_index(
+                                index,
+                                key,
+                                expected,
+                                new,
+                                &mut changed,
+                                &mut shadowed,
+                            );
                             debug_assert!(examined, "key present in index must be examined");
-                        } else if below_target(*expected)
-                            && let Some(shard) = levels.shard_for(key)
-                        {
-                            missing.push((shard.position, idx, item));
+                        } else if below_target(*expected) {
+                            match levels.shard_for(key) {
+                                Some(shard) => missing.push((shard.position, idx, item)),
+                                None => shadowed.push((
+                                    *expected,
+                                    unexamined_shadowing(expected.batch, self.current()),
+                                )),
+                            }
                         }
                     }
                     // Group by shard position so each needed shard is loaded at
@@ -1040,7 +1093,14 @@ impl TableInner {
                     let mut cached: Option<(WalPosition, IndexTable<VersionPosition>)> = None;
                     for (shard_pos, _, (key, expected, new)) in missing {
                         if index.get_update_position(key).is_some() {
-                            let examined = apply_in_index(index, key, expected, new, &mut changed);
+                            let examined = apply_in_index(
+                                index,
+                                key,
+                                expected,
+                                new,
+                                &mut changed,
+                                &mut shadowed,
+                            );
                             debug_assert!(examined, "key present in index must be examined");
                             continue;
                         }
@@ -1063,9 +1123,17 @@ impl TableInner {
                                 index.insert(key.clone(), *new);
                                 changed = true;
                             }
-                            // A different shard entry (or none) means the
-                            // compare-and-set has nothing to re-point.
-                            Some(_) | None => {}
+                            Some(current) => {
+                                // `expected` is below target (checked when queued),
+                                // so the different shard entry shadows it.
+                                shadowed.push((*expected, current.batch));
+                            }
+                            None => {
+                                shadowed.push((
+                                    *expected,
+                                    unexamined_shadowing(expected.batch, self.current()),
+                                ));
+                            }
                         }
                     }
                 } else {
@@ -1085,13 +1153,20 @@ impl TableInner {
                         *index = merged;
                     }
                     for (key, expected, new) in updates {
-                        apply_in_index(index, key, expected, new, &mut changed);
+                        let examined =
+                            apply_in_index(index, key, expected, new, &mut changed, &mut shadowed);
+                        if !examined && below_target(*expected) {
+                            shadowed.push((
+                                *expected,
+                                unexamined_shadowing(expected.batch, self.current()),
+                            ));
+                        }
                     }
                 }
                 if drop_entries {
                     drop_index_rows_preserving_resident_values(index, &below_target, &mut changed);
                 }
-                Ok(((), changed))
+                Ok((shadowed, changed))
             })
             .map_err(|error| match error {
                 CellUpdateError::Background(error) => {
@@ -1099,7 +1174,22 @@ impl TableInner {
                 }
                 CellUpdateError::Loader(error) => error,
             })?;
-        Ok(())
+        Ok(match result {
+            Some(shadowed) => shadowed,
+            None => {
+                // Cell absent or empty (for example dropped concurrently):
+                // every below-target expectation was unexamined and joins the
+                // shadow witness.
+                let published = self.current();
+                updates
+                    .iter()
+                    .filter(|(_, expected, _)| below_target(*expected))
+                    .map(|(_, expected, _)| {
+                        (*expected, unexamined_shadowing(expected.batch, published))
+                    })
+                    .collect()
+            }
+        })
     }
 
     /// Counts a cadence pass that stored nothing because a reader latch held the
