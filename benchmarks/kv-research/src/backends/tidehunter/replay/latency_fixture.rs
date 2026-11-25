@@ -613,6 +613,7 @@ pub async fn run(driver_path: &Path, output: &Path) -> BackendResult<()> {
                         "persist_failures": stats.persist_failures,
                         "poll_failures": stats.poll_failures,
                         "certifications": stats.certifications,
+                        "targeted_syncs": stats.targeted_syncs,
                     })
                 });
             let observation = database
