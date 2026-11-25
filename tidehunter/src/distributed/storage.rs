@@ -1918,7 +1918,7 @@ impl PartitionLog {
         }
         if open.closing {
             return if close || through > open.adoption.adopted_end {
-                Err(StorageError::Invalid("live extent is closing"))
+                Err(StorageError::LiveCloseInProgress)
             } else {
                 Ok(Some(open.adoption.clone()))
             };
@@ -2179,7 +2179,7 @@ impl PartitionLog {
                 return Err(StorageError::Invalid("foreign live extent"));
             }
             if open.closing {
-                return Err(StorageError::Invalid("live extent is closing"));
+                return Err(StorageError::LiveCloseInProgress);
             }
             if through != open.adoption.adopted_end {
                 state.poison = Some(WriterPoison::IncompleteLiveFrame);
@@ -4734,6 +4734,10 @@ pub enum StorageError {
     /// Unresolved external bytes failed frame/identity validation; no no-effect
     /// result is implied. Revocation and frontier-based recovery are required.
     IncompleteLiveFrame,
+    /// A close of this extent is executing: it dropped the state lock for its
+    /// suffix scan, so its frontier and outcome are not readable yet. The
+    /// request changed nothing; the caller retries after the close completes.
+    LiveCloseInProgress,
     /// Effects may exist. Resolve the original identity after recovery.
     Unknown(WalError),
 }

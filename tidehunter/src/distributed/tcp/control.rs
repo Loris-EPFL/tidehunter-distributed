@@ -1642,6 +1642,16 @@ impl ControlContext {
                 let (adoption, profile) = log
                     .adopt_live_extent(RequestAuthority { epoch }, token, through, close)
                     .map_err(|error| {
+                        // A close is executing for this extent and its reply is
+                        // not readable yet. It changed nothing, so the caller
+                        // retries after the close completes: `WouldBlock` is
+                        // the wire's retry-later class.
+                        if matches!(error, StorageError::LiveCloseInProgress) {
+                            return TcpError::with_kind(
+                                io::ErrorKind::WouldBlock,
+                                "live extent close is in progress",
+                            );
+                        }
                         if matches!(error, StorageError::IncompleteLiveFrame) {
                             self.poison_incomplete_live();
                         } else if matches!(error, StorageError::Unknown(_) | StorageError::Poisoned)

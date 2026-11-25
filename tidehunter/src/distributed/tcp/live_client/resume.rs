@@ -42,6 +42,11 @@ pub(super) const MAX_CONSECUTIVE_RESUMES: u32 = 3;
 /// A resume never runs longer than this many of the write path's own I/O
 /// deadlines, and never past the coordinator lease's deadline.
 const RESUME_IO_TIMEOUTS: u32 = 2;
+/// The owner never notifies a coordinator that a close it is executing has
+/// finished, so the resume re-probes the extent's frontier and backs off. Each
+/// wait is short and the episode budget is the only retry bound.
+const CLOSE_REPROBE_FIRST: Duration = Duration::from_micros(200);
+const CLOSE_REPROBE_MAX: Duration = Duration::from_millis(10);
 
 /// Which side of the write path lost its transport. It decides one thing: a
 /// data-queue break detaches the queue and rewrites the retained suffix, while
@@ -158,6 +163,10 @@ impl Client {
         #[cfg(test)]
         {
             self.live_leased.resume_steps = 0;
+            self.live_leased.resume_attempt = 0;
+            self.live_leased.attempt_steps.clear();
+            self.live_leased.lapse_at = None;
+            self.live_leased.close_reprobes = 0;
         }
         let result = self.resume_episode(kind, deadline);
         self.live_leased.resuming = false;
@@ -227,7 +236,19 @@ impl Client {
             if let Some(counters) = &self.live_counters {
                 counters.record_resume_attempt();
             }
-            match self.resume_once(kind, deadline) {
+            #[cfg(test)]
+            {
+                // Each attempt is measured on its own, so the episode's retry
+                // never advances the step count a test asserts on.
+                self.live_leased.resume_attempt = attempt - 1;
+                self.live_leased.resume_steps = 0;
+            }
+            let result = self.resume_once(kind, deadline);
+            #[cfg(test)]
+            self.live_leased
+                .attempt_steps
+                .push(self.live_leased.resume_steps);
+            match result {
                 Err(error) if attempt < MAX_RESUME_ATTEMPTS && is_transient_break(&error) => {
                     attempt += 1;
                 }
@@ -271,6 +292,11 @@ impl Client {
         self.after_resume_step();
         // Step 6: declare what the owner can now prove, and settle the flights
         // it covers. Nothing is popped and nothing is reordered.
+        #[cfg(test)]
+        if let Some((entered, release)) = self.live_leased.declaration_gate.take() {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         self.declare_resumed_adoption(kind == BreakKind::Data, deadline)?;
         #[cfg(test)]
         self.after_resume_step();
@@ -302,6 +328,10 @@ impl Client {
         };
         if *after == self.live_leased.resume_steps {
             validity.lapse_for_test();
+            self.live_leased.lapse_at = Some((
+                self.live_leased.resume_attempt,
+                self.live_leased.resume_steps,
+            ));
         }
     }
 
@@ -619,6 +649,14 @@ impl Client {
             len: frame.frame.len(),
             id,
         });
+        // A test can lapse the lease between two frames of one rewrite, which is
+        // the only boundary where the per-frame check is the next guard.
+        #[cfg(test)]
+        if let Some((after, validity)) = self.live_leased.lapse_lease_after_rewrite.as_ref()
+            && self.live_leased.rewrites.len() == usize::try_from(*after).unwrap_or(usize::MAX)
+        {
+            validity.lapse_for_test();
+        }
         self.harvest_rewrite(id, frame_deadline)
     }
 
@@ -763,17 +801,33 @@ impl Client {
                     lease_next: false,
                     target,
                 };
-                let reply = self.within_resume_budget(deadline, |client| {
+                let exchange = self.within_resume_budget(deadline, |client| {
                     client.adopt_live_extent(epoch, token, declare, close, false)
-                })?;
-                self.check_leased_adoption(pending, &reply)?;
-                if close {
-                    self.recycle_closing()?;
-                } else {
-                    let Some(extent) = self.extent_mut(target) else {
-                        continue;
-                    };
-                    extent.declared_through = extent.declared_through.max(declare);
+                });
+                match exchange {
+                    Ok(reply) => {
+                        self.check_leased_adoption(pending, &reply)?;
+                        if close {
+                            self.recycle_closing()?;
+                        } else {
+                            let Some(extent) = self.extent_mut(target) else {
+                                continue;
+                            };
+                            extent.declared_through = extent.declared_through.max(declare);
+                        }
+                    }
+                    // The owner is still finishing a close this coordinator
+                    // started before the break. It is not refused, it is in
+                    // flight: re-probe until the closed summary arrives, and
+                    // fail when the episode budget is spent.
+                    Err(error) if close && error.kind() == io::ErrorKind::WouldBlock => {
+                        #[cfg(test)]
+                        if let Some(notify) = &self.live_leased.close_in_progress {
+                            let _ = notify.try_send(());
+                        }
+                        self.await_owner_close(epoch, token, deadline)?;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             // Adoption reads the file on the owner, independently of this
@@ -795,6 +849,68 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Wait for a close the owner is still executing, by re-probing the closing
+    /// extent's frontier.
+    ///
+    /// The owner answers a probe from memory while it closes, and never
+    /// notifies the coordinator when the close finishes. Each round is one
+    /// bounded probe and a short backed-off wait; `remaining_resume` bounds the
+    /// whole wait with the episode budget and rechecks the lease before every
+    /// round, so a lapse or a spent budget still fails the resume. The closed
+    /// summary is read with the same rule as any other: its frontier must equal
+    /// this coordinator's whole written prefix.
+    fn await_owner_close(
+        &mut self,
+        epoch: u64,
+        token: [u8; 16],
+        deadline: Instant,
+    ) -> Result<(), TcpError> {
+        let mut wait = CLOSE_REPROBE_FIRST;
+        loop {
+            self.remaining_resume(deadline)?;
+            let through = self
+                .live_leased
+                .closing
+                .as_ref()
+                .ok_or_else(|| TcpError::new("closing extent missing"))?
+                .adopted
+                .end;
+            let reply = self.within_resume_budget(deadline, |client| {
+                client.probe_live_extent(epoch, token, through)
+            })?;
+            self.check_leased_adoption(
+                PendingAdoption {
+                    through,
+                    close: false,
+                    lease_next: false,
+                    target: PendingTarget::Closing,
+                },
+                &reply,
+            )?;
+            if reply.adoption.closed {
+                // The owner finished the close: the closed-reply rule has
+                // already compared its frontier with the written prefix.
+                self.recycle_closing()?;
+                return Ok(());
+            }
+            #[cfg(test)]
+            {
+                self.live_leased.close_reprobes += 1;
+                if let Some(notify) = &self.live_leased.close_in_progress {
+                    let _ = notify.try_send(());
+                }
+            }
+            // Nothing carries a completion: the coordinator waits for the
+            // owner's progress for one short slice, then probes again. The probe
+            // consumed part of the budget, so the sleep is bounded by what is
+            // left after it and never passes the episode deadline; that check
+            // also re-reads the lease after the exchange.
+            let remaining = self.remaining_resume(deadline)?;
+            std::thread::sleep(wait.min(remaining));
+            wait = wait.saturating_mul(2).min(CLOSE_REPROBE_MAX);
+        }
     }
 
     /// Bind a live queue when a detached one left flights behind. The release

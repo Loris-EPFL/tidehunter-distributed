@@ -77,6 +77,18 @@ impl LeaseValidity {
         }
     }
 
+    /// A stamp that is valid for an hour, so a test can lapse it at a chosen
+    /// step boundary instead of before the resume.
+    #[cfg(test)]
+    pub(crate) fn fresh_for_test() -> Self {
+        let stamp = Self::new(Instant::now());
+        // One hour, far beyond any test's own wait bounds.
+        stamp
+            .valid_until_ns
+            .store(3_600_000_000_000, Ordering::Release);
+        stamp
+    }
+
     /// Lapse this owner's lease from a test and keep it lapsed.
     ///
     /// A resume step runs on the worker thread while the renewer of the same

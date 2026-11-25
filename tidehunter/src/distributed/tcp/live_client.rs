@@ -432,6 +432,38 @@ pub(super) struct LeasedWriter {
         u32,
         std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
     )>,
+    /// The resume attempt now running, counted from zero per resume. The
+    /// episode's internal retry advances it, so a test can tell the attempt
+    /// that met a condition from the one that retried it.
+    #[cfg(test)]
+    resume_attempt: u32,
+    /// Steps each finished attempt completed, in attempt order.
+    #[cfg(test)]
+    attempt_steps: Vec<u32>,
+    /// The attempt and completed-step count at which the test's lapse landed.
+    #[cfg(test)]
+    lapse_at: Option<(u32, u32)>,
+    /// The lease stamp to lapse once `rewrites.len()` reaches the given count,
+    /// so a test can land the lapse between two frames of one rewrite.
+    #[cfg(test)]
+    lapse_lease_after_rewrite: Option<(
+        u32,
+        std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
+    )>,
+    /// Rounds a resume re-probed a close the owner was still executing.
+    #[cfg(test)]
+    close_reprobes: u32,
+    /// Notified once per declaration close the owner reported as in progress.
+    #[cfg(test)]
+    close_in_progress: Option<std::sync::mpsc::SyncSender<()>>,
+    /// A test rendezvous before the declaration step: the resume announces that
+    /// it is about to declare, then waits for the test, so a test can put the
+    /// owner into a state that is otherwise a race to enter.
+    #[cfg(test)]
+    declaration_gate: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     /// Extents a resume probed, in probe order.
     #[cfg(test)]
     resume_targets: Vec<PendingTarget>,
@@ -5576,9 +5608,35 @@ impl super::Client {
     pub(crate) fn leased_test_submitted_ids(&self) -> &[u64] {
         &self.live_leased.submitted_ids
     }
-    /// Resume steps the last resume completed before it returned or failed.
-    pub(crate) fn leased_test_resume_steps(&self) -> u32 {
-        self.live_leased.resume_steps
+    /// Steps each attempt of the last resume completed, in attempt order.
+    pub(crate) fn leased_test_attempt_steps(&self) -> &[u32] {
+        &self.live_leased.attempt_steps
+    }
+    /// The attempt and completed-step count at which the test lapse landed.
+    pub(crate) fn leased_test_lapse_at(&self) -> Option<(u32, u32)> {
+        self.live_leased.lapse_at
+    }
+    /// Rounds a resume re-probed a close the owner was still executing.
+    pub(crate) fn leased_test_close_reprobes(&self) -> u32 {
+        self.live_leased.close_reprobes
+    }
+    /// Notify this channel once per declaration close the owner reports as in
+    /// progress, so a test can release a paused owner close at that moment.
+    pub(crate) fn leased_test_notify_close_in_progress(
+        &mut self,
+        notify: std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.live_leased.close_in_progress = Some(notify);
+    }
+    /// Announce the declaration step on `entered`, then wait on `release`
+    /// before it runs, so a test can place the owner in a state that is
+    /// otherwise a race to enter.
+    pub(crate) fn leased_test_pause_before_declaration(
+        &mut self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.live_leased.declaration_gate = Some((entered, release));
     }
     /// Lapse `validity` once `steps` resume steps of one resume have completed,
     /// so the test decides the step that must observe the lapse.
@@ -5588,6 +5646,15 @@ impl super::Client {
         validity: std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
     ) {
         self.live_leased.lapse_lease_after = Some((steps, validity));
+    }
+    /// Lapse `validity` once `after` frames of one rewrite have been resent, so
+    /// the test lands the lapse between two frames of the same rewrite.
+    pub(crate) fn leased_test_lapse_lease_after_rewrite(
+        &mut self,
+        after: u32,
+        validity: std::sync::Arc<crate::distributed::remote_db::coordinator_lease::LeaseValidity>,
+    ) {
+        self.live_leased.lapse_lease_after_rewrite = Some((after, validity));
     }
     /// `(offset, len)` of every write this queue accepted, in order.
     pub(crate) fn leased_test_write_submissions(&self) -> Vec<(u64, usize)> {
