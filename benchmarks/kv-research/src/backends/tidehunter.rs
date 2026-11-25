@@ -43,7 +43,7 @@ use tidehunter::distributed::storage::{
 };
 use tidehunter::distributed::sui;
 use tidehunter::distributed::tcp::{FabricSecurity, LiveTargetPool, PollingPolicy, Transport};
-use tidehunter::key_shape::{KeyShape, KeyType};
+use tidehunter::key_shape::{KeyShape, KeySpaceConfig, KeyType};
 use tidehunter::minibytes::Bytes;
 
 // A 32-member batch of 64 KiB values must remain one native atomic batch.
@@ -633,6 +633,15 @@ fn confirm_owner_receipts(
     Ok(())
 }
 
+fn synthetic_shape(value_cache_size: usize) -> KeyShape {
+    KeyShape::new_single_config(
+        32,
+        16,
+        KeyType::uniform(64),
+        KeySpaceConfig::default().with_value_cache_size(value_cache_size),
+    )
+}
+
 // Shared async factory interface; the existing owner harness opens synchronously.
 #[allow(clippy::unused_async)]
 #[allow(clippy::too_many_lines)]
@@ -640,12 +649,8 @@ async fn open_for(
     value: &serde_json::Value,
     registry: &prometheus::Registry,
 ) -> BackendResult<TidehunterBackend> {
-    open_with_shape(
-        value,
-        registry,
-        KeyShape::new_single(32, 16, KeyType::uniform(64)),
-    )
-    .await
+    let options = parse_options(value)?;
+    open_with_shape(value, registry, synthetic_shape(options.value_cache_size)).await
 }
 
 #[allow(clippy::unused_async)]
@@ -771,6 +776,7 @@ async fn open_with_shape(
         "retained_history_capacity_batches_per_partition": effective_max_batches,
         "batch_atomicity_scope": "crash_recovery_only; no serializable visibility/isolation claim",
         "key_count": options.key_count,
+        "value_cache_entries_per_keyspace": options.value_cache_size,
         "key_bytes": 32,
         "keyshape_mutexes": 16,
         "keyshape_cells_per_mutex": 64,

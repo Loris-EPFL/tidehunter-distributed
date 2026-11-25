@@ -777,3 +777,83 @@ fn rejects_selected_ofi_before_services_when_feature_is_disabled() {
     );
     assert!(Transport::Tcp.validate().is_ok());
 }
+
+#[test]
+fn value_cache_size_reaches_the_synthetic_shape() {
+    for cache in [0, 1_000] {
+        let shape = super::synthetic_shape(cache);
+        let document = serde_json::to_value(&shape).expect("keyspace shape serializes");
+        assert_eq!(
+            document["key_spaces"][0]["inner"]["config"]["value_cache_size"],
+            serde_json::json!(cache)
+        );
+    }
+}
+
+fn external_remote_options() -> serde_json::Value {
+    // Complete external deployment so the test runs without the test-utils
+    // local fixture, in every feature profile CI builds.
+    serde_json::json!({
+        "storage": {
+            "partitions": [0],
+            "batch_limits": {"max_operations": 64, "max_encoded_bytes": 1_048_576},
+            "group_limits": {"max_batches": 8, "max_encoded_bytes": 2_097_152},
+            "fragment_bytes": 4_194_304,
+            "wal_file_bytes": 16_777_216,
+            "max_batches_per_partition": 1_000,
+            "max_reference_metadata_bytes": 1_048_576
+        },
+        "endpoints": [{"partition": 0, "address": "127.0.0.1:24000", "server_name": "node-0"}],
+        "tls": {
+            "transport": {"kind": "tcp-trusted"},
+            "ca": "", "cert": "", "key": "", "server_name": "node-0"
+        },
+        "timeout": {"secs": 30, "nanos": 0},
+        "max_admitted_batches": 1_000,
+        "max_pending_batches": 8,
+        "max_pending_bytes": 67_108_864,
+        "read_cache_bytes": 8_388_608,
+        "read_memory_allowance_bytes": 536_870_912,
+        "max_pending_reads": 256,
+        "max_pending_read_bytes": 67_108_864,
+        "live_nvme": {
+            "host_nqn": "nqn.2014-08.org.nvmexpress:uuid:11111111-1111-4111-8111-111111111111",
+            "host_id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "max_inflight_requests": 32,
+            "max_inflight_bytes": 16_777_216,
+            "connect_timeout_ms": 30_000,
+            "io_timeout_ms": 30_000,
+            "leased_durability": "native"
+        }
+    })
+}
+
+#[test]
+fn value_cache_option_is_admitted_and_bounded() {
+    let accepted = super::parse_options(&serde_json::json!({
+        "transport": {"kind": "tcp-trusted"},
+        "path": "/tmp/value-cache-option",
+        "owners": 1,
+        "value_cache_size": 1_000,
+        "external_remote_config": external_remote_options()
+    }))
+    .expect("value_cache_size is admitted");
+    assert_eq!(accepted.value_cache_size, 1_000);
+    let default = super::parse_options(&serde_json::json!({
+        "transport": {"kind": "tcp-trusted"},
+        "path": "/tmp/value-cache-option",
+        "owners": 1,
+        "external_remote_config": external_remote_options()
+    }))
+    .expect("the option defaults to zero");
+    assert_eq!(default.value_cache_size, 0);
+    let error = super::parse_options(&serde_json::json!({
+        "transport": {"kind": "tcp-trusted"},
+        "path": "/tmp/value-cache-option",
+        "owners": 1,
+        "value_cache_size": 1_000_001,
+        "external_remote_config": external_remote_options()
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("value_cache_size"), "{error}");
+}

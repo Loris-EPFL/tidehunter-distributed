@@ -361,3 +361,40 @@ fn fixture_tree_is_removed_when_a_test_panics() {
         seen.display()
     );
 }
+
+#[test]
+fn value_cache_size_reaches_the_keyspace_configuration() {
+    for cache in [0, 1_000] {
+        let shape = keyspace_shape(cache);
+        let document = serde_json::to_value(&shape).expect("keyspace shape serializes");
+        assert_eq!(
+            document["key_spaces"][0]["inner"]["config"]["value_cache_size"],
+            serde_json::json!(cache)
+        );
+    }
+}
+
+#[tokio::test]
+async fn value_cache_option_is_admitted_recorded_and_bounded() {
+    let guard =
+        tempfile::TempDir::with_prefix("kv-research-native-value-cache-").expect("test tree");
+    let backend = open(
+        &serde_json::json!({"path": guard.path(), "value_cache_size": 1_000}),
+        &prometheus::Registry::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend.info().configuration["value_cache_entries_per_keyspace"],
+        serde_json::json!(1_000)
+    );
+    backend.shutdown().await.unwrap();
+    let error = open(
+        &serde_json::json!({"path": guard.path().join("bounded"), "value_cache_size": 1_000_001}),
+        &prometheus::Registry::new(),
+    )
+    .await
+    .err()
+    .expect("an oversized value cache must be rejected");
+    assert!(error.to_string().contains("value_cache_size"), "{error}");
+}

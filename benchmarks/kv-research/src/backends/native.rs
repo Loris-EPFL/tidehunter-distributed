@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tidehunter::config::Config;
 use tidehunter::db::{Db, NativeWriteStages, ValueWalPersistenceProfile};
-use tidehunter::key_shape::{KeyShape, KeySpace, KeyType};
+use tidehunter::key_shape::{KeyShape, KeySpace, KeySpaceConfig, KeyType};
 use tidehunter::metrics::Metrics;
 use tidehunter::minibytes::Bytes;
 
@@ -63,6 +63,9 @@ struct Options {
     native_wal_geometry: NativeWalGeometry,
     #[serde(default = "default_native_shards")]
     native_shards: usize,
+    /// Per-keyspace value-cache entries; zero disables the cache (the default).
+    #[serde(default)]
+    value_cache_size: usize,
 }
 
 fn default_key_count() -> u64 {
@@ -107,6 +110,7 @@ pub struct NativeBackend {
     native_wal_geometry: NativeWalGeometry,
     path: PathBuf,
     key_count: u64,
+    value_cache_size: usize,
     diagnostics: Mutex<NativeWriteDiagnostics>,
 }
 
@@ -120,6 +124,9 @@ fn parse_options(value: &serde_json::Value) -> BackendResult<Options> {
     }
     if options.path.as_os_str().is_empty() {
         return Err("native path must not be empty".into());
+    }
+    if options.value_cache_size > 1_000_000 {
+        return Err("native value_cache_size must not exceed 1000000 entries per keyspace".into());
     }
     usize::try_from(options.key_count).map_err(|_| "native key_count exceeds platform limit")?;
     Ok(options)
@@ -153,6 +160,15 @@ fn shard_index(key: &[u8], shards: usize) -> usize {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
     });
     (hash % shards as u64) as usize
+}
+
+fn keyspace_shape(value_cache_size: usize) -> KeyShape {
+    KeyShape::new_single_config(
+        32,
+        16,
+        KeyType::uniform(64),
+        KeySpaceConfig::default().with_value_cache_size(value_cache_size),
+    )
 }
 
 fn native_config(geometry: NativeWalGeometry) -> Config {
@@ -213,7 +229,7 @@ pub async fn open(
             shard_filesystem_device_ids.push(fs::metadata(&path)?.dev());
         }
         // `key_count` is the dataset bound, not cells per mutex.
-        let shape = KeyShape::new_single(32, 16, KeyType::uniform(64));
+        let shape = keyspace_shape(options.value_cache_size);
         let private_registry = prometheus::Registry::new();
         let engine_registry = if options.native_shards == 1 {
             registry
@@ -239,6 +255,7 @@ pub async fn open(
         native_wal_geometry: options.native_wal_geometry,
         path: options.path,
         key_count: options.key_count,
+        value_cache_size: options.value_cache_size,
         diagnostics: Mutex::default(),
     })
 }
@@ -386,6 +403,7 @@ impl NativeBackend {
                 "transport_security": "in_process",
                 "durability": match self.durability { Durability::PageCache => "page_cache", Durability::ValueWalBarrier => "value_wal_barrier", Durability::ValueWalGroupBarrier => "value_wal_group_barrier" },
                 "key_count": self.key_count,
+                "value_cache_entries_per_keyspace": self.value_cache_size,
                 "native_shards": self.shards.len(),
                 "key_bytes": 32,
                 "keyshape_mutexes": 16,

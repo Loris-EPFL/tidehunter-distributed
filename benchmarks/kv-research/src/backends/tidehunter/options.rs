@@ -48,6 +48,9 @@ pub(super) struct Options {
     /// partition order, copied to the coordinator host. Required there; a missing file fails open.
     #[serde(default)]
     pub(super) external_owner_durability_receipts: Vec<PathBuf>,
+    /// Per-keyspace value-cache entries; zero disables the cache (the default).
+    #[serde(default)]
+    pub(super) value_cache_size: usize,
 }
 
 /// Local ordinary-file fixture owner WAL geometry. The fixture's default is the
@@ -124,6 +127,12 @@ pub(super) fn parse_options(value: &serde_json::Value) -> BackendResult<Options>
             )
             .into());
         }
+    }
+    if options.value_cache_size > 1_000_000 {
+        return Err(format!(
+            "{name} value_cache_size must not exceed 1000000 entries per keyspace"
+        )
+        .into());
     }
     if let Some(limits) = options.batch_limits {
         limits.validate()?;
