@@ -171,11 +171,18 @@ def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, d
 
 
 def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
-           disk_sample=None, disk_interval_seconds=10):
+           disk_sample=None, disk_interval_seconds=10, bound=None,
+           short_run=False, certified_epoch=None):
+    if bound is None:
+        bound = tip
+    if short_run and certified_epoch is None:
+        raise ValueError('a short replay needs the producer-certified epoch')
     config = checkpoint.configuration(root, mode)
     start = time.monotonic()
     child = owned.start(mode, [binary, '--config-path', root / f'{mode}.yaml',
-                              '--run-with-range-checkpoint', replay_bound(tip)], extra)
+                              '--run-with-range-checkpoint', replay_bound(bound)], extra)
+    interval = 0.05 if short_run else 0.25
+    log_path = owned.root / f'{mode}.log'
     progress, samples, disk_samples, final_count = [], [], [], 0
     next_disk = time.monotonic() if disk_sample else float('inf')
     metrics = ''
@@ -199,6 +206,11 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                 failed = next((p for p in [row['node'], *row['shards']]
                                if p.get('exited') or p.get('core_dumping')), None)
                 if failed is not None:
+                    if short_run and failed.get('exited') and failed.get('exit_code') == 0:
+                        require_short_exit(log_path, tip, mode=mode)
+                        progress.append(dict(seconds=time.monotonic()-start,
+                                             completed_checkpoint=tip, exited_at_bound=True))
+                        break
                     state = f"exited with code {failed['exit_code']}" if failed.get('exited') else 'is core-dumping'
                     raise RuntimeError(f"{mode}: owned process {failed['pid']} {state} during replay; see {owned.root}/*.log")
                 try:
@@ -206,15 +218,15 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                         metrics = response.read(32 << 20).decode()
                     completed = checkpoint.completed_checkpoint(metrics)
                 except (OSError, ValueError):
-                    time.sleep(.25)
+                    time.sleep(interval)
                     continue
                 progress.append(dict(seconds=time.monotonic()-start, completed_checkpoint=completed))
                 if completed > tip:
                     raise RuntimeError('replay passed frozen tip')
                 final_count = final_count+1 if completed == tip else 0
-                if final_count == 2:
+                if final_count == 2 and not short_run:
                     break
-                time.sleep(.25)
+                time.sleep(interval)
             else:
                 raise TimeoutError(f'{mode}: foreground deadline exceeded')
         except BaseException as error:
@@ -226,15 +238,31 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
             raise
     elapsed = time.monotonic()-start
     (owned.root / f'{mode}-foreground.prom').write_text(metrics)
-    metrics, catchup = checkpoint.wait_for_rpc_indexes(child, config['metrics-address'], tip, metrics)
-    certified = checkpoint.rpc(config['json-rpc-address'], 'sui_getCheckpoint', [str(tip)])
-    if certified['digest'] != digest or int(certified['sequenceNumber']) != tip:
-        raise RuntimeError('completed certified checkpoint digest mismatch')
     schema = deployment.schemas(Path(extra['SUI_SHARDED_WAL_SCHEMA_OUTPUT']),
                                 'sharded-wal' if mode == 'remote' else 'native')
-    namespaces = live_metric_namespaces(schema, int(certified['epoch']))
-    metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
-        remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
+    if short_run:
+        # The node exits 0 after the inclusive bound. Its RPC and final-metrics
+        # path are gone, so keep the last live scrape and use the producer's
+        # certified checkpoint for the epoch and digest identity.
+        (owned.root / f'{mode}-final.prom').write_text(metrics)
+        catchup = dict(available=False, started=0, indexed=0, tip=tip,
+                       reason='short replay: node stopped at the inclusive bound')
+        certified = dict(sequenceNumber=tip, digest=digest,
+                         epoch=int(certified_epoch), source='producer')
+        namespaces = live_metric_namespaces(schema, int(certified_epoch))
+        freshness = dict(available=False, required_namespaces=namespaces,
+                         source='last_live_scrape',
+                         reason='short replay: node exited at the inclusive bound; '
+                                'final metrics are the last live scrape and the state '
+                                'audit reopens the stopped stores')
+    else:
+        metrics, catchup = checkpoint.wait_for_rpc_indexes(child, config['metrics-address'], tip, metrics)
+        certified = checkpoint.rpc(config['json-rpc-address'], 'sui_getCheckpoint', [str(tip)])
+        if certified['digest'] != digest or int(certified['sequenceNumber']) != tip:
+            raise RuntimeError('completed certified checkpoint digest mismatch')
+        namespaces = live_metric_namespaces(schema, int(certified['epoch']))
+        metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
+            remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
     # SIGTERM only after committed indexer frontiers; audit subsequently reopens all stores.
     owned.stop(child)
     if child.returncode not in (0, -signal.SIGTERM):
@@ -253,6 +281,9 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
         checkpoint_limit=tip, completed_window=checkpoint.completion_window(progress), progress=progress,
         phase_timing=checkpoint.replay_phases((owned.root / f'{mode}.log').read_text(), elapsed),
         rpc_index_catchup=catchup, final_metrics_freshness=freshness, exit_code=child.returncode,
+        bound=bound, short_run=short_run, final_metrics_source=(
+            'last_live_scrape' if short_run else 'post-certified live scrape'),
+        certified_source=('producer' if short_run else 'measured node'),
         peak_sampled_rss_bytes=max(sum(p.get('VmRSS', 0) for p in [r['node'], *r['shards']]) for r in samples),
         process_io_final=samples[-1], host_before=samples[0]['host'], host_after=samples[-1]['host'],
         disk_samples=disk_samples if disk_sample else None, disk_final=final_disk)
@@ -616,12 +647,30 @@ def producer_command(binary, config_path):
     return [binary, '--config-path', config_path]
 
 
-def configure_range(config, *, mode, tip):
-    """Producer: no range. Measured nodes: the inclusive highest sequence."""
+def require_short_exit(log_path, tip, *, mode='replay'):
+    """A short run may exit 0 only after executing the requested last checkpoint."""
+    watermark = checkpoint.log_executed_watermark(log_path)
+    if watermark != tip:
+        raise RuntimeError(f'{mode}: short replay exited 0 after checkpoint '
+                           f'{watermark}, expected {tip}')
+    return watermark
+
+
+def replay_mode(source_tip, requested):
+    """Full cells keep the node alive; short cells exit at the inclusive N-1."""
+    tip = requested_checkpoint(source_tip, requested)
+    short_run = tip != source_tip
+    return dict(tip=tip, short_run=short_run,
+                bound=tip if short_run else source_tip + 1)
+
+
+def configure_range(config, *, mode, tip, short_run):
+    """Producer: no range. Measured nodes: full stays alive, short exits at N-1."""
     if mode == 'producer':
         config.pop('run-with-range', None)
     else:
-        config['run-with-range'] = checkpoint.CheckpointBound(replay_bound(tip))
+        bound = tip if short_run else tip + 1
+        config['run-with-range'] = checkpoint.CheckpointBound(replay_bound(bound))
     return config
 
 
@@ -749,8 +798,10 @@ def main():
     source_tip, expected_digest = prior['checkpoint_limit'], prior['checkpoint_digest']
     if not 0 < source_tip < 5000:
         raise ValueError('fixture does not retain the complete genesis range')
-    tip = requested_checkpoint(source_tip, args.checkpoints)
+    mode_range = replay_mode(source_tip, args.checkpoints)
+    tip, short_run, bound = mode_range['tip'], mode_range['short_run'], mode_range['bound']
     replay_digest = expected_digest
+    prefix_epoch = None
     # Lock original fixture DB; only the experiment lock file is created there.
     lock = (fixture/'experiment/.sharded-replay.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -777,7 +828,7 @@ def main():
         config['db-path']=str(root/mode/relative)
         config['consensus-config']=None
         config['fullnode-sync-mode']='state-sync-only'
-        configure_range(config, mode=mode, tip=tip)
+        configure_range(config, mode=mode, tip=tip, short_run=short_run)
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
@@ -839,12 +890,18 @@ def main():
         if result['source_range'] != prior['verified_source_range']:
             raise ValueError('complete source digest range differs')
         replay_digest = expected_digest
-        if tip != source_tip:
-            replay_digest = checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])['digest']
+        if short_run:
+            prefix = checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])
+            replay_digest = prefix['digest']
+            prefix_epoch = int(prefix['epoch'])
+            result['checkpoint_digest'] = replay_digest
             result['source_range_prefix'] = checkpoint.verify_source_range(address, tip)
         result['source_checkpoint_limit'] = source_tip
+        result['short_run'] = short_run
+        result['bound'] = bound
         native_extra=dict(SUI_SHARDED_WAL_ROOT=str(native_root), SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(output/'native-schema'))
-        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,replay_digest,native_extra,[],args.deadline)
+        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,replay_digest,native_extra,[],args.deadline,
+            bound=bound, short_run=short_run, certified_epoch=prefix_epoch)
         schema=deployment.schemas(output/'native-schema', 'native')
         shards=[]
         if args.external_config:
@@ -914,7 +971,8 @@ def main():
         result['disk_geometry'] = dict(fragment_bytes=args.fragment_mib*deployment.MIB,
             production_fragment_bytes=1024*deployment.MIB,
             matches_production=args.fragment_mib == 1024)
-        result['remote']=replay(owned,bins/'sui-node-remote',root,'remote',tip,expected_digest,remote_extra,shards,args.deadline,
+        result['remote']=replay(owned,bins/'sui-node-remote',root,'remote',tip,replay_digest,remote_extra,shards,args.deadline,
+            bound=bound, short_run=short_run, certified_epoch=prefix_epoch,
             disk_sample=disk_sample, disk_interval_seconds=args.disk_sample_seconds)
         result['disk'] = dict(geometry=result['disk_geometry'],
             samples=result['remote']['disk_samples'], final=result['remote']['disk_final'])
@@ -926,8 +984,9 @@ def main():
         if deployment.schemas(output/'remote-schema', 'sharded-wal') != schema:
             raise ValueError('remote selected schema differs from native')
         from analyze import adapter_stats, checkpoint_sequence_cache_stats, metric_cut, metrics
-        metric_cut(metrics(output/'remote-final.prom'),
-                   result['remote']['final_metrics_freshness']['required_namespaces'], remote=True)
+        if not short_run:
+            metric_cut(metrics(output/'remote-final.prom'),
+                       result['remote']['final_metrics_freshness']['required_namespaces'], remote=True)
         counters = adapter_stats(metrics(output/'remote-final.prom'))
         result['adapter_metrics_available'] = bool(counters)
         required = {'read_calls','read_keys','read_rpcs','cache_hits','cache_misses',
@@ -970,6 +1029,8 @@ def main():
             if not checkpoint_sequence_cache_stats(metrics(output / f'{mode}-foreground.prom')):
                 raise ValueError('checkpoint sequence-cache counters are unavailable')
         result['audit']=audit(root,output,bins,schema,native_root,remote_root,config_path,env)
+        result['audit_scope'] = ('re-open of both stopped stores after a short bound; shards stayed live'
+                                 if short_run else 're-open of both stopped stores; shards stayed live')
         if producer.poll() is not None or int(checkpoint.rpc(address,'sui_getLatestCheckpointSequenceNumber')) != source_tip or checkpoint.verify_source_range(address,source_tip)!=result['source_range']:
             raise RuntimeError('source changed across paired replays')
         if tip != source_tip and checkpoint.rpc(address,'sui_getCheckpoint',[str(tip)])['digest'] != replay_digest:

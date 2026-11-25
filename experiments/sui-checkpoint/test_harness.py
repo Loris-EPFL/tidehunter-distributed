@@ -660,19 +660,42 @@ class RunnerKnobs(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'panics below 3'):
                 self.environment(**{field: 2})
 
-    def test_producer_has_no_range_and_measured_nodes_use_count_minus_one(self):
+    def test_producer_has_no_range_and_measured_modes_are_explicit(self):
         producer = {'run-with-range': run.checkpoint.CheckpointBound(1775), 'db-path': 'x'}
-        run.configure_range(producer, mode='producer', tip=1775)
+        run.configure_range(producer, mode='producer', tip=1775, short_run=False)
         self.assertNotIn('run-with-range', producer)
         command = run.producer_command('sui-node-native', 'producer.yaml')
         self.assertEqual(command, ['sui-node-native', '--config-path', 'producer.yaml'])
         self.assertNotIn('--run-with-range-checkpoint', command)
+        full = run.replay_mode(1775, None)
+        self.assertEqual(full, dict(tip=1775, short_run=False, bound=1776))
+        self.assertEqual(run.replay_mode(1775, 1776), full)
         for mode in ('native', 'remote'):
             config = {'run-with-range': 0}
-            run.configure_range(config, mode=mode,
-                                tip=run.requested_checkpoint(1775, 8))
-            self.assertEqual(config['run-with-range'], 7)
-            self.assertEqual(int(config['run-with-range']) + 1, 8)
+            run.configure_range(config, mode=mode, tip=1775, short_run=False)
+            self.assertEqual(int(config['run-with-range']), 1776)
+        short = run.replay_mode(1775, 8)
+        self.assertEqual(short, dict(tip=7, short_run=True, bound=7))
+        for mode in ('native', 'remote'):
+            config = {'run-with-range': 0}
+            run.configure_range(config, mode=mode, tip=short['tip'],
+                                short_run=short['short_run'])
+            self.assertEqual(int(config['run-with-range']), 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'node.log'
+            log.write_text('INFO Finished syncing and executing checkpoint 6\n'
+                           'INFO Finished syncing and executing checkpoint 7\n')
+            self.assertEqual(run.checkpoint.log_executed_watermark(log), 7)
+            log.write_text('INFO checkpoint 7 without the watermark marker\n')
+            self.assertIsNone(run.checkpoint.log_executed_watermark(log))
+            log.write_text('INFO Finished syncing and executing checkpoint 7\n')
+            self.assertEqual(run.require_short_exit(log, 7), 7)
+            for tip in (6, 8):
+                with self.subTest(tip=tip), self.assertRaisesRegex(RuntimeError, 'expected'):
+                    run.require_short_exit(log, tip)
+            log.write_text('nothing executed\n')
+            with self.assertRaisesRegex(RuntimeError, 'None'):
+                run.require_short_exit(log, 7)
 
     def test_checkpoint_limit_is_an_inclusive_count(self):
         for requested, expected in ((None, 1775), (1, 0), (8, 7), (100, 99),

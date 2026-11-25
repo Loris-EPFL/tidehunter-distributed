@@ -250,3 +250,20 @@ def replay_phases(text, elapsed_seconds):
         raise ValueError("process elapsed and logged execution timeline disagree")
     return {**timing, "after_first_execution_to_exit_upper_seconds": elapsed_seconds - startup,
             "phase_note": "upper bound includes final execution, shutdown and exit polling; not completion latency or steady state"}
+
+
+_EXECUTED_WATERMARK = re.compile(r"Finished syncing and executing checkpoint ([0-9]+)")
+
+
+def log_executed_watermark(path):
+    """Highest checkpoint Sui logged as executed, or None."""
+    value = None
+    try:
+        lines = Path(path).read_text(errors='replace').splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = _EXECUTED_WATERMARK.search(line)
+        if match:
+            value = int(match.group(1))
+    return value

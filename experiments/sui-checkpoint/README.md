@@ -436,9 +436,13 @@ producer. Both measured DB roots are new. Producer and measured configs are
 state-sync-only fullnodes. The producer is a checkpoint source and receives no
 `run-with-range` at all: its database already holds the frozen tip, so a range
 equal to the tip is met at startup, before Sui's executor shutdown receiver
-exists, and Sui panics. Only the measured native and remote nodes are bounded,
-at the inclusive highest sequence (`--checkpoints N` ends at N-1). Their
-certified completed tip must equal the producer.
+exists, and Sui panics. Only the measured native and remote nodes are bounded.
+A full-range cell uses `source_tip + 1`, which the frozen store never reaches,
+so the node stays alive at the tip for the final scrape and the live audit. A
+short cell (`--checkpoints N`) uses the inclusive `N-1`, so the node executes
+exactly N and exits 0; the runner requires that watermark, uses the last live
+scrape and then audits the stopped stores. Their certified completed tip must
+equal the producer.
 The producer alone receives `source_environment(prior)`: its original fragment
 size and durability policy, with historical defaults of 32 MiB and asynchronous
 writes. Measured durable settings must never reinterpret the producer's WAL.
@@ -475,7 +479,11 @@ in `results.json:knobs` and `results.json:environment`:
 `--pacing-ms` (valid only with a `SUI_CHECKPOINT_EXECUTION_PACING_MS` hook in
 the frozen Sui executor, detected under `checkpoint_executor/` or in the built
 node's strings; refused otherwise rather than claimed), `--checkpoints N`
-(replay exactly N checkpoints 0..N-1; Sui's RunWithRange bound is inclusive),
+(a short cell replays exactly N checkpoints 0..N-1: its inclusive bound is
+N-1, so Sui exits 0 at the bound; the runner accepts only that watermark, keeps
+the last live scrape as final metrics and runs the state audit by reopening the
+stopped stores. A full-range cell uses the unreachable `source_tip + 1` bound so
+the node stays live for the final scrape and the live audit),
 `--value-cache-size` (`TH_VALUE_CACHE_SIZE`),
 `--default-value-cache-size` (`TH_DEFAULT_VALUE_CACHE_SIZE`, default 1000),
 `--max-dirty-keys` (`TH_DEFAULT_MAX_DIRTY_KEYS`, default 1024),
