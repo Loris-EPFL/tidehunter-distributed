@@ -680,7 +680,13 @@ python3 experiments/sui-checkpoint/stage3_campaign.py \
 `--from <cell-id>` shifts the plan, `--continue-on-failure` keeps measuring
 after a failed cell (the default stops), and every non-reference spec is
 `-cache0`; the two `-cache1000` read-only C=16 cells are the labelled cache-on
-reference pair.
+reference pair. `backend.options.value_cache_size` carries the same count into
+the distributed and native keyspace configuration.
+
+The Sui campaign's three stages do not use `manual_campaign.py`. That module
+remains the KV/NVMe-oF fleet orchestrator. Stage 1 and stage 2 are driven by
+`manual_sui.py` on the three Sui hosts, and stage 3 is driven by
+`stage3_campaign.py` on the same hosts; both use the shared campaign ledger.
 
 The retired compact six-VM Sui spec (`sui_nvmeof_compact`,
 `sui_nvmeof_harness_synchronous`) is not used by the campaign. The three-stage

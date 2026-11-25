@@ -39,6 +39,7 @@ from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'sui-checkpoint'))
 import campaign_ledger as ledger_module
+import gcs_ledger
 
 PREPARATION_SECONDS = 900
 PAIR_SECONDS = 1200
@@ -1372,6 +1373,14 @@ def output_artifacts(root):
     return rows
 
 
+def publish_ledger(store, ledger, run_id):
+    """Write the local ledger, then its generation-preconditioned bucket copy."""
+    if isinstance(store, gcs_ledger.ObjectStore):
+        return gcs_ledger.save_ledger(store, ledger,
+                                      f'runs/{run_id}/campaign-ledger.json')
+    return ledger.save()
+
+
 async def _finish_campaign(config, parent, path, store, execute, output, error):
     """Use early teardown only after a terminal, durably bound export."""
     failures = [error] if error is not None else []
@@ -1619,7 +1628,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_lease_owned, store, parent)
         entry = ledger.begin(stage='campaign', cell_id='suite', config_hash=identity,
                              unit='suite')
-        ledger.save()
+        publish_ledger(store, ledger, parent['run_id'])
         result = await _suite(store, admitted_config, fleet_state, fleet_path, fleet, package, spec, out, rdma_device)
         await _blocking(_record, path, parent, 'complete')
     except BaseException as exc:
@@ -1630,7 +1639,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
             ledger.mark_passed(entry, output_artifacts(out))
         else:
             ledger.fail(entry, error)
-        ledger.save()
+        publish_ledger(store, ledger, parent['run_id'])
     return {'parent_run_id': parent['run_id'], 'children': parent['children'],
             'observer_qualification': observer_qualification,
             'image_qualification': reference, 'terminal': result}
