@@ -8,10 +8,12 @@ its host, starts the owner process groups, runs the paired `run.py` with
 `resources-required` handshake with sampled `/proc` evidence, and stops only the
 groups it started.
 
-Remote commands go through one `execute(argv, stdin)` callback. The default
-callback is `gcloud compute ssh --command`, so a test can substitute a fake
-without a cloud account. Every owner archive is extracted into the same absolute
-guest root on every host, as the engine manifest requires.
+Remote commands go through `host_exec.HostExecution`, the one seam shared with
+`stage3_campaign.py` and `fault_cells.py`. The default implementation is
+`host_exec.GcloudSsh` (`gcloud compute ssh --command`), so another executor — a
+bucket mailbox, a test double — is a constructor swap. Every owner archive is
+extracted into the same absolute guest root on every host, as the engine
+manifest requires.
 """
 import argparse
 import json
@@ -32,6 +34,7 @@ import campaign_manifest
 import campaign_upload as upload_module
 import checkpoint_support as checkpoint
 import deployment
+import host_exec
 import proc_sampler
 
 OWNER_READY_SECONDS = 120
@@ -52,45 +55,6 @@ def plan(coordinator, owners):
     if len(set([coordinator, *owners])) != 3:
         raise ValueError('coordinator and owner hosts must be distinct')
     return dict(coordinator=coordinator, owners=list(owners))
-
-
-class Remote:
-    """One shell command per host through an injected gcloud argv builder."""
-
-    def __init__(self, zone, *, execute=None, iap=False):
-        self.zone, self.execute, self.iap = zone, execute or self._gcloud, iap
-
-    def _gcloud(self, argv, stdin=None):
-        completed = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, timeout=1800)
-        return completed.returncode, completed.stdout, completed.stderr
-
-    def argv(self, host, command):
-        value = ['gcloud', 'compute', 'ssh', host, '--zone', self.zone,
-                 '--quiet', f'--command={command}']
-        if self.iap:
-            value.append('--tunnel-through-iap')
-        return value
-
-    def run(self, host, command, *, stdin=None, check=True):
-        code, out, err = self.execute(self.argv(host, command), stdin=stdin)
-        if check and code != 0:
-            raise LaunchError(f'{host}: command failed ({code}): '
-                              f'{err.decode(errors="replace")[-2000:]}')
-        return code, out, err
-
-    def shell(self, host, command, *, stdin=None, check=True):
-        return self.run(host, 'sh -lc ' + shlex.quote(command), stdin=stdin, check=check)
-
-    def read_bytes(self, host, path):
-        code, out, err = self.shell(host, f'cat {shlex.quote(str(path))}', check=False)
-        if code != 0:
-            raise LaunchError(f'{host}: cannot read {path}: {err.decode(errors="replace")}')
-        return out
-
-    def exists(self, host, path):
-        code, _, _ = self.shell(host, f'test -e {shlex.quote(str(path))}', check=False)
-        return code == 0
 
 
 class SuiLauncher:
@@ -548,7 +512,7 @@ def main():
         if store is not None:
             resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
     launcher = SuiLauncher(
-        remote=Remote(args.zone, iap=args.tunnel_through_iap),
+        remote=host_exec.GcloudSsh(args.zone, iap=args.tunnel_through_iap),
         build_root=args.build, fixture=args.fixture, output=output,
         guest_root=args.guest_root,
         stage_dir=args.stage_dir or output.with_name(output.name + '-stages'),

@@ -19,8 +19,8 @@ frozen `storage-node` (`kv-research`) binary:
 Cell definitions, specs and check lists live in
 `experiments/sui-checkpoint/stage2_mechanism.py`; this module performs the
 lifecycle and records timestamps. Remote commands go through
-`manual_sui.Remote`, the same injected `gcloud compute ssh` boundary the Sui
-stages use, so a test substitutes a fake without a cloud account.
+`host_exec.HostExecution`, the same seam the Sui stages use, so a bucket-mailbox
+executor or a test double is a constructor swap.
 
 Every cell here is a synthetic mechanism cell over the campaign topology, not a
 Sui-adapter result. `--dry-run` prints the plan without touching a host.
@@ -45,6 +45,7 @@ import campaign_ledger as ledger_module
 import campaign_manifest
 import campaign_upload
 import disk_collector
+import host_exec
 import manual_sui
 import stage2_mechanism as mechanism
 
@@ -1086,7 +1087,7 @@ def main():
         store, _, prefix = campaign_upload.open_store(
             args.bucket_prefix, args.impersonation_account)
     hosts = manual_sui.plan(args.coordinator, args.owners.split(','))
-    cluster = Cluster(remote=manual_sui.Remote(args.zone, iap=args.tunnel_through_iap),
+    cluster = Cluster(remote=host_exec.GcloudSsh(args.zone, iap=args.tunnel_through_iap),
                       build_root=args.build, output=output,
                       guest_root=args.guest_root, config_dir=config_dir,
                       owners=hosts['owners'], tier=tier, transport=args.transport,

@@ -16,6 +16,7 @@ import unittest
 
 import gcp_api
 import gcs_ledger
+import host_exec
 import manual_sui
 from test_gcs_ledger import FakeObjectStore
 
@@ -171,7 +172,7 @@ class LauncherShape(unittest.TestCase):
                 manual_sui.plan(coordinator, owners)
 
     def test_gcloud_argv_names_the_host_and_zone(self):
-        remote = manual_sui.Remote('us-central1-a')
+        remote = host_exec.GcloudSsh('us-central1-a')
         self.assertEqual(remote.argv('owner-1', 'true'), [
             'gcloud', 'compute', 'ssh', 'owner-1', '--zone', 'us-central1-a',
             '--quiet', '--command=true'])
@@ -193,7 +194,7 @@ class LauncherHandshake(unittest.TestCase):
     def launcher(self, directory='', **overrides):
         base = self.root / directory if directory else self.root
         values = dict(
-            remote=manual_sui.Remote('us-central1-a', execute=self.gcloud),
+            remote=host_exec.GcloudSsh('us-central1-a', runner=self.gcloud),
             build_root=self.build.root, fixture=self.fixture,
             output=base / 'run', guest_root=self.root / 'guest',
             stage_dir=base / 'stages', config_dir=base / 'external-config',

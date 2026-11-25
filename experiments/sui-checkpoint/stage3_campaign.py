@@ -67,6 +67,7 @@ sys.path.insert(0, str(HERE.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
 import campaign_upload
 import gcp_manual_storage
+import host_exec
 import manual_sui
 import proc_sampler
 import stage3_specs
@@ -858,7 +859,7 @@ def main():
                         stale_root=root / 'stage3' / 'stale', mode=args.mode)
     remote = owners = None
     if cluster:
-        remote_transport = manual_sui.Remote(args.zone, iap=args.iap)
+        remote_transport = host_exec.GcloudSsh(args.zone, iap=args.iap)
         local.remote = remote_transport
         remote = HostRunner(remote=remote_transport,
                             host=args.native_host or owner_hosts[0],
