@@ -285,6 +285,7 @@ impl HybridTable {
             metrics.clone(),
             SharedLastProcessed::default(),
             loader.as_ref(),
+            health.clone(),
         );
         let opened_fronts = region
             .as_ref()
@@ -1078,6 +1079,9 @@ impl TableInner {
                 Ok(((), changed))
             })
             .map_err(|error| match error {
+                CellUpdateError::Background(error) => {
+                    LocalDbError::new(format!("relocation apply: {error:?}"))
+                }
                 CellUpdateError::Loader(error) => error,
             })?;
         Ok(())
@@ -1211,8 +1215,9 @@ impl TableInner {
     ) -> Result<(), LocalDbError> {
         self.check_background_health()?;
         let context = self.contexts.ks_context(ks);
-        self.table.drop_cells_in_range(context, &from, &to);
-        Ok(())
+        self.table
+            .drop_cells_in_range(context, &from, &to)
+            .map_err(|error| LocalDbError::new(format!("drop cells in range: {error:?}")))
     }
 
     /// Native `Db::check_background_health`: once a flusher (or any worker the

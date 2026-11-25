@@ -80,6 +80,7 @@ pub(crate) trait ReplaySource<P: IndexPosition> {
 #[derive(Debug)]
 pub(crate) enum ReplayError<E> {
     Source(E),
+    Db(DbError),
 }
 
 impl<E> ReplayError<E> {
@@ -92,6 +93,7 @@ impl<E> ReplayError<E> {
     {
         match self {
             Self::Source(error) => error.into(),
+            Self::Db(error) => error,
         }
     }
 }
@@ -100,6 +102,7 @@ impl<E: std::fmt::Display> std::fmt::Display for ReplayError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "replay source failed: {error}"),
+            Self::Db(error) => write!(f, "replay apply failed: {error:?}"),
         }
     }
 }
@@ -268,7 +271,9 @@ pub(crate) fn replay_wal<P: IndexPosition, S: ReplaySource<P>, L: Loader<Positio
                 // cells exist as Unloaded entries from a CR snapshot loaded
                 // at replay start).
                 buffer.drop_cells_in_range(ks, &from_cell, &to_cell);
-                large_table.drop_cells_in_range(context, &from_cell, &to_cell);
+                large_table
+                    .drop_cells_in_range(context, &from_cell, &to_cell)
+                    .map_err(ReplayError::Db)?;
             }
             entry @ WalEntry::CompressedBatch(..) => {
                 // A compressed batch is one durable WAL frame — either it

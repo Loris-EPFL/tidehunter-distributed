@@ -30,6 +30,7 @@ fn reopened<P: IndexPosition>(
         Metrics::new(),
         SharedLastProcessed::default(),
         loader,
+        Arc::default(),
     )
 }
 
@@ -130,6 +131,7 @@ fn live_insert_takes_the_loader_cadence_on_first_dirtying_only() {
         Metrics::new(),
         SharedLastProcessed::default(),
         &loader,
+        Arc::default(),
     );
     let context = table.ks_context(KeySpace::first());
     let write = |offset| {
@@ -170,6 +172,7 @@ fn native_cadence_follows_the_stored_frontier() {
         Metrics::new(),
         SharedLastProcessed::default(),
         &loader,
+        Arc::default(),
     );
     let context = table.ks_context(KeySpace::first());
     let cell = context.ks_config.cell_id(&key(1));

@@ -2,9 +2,7 @@
 // with the two-pass snapshot mechanism.
 use crate::cell::CellId;
 use crate::context::KsContext;
-#[cfg(feature = "experimental-distributed")]
-use crate::db::BackgroundThread;
-use crate::db::Db;
+use crate::db::{BackgroundThread, Db};
 use crate::index::index_format::IndexFormat;
 use crate::index::index_table::IndexTable;
 use crate::index::levels::{IndexLevels, IndexShard};
@@ -55,7 +53,6 @@ pub(crate) trait FlusherHost<P: IndexPosition>:
     /// large-table failpoint; a host without failpoints keeps it a no-op.
     fn before_flush_completion(&self) {}
 
-    #[cfg(feature = "experimental-distributed")]
     fn background_health(&self) -> Arc<crate::background_health::BackgroundHealth>;
 }
 
@@ -174,19 +171,14 @@ impl<P: IndexPosition> IndexFlusher<P> {
                     metrics.clone(),
                     thread_id,
                 );
-                let run = move || flusher_thread.run();
-                #[cfg(feature = "experimental-distributed")]
-                let run = {
-                    let health = db
-                        .upgrade()
-                        .expect("opener keeps the database alive")
-                        .background_health();
-                    move || health.run(BackgroundThread::Flusher, run)
-                };
+                let health = db
+                    .upgrade()
+                    .expect("opener keeps the database alive")
+                    .background_health();
 
                 thread::Builder::new()
                     .name(format!("flusher-{thread_id}"))
-                    .spawn(run)
+                    .spawn(move || health.run(BackgroundThread::Flusher, || flusher_thread.run()))
                     .unwrap()
             })
             .collect()

@@ -68,6 +68,7 @@ impl<P: IndexPosition> Fixture<P> {
             metrics.clone(),
             SharedLastProcessed::default(),
             &loader,
+            Arc::default(),
         );
         Self {
             shape,

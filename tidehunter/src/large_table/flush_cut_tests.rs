@@ -150,6 +150,7 @@ impl<P: IndexPosition> Fixture<P> {
             Metrics::new(),
             SharedLastProcessed::default(),
             &loader,
+            Arc::default(),
         );
         Self {
             shape,
@@ -454,6 +455,7 @@ fn reopen_from(
             Metrics::new(),
             SharedLastProcessed::default(),
             &fixture.loader,
+            Arc::default(),
         ),
         loader: MovingFrontierLoader {
             disk: parking_lot::Mutex::new(fixture.loader.disk.lock().clone()),

@@ -1,7 +1,6 @@
 use super::WalPosition;
 use super::position::LastProcessed;
 use crate::WalLayout;
-#[cfg(feature = "experimental-distributed")]
 use crate::background_health::{BackgroundHealth, BackgroundThread};
 use crate::latch::LatchGuard;
 use crate::metrics::{MetricIntGauge, Metrics, TimerExt};
@@ -195,7 +194,7 @@ impl WalTracker {
         mapper: WalMapper,
         last_processed: LastProcessed,
         metrics: Arc<Metrics>,
-        #[cfg(feature = "experimental-distributed")] health: Arc<BackgroundHealth>,
+        health: Arc<BackgroundHealth>,
         shared: SharedLastProcessed,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -224,12 +223,9 @@ impl WalTracker {
             metric_internal,
             metric_active_latches,
         };
-        let run = move || thread.run();
-        #[cfg(feature = "experimental-distributed")]
-        let run = move || health.run(BackgroundThread::WalTracker, run);
         let jh = thread::Builder::new()
             .name("wal-tracker".to_string())
-            .spawn(run)
+            .spawn(move || health.run(BackgroundThread::WalTracker, || thread.run()))
             .expect("failed to start wal-tracker thread");
         Self {
             jh: Some(jh),
@@ -720,7 +716,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -735,7 +730,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -749,7 +743,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -783,7 +776,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -811,7 +803,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -851,7 +842,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -903,7 +893,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
@@ -965,7 +954,6 @@ mod tests {
             WalMapper::new_unstarted().0,
             LastProcessed::new(0),
             Metrics::new(),
-            #[cfg(feature = "experimental-distributed")]
             Arc::default(),
             SharedLastProcessed::default(),
         );
