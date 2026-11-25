@@ -6,8 +6,9 @@
 //! linearizability search: after the join, every acknowledged batch has applied
 //! its edits exactly once and no two writers touch one key. Readers run after
 //! the writers join and compare their partition to the model. The fresh block
-//! rewrites every key after the rounds, so the relocation filter stops at a
-//! live value above all earlier data and the pass reclaims a real dead prefix.
+//! rewrites every key twice after the rounds, so the relocation filter stops at
+//! a live value above all earlier data and both arms reclaim a real dead prefix
+//! of whole value WAL files.
 //!
 //! `TH_GATE_SCHEDULES` sets the schedule count (default 200, maximum 1000);
 //! `TH_GATE_SEED` sets the base seed. A failure prints both and the schedule,
@@ -16,8 +17,8 @@
 
 use super::native_parity_gates::{
     Bounds, Edit, Model, Phase, apply_phase, assert_same_reads, assert_same_rows, close_arm,
-    expected_rows, filtered_shape, fixture, hex, keys, model_edit, native_config, open_hybrid,
-    open_native, read_one, scan, sequential_apply, value,
+    expected_rows, filtered_shape, fixture, hex, keys, model_edit, native_arm_config,
+    native_config, open_hybrid, open_native, read_one, scan, sequential_apply, value,
 };
 use crate::RelocationGate;
 use crate::distributed::sui::Db as SuiDb;
@@ -36,11 +37,11 @@ const ROUNDS: usize = 3;
 /// A reopen every ten schedules bounds the retained index generations while
 /// still exercising the reopen path many times within one sweep.
 const REOPEN_EVERY: usize = 10;
-/// The hybrid pass runs every schedule; the native pass runs every fiftieth.
-/// Native's single value WAL file is far larger than the fixture's owner files,
-/// so its whole-file target stays at zero and a per-schedule pass would rescan
-/// every earlier schedule's bytes (quadratic in the sweep). The native arm is
-/// the state oracle here; its relocation decisions have their own gates.
+/// The hybrid pass runs every schedule; the native pass every fiftieth, so one
+/// native pass scans about fifty schedules of dead records and reclaims a real
+/// multi-file prefix of its value WAL, while the sweep does not pay the native
+/// pass's whole-prefix scan and control-region rebuild on every schedule. Both
+/// arms must report `DidWork` on the passes they run.
 const NATIVE_RELOCATE_EVERY: usize = 50;
 const DEFAULT_SCHEDULES: usize = 200;
 const MAX_SCHEDULES: usize = 1000;
@@ -101,20 +102,26 @@ fn write_plans(seed: u64, round: usize) -> Vec<Vec<Edit>> {
         .collect()
 }
 
-/// Rewrite every key at a fresh generation, then delete the tail keys. All
-/// earlier data becomes dead, so the next pass reclaims a whole dead prefix.
+/// Rewrite every key twice, at a dead then a fresh generation, and delete the
+/// tail keys. All earlier data becomes dead and so does the first block, so the
+/// next pass has a whole dead prefix of at least one block. Native's value WAL
+/// files are 8 KiB (`GATE_WAL_FILE`) and its relocation reclaims only whole
+/// files, so a single live block (about 12 KiB here) would leave the first
+/// scheduled native pass short of a file after one schedule; with two blocks the
+/// pass reclaims a whole file whatever the seed and the schedule count.
 fn fresh_phase(seed: u64, schedule: usize) -> Phase {
     let all = keys();
     let generation = 1000 + schedule as u64;
-    let mut batches: Vec<Vec<Edit>> = all
-        .chunks(4)
-        .map(|chunk| {
+    let mut batches: Vec<Vec<Edit>> =
+        Vec::with_capacity(all.len().div_ceil(4) * 2 + FRESH_DELETES.div_ceil(4));
+    for pass in [generation, generation + 1] {
+        batches.extend(all.chunks(4).map(|chunk| {
             chunk
                 .iter()
-                .map(|key| Edit::Put(key.clone(), value(seed, key, generation)))
+                .map(|key| Edit::Put(key.clone(), value(seed, key, pass)))
                 .collect()
-        })
-        .collect();
+        }));
+    }
     for chunk in all[all.len() - FRESH_DELETES..].chunks(4) {
         batches.push(chunk.iter().map(|key| Edit::Delete(key.clone())).collect());
     }
@@ -196,12 +203,13 @@ fn concurrent_schedule_sweep_matches_the_sequential_model() {
     let seed = base_seed();
     let schedules = schedule_count();
     eprintln!("schedule sweep: seed={seed:#x} schedules={schedules}");
-    let config = native_config();
+    let index_config = native_config();
+    let value_config = native_arm_config();
     let live = Arc::new(Mutex::new(Model::new()));
     let shape = filtered_shape(Arc::clone(&live));
-    let fixture = fixture(&config, shape.clone());
+    let fixture = fixture(&index_config, shape.clone());
     let native_root = tempdir::TempDir::new("native-schedule-sweep").expect("native root");
-    let mut native = open_native(native_root.path(), &config, &shape);
+    let mut native = open_native(native_root.path(), &value_config, &shape);
     let mut hybrid = open_hybrid(&fixture);
     let ks = native.ks(KS_NAME);
     let domain = keys();
@@ -253,11 +261,17 @@ fn concurrent_schedule_sweep_matches_the_sequential_model() {
         }
 
         if (schedule + 1) % NATIVE_RELOCATE_EVERY == 0 || schedule + 1 == schedules {
-            apply_phase(
+            let native_gate = apply_phase(
                 &native,
                 ks,
                 &Phase::relocate(),
                 &format!("schedule {schedule} native"),
+            );
+            assert!(
+                matches!(native_gate, Some(RelocationGate::DidWork)),
+                "schedule {schedule} seed={schedule_seed:#x}: the native relocation pass must \
+                 reclaim the whole dead value WAL files behind the fresh block, got \
+                 {native_gate:?}"
             );
         }
         let hybrid_gate = apply_phase(
@@ -294,7 +308,7 @@ fn concurrent_schedule_sweep_matches_the_sequential_model() {
         if (schedule + 1) % REOPEN_EVERY == 0 || schedule + 1 == schedules {
             close_arm(native, "native before reopen");
             close_arm(hybrid, "hybrid before reopen");
-            native = open_native(native_root.path(), &config, &shape);
+            native = open_native(native_root.path(), &value_config, &shape);
             hybrid = open_hybrid(&fixture);
             assert_same_reads(
                 schedule_seed,

@@ -8,11 +8,20 @@
 //! The expected state is the sequential replay of the same plan, so a failure
 //! names the phase, the key and the seed.
 //!
-//! Both arms use the same `Config::small()` index geometry: the native arm opens
-//! with that config, the hybrid arm receives
-//! [`HybridIndexConfig::from_native`] of it. Automatic snapshots are off
-//! (`snapshot_written_bytes` unsigned-max), so only the explicit store before a
-//! reopen decides the persisted image.
+//! Both arms compare the same observable state, but their WAL geometry is not
+//! identical. [`native_config`] keeps `Config::small()`'s sizes and supplies the
+//! index geometry of both arms (the hybrid receives
+//! [`HybridIndexConfig::from_native`] of it); the native arm opens with
+//! [`native_arm_config`], whose value WAL uses the fixture's owner geometry
+//! (two [`GATE_FRAG_SIZE`] fragments in a [`GATE_WAL_FILE`] file). WAL file size
+//! is a layout knob only: native's WAL-based relocation cuts exclusively on
+//! whole-file boundaries, so with the default 4 MiB files this key domain never
+//! fills one file and every native pass reports `NoWork`. The smaller files let
+//! the native arm reclaim real whole files, the hybrid arm already cuts on its
+//! 8 KiB owner files, and no read, scan, reopen or model comparison can observe
+//! the difference. Automatic snapshots are off (`snapshot_written_bytes`
+//! unsigned-max) in both configs, so only the explicit store before a reopen
+//! decides the persisted image.
 //!
 //! The relocation filter of the golden gate stops at the first put whose value
 //! is the live value of its key and removes every earlier put. That is the
@@ -145,10 +154,30 @@ pub(super) fn filtered_shape(live: Arc<Mutex<Model>>) -> KeyShape {
     builder.build()
 }
 
-/// The native configuration of both arms. Automatic snapshots are disabled so
-/// only an explicit store changes the persisted index image.
+/// The native arm's value WAL fragment: the fixture's owner fragment, so an
+/// index or record frame that fits an owner WAL also fits a native one.
+pub(super) const GATE_FRAG_SIZE: u64 = 4096;
+/// The native arm's value WAL file: two fragments, matching the fixture's owner
+/// WAL file. Native relocation reclaims only whole files, so a file larger than
+/// this fixture's dead-prefix block would report `NoWork` on every pass.
+pub(super) const GATE_WAL_FILE: u64 = 8192;
+
+/// The shared index geometry of both arms and the hybrid's own index WAL.
+/// Automatic snapshots are disabled so only an explicit store changes the
+/// persisted index image.
 pub(super) fn native_config() -> Arc<Config> {
     let mut config = Config::small();
+    config.snapshot_written_bytes = u64::MAX;
+    Arc::new(config)
+}
+
+/// The native arm's configuration: [`native_config`] with the fixture's owner
+/// WAL geometry, so its WAL-based relocation finds whole dead files to reclaim.
+/// Only the value/index WAL layout changes; every observable result is the same.
+pub(super) fn native_arm_config() -> Arc<Config> {
+    let mut config = Config::small();
+    config.frag_size = GATE_FRAG_SIZE;
+    config.wal_file_size = GATE_WAL_FILE;
     config.snapshot_written_bytes = u64::MAX;
     Arc::new(config)
 }
@@ -569,6 +598,21 @@ fn golden_phases(seed: u64) -> Vec<(&'static str, Phase)> {
             ..Phase::default()
         },
     ));
+    // `repopulate` overwrites every key below, so this whole block is dead when
+    // the second pass scans it. Native's value WAL reclaims only whole files
+    // (`GATE_WAL_FILE` bytes), and the first pass leaves less than one file
+    // below its cut, so without this block the second pass would find no whole
+    // dead file before `repopulate`'s first live value and report `NoWork`.
+    phases.push((
+        "dead_churn",
+        Phase {
+            singles: all
+                .iter()
+                .map(|key| Edit::Put(key.clone(), value(seed, key, 9)))
+                .collect(),
+            ..Phase::default()
+        },
+    ));
     phases.push((
         "repopulate",
         Phase {
@@ -625,17 +669,19 @@ fn scan_cases() -> Vec<(&'static str, Bounds)> {
 fn golden_phases_keep_native_and_hybrid_equal_to_the_sequential_model() {
     let seed = 0x900d_5eed_2026_1117;
     eprintln!("golden phases: seed={seed:#x}");
-    let config = native_config();
+    let plan = golden_phases(seed);
+    let index_config = native_config();
+    let value_config = native_arm_config();
     let live = Arc::new(Mutex::new(Model::new()));
     let shape = filtered_shape(Arc::clone(&live));
-    let fixture = fixture(&config, shape.clone());
+    let fixture = fixture(&index_config, shape.clone());
     let native_root = tempdir::TempDir::new("native-golden-phases").expect("native root");
     let probes = probe_keys();
 
-    let native = open_native(native_root.path(), &config, &shape);
+    let native = open_native(native_root.path(), &value_config, &shape);
     let hybrid = open_hybrid(&fixture);
     let ks = native.ks(KS_NAME);
-    for (name, phase) in golden_phases(seed) {
+    for (name, phase) in plan {
         {
             let mut model = live.lock();
             sequential_apply(&mut model, &phase);
@@ -645,18 +691,20 @@ fn golden_phases_keep_native_and_hybrid_equal_to_the_sequential_model() {
         let hybrid_gate = apply_phase(&hybrid, ks, &phase, &format!("hybrid/{name}"));
         if phase.relocate {
             eprintln!("{name}: native gate {native_gate:?}, hybrid gate {hybrid_gate:?}");
-            assert!(
-                matches!(hybrid_gate, Some(RelocationGate::DidWork)),
-                "{name} (seed={seed:#x}): the hybrid relocation pass must reclaim the dead \
-                 prefix below the first live value, got {hybrid_gate:?}"
-            );
+            for (arm, gate) in [("native", native_gate), ("hybrid", hybrid_gate)] {
+                assert!(
+                    matches!(gate, Some(RelocationGate::DidWork)),
+                    "{name} (seed={seed:#x}): the {arm} relocation pass must reclaim the dead \
+                     prefix below the first live value, got {gate:?}"
+                );
+            }
         }
         assert_same_reads(seed, name, ks, &native, &hybrid, &probes, &expected);
     }
     close_arm(native, "native before reopen");
     close_arm(hybrid, "hybrid before reopen");
 
-    let native = open_native(native_root.path(), &config, &shape);
+    let native = open_native(native_root.path(), &value_config, &shape);
     let hybrid = open_hybrid(&fixture);
     let expected = live.lock().clone();
     assert_same_reads(seed, "reopen", ks, &native, &hybrid, &probes, &expected);
