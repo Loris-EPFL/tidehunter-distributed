@@ -433,8 +433,12 @@ python3 /absolute/owned/checkpoint-build/sources/tidehunter-sharded-wal/experime
 A fixture lock prevents concurrent use of its private ports. The producer opens
 an owned **copy** of the saved producer DB; neither replay writes the original
 producer. Both measured DB roots are new. Producer and measured configs are
-state-sync-only fullnodes bounded at tip+1, so they stay alive for final metrics
-at the frozen tip. Their certified completed tip must equal the producer.
+state-sync-only fullnodes. The producer is a checkpoint source and receives no
+`run-with-range` at all: its database already holds the frozen tip, so a range
+equal to the tip is met at startup, before Sui's executor shutdown receiver
+exists, and Sui panics. Only the measured native and remote nodes are bounded,
+at the inclusive highest sequence (`--checkpoints N` ends at N-1). Their
+certified completed tip must equal the producer.
 The producer alone receives `source_environment(prior)`: its original fragment
 size and durability policy, with historical defaults of 32 MiB and asynchronous
 writes. Measured durable settings must never reinterpret the producer's WAL.

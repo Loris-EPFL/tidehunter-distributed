@@ -606,6 +606,25 @@ def replay_bound(highest):
     return highest
 
 
+def producer_command(binary, config_path):
+    """The producer is a checkpoint source, never a bounded replay.
+
+    A producer database already holds the frozen tip, so a RunWithRange equal
+    to that tip is met at startup, before the executor's shutdown receiver
+    exists; Sui then panics. The producer therefore gets no range at all.
+    """
+    return [binary, '--config-path', config_path]
+
+
+def configure_range(config, *, mode, tip):
+    """Producer: no range. Measured nodes: the inclusive highest sequence."""
+    if mode == 'producer':
+        config.pop('run-with-range', None)
+    else:
+        config['run-with-range'] = checkpoint.CheckpointBound(replay_bound(tip))
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
@@ -758,7 +777,7 @@ def main():
         config['db-path']=str(root/mode/relative)
         config['consensus-config']=None
         config['fullnode-sync-mode']='state-sync-only'
-        config['run-with-range']=checkpoint.CheckpointBound(replay_bound(source_tip if mode == 'producer' else tip))
+        configure_range(config, mode=mode, tip=tip)
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
@@ -809,7 +828,7 @@ def main():
     signal.signal(signal.SIGTERM,interrupted)
     signal.signal(signal.SIGINT,interrupted)
     try:
-        producer=owned.start('producer',[bins/'sui-node-native','--config-path',root/'producer.yaml','--run-with-range-checkpoint',replay_bound(source_tip)], producer_env)
+        producer=owned.start('producer',producer_command(bins/'sui-node-native', root/'producer.yaml'), producer_env)
         address=configs['producer']['json-rpc-address']
         if int(checkpoint.wait_rpc(producer,address)) != source_tip:
             raise ValueError('producer tip differs')

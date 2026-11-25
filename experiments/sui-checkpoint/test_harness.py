@@ -660,6 +660,20 @@ class RunnerKnobs(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'panics below 3'):
                 self.environment(**{field: 2})
 
+    def test_producer_has_no_range_and_measured_nodes_use_count_minus_one(self):
+        producer = {'run-with-range': run.checkpoint.CheckpointBound(1775), 'db-path': 'x'}
+        run.configure_range(producer, mode='producer', tip=1775)
+        self.assertNotIn('run-with-range', producer)
+        command = run.producer_command('sui-node-native', 'producer.yaml')
+        self.assertEqual(command, ['sui-node-native', '--config-path', 'producer.yaml'])
+        self.assertNotIn('--run-with-range-checkpoint', command)
+        for mode in ('native', 'remote'):
+            config = {'run-with-range': 0}
+            run.configure_range(config, mode=mode,
+                                tip=run.requested_checkpoint(1775, 8))
+            self.assertEqual(config['run-with-range'], 7)
+            self.assertEqual(int(config['run-with-range']) + 1, 8)
+
     def test_checkpoint_limit_is_an_inclusive_count(self):
         for requested, expected in ((None, 1775), (1, 0), (8, 7), (100, 99),
                                     (1776, 1775)):
