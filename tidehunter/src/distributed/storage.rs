@@ -353,6 +353,10 @@ struct OpenLiveExtent {
     // Independent scratch for close and the revoked-tail seal scan.
     buffer: Vec<u8>,
     round: Arc<Mutex<AdoptionRound>>,
+    /// The lease timings this grant was answered with. A repeated prelease
+    /// answers from them, so its reply repeats the grant instead of measuring
+    /// a new one.
+    lease: super::tcp::LeaseProfile,
 }
 
 // Lock order: round gate -> state. Clone the gate under state, then release
@@ -1114,6 +1118,48 @@ impl PartitionLog {
         self.lease_live_extent_impl(authority, Some(after))
     }
 
+    /// The reservation a *repeated* prelease already holds, when the request is
+    /// the same grant: `after` is still the open extent, the reserved successor
+    /// continues it, and both live under this request's fenced epoch and
+    /// generation. Read-only: it takes no allocation and grants nothing, so a
+    /// lost reply can be answered again without a second reservation.
+    ///
+    /// `None` sends the caller to the ordinary grant path, which refuses every
+    /// other case exactly as before.
+    pub(crate) fn repeated_prelease(
+        &self,
+        authority: RequestAuthority,
+        after: [u8; 16],
+    ) -> Option<(
+        super::nvmeof::live_storage::LiveWriteExtent,
+        super::tcp::LeaseProfile,
+    )> {
+        let config = self.config();
+        let state = self.state.lock();
+        if authority.epoch != config.inventory.epoch
+            || state.poison.is_some()
+            || state.sealed
+            || state.is_sealing()
+            || !state.live
+        {
+            return None;
+        }
+        let open = state.open_live_extent.as_ref()?;
+        if open.closing || open.extent.token != after {
+            return None;
+        }
+        let next = state.next_live_extent.as_ref()?;
+        let segment = &next.extent.segment;
+        if next.extent.token == after
+            || segment.epoch != authority.epoch
+            || segment.generation != config.inventory.segment_generation
+            || next.extent.start != open.extent.end
+        {
+            return None;
+        }
+        Some((next.extent.clone(), next.lease))
+    }
+
     /// Prepare after the durable namespace highwater: at most one file beyond the
     /// allocator-position file (two beyond the last grant with two-fragment files).
     /// Allocation/file sync run unlocked; publication uses persistence -> state.
@@ -1353,6 +1399,13 @@ impl PartitionLog {
                 Some(crate::wal::position::WalFileId::from_u64(last_file));
             state.stats.namespace_syncs += 1;
         }
+        // A repeated prelease answers with this grant's own timings, so the
+        // reservation keeps them finalized rather than its initial copy.
+        if let Some(next) = state.next_live_extent.as_mut()
+            && next.extent.token == extent.token
+        {
+            next.lease = profile;
+        }
         state.poison = None;
         lease_grant_span.end_at(extent.start);
         Ok((extent, profile))
@@ -1496,21 +1549,20 @@ impl PartitionLog {
             allocation,
             buffer: Vec::new(),
             round: Arc::new(Mutex::new(AdoptionRound::default())),
+            lease: super::tcp::LeaseProfile {
+                reserve_ns,
+                namespace_sync_ns: 0,
+                publish_ns: 0,
+            },
         };
+        let profile = open.lease;
         if prelease {
             state.next_live_extent = Some(open);
         } else {
             state.open_live_extent = Some(open);
         }
         state.poison = None;
-        Ok((
-            extent,
-            super::tcp::LeaseProfile {
-                reserve_ns,
-                namespace_sync_ns: 0,
-                publish_ns: 0,
-            },
-        ))
+        Ok((extent, profile))
     }
 
     /// A failed declared frame fences writes while its earlier validated prefix

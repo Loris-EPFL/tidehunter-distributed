@@ -929,3 +929,74 @@ fn leased_close_in_progress_is_typed_and_retryable() {
         "the retried close changes nothing"
     );
 }
+
+/// A repeated prelease is answered with the reservation it already holds, and
+/// only when the request names that same grant: `after` is still the open
+/// extent, under this request's fenced epoch and generation. The repeat is
+/// read-only: it takes no allocation and grants nothing.
+#[test]
+fn leased_repeated_prelease_answers_only_the_same_reservation() {
+    let (_temp, config, log) = fixture();
+    let first = log.lease_live_extent(authority(&config)).unwrap().0;
+    let after = first.token;
+    let (reserved, profile) = log
+        .prelease_live_extent(authority(&config), after)
+        .expect("the owner reserves the successor");
+    assert_eq!(
+        reserved.start, first.end,
+        "the reservation continues the open extent"
+    );
+    let position = log.state.lock().writer.as_ref().unwrap().position();
+    let (again, same) = log
+        .repeated_prelease(authority(&config), after)
+        .expect("the repeated prelease names its own reservation");
+    assert_eq!(again, reserved, "the repeat answers the same extent");
+    assert_eq!(
+        (same.reserve_ns, same.namespace_sync_ns),
+        (profile.reserve_ns, profile.namespace_sync_ns),
+        "the repeat answers the same timings"
+    );
+    assert_eq!(
+        log.state.lock().writer.as_ref().unwrap().position(),
+        position,
+        "the repeat allocates nothing"
+    );
+    assert_eq!(
+        log.state
+            .lock()
+            .next_live_extent
+            .as_ref()
+            .map(|next| next.extent.token),
+        Some(reserved.token),
+        "the repeat grants no second reservation"
+    );
+    // A different `after` is not this reservation, and the ordinary path refuses.
+    assert!(
+        log.repeated_prelease(authority(&config), reserved.token)
+            .is_none(),
+        "another after names no reservation"
+    );
+    assert!(matches!(
+        log.prelease_live_extent(authority(&config), reserved.token),
+        Err(StorageError::Invalid(
+            "prelease requires the open live extent"
+        ))
+    ));
+    // A reservation made under another generation is not this grant.
+    log.state
+        .lock()
+        .next_live_extent
+        .as_mut()
+        .expect("the reservation exists")
+        .extent
+        .segment
+        .generation += 1;
+    assert!(
+        log.repeated_prelease(authority(&config), after).is_none(),
+        "another generation names no reservation"
+    );
+    assert!(matches!(
+        log.prelease_live_extent(authority(&config), after),
+        Err(StorageError::Invalid("live extent already preleased"))
+    ));
+}

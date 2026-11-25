@@ -1477,24 +1477,36 @@ impl ControlContext {
         #[cfg(test)]
         let lookup_inventory_wait_ns =
             lookup_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let leased = match after {
-            Some(after) => log.prelease_live_extent(RequestAuthority { epoch }, after),
-            None => log.lease_live_extent(RequestAuthority { epoch }),
-        };
-        let (extent, mut profile) = leased.map_err(|error| {
-            if matches!(error, StorageError::Unknown(_) | StorageError::Poisoned) {
-                self.poison_readers();
+        // A prelease whose reply was lost is answered with the reservation it
+        // already made: the same grant, no second allocation and no second
+        // grant event. Every other state takes the ordinary grant path.
+        let repeated =
+            after.and_then(|after| log.repeated_prelease(RequestAuthority { epoch }, after));
+        let granted = repeated.is_none();
+        let (extent, mut profile) = match repeated {
+            Some(reservation) => reservation,
+            None => {
+                let leased = match after {
+                    Some(after) => log.prelease_live_extent(RequestAuthority { epoch }, after),
+                    None => log.lease_live_extent(RequestAuthority { epoch }),
+                };
+                leased.map_err(|error| {
+                    if matches!(error, StorageError::Unknown(_) | StorageError::Poisoned) {
+                        self.poison_readers();
+                    }
+                    TcpError::component(error)
+                })?
             }
-            TcpError::component(error)
-        })?;
+        };
         let publish_started = Instant::now();
         // Prepared file: answer from its published binding with only the
         // inventory mutex. No reap, no target work, no lifecycle gate, so a
         // seal, retirement revoke or tombstone removal never delays it.
         let published = {
             let mut inventory = self.inventory.lock();
-            // The grant is allocated: a first grant in a later file is a roll.
-            if let Some(events) = inventory.r1_events.as_mut() {
+            // A repeated prelease answers a reservation that already exists, so
+            // it is not a new grant and records no grant event.
+            if granted && let Some(events) = inventory.r1_events.as_mut() {
                 events.grant(&extent.segment);
             }
             let ready = (|| {

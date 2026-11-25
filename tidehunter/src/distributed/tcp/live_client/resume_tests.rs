@@ -2081,3 +2081,78 @@ fn lapsed_lease_stops_the_rewrite_between_frames() {
     assert_eq!(counts.resume_refused, 1, "the refusal is counted");
     assert_eq!(counts.resume_rewrites, 0, "no rewrite episode completed");
 }
+
+/// A prelease whose reply is lost repeats the same grant: the resume's grant of
+/// the successor extent is answered with the reservation the owner already
+/// holds, so the switch continues writing into it instead of fail-stopping, and
+/// no second extent is allocated.
+#[test]
+fn lost_prelease_reply_is_answered_with_the_same_reservation() {
+    let fixture = Fixture::new(DurabilityTier::Native, 16384);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    // The lease install preleases the successor. The reply is harvested and
+    // lost, as a session break loses it, so the owner holds it and the client
+    // does not.
+    client.leased_test_drop_next_prelease_reply();
+    for sequence in 0..4 {
+        submit(&mut client, &fixture, sequence);
+    }
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the four frames complete");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the prefix");
+    let lost = client
+        .leased_test_lost_prelease()
+        .expect("the prelease reply was lost");
+    let (start, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    assert_eq!(cursor, start + 4 * 4096, "the first extent is full");
+    assert_eq!(
+        lost.extent.start, cursor,
+        "the lost reply named the successor extent"
+    );
+    assert!(
+        !client.leased_test_ahead_state().1,
+        "the lost reply leaves the client without a reservation"
+    );
+    // The next frame loses the queue: the resume grants the successor again and
+    // the switch must continue into the reservation the owner already holds.
+    client.leased_test_fail_submit(libc::ENODEV);
+    submit(&mut client, &fixture, 4);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the resumed submission completes");
+    let current = client.live_leased.current.as_ref().expect("an open extent");
+    assert_eq!(
+        current.lease.extent, lost.extent,
+        "the switch uses the extent the lost reply named, with no second grant"
+    );
+    assert_eq!(
+        current.lease.binding, lost.binding,
+        "the repeated reply names the same binding"
+    );
+    assert_eq!(
+        current.lease.tier, lost.tier,
+        "the repeated reply names the same tier"
+    );
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume attempt");
+    assert_eq!(counts.resume_refused, 0, "the repeat is not a refusal");
+    assert_eq!(
+        counts.extent_preleases, 2,
+        "the prelease was answered twice"
+    );
+    assert!(
+        !client.live_write_failed,
+        "the writer stays usable after the repeated prelease"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the frame");
+    assert_eq!(released.len(), 5, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}

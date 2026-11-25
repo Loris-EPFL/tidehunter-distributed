@@ -492,6 +492,13 @@ pub(super) struct LeasedWriter {
     flight_adoption_waits: u64,
     #[cfg(test)]
     largest_close_profile: super::AdoptProfile,
+    /// Discard the next prelease reply, as a session break loses it, and record
+    /// it instead of applying it.
+    #[cfg(test)]
+    drop_prelease_reply: bool,
+    /// The prelease reply [`Self::drop_prelease_reply`] discarded.
+    #[cfg(test)]
+    lost_prelease: Option<super::LiveLeased>,
     /// Value-WAL allocations of submitted batches, oldest first, when the hybrid
     /// index writer has enabled recording.
     ///
@@ -1157,6 +1164,13 @@ impl super::Client {
                 if let Some(counters) = &self.live_counters {
                     counters.record_lease_profile(leased.profile);
                     counters.record_extent_prelease();
+                }
+                #[cfg(test)]
+                if std::mem::take(&mut self.live_leased.drop_prelease_reply) {
+                    // The owner reserved the extent; this session never learned
+                    // it, as a break before the reply does.
+                    self.live_leased.lost_prelease = Some(leased);
+                    return Ok(());
                 }
                 self.live_leased.next = Some(leased);
                 Ok(())
@@ -5479,6 +5493,15 @@ impl super::Client {
             self.live_leased.closing.is_some(),
             self.live_leased.next.is_some(),
         )
+    }
+    /// Lose the next prelease reply: the owner keeps the reservation and this
+    /// client never records it, as a session break before the reply does.
+    pub(crate) fn leased_test_drop_next_prelease_reply(&mut self) {
+        self.live_leased.drop_prelease_reply = true;
+    }
+    /// The prelease reply a test lost, if one was lost.
+    pub(crate) fn leased_test_lost_prelease(&self) -> Option<super::LiveLeased> {
+        self.live_leased.lost_prelease.clone()
     }
     pub(crate) fn leased_test_enable_ahead(&mut self) {
         self.live_config.as_mut().unwrap().lease_ahead = true;
