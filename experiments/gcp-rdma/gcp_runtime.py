@@ -171,7 +171,8 @@ def validate_runtime(config):
         or not re.fullmatch(r'[0-9a-f]{40}', str(package.get('source_revision', '')))):
         raise RuntimeSafetyError('package source, revision or immutable object identity mismatch')
     _sha(package.get('sha256'))
-    if config['spec'].get('suite') != 'kv':
+    suite = config['spec'].get('suite')
+    if suite not in ('kv', 'sui'):
         raise RuntimeSafetyError('invalid campaign suite')
     import workflow_input
     backends = config['spec'].get('backends', [])
@@ -179,10 +180,18 @@ def validate_runtime(config):
             or any(not isinstance(backend, str) or backend not in workflow_input.BACKENDS for backend in backends)
             or len(set(backends)) != len(backends)):
         raise RuntimeSafetyError('invalid GCP backend selection')
+    sui = suite == 'sui'
     mode = config['spec'].get('mode', 'standard')
-    if mode not in {'standard', 'standard-with-live-nvmeof', 'focused'}:
+    admitted_modes = {'sui'} if sui else {'standard', 'standard-with-live-nvmeof', 'focused'}
+    if mode not in admitted_modes:
         raise RuntimeSafetyError('invalid matrix mode')
-    if len(config['fleet']) == 2:
+    if sui:
+        # The Sui campaign owns its transport admission in its own drivers; this
+        # runtime only bounds the mailbox worker, so it must name the owner count.
+        owners = config['spec'].get('owners')
+        if type(owners) is not int or not 1 <= owners <= 16 or owners != len(config['fleet']) - 1:
+            raise RuntimeSafetyError('Sui owner count differs from the fleet')
+    if len(config['fleet']) == 2 and not sui:
         if mode != 'focused' or config['spec'].get('suite') != 'kv':
             raise RuntimeSafetyError('compact fleet requires a focused KV selection')
         forbidden = {'tikv', 'cassandra', 'foundationdb', 'valkey_tcp', 'garnet', 'kvrocks'}
@@ -258,6 +267,14 @@ def validate_runtime(config):
         raise RuntimeSafetyError('exact placement policy name and numeric ID required')
     if config.get('package_root') != '/mnt/tidehunter/' + config['run_id'] + '/package':
         raise RuntimeSafetyError('invalid installed package root')
+    roots = config.get('guest_roots', [])
+    if (not isinstance(roots, list) or len(roots) > 8 or len(set(roots)) != len(roots)
+            or any(not isinstance(value, str)
+                   or not value.startswith(('/mnt/tidehunter/', '/mnt/tidehunter-kv-comparison/'))
+                   or '..' in PurePosixPath(value).parts or value.endswith('/')
+                   for value in roots)):
+        raise RuntimeSafetyError(
+            'guest roots must be distinct directories under /mnt/tidehunter or /mnt/tidehunter-kv-comparison')
     return config
 
 
@@ -266,6 +283,7 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
     source_sha256 = package_receipt.get('source_sha256')
     campaign_deadline = optional.pop('campaign_deadline_utc', None)
     policy = optional.pop('placement_policy', None)
+    guest_roots = optional.pop('guest_roots', None)
     if campaign_deadline is None:
         campaign_deadline = datetime.fromtimestamp(_deadline(deadline_utc) - 120, timezone.utc).isoformat()
     if optional:
@@ -283,6 +301,8 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
         config['live_qualification'] = launch_config['live_qualification']
     if policy is not None:
         config['placement_policy'] = dict(policy)
+    if guest_roots is not None:
+        config['guest_roots'] = list(guest_roots)
     return validate_runtime(config)
 
 
@@ -364,7 +384,8 @@ class RemoteMailbox:
         self.deadline = _deadline(deadline_utc)
         self.deadline_utc = deadline_utc
 
-    def submit(self, index, argv, *, operation_id, timeout_seconds, env=None, cwd=None):
+    def submit(self, index, argv, *, operation_id, timeout_seconds, env=None, cwd=None,
+               stdin=None, stdout_object=None):
         if type(index) is not int or index not in range(len(self.fleet)):
             raise RuntimeSafetyError('invalid fleet index')
         if not isinstance(operation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', operation_id):
@@ -377,14 +398,24 @@ class RemoteMailbox:
             raise RuntimeSafetyError('invalid environment')
         if cwd is not None and (not isinstance(cwd, str) or not PurePosixPath(cwd).is_absolute() or '..' in PurePosixPath(cwd).parts):
             raise RuntimeSafetyError('invalid working directory')
+        host = self.fleet[index]
+        prefix = f'runs/{self.run_id}/transfer/{host["id"]}/{operation_id}/'
+        if stdin is not None:
+            if (not isinstance(stdin, dict) or set(stdin) != {'object', 'sha256', 'size'}
+                    or stdin['object'] != prefix + 'stdin' or not _sha(str(stdin.get('sha256')))
+                    or type(stdin['size']) is not int or stdin['size'] < 0):
+                raise RuntimeSafetyError('invalid command stdin blob')
+        if stdout_object is not None and stdout_object != prefix + 'stdout':
+            raise RuntimeSafetyError('invalid command stdout blob')
         now = time.time()
         if now >= self.deadline:
             raise RuntimeSafetyError('run deadline reached')
-        host = self.fleet[index]
         request = {'schema_version': 1, 'run_id': self.run_id, 'source_sha256': self.source_sha256,
                    'instance_id': str(host['id']), 'index': index, 'operation_id': operation_id,
                    'deadline_utc': self.deadline_utc, 'timeout_seconds': timeout_seconds,
-                   'argv': argv, 'env': env or {}, 'cwd': cwd}
+                   'argv': argv, 'env': env or {}, 'cwd': cwd,
+                   **({'stdin': stdin} if stdin is not None else {}),
+                   **({'stdout_object': stdout_object} if stdout_object is not None else {})}
         raw = _encode(request)
         key = f'runs/{self.run_id}/mailbox/{host["id"]}/requests/{operation_id}.json'
         metadata = _put_once(self.store, key, raw)

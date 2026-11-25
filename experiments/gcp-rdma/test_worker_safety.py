@@ -2,6 +2,7 @@ import json
 import concurrent.futures
 import sqlite3
 import tempfile
+import hashlib
 from pathlib import Path
 import threading
 import unittest
@@ -493,6 +494,135 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('remaining = int(deadline - time.time())', script)
         self.assertIn("if remaining <= 0: raise TimeoutError('worker startup expired')", script)
         self.assertIn("'--on-calendar='", script)
+
+
+class CampaignCommandTests(unittest.TestCase):
+    """The two admissions the campaign drivers need beyond a sealed argv."""
+
+    def config(self, **extra):
+        return {'run_id': 'run', 'source_sha256': 'a' * 64,
+                'package_root': '/mnt/tidehunter/run/package', 'deadline_utc': 'x',
+                'guest_roots': ['/mnt/tidehunter/sui-run-run'], **extra}
+
+    def request(self, argv, **extra):
+        return {'argv': argv, 'env': {}, 'cwd': None, **extra}
+
+    def test_one_shell_script_is_admitted(self):
+        argv, cwd, env = worker.admit_command(
+            self.config(), self.request(['/bin/sh', '-c', 'rm -rf /mnt/tidehunter/run/x && mkdir -p /mnt/tidehunter/run/x']))
+        self.assertEqual(argv[0], '/bin/sh')
+        self.assertEqual((cwd, env), (None, {}))
+
+    def test_every_other_shell_shape_is_refused(self):
+        for argv in (['/bin/bash', '-c', 'true'], ['/bin/sh', '-lc', 'true'],
+                     ['/bin/sh', '-c', 'true', 'extra'], ['/bin/sh'], ['/bin/sh', '-c', ''],
+                     ['/bin/sh', '-c', 'x' * (worker.MAX_SCRIPT + 1)],
+                     ['/bin/sh', '-c', 'true\x00'], ['/bin/sh', '--', 'true']):
+            with self.subTest(argv=argv[0] if len(argv) < 3 else argv[:2]):
+                with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+                    worker.admit_command(self.config(), self.request(argv))
+
+    def test_sealed_argv_admission_is_unchanged(self):
+        with mock.patch.object(worker, '_inside', return_value=True):
+            argv, _, _ = worker.admit_command(
+                self.config(), self.request([gcp_runtime.GUEST_PYTHON, '/pkg/source/a.py']))
+        self.assertEqual(argv[1], '/pkg/source/a.py')
+        with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+            worker.admit_command(self.config(), self.request(['/usr/bin/tar', '-xzf', '-']))
+
+    def test_a_declared_guest_root_widens_only_that_root(self):
+        with mock.patch.object(worker, '_inside', side_effect=lambda path, root: str(root) == str(path.parent)):
+            worker.admit_command(self.config(), self.request(['/bin/sh', '-c', 'true'],
+                                                            cwd='/mnt/tidehunter/sui-run-run/owners'))
+        with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+            worker.admit_command(self.config(), self.request(['/bin/sh', '-c', 'true'],
+                                                             cwd='/mnt/tidehunter/other/owners'))
+
+    def test_the_two_transfer_blobs_are_bound_to_the_operation(self):
+        host = {'id': '42', 'index': 0}
+        keys = 'runs/run/transfer/42/op/'
+        source, sink = worker.admit_transfer(self.config(), host, 'op', {
+            'stdin': {'object': keys + 'stdin', 'sha256': 'b' * 64, 'size': 4},
+            'stdout_object': keys + 'stdout'})
+        self.assertEqual((source['object'], sink), (keys + 'stdin', keys + 'stdout'))
+        for change in ({'object': 'runs/run/transfer/42/other/stdin'},
+                       {'object': 'runs/run/transfer/43/op/stdin'},
+                       {'sha256': 'B' * 64}, {'size': -1}, {'size': '4'},
+                       {'object': keys + 'stdin', 'sha256': 'b' * 64, 'size': 4, 'x': 1}):
+            with self.subTest(change=change):
+                blob = {'object': keys + 'stdin', 'sha256': 'b' * 64, 'size': 4, **change}
+                with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+                    worker.admit_transfer(self.config(), host, 'op', {'stdin': blob})
+        with self.assertRaises(gcp_runtime.RuntimeSafetyError):
+            worker.admit_transfer(self.config(), host, 'op', {'stdout_object': keys + 'other'})
+
+    def test_a_refusal_is_published_as_a_terminal_receipt(self):
+        store = mock.Mock()
+        store.get.return_value = json.dumps({'operation_id': 'op'}).encode()
+        host = {'id': '42', 'index': 0}
+        receipt = worker.publish_rejection(store, self.config(), host,
+                                           'runs/run/mailbox/42/requests/op.json', '7',
+                                           worker.InvalidRequest('invalid campaign shell command'))
+        self.assertIs(receipt['rejected'], True)
+        self.assertEqual(receipt['exit_code'], 126)
+        self.assertEqual(receipt['operation_id'], 'op')
+        self.assertEqual(receipt['instance_id'], '42')
+        self.assertIn('invalid campaign shell command', receipt['stderr'])
+        key, raw = store.put.call_args.args[:2]
+        self.assertEqual(key, 'runs/run/mailbox/42/responses/op.json')
+        self.assertEqual(json.loads(raw), receipt)
+
+    def test_an_unreadable_refusal_publishes_nothing(self):
+        store = mock.Mock()
+        store.get.side_effect = RuntimeError('bucket unavailable')
+        self.assertIsNone(worker.publish_rejection(
+            store, self.config(), {'id': '42'}, 'runs/run/mailbox/42/requests/op.json', '7',
+            worker.InvalidRequest('nope')))
+        store.put.assert_not_called()
+
+
+class TransferRunTests(unittest.TestCase):
+    """One real subprocess: stdin from the bucket, stdout back to it."""
+
+    def test_stdin_and_spilled_stdout_round_trip(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            store = mock.Mock()
+            store.put.return_value = {'generation': '9'}
+            payload = b'payload' * 1000
+            store.download.side_effect = lambda key, path, **kwargs: Path(path).write_bytes(payload)
+            spill = {}
+
+            def upload(key, path, **kwargs):
+                spill['key'], spill['bytes'] = key, Path(path).read_bytes()
+                return {'generation': '9', 'size': len(spill['bytes']),
+                        'metadata': {'sha256': __import__('hashlib').sha256(spill['bytes']).hexdigest()}}
+            store.upload.side_effect = upload
+            config = {'run_id': 'run', 'source_sha256': 'a' * 64,
+                      'deadline_utc': '2099-01-01T00:00:00Z', 'package_root': '/package'}
+            host = {'id': '42', 'index': 1}
+            key = 'runs/run/mailbox/42/requests/op.json'
+            request = {'operation_id': 'op', 'schema_version': 1, 'run_id': 'run',
+                       'source_sha256': 'a' * 64, 'instance_id': '42', 'index': 1,
+                       'deadline_utc': config['deadline_utc'], 'timeout_seconds': 60,
+                       'argv': ['/bin/sh', '-c', 'wc -c >&2; head -c 1200000 /dev/zero | tr "\\0" a'],
+                       'env': {}, 'cwd': None,
+                       'stdin': {'object': 'runs/run/transfer/42/op/stdin',
+                                 'sha256': __import__('hashlib').sha256(payload).hexdigest(),
+                                 'size': len(payload)},
+                       'stdout_object': 'runs/run/transfer/42/op/stdout'}
+            store.get.return_value = json.dumps(request).encode()
+            with mock.patch.object(worker, 'scratch_root', side_effect=lambda *_: root), \
+                    mock.patch.object(worker.gcp_runtime, 'GUEST_PATH', '/usr/bin:/bin'):
+                result = worker.run_request(config, host, store, key, '7', root)
+            self.assertEqual(result['exit_code'], 0)
+            self.assertEqual(result['stdout'], '')
+            self.assertEqual(result['stdout_object']['size'], 1200000)
+            self.assertEqual(spill['key'], 'runs/run/transfer/42/op/stdout')
+            self.assertEqual(spill['bytes'], b'a' * 1200000)
+            self.assertEqual(result['stderr'].strip(), str(len(payload)))
+            stored = json.loads(store.put.call_args.args[1])
+            self.assertEqual(stored['stdout_object'], result['stdout_object'])
 
 
 if __name__ == '__main__':

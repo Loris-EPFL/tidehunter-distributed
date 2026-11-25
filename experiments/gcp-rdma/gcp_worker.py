@@ -1,4 +1,13 @@
-"""Exact-instance GCS mailbox worker; never executes a request twice."""
+"""Exact-instance GCS mailbox worker; never executes a request twice.
+
+A request either carries an admitted `argv` from the sealed package or one
+campaign shell script (`/bin/sh -c`), and it may name one input blob and one
+output blob under the run's transfer prefix so a campaign command can read
+stdin and spill a large stdout through the bucket instead of the receipt. Both
+blobs are bound to the request's own operation ID, both are SHA-256 verified,
+and both run under the existing identity, cwd, environment, timeout,
+at-most-once and poweroff rules.
+"""
 import concurrent.futures
 import fcntl
 import hashlib
@@ -25,9 +34,17 @@ import cloud_package
 import physical_storage
 
 MAX_OUTPUT = 1024 * 1024
+# The campaign drivers issue one shell script per host command. This is the
+# largest script the worker will admit; the drivers emit well under it.
+MAX_SCRIPT = 64 * 1024
+# One input blob and one output blob per request, both streamed through the
+# bucket. A larger stdout must be split by the caller.
+MAX_BLOB = 16 * 1024 * 1024 * 1024
 MAX_ACTIVE = 16
 MAX_REQUESTS = 32768
 MAX_ATTEMPTS = 3
+SHELL = '/bin/sh'
+DATA_ROOT = '/mnt/tidehunter-kv-comparison'
 
 
 
@@ -256,18 +273,52 @@ def _inside(path, root):
         return False
 
 
+def run_roots(config):
+    """Every directory this run owns on the guest; transfers may not leave it."""
+    roots = [Path('/mnt/tidehunter') / config['run_id'], Path(DATA_ROOT) / config['run_id']]
+    roots.extend(Path(value) for value in config.get('guest_roots') or [])
+    return roots
+
+
+def transfer_key(config, host, operation_id, leaf):
+    """The one bucket key a request may read (`stdin`) or write (`stdout`)."""
+    return f'runs/{config["run_id"]}/transfer/{host["id"]}/{operation_id}/{leaf}'
+
+
+def admit_transfer(config, host, op, request):
+    """Admit the optional input blob and output blob of one request."""
+    source, sink = request.get('stdin'), request.get('stdout_object')
+    if source is not None:
+        if (not isinstance(source, dict) or set(source) != {'object', 'sha256', 'size'}
+                or source['object'] != transfer_key(config, host, op, 'stdin')
+                or not isinstance(source['sha256'], str)
+                or re.fullmatch(r'[0-9a-f]{64}', source['sha256']) is None
+                or type(source['size']) is not int or not 0 <= source['size'] <= MAX_BLOB):
+            raise gcp_runtime.RuntimeSafetyError('invalid command stdin blob')
+    if sink is not None and sink != transfer_key(config, host, op, 'stdout'):
+        raise gcp_runtime.RuntimeSafetyError('invalid command stdout blob')
+    return source, sink
+
+
 def admit_command(config, request):
     argv = request.get('argv')
     if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or '\x00' in x for x in argv):
         raise gcp_runtime.RuntimeSafetyError('invalid command')
     root = Path(config['package_root'])
-    if argv[0] == gcp_runtime.GUEST_PYTHON:
+    if argv[0] == SHELL:
+        # One bounded shell script replaces a sealed argv for campaign commands
+        # that no admitted binary can express: archive extraction, process-group
+        # start and stop, `/proc` sampling and the disk collector's stdin.
+        if (len(argv) != 3 or argv[1] != '-c' or not argv[2]
+                or len(argv[2].encode('utf-8', 'surrogatepass')) > MAX_SCRIPT):
+            raise gcp_runtime.RuntimeSafetyError('invalid campaign shell command')
+    elif argv[0] == gcp_runtime.GUEST_PYTHON:
         if len(argv) < 2 or not argv[1].endswith('.py') or not _inside(Path(argv[1]), root / 'source'):
             raise gcp_runtime.RuntimeSafetyError('Python script must be from admitted source')
     elif not _inside(Path(argv[0]), root / 'runtime' / 'bin'):
         raise gcp_runtime.RuntimeSafetyError('executable must be from admitted runtime')
     cwd = request.get('cwd')
-    if cwd is not None and not _inside(Path(cwd), Path('/mnt/tidehunter') / config['run_id']):
+    if cwd is not None and not any(_inside(Path(cwd), root) for root in run_roots(config)):
         raise gcp_runtime.RuntimeSafetyError('working directory outside run root')
     env = request.get('env')
     if not isinstance(env, dict) or any(not re.fullmatch(r'[A-Z][A-Z0-9_]*', k) or not isinstance(v, str)
@@ -276,6 +327,42 @@ def admit_command(config, request):
                                         for k, v in env.items()):
         raise gcp_runtime.RuntimeSafetyError('unsafe command environment')
     return argv, cwd, env
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fetch_stdin(store, blob, directory, deadline):
+    """Download the admitted input blob and prove its digest before it is used."""
+    handle, path = tempfile.mkstemp(dir=str(directory))
+    os.close(handle)
+    try:
+        def check():
+            if time.time() >= deadline:
+                raise gcp_runtime.RuntimeSafetyError('command expired before its input arrived')
+        store.download(blob['object'], path, max_bytes=max(blob['size'], 1), deadline_check=check)
+        if os.path.getsize(path) != blob['size'] or _file_sha256(path) != blob['sha256']:
+            raise gcp_runtime.RuntimeSafetyError('command stdin blob differs from its admitted digest')
+    except BaseException:
+        os.unlink(path)
+        raise
+    return path
+
+
+def scratch_root(config, gate_root):
+    """Staging for command I/O: the run's data root when it is mounted, else the gate."""
+    candidate = Path(DATA_ROOT) / config['run_id']
+    try:
+        if candidate.is_dir():
+            return candidate / '.mailbox'
+    except OSError:
+        pass
+    return Path(gate_root) / 'scratch'
 
 
 def run_request(config, host, store, key, generation, gate_root):
@@ -299,6 +386,7 @@ def run_request(config, host, store, key, generation, gate_root):
         raise InvalidRequest('expired or invalid command timeout')
     try:
         argv, cwd, env = admit_command(config, request)
+        source, sink = admit_transfer(config, host, op, request)
     except gcp_runtime.RuntimeSafetyError as exc:
         raise InvalidRequest(str(exc)) from exc
     request_sha = hashlib.sha256(raw).hexdigest()
@@ -307,26 +395,71 @@ def run_request(config, host, store, key, generation, gate_root):
         remaining = min(timeout, deadline - time.time())
         if remaining <= 0:
             raise gcp_runtime.RuntimeSafetyError('command expired before start')
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            process = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **env, 'PATH': gcp_runtime.GUEST_PATH, 'PYTHONDONTWRITEBYTECODE': '1'}, stdout=stdout,
-                                       stderr=stderr, start_new_session=True)
+        scratch = scratch_root(config, gate_root)
+        scratch.mkdir(parents=True, mode=0o700, exist_ok=True)
+        source_path = _fetch_stdin(store, source, scratch, deadline) if source is not None else None
+        stdout_file = tempfile.NamedTemporaryFile(dir=str(scratch), delete=False)
+        stderr_file = tempfile.NamedTemporaryFile(dir=str(scratch), delete=False)
+        stdout_path, stderr_path = stdout_file.name, stderr_file.name
+        spill = None
+        try:
+            stdin_stream = open(source_path, 'rb') if source_path else open(os.devnull, 'rb')
             try:
-                code = process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
+                process = subprocess.Popen(
+                    argv, cwd=cwd,
+                    env={**os.environ, **env, 'PATH': gcp_runtime.GUEST_PATH, 'PYTHONDONTWRITEBYTECODE': '1'},
+                    stdin=stdin_stream, stdout=stdout_file, stderr=stderr_file, start_new_session=True)
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-                code = 124
-            stdout.seek(0)
-            stderr.seek(0)
-            out, err = stdout.read(MAX_OUTPUT + 1), stderr.read(MAX_OUTPUT + 1)
-        if len(out) > MAX_OUTPUT or len(err) > MAX_OUTPUT:
+                    code = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    code = 124
+            finally:
+                stdin_stream.close()
+            stdout_file.close()
+            stderr_file.close()
+            size = os.path.getsize(stdout_path)
+            with open(stderr_path, 'rb') as stream:
+                err = stream.read(MAX_OUTPUT + 1)
+            if len(err) > MAX_OUTPUT:
+                raise gcp_runtime.RuntimeSafetyError('command output exceeds mailbox bound')
+            if size > MAX_OUTPUT:
+                # A campaign copy-back (a tar of an output tree) is larger than
+                # a receipt may carry; it goes to the bucket instead.
+                if sink is None or size > MAX_BLOB:
+                    raise gcp_runtime.RuntimeSafetyError('command output exceeds mailbox bound')
+                if time.time() >= deadline:
+                    raise gcp_runtime.RuntimeSafetyError('command expired before its output was stored')
+                receipt = store.upload(sink, stdout_path, content_type='application/octet-stream',
+                                       if_generation_match=0)
+                digest = (receipt.get('metadata') or {}).get('sha256')
+                if digest is None or int(receipt.get('size', -1)) != size:
+                    raise gcp_runtime.RuntimeSafetyError('command output upload receipt mismatch')
+                spill = {'object': sink, 'sha256': digest, 'size': size}
+                out = b''
+            else:
+                with open(stdout_path, 'rb') as stream:
+                    out = stream.read()
+        finally:
+            stdout_file.close()
+            stderr_file.close()
+            for path in (source_path, stdout_path, stderr_path):
+                if path is not None:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        if len(out) > MAX_OUTPUT:
             raise gcp_runtime.RuntimeSafetyError('command output exceeds mailbox bound')
         return {'schema_version': 1, 'operation_id': op, 'instance_id': str(host['id']),
                 'source_sha256': config['source_sha256'], 'request_sha256': request_sha,
-                'exit_code': code, 'stdout': out.decode('utf-8', 'replace'), 'stderr': err.decode('utf-8', 'replace')}
+                'exit_code': code, 'stdout': out.decode('utf-8', 'replace'),
+                'stderr': err.decode('utf-8', 'replace'),
+                **({'stdout_object': spill} if spill is not None else {})}
 
     result = execute_at_most_once(gate_root, key, request, execute, deadline_epoch=deadline)
     response_key = key.replace('/requests/', '/responses/')
@@ -336,6 +469,30 @@ def run_request(config, host, store, key, generation, gate_root):
                          'execute', '/mnt/tidehunter/' + config['run_id'] + '/runtime.json']):
         gcp_poweroff.publish_terminal(config, host, store, result, response_key)
     return result
+
+
+def publish_rejection(store, config, host, key, generation, error):
+    """Publish the terminal refusal so the caller learns why it was refused.
+
+    A refused request never runs, so this receipt is the only evidence the
+    caller can read instead of waiting for a response that cannot arrive.
+    """
+    try:
+        raw = store.get(key, generation=generation, max_bytes=4 * 1024 * 1024)
+        request = json.loads(raw)
+        op = request.get('operation_id') if isinstance(request, dict) else None
+        if not isinstance(op, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', op):
+            return None
+        receipt = {'schema_version': 1, 'operation_id': op, 'instance_id': str(host['id']),
+                   'source_sha256': config['source_sha256'],
+                   'request_sha256': hashlib.sha256(raw).hexdigest(),
+                   'exit_code': 126, 'stdout': '', 'stderr': str(error)[:4096], 'rejected': True}
+        gcp_runtime._put_once(store, key.replace('/requests/', '/responses/'), gcp_runtime._encode(receipt))
+        return receipt
+    except Exception as exc:
+        print(f'worker rejection receipt deferred: {type(exc).__name__}: {exc}',
+              file=sys.stderr, flush=True)
+        return None
 
 
 def serve(config, *, api=None, poll_seconds=1):
@@ -370,20 +527,22 @@ def serve(config, *, api=None, poll_seconds=1):
         while time.time() < deadline:
             for key, future in list(active.items()):
                 if future.done():
+                    record = state.entries[key]
                     try:
                         future.result()
                     except InvalidRequest as exc:
                         print(f'worker rejected {key}: {exc}', file=sys.stderr, flush=True)
-                        state.entries[key]['status'] = 'rejected'
+                        record['status'] = 'rejected'
+                        publish_rejection(store, config, host, key, record['generation'], exc)
                     except Exception as exc:
                         print(f'worker operation {key}: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
-                        record = state.entries[key]
                         if record['attempts'] >= MAX_ATTEMPTS:
                             record['status'] = 'rejected'
+                            publish_rejection(store, config, host, key, record['generation'], exc)
                         else:
                             record['retry_after'] = time.time() + min(2 ** (record['attempts'] - 1), 8)
                     else:
-                        state.entries[key]['status'] = 'completed'
+                        record['status'] = 'completed'
                     state.save(key)
                     del active[key]
             if len(active) < MAX_ACTIVE:

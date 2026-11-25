@@ -105,7 +105,7 @@ set -euo pipefail
 export PATH=''' + shlex.quote(gcp_runtime.GUEST_PATH) + '''
 exec ''' + shlex.quote(gcp_runtime.GUEST_PYTHON) + ''' - <<'TIDEHUNTER_BOOTSTRAP'
 ''' + preamble + '''# Stop this run's control worker; GCE DELETE bounds the VM and separate workload units.
-subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-expire-' + c['run_id'],
+subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-expire-' + c['run_id'],
                 '--on-calendar=' + datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
                 '/usr/bin/systemctl', 'stop', 'tidehunter-worker-' + c['run_id'] + '.service'], check=True, timeout=30)
 ''' + _fetch_program() + '''
@@ -117,7 +117,8 @@ os.chmod(config_path, 0o600)
 worker = target / 'source/experiments/gcp-rdma/gcp_worker.py'
 remaining = int(deadline - time.time())
 if remaining <= 0: raise TimeoutError('worker startup expired')
-subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-worker-' + c['run_id'],
+# --collect keeps a released gate re-releasable after a failed worker start.
+subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-worker-' + c['run_id'],
                 '--setenv=PATH=' + c['guest_path'],
                 '--property=Restart=on-failure', '--property=RestartSec=3', '--property=KillMode=control-group',
                 '--property=LimitMEMLOCK=infinity', '--property=RuntimeMaxSec=' + str(remaining),

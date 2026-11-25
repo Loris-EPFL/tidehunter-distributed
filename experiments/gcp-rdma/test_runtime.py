@@ -847,5 +847,60 @@ class MailboxTests(unittest.TestCase):
 
 
 
+class SuiRuntimeTests(unittest.TestCase):
+    """The worker admits the Sui campaign runtime without a KV matrix."""
+
+    def hosts(self, count=3):
+        return [{'index': index, 'role': 'coordinator' if index == 0 else 'owner',
+                 'name': f'run-{index}', 'id': str(300 + index), 'zone': 'us-central1-a',
+                 'internal_ip': f'10.0.0.{index + 1}', 'rdma_ip': f'10.1.0.{index + 1}'}
+                for index in range(count)]
+
+    def launch(self):
+        return {'project_id': 'mysten-research', 'project_number': '514867804006',
+                'bucket': 'bucket', 'machine_type': 'z4m-highmem-16',
+                'run_id': 'bench-' + '1' * 16}
+
+    def package(self, run_id):
+        return {'source_sha256': 'a' * 64, 'object_key': f'runs/{run_id}/package.tar',
+                'generation': '3', 'sha256': 'b' * 64, 'source_revision': 'c' * 40}
+
+    def build(self, spec, *, fleet=None, **optional):
+        launch = self.launch()
+        return runtime.build_runtime_config(
+            launch, fleet or self.hosts(), self.package(launch['run_id']), spec,
+            (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(),
+            run_id=launch['run_id'], **optional)
+
+    def test_the_sui_suite_is_admitted_with_its_owner_count(self):
+        spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                'backends': ['native', 'tidehunter_nvme_rdma']}
+        config = self.build(spec, guest_roots=['/mnt/tidehunter/sui-run'])
+        self.assertEqual(config['spec'], spec)
+        self.assertEqual(config['guest_roots'], ['/mnt/tidehunter/sui-run'])
+
+    def test_a_sui_runtime_cannot_borrow_a_kv_mode(self):
+        for change in ({'mode': 'focused'}, {'owners': 1}, {'owners': 3}):
+            with self.subTest(change=change):
+                spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                        'backends': ['native'], **change}
+                with self.assertRaises(runtime.RuntimeSafetyError):
+                    self.build(spec)
+
+    def test_guest_roots_must_stay_inside_the_mounted_prefixes(self):
+        spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2, 'backends': ['native']}
+        for roots in (['/etc'], ['/mnt/tidehunter'], ['/mnt/tidehunter/../etc'],
+                      ['/mnt/tidehunter/a/'], ['/mnt/tidehunter/a', '/mnt/tidehunter/a'],
+                      ['/mnt/tidehunter/' + str(index) for index in range(9)]):
+            with self.subTest(roots=roots):
+                with self.assertRaises(runtime.RuntimeSafetyError):
+                    self.build(spec, guest_roots=roots)
+
+    def test_a_kv_suite_still_requires_its_own_mode(self):
+        spec = {'suite': 'kv', 'mode': 'sui', 'backends': ['native']}
+        with self.assertRaises(runtime.RuntimeSafetyError):
+            self.build(spec)
+
+
 if __name__ == '__main__':
     unittest.main()
