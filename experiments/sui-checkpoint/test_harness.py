@@ -689,6 +689,22 @@ class RunnerKnobs(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'None'):
             run.require_short_watermark('no gauge\n', 7)
 
+    def test_short_run_records_are_json_serializable(self):
+        catchup, certified, freshness = run.short_run_records(
+            tip=7, digest='DIGEST', certified_epoch=3,
+            namespaces={'live/store/perpetual', 'live/store/epoch_0', 'live/checkpoints'})
+        self.assertEqual(freshness['required_namespaces'],
+                         ['live/checkpoints', 'live/store/epoch_0',
+                          'live/store/perpetual'])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'results.json'
+            build.save(path, dict(catchup=catchup, certified=certified,
+                                  freshness=freshness))
+            stored = json.loads(path.read_text())
+        self.assertEqual(stored['freshness'], freshness)
+        self.assertEqual(stored['certified'], certified)
+        self.assertEqual(stored['catchup'], catchup)
+
     def test_checkpoint_limit_is_an_inclusive_count(self):
         for requested, expected in ((None, 1775), (1, 0), (8, 7), (100, 99),
                                     (1776, 1775)):

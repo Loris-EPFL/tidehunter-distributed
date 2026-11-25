@@ -245,16 +245,9 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
         # path are gone, so keep the last live scrape and use the producer's
         # certified checkpoint for the epoch and digest identity.
         (owned.root / f'{mode}-final.prom').write_text(metrics)
-        catchup = dict(available=False, started=0, indexed=0, tip=tip,
-                       reason='short replay: node stopped at the inclusive bound')
-        certified = dict(sequenceNumber=tip, digest=digest,
-                         epoch=int(certified_epoch), source='producer')
-        namespaces = live_metric_namespaces(schema, int(certified_epoch))
-        freshness = dict(available=False, required_namespaces=namespaces,
-                         source='last_live_scrape',
-                         reason='short replay: node exited at the inclusive bound; '
-                                'final metrics are the last live scrape and the state '
-                                'audit reopens the stopped stores')
+        catchup, certified, freshness = short_run_records(
+            tip=tip, digest=digest, certified_epoch=int(certified_epoch),
+            namespaces=live_metric_namespaces(schema, int(certified_epoch)))
     else:
         metrics, catchup = checkpoint.wait_for_rpc_indexes(child, config['metrics-address'], tip, metrics)
         certified = checkpoint.rpc(config['json-rpc-address'], 'sui_getCheckpoint', [str(tip)])
@@ -645,6 +638,20 @@ def producer_command(binary, config_path):
     exists; Sui then panics. The producer therefore gets no range at all.
     """
     return [binary, '--config-path', config_path]
+
+
+def short_run_records(*, tip, digest, certified_epoch, namespaces):
+    """JSON-safe short-run result records (namespace sets are sorted)."""
+    catchup = dict(available=False, started=0, indexed=0, tip=tip,
+                   reason='short replay: node stopped at the inclusive bound')
+    certified = dict(sequenceNumber=tip, digest=digest,
+                     epoch=int(certified_epoch), source='producer')
+    freshness = dict(available=False, required_namespaces=sorted(namespaces),
+                     source='last_live_scrape',
+                     reason='short replay: node exited at the inclusive bound; '
+                            'final metrics are the last live scrape and the state '
+                            'audit reopens the stopped stores')
+    return catchup, certified, freshness
 
 
 def require_short_watermark(metrics, tip, *, mode='replay'):
