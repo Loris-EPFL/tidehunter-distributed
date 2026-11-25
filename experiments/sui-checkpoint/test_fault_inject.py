@@ -88,7 +88,7 @@ class InjectionRun(unittest.TestCase):
                         'tidehunter_nvmeof_live_read_io_samples_total 3\n') % value
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(self.args(), snapshot=snapshot, delete=delete,
-                    latest=latest, rpc=lambda *a: None, metrics=metrics,
+                    latest=latest, metrics=metrics,
                     clock=clock.monotonic, sleep=clock.sleep, read_checkpoint=read)
             self.assertTrue(record['ok'], record)
             self.assertEqual(record['target']['controller'], 'nvme1')

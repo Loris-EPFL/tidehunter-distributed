@@ -145,7 +145,7 @@ def process_state(pids):
     return rows
 
 
-def run(args, *, snapshot=None, delete=None, rpc=checkpoint.rpc,
+def run(args, *, snapshot=None, delete=None,
         latest=latest_checkpoint, metrics=scrape_metrics, clock=time.monotonic,
         sleep=time.sleep, read_checkpoint=read_checkpoint):
     """Inject one controller loss and return the retained record."""
