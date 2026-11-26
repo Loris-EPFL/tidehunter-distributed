@@ -40,7 +40,9 @@ def preparation(root, tier, *, hosts=('10.20.0.2', '10.20.0.3'), guest=None):
                 handle.add(node['launch'],
                            arcname=str(Path(node['launch']).relative_to(root)))
         records.append(dict(
-            host=host, partition=partition, archive=str(archive),
+            # `prepare_external.py` records an absolute path on the host that
+            # ran it; a staged preparation resolves the archive beside itself.
+            host=host, partition=partition, archive='/elsewhere/' + archive.name,
             archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
             commands=[[str(guest / 'storage-node'), '--experimental-storage-node',
                        str(guest / Path(node['launch']).relative_to(root))]

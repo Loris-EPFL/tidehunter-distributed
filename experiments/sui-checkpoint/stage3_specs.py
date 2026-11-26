@@ -44,6 +44,7 @@ Usage: `stage3_specs.py --root DIR [--rehearsal | --external TIER=DIR ...]
 [--native-root DIR] [--calibration FILE] [--validate BINARY]`.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -186,6 +187,16 @@ def load_external(directory, *, tier, database=None):
         if (len(record.get('commands') or []) != len(databases)
                 or len(record.get('ready_files') or []) != len(databases)):
             raise ValueError('external manifest commands/ready files do not cover every database')
+        # `prepare_external.py` records the absolute archive path of the host
+        # that ran it. A staged preparation carries the same archive beside the
+        # manifest, so resolve it inside this directory and keep the digest.
+        archive_name = Path(str(record.get('archive') or '')).name
+        archive = directory / archive_name
+        if (not archive_name or not archive.is_file()
+                or hashlib.sha256(archive.read_bytes()).hexdigest()
+                != record.get('archive_sha256')):
+            raise ValueError(f'external manifest archive is missing or differs: {archive}')
+        record['archive'] = str(archive)
     return dict(tier=tier, directory=directory, manifest=manifest, config=config,
                 database=name, index=list(databases).index(name), document=document)
 

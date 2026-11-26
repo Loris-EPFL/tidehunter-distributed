@@ -1,5 +1,6 @@
 """Stage-3 driver: local arm, host arm, owner lifecycle, upload-before-pass."""
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -698,8 +699,30 @@ class ClusterDispatch(unittest.TestCase):
             'tls': {'transport': {'kind': 'tcp'}},
             'live_nvme': {'leased_durability': tier},
             'read_cache_bytes': 0}}}
+        for partition in range(2):
+            archive = directory / f'host-{partition}.tar.gz'
+            archive.write_bytes(b'archive-' + str(partition).encode())
+            manifest['hosts'][partition]['archive'] = '/elsewhere/host-%d.tar.gz' % partition
+            manifest['hosts'][partition]['archive_sha256'] = hashlib.sha256(
+                archive.read_bytes()).hexdigest()
         (directory / 'external-manifest.json').write_text(json.dumps(manifest))
         (directory / 'config.json').write_text(json.dumps(config))
+
+    def test_a_staged_preparation_resolves_its_own_archives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'external'
+            self.preparation(directory, 'native', 'a' * 64)
+            prepared = stage3_specs.load_external(directory, tier='native')
+        for record in prepared['manifest']['hosts']:
+            self.assertEqual(Path(record['archive']).parent, directory)
+
+    def test_a_missing_staged_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'external'
+            self.preparation(directory, 'native', 'a' * 64)
+            (directory / 'host-1.tar.gz').unlink()
+            with self.assertRaisesRegex(ValueError, 'archive is missing or differs'):
+                stage3_specs.load_external(directory, tier='native')
 
     def test_each_external_tree_is_staged_local_first(self):
         with tempfile.TemporaryDirectory() as tmp:
