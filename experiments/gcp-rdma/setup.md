@@ -1287,10 +1287,13 @@ is given explicitly.
 
 `config.json` pins `qualification_profile: "focused"`. The image
 `bench-img-3012611b9ce24218-image` (numeric ID `1937849582956621267`) carries a
-focused receipt whose recipe hashes are older than the current
-`gcp_image_prepare.py`, `gcp_image_qualify.py` and `gcp_worker.py`, so
-`gcp_image.admit_image` rejects it. The recipe hash of `gcp_worker.py` changes
-with any worker change, which is why this run is mandatory before a new fleet.
+focused receipt at `runs/bench-2eb0f277d21a4328/qualification/image-receipt.json`
+(generation `1795663306159264`, sha `2e1bfe33…`), and
+`gcp_image.admit_image` accepts it while `gcp_image.recipe_hashes()` still
+matches that receipt. The recipe hash covers `gcp_image_prepare.py`,
+`gcp_image_qualify.py` and `gcp_worker.py`; any change to one of those three
+files forces a new qualification run before a new fleet. Stage 0 of the
+checklist is the admission check: run it, and requalify only when it refuses.
 
 The one-fleet path is the reviewed orchestrator: it boots a fleet with the
 qualification gate, qualifies every member, starts the ordinary worker, admits
@@ -1309,7 +1312,7 @@ python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import m
 
 `q0_spec` binds the fixed workload to the sealed case binaries; `q0_quote`
 prints the surcharge the run requires. The package must be the focused seal from
-step 0, built at the same revision.
+the package section above, built at the same revision.
 
 ```sh
 python3 /absolute/qualify/requalify.py
