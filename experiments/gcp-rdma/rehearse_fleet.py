@@ -487,7 +487,7 @@ class Rehearsal:
         external = self.prepare_stage3_external(output)
         argv = [sys.executable, ENGINE / 'experiments/sui-checkpoint/stage3_campaign.py',
                 '--root', output, '--binary', Path(self.build) / 'binaries/storage-node',
-                '--external', 'native=' + str(external),
+                *[item for tier in external for item in ('--external', tier)],
                 '--native-root', str(GUEST_ROOT / 'native'),
                 '--guest-root', GUEST_ROOT,
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
@@ -501,23 +501,31 @@ class Rehearsal:
         self.step('stage3_campaign cluster mode', ok, detail)
 
     def prepare_stage3_external(self, output):
-        """Prepare stage-3's external deployment with the branch's prepare_external."""
+        """Prepare one external deployment per tier, with the read cache off.
+
+        `stage3_specs.load_external` requires both tiers and a coordinator
+        read cache of zero, which the probe measures against.
+        """
         directory = output / 'external'
         output.mkdir(parents=True, exist_ok=True)
-        # `prepare_external.py` creates its own fresh output directory.
         if directory.exists():
             shutil.rmtree(directory)
-        database = self.stage3_database()
+        directory.mkdir()
         control = [host['internal_ip'] for host in self.fleet_hosts[1:]]
         live = [host['rdma_ip'] for host in self.fleet_hosts[1:]]
-        result = run([sys.executable, ENGINE / 'experiments/sui-checkpoint/prepare_external.py',
-                      '--build', self.build, '--schema', self.args.schema,
-                      '--output', directory, '--db-root', str(GUEST_ROOT / 'native'),
-                      '--guest-root', GUEST_ROOT,
-                      '--hosts', ','.join(control), '--live-hosts', ','.join(live),
-                      '--port', '9400', '--transport', 'tcp', '--live-transport', 'rdma',
-                      '--durability-tier', 'native'], check=True)
-        return directory
+        items = []
+        for tier in ('native', 'synchronous'):
+            target = directory / tier
+            run([sys.executable, ENGINE / 'experiments/sui-checkpoint/prepare_external.py',
+                 '--build', self.build, '--schema', self.args.schema,
+                 '--output', str(target), '--db-root', str(GUEST_ROOT / 'native'),
+                 '--guest-root', GUEST_ROOT,
+                 '--hosts', ','.join(control), '--live-hosts', ','.join(live),
+                 '--port', '9400', '--transport', 'tcp', '--live-transport', 'rdma',
+                 '--durability-tier', tier,
+                 '--coordinator-cache-mib', '0', '--shard-cache-mib', '0'], check=True)
+            items.append(f'{tier}={target}')
+        return items
 
     def stage3_database(self):
         manifests = sorted(Path(self.args.schema).rglob('manifest.json'))
