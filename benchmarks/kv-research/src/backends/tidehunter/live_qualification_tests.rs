@@ -188,3 +188,48 @@ fn controller_loss_is_opt_in_and_never_implicit() {
         "an unknown key stays rejected"
     );
 }
+
+#[test]
+fn controller_loss_targets_the_current_writer_route() {
+    let mut sample = serde_json::json!({
+        "route_evidence_dropped": 0,
+        "routes": [
+            {"transport": "tcp", "address": "10.0.0.2", "service": 4420, "writer": null,
+             "namespace_identity": {"nqn": "nqn.2026-01.test:read", "nsid": 1,
+                 "uuid": [9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},
+            {"transport": "tcp", "address": "10.0.0.2", "service": 4420,
+             "writer": {"epoch": 1, "file_index": 0},
+             "namespace_identity": {"nqn": "nqn.2026-01.test:sub", "nsid": 1,
+                 "uuid": [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}},
+            {"transport": "tcp", "address": "10.0.0.2", "service": 4420,
+             "writer": {"epoch": 1, "file_index": 1},
+             "namespace_identity": {"nqn": "nqn.2026-01.test:sub", "nsid": 2,
+                 "uuid": [2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}
+        ]
+    });
+    // The member transition leaves two writer routes; the newest one is the
+    // member the write path opened last.
+    let route = current_write_route(&sample).expect("the last writer route is current");
+    assert_eq!(
+        route["writer"]["file_index"], 1,
+        "the post-transition member is the current one"
+    );
+    assert_eq!(
+        route["namespace_identity"]["nsid"], 2,
+        "the current route names the transitioned member"
+    );
+    // A read route is never a controller-loss target.
+    let read_only = sample["routes"][0].clone();
+    sample["routes"] = serde_json::json!([read_only]);
+    assert!(
+        current_write_route(&sample).is_err(),
+        "a read route does not name a write controller"
+    );
+    // Dropped evidence breaks the append order, so the selection is refused.
+    sample["routes"] = serde_json::json!([]);
+    sample["route_evidence_dropped"] = serde_json::json!(1);
+    assert!(
+        current_write_route(&sample).is_err(),
+        "dropped route evidence cannot name the current writer"
+    );
+}

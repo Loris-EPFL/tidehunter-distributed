@@ -1180,6 +1180,23 @@ fn open_descriptors(path: &Path) -> BackendResult<usize> {
     Ok(count)
 }
 
+/// The writer route the engine opened last, from one evidence snapshot.
+///
+/// Routes are appended when a queue opens, and `LiveNvmeMetrics::record_route`
+/// drops nothing until its 1024-entry bound. `verify_routes` refuses a snapshot
+/// whose `route_evidence_dropped` is nonzero, and this repeats that check, so
+/// the last writer route is the member the write path uses now — also after the
+/// member transition added a second writer route on another file and UUID.
+fn current_write_route(sample: &serde_json::Value) -> BackendResult<serde_json::Value> {
+    check(
+        count(sample, "route_evidence_dropped")? == 0,
+        "the live namespace route evidence was dropped",
+    )?;
+    writer_routes(sample)?
+        .pop()
+        .ok_or_else(|| "controller loss requires an active write route".into())
+}
+
 /// Delete the active write controller from outside and require a W1 resume.
 ///
 /// The request file names the controller, its sysfs inode, its namespace and
@@ -1197,12 +1214,8 @@ fn qualify_controller_loss(
     progress: &mut QualificationProgress,
     clean: &serde_json::Value,
 ) -> BackendResult<serde_json::Value> {
-    let routes = writer_routes(clean)?;
-    check(
-        routes.len() == 1,
-        "controller loss requires exactly one active write route",
-    )?;
-    let controller = ActiveWriteController::from_route(&routes[0])?;
+    let route = current_write_route(clean)?;
+    let controller = ActiveWriteController::from_route(&route)?;
     check(
         controller.state().as_deref() == Some("live"),
         "the active write controller is not live before the loss",
@@ -1219,9 +1232,9 @@ fn qualify_controller_loss(
         "schema": 1, "kind": "w1_controller_loss_request",
         "phase": "controller_loss",
         "pid": std::process::id(),
-        "host_nqn": routes[0]["host_nqn"],
-        "address": routes[0]["address"],
-        "service": routes[0]["service"],
+        "host_nqn": route["host_nqn"],
+        "address": route["address"],
+        "service": route["service"],
         "target": controller.evidence(),
     });
     let request_path = output.join("controller-loss-ready.json");
