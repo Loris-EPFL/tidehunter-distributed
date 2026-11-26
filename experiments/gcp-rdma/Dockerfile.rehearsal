@@ -1,9 +1,8 @@
 FROM tidehunter-gcp-build:latest
-# The real guest runs its own interpreter with the pinned PyYAML wheel. The
-# rehearsal image adds only that, so every binary and every Python module the
-# rehearsal runs is the same glibc 2.34 environment the campaign guest uses.
-RUN python3 -m pip install --no-cache-dir 'pyyaml==6.0.2' && \
-    mkdir -p /opt/tidehunter-python/bin && \
-    ln -sf /usr/bin/python3 /opt/tidehunter-python/bin/python3 && \
+# The real guest runs its own interpreter, a venv with the system packages and
+# the pinned PyYAML wheel. The rehearsal image reproduces exactly that, so every
+# binary and module the rehearsal runs is the same glibc 2.34 environment.
+RUN python3 -m venv --system-site-packages /opt/tidehunter-python && \
+    /opt/tidehunter-python/bin/python3 -m pip install --no-cache-dir 'pyyaml==6.0.2' && \
     /opt/tidehunter-python/bin/python3 -c \
-      'import yaml; assert yaml.__version__ == "6.0.2", yaml.__version__'
+      'import sys, yaml; assert yaml.__version__ == "6.0.2"; assert sys.executable == "/opt/tidehunter-python/bin/python3"'
