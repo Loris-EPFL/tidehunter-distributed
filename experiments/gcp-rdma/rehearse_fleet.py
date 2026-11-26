@@ -106,28 +106,44 @@ class Rehearsal:
 
     # ---- preflight -----------------------------------------------------
     def stage_build(self):
-        """Copy the frozen guest build and overlay this branch's harness sources.
+        """Freeze this branch's sources and pair them with the guest binaries.
 
-        The binaries and the build manifest stay exactly as built; only the
-        Python harness is the branch under test, because a real reseal produces
-        the same pair (same binaries, newer drivers).
+        The staged build binds its source inventory: `run.py` refuses a tree
+        whose files changed. The rehearsal re-freezes the branch with the real
+        `build.py prepare` and reuses the guest-compatible binaries built from
+        the same engine commit, so the drivers under test are this branch and
+        the executables stay the admitted guest build.
         """
-        source = Path(self.args.build).resolve()
         target = self.work / 'build'
-        if not target.exists():
-            run(['cp', '-al', str(source), str(target)])
-        overlays = 0
-        for relative in ('experiments/gcp-rdma', 'experiments/sui-checkpoint'):
-            for item in sorted((ENGINE / relative).glob('*.py')):
-                destination = target / 'sources/tidehunter-sharded-wal' / relative / item.name
-                if not destination.parent.is_dir():
-                    continue
-                destination.unlink(missing_ok=True)
-                shutil.copy2(item, destination)
-                overlays += 1
+        source = Path(self.args.build).resolve()
+        if not (target / 'build-manifest.json').exists():
+            old = json.loads((source / 'build-manifest.json').read_text())
+            command = [sys.executable, ENGINE / 'experiments/sui-checkpoint/build.py',
+                       'prepare', '--sui', self.args.sui, '--engine', ENGINE,
+                       '--output', target, '--jobs', '2']
+            if old.get('fabric'):
+                command.append('--fabric')
+            run(command)
+            plan = json.loads((target / 'plan.json').read_text())
+            shutil.copytree(source / 'binaries', target / 'binaries')
+            manifest = dict(plan, commands=old['commands'], binaries=old['binaries'],
+                            environment=old.get('environment', {}),
+                            resolved_locks=old.get('resolved_locks', {}),
+                            executable_binding=old.get('executable_binding'))
+            if 'guest_abi' in old:
+                manifest['guest_abi'] = old['guest_abi']
+            (target / 'build-manifest.json').write_text(json.dumps(manifest))
         self.build = target
         self.step('build staging', True,
-                  str(target) + ' (' + str(overlays) + ' harness sources overlaid)')
+                  str(target) + ' (branch sources re-frozen, guest binaries reused)')
+
+    def clean_work(self):
+        """Remove an earlier run's tree, including root-owned container files."""
+        if not self.work.exists():
+            return
+        run(['docker', 'run', '--rm', '-v', str(self.work.parent) + ':/w', IMAGE,
+             'sh', '-c', 'rm -rf /w/' + self.work.name])
+        self.step('work tree', True, str(self.work) + ' (cleaned)')
 
     def preflight(self):
         missing = [str(path) for path in
@@ -296,25 +312,27 @@ class Rehearsal:
         return lines
 
     def wall(self, cell, result):
-        """A cell passes only when it stopped at kernel NVMe-oF provisioning."""
+        """A cell passes only when it stopped at kernel NVMe-oF provisioning.
+
+        The owners start before the engine provisions the NVMe-oF target, so
+        the failure normally appears in the coordinator's output on H0. Owner
+        logs are accepted too, because a target bind can fail there first.
+        Another failure after owner start stays a failure.
+        """
         logs = self.owner_logs()
-        if not logs:
-            return False, 'no owner log: the cell did not reach owner start'
-        matched = []
-        for host, name, text in logs:
-            if not text.strip():
-                continue
+        if not logs or not any('storage_node_pid=' in text for _, _, text in logs):
+            return False, 'no owner start: the cell did not reach the owner lifecycle'
+        coordinator = (result.stdout or '') + (result.stderr or '')
+        sources = [(f'{host}/{name}', text) for host, name, text in logs]
+        sources.append(('H0 coordinator', coordinator))
+        for label, text in sources:
             for marker in WALL_MARKERS:
                 if marker in text:
                     line = next(row for row in text.splitlines() if marker in row)
-                    matched.append(f'{host}/{name}: {line.strip()[:160]}')
-                    break
-        if not matched:
-            tail = (logs[-1][2].strip().splitlines() or ['<empty>'])[-3:]
-            return False, ('owner logs carry no kernel NVMe-oF failure; last lines: '
-                           + ' | '.join(tail))
-        return True, f'stopped at kernel NVMe-oF provisioning ({len(matched)} owner logs): ' \
-                     + '; '.join(matched)
+                    return True, (f'stopped at kernel NVMe-oF provisioning '
+                                  f'({label}): {line.strip()[:200]}')
+        tail = (coordinator.strip().splitlines() or ['<empty>'])[-3:]
+        return False, 'no kernel NVMe-oF failure; coordinator last lines: ' + ' | '.join(tail)
 
     def manual_sui(self):
         output = self.work / 'cells' / 'manual_sui'
@@ -331,6 +349,32 @@ class Rehearsal:
         ok, detail = self.wall('manual_sui', result)
         self.step('manual_sui S1-0 (checkpoints 4)', ok, detail)
         self.check_launch_addresses('manual_sui')
+
+    def manual_sui_controller_loss(self):
+        """Dispatch S1-4 mid-frame (native) to the same wall.
+
+        The injector gate polls a live Sui RPC, so the cell cannot reach a
+        checkpoint here; the point of the rehearsal is that admission, cell id
+        and injector plumbing dispatch, and that the owner lifecycle stops at
+        the same kernel wall first.
+        """
+        output = self.work / 'cells' / 'manual_sui_loss'
+        argv = [sys.executable, HERE / 'manual_sui.py',
+                '--build', self.build, '--fixture', self.args.fixture,
+                '--schema', self.args.schema, '--output', output,
+                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
+                '--transport', 'tcp', '--live-transport', 'rdma',
+                '--fleet-state', self.state_path, '--fleet-config', self.config_path,
+                '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds),
+                '--controller-loss', 'mid-frame', '--durability-tier', 'native',
+                '--cell-id', 'S1-4-mid-frame-native', '--stage', 'stage1',
+                '--', '--checkpoints', '4']
+        result = self.dispatch('manual_sui S1-4', argv, self.args.cell_seconds + 300)
+        ok, detail = self.wall('manual_sui S1-4', result)
+        self.step('manual_sui S1-4 mid-frame native', ok, detail)
+        self.check_launch_addresses('manual_sui_loss',
+                                    'out/manual_sui_loss-external-config')
 
     def check_launch_addresses(self, cell, config_dir='out/manual_sui-external-config'):
         """The prepared launch must listen on the control IP and export the RDMA IP."""
@@ -448,6 +492,9 @@ def main():
                         default=Path('/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/'
                                      'rehearsal-2026-11-26/package'))
     parser.add_argument('--revision', help='source revision; defaults to the engine HEAD')
+    parser.add_argument('--sui', type=Path,
+                        default=Path('/home/hybr1d/Desktop/PDM/TideHunter/'
+                                     'scratch/SuiPinFinal/sui'))
     parser.add_argument('--work', type=Path,
                         default=Path('/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/'
                                      'cluster-campaign-2026-11-25/rehearsal-local'))
@@ -457,7 +504,8 @@ def main():
                         help='bound of one dispatched coordinator request')
     parser.add_argument('--ready-seconds', type=int, default=1800)
     parser.add_argument('--fault-cell', default='M6-w1-c16')
-    parser.add_argument('--cells', default='manual_sui,fault_cells,stage3',
+    parser.add_argument('--cells',
+                        default='manual_sui,manual_sui_controller_loss,fault_cells,stage3',
                         help='comma-separated cells to run')
     parser.add_argument('--keep', action='store_true',
                         help='keep the containers and the store for inspection')
@@ -468,6 +516,7 @@ def main():
     code = 1
     try:
         rehearsal.preflight()
+        rehearsal.clean_work()
         rehearsal.stage_build()
         rehearsal.start_store()
         rehearsal.make_networks()
