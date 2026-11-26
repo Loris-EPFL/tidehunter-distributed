@@ -198,6 +198,8 @@ class Rehearsal:
                    '-v', str(Path(self.args.package) / 'fabric') + ':/rehearsal/fabric:ro',
                    '-v', str(Path(self.args.package) / 'fabric/lib/libfabric.so.1')
                    + ':/usr/lib64/libfabric.so.1:ro',
+                   '-v', str(Path(self.args.package) / 'fabric/bin/fi_info')
+                   + ':/usr/local/bin/fi_info:ro',
                    '-e', 'REHEARSAL_IDENTITY=/rehearsal/work/identity.json',
                    '-e', gcp_api.REHEARSAL_ENDPOINT + '=' + guest_endpoint,
                    IMAGE, '/opt/tidehunter-python/bin/python3',
