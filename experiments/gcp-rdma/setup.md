@@ -1320,7 +1320,8 @@ Rocky 9 containers. Only the ACPI poweroff is a recorded action inside each
 container.
 
 ```sh
-python3 experiments/gcp-rdma/rehearse_fleet.py --cells idle_stop
+python3 experiments/gcp-rdma/rehearse_fleet.py --cells idle_stop \
+  --build $BUILD --package $PACKAGE --work $CAMPAIGN_ROOT/rehearsal-idle
 ```
 
 The command uses a 60-second test window. It PASSes only when a dispatched

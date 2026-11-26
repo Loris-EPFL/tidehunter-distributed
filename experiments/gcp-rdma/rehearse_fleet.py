@@ -811,7 +811,7 @@ def main():
                         default=Path(os.environ.get(
                             'REHEARSAL_BUILD',
                             '/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/'
-                            'cluster-campaign-2026-11-25/build-guest')))
+                            'cluster-campaign-2026-11-25/build-guest3')))
     parser.add_argument('--fixture', type=Path,
                         default=Path('/home/hybr1d/Desktop/PDM/TideHunter/'
                                      'checkpoint-fixtures/sui-genesis-1775/fixture'))
@@ -822,7 +822,7 @@ def main():
                                      'experiment/native-schema'))
     parser.add_argument('--package', type=Path,
                         default=Path('/home/hybr1d/Desktop/PDM/TideHunter/checkpoint-work/'
-                                     'rehearsal-2026-11-26/package'))
+                                     'cluster-campaign-2026-11-25/package3'))
     parser.add_argument('--revision', help='source revision; defaults to the engine HEAD')
     parser.add_argument('--sui', type=Path,
                         default=Path('/home/hybr1d/Desktop/PDM/TideHunter/'
