@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Build and qualify a sealed engine checkout without cloud credentials."""
+"""Build and qualify a sealed engine checkout without cloud credentials.
+
+Campaign reseal (the Sui fleet package). Every campaign guest must load the
+pinned nvmet module; a package without it cannot pass S1-0, because a short
+`IOCB_NOWAIT` read on the buffered target can return `-EREMOTEIO` on the stock
+module. The reviewed reseal command is:
+
+    python3 experiments/gcp-rdma/prepare.py \
+        --engine <clean checkout> --output <package-dir> --revision <full sha> \
+        --spec checkpoint-work/cluster-campaign-2026-11-25/package-spec.json \
+        --build-container <rocky9 build image> \
+        --nvmet-fix-prefix checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix
+
+`--nvmet-fix-prefix` is admitted statically: exactly the four reviewed files,
+the pinned patch, and `nvmet.ko` with SHA-256 `5ba7b96c...`
+(`experiments/nvmeof/kernel_fix.MODULE_SHA`). `mailbox_exec.publish` refuses a
+Sui campaign package whose receipt carries no nvmet fix, so a reseal that omits
+the flag stops before a host is rented.
+"""
 import argparse
 import json
 import os
@@ -12,6 +30,9 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+# The pinned campaign module (experiments/nvmeof/kernel_fix.MODULE_SHA). A
+# campaign package that stages another nvmet.ko is not this review's module.
+NVMET_FIX_MODULE_SHA256 = '5ba7b96c3b232e7fc0d1200b674d6210324d87ed406f8b51f4b323609ccc233a'
 sys.path.insert(0, str(ROOT / 'experiments/kv-comparison'))
 import cloud_package
 import ci_prepare
@@ -211,6 +232,12 @@ def prepare(engine, output, revision, fabric, deadline_seconds, spec_path=None, 
     cloud_package.stage(engine, snapshot, build, fdb, package,
                         valkey_source=valkey_source, nvmet_fix_prefix=nvmet_fix_prefix,
                         **profile_args)
+    if nvmet_fix_prefix is not None:
+        staged = json.loads((package / 'manifest.json').read_text()).get('nvmet_fix') or {}
+        if staged.get('module_sha256') != NVMET_FIX_MODULE_SHA256:
+            raise ValueError(
+                'the staged nvmet fix is not the pinned module '
+                + NVMET_FIX_MODULE_SHA256)
     if (package / 'bundle.tar.gz').stat().st_size > 512 << 20:
         raise ValueError('compressed KV runtime exceeds guest download limit')
     env = cloud_package.clean_environment()
@@ -306,7 +333,11 @@ def main():
     parser.add_argument('--build-container', help='local Rocky 9 build image; builds fabric and Valkey inside it')
     parser.add_argument('--deadline', type=int, default=10800)
     parser.add_argument('--spec', type=Path)
-    parser.add_argument('--nvmet-fix-prefix', type=Path, help='statically admitted nvmet kernel fix prefix')
+    parser.add_argument(
+        '--nvmet-fix-prefix', type=Path,
+        help='statically admitted nvmet kernel fix prefix; the campaign reseal uses '
+             'checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix (nvmet.ko '
+             'SHA-256 5ba7b96c...) and a campaign package without it is refused')
     parser.add_argument('--admit-transfer', action='store_true')
     parser.add_argument('--manual-allow-dirty', action='store_true',
                         help='allow a frozen dirty checkout only for the reviewed manual KV campaign')

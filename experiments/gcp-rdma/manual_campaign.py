@@ -635,12 +635,18 @@ while time.time() < end:
         with opener.open(urllib.request.Request(url, headers={'Authorization':'Bearer ' + token}), timeout=15) as r: raw = r.read(1048577)
         if len(raw) > 1048576: raise ValueError('oversized gate')
         gate = json.loads(raw)
-        if gate.get('run_id') != c['run_id'] or gate.get('source_sha256') != c['source'] or gate.get('instance_id') != instance or gate.get('deadline_utc') != c['deadline']: raise ValueError('gate identity mismatch')
-        script = gate['script'].encode()
-        if hashlib.sha256(script).hexdigest() != gate['sha256']: raise ValueError('gate checksum mismatch')
+        script = gate.get('script')
+        if (gate.get('run_id') != c['run_id'] or gate.get('source_sha256') != c['source'] or gate.get('instance_id') != instance or gate.get('deadline_utc') != c['deadline'] or not isinstance(script, str) or hashlib.sha256(script.encode()).hexdigest() != gate.get('sha256')):
+            # An earlier attempt under the same deterministic run id left its
+            # gate here. The admitted gate lands seconds after the hosts exist,
+            # and this script runs once per boot: aborting would leave a
+            # silent, billing host with no worker and no idle guard. Wait for
+            # the gate that names this exact instance and deadline.
+            time.sleep(1)
+            continue
         remaining = int(end - time.time())
         if remaining <= 0: raise TimeoutError('gate expired')
-        subprocess.run(['/bin/bash'], input=script, check=True, timeout=remaining)
+        subprocess.run(['/bin/bash'], input=script.encode(), check=True, timeout=remaining)
         break
     except urllib.error.HTTPError as e:
         if e.code != 404: raise

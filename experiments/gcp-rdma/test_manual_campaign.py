@@ -538,9 +538,64 @@ class ManualCampaignTest(unittest.TestCase):
         gate = manual._gate(CONFIG['bucket'], state)
         for fragment in ("meta('instance/id')", "gate.get('instance_id') != instance",
                          "gate.get('source_sha256') != c['source']",
-                         "gate.get('deadline_utc') != c['deadline']", 'hashlib.sha256(script)',
+                         "gate.get('deadline_utc') != c['deadline']", 'hashlib.sha256(script',
                          "subprocess.run(['/bin/bash']"):
             self.assertIn(fragment, gate)
+
+    def test_a_stale_gate_is_waited_out_not_raised(self):
+        # A re-create under the same deterministic run id meets the previous
+        # attempt's gate. The boot script runs once, so aborting would leave a
+        # silent, billing host with no worker and no idle guard.
+        state = parent()
+        gate = manual._gate(CONFIG['bucket'], state)
+        body = gate.split("exec /usr/bin/python3 - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        name, instance = state['run_id'] + '-0', '200'
+        fresh = 'echo fresh\n'
+        stale = json.dumps({'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
+                            'instance_id': '999', 'deadline_utc': state['deadline'],
+                            'script': 'echo stale', 'sha256': hashlib.sha256(b'echo stale').hexdigest()})
+        current = json.dumps({'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
+                              'instance_id': instance, 'deadline_utc': state['deadline'],
+                              'script': fresh, 'sha256': hashlib.sha256(fresh.encode()).hexdigest()})
+        reads = [stale, stale, current]
+
+        class Response:
+            def __init__(self, data=b'', headers=None):
+                self.data, self.headers = data, headers or {}
+
+            def read(self, limit=-1):
+                return self.data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def open(self, request, timeout=None):
+                url = request.full_url if hasattr(request, 'full_url') else request.get_full_url()
+                if 'metadata.google.internal' in url:
+                    if url.endswith('token'):
+                        return Response(json.dumps({'access_token': 'token'}).encode(),
+                                        {'Metadata-Flavor': 'Google'})
+                    value = {'instance/id': instance, 'instance/name': name,
+                             'attributes/bench-run': state['run_id'],
+                             'attributes/bench-source': state['source_sha256'],
+                             'attributes/bench-expiry': state['deadline']}
+                    attribute = next(key for key in value if url.endswith(key))
+                    return Response(value[attribute].encode(), {'Metadata-Flavor': 'Google'})
+                return Response(reads.pop(0).encode())
+
+        ran, sleeps = [], []
+        import urllib.request
+        with patch.object(urllib.request, 'build_opener', return_value=Opener()), \
+                patch.object(time, 'sleep', side_effect=sleeps.append), \
+                patch.object(subprocess, 'run',
+                             side_effect=lambda argv, **kw: ran.append(kw['input'])):
+            exec(compile(body, 'gate', 'exec'), {'__name__': 'gate'})
+        self.assertEqual(ran, [fresh.encode()])
+        self.assertEqual(len(sleeps), 2)
 
     def test_source_bound_staging_pins_archive_and_wheel_generations(self):
         store, state = Store(), parent()
