@@ -48,6 +48,46 @@ GCLOUD_SECONDS = 600
 FLEET_HOSTS = (2, 3)
 FLEET_ROLES = ('campaign', 'qualification')
 MAX_FLEET_HOURS = 6
+# The image carries kernel 687.42.1 as well as 687.49.1, and the pinned module
+# only loads on 687.49.1. These mirror experiments/nvmeof/kernel_fix.py
+# (RELEASE, CANDIDATE_SRC, CANDIDATE_BUILD); a test keeps them equal.
+KERNEL_RELEASE = '5.14.0-687.49.1+2.1.el9_8_ciq.x86_64'
+NVMET_SRCVERSION = '9F99AF855591751D53D463D'
+NVMET_BUILD_ID = '61aabd36adb3d8a51feb01cd289410d958c68c20'
+
+
+def kernel_admission(remote, prepared):
+    """Read the running kernel and the loaded nvmet identity on every host.
+
+    The guest gate installs the pinned module and records the build ID it
+    loaded. The running release and the loaded srcversion are read from the
+    guest, so a host that booted another kernel, or that runs the stock module,
+    stops the run before any campaign driver starts.
+    """
+    observed = {}
+    for name in sorted(prepared):
+        receipt = prepared[name]
+        _code, out, _err = remote.shell(name, 'uname -r')
+        release = out.decode('utf-8', 'replace').strip()
+        _code, out, _err = remote.shell(name, 'cat /sys/module/nvmet/srcversion')
+        srcversion = out.decode('utf-8', 'replace').strip()
+        loaded = (((receipt.get('nvmet_fix') or {}).get('loaded') or {})
+                  .get('loaded_nvmet') or {})
+        if release != KERNEL_RELEASE:
+            raise ComputeError(f'{name}: running kernel {release or "<none>"} is not '
+                               + KERNEL_RELEASE)
+        if srcversion != NVMET_SRCVERSION:
+            raise ComputeError(f'{name}: loaded nvmet srcversion '
+                               f'{srcversion or "<none>"} is not the pinned module')
+        if loaded != {'srcversion': NVMET_SRCVERSION, 'build_id': NVMET_BUILD_ID}:
+            raise ComputeError(f'{name}: the worker did not record the pinned nvmet '
+                               'build ID')
+        observed[name] = {'kernel': release, 'nvmet_srcversion': srcversion,
+                          'nvmet_build_id': loaded['build_id']}
+    return {'kernel_release': KERNEL_RELEASE, 'nvmet_srcversion': NVMET_SRCVERSION,
+            'nvmet_build_id': NVMET_BUILD_ID, 'hosts': observed}
+
+
 def startup_script(config, state):
     """The identity-bound gate every host boots with; it runs no workload yet."""
     return mailbox_exec.gate_script(config['bucket'], state)
@@ -1105,7 +1145,8 @@ async def create(config, args):
         Compute(config, state, args.state, gcloud)
     if args.package is not None and args.role == 'campaign':
         # A campaign package must carry the pinned nvmet module: without it
-        # S1-0 cannot pass, so refuse before a host is rented.
+        # the S1-0 admission cells cannot pass, so refuse before a host is
+        # rented.
         mailbox_exec.admit_package_nvmet_fix(Path(args.package))
     image_path = args.image or config.get('image')
     if args.dry_run:
@@ -1227,7 +1268,16 @@ async def ready(config, args):
         args.state, gcp_api.campaign_client(config), bucket=config['bucket'],
         timeout_seconds=args.worker_seconds)
     prepared = remote.wait_workers(require=args.require_manifest_sha256)
+    admission = kernel_admission(remote, prepared)
+    state['kernel_admission'] = admission
+    save(args.state, state)
+    # Campaign evidence: the same identity every host reported, under the run.
+    store = gcp_api.campaign_client(config).objects(config['bucket'])
+    mailbox_exec.replace_object(
+        store, f'runs/{state["run_id"]}/qualification/kernel-admission.json',
+        (json.dumps(admission, sort_keys=True, indent=2) + '\n').encode())
     print(json.dumps({'run_id': state['run_id'], 'hosts': sorted(prepared),
+                      'kernel': admission,
                       'storage': {name: item.get('storage') for name, item in prepared.items()}},
                      sort_keys=True, indent=2))
     return 0

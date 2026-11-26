@@ -480,19 +480,21 @@ class PerCellCriteria(unittest.TestCase):
                                    checkpoint_count=2)
 
     def test_the_admission_cell_proves_the_rdma_live_path_and_lists_the_rest(self):
-        checks = self.checks('S1-0', scrape())
-        self.assertEqual(checks['failures'], [])
-        admission = checks['checks']['admission']
-        self.assertEqual(admission['rdma_live_path']['state'], 'pass')
-        self.assertEqual(admission['write_protect_readback']['state'], 'pass')
-        self.assertEqual(admission['lease_protocol']['state'], 'not_exported')
-        self.assertEqual(admission['no_tcp_fallback']['state'], 'not_exported')
-        self.assertEqual(admission['orphan_export']['state'], 'not_exported')
-        for key in ('lease_protocol', 'no_tcp_fallback', 'orphan_export'):
-            self.assertIn(f'admission.{key}', checks['not_exported'])
+        for cell_id in ('S1-0-native', 'S1-0-synchronous'):
+            with self.subTest(cell=cell_id):
+                checks = self.checks(cell_id, scrape())
+                self.assertEqual(checks['failures'], [])
+                admission = checks['checks']['admission']
+                self.assertEqual(admission['rdma_live_path']['state'], 'pass')
+                self.assertEqual(admission['write_protect_readback']['state'], 'pass')
+                self.assertEqual(admission['lease_protocol']['state'], 'not_exported')
+                self.assertEqual(admission['no_tcp_fallback']['state'], 'not_exported')
+                self.assertEqual(admission['orphan_export']['state'], 'not_exported')
+                for key in ('lease_protocol', 'no_tcp_fallback', 'orphan_export'):
+                    self.assertIn(f'admission.{key}', checks['not_exported'])
 
     def test_a_missing_live_family_fails_the_admission_cell(self):
-        checks = self.checks('S1-0', scrape(live=False))
+        checks = self.checks('S1-0-native', scrape(live=False))
         self.assertTrue(any('admission' in item for item in checks['failures']))
         self.assertEqual(checks['checks']['admission']['rdma_live_path']['state'],
                          'missing_counter')
@@ -500,7 +502,7 @@ class PerCellCriteria(unittest.TestCase):
     def test_a_fixture_target_never_passes_an_admission_cell(self):
         values = scrape()
         values['tidehunter_nvmeof_live_target_fixture_partitions'] = 2
-        checks = self.checks('S1-0', values)
+        checks = self.checks('S1-0-synchronous', values)
         self.assertTrue(any('fixture target' in item for item in checks['failures']))
         self.assertEqual(checks['checks']['admission']['rdma_live_path']['state'], 'fail')
 

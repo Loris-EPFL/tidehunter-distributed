@@ -1677,7 +1677,8 @@ class ReviewedCellAdmission(unittest.TestCase):
 
     def test_each_reviewed_row_admits_its_own_knobs(self):
         rows = {
-            'S1-0': dict(checkpoints=4),
+            'S1-0-native': dict(checkpoints=4),
+            'S1-0-synchronous': dict(checkpoints=4),
             'S1-1-native': dict(lifecycle_checks=True),
             'S1-7-cache0-native': dict(value_cache_size=0),
             'S1-7-blob1024-native': dict(index_blob_cache_mib=1024,
@@ -1692,7 +1693,7 @@ class ReviewedCellAdmission(unittest.TestCase):
         }
         for cell_id, knobs in rows.items():
             with self.subTest(cell=cell_id):
-                tier = 'synchronous' if cell_id == 'M4-synchronous' else 'native'
+                tier = 'synchronous' if cell_id.endswith('-synchronous') else 'native'
                 row = run.cell_admission(self.namespace(cell_id, durability_tier=tier,
                                                         **knobs))
                 self.assertEqual(row['id'], cell_id)
@@ -1707,7 +1708,7 @@ class ReviewedCellAdmission(unittest.TestCase):
             ('M3-native', dict(fragment_mib=64, max_maps=3, max_index_maps=3,
                                max_dirty_keys=1024), 'max-dirty-keys'),
             ('M5-hold', dict(hold_seconds=0), 'hold-seconds'),
-            ('S1-0', dict(checkpoints=None), 'checkpoints'),
+            ('S1-0-native', dict(checkpoints=None), 'checkpoints'),
             ('M2-cache0-native', dict(value_cache_size=None), 'value-cache-size'),
         )
         for cell_id, knobs, needle in cases:

@@ -206,7 +206,8 @@ class ReviewedCells(unittest.TestCase):
 
     def test_the_stage_one_lifecycle_and_cache_rows_exist_per_tier(self):
         ids = {row['id'] for row in ledger.MANUAL_SUI_CELLS}
-        for required in ('S1-0', 'S1-1-native', 'S1-1-synchronous',
+        for required in ('S1-0-native', 'S1-0-synchronous',
+                         'S1-1-native', 'S1-1-synchronous',
                          'S1-7-cache0-native', 'S1-7-cache128-native',
                          'S1-7-cache1000-native', 'S1-7-cache1000-synchronous',
                          'S1-7-blob1024-native', 'S1-8-native', 'S1-8-synchronous',
@@ -231,8 +232,9 @@ class ReviewedCells(unittest.TestCase):
         self.assertIn('hold', hold['requires'])
 
     def test_run_arguments_round_trip(self):
-        self.assertEqual(ledger.run_arguments(ledger.cell('S1-0')),
-                         ['--checkpoints', '4'])
+        for cell_id in ('S1-0-native', 'S1-0-synchronous'):
+            self.assertEqual(ledger.run_arguments(ledger.cell(cell_id)),
+                             ['--checkpoints', '4'])
         self.assertEqual(ledger.run_arguments(ledger.cell('S1-1-native')),
                          ['--lifecycle-checks', '--tail-checkpoints', '64'])
         self.assertEqual(ledger.run_arguments(ledger.cell('M1-c4-native')),

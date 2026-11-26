@@ -2,9 +2,9 @@
 """Build and qualify a sealed engine checkout without cloud credentials.
 
 Campaign reseal (the Sui fleet package). Every campaign guest must load the
-pinned nvmet module; a package without it cannot pass S1-0, because a short
-`IOCB_NOWAIT` read on the buffered target can return `-EREMOTEIO` on the stock
-module. The reviewed reseal command is:
+pinned nvmet module; a package without it cannot pass the S1-0 admission cells,
+because a short `IOCB_NOWAIT` read on the buffered target can return
+`-EREMOTEIO` on the stock module. The reviewed reseal command is:
 
     python3 experiments/gcp-rdma/prepare.py \
         --engine <clean checkout> --output <package-dir> --revision <full sha> \

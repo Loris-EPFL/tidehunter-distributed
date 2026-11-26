@@ -133,7 +133,8 @@ def admit_nvmet_fix(receipt):
     """The campaign package must carry the pinned nvmet kernel module.
 
     The guests bind the stock CIQ module otherwise, and a short `IOCB_NOWAIT`
-    read on the buffered target can return `-EREMOTEIO`, so S1-0 cannot pass.
+    read on the buffered target can return `-EREMOTEIO`, so the S1-0 admission
+    cells cannot pass.
     A package is either resealed with `prepare.py --nvmet-fix-prefix
     checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix` or it is not
     a campaign package.

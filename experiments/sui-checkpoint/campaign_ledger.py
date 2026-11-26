@@ -72,7 +72,11 @@ def _cell(cell_id, stage, tier, *, requires=(), run=(), fragment_mib=None,
 def _manual_sui_cells():
     rows = [
         # ---- stage 1: correctness -------------------------------------------
-        _cell('S1-0', 'stage1', 'native', requires=('admission',),
+        # The admission cell runs on both tiers: the synchronous one is the
+        # first FUA write on this image.
+        _cell('S1-0-native', 'stage1', 'native', requires=('admission',),
+              run=(('--checkpoints', '4'),)),
+        _cell('S1-0-synchronous', 'stage1', 'synchronous', requires=('admission',),
               run=(('--checkpoints', '4'),)),
         _cell('S1-1-native', 'stage1', 'native', requires=('lifecycle',),
               run=(('--lifecycle-checks',), ('--tail-checkpoints', '64'))),

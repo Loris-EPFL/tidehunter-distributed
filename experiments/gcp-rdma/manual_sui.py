@@ -43,6 +43,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -82,6 +83,10 @@ CONTROLLER_LOSS_COUNTERS = {
 }
 CONTROLLER_LOSS_CASE = {'stage1': 'S1-4', 'stage2': 'M7'}
 MAX_CONTROLLER_LOSS_SAMPLES = 2048
+# A udev partition probe after the controller deletion is expected noise. The
+# evidence labels those lines; the cell never gates on the kernel log.
+UDEV_PROBE = re.compile(r'udev|blkid|BLKRRPART|no available path|Buffer I/O error',
+                        re.IGNORECASE)
 # `run.py` bounds each audit command at 600 s; a cell runs at most 8 of them
 # (state and RocksDB, for both modes, before and after a reopen) and adds one
 # 900 s slack window. The launcher's own wait must cover that plus the replays
@@ -330,12 +335,50 @@ class ControllerLoss:
             argv += ['--metrics-url', self.metrics_url]
         return argv
 
+    def host_time(self, remote):
+        """The host wall clock, used as the kernel-log window start."""
+        code, out, err = remote.run(self.host, 'date -u +%Y-%m-%dT%H:%M:%SZ', check=False)
+        if code != 0:
+            return None
+        text = out.decode('utf-8', 'replace').strip()
+        return text or None
+
+    def kernel_log(self, remote, since, until=None):
+        """The host kernel log of the injection window, udev probes labelled.
+
+        The injector deletes a controller outside the engine's teardown guards,
+        so a udev partition probe can log an expected error. Those lines are
+        kept and labelled; the cell never gates on this window.
+        """
+        window = dict(host=self.host, since=since, until=until, available=False,
+                      reason=None, lines=[], udev_probe=[], other=[])
+        if since is None:
+            window['reason'] = 'the host clock was unreadable'
+            return window
+        code, out, err = remote.run(
+            self.host, 'dmesg --time-format=iso --since ' + shlex.quote(since),
+            check=False)
+        if code != 0:
+            window['reason'] = (err.decode('utf-8', 'replace').strip()[-500:]
+                                or f'dmesg exited {code}')
+            return window
+        window['available'] = True
+        window['collected_unix_ns'] = time.time_ns()
+        for line in out.decode('utf-8', 'replace').splitlines():
+            if not line.strip():
+                continue
+            window['lines'].append(line)
+            (window['udev_probe'] if UDEV_PROBE.search(line) else window['other']).append(line)
+        return window
+
     def inject(self, remote, gate):
         """Run the package injector on the controller's host and retain its record."""
         output = self.output / 'controller-loss' / f'{self.point}.json'
         remote.shell(self.host, f'mkdir -p {shlex.quote(str(output.parent))}')
+        since = self.host_time(remote)
         command = 'exec ' + ' '.join(shlex.quote(str(part)) for part in self.argv(output))
         code, out, err = remote.run(self.host, command, check=False)
+        until = self.host_time(remote)
         record = None
         try:
             record = json.loads(remote.read_bytes(self.host, output))
@@ -348,7 +391,8 @@ class ControllerLoss:
             exit_code=code, stdout=out.decode('utf-8', 'replace')[-4000:],
             stderr=err.decode('utf-8', 'replace')[-4000:],
             resume=resume_deltas((record or {}).get('live_delta')),
-            gate=gate, samples=self.samples, injector=record)
+            gate=gate, samples=self.samples, injector=record,
+            kernel_log=self.kernel_log(remote, since, until))
         write_json(self.output / 'controller-loss' / f'{self.point}.json', record)
         self.done = True
 

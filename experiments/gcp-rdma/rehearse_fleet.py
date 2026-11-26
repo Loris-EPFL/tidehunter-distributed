@@ -11,9 +11,11 @@ local (see `rehearse_guest.py`). The laptop runs the real operator sequence:
   2. wait for every worker's readiness object (`MailboxExec.wait_workers`);
   3. dispatch `manual_sui.py` S1-0 to H0, which stages the build, fixture and
      schema through the mailbox, runs `prepare_external.py` on the guest,
-     installs the owner archives and starts the owner process groups;
-  4. dispatch one `fault_cells.py` cell and the `stage3_campaign.py` cluster
-     probe the same way;
+     installs the owner archives and starts the owner process groups. The
+     admission cell runs on both tiers (`S1-0-native`, `S1-0-synchronous`);
+  4. dispatch one `manual_sui.py` controller-loss cell, one `fault_cells.py`
+     cell and the `stage3_campaign.py` cluster probe the same way. The stage-3
+     driver prepares both tier externals on H0 itself;
   5. optionally exercise the idle guard (`--cells idle_stop`): a request longer
      than the test idle window holds every guest up, and every guest records
      its poweroff after the request ends and the window expires. The poweroff
@@ -381,13 +383,35 @@ class Rehearsal:
                 '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--transport', 'tcp', '--live-transport', 'rdma',
+                '--cell-id', 'S1-0-native', '--stage', 'stage1',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,
                 '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds),
                 '--', '--checkpoints', '4']
-        result = self.dispatch('manual_sui S1-0', argv, self.args.cell_seconds + 300)
+        result = self.dispatch('manual_sui S1-0-native', argv, self.args.cell_seconds + 300)
         ok, detail = self.wall('manual_sui', result)
-        self.step('manual_sui S1-0 (checkpoints 4)', ok, detail)
+        self.step('manual_sui S1-0-native (checkpoints 4)', ok, detail)
         self.check_launch_addresses('manual_sui')
+
+    def manual_sui_synchronous(self):
+        """The synchronous admission cell: the first FUA path on this image."""
+        output = self.work / 'cells' / 'manual_sui_synchronous'
+        self.reset_cell('manual_sui_synchronous')
+        argv = [sys.executable, HERE / 'manual_sui.py',
+                '--build', self.build, '--fixture', self.args.fixture,
+                '--schema', self.args.schema, '--output', output,
+                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
+                '--transport', 'tcp', '--live-transport', 'rdma',
+                '--durability-tier', 'synchronous',
+                '--cell-id', 'S1-0-synchronous', '--stage', 'stage1',
+                '--fleet-state', self.state_path, '--fleet-config', self.config_path,
+                '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds),
+                '--', '--checkpoints', '4']
+        result = self.dispatch('manual_sui S1-0-synchronous', argv,
+                               self.args.cell_seconds + 300)
+        ok, detail = self.wall('manual_sui_synchronous', result)
+        self.step('manual_sui S1-0-synchronous (checkpoints 4)', ok, detail)
+        self.check_launch_addresses('manual_sui_synchronous')
 
     def manual_sui_controller_loss(self):
         """Dispatch S1-4 mid-frame (native) to the same wall.
@@ -479,7 +503,7 @@ class Rehearsal:
                 '--schema', self.args.schema, '--output', output,
                 '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
-                '--zone', ZONE, '--transport', 'tcp', '--live-transport', 'rdma',
+                '--transport', 'tcp', '--live-transport', 'rdma',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,
                 '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds)]
         result = self.dispatch('fault_cells', argv, self.args.cell_seconds + 300)
@@ -489,48 +513,19 @@ class Rehearsal:
     def stage3(self):
         output = self.work / 'cells' / 'stage3'
         self.reset_cell('root', 'external')
-        external = self.prepare_stage3_external(output)
         argv = [sys.executable, ENGINE / 'experiments/sui-checkpoint/stage3_campaign.py',
                 '--root', output, '--binary', Path(self.build) / 'binaries/storage-node',
-                *[item for tier in external for item in ('--external', tier)],
+                '--build', self.build, '--schema', self.args.schema,
                 '--native-root', str(GUEST_ROOT / 'native'),
                 '--guest-root', GUEST_ROOT,
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
-                '--zone', ZONE,
                 '--bucket-prefix', 'gs://' + BUCKET + '/rehearsal',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,
                 '--mode', 'cluster', '--coordinator-seconds',
                 str(self.args.cell_seconds)]
         result = self.dispatch('stage3_campaign', argv, self.args.cell_seconds + 300)
         ok, detail = self.wall('stage3', result)
-        self.step('stage3_campaign cluster mode', ok, detail)
-
-    def prepare_stage3_external(self, output):
-        """Prepare one external deployment per tier, with the read cache off.
-
-        `stage3_specs.load_external` requires both tiers and a coordinator
-        read cache of zero, which the probe measures against.
-        """
-        directory = output / 'external'
-        output.mkdir(parents=True, exist_ok=True)
-        if directory.exists():
-            shutil.rmtree(directory)
-        directory.mkdir()
-        control = [host['internal_ip'] for host in self.fleet_hosts[1:]]
-        live = [host['rdma_ip'] for host in self.fleet_hosts[1:]]
-        items = []
-        for tier in ('native', 'synchronous'):
-            target = directory / tier
-            run([sys.executable, ENGINE / 'experiments/sui-checkpoint/prepare_external.py',
-                 '--build', self.build, '--schema', self.args.schema,
-                 '--output', str(target), '--db-root', str(GUEST_ROOT / 'native'),
-                 '--guest-root', GUEST_ROOT,
-                 '--hosts', ','.join(control), '--live-hosts', ','.join(live),
-                 '--port', '9400', '--transport', 'tcp', '--live-transport', 'rdma',
-                 '--durability-tier', tier,
-                 '--coordinator-cache-mib', '0', '--shard-cache-mib', '0'], check=True)
-            items.append(f'{tier}={target}')
-        return items
+        self.step('stage3_campaign cluster mode (tiers prepared on H0)', ok, detail)
 
     def stage3_database(self):
         manifests = sorted(Path(self.args.schema).rglob('manifest.json'))
@@ -650,7 +645,8 @@ def main():
     parser.add_argument('--ready-seconds', type=int, default=1800)
     parser.add_argument('--fault-cell', default='M6-w1-c16')
     parser.add_argument('--cells',
-                        default='manual_sui,manual_sui_controller_loss,fault_cells,stage3',
+                        default=('manual_sui,manual_sui_synchronous,'
+                                 'manual_sui_controller_loss,fault_cells,stage3'),
                         help='comma-separated cells to run; add idle_stop for the '
                              'guest idle guard (use it alone with a short window)')
     parser.add_argument('--idle-seconds', type=int, default=None,

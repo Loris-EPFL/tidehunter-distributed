@@ -664,12 +664,49 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertNotIn('--nqn', words)
         evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
         self.assertTrue(evidence['injected'])
+        self.assertIn('kernel_log', evidence)
+        self.assertEqual(evidence['kernel_log']['host'], 'coordinator')
         self.assertGreaterEqual(len(evidence['samples']), 2)
         self.assertEqual(evidence['injector']['ok'], True)
         self.assertTrue((self.root / 'run/controller-loss/mid-frame.json').is_file())
         names = {row['name'] for row in self.launcher(remote, gate).artifacts()}
         self.assertIn('controller-loss/evidence.json', names)
         self.assertIn('controller-loss/mid-frame.json', names)
+
+    def test_the_kernel_log_window_labels_udev_probe_lines(self):
+        gate = self.gate(MailboxDouble(self.root, self.root / 'guest'))
+
+        class Remote:
+            def run(self, host, command, *, stdin=None, check=True):
+                self.command = command
+                return 0, (
+                    b'2026-11-26T10:00:00,000000+00:00 host kernel: nvme nvme1: '
+                    b'failed to reconnect\n'
+                    b'2026-11-26T10:00:01,000000+00:00 host systemd-udevd[9]: '
+                    b'blkid: Buffer I/O error on dev nvme1n1\n'), b''
+
+        window = gate.kernel_log(Remote(), '2026-11-26T09:59:59Z', '2026-11-26T10:00:02Z')
+        self.assertTrue(window['available'])
+        self.assertEqual((window['since'], window['until']),
+                         ('2026-11-26T09:59:59Z', '2026-11-26T10:00:02Z'))
+        self.assertEqual(len(window['lines']), 2)
+        self.assertEqual(len(window['other']), 1)
+        self.assertEqual(len(window['udev_probe']), 1)
+        self.assertIn('Buffer I/O error', window['udev_probe'][0])
+
+    def test_an_unreadable_kernel_log_is_recorded_without_gating(self):
+        gate = self.gate(MailboxDouble(self.root, self.root / 'guest'))
+
+        class Denied:
+            def run(self, host, command, *, stdin=None, check=True):
+                return 1, b'', b'dmesg: read kernel buffer failed: Operation not permitted'
+
+        window = gate.kernel_log(Denied(), '2026-11-26T09:59:59Z')
+        self.assertFalse(window['available'])
+        self.assertIn('Operation not permitted', window['reason'])
+        self.assertFalse(window['lines'])
+        denied = Denied()
+        self.assertIsNone(gate.kernel_log(denied, None)['since'])
 
     def test_an_unobserved_mid_frame_point_fails_the_cell_and_keeps_the_series(self):
         remote = MailboxDouble(self.root, self.root / 'guest')

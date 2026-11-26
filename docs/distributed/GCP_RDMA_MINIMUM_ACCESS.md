@@ -22,7 +22,7 @@ This list assumes no custom snapshots, templates, static IP reservations or netw
 
 ## Missing infrastructure, not necessarily missing user permissions
 
-An administrator must create one Falcon VPC/subnet, because none existed and this user cannot create networks/subnets. Use profile `us-central1-a-vpc-falcon`, a non-conflicting IPv4 subnet in `us-central1`, and Google's required MTU. Reuse the ordinary VPC for management traffic.
+An administrator must create one Falcon VPC/subnet, because none existed and this user cannot create networks/subnets. Use profile `us-central1-a-vpc-falcon`, a non-conflicting IPv4 subnet in `us-central1`, and Google's required MTU. That is the IP/VPC MTU, 8,896 B; the RDMA verbs port has its own maximum and active `active_mtu` of 4,096 B. Reuse the ordinary VPC for management traffic.
 
 Prefer administrator precreation over granting permanent Network Admin. Both VMs must share a zone and a compact placement policy with maximum distance 3 or lower. See [Falcon network setup](https://docs.cloud.google.com/vpc/docs/create-vpc-network-rdma).
 

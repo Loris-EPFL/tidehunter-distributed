@@ -204,8 +204,8 @@ TOPOLOGY = dict(
     coordinator_index_fragment_mib=1024)
 
 STAGE1_CASES = [
-    dict(id='S1-0', case='admission and qualification', tiers=['native'], points=1,
-         est_minutes=30, driver='manual_sui.py'),
+    dict(id='S1-0', case='admission and qualification', tiers=['native', 'synchronous'],
+         points=1, est_minutes=30, driver='manual_sui.py'),
     dict(id='S1-1', case='clean lifecycle', tiers=['native', 'synchronous'], points=1,
          est_minutes=20, driver='manual_sui.py',
          pass_criteria=['audit digest equals the producer digest',

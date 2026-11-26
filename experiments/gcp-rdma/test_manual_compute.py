@@ -19,6 +19,15 @@ from gcp_campaign import GUEST_SERVICE_ACCOUNT
 from gcp_manual_compute import Compute, ComputeError
 
 
+def pinned_kernel(host, command, **_):
+    """The two identity reads `ready` makes on every host."""
+    if command == 'uname -r':
+        return 0, gcp_manual_compute.KERNEL_RELEASE.encode(), b''
+    if command == 'cat /sys/module/nvmet/srcversion':
+        return 0, gcp_manual_compute.NVMET_SRCVERSION.encode(), b''
+    raise AssertionError('unexpected ready command: ' + str(command))
+
+
 class Store:
     """One bucket: enough of ObjectStore for the release path."""
 
@@ -1092,16 +1101,66 @@ class OperatorFleetTests(unittest.TestCase):
         self.state_path.write_text(json.dumps(state))
         receipt = {'complete': True, 'run_id': state['run_id'], 'source_sha256': SOURCE,
                    'deadline_utc': state['deadline'], 'manifest_sha256': 'e' * 64,
-                   'storage': {'device': '/dev/nvme0n1'}}
+                   'storage': {'device': '/dev/nvme0n1'},
+                   'nvmet_fix': {'loaded': {'loaded_nvmet': {
+                       'srcversion': gcp_manual_compute.NVMET_SRCVERSION,
+                       'build_id': gcp_manual_compute.NVMET_BUILD_ID}}}}
         with mock.patch.object(gcp_manual_compute.gcp_api, 'GoogleApi'), \
              mock.patch.object(mailbox_exec.MailboxExec, 'from_state') as from_state:
             from_state.return_value.wait_workers.return_value = {
                 record['fleet']['name']: dict(receipt, instance_name=record['fleet']['name'],
                                               instance_id=record['fleet']['id'])
                 for record in state['instances']}
+            from_state.return_value.shell.side_effect = pinned_kernel
             report = self.output(self.cli('ready', '--require-manifest-sha256', 'e' * 64))
         from_state.return_value.wait_workers.assert_called_once_with(require='e' * 64)
         self.assertEqual(report['hosts'], sorted(record['fleet']['name'] for record in state['instances']))
+        self.assertEqual(report['kernel']['kernel_release'], gcp_manual_compute.KERNEL_RELEASE)
+        saved = json.loads(self.state_path.read_text())
+        self.assertEqual(saved['kernel_admission']['nvmet_srcversion'],
+                         gcp_manual_compute.NVMET_SRCVERSION)
+        self.assertIn('runs/' + saved['run_id'] + '/qualification/kernel-admission.json',
+                      self.store.objects)
+
+    def ready_with_kernel(self, *, release=None, srcversion=None, loaded=None):
+        """Run the kernel gate over one prepared receipt with a chosen identity."""
+        prepared = {'h': {
+            'nvmet_fix': {'loaded': {'loaded_nvmet': loaded or {
+                'srcversion': gcp_manual_compute.NVMET_SRCVERSION,
+                'build_id': gcp_manual_compute.NVMET_BUILD_ID}}}}}
+        remote = mock.Mock()
+        remote.shell.side_effect = [
+            (0, (release or gcp_manual_compute.KERNEL_RELEASE).encode(), b''),
+            (0, (srcversion or gcp_manual_compute.NVMET_SRCVERSION).encode(), b'')]
+        return gcp_manual_compute.kernel_admission(remote, prepared)
+
+    def test_the_kernel_gate_records_the_pinned_identity(self):
+        admission = self.ready_with_kernel()
+        self.assertEqual(admission['hosts']['h'], {
+            'kernel': gcp_manual_compute.KERNEL_RELEASE,
+            'nvmet_srcversion': gcp_manual_compute.NVMET_SRCVERSION,
+            'nvmet_build_id': gcp_manual_compute.NVMET_BUILD_ID})
+
+    def test_the_kernel_gate_refuses_another_release(self):
+        with self.assertRaisesRegex(ComputeError, 'running kernel 5.14.0-687.42.1'):
+            self.ready_with_kernel(release='5.14.0-687.42.1+2.1.el9_8_ciq.x86_64')
+
+    def test_the_kernel_gate_refuses_the_stock_module(self):
+        with self.assertRaisesRegex(ComputeError, 'is not the pinned module'):
+            self.ready_with_kernel(srcversion='EE2F4FC798D5ABF4AC018D3')
+        with self.assertRaisesRegex(ComputeError, 'did not record the pinned nvmet'):
+            self.ready_with_kernel(loaded={'srcversion': 'EE2F4FC798D5ABF4AC018D3',
+                                           'build_id': 'b' * 40})
+
+    def test_the_kernel_constants_match_the_module_review(self):
+        import importlib.util
+        path = Path(__file__).resolve().parents[2] / 'experiments/nvmeof/kernel_fix.py'
+        module = importlib.util.spec_from_file_location('kernel_fix_pinned', path)
+        kernel_fix = importlib.util.module_from_spec(module)
+        module.loader.exec_module(kernel_fix)
+        self.assertEqual(gcp_manual_compute.KERNEL_RELEASE, kernel_fix.RELEASE)
+        self.assertEqual(gcp_manual_compute.NVMET_SRCVERSION, kernel_fix.CANDIDATE_SRC)
+        self.assertEqual(gcp_manual_compute.NVMET_BUILD_ID, kernel_fix.CANDIDATE_BUILD)
 
     def test_delete_purges_an_expired_lease_of_the_cleaned_run(self):
         with mock.patch.object(gcp_manual_compute, 'admit_image',

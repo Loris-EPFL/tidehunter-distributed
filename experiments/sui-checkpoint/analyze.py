@@ -1060,7 +1060,7 @@ def cache_invariants(values, namespaces, *, coordinator_cache_mib):
 
 
 def admission_checks(values, *, live_transport):
-    """S1-0: the RDMA live path and each criterion the scrape can decide."""
+    """The S1-0 admission cell: the RDMA live path and each decidable criterion."""
     live = live_nvmeof_stats(values)
     details = {}
     if not live['available']:

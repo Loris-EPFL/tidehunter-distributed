@@ -705,7 +705,7 @@ python3 experiments/gcp-rdma/manual_sui.py \
   --fleet-state /absolute/fleet-stage1.json \
   --fleet-config experiments/gcp-rdma/config.json \
   --transport efa --live-transport rdma --durability-tier native \
-  --cell-id S1-0 --stage stage1 \
+  --cell-id S1-0-native --stage stage1 \
   --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
   --ledger /absolute/campaign-ledger.json -- --checkpoints 4
 ```
@@ -714,7 +714,9 @@ python3 experiments/gcp-rdma/manual_sui.py \
 needs a reviewed `--cell-id`, and the launcher refuses any other id when
 `--bucket-prefix` is set. A reviewed row fixes `--fragment-mib`,
 `--coordinator-cache-mib` and `--hold-seconds`, so pass a different value only
-for a row that declares it (M3 and M4 declare 64 MiB).
+for a row that declares it (M3 and M4 declare 64 MiB). The admission cell exists
+per tier: `S1-0-native` and `S1-0-synchronous`, where the synchronous one is the
+first FUA write path on this image.
 
 Launcher options end at `--`; everything after it is passed to `run.py`
 unchanged, including `--driver-concurrency`, `--pacing-ms`, `--checkpoints`,
@@ -880,6 +882,7 @@ The fixed body of each host, printed by `--dry-run`:
 | Machine | `z4m-highmem-16` with its mandatory bundled Local SSD |
 | Boot disk | one 80 GiB `hyperdisk-balanced`, `NVME`, `boot`, `autoDelete` |
 | Network | `default` (GVNIC) and `falcon-rdma-us-central1-a` (IRDMA), no external address |
+| Link MTU | Falcon IP MTU 8,896 B; RDMA verbs `active_mtu` 4,096 B |
 | Service account | `bench-guest@mysten-research.iam.gserviceaccount.com`, `cloud-platform` |
 | Placement | `<run_id>-placement`, `COLLOCATED`, `maxDistance 3` |
 | Lifetime | `terminationTime` = deadline, `instanceTerminationAction` = `DELETE`, no restart on failure |
@@ -950,8 +953,15 @@ readback. A second `create` on the same state reuses verified hosts and refuses
 any other campaign, host count, source or deadline.
 
 `ready` waits for `runs/$RUN/qualification/<host>/worker-ready.json` on every
-host and prints the formatted Local SSD evidence. The guest bootstrap installs
-the package read-only under `/mnt/tidehunter/$RUN/package`, formats and mounts
+host and prints the formatted Local SSD evidence. It then reads `uname -r` and
+`/sys/module/nvmet/srcversion` on every host and refuses unless the release is
+`5.14.0-687.49.1+2.1.el9_8_ciq.x86_64` and the loaded module is the pinned one
+(srcversion `9F99AF855591751D53D463D`, build ID `61aabd36…`, the identity the
+worker recorded from `admit_nvmet_fix`). The image also carries kernel
+`687.42.1`, so this read is the only proof that a guest booted the reviewed
+release. The identity is written to the fleet state under `kernel_admission` and
+uploaded as `runs/$RUN/qualification/kernel-admission.json`. The guest bootstrap
+installs the package read-only under `/mnt/tidehunter/$RUN/package`, formats and mounts
 the bundled 14,000 GiB Local SSD with the reviewed `largefile4` profile at
 `/mnt/tidehunter-kv-comparison/$RUN` (`gcp_worker.prepare_storage`), loads the
 pinned `nvmet.ko` from the package (`gcp_runtime.admit_nvmet_fix`) and starts
@@ -1049,8 +1059,10 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py ready --state $STATE1
 `--package` derives the source SHA-256 from the package receipt, so do not pass
 `--source-sha256`. Add `--dry-run` to print the three bodies and write nothing.
 `create` prints the fleet with each internal and RDMA address, and it refuses a
-package whose receipt carries no nvmet fix. Evidence: the fleet state,
-`<state>.credentials.json`, `runs/$RUN/package.tar`, `package.json`,
+package whose receipt carries no nvmet fix. `ready` refuses a host that runs
+another kernel or the stock `nvmet` module, and records both in the fleet state
+and in `runs/$RUN/qualification/kernel-admission.json`. Evidence: the fleet
+state, `<state>.credentials.json`, `runs/$RUN/package.tar`, `package.json`,
 `runtime.json` and one gate per host; then `worker-ready.json` per host with its
 Local SSD evidence.
 
@@ -1067,10 +1079,20 @@ python3 experiments/gcp-rdma/manual_sui.py --list stage1
 
 ```sh
 gcloud auth login
-python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0 \
+python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0-native \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage1/S1-0 --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage1/S1-0-native --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
+  --bucket-prefix $BUCKET --ledger $LEDGER \
+  -- --checkpoints 4
+
+python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
+  --cell-id S1-0-synchronous --durability-tier synchronous \
+  --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
+  --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
+  --output $CAMPAIGN_ROOT/stage1/S1-0-synchronous \
+  --guest-root /mnt/tidehunter/sui-run-$RUN \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER \
   -- --checkpoints 4
@@ -1543,7 +1565,11 @@ GitHub activation remains `false`. No VM or other cloud resource was created.
 
 The Falcon network omits `mtu`; that is consistent with its documented
 profile-controlled 8,896-byte default. Admission accepts omission only with the
-configured zonal Falcon profile and rejects a conflicting explicit MTU.
+configured zonal Falcon profile and rejects a conflicting explicit MTU. That
+8,896-byte value is the IP/VPC MTU. The RDMA verbs MTU is a separate limit: the
+verbs port reports maximum and active `active_mtu` 4,096 B (`ibv_devinfo -v`,
+`ib_send_lat` `Mtu : 4096[B]`), so a bandwidth model uses 4,096 B for a verbs
+message and 8,896 B for IP traffic.
 Private Google Access belongs on the ordinary subnet, **not** the Falcon
 subnet: the live Falcon profile explicitly blocks that feature.
 
