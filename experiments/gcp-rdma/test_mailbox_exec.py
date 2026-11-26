@@ -479,8 +479,10 @@ class SwapTests(unittest.TestCase):
             path.write_text(json.dumps(state))
             config = Path(directory) / 'config.json'
             config.write_text(json.dumps({'project_id': 'mysten-research', 'bucket': 'bucket'}))
-            with mock.patch.object(mailbox_exec.gcp_api, 'campaign_client',
-                                   return_value=Api()):
+            with mock.patch.object(mailbox_exec.gcp_api, 'require_paid_credentials',
+                                   return_value={'step': 'test', 'issued_epoch': 0}), \
+                    mock.patch.object(mailbox_exec.gcp_api, 'campaign_client',
+                                      return_value=Api()):
                 remote = mailbox_exec.open_executor(
                     self.args(fleet_state=path, fleet_config=config))
         self.assertIsInstance(remote, mailbox_exec.MailboxExec)

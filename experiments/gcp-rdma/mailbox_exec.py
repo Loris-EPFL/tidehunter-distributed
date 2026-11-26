@@ -685,10 +685,18 @@ def open_executor(args):
     if args.fleet_state is None:
         raise SystemExit('a campaign run needs --fleet-state, or --gcloud-ssh for a rehearsal')
     config = load_config(args.fleet_config)
+    guest = bool(getattr(args, 'guest_token', False))
+    if not guest and gcp_api.rehearsal_endpoint() is None:
+        # Every advertised stage is paid. Refuse before the first request when
+        # the workstation or the delegated bench-guest identity cannot mint.
+        receipt = gcp_api.require_paid_credentials(
+            config, Path(sys.argv[0]).stem + '-dispatch')
+        gcp_api.record_credential_receipt(
+            Path(args.fleet_state).with_name('credentials-gate.json'), receipt)
     # The workstation cannot read the campaign bucket as its own user. Every
     # laptop-side client delegates to the campaign service account; the
     # coordinator uses its own metadata identity.
-    api = gcp_api.campaign_client(config, guest=bool(getattr(args, 'guest_token', False)))
+    api = gcp_api.campaign_client(config, guest=guest)
     return MailboxExec.from_state(args.fleet_state, api, bucket=config['bucket'])
 
 

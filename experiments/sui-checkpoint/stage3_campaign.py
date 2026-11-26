@@ -862,7 +862,9 @@ def main():
     parser.add_argument('--binary', type=Path, required=True,
                         help='kv-research (the campaign bundle calls it storage-node)')
     parser.add_argument('--ledger', type=Path)
-    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--resume', action='store_true',
+                        help='accepted for older command lines; the ledger is always '
+                             'merged and a passed cell is always skipped')
     parser.add_argument('--only', action='append', default=[])
     parser.add_argument('--from', dest='from_')
     parser.add_argument('--continue-on-failure', action='store_true')
@@ -995,8 +997,6 @@ def main():
         sys.stderr.write(err.decode('utf-8', 'replace'))
         return code
     path = args.ledger or root / 'campaign-ledger.json'
-    if Path(path).exists() and not args.resume:
-        raise SystemExit(f'ledger exists; use --resume or a new --ledger: {path}')
     if cluster and external is None:
         if args.fleet_state is None:
             raise SystemExit('preparing the tier externals needs --fleet-state for '
@@ -1008,12 +1008,14 @@ def main():
             database=args.external_database)
         check_binary(args.binary, external)
     ledger = ledger_module.Ledger(path)
-    if args.resume:
+    # The bucket ledger is the campaign record: load and merge it on every run,
+    # not only with --resume, so a passed cell is never rerun on a new fleet.
+    if Path(path).exists():
         ledger.load()
     bucket = (bucket_store(args.bucket_prefix, args.impersonate_service_account,
                            args.bucket_deadline_seconds, guest=args.guest_token)
               if args.bucket_prefix else None)
-    if args.resume and bucket is not None:
+    if bucket is not None:
         ledger = bucket.merge(ledger)
     binary_ids = {name: ledger_module.sha256_file(Path(args.binary))
                   for name in ('kv-research',)}

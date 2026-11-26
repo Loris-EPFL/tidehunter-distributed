@@ -1120,6 +1120,13 @@ async def create(config, args):
                           'instances': bodies}, sort_keys=True, indent=2))
         return 0
 
+    # A paid create refuses to start unless both the workstation user and the
+    # delegated bench-guest identity can mint a token now. The recorded issue
+    # time is the evidence the owner reauthenticated before this stage.
+    receipt = await asyncio.to_thread(gcp_api.require_paid_credentials, config, 'create')
+    gcp_api.record_credential_receipt(
+        args.state.with_name(args.state.name + '.credentials.json'), receipt)
+
     if args.role == 'qualification':
         image = {'path': image_path, 'id': str(admit_ready_image(config, image_path)['id'])}
     else:

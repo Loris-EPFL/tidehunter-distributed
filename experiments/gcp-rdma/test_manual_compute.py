@@ -851,6 +851,13 @@ class OperatorFleetTests(unittest.TestCase):
                                     'infrastructure_preflight', new=self.preflight)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The gate itself is tested in test_gcp_credentials; these tests cover
+        # the fleet bodies and the cleanup proofs.
+        gate = mock.patch.object(
+            gcp_manual_compute.gcp_api, 'require_paid_credentials',
+            return_value={'schema_version': 1, 'step': 'create', 'issued_epoch': 0})
+        self.gate = gate.start()
+        self.addCleanup(gate.stop)
 
     def cli(self, action, *extra, state=None):
         return [action, *extra, '--config', str(self.config_path),
@@ -1285,6 +1292,29 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertEqual(config, self.config)
         self.assertEqual(image, IMAGE)
         self.assertIs(execute, transport)
+
+    def test_the_paid_create_mints_both_identities_and_records_the_receipt(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.create()
+        self.gate.assert_called_once_with(self.config, 'create')
+        receipt = json.loads(
+            self.state_path.with_name('fleet.json.credentials.json').read_text())
+        self.assertEqual(receipt['step'], 'create')
+
+    def test_a_closed_credential_gate_creates_no_host(self):
+        self.gate.side_effect = ValueError('delegation is not fresh')
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.create(), 1)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self.state_path.with_name(
+            'fleet.json.credentials.json').exists())
 
     def test_a_campaign_package_without_the_pinned_nvmet_module_is_refused(self):
         package = Path(self.temp.name) / 'package'

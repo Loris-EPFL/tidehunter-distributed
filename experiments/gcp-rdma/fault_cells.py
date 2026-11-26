@@ -1107,7 +1107,9 @@ def main():
                         help='service account that writes the campaign prefix')
     parser.add_argument('--allow-local-ledger', action='store_true',
                         help='local rehearsal only: pass a cell without an uploaded bundle')
-    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--resume', action='store_true',
+                        help='accepted for older command lines; the ledger is always '
+                             'merged and a passed cell is always skipped')
     parser.add_argument('--dry-run', action='store_true',
                         help='print the plan and exit; no host is touched')
     parser.add_argument('--tunnel-through-iap', action='store_true',
@@ -1166,14 +1168,14 @@ def main():
                     '--output': Path('out') / args.output.name,
                     '--config-dir': 'external', '--ledger': 'campaign-ledger.json'})
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
-    if Path(ledger_path).exists() and not args.resume:
-        raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
     ledger, entry = ledger_module.Ledger(ledger_path), None
     evidence = (campaign_upload.Evidence(store, prefix) if store is not None else None)
-    if args.resume:
+    # The bucket ledger is the campaign record: load and merge it on every run,
+    # not only with --resume, so a passed cell is never rerun on a new fleet.
+    if Path(ledger_path).exists():
         ledger.load()
-        if evidence is not None:
-            ledger = evidence.merge(ledger)
+    if evidence is not None:
+        ledger = evidence.merge(ledger)
     manifest = json.loads((Path(args.build) / 'build-manifest.json').read_text())
     identity = ledger_module.config_hash(
         spec=dict(build_manifest=digest(Path(args.build) / 'build-manifest.json'),
@@ -1186,7 +1188,7 @@ def main():
         sui_rev=manifest.get('source_archive_sha256'),
         binary_ids=manifest['binaries'])
     previous = ledger.entries.get((cell['stage'], cell['id']))
-    if (args.resume and previous and previous['status'] == 'passed'
+    if (previous and previous['status'] == 'passed'
             and previous['config_hash'] == identity):
         print(json.dumps(dict(cell=cell['id'], skipped=True)))
         return 0
