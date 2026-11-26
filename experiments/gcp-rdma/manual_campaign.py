@@ -1429,13 +1429,19 @@ async def _finish_campaign(config, parent, path, store, execute, output, error):
 async def run(config, *, package_dir, revision, spec, wheels, base_image,
               base_image_id, rdma_device, output, execute, artifacts=None,
               surcharge_cents, preflight_api=None, ledger_path=None,
-              resume=False):
+              resume=False, qualification_only=False):
     """Run one reviewed campaign; never creates a replacement on failure.
 
     ``execute`` is an async callback accepting gcloud argv without ``gcloud``.
     ``package_dir`` is a previously qualified, exact-checkout snapshot. The
     surcharge quote must cover disks, image, objects, requests and transfers;
     the reservation is an estimate, not a project-wide billing cap.
+
+    One fleet serves both halves: every host boots the fleet qualification
+    script, the receipt is admitted, and only then does the same fleet receive
+    the campaign request. ``qualification_only`` stops after that admission, so
+    a worker change can refresh ``image-receipt.json`` without paying for the
+    suite; the fleet is still torn down and the lease released.
     """
     from gcp_manual_compute import Compute, _json_response
 
@@ -1623,14 +1629,19 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         if await fleet_compute.admit_guests() != fleet:
             raise RuntimeError('guest fleet identity changed after qualification')
         await _admit_boot_images(fleet_compute, fleet_state, image)
-        await _blocking(_record, path, parent, 'suite')
+        if qualification_only:
+            # The admitted receipt binds this exact image and these recipe
+            # hashes; the suite would only add cases.
+            await _blocking(_record, path, parent, 'qualified')
+        else:
+            await _blocking(_record, path, parent, 'suite')
 
-        await _blocking(_lease_owned, store, parent)
-        entry = ledger.begin(stage='campaign', cell_id='suite', config_hash=identity,
-                             unit='suite')
-        publish_ledger(store, ledger, parent['run_id'])
-        result = await _suite(store, admitted_config, fleet_state, fleet_path, fleet, package, spec, out, rdma_device)
-        await _blocking(_record, path, parent, 'complete')
+            await _blocking(_lease_owned, store, parent)
+            entry = ledger.begin(stage='campaign', cell_id='suite', config_hash=identity,
+                                 unit='suite')
+            publish_ledger(store, ledger, parent['run_id'])
+            result = await _suite(store, admitted_config, fleet_state, fleet_path, fleet, package, spec, out, rdma_device)
+            await _blocking(_record, path, parent, 'complete')
     except BaseException as exc:
         error = exc
     await _finish_campaign(config, parent, path, store, execute, out, error)
@@ -1642,4 +1653,5 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         publish_ledger(store, ledger, parent['run_id'])
     return {'parent_run_id': parent['run_id'], 'children': parent['children'],
             'observer_qualification': observer_qualification,
-            'image_qualification': reference, 'terminal': result}
+            'image_qualification': reference, 'terminal': result,
+            'qualification_only': qualification_only}

@@ -20,11 +20,17 @@ import gcp_api
 import gcs_ledger
 
 
-def open_store(bucket_prefix, account=campaign_manifest.ACCOUNT):
-    """Return (store, bucket, prefix) through the delegated guest identity."""
+def open_store(bucket_prefix, account=campaign_manifest.ACCOUNT, *, guest=False):
+    """Return (store, bucket, prefix) through the delegated guest identity.
+
+    `guest` is the copy of this campaign that runs on the coordinator: it
+    already holds the guest service-account identity from the metadata server,
+    so it delegates nothing and needs no `gcloud`.
+    """
     bucket, prefix = campaign_manifest.parse_bucket_prefix(bucket_prefix)
-    api = gcp_api.GoogleApi(campaign_manifest.PROJECT)
-    if account:
+    api = gcp_api.GoogleApi(campaign_manifest.PROJECT,
+                            token_provider=gcp_api.metadata_token if guest else None)
+    if account and not guest:
         api = api.impersonated(account)
     return api.objects(bucket), bucket, prefix
 

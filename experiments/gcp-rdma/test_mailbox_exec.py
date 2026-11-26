@@ -2,12 +2,17 @@
 import hashlib
 import json
 from pathlib import Path
+import shlex
+import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 
+import campaign_upload
+import gcp_api
+import gcp_manual_storage
 import gcp_runtime
 import gcp_worker as worker
 import host_exec
@@ -108,6 +113,11 @@ class Campaign(unittest.TestCase):
                        'package_root': '/mnt/tidehunter/' + RUN + '/package'}
         patcher = mock.patch.object(worker, 'scratch_root',
                                     side_effect=lambda *_: Path(self.scratch.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The guest interpreter is absent on a workstation; the exit status and
+        # stream contract is what this test exercises.
+        patcher = mock.patch.object(gcp_runtime, 'GUEST_PYTHON', sys.executable)
         patcher.start()
         self.addCleanup(patcher.stop)
         # Deliver on submit so the seam methods below block only on the worker.
@@ -213,6 +223,67 @@ class Campaign(unittest.TestCase):
         self.assertEqual(receipt['stdout_object']['object'],
                          f'runs/{RUN}/transfer/{FLEET[0]["id"]}/'
                          f'{receipt["operation_id"]}/stdout')
+
+    # ---- campaign files and the orchestrator ---------------------------
+    def test_send_file_streams_one_bucket_blob(self):
+        target = Path(self.scratch.name) / 'guest/bundle.bin'
+        source = Path(self.scratch.name) / 'bundle.bin'
+        source.write_bytes(b'x' * 100000)
+        self.client.send_file(FLEET[1]['name'], target, source)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        request = self.request()
+        blob = request['stdin']
+        self.assertEqual(blob['sha256'], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertEqual(blob['size'], 100000)
+        self.assertEqual(self.store.get(blob['object']), source.read_bytes())
+
+    def test_stage_tree_copies_a_directory_through_the_bucket(self):
+        build = Path(self.scratch.name) / 'build'
+        (build / 'binaries').mkdir(parents=True)
+        (build / 'build-manifest.json').write_text('{"protocol": 9}')
+        (build / 'binaries/sui-node-native').write_bytes(b'binary')
+        guest = Path(self.scratch.name) / 'guest/build'
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        self.assertEqual((guest / 'build-manifest.json').read_text(), '{"protocol": 9}')
+        self.assertEqual((guest / 'binaries/sui-node-native').read_bytes(), b'binary')
+
+    def test_run_driver_executes_the_admitted_script_on_the_host(self):
+        script = Path(self.scratch.name) / 'driver.py'
+        script.write_text('import json,sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
+        code, out, err = self.client.run_driver(
+            FLEET[2]['name'], str(script), ['--owners', 'H1,H2', '--cell-id', 'S1 0'])
+        self.assertEqual((code, err), (0, b''))
+        self.assertEqual(json.loads(out), {'argv': ['--owners', 'H1,H2', '--cell-id', 'S1 0']})
+        request = self.request()
+        self.assertIn(shlex.quote(sys.executable) + ' ' + shlex.quote(str(script)),
+                      request['argv'][2])
+        self.assertEqual(request['stdout_object'],
+                         f'runs/{RUN}/transfer/{FLEET[2]["id"]}/'
+                         f'{request["operation_id"]}/stdout')
+
+    def test_run_driver_returns_a_chatty_stdout_from_the_blob(self):
+        script = Path(self.scratch.name) / 'chatty.py'
+        script.write_text('import sys\nsys.stdout.write("y" * 1200000)\n')
+        code, out, _ = self.client.run_driver(FLEET[0]['name'], str(script))
+        self.assertEqual(code, 0)
+        self.assertEqual(out, b'y' * 1200000)
+        receipt = next(iter(self.receipts().values()))
+        self.assertEqual(receipt['stdout'], '')
+        self.assertEqual(receipt['stdout_object']['size'], 1200000)
+
+    def test_run_driver_reports_a_failing_orchestrator(self):
+        script = Path(self.scratch.name) / 'failing.py'
+        script.write_text('import sys\nprint("boom", file=sys.stderr)\nsys.exit(3)\n')
+        code, out, err = self.client.run_driver(FLEET[0]['name'], str(script))
+        self.assertEqual(code, 3)
+        self.assertEqual(out, b'')
+        self.assertIn(b'boom', err)
+
+    def test_an_absolute_script_is_required(self):
+        for script in ('', 'driver.py', None):
+            with self.subTest(script=script):
+                with self.assertRaises(ValueError):
+                    self.client.run_driver(FLEET[0]['name'], script)
 
     # ---- failures ------------------------------------------------------
     def test_refused_request_raises_a_typed_failure(self):
@@ -379,6 +450,104 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(reference['generation'], '1')
         self.assertEqual([key for key in store.objects if key.endswith('runtime.json')],
                          [f'runs/{RUN}/runtime.json'])
+
+
+class CoordinatorTests(unittest.TestCase):
+    """The orchestrator runs on H0; the workstation only stages and relays."""
+
+    def state(self, directory):
+        state = {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline(),
+                 'host_count': 3, 'bucket': 'bucket',
+                 'instances': [{'name': f'{RUN}-{index}', 'fleet': host}
+                               for index, host in enumerate(FLEET)]}
+        path = Path(directory) / 'state.json'
+        path.write_text(json.dumps(state))
+        config = Path(directory) / 'config.json'
+        config.write_text(json.dumps({'project_id': 'mysten-research', 'bucket': 'bucket'}))
+        return path, config
+
+    def test_the_coordinator_is_the_first_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, _ = self.state(directory)
+            self.assertEqual(mailbox_exec.coordinator_of(path), FLEET[0]['name'])
+
+    def test_a_state_without_a_coordinator_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            path.write_text(json.dumps({'run_id': RUN, 'host_count': 0, 'instances': []}))
+            with self.assertRaises(ValueError):
+                mailbox_exec.coordinator_of(path)
+
+    def test_rewrite_replaces_only_named_flag_values(self):
+        argv = ['--build', '/local/build', '--cell', '--build-like', '--', '--build', '/run.py-x']
+        self.assertEqual(mailbox_exec.rewrite(argv, {'--build': '/guest/build'}),
+                         ['--build', '/guest/build', '--cell', '--build-like', '--',
+                          '--build', '/run.py-x'])
+
+    def test_dispatch_stages_the_inputs_and_runs_the_package_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, config = self.state(directory)
+            remote = mock.Mock(spec=mailbox_exec.MailboxExec)
+            remote.run_driver.return_value = (0, b'{"complete": true}\n', b'')
+            args = type('Args', (), {'fleet_state': path, 'fleet_config': config,
+                                     'coordinator_seconds': 60})()
+            argv = ['manual_sui.py', '--build', '/local/build', '--fixture', '/local/fixture',
+                    '--output', '/local/cell', '--on-coordinator', '--', '--checkpoints', '4']
+            with mock.patch.object(mailbox_exec, 'open_executor', return_value=remote), \
+                    mock.patch.object(mailbox_exec.sys, 'argv', argv):
+                code = mailbox_exec.dispatch(
+                    args, coordinator=FLEET[0]['name'],
+                    script_relative='experiments/gcp-rdma/manual_sui.py',
+                    trees=[('build', '/local/build'), ('fixture', '/local/fixture')],
+                    values={'--build': 'build', '--fixture': 'fixture',
+                            '--output': Path('out/cell')})
+        self.assertEqual(code, 0)
+        campaign = Path(f'/mnt/tidehunter/{RUN}/campaign')
+        self.assertEqual(remote.stage_tree.call_args_list,
+                         [mock.call(FLEET[0]['name'], campaign / 'build', '/local/build'),
+                          mock.call(FLEET[0]['name'], campaign / 'fixture', '/local/fixture')])
+        self.assertIn(mock.call(FLEET[0]['name'], campaign / 'fleet-state.json', path),
+                      remote.send_file.call_args_list)
+        self.assertIn(mock.call(FLEET[0]['name'], campaign / 'config.json', config),
+                      remote.send_file.call_args_list)
+        coordinator, script, guest_argv = remote.run_driver.call_args.args[:3]
+        self.assertEqual(coordinator, FLEET[0]['name'])
+        self.assertEqual(script,
+                         f'/mnt/tidehunter/{RUN}/package/source/experiments/gcp-rdma/manual_sui.py')
+        self.assertEqual(remote.run_driver.call_args.kwargs['timeout_seconds'], 60)
+        expected = ['--build', str(campaign / 'build'),
+                    '--fixture', str(campaign / 'fixture'),
+                    '--output', str(campaign / 'out/cell'),
+                    '--on-coordinator', '--guest-token',
+                    '--fleet-state', str(campaign / 'fleet-state.json'),
+                    '--fleet-config', str(campaign / 'config.json'),
+                    '--', '--checkpoints', '4']
+        self.assertEqual(guest_argv, expected)
+
+
+class GuestIdentityTests(unittest.TestCase):
+    """On the coordinator the campaign uses the guest identity directly."""
+
+    def test_open_store_delegates_on_the_workstation_only(self):
+        with mock.patch.object(gcp_api, 'GoogleApi') as api:
+            store = campaign_upload.open_store('gs://mysten-research-bench-artifacts/campaign')
+            self.assertIs(store[0], api.return_value.impersonated.return_value.objects.return_value)
+            self.assertIsNone(api.call_args.kwargs.get('token_provider'))
+            api.return_value.impersonated.assert_called_once()
+        with mock.patch.object(gcp_api, 'GoogleApi') as api:
+            campaign_upload.open_store('gs://mysten-research-bench-artifacts/campaign', guest=True)
+            self.assertIs(api.call_args.kwargs['token_provider'], gcp_api.metadata_token)
+            api.return_value.impersonated.assert_not_called()
+
+    def test_the_delegated_store_takes_the_metadata_token_on_a_guest(self):
+        with mock.patch.object(gcp_manual_storage, 'GoogleApi') as api:
+            gcp_manual_storage.DelegatedArtifacts('mysten-research-bench-artifacts',
+                                                  deadline=time.time() + 60, guest=True)
+            self.assertIs(api.call_args.kwargs['token_provider'], gcp_api.metadata_token)
+        with mock.patch.object(gcp_manual_storage, 'GoogleApi') as api:
+            gcp_manual_storage.DelegatedArtifacts('mysten-research-bench-artifacts',
+                                                  deadline=time.time() + 60)
+            self.assertNotEqual(api.call_args.kwargs['token_provider'], gcp_api.metadata_token)
 
 
 class FleetStateTests(unittest.TestCase):

@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
+import gcp_api
 from gcp_api import GoogleApi, ObjectStore
 
 ACCOUNT = 'bench-guest@mysten-research.iam.gserviceaccount.com'
@@ -85,7 +86,8 @@ class DelegatedArtifacts(ObjectStore):
     of token validity; HTTP authorization failures are not retried here.
     """
 
-    def __init__(self, bucket=BUCKET, *, deadline, executable='gcloud', opener=None):
+    def __init__(self, bucket=BUCKET, *, deadline, executable='gcloud', opener=None,
+                 guest=False):
         if bucket != BUCKET or type(deadline) not in (int, float) or not math.isfinite(deadline):
             raise ValueError('exact reviewed bucket and finite absolute deadline required')
         self.deadline = deadline
@@ -94,7 +96,10 @@ class DelegatedArtifacts(ObjectStore):
         self._token_lock = threading.Lock()
         self._cached_token = None
         self._token_cache_until = 0.0
-        api = GoogleApi(PROJECT, token_provider=self._token, opener=self._bounded_open)
+        # The coordinator copy already runs as the guest identity, so it takes
+        # the metadata token directly and never shells out to `gcloud`.
+        provider = gcp_api.metadata_token if guest else self._token
+        api = GoogleApi(PROJECT, token_provider=provider, opener=self._bounded_open)
         super().__init__(api, bucket)
 
     def _remaining(self):

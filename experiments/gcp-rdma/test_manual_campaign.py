@@ -1,5 +1,6 @@
 import asyncio
 from collections import Counter
+from contextlib import ExitStack
 import copy
 from decimal import Decimal
 import hashlib
@@ -1984,6 +1985,146 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(gcp_lease.read(store))
 
 
+
+
+    async def test_qualification_only_stops_after_admitting_the_receipt(self):
+        """One fleet qualifies and the receipt is admitted; the suite is optional."""
+        from unittest.mock import AsyncMock
+        revision, source = 'b' * 40, 'a' * 64
+        manifest = 'c' * 64
+        image = 'projects/mysten-research/global/images/base-image'
+        spec = manual.REVIEWED_SPEC
+        store = Store()
+        hosts = [{'index': index, 'role': 'coordinator' if index == 0 else 'owner',
+                  'name': 'run-' + str(index), 'id': str(500 + index), 'zone': 'us-central1-a',
+                  'internal_ip': '10.3.0.' + str(index + 1), 'rdma_ip': '10.4.0.' + str(index + 1)}
+                 for index in range(6)]
+
+        class Compute:
+            def __init__(self, config, state, state_path, execute):
+                self.state, self.path = state, state_path
+
+            async def create_policy(self):
+                self.state['policy'] = {'name': self.state['run_id'] + '-placement', 'id': '9'}
+
+            async def create_vm(self, index, boot_image, deadline, startup):
+                host = dict(hosts[index], name=self.state['run_id'] + '-' + str(index))
+                self.state['instances'].append({'name': host['name'], 'id': host['id'],
+                                                'fleet': host, 'startup_sha256': 'e' * 64})
+                gcp_campaign.save(self.path, self.state)
+                return host
+
+            async def admit_guests(self):
+                return [record['fleet'] for record in self.state['instances']]
+
+            async def cleanup(self):
+                raise AssertionError('the test never reaches cleanup')
+
+        async def execute(argv):
+            return {'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = root / 'package'
+            package_dir.mkdir()
+            (package_dir / 'spec.json').write_text(json.dumps(spec))
+            archive = root / 'bundle.tar.gz'
+            archive.write_bytes(b'sealed')
+            wheel = root / 'PyYAML-6.0.2-cp311-cp311-manylinux_2_17_x86_64.whl'
+            wheel.write_bytes(b'wheel')
+            wheel_sha = hashlib.sha256(b'wheel').hexdigest()
+            receipt = {'archive_path': str(archive), 'sha256': hashlib.sha256(b'sealed').hexdigest(),
+                       'source_revision': revision, 'source_sha256': source,
+                       'manifest_sha256': manifest, 'abi': {}}
+
+            async def status(store_arg, state, name, manifest_arg, *, filename='status.json', host=None):
+                if filename == 'status.json':
+                    return {'cleanup_complete': True, 'pair': host['index'] < 2,
+                            '_reference': {'object': name, 'generation': '1', 'sha256': '2' * 64}}
+                return {'proof': {'kind': 'bake-software-diagnostic',
+                                  'source_sha256': source, 'manifest_sha256': manifest,
+                                  'preparation_sha256': 'e' * 64, 'wheel_sha256': wheel_sha},
+                        '_reference': {'object': name, 'generation': '1',
+                                       'sha256': '2' * 64}}
+
+            def evidence(store_arg, bucket, state, name, output):
+                host = next(item for item in hosts if name.endswith('-' + str(item['index'])))
+                peer = hosts[1 - host['index']]
+                record = {'instance_id': host['id'], 'peer_instance_id': peer['id'],
+                          'local_rdma': host['rdma_ip'], 'peer': peer['rdma_ip']}
+                path = Path(output) / (name + '-diagnostic.json')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(json.dumps(record).encode())
+                return {'file': str(path), 'reference': {
+                    'bucket': bucket, 'object': 'runs/x/qualification/' + name + '/diagnostic.json',
+                    'generation': '1', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}}
+
+            suite, cleanup = AsyncMock(), AsyncMock()
+
+            def suite_mock(**kwargs):
+                return suite
+
+            def cleanup_mock(**kwargs):
+                return cleanup
+
+            patches = [
+                patch.object(manual, '_admit_package',
+                             return_value=(receipt, {'tree_sha256': 'f' * 64, 'dirty': True})),
+                patch.object(manual, '_qualify_observer', return_value={}),
+                patch.object(manual, '_check_snapshot'),
+                patch.object(manual, '_admit_live_pair'),
+                patch.object(manual, '_admit_boot_images', new_callable=AsyncMock),
+                patch.object(manual, '_stage',
+                             return_value=({'manifest_sha256': manifest}, 'e' * 64)),
+                patch.object(manual, '_wait_status', side_effect=status),
+                patch.object(manual, '_evidence', side_effect=evidence),
+                patch.object(manual, '_suite', new_callable=suite_mock),
+                patch.object(manual, '_cleanup_joined', new_callable=cleanup_mock),
+                patch.object(manual, '_collect_qualification'),
+                patch.object(manual, '_collect'),
+                patch.object(manual.gcp_manual_preflight, 'permission_preflight'),
+                patch.object(manual.gcp_manual_preflight, 'quota_preflight',
+                             new_callable=AsyncMock, return_value=QUOTAS),
+                patch.object(manual.gcp_manual_preflight, 'infrastructure_preflight',
+                             new_callable=AsyncMock,
+                             return_value={'id': '42', 'status': 'READY',
+                                           'selfLink': 'https://example/' + image}),
+                patch.object(manual.gcp_budget, 'reserve', return_value={}),
+                patch.object(manual.gcp_image_receipt, 'make_receipt', return_value={
+                    'schema_version': 1, 'image': {'path': image, 'id': '42'},
+                    'runtime_sha256': manifest, 'service_account': CONFIG['service_account'],
+                    'evidence': [], 'recipes': {}}),
+                patch.object(manual.gcp_image, 'admit_image', return_value={'_records': []}),
+                patch.object(manual.gcp_image, 'admit_nvme_transports'),
+                patch.object(manual.gcp_image, 'admit_abi'),
+                patch('gcp_manual_compute.Compute', Compute),
+            ]
+            with ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                result = await manual.run(CONFIG, package_dir=package_dir, revision=revision,
+                                          spec=spec,
+                                          wheels=[{'path': str(wheel), 'sha256': wheel_sha}],
+                                          base_image=image, base_image_id='42',
+                                          rdma_device='irdma0', output=root / 'out',
+                                          execute=execute, artifacts=store, surcharge_cents=0,
+                                          qualification_only=True)
+            suite.assert_not_awaited()
+            cleanup.assert_awaited_once()   # the fleet is still torn down and released
+            suite.assert_not_awaited()
+            cleanup.assert_awaited_once()   # the fleet is still torn down and released
+            self.assertTrue(result['qualification_only'])
+            self.assertIsNone(result['terminal'])
+            key = result['image_qualification']['object']
+            self.assertRegex(key, r'^runs/bench-[0-9a-f]{16}/qualification/image-receipt\.json$')
+            self.assertEqual(store.head(key)['generation'],
+                             result['image_qualification']['generation'])
+            self.assertTrue((root / 'out/image-receipt.json').is_file())
+            state = json.loads((root / 'out/state.json').read_text())
+            self.assertEqual(state['phase'], 'qualified')
+            self.assertEqual(state['children']['fleet']['qualification_receipt'],
+                             {**result['image_qualification'],
+                              'bucket': CONFIG['bucket']})
 
 
 class ReviewedKvMatrixRegressionTests(unittest.TestCase):

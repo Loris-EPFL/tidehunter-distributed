@@ -21,12 +21,27 @@ Every wait is bounded by the fleet's own absolute deadline, a refused request
 raises `MailboxRefused` instead of hanging, and a missing receipt raises
 `MailboxTimeout` because the outcome is unknown. `GcloudSsh` remains only for an
 explicit local rehearsal, where a reachable host exists.
+
+The campaign orchestrator runs on the coordinator host, not on the workstation.
+`manual_sui.py`, `stage3_campaign.py` and `fault_cells.py` all start their
+coordinator work as a local child (`run.py`, stage-3 arm A, the fault
+coordinator) because it must reach the owners; that child is correct only on
+H0. `run_driver` submits the whole orchestrator as one bounded request, its
+admitted script being `<package>/source/experiments/...`, and the driver builds
+its executor from the guest metadata identity (`--guest-token`) so the owner
+requests are written from H0. The workstation only stages files
+(`stage_tree`/`send_file`) and reads the terminal receipt, so nothing depends on
+a route or on the 1 MiB inline bound.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
+import sys
+import tarfile
+import tempfile
 import time
 import uuid
 
@@ -137,15 +152,23 @@ class MailboxExec(host_exec.HostExecution):
     def transfer_key(self, index, operation_id, leaf):
         return f'runs/{self.run_id}/transfer/{self.fleet[index]["id"]}/{operation_id}/{leaf}'
 
-    def submit(self, host, command, *, operation_id=None, stdin=None, timeout_seconds=None):
-        """Publish one immutable request and return its reference."""
+    def submit(self, host, command, *, operation_id=None, stdin=None, stdin_blob=None,
+               timeout_seconds=None):
+        """Publish one immutable request and return its reference.
+
+        Every request names its stdout blob, so a chatty command (the campaign
+        orchestrator, `tar -czf -`) spills to the bucket instead of failing at
+        the receipt bound.
+        """
         index = self.index_of(host)
         if (not isinstance(command, str) or not command or '\x00' in command
                 or len(command.encode('utf-8', 'surrogatepass')) > MAX_SCRIPT):
             raise ValueError('invalid campaign command')
+        if stdin is not None and stdin_blob is not None:
+            raise ValueError('one command takes one stdin')
         operation_id = operation_id or self.next_operation()
         timeout = self.command_timeout(timeout_seconds)
-        blob = None
+        blob = stdin_blob
         if stdin is not None:
             data = bytes(stdin)
             if len(data) > MAX_BLOB:
@@ -153,6 +176,8 @@ class MailboxExec(host_exec.HostExecution):
             key = self.transfer_key(index, operation_id, 'stdin')
             self.put_blob(key, data)
             blob = {'object': key, 'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+        if blob is not None and blob.get('object') != self.transfer_key(index, operation_id, 'stdin'):
+            raise ValueError('stdin blob does not belong to this operation')
         return self.mailbox.submit(
             index, [SHELL, '-c', command], operation_id=operation_id, timeout_seconds=timeout,
             stdin=blob, stdout_object=self.transfer_key(index, operation_id, 'stdout'))
@@ -225,6 +250,87 @@ class MailboxExec(host_exec.HostExecution):
                 or type(blob['size']) is not int or not 0 <= blob['size'] <= MAX_BLOB):
             raise MailboxError(f'{field}: invalid receipt blob')
         return self.get_blob(blob)
+
+    # ---- campaign files ------------------------------------------------
+    def upload_file(self, key, path):
+        """Stream one local file to the bucket and return its admitted blob."""
+        path = Path(path)
+        size = path.stat().st_size
+        if not 0 <= size <= MAX_BLOB:
+            raise ValueError('campaign file exceeds the mailbox bound')
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        meta = self.store.upload(key, path, content_type='application/octet-stream',
+                                 if_generation_match=0)
+        if (int(meta.get('size', -1)) != size
+                or (meta.get('metadata') or {}).get('sha256') != digest.hexdigest()):
+            raise MailboxError(f'{key}: uploaded blob receipt mismatch')
+        return {'object': key, 'sha256': digest.hexdigest(), 'size': size}
+
+    def send_local(self, host, command, local, *, operation_id=None):
+        """Run one guest command whose stdin is a local file, through the bucket."""
+        index = self.index_of(host)
+        operation_id = operation_id or self.next_operation()
+        blob = self.upload_file(self.transfer_key(index, operation_id, 'stdin'), local)
+        reference = self.mailbox.submit(
+            index, [SHELL, '-c', command], operation_id=operation_id,
+            timeout_seconds=self.command_timeout(None), stdin=blob,
+            stdout_object=self.transfer_key(index, operation_id, 'stdout'))
+        return self.finish(host, reference)
+
+    def send_file(self, host, path, local, *, operation_id=None):
+        """Copy one local file to a guest path through the bucket."""
+        destination = Path(path)
+        return self.send_local(
+            host, f'mkdir -p {shlex.quote(str(destination.parent))} && '
+                  f'cat > {shlex.quote(str(destination))}', local,
+            operation_id=operation_id)
+
+    def stage_tree(self, host, local_dir, guest_dir, *, operation_id=None):
+        """Copy one local directory to a guest directory as one bucket blob.
+
+        The build bundle (1.1 GB) and the fixture (752 MB) reach the coordinator
+        this way: one upload from the workstation, one download on the guest,
+        never a copy held in the launcher's memory.
+        """
+        local_dir = Path(local_dir)
+        if not local_dir.is_dir():
+            raise ValueError(f'{local_dir}: not a campaign directory')
+        index = self.index_of(host)
+        operation_id = operation_id or self.next_operation()
+        handle, name = tempfile.mkstemp(suffix='.tar.gz')
+        os.close(handle)
+        archive = Path(name)
+        try:
+            with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
+                for entry in sorted(local_dir.iterdir()):
+                    bundle.add(entry, arcname=entry.name, recursive=True)
+            destination = Path(guest_dir)
+            return self.send_local(
+                host, f'mkdir -p {shlex.quote(str(destination))} && '
+                      f'tar -xzf - -C {shlex.quote(str(destination))}', archive,
+                operation_id=operation_id)
+        finally:
+            archive.unlink()
+
+    def run_driver(self, host, script, argv=(), *, timeout_seconds=None, operation_id=None):
+        """Run one admitted orchestrator script on the coordinator host.
+
+        `manual_sui.py`, `stage3_campaign.py` and `fault_cells.py` are written
+        for the coordinator host: their `run.py`, arm A and fault coordinator
+        are local children that must reach the owners, so the whole orchestrator
+        runs there as one bounded request. Its stdout spills to the bucket.
+        """
+        if not isinstance(script, str) or not script.startswith('/'):
+            raise ValueError('an absolute admitted script is required')
+        command = 'exec ' + ' '.join(
+            [shlex.quote(gcp_runtime.GUEST_PYTHON), shlex.quote(script)]
+            + [shlex.quote(str(item)) for item in argv])
+        code, out, err = self.finish(host, self.submit(
+            host, command, operation_id=operation_id, timeout_seconds=timeout_seconds))
+        return code, out, err
 
     # ---- boot ----------------------------------------------------------
     def wait_workers(self, timeout_seconds=READY_SECONDS, *, require=None):
@@ -320,6 +426,72 @@ def gate_script(bucket, state):
     return manual_campaign._gate(bucket, state)
 
 
+def with_flags(argv, extra):
+    """Add driver flags ahead of a `--` passthrough, never behind it."""
+    result = list(argv)
+    if '--' in result:
+        index = result.index('--')
+        return result[:index] + list(extra) + result[index:]
+    return result + list(extra)
+
+
+def coordinator_of(state_path):
+    """The coordinator host name of one recorded fleet (index 0)."""
+    state = json.loads(Path(state_path).read_text())
+    fleet = state.get('fleet') or [record['fleet'] for record in state.get('instances', [])
+                                   if record.get('fleet')]
+    if not fleet or fleet[0].get('index') != 0:
+        raise ValueError('fleet state names no coordinator host')
+    return fleet[0]['name']
+
+
+def dispatch(args, *, coordinator, script_relative, trees=(), files=(), values=None):
+    """Stage this driver's inputs and run it on the coordinator host.
+
+    `trees` and `files` are `(guest name, local path)` pairs staged under
+    `runs/<run>` inside the guest root; `values` maps a flag to the guest name
+    its value becomes. The coordinator runs the admitted package copy of this
+    script, with the guest metadata identity, so it writes the owner requests
+    itself.
+    """
+    remote = open_executor(args)
+    state_path = Path(args.fleet_state)
+    state = json.loads(state_path.read_text())
+    campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
+    for name, local in trees:
+        remote.stage_tree(coordinator, campaign / name, local)
+    for name, local in files:
+        remote.send_file(coordinator, campaign / name, local)
+    remote.send_file(coordinator, campaign / 'fleet-state.json', state_path)
+    remote.send_file(coordinator, campaign / 'config.json', Path(args.fleet_config).resolve())
+    argv = rewrite([item for item in sys.argv[1:] if item != '--on-coordinator'],
+                   {flag: str(campaign / name) for flag, name in (values or {}).items()})
+    argv = with_flags(argv, ['--on-coordinator', '--guest-token',
+                            '--fleet-state', str(campaign / 'fleet-state.json'),
+                            '--fleet-config', str(campaign / 'config.json')])
+    script = f'/mnt/tidehunter/{state["run_id"]}/package/source/{script_relative}'
+    code, out, err = remote.run_driver(coordinator, script, argv,
+                                       timeout_seconds=getattr(args, 'coordinator_seconds', None))
+    sys.stdout.write(out.decode('utf-8', 'replace'))
+    sys.stderr.write(err.decode('utf-8', 'replace'))
+    return code
+
+
+def rewrite(argv, values):
+    """Replace the values of named flags in an existing argument vector.
+
+    A flag absent from `argv` keeps its own default on the guest, so a caller
+    maps only the paths that exist on the workstation.
+    """
+    result = [str(item) for item in argv]
+    for index, item in enumerate(result[:-1]):
+        if item == '--':
+            break
+        if item in values:
+            result[index + 1] = str(values[item])
+    return result
+
+
 def load_config(path=None):
     """The campaign configuration that names the project and the bucket."""
     return json.loads(Path(path or Path(__file__).with_name('config.json')).read_text())
@@ -328,9 +500,12 @@ def load_config(path=None):
 def open_executor(args):
     """The one constructor swap the drivers make: mailbox, or SSH for a rehearsal.
 
-    The caller supplies `args.gcloud_ssh`, `args.zone`, `args.fleet_state` and
-    `args.fleet_config`; `args.iap` and `args.tunnel_through_iap` are accepted
-    because the two SSH flags have different names in the existing drivers.
+    The caller supplies `args.gcloud_ssh`, `args.zone`, `args.fleet_state`,
+    `args.fleet_config` and `args.guest_token`; `args.iap` and
+    `args.tunnel_through_iap` are accepted because the two SSH flags have
+    different names in the existing drivers. `--guest-token` selects the guest
+    metadata identity, which is what an orchestrator running on the coordinator
+    uses to write requests for the owners.
     """
     if args.gcloud_ssh:
         if not args.zone:
@@ -340,10 +515,11 @@ def open_executor(args):
     if args.fleet_state is None:
         raise SystemExit('a campaign run needs --fleet-state, or --gcloud-ssh for a rehearsal')
     config = load_config(args.fleet_config)
-    api = gcp_api.GoogleApi(config['project_id'])
+    provider = gcp_api.metadata_token if getattr(args, 'guest_token', False) else None
+    api = gcp_api.GoogleApi(config['project_id'], token_provider=provider)
     return MailboxExec.from_state(args.fleet_state, api, bucket=config['bucket'])
 
 
 __all__ = ['MailboxError', 'MailboxTimeout', 'MailboxRefused', 'MailboxUnknownHost',
            'MailboxExec', 'sui_spec', 'publish', 'release', 'gate_script', 'load_config',
-           'open_executor']
+           'open_executor', 'rewrite', 'with_flags', 'coordinator_of', 'dispatch']
