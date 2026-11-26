@@ -913,6 +913,19 @@ gate loads that module before the worker starts. Seal it with
 `--nvmet-fix-prefix`. A package receipt without the fix also fails the
 `create --package` admission, so no host is rented for it.
 
+`--nvmet-fix-prefix` must name a directory that holds exactly the four admitted
+files, because `kernel_fix.validate_prefix` rejects any other entry. The pinned
+artifact directory also keeps `README.md` and `rpms/`, so stage the four files
+first and check the module hash:
+
+```sh
+NVMET_FIX=/absolute/checkpoint-work/cluster-campaign-2026-11-25/nvmet-fix-prefix
+mkdir -p $NVMET_FIX
+cp /absolute/checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix/\
+{nvmet.ko,abi-admission.json,source.json,partial-nowait-read.patch} $NVMET_FIX/
+sha256sum $NVMET_FIX/nvmet.ko   # 5ba7b96c3b232e7fc0d1200b674d6210324d87ed406f8b51f4b323609ccc233a
+```
+
 ```sh
 python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.REVIEWED_SPECS["nvmeof_path_compact"],open(sys.argv[1],"x"),sort_keys=True,indent=2)' $CAMPAIGN_ROOT/package-spec.json
 python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import mailbox_exec; json.dump(mailbox_exec.sui_spec(2,["native","tidehunter_nvme_rdma"]),open(sys.argv[1],"x"),sort_keys=True,indent=2)' $CAMPAIGN_ROOT/runtime-spec.json
