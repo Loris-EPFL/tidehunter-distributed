@@ -487,6 +487,18 @@ def fleet_hosts(fleet, names, *, transport, live_transport):
     return control, live
 
 
+def controller_loss_intents(args, launcher):
+    """The coordinator's live connection intents directory on the injector host.
+
+    The engine publishes one intent per controller under the coordinator
+    database root, which the rehearsal already hands to `prepare_external` as
+    `--db-root`. An explicit `--controller-loss-intents` still wins.
+    """
+    if args.controller_loss_intents is not None:
+        return Path(args.controller_loss_intents)
+    return launcher.remote_root() / 'live-nvme-connections'
+
+
 def plan(coordinator, owners):
     """Validate the 1 coordinator + 2 owner shape and return the roles."""
     if not isinstance(owners, (list, tuple)) or len(owners) != 2:
@@ -1240,10 +1252,9 @@ def main():
                              'names the coordinator intents directory that selects the '
                              'active write controller')
     parser.add_argument('--controller-loss-intents',
-                        help="the coordinator's live-nvme-connections directory on the "
-                             'injector host; its newest intent inside the owner service '
-                             'window names the active write controller (required when '
-                             '--controller-loss-nqn is absent)')
+                        help="override the coordinator's live-nvme-connections "
+                             'directory; by default it is derived from the '
+                             "coordinator database root this cell prepares")
     parser.add_argument('--controller-loss-timeout', type=float, default=30.0,
                         help='injector reconnect and write-progress deadline in seconds')
     parser.add_argument('--controller-loss-gate-timeout', type=float,
@@ -1325,7 +1336,6 @@ def main():
             transport=args.live_transport,
             metrics_url='http://' + metrics_address + '/metrics',
             rpc_address=rpc_address, output=output, nqn=args.controller_loss_nqn,
-            intents=args.controller_loss_intents,
             timeout=args.controller_loss_timeout,
             gate_timeout=(args.controller_loss_gate_timeout
                           if args.controller_loss_gate_timeout is not None
@@ -1352,6 +1362,8 @@ def main():
         resident_reads=args.resident_reads,
         allow_local_ledger=args.allow_local_ledger,
         controller_loss=controller_loss, hold_seconds=args.hold_seconds)
+    if controller_loss is not None:
+        controller_loss.intents = controller_loss_intents(args, launcher)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
     if receipt.get('status') in ('not_reached', 'invalid'):

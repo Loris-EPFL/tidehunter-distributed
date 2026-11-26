@@ -24,6 +24,7 @@ import gcs_ledger
 import host_exec
 import manual_sui
 from test_gcs_ledger import FakeObjectStore
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 CHECKPOINT = HERE.parent / 'sui-checkpoint'
@@ -710,6 +711,41 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertFalse(window['lines'])
         denied = Denied()
         self.assertIsNone(gate.kernel_log(denied, None)['since'])
+    def test_the_intent_directory_is_derived_from_the_coordinator_root(self):
+        launcher = self.launcher(MailboxDouble(self.root, self.root / 'guest'), None)
+        root = launcher.remote_root()
+        self.assertEqual(root.name, '94970e38de08', "the fixture names the database")
+        args = SimpleNamespace(controller_loss_intents=None)
+        self.assertEqual(manual_sui.controller_loss_intents(args, launcher),
+                         root / 'live-nvme-connections',
+                         'the directory follows the coordinator database root')
+        override = self.root / 'operator-intents'
+        self.assertEqual(
+            manual_sui.controller_loss_intents(
+                SimpleNamespace(controller_loss_intents=override), launcher),
+            override, 'an explicit override still wins')
+
+    def test_the_derived_intent_directory_reaches_the_injector(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        launcher = self.launcher(remote, None)
+        derived = manual_sui.controller_loss_intents(
+            SimpleNamespace(controller_loss_intents=None), launcher)
+        gate = self.gate(remote, intents=derived)
+        receipt = self.launcher(remote, gate, ledger=ledger,
+                                cell_id='S1-4-mid-frame-native',
+                                allow_local_ledger=True).run(
+            manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertTrue(receipt['complete'])
+        injector = [row for row in remote.requests if 'fault_inject.py' in row['command']]
+        words = shlex.split(injector[0]['command'])
+        self.assertEqual(words[words.index('--intents') + 1], str(derived))
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertEqual(evidence['intents'], str(derived))
+        self.assertEqual(
+            derived, self.root / 'run/remote/full_node_db/94970e38de08/live-nvme-connections',
+            'the derived path is the coordinator root the cell prepared')
+
     def test_a_refused_write_path_preflight_fails_the_cell(self):
         refused = dict(INJECTOR_RECORD, ok=False,
                        reason='no process holds a descriptor on the selected controller namespace',
