@@ -438,12 +438,13 @@ class Driver(unittest.TestCase):
             preparations[tier] = stage3_specs.load_external(directory, tier=tier)
         return preparations
 
-    def seed_owner_files(self, remote, preparation_, tier):
+    def seed_owner_files(self, remote, preparation_, tier, *, pid=4242, nonce=None):
         """The next owner incarnation publishes its own ready and receipt files."""
         for record in preparation_['manifest']['hosts']:
             ready = record['ready_files'][preparation_['index']]
             receipt = dict(partition=record['partition'],
-                           durability=dict(tier=tier), launch_nonce='nonce-' + tier)
+                           durability=dict(tier=tier), pid=pid,
+                           launch_nonce=('nonce-' + tier) if nonce is None else nonce)
             remote.owner_ready[record['host']] = {
                 ready: b'',
                 ready + '.durability.json': json.dumps(receipt).encode()}
@@ -471,6 +472,26 @@ class Driver(unittest.TestCase):
         self.assertEqual(owners.active, 'synchronous')
         self.assertEqual(owners.stop(), [])
         self.assertIsNone(owners.active)
+
+    def test_a_receipt_from_another_incarnation_is_refused(self):
+        remote = FakeRemote()
+        preparations = self.external()
+        owners = stage3_campaign.Owners(remote, preparations, root=self.root,
+                                        guest_root=self.base / 'guest')
+        self.seed_owner_files(remote, preparations['native'], 'native', pid=9999)
+        with self.assertRaisesRegex(ValueError, 'running incarnation'):
+            owners.start('native')
+        self.assertEqual(owners.stop(), [])
+
+    def test_an_empty_launch_nonce_is_the_declared_value(self):
+        remote = FakeRemote()
+        preparations = self.external()
+        owners = stage3_campaign.Owners(remote, preparations, root=self.root,
+                                        guest_root=self.base / 'guest')
+        self.seed_owner_files(remote, preparations['native'], 'native', nonce='')
+        receipts = owners.start('native')
+        self.assertEqual([row['launch_nonce'] for row in receipts], ['', ''])
+        self.assertEqual(owners.stop(), [])
 
     def test_arm_b_stops_the_owner_set_first(self):
         remote = FakeRemote()

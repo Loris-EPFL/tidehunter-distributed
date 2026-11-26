@@ -487,16 +487,21 @@ class Owners:
             published = str(record['ready_files'][index]) + '.durability.json'
             data = self.remote.read_bytes(host, published)
             receipt = json.loads(data)
+            # The owner publishes its own PID; a receipt from another
+            # incarnation (a stale ready file) carries a different one. The
+            # launch nonce is optional, so an empty one is the declared value.
+            started = (self.namespaces.get(host) or {}).get('pid')
             if (receipt.get('partition') != partition
                     or receipt.get('durability', {}).get('tier') != self.active
-                    or not receipt.get('launch_nonce')):
-                raise ValueError(f'{host}: owner receipt differs from partition/tier')
+                    or receipt.get('pid') != started):
+                raise ValueError(f'{host}: owner receipt differs from the '
+                                 'partition, tier or running incarnation')
             target = stage3_specs.receipt_path(self.root, self.active, partition)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             rows.append(dict(host=host, partition=partition, published=published,
                              path=str(target), sha256=ledger_module.sha256_bytes(data),
-                             launch_nonce=receipt['launch_nonce']))
+                             launch_nonce=receipt.get('launch_nonce', '')))
         return rows
 
     def stop(self):
