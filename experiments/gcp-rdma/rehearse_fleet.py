@@ -8,15 +8,22 @@ local (see `rehearse_guest.py`). The laptop runs the real operator sequence:
 
   1. publish the sealed package and the runtime, then release every gate
      (`mailbox_exec.publish` / `mailbox_exec.release`);
-  2. wait for every worker's readiness object (`MailboxExec.wait_workers`);
-  3. dispatch `manual_sui.py` S1-0 to H0, which stages the build, fixture and
+  2. re-create on the same run id: a second package with other archive bytes is
+     refused while the dead attempt's `package.tar` exists, then the run prefix
+     is purged with `create`'s control-object predicate and the publish
+     succeeds (`sweep_prefix`);
+  3. start the three guests and wait for every worker's readiness object
+     (`MailboxExec.wait_workers`);
+  4. dispatch `manual_sui.py` S1-0 to H0, which stages the build, fixture and
      schema through the mailbox, runs `prepare_external.py` on the guest,
      installs the owner archives and starts the owner process groups. The
      admission cell runs on both tiers (`S1-0-native`, `S1-0-synchronous`);
-  4. dispatch one `manual_sui.py` controller-loss cell, one `fault_cells.py`
-     cell and the `stage3_campaign.py` cluster probe the same way. The stage-3
-     driver prepares both tier externals on H0 itself;
-  5. optionally exercise the idle guard (`--cells idle_stop`): a request longer
+  5. dispatch one `manual_sui.py` controller-loss cell, the stage-2 M5-hold
+     cell, two `fault_cells.py` cells and the `stage3_campaign.py` cluster
+     probe. The first fault cell publishes to the store, so its failed attempt
+     must leave attempt-scoped evidence and a `failed` bucket ledger; the
+     stage-3 driver prepares both tier externals on H0 itself;
+  6. optionally exercise the idle guard (`--cells idle_stop`): a request longer
      than the test idle window holds every guest up, and every guest records
      its poweroff after the request ends and the window expires. The poweroff
      is a recorded action inside each container, not a real stop.
@@ -30,6 +37,7 @@ API the real `gcp_api.ObjectStore` uses, so publish, the mailbox, transfers,
 receipts and generations are all the production code path.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,6 +47,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 
@@ -49,9 +58,12 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ENGINE / 'experiments' / 'kv-comparison'))
 sys.path.insert(0, str(ENGINE / 'experiments' / 'sui-checkpoint'))
 
+import campaign_ledger
+import campaign_manifest
 import gcp_api
 import gcp_manual_compute
 import mailbox_exec
+import stage2_mechanism
 
 BUCKET = 'mysten-research-bench-artifacts'
 PROJECT = 'mysten-research'
@@ -86,6 +98,61 @@ def docker(*argv, check=True):
     return run(['docker', *argv], check=check)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def second_package(source, destination):
+    """A second sealed package of the same tree, with different bundle bytes.
+
+    The run id is derived from the campaign, so a re-create publishes over the
+    prefix the dead attempt left. `package.tar` is immutable by bytes
+    (`mailbox_exec.upload_identical`), so a rebuild that seals a different
+    archive must find that object purged first. Re-encoding the bundle keeps the
+    receipt's verified fields (source, binary, ABI, manifest) equal to the
+    admitted directory and changes only the archive bytes and its `sha256`.
+    """
+    source, destination = Path(source).resolve(), Path(destination)
+    if destination.exists():
+        raise Failure('the second package destination already exists: ' + str(destination))
+    shutil.copytree(source / 'package', destination / 'package')
+    receipt = json.loads((source / 'package-receipt.json').read_text())
+    bundle = destination / 'package' / 'bundle.tar.gz'
+    bundle.unlink()
+    with tarfile.open(source / 'package/bundle.tar.gz', 'r:gz') as old, \
+            tarfile.open(bundle, 'w:gz', compresslevel=1) as new:
+        for member in old.getmembers():
+            new.addfile(member, old.extractfile(member))
+    receipt['sha256'] = sha256_file(bundle)
+    receipt['archive_path'] = str(bundle.resolve())
+    (destination / 'package-receipt.json').write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + '\n')
+    return destination
+
+
+def purge_control_objects(store, run_id):
+    """Delete the run-prefix control objects a gone attempt left behind.
+
+    `gcp_manual_compute.Compute.sweep_prefix` does exactly this once it has
+    proved no instance or boot disk of the run exists: the package, runtime and
+    transfer objects and the per-host gate and readiness objects. The rehearsal
+    has no cloud instance to prove absent, so it applies the same predicate to
+    the same store.
+    """
+    removed = []
+    for item in store.list('runs/' + run_id + '/'):
+        name = item.get('name')
+        if not gcp_manual_compute._control_object(name, run_id):
+            continue
+        store.delete(name, if_generation_match=item['generation'])
+        removed.append(name)
+    return sorted(removed)
+
+
 class Rehearsal:
     def __init__(self, args):
         self.args = args
@@ -103,6 +170,11 @@ class Rehearsal:
         self.deadline = None
         self.run_id = 'bench-rehearsal-' + self.tag
         self.store = None
+        self.config = None
+        self.package = Path(args.package)
+        # The guests mount the sealed libfabric prefix from the first package:
+        # a re-create rebinds the archive and runtime, never the fabric.
+        self.fabric = Path(args.package) / 'fabric'
 
     # ---- reporting -----------------------------------------------------
     def step(self, name, ok, detail=''):
@@ -156,7 +228,7 @@ class Rehearsal:
     def preflight(self):
         missing = [str(path) for path in
                    (self.args.build, self.args.fixture, self.args.schema,
-                    self.args.package, Path(self.args.package) / 'package-receipt.json')
+                    self.package, self.package / 'package-receipt.json')
                    if not Path(path).exists()]
         if missing:
             raise Failure('missing launch inputs: ' + ', '.join(missing))
@@ -219,10 +291,10 @@ class Rehearsal:
                    # loader path; the rehearsal mounts the sealed prefix there,
                    # because the worker replaces LD_LIBRARY_PATH with the
                    # package's own runtime/lib.
-                   '-v', str(Path(self.args.package) / 'fabric') + ':/rehearsal/fabric:ro',
-                   '-v', str(Path(self.args.package) / 'fabric/lib/libfabric.so.1')
+                   '-v', str(self.fabric) + ':/rehearsal/fabric:ro',
+                   '-v', str(self.fabric / 'lib/libfabric.so.1')
                    + ':/usr/lib64/libfabric.so.1:ro',
-                   '-v', str(Path(self.args.package) / 'fabric/bin/fi_info')
+                   '-v', str(self.fabric / 'bin/fi_info')
                    + ':/usr/local/bin/fi_info:ro',
                    '-e', 'REHEARSAL_IDENTITY=/rehearsal/work/identity.json',
                    '-e', gcp_api.REHEARSAL_ENDPOINT + '=' + guest_endpoint,
@@ -234,8 +306,8 @@ class Rehearsal:
 
     # ---- operator sequence ---------------------------------------------
     def publish(self):
-        receipt = json.loads((Path(self.args.package) / 'package-receipt.json').read_text())
-        derived = gcp_manual_compute.package_source_sha256(self.args.package)
+        receipt = json.loads((self.package / 'package-receipt.json').read_text())
+        derived = gcp_manual_compute.package_source_sha256(self.package)
         if derived != receipt['source_sha256']:
             raise Failure('the package receipt source is not self-consistent')
         self.source_sha256 = derived
@@ -243,7 +315,6 @@ class Rehearsal:
                                       time.gmtime(time.time() + self.args.hours * 3600))
         self.spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2, 'backends': ['native']}
         self.fleet_hosts = self.fleet()
-        self.start_guests(self.fleet_hosts, self.deadline)
         store = self.store = gcp_api.campaign_client(
             {'project_id': PROJECT}).objects(BUCKET)
         state = {'run_id': self.run_id, 'campaign': 'rehearsal', 'role': 'campaign',
@@ -252,6 +323,7 @@ class Rehearsal:
                  'instances': [{'name': host['name'], 'fleet': host}
                                for host in self.fleet_hosts],
                  'workers_released': []}
+        self.state = state
         self.state_path.write_text(json.dumps(state, indent=2) + '\n')
         self.config_path.write_text(json.dumps(
             {'project_id': PROJECT, 'project_number': PROJECT_NUMBER,
@@ -259,18 +331,18 @@ class Rehearsal:
                  'bench-guest@mysten-research.iam.gserviceaccount.com',
              'machine_type': MACHINE_TYPE,
              'idle_stop_seconds': self.args.idle_seconds}, indent=2) + '\n')
-        config = json.loads(self.config_path.read_text())
+        config = self.config = json.loads(self.config_path.read_text())
         # The receipt source is the fleet identity; a build-bundle SHA would
         # bind every gate to an identity no guest can match.
         runtime, reference = mailbox_exec.publish(
-            store, config, state, self.args.package, self.args.revision,
+            store, config, state, self.package, self.args.revision,
             self.spec, self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
         script = mailbox_exec.gate_script(BUCKET, state)
         for host in self.fleet_hosts:
             mailbox_exec.release(store, state, host, script)
         # A second release must reuse the identical gate instead of failing 412.
         mailbox_exec.release(store, state, self.fleet_hosts[0], script)
-        again, same = mailbox_exec.publish(store, config, state, self.args.package,
+        again, same = mailbox_exec.publish(store, config, state, self.package,
                                            self.args.revision, self.spec,
                                            self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
         if again != runtime or same['generation'] != reference['generation']:
@@ -279,12 +351,61 @@ class Rehearsal:
                   'source ' + self.source_sha256[:12] + ', runtime generation '
                   + reference['generation'] + ', three gates (idempotent retry)')
 
+    def recreate(self):
+        """A dead attempt's prefix must be purged before a different package.
+
+        The first attempt published its archive under the deterministic run id.
+        A re-create whose new package holds other bytes is refused by the
+        immutable `package.tar` (`upload_identical`), and the earlier gate and
+        readiness objects would make the fresh guests exit before their first
+        poll. `create` calls `sweep_prefix` once the fleet is verifiably gone;
+        the rehearsal applies the same predicate, then publishes the second
+        package and rebinds every gate to it.
+        """
+        second = second_package(self.package, self.work / 'package-second')
+        state = self.state
+        refused = None
+        try:
+            mailbox_exec.publish(self.store, self.config, state, second,
+                                 self.args.revision, self.spec, self.fleet_hosts,
+                                 guest_roots=[str(GUEST_ROOT)])
+        except mailbox_exec.MailboxError as error:
+            refused = str(error)
+        if refused is None or 'immutable blob already holds other bytes' not in refused:
+            raise Failure('a re-create with other package bytes was not refused: '
+                          + str(refused))
+        removed = purge_control_objects(self.store, self.run_id)
+        expected = {'runs/' + self.run_id + '/package.tar',
+                    'runs/' + self.run_id + '/runtime.json'}
+        if not expected <= set(removed):
+            raise Failure('the prefix purge missed the attempt control objects: '
+                          + ', '.join(sorted(expected - set(removed))))
+        _runtime, reference = mailbox_exec.publish(
+            self.store, self.config, state, second, self.args.revision, self.spec,
+            self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
+        package_object = json.loads(self.store.get('runs/' + self.run_id + '/package.json'))
+        receipt = json.loads((second / 'package-receipt.json').read_text())
+        if package_object.get('sha256') != receipt['sha256']:
+            raise Failure('the re-create kept the dead attempt package identity')
+        script = mailbox_exec.gate_script(BUCKET, state)
+        for host in self.fleet_hosts:
+            mailbox_exec.release(self.store, state, host, script)
+        self.package = second
+        self.step('re-create after prefix purge', True,
+                  'refused ' + refused[:60] + '...; purged ' + str(len(removed))
+                  + ' objects; runtime generation ' + reference['generation'])
+
+    def start(self):
+        self.start_guests(self.fleet_hosts, self.deadline)
+        self.step('guests started', True,
+                  ', '.join(host['name'] for host in self.fleet_hosts))
+
     def ready(self, timeout):
         api = gcp_api.campaign_client({'project_id': PROJECT})
         executor = mailbox_exec.MailboxExec.from_state(
             self.state_path, api, bucket=BUCKET, timeout_seconds=timeout)
         prepared = executor.wait_workers(require=json.loads(
-            (Path(self.args.package) / 'package-receipt.json').read_text())['manifest_sha256'])
+            (self.package / 'package-receipt.json').read_text())['manifest_sha256'])
         self.step('worker ready', True, ', '.join(sorted(prepared)))
 
     # ---- cells ---------------------------------------------------------
@@ -439,6 +560,32 @@ class Rehearsal:
         self.step('manual_sui S1-4 mid-frame native', ok, detail)
         self.check_launch_addresses('manual_sui_loss')
 
+    def manual_sui_hold(self):
+        """Dispatch the stage-2 M5-hold cell with its reviewed hold window.
+
+        The owner lifecycle stops at the same kernel wall before any hold
+        begins, so the reviewed 1800 s window never elapses here; the driver
+        still admits the cell row (`hold-seconds`) and writes the disk samples.
+        """
+        output = self.work / 'cells' / 'manual_sui_hold'
+        self.reset_cell('manual_sui_hold')
+        argv = [sys.executable, HERE / 'manual_sui.py',
+                '--build', self.build, '--fixture', self.args.fixture,
+                '--schema', self.args.schema, '--output', output,
+                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
+                '--transport', 'tcp', '--live-transport', 'rdma',
+                '--fleet-state', self.state_path, '--fleet-config', self.config_path,
+                '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds),
+                '--durability-tier', 'native', '--hold-seconds', '1800',
+                '--disk-sample-seconds', '10',
+                '--cell-id', 'M5-hold', '--stage', 'stage2',
+                '--', '--checkpoints', '4']
+        result = self.dispatch('manual_sui M5-hold', argv, self.args.cell_seconds + 300)
+        ok, detail = self.wall('manual_sui_hold', result)
+        self.step('manual_sui M5-hold (hold-seconds 1800)', ok, detail)
+        self.check_launch_addresses('manual_sui_hold')
+
     def launch_files(self, wanted):
         """One cell's prepared `launch.yaml` files, read through the guest image.
 
@@ -495,20 +642,62 @@ class Rehearsal:
                               f"address {expected['rdma_ip']}")
 
     def fault_cells(self):
-        output = self.work / 'cells' / 'fault_cells'
-        self.reset_cell('fault_cells', 'external')
-        argv = [sys.executable, HERE / 'fault_cells.py',
-                '--cell', self.args.fault_cell,
-                '--build', self.build, '--fixture', self.args.fixture,
-                '--schema', self.args.schema, '--output', output,
-                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
-                '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
-                '--transport', 'tcp', '--live-transport', 'rdma',
-                '--fleet-state', self.state_path, '--fleet-config', self.config_path,
-                '--allow-local-ledger', '--coordinator-seconds', str(self.args.cell_seconds)]
-        result = self.dispatch('fault_cells', argv, self.args.cell_seconds + 300)
-        ok, detail = self.wall('fault_cells', result)
-        self.step('fault_cells ' + self.args.fault_cell, ok, detail)
+        """Two fault cells; the first one passes through the store's failure path.
+
+        A cell stops at the kernel wall before its family driver runs, so both
+        attempts fail. The first runs with `--bucket-prefix` and no local-ledger
+        escape: its failed receipt, specs and samples must be uploaded under the
+        attempt-scoped keys and the bucket ledger must record `failed`. The
+        second keeps the local ledger, so a rehearsal that never reaches the
+        store still reports its wall.
+        """
+        for index, cell_id in enumerate(
+                name.strip() for name in self.args.fault_cells.split(',') if name.strip()):
+            prefix = 'gs://' + BUCKET + '/rehearsal-' + self.tag
+            output = self.work / 'cells' / ('fault_cells_' + cell_id)
+            self.reset_cell('fault_cells_' + cell_id, 'external')
+            argv = [sys.executable, HERE / 'fault_cells.py',
+                    '--cell', cell_id,
+                    '--build', self.build, '--fixture', self.args.fixture,
+                    '--schema', self.args.schema, '--output', output,
+                    '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                    '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
+                    '--transport', 'tcp', '--live-transport', 'rdma',
+                    '--fleet-state', self.state_path, '--fleet-config', self.config_path,
+                    '--coordinator-seconds', str(self.args.cell_seconds)]
+            argv += (['--bucket-prefix', prefix] if index == 0
+                     else ['--allow-local-ledger'])
+            result = self.dispatch('fault_cells ' + cell_id, argv,
+                                   self.args.cell_seconds + 300)
+            ok, detail = self.wall('fault_cells', result)
+            self.step('fault_cells ' + cell_id, ok, detail)
+            if index == 0:
+                self.failure_evidence(cell_id, prefix)
+
+    def failure_evidence(self, cell_id, bucket_prefix):
+        """A failed attempt leaves its evidence and a `failed` ledger in the store."""
+        bucket, prefix = campaign_manifest.parse_bucket_prefix(bucket_prefix)
+        if bucket != BUCKET:
+            raise Failure('the failure evidence bucket differs from the store')
+        key = campaign_manifest.ledger_key(prefix)
+        try:
+            payload = self.store.get(key)
+        except (gcp_api.ApiError, KeyError) as error:
+            raise Failure(f'the failed attempt wrote no bucket ledger: {error}') from None
+        ledger = campaign_ledger.Ledger.from_bytes(payload)
+        stage = stage2_mechanism.find(cell_id)['stage']
+        entry = ledger.entries.get((stage, cell_id))
+        if entry is None or entry.get('status') != 'failed':
+            raise Failure(f'{cell_id} has no failed ledger entry: {entry and entry.get("status")}')
+        uploaded = (entry.get('failure_evidence') or {}).get('uploaded') or []
+        if not uploaded:
+            raise Failure(f'{cell_id} uploaded no failure evidence')
+        wanted = f'/{stage}/evidence/{cell_id}/attempt-'
+        names = {item.get('name') for item in self.store.list(prefix + '/')}
+        if not any(wanted in (name or '') for name in names):
+            raise Failure(f'{cell_id} has no attempt-scoped evidence object')
+        self.step('failure evidence ' + cell_id, True,
+                  f'{len(uploaded)} artifacts, ledger {key}')
 
     def stage3(self):
         output = self.work / 'cells' / 'stage3'
@@ -643,10 +832,13 @@ def main():
     parser.add_argument('--cell-seconds', type=int, default=1800,
                         help='bound of one dispatched coordinator request')
     parser.add_argument('--ready-seconds', type=int, default=1800)
-    parser.add_argument('--fault-cell', default='M6-w1-c16')
+    parser.add_argument('--fault-cells', default='S1-2S-publication-native,M6-w1-c16',
+                        help='comma-separated fault cells; the first uploads its '
+                             'failure evidence to the store, the rest keep the ledger local')
     parser.add_argument('--cells',
                         default=('manual_sui,manual_sui_synchronous,'
-                                 'manual_sui_controller_loss,fault_cells,stage3'),
+                                 'manual_sui_controller_loss,manual_sui_hold,'
+                                 'fault_cells,stage3'),
                         help='comma-separated cells to run; add idle_stop for the '
                              'guest idle guard (use it alone with a short window)')
     parser.add_argument('--idle-seconds', type=int, default=None,
@@ -668,6 +860,8 @@ def main():
         rehearsal.start_store()
         rehearsal.make_networks()
         rehearsal.publish()
+        rehearsal.recreate()
+        rehearsal.start()
         rehearsal.ready(args.ready_seconds)
         for cell in args.cells.split(','):
             getattr(rehearsal, cell.strip())()
