@@ -4,7 +4,8 @@
 Three containers from the Rocky 9 (glibc 2.34) build image act as H0, H1 and H2
 on two Docker networks. Every guest runs the real `gcp_worker.serve`; only the
 GCE metadata identity, the GCE instance describe and the Local SSD admission are
-local (see `rehearse_guest.py`). The laptop runs the real operator sequence:
+local (see `rehearse_guest.py`), and the pinned kernel module is recorded, not
+loaded. The laptop runs the real operator sequence:
 
   1. publish the sealed package and the runtime, then release every gate
      (`mailbox_exec.publish` / `mailbox_exec.release`);

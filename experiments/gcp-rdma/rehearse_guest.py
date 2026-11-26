@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """One rehearsal guest: the real `gcp_worker.serve`, with the cloud identity stubbed.
 
-The container has no GCE metadata server, no local SSD and no Compute API, so
-three guest-local functions differ from a real guest: `metadata` reads the
-rehearsal identity file, `verify_fleet` admits that identity against the runtime
-fleet, and `prepare_storage` uses the container filesystem. Everything else is
+The container has no GCE metadata server, no local SSD, no Compute API and no
+kernel it may load a module into, so four guest-local functions differ from a
+real guest: `metadata` reads the rehearsal identity file, `verify_fleet` admits
+that identity against the runtime fleet, `prepare_storage` uses the container
+filesystem, and `admit_nvmet_fix` keeps the static four-file prefix admission
+but records the pinned module identity instead of loading it. Everything else is
 the real worker: gate checks, package admission, request admission, at-most-once
 execution, transfers, receipts and the poweroff decision log.
 
@@ -74,6 +76,36 @@ def prepare_storage(config, host, api):
     return {'device': '(rehearsal container filesystem)', 'mkfs_duration_seconds': None,
             'lazy_initialization_disabled': None,
             'reason': 'the rehearsal guest has no GCE local SSD'}
+
+
+def admit_nvmet_fix(runtime, host, package):
+    """Record the pinned module identity a container cannot load.
+
+    The static prefix admission still runs (`validate_prefix`), so a package
+    with another module, patch or ABI receipt stops here. The live kernel half
+    is the campaign's `ready` gate, which reads the running release and the
+    loaded `nvmet` srcversion on every real host.
+    """
+    candidate = package.get('nvmet_fix')
+    if candidate is None:
+        return None
+    if package.get('manifest_sha256') != runtime['package']['manifest_sha256']:
+        raise ValueError('nvmet fix manifest differs from selected package')
+    import cloud_package
+    root = Path(runtime['package_root'])
+    proof = cloud_package.nvmet_fix_module(root / 'source').validate_prefix(
+        root / 'nvmet-fix')
+    if any(proof.get(key) != value for key, value in candidate.items()):
+        raise ValueError('staged nvmet fix differs from the selected candidate')
+    loaded = dict(proof,
+                  guest={'instance_name': host['name'],
+                         'instance_id': str(host['id']),
+                         'run_id': runtime['run_id']},
+                  loaded_nvmet={'srcversion': candidate['candidate_srcversion'],
+                                'build_id': candidate['candidate_build_id']},
+                  policy={'mode': 'rehearsal record: no module load'},
+                  stock_modules={}, provider_transports={}, already_loaded=False)
+    return {'candidate': candidate, 'loaded': loaded}
 
 
 def fetch(store, key, generation=None, limit=MAX_PACKAGE):
@@ -184,6 +216,7 @@ def main():
     endpoint = os.environ['TIDEHUNTER_REHEARSAL_STORE']
     gcp_worker.metadata = metadata
     gcp_runtime.verify_fleet = verify_fleet
+    gcp_runtime.admit_nvmet_fix = admit_nvmet_fix
     gcp_worker.prepare_storage = prepare_storage
 
     def recorded_poweroff(reason):
