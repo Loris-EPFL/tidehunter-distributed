@@ -1183,11 +1183,25 @@ impl LiveReadCache {
         );
         let since = *state.connect_since.get_or_insert_with(Instant::now);
         let deadline = connect_budget(state.deadline, since, connect_timeout);
-        if let Some(index) = self
+        // A grant's lease can be verified dead after the write path evicted it:
+        // never attach a member to that controller. Mark it lost (not a
+        // subsystem failure) and fall through to a fresh connect below.
+        let reusable = self
             .grants
             .iter()
-            .position(|grant| !grant.broken && grant.scope.covers(position_ref))
-        {
+            .position(|grant| !grant.broken && grant.scope.covers(position_ref));
+        let reusable = reusable.filter(|index| {
+            let dead = self.grants[*index]
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.controller_lost());
+            if dead {
+                self.grants[*index].broken = true;
+                self.grants[*index].lost = true;
+            }
+            !dead
+        });
+        if let Some(index) = reusable {
             let grant = &mut self.grants[index];
             let _setup =
                 LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
@@ -1820,13 +1834,19 @@ impl LiveReadCache {
         if let Some(first) = flight.positions.iter().min() {
             state.first_pending = state.first_pending.min(*first);
         }
-        if let Some(grant) = self
-            .grants
-            .iter_mut()
-            .find(|grant| grant.id == flight.grant)
-        {
-            grant.broken = true;
-            grant.lost = true;
+        // Every grant of that subsystem shares the pooled lease, so all of them
+        // are dead: mark them lost (never a subsystem failure) so no admission
+        // reuses one while the reconnect runs.
+        let dead = Arc::clone(lease);
+        for grant in &mut self.grants {
+            if grant
+                .lease
+                .as_ref()
+                .is_some_and(|other| Arc::ptr_eq(other, &dead))
+            {
+                grant.broken = true;
+                grant.lost = true;
+            }
         }
         Ok(true)
     }
