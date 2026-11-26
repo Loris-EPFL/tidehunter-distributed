@@ -4,6 +4,7 @@ The registry is the atomic cap/budget/quota reservation boundary. Entries are
 keyed by run ID and have stable owner tokens, independent of sibling mutations.
 The legacy singleton remains readable and is never rewritten by admission.
 """
+import datetime as dt
 import json
 import math
 import re
@@ -198,6 +199,63 @@ def owned(store, state):
     if any(lease.get(k) != v for k, v in expected.items()) or not lease.get('token'):
         raise RuntimeError('active campaign lease identity mismatch')
     return lease, generation
+
+
+def expiry(lease):
+    """The absolute deadline the lease itself carries."""
+    value = lease.get('deadline') if isinstance(lease, dict) else None
+    if not isinstance(value, str):
+        raise RuntimeError('invalid active lease deadline')
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError as exc:
+        raise RuntimeError('invalid active lease deadline') from exc
+    if parsed.tzinfo is None:
+        raise RuntimeError('active lease deadline lacks a UTC offset')
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def expired(lease, now=None):
+    return expiry(lease) <= (now or dt.datetime.now(dt.timezone.utc))
+
+
+def purge(store, run_id, *, absent, now=None):
+    """Remove one expired lease whose instances are verifiably absent.
+
+    A dead run (a lost workstation or a credential outage) leaves its registry
+    entry behind and blocks the same run id forever. `absent` is the caller's
+    verified result: no instance and no boot disk of the run exists. An
+    unexpired lease is never purged, because its fleet may still be billing.
+    """
+    if absent is not True:
+        raise RuntimeError('lease instances are not verifiably absent')
+    current = read(store, run_id)
+    if current is None:
+        return None
+    lease, _token = current
+    if lease.get('version') != 2:
+        raise RuntimeError('a legacy lease needs an explicit release')
+    if not expired(lease, now):
+        raise RuntimeError('active lease has not expired')
+    for _ in range(30):
+        registry, generation = _registry(store)
+        if registry['runs'].get(run_id) != lease:
+            if read(store, run_id) is None:
+                return lease
+            raise RuntimeError('active campaign lease changed before purge')
+        del registry['runs'][run_id]
+        try:
+            store.put(REGISTRY_KEY, _encode(registry), content_type='application/json',
+                      if_generation_match=generation)
+            return lease
+        except ApiError as exc:
+            if exc.status == 412:
+                continue
+            if exc.status is None or exc.status >= 500:
+                if read(store, run_id) is None:
+                    return lease
+            raise
+    raise RuntimeError('lease purge CAS contention exceeded retry bound')
 
 
 def release(store, lease, generation):

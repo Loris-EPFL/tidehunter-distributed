@@ -20,6 +20,7 @@ import datetime as dt
 import hashlib
 import ipaddress
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -29,6 +30,9 @@ import uuid
 
 import gcp_api
 import gcp_bootstrap
+import gcp_budget
+import gcp_lease
+import gcp_manual_preflight
 import mailbox_exec
 from gcp_campaign import (BOOT_DISK_GIB, GUEST_SERVICE_ACCOUNT, campaign_mark,
                           campaign_identity, has_delete_expiry, instance_body,
@@ -177,6 +181,24 @@ def _dict_flag(values):
     while any(delimiter in str(value) for value in values.values()):
         delimiter += 'X'
     return '^' + delimiter + '^' + delimiter.join(k + '=' + str(v) for k, v in values.items())
+
+
+def _control_object(name, run_id):
+    """One of the run prefix's control objects that a re-create must not inherit.
+
+    The run id is derived from the campaign, so every stage fleet writes the
+    same `runs/<run>/` keys. These objects name one attempt's instance ids and
+    deadline; a new attempt must start without them.
+    """
+    prefix = 'runs/' + run_id + '/'
+    if not isinstance(name, str) or not name.startswith(prefix):
+        return False
+    leaf = name[len(prefix):]
+    if leaf in ('package.tar', 'package.json', 'runtime.json') or leaf.startswith('transfer/'):
+        return True
+    parts = leaf.split('/')
+    return (len(parts) == 3 and parts[0] == 'qualification'
+            and parts[2] in ('worker-ready.json', 'gate.json'))
 
 
 def fleet_run_id(campaign):
@@ -701,6 +723,98 @@ class Compute:
         return {'index': index, 'role': 'coordinator' if index == 0 else 'owner', 'name': rec['name'],
                 'id': _id(rec['id']), 'zone': ZONE, 'internal_ip': ips[0], 'rdma_ip': ips[1]}
 
+    def _requested_identity(self, *, source_sha256, deadline):
+        """The persisted identity fields this command asks to change."""
+        changes = {}
+        if deadline is not None and parse_time(deadline) != parse_time(self.state['deadline']):
+            changes['deadline'] = deadline
+        if source_sha256 is not None and source_sha256 != self.state.get('source_sha256'):
+            changes['source_sha256'] = source_sha256
+        return changes
+
+    async def _run_prefix_present(self):
+        """Every instance or boot disk name this run owns, present or not."""
+        names = [self.state['run_id'] + '-' + str(index) for index in range(self.host_count)]
+        present = []
+        for name in names:
+            for kind in ('instance', 'disk'):
+                if await self._exists(kind, name):
+                    present.append(kind + ':' + name)
+        return present
+
+    async def purge_expired_lease(self, store):
+        """Drop one dead attempt's expired lease once its fleet is verifiably gone."""
+        current = gcp_lease.read(store, self.state['run_id'])
+        if current is None or not gcp_lease.expired(current[0]):
+            return None
+        return gcp_lease.purge(store, self.state['run_id'], absent=True)
+
+    async def sweep_prefix(self, *, source_sha256=None, deadline=None):
+        """Remove one dead attempt's state before this fleet takes the run prefix.
+
+        The run id is derived from the campaign, so every re-create writes the
+        same `runs/<run>/qualification/<host>/worker-ready.json` and `gate.json`
+        keys, the same `package.tar`, and the same placement policy name. The
+        worker publishes readiness with `_put_once`, so a stale object makes the
+        new worker exit before its first poll, and a guest gate that names the
+        previous instance waits for a gate that never arrives. Delete these
+        control objects and the policy only when no instance or boot disk of the
+        run exists; a live fleet is never touched, and evidence under the
+        campaign prefix is never listed.
+        """
+        if self._cleanup_until is not None:
+            raise ComputeError('cleanup already in progress')
+        changes = self._requested_identity(source_sha256=source_sha256, deadline=deadline)
+        self._cleanup_until = time.monotonic() + CLEANUP_SECONDS
+        try:
+            present = await self._run_prefix_present()
+            if present:
+                if changes:
+                    raise ComputeError(
+                        'a recorded instance or disk still exists; a new fleet identity '
+                        'needs a verifiably gone fleet: ' + ', '.join(present))
+                return {'present': present, 'removed': None}
+            removed = {'policy': None, 'objects': [], 'lease': None}
+            policy_name = self.state['run_id'] + '-placement'
+            if await self._exists('policy', policy_name):
+                # Persist the intent first: a retried sweep repeats a recorded
+                # delete instead of an unrecorded name-based one.
+                self.state['policy'] = {'name': policy_name, 'region': REGION,
+                                        'delete_requested': True}
+                self._save()
+                await self._delete('policy', policy_name)
+                removed['policy'] = policy_name
+            store = gcp_api.campaign_client(self.config).objects(self.config['bucket'])
+            for item in store.list('runs/' + self.state['run_id'] + '/'):
+                name = item.get('name')
+                if not _control_object(name, self.state['run_id']):
+                    continue
+                try:
+                    store.delete(name, if_generation_match=item['generation'])
+                except gcp_api.ApiError as exc:
+                    if exc.status != 404:
+                        raise
+                removed['objects'].append({'object': name,
+                                           'generation': str(item['generation'])})
+            lease = await self.purge_expired_lease(store)
+            removed['lease'] = self.state['run_id'] if lease is not None else None
+            self.state['instances'] = []
+            for key in ('policy', 'workers_released', 'guest_admitted', 'cleanup_errors'):
+                self.state.pop(key, None)
+            if 'deadline' in changes:
+                self.state['deadline'] = changes['deadline']
+            if 'source_sha256' in changes:
+                self.state['source_sha256'] = changes['source_sha256']
+            self.state['prefix_purge'] = {
+                'at_utc': dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+                          .isoformat().replace('+00:00', 'Z'),
+                'no_instance_or_disk': True, 'identity_changes': sorted(changes),
+                **removed}
+            self._save()
+            return {'present': [], 'removed': removed}
+        finally:
+            self._cleanup_until = None
+
     async def create_vm(self, index, image, deadline, startup):
         self._live()
         if type(index) is not int or index not in range(self.host_count) or not isinstance(startup, str) or not startup:
@@ -958,7 +1072,7 @@ async def gcloud(argv):
             'stderr': stderr.decode('utf-8', 'replace')}
 
 
-def _recorded_fleet(config, args):
+def _recorded_fleet(config, args, *, rebind=False):
     state = json.loads(args.state.read_text())
     args.campaign = args.campaign or state.get('campaign')
     args.hosts = args.hosts or state.get('host_count')
@@ -967,9 +1081,9 @@ def _recorded_fleet(config, args):
         raise ValueError('recorded fleet campaign or host count differs from this command')
     if state.get('role', 'campaign') != args.role:
         raise ValueError('recorded fleet role differs from this command')
-    if args.source_sha256 is not None and state.get('source_sha256') != args.source_sha256:
+    if args.source_sha256 is not None and state.get('source_sha256') != args.source_sha256 and not rebind:
         raise ValueError('recorded fleet source differs from this command')
-    if args.deadline is not None and parse_time(state['deadline']) != parse_time(args.deadline):
+    if args.deadline is not None and parse_time(state['deadline']) != parse_time(args.deadline) and not rebind:
         raise ValueError('recorded fleet deadline differs from this command')
     Compute(config, state, args.state, gcloud)
     return state
@@ -979,10 +1093,14 @@ async def create(config, args):
     """Create the placement policy and every owned host of one reviewed fleet."""
     if args.package is not None:
         # Derive the source from the package the guests will verify, and refuse
-        # a differing explicit value before any cloud call creates a host.
+        # a differing explicit value before any cloud call creates a host. A
+        # campaign package must also carry the pinned nvmet module: without it
+        # S1-0 cannot pass, so refuse before a host is rented.
         args.source_sha256 = package_source_sha256(args.package, args.source_sha256)
+        if (args.role or 'campaign') == 'campaign':
+            mailbox_exec.admit_package_nvmet_fix(Path(args.package))
     if args.state.exists():
-        state = _recorded_fleet(config, args)
+        state = _recorded_fleet(config, args, rebind=True)
     else:
         state = new_state(config, campaign=args.campaign, run_id=args.run_id,
                           deadline=args.deadline, hosts=args.hosts,
@@ -990,12 +1108,11 @@ async def create(config, args):
                           role=args.role)
         Compute(config, state, args.state, gcloud)
     image_path = args.image or config.get('image')
-    policy = policy_body(state)
-    gate = startup_script(config, state)
     if args.dry_run:
+        policy = policy_body(state)
         preview = dict(state, policy={'name': policy['name']})
         bodies = [launch_spec(config, candidate(config), preview, index, image_path,
-                              gate, '0' * 32, policy['name'])[1]
+                              startup_script(config, state), '0' * 32, policy['name'])[1]
                   for index in range(state['host_count'])]
         print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                           'role': state.get('role', 'campaign'), 'host_count': state['host_count'],
@@ -1009,7 +1126,22 @@ async def create(config, args):
         if args.image is not None and args.image != config.get('image'):
             raise ValueError('--image must equal the admitted config image')
         image = admit_image(config)
+    # The checklist's Falcon profile and MTU admission belongs to this path, not
+    # only to the qualification flow.
+    await gcp_manual_preflight.infrastructure_preflight(config, image['path'], gcloud)
     compute = Compute(config, state, args.state, gcloud)
+    # The run id is derived from the campaign, so a re-create meets its own
+    # previous attempt: stale readiness and gate objects, a reserved placement
+    # policy name, and (after an expiry) an old deadline. Clear them only when
+    # no instance or boot disk of the run exists.
+    swept = await compute.sweep_prefix(source_sha256=args.source_sha256, deadline=args.deadline)
+    compute = Compute(config, state, args.state, gcloud)
+    budget = None
+    if not state.get('instances'):
+        # The conservative campaign cap is checked before the first rented host.
+        budget = gcp_budget.admit_campaign(_window_hours(state), state['host_count'])
+    gate = startup_script(config, state)
+    policy = policy_body(state)
     if not state.get('policy'):
         save(args.state, state)
         await compute.create_policy()
@@ -1020,15 +1152,39 @@ async def create(config, args):
             fleet.append(record['fleet'])
             continue
         fleet.append(await compute.create_vm(index, image['path'], state['deadline'], gate))
-    if await compute.admit_guests() != fleet:
-        raise ComputeError('guest fleet identity changed before admission')
     released = None
-    if args.role == 'campaign' and args.package is not None:
-        released = _release_workers(config, state, args, fleet, args.state)
+    try:
+        if await compute.admit_guests() != fleet:
+            raise ComputeError('guest fleet identity changed before admission')
+        if args.role == 'campaign' and args.package is not None:
+            released = _release_workers(config, state, args, fleet, args.state)
+    except BaseException:
+        # The hosts exist and bill. A publication that raises must not leave
+        # them waiting on a closed gate until the DELETE deadline.
+        await _abandon_fleet(compute, state, args.state)
+        raise
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                       'role': state.get('role', 'campaign'), 'image': image, 'policy': policy['name'],
-                      'hosts': fleet, 'workers_released': released}, sort_keys=True, indent=2))
+                      'hosts': fleet, 'workers_released': released, 'control_purge': swept,
+                      'budget': budget}, sort_keys=True, indent=2))
     return 0
+
+
+def _window_hours(state):
+    """The billed window of a fleet as whole hours, rounded up."""
+    remaining = (parse_time(state['deadline'])
+                 - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    return max(1, math.ceil(remaining / 3600 - 1e-6))
+
+
+async def _abandon_fleet(compute, state, path):
+    """Delete a fleet whose create failed after its hosts existed."""
+    try:
+        await compute.cleanup()
+    except Exception as exc:
+        state.setdefault('cleanup_errors', []).append('abandoned create: ' + str(exc))
+        save(path, state)
+        print('error: fleet cleanup incomplete: ' + str(exc), file=sys.stderr)
 
 
 def _release_workers(config, state, args, fleet, path):
@@ -1100,10 +1256,15 @@ async def verify(config, args):
 async def delete(config, args):
     """Delete the recorded hosts, their boot disks and the placement policy."""
     state = _recorded_fleet(config, args)
-    result = await Compute(config, state, args.state, gcloud).cleanup()
+    compute = Compute(config, state, args.state, gcloud)
+    result = await compute.cleanup()
+    # Cleanup just proved that no instance or boot disk of the run exists, so an
+    # expired lease of the same run is dead and must not block the next fleet.
+    store = gcp_api.campaign_client(config).objects(config['bucket'])
+    lease = await compute.purge_expired_lease(store)
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
-                      'cleanup': result, 'hosts': len(state['instances'])},
-                     sort_keys=True, indent=2))
+                      'cleanup': result, 'hosts': len(state['instances']),
+                      'lease_purged': bool(lease)}, sort_keys=True, indent=2))
     return 0
 
 
@@ -1178,7 +1339,7 @@ def main(argv=None):
               'delete': delete}[args.action]
     try:
         return asyncio.run(action(config, args))
-    except (ComputeError, ValueError, TimeoutError, OSError) as exc:
+    except (ComputeError, gcp_api.ApiError, ValueError, TimeoutError, OSError) as exc:
         print('error: ' + str(exc), file=sys.stderr)
         return 1
 

@@ -11,6 +11,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+import gcp_api
+import gcp_lease
 import gcp_manual_compute
 import mailbox_exec
 from gcp_campaign import GUEST_SERVICE_ACCOUNT
@@ -26,7 +28,7 @@ class Store:
 
     def put(self, key, data, *, if_generation_match=None, **kwargs):
         if if_generation_match == 0 and key in self.objects:
-            raise ValueError('generation mismatch')
+            raise gcp_api.ApiError(412, 'generation mismatch')
         generation = str(self.next_generation)
         self.next_generation += 1
         self.objects[key] = (generation, bytes(data))
@@ -35,16 +37,32 @@ class Store:
 
     def head(self, key):
         if key not in self.objects:
-            raise KeyError(key)
+            raise gcp_api.ApiError(404, key)
         generation, data = self.objects[key]
         return {'name': key, 'generation': generation, 'size': len(data),
                 'metadata': {'sha256': hashlib.sha256(data).hexdigest()}}
 
     def get(self, key, *, generation=None, max_bytes=None):
+        if key not in self.objects:
+            raise gcp_api.ApiError(404, key)
         return self.objects[key][1]
 
     def upload(self, key, path, **kwargs):
         return self.put(key, Path(path).read_bytes(), **kwargs)
+
+    def list(self, prefix):
+        return iter([{'name': key, 'generation': generation, 'size': len(data),
+                      'metadata': {'sha256': hashlib.sha256(data).hexdigest()}}
+                     for key, (generation, data) in sorted(self.objects.items())
+                     if key.startswith(prefix)])
+
+    def delete(self, key, *, if_generation_match):
+        if key not in self.objects:
+            raise gcp_api.ApiError(404, key)
+        generation, _data = self.objects[key]
+        if str(generation) != str(if_generation_match):
+            raise gcp_api.ApiError(412, 'generation mismatch')
+        del self.objects[key]
 
 
 def flag(argv, name):
@@ -794,6 +812,8 @@ class ManualComputeTests(unittest.IsolatedAsyncioTestCase):
 
 
 CAMPAIGN = 'campaign-hybrid-sui-2026-11-25'
+NVMET_FIX = {'module_sha256': '5ba7b96c3b232e7f' + '0' * 48,
+             'scope': 'offline ABI admission only; cloud load and correctness not qualified'}
 SOURCE = 'c' * 64
 IMAGE = 'projects/mysten-research/global/images/bench-img-3012611b9ce24218-image'
 
@@ -815,6 +835,22 @@ class OperatorFleetTests(unittest.TestCase):
         self.config_path = Path(self.temp.name) / 'config.json'
         self.config_path.write_text(json.dumps(self.config))
         self.api = FakeMcp(None, self.config, self.state_path)
+        # The run-prefix sweep reads the bucket; the fake keeps the same objects
+        # the publish path would write.
+        self.store = Store()
+        self.client = mock.Mock()
+        self.client.objects.return_value = self.store
+        patcher = mock.patch.object(gcp_manual_compute.gcp_api, 'campaign_client',
+                                    return_value=self.client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The Falcon profile and MTU admission is exercised by its own suite;
+        # here it must run on the create path and see the admitted image.
+        self.preflight = mock.AsyncMock()
+        patcher = mock.patch.object(gcp_manual_compute.gcp_manual_preflight,
+                                    'infrastructure_preflight', new=self.preflight)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def cli(self, action, *extra, state=None):
         return [action, *extra, '--config', str(self.config_path),
@@ -979,7 +1015,8 @@ class OperatorFleetTests(unittest.TestCase):
         package.mkdir()
         (package / 'package-receipt.json').write_text(json.dumps(
             {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
-             'source_revision': 'b' * 40, 'archive_path': str(package / 'bundle.tar.gz')}))
+             'source_revision': 'b' * 40, 'archive_path': str(package / 'bundle.tar.gz'),
+             'nvmet_fix': NVMET_FIX}))
         spec = Path(self.temp.name) / 'spec.json'
         spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
                                     'backends': ['native']}))
@@ -1027,6 +1064,7 @@ class OperatorFleetTests(unittest.TestCase):
                                new=FakeMcp(None, self.config, self.state_path).__call__), \
              mock.patch.object(mailbox_exec, 'release') as release:
             api.return_value.request.return_value = ready
+            api.return_value.objects.return_value = self.store
             report = self.output(self.cli(
                 'create', '--campaign', CAMPAIGN + '-qualify', '--hosts', '2', '--hours', '1',
                 '--role', 'qualification', '--image', IMAGE, '--source-sha256', SOURCE,
@@ -1058,6 +1096,25 @@ class OperatorFleetTests(unittest.TestCase):
         from_state.return_value.wait_workers.assert_called_once_with(require='e' * 64)
         self.assertEqual(report['hosts'], sorted(record['fleet']['name'] for record in state['instances']))
 
+    def test_delete_purges_an_expired_lease_of_the_cleaned_run(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.create()
+        state = json.loads(self.state_path.read_text())
+        gcp_lease.acquire(self.store, {
+            'run_id': state['run_id'], 'project_id': 'mysten-research',
+            'source_sha256': SOURCE,
+            'deadline': (dt.datetime.now(dt.timezone.utc)
+                         - dt.timedelta(hours=1)).isoformat()})
+        self.assertIsNotNone(gcp_lease.read(self.store, state['run_id']))
+        with mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            report = self.output(self.cli('delete'))
+        self.assertTrue(report['lease_purged'])
+        self.assertIsNone(gcp_lease.read(self.store, state['run_id']))
+
     def test_package_flags_are_validated_before_any_call(self):
         for extra, message in (((['--package', '/tmp/p'],), '--spec'),
                                ((['--worker-seconds', '5'],), 'ready only')):
@@ -1066,6 +1123,150 @@ class OperatorFleetTests(unittest.TestCase):
                     gcp_manual_compute.parse(self.cli('create', '--campaign', CAMPAIGN,
                                                       '--hosts', '3', '--hours', '5',
                                                       '--source-sha256', SOURCE, *extra[0]))
+
+    def _stale_run_prefix(self):
+        """The control objects and policy a deleted earlier attempt leaves."""
+        run_id = gcp_manual_compute.fleet_run_id(CAMPAIGN)
+        stale = []
+        for index in range(3):
+            for leaf in ('worker-ready.json', 'gate.json'):
+                stale.append(f'runs/{run_id}/qualification/{run_id}-{index}/{leaf}')
+        stale += [f'runs/{run_id}/package.tar', f'runs/{run_id}/package.json',
+                  f'runs/{run_id}/runtime.json',
+                  f'runs/{run_id}/transfer/200/cmd-000001-0123456789ab/stdin']
+        for key in stale:
+            self.store.put(key, b'old attempt', if_generation_match=0)
+        live = f'{CAMPAIGN}/stage1/evidence/S1-1/attempt-1/results.json'
+        self.store.put(live, b'evidence', if_generation_match=0)
+        name = run_id + '-placement'
+        self.api.resources['policy'][name] = {
+            'name': name, 'id': '100', 'region': 'regions/us-central1',
+            'description': '{}', 'groupPlacementPolicy': {'collocation': 'COLLOCATED',
+                                                          'maxDistance': 3}}
+        return run_id, stale, live, name
+
+    def _recorded_state(self, run_id, *, hours=4, source=SOURCE):
+        state = gcp_manual_compute.new_state(
+            self.config, campaign=CAMPAIGN, run_id=run_id,
+            deadline=gcp_manual_compute.fleet_deadline(hours), hosts=3,
+            source_sha256=source, owner_nonce='b' * 32)
+        self.state_path.write_text(json.dumps(state))
+        return state
+
+    def test_a_recreate_clears_the_previous_attempts_control_objects(self):
+        run_id, stale, evidence, policy = self._stale_run_prefix()
+        self._recorded_state(run_id)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=self.api.__call__):
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', SOURCE))
+        purge = report['control_purge']
+        self.assertEqual(purge['present'], [])
+        self.assertEqual(sorted(item['object'] for item in purge['removed']['objects']),
+                         sorted(stale))
+        self.assertEqual(purge['removed']['policy'], policy)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(sorted(item['object'] for item in state['prefix_purge']['objects']),
+                         sorted(stale))
+        self.assertTrue(state['prefix_purge']['no_instance_or_disk'])
+        for key in stale:
+            self.assertNotIn(key, self.store.objects)
+        # Evidence under the campaign prefix is never listed or removed.
+        self.assertIn(evidence, self.store.objects)
+        # The run's own policy is recreated with the new deadline.
+        self.assertEqual(state['deadline'], state['instances'][0]['launch_spec']['deadline'])
+        self.assertIsNotNone(state.get('policy'))
+
+    def test_a_recreate_of_a_live_fleet_refuses_a_new_identity(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.create()
+            before = len(json.loads(self.state_path.read_text())['instances'])
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(self.create('--hours', '6'), 1)
+        self.assertIn('a recorded instance or disk still exists', error.getvalue())
+        self.assertEqual(len(json.loads(self.state_path.read_text())['instances']), before)
+
+    def test_a_publish_failure_deletes_the_rented_fleet(self):
+        package = Path(self.temp.name) / 'package'
+        package.mkdir()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+             'source_revision': 'b' * 40, 'nvmet_fix': NVMET_FIX,
+             'archive_path': str(package / 'bundle.tar.gz')}))
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                                    'backends': ['native']}))
+        api = FakeMcp(None, self.config, self.state_path)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__), \
+             mock.patch.object(mailbox_exec, 'publish',
+                               side_effect=RuntimeError('bucket 403')):
+            with self.assertRaisesRegex(RuntimeError, 'bucket 403'):
+                gcp_manual_compute.main(self.cli(
+                    'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                    '--package', str(package), '--spec', str(spec),
+                    '--revision', 'b' * 40))
+        # The fleet billed only until the failure; every host, disk and policy
+        # is gone rather than waiting for the DELETE deadline.
+        self.assertEqual(api.resources['instance'], {})
+        self.assertEqual(api.resources['disk'], {})
+        self.assertEqual(api.resources['policy'], {})
+        self.assertEqual([kind for kind, verb, _ in api.mutations if verb == 'delete'],
+                         ['instance'] * 3 + ['policy'])
+
+    def test_create_calls_the_infrastructure_preflight(self):
+        transport = FakeMcp(None, self.config, self.state_path).__call__
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=transport):
+            self.create()
+        self.preflight.assert_awaited_once()
+        config, image, execute = self.preflight.await_args.args
+        self.assertEqual(config, self.config)
+        self.assertEqual(image, IMAGE)
+        self.assertIs(execute, transport)
+
+    def test_a_campaign_package_without_the_pinned_nvmet_module_is_refused(self):
+        package = Path(self.temp.name) / 'package'
+        package.mkdir()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+             'source_revision': 'b' * 40, 'nvmet_fix': None,
+             'archive_path': str(package / 'bundle.tar.gz')}))
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                                    'backends': ['native']}))
+        with mock.patch.object(gcp_manual_compute, 'admit_image') as admit, \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--package', str(package), '--spec', str(spec), '--revision', 'b' * 40))
+        self.assertEqual(code, 1)
+        self.assertIn('no pinned nvmet fix', error.getvalue())
+        admit.assert_not_called()
+        self.assertFalse(self.state_path.exists())
+
+    def test_create_refuses_a_fleet_that_crosses_the_campaign_cap(self):
+        api = FakeMcp(None, self.config, self.state_path)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__), \
+             mock.patch.object(gcp_manual_compute.gcp_budget, 'admit_campaign',
+                               side_effect=ValueError('campaign cap: $76.40 spent + '
+                                                      '$309.44 for 3 hosts x 24 h exceeds $260.00')), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', SOURCE))
+        self.assertEqual(code, 1)
+        self.assertIn('campaign cap', error.getvalue())
+        self.assertEqual(api.mutations, [])
 
     def test_recorded_fleet_refuses_a_different_campaign_or_size(self):
         with mock.patch.object(gcp_manual_compute, 'admit_image',
@@ -1087,6 +1288,7 @@ class OperatorFleetTests(unittest.TestCase):
              mock.patch.object(gcp_manual_compute, 'gcloud',
                                new=FakeMcp(None, self.config, self.state_path).__call__):
             api.return_value.request.return_value = ready
+            api.return_value.objects.return_value = self.store
             report = self.output(self.cli(
                 'create', '--campaign', CAMPAIGN + '-qualify',
                 '--hosts', '2', '--hours', '1', '--role', 'qualification', '--image', IMAGE,
@@ -1097,6 +1299,7 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertEqual(json.loads(self.state_path.read_text())['role'], 'qualification')
         with mock.patch('gcp_api.campaign_client') as api:
             api.return_value.request.return_value = dict(ready, status='PENDING')
+            api.return_value.objects.return_value = self.store
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(gcp_manual_compute.main(self.cli(
                     'create', '--campaign', CAMPAIGN + '-other',

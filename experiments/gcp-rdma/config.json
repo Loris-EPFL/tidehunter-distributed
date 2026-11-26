@@ -5,8 +5,13 @@
   "bucket": "mysten-research-bench-artifacts",
   "service_account": "bench-guest@mysten-research.iam.gserviceaccount.com",
   "machine_type": "z4m-highmem-16",
-  "image": "",
-  "image_qualification": null,
+  "image": "projects/mysten-research/global/images/bench-img-3012611b9ce24218-image",
+  "image_qualification": {
+    "bucket": "mysten-research-bench-artifacts",
+    "object": "runs/bench-2eb0f277d21a4328/qualification/image-receipt.json",
+    "generation": "1795663306159264",
+    "sha256": "2e1bfe33a62ac3bc635aac568ffd676b1096cf3b4e8a49cfb1b2aa52c1146437"
+  },
   "qualification_profile": "focused",
   "max_distance": 3,
   "candidates": [

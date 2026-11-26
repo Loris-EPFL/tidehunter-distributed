@@ -39,6 +39,36 @@ class LeaseTests(unittest.TestCase):
             gcp_lease.owned(self.store, other)
         self.assertEqual(gcp_lease.read(self.store), lease)
 
+    def test_an_expired_lease_of_an_absent_fleet_is_purged(self):
+        self.state['deadline'] = (dt.datetime.now(dt.timezone.utc)
+                                  - dt.timedelta(hours=1)).isoformat()
+        lease = gcp_lease.acquire(self.store, self.state, max_runs=1)
+        self.assertTrue(gcp_lease.expired(lease[0]))
+        purged = gcp_lease.purge(self.store, self.state['run_id'], absent=True)
+        self.assertEqual(purged, lease[0])
+        self.assertIsNone(gcp_lease.read(self.store, self.state['run_id']))
+        # The capacity admission the dead entry blocked is available again.
+        gcp_lease.acquire(self.store, self.state, max_runs=1)
+
+    def test_a_lease_is_never_purged_while_its_fleet_may_exist(self):
+        self.state['deadline'] = (dt.datetime.now(dt.timezone.utc)
+                                  - dt.timedelta(hours=1)).isoformat()
+        gcp_lease.acquire(self.store, self.state)
+        with self.assertRaisesRegex(RuntimeError, 'not verifiably absent'):
+            gcp_lease.purge(self.store, self.state['run_id'], absent=False)
+        with self.assertRaisesRegex(RuntimeError, 'not verifiably absent'):
+            gcp_lease.purge(self.store, self.state['run_id'], absent=None)
+        self.assertIsNotNone(gcp_lease.read(self.store, self.state['run_id']))
+
+    def test_an_unexpired_lease_is_never_purged(self):
+        gcp_lease.acquire(self.store, self.state)
+        with self.assertRaisesRegex(RuntimeError, 'has not expired'):
+            gcp_lease.purge(self.store, self.state['run_id'], absent=True)
+        self.assertIsNotNone(gcp_lease.read(self.store, self.state['run_id']))
+
+    def test_purging_an_absent_run_is_a_no_op(self):
+        self.assertIsNone(gcp_lease.purge(self.store, self.state['run_id'], absent=True))
+
     def test_lost_lease_response_adopts_only_own_generation(self):
         original = self.store.put
         def lost(*args, **kwargs):
