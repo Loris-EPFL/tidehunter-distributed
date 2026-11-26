@@ -21,6 +21,14 @@ from test_manual_campaign import CONFIG, QUOTAS
 
 
 class AdmissionRefusalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The paid-step gate has its own tests; these cases exercise admission.
+        credentials = mock.patch.object(
+            manual_campaign.gcp_api, 'require_paid_credentials',
+            return_value={'schema_version': 1, 'step': 'campaign', 'issued_epoch': 0})
+        credentials.start()
+        self.addCleanup(credentials.stop)
+
     async def test_manual_admission_failures_are_terminal_and_recover_without_compute(self):
         image = 'projects/mysten-research/global/images/base-image'
         spec = dict(manual_campaign.REVIEWED_SPECS['nvmeof_f7_highmem32'], reservation_hours=3)

@@ -327,6 +327,14 @@ class FleetAdmissionTests(unittest.TestCase):
 
 
 class ReservationWindowTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The paid-step gate has its own tests; these cases exercise the window.
+        credentials = mock.patch.object(
+            manual.gcp_api, 'require_paid_credentials',
+            return_value={'schema_version': 1, 'step': 'campaign', 'issued_epoch': 0})
+        credentials.start()
+        self.addCleanup(credentials.stop)
+
     def test_default_and_three_hour_quote(self):
         spec = copy.deepcopy(manual.REVIEWED_SPECS['nvmeof_f7_highmem32'])
         self.assertEqual(manual.reservation_quote(spec, 'z4m-highmem-32'), (21600, 7890, 9668))
