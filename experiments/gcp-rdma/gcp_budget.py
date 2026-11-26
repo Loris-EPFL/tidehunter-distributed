@@ -1,9 +1,73 @@
 """Conservative estimates, not a billing invoice. All values are USD cents."""
 import datetime as dt
 import json
+from pathlib import Path
 from gcp_api import ApiError
 
 KEY = 'budget/ledger.json'
+BUDGET_PATH = Path(__file__).with_name('budget.json')
+
+
+def load(path=None):
+    """The reviewed budget document next to this module."""
+    return json.loads(Path(path or BUDGET_PATH).read_text())
+
+
+def _campaign(value):
+    campaign = value.get('campaign')
+    if not isinstance(campaign, dict):
+        raise ValueError('budget.json carries no campaign cap block')
+    for key in ('cap_usd', 'spent_usd', 'hosts', 'nanodollars_per_host_hour',
+                'ceiling_numer', 'ceiling_denom'):
+        if key not in campaign:
+            raise ValueError('budget.json campaign cap block lacks ' + key)
+    for key in ('hosts', 'nanodollars_per_host_hour', 'ceiling_numer', 'ceiling_denom'):
+        if type(campaign[key]) is not int or campaign[key] <= 0:
+            raise ValueError('budget.json campaign ' + key + ' must be a positive integer')
+    for key in ('cap_usd', 'spent_usd'):
+        if type(campaign[key]) not in (int, float) or campaign[key] < 0:
+            raise ValueError('budget.json campaign ' + key + ' must be nonnegative USD')
+    return campaign
+
+
+def _cents(usd):
+    return int(round(float(usd) * 100))
+
+
+def fleet_ceiling_cents(hours, hosts, value=None):
+    """The reviewed ceiling of one fleet window, rounded up to whole cents.
+
+    Same price and same 14500/11834 compute-to-ceiling ratio as the campaign
+    manifest, so the published row and this refusal cannot drift.
+    """
+    if type(hours) is not int or hours <= 0:
+        raise ValueError('fleet window must be a positive integer hour count')
+    if type(hosts) is not int or hosts <= 0:
+        raise ValueError('fleet host count must be a positive integer')
+    campaign = _campaign(value if value is not None else load())
+    numerator = (campaign['nanodollars_per_host_hour'] * hosts * hours
+                 * campaign['ceiling_numer'] * 100)
+    denominator = campaign['ceiling_denom'] * 10 ** 9
+    return -(-numerator // denominator)
+
+
+def admit_campaign(hours, hosts, value=None):
+    """Refuse a fleet whose conservative ceiling crosses the campaign cap.
+
+    `spent_usd` is the conservative total before this fleet: stage 0 plus the
+    failed stage-1 fleet. The ceiling is the price-based bound of the requested
+    window, so a plan row and this refusal cannot describe different money.
+    """
+    campaign = _campaign(value if value is not None else load())
+    ceiling = fleet_ceiling_cents(hours, hosts, value)
+    cap, spent = _cents(campaign['cap_usd']), _cents(campaign['spent_usd'])
+    if spent + ceiling > cap:
+        raise ValueError(
+            f'campaign cap: ${spent / 100:.2f} spent + ${ceiling / 100:.2f} for '
+            f'{hosts} hosts x {hours} h exceeds ${cap / 100:.2f}')
+    return {'cap_usd': cap / 100, 'spent_usd': spent / 100,
+            'fleet_ceiling_usd': ceiling / 100,
+            'remaining_after_usd': (cap - spent - ceiling) / 100}
 
 
 def immutable_receipt(store, run_id, entry):

@@ -15,13 +15,22 @@ class ManifestBindings(unittest.TestCase):
         value = manifest.manifest()
         self.assertEqual(value['campaign']['id'], 'campaign-hybrid-sui-2026-11-25')
         self.assertEqual(value['owner']['decided_utc'], '2026-11-26')
-        self.assertEqual(value['budget']['cap_usd'], 200.00)
+        self.assertEqual(value['budget']['cap_usd'], 260.00)
+        self.assertEqual(value['budget']['spent_usd'], 76.40)
+        self.assertEqual(value['budget']['remaining_usd'], 183.60)
         self.assertEqual(value['owner']['cap_usd'], value['budget']['cap_usd'])
         ceilings = {stage['id']: stage['ceiling_usd'] for stage in value['stages']}
         self.assertEqual(ceilings, {'stage1': 60.42, 'stage2': 72.50, 'stage3': 24.17})
-        self.assertAlmostEqual(sum(ceilings.values()), value['budget']['base_ceiling_usd'], places=2)
-        self.assertAlmostEqual(value['budget']['cap_usd'] - value['budget']['base_ceiling_usd'],
-                               value['budget']['headroom_above_base_usd'], places=2)
+        # The manifest row is the ceiling gcp_budget.admit_campaign enforces.
+        self.assertEqual({str(stage['window_hours']): stage['ceiling_usd']
+                          for stage in value['stages']},
+                         {'5': value['budget']['fleet_ceilings_usd']['5'],
+                          '6': value['budget']['fleet_ceilings_usd']['6'],
+                          '2': value['budget']['fleet_ceilings_usd']['2']})
+        self.assertAlmostEqual(
+            value['budget']['cap_usd'] - value['budget']['spent_usd']
+            - sum(ceilings.values()), value['stages'][-1]['entry_remaining_usd']
+            - value['stages'][-1]['ceiling_usd'], places=2)
         for stage in value['stages']:
             self.assertLess(stage['ceiling_usd'], stage['stop_usd'])
 
@@ -55,7 +64,18 @@ class ManifestBindings(unittest.TestCase):
         cases = manifest.manifest()['cases']
         self.assertEqual([case['id'] for case in cases['stage1']],
                          [f'S1-{index}' for index in range(9)])
-        self.assertEqual(sum(case['cells'] for case in cases['stage2']), 49)
+        # The stage-2 rows are the cells the drivers build, not the plan's older
+        # per-keyspace count, and their minutes fit the 6 h window.
+        self.assertEqual(sum(case['cells'] for case in cases['stage2']), 41)
+        self.assertEqual(sum(case['est_minutes'] for case in cases['stage2']), 230)
+        self.assertEqual({case['id']: case['cells'] for case in cases['stage2']},
+                         {'M1': 7, 'M2': 4, 'M3': 2, 'M4': 2, 'M5': 1, 'M6': 9,
+                          'M7': 5, 'M8': 8, 'M9': 2, 'M13': 1})
+        controller_loss = [case for case in cases['stage1'] + cases['stage2']
+                           if case['id'] in ('S1-4', 'M7')]
+        self.assertEqual([case['cells'] for case in controller_loss], [5, 5])
+        hold = next(case for case in cases['stage2'] if case['id'] == 'M5')
+        self.assertEqual(hold['hold_minutes'], 30)
         stage3 = cases['stage3']
         distributed = sum(case['cells'] for case in stage3['distributed'])
         native = sum(case['cells'] for case in stage3['native_reference'])
@@ -64,6 +84,8 @@ class ManifestBindings(unittest.TestCase):
         self.assertEqual(native + cache_on['native'], 17)
         self.assertEqual(distributed + native + sum(cache_on.values()),
                          stage3['cell_total'])
+        self.assertEqual(stage3['totals'], {'distributed_cells': 55, 'native_cells': 17,
+                                            'total_cells': 72})
 
     def test_a_rebuilt_bundle_can_rebind_the_three_build_hashes(self):
         value = manifest.manifest(revisions={'bundle_sha256': 'f' * 64})

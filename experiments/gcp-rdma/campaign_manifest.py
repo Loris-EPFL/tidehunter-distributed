@@ -21,6 +21,8 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'sui-checkpoint'))
 import campaign_ledger
+import stage2_mechanism
+import gcp_budget
 
 SCHEMA = 1
 CAMPAIGN_ID = 'campaign-hybrid-sui-2026-11-25'
@@ -79,6 +81,18 @@ def evidence_key(prefix, stage, cell_id, name, attempt=1):
             f'{cell_id}/attempt-{attempt}/{name}')
 
 
+# One source for the money: budget.json's campaign block, which
+# gcp_budget.admit_campaign enforces at create. The manifest never restates a
+# cap, a spent total or a fleet ceiling the code does not use.
+CAMPAIGN_BUDGET = gcp_budget.load()['campaign']
+USD = lambda cents: round(cents / 100, 2)
+
+
+def fleet_ceiling_usd(hours, hosts=None):
+    """The price-based ceiling of one fleet window, as create enforces it."""
+    return USD(gcp_budget.fleet_ceiling_cents(
+        hours, hosts if hosts is not None else CAMPAIGN_BUDGET['hosts']))
+
 OWNER = dict(
     decision='full option approved',
     decided_utc='2026-11-26',
@@ -86,47 +100,66 @@ OWNER = dict(
               'concurrency 1-16 only, stage 3 variant A'),
     grants_usd=[dict(reason='stages 1 and 2 ceiling', amount=21.03),
                 dict(reason='stage 3 ceiling', amount=17.09)],
-    cap_usd=200.00,
+    cap_usd=float(CAMPAIGN_BUDGET['cap_usd']),
     note='the owner writes the two grants and the cap in coordination/LEDGER.md')
 
 BUDGET = dict(
-    cap_usd=200.00,
-    base_ceiling_usd=157.09,
-    headroom_above_base_usd=42.91,
+    cap_usd=float(CAMPAIGN_BUDGET['cap_usd']),
+    spent_usd=float(CAMPAIGN_BUDGET['spent_usd']),
+    remaining_usd=USD(round(CAMPAIGN_BUDGET['cap_usd'] * 100)
+                      - round(CAMPAIGN_BUDGET['spent_usd'] * 100)),
+    cap_rule=('create refuses a fleet whose spent_usd plus the price-based ceiling '
+              'of its window exceeds cap_usd'),
+    spent_source=('stage 0 $4.03 plus the failed stage-1 fleet $72.4; the operator '
+                  'raises spent_usd after each fleet'),
     resume_admission_usd=6.04,
     resume_min_remaining_usd=7.00,
-    ledger_remaining_before_usd=118.97156,
-    stages_1_2_cap_usd=140.00)
+    fleet_ceilings_usd={str(hours): fleet_ceiling_usd(hours) for hours in (1, 2, 5, 6)})
 
 PRICE = dict(
     machine='z4m-highmem-16',
     region='us-central1',
     zone='us-central1-a',
-    usd_per_host_hour=3.287109973,
-    nanodollars_per_host_hour=3287109973,
+    usd_per_host_hour=CAMPAIGN_BUDGET['nanodollars_per_host_hour'] / 1e9,
+    nanodollars_per_host_hour=CAMPAIGN_BUDGET['nanodollars_per_host_hour'],
     observed_utc='2026-11-02T12:38:36Z',
     includes='mandatory 14000 GiB Local SSD',
     excludes='boot disks, network traffic, retained artifacts, taxes, account discounts',
     ceiling_rule='14500/11834 of compute',
-    ceiling_factor=14500 / 11834,
-    launcher_constant='experiments/gcp-rdma/manual_campaign.py:55',
+    ceiling_factor=CAMPAIGN_BUDGET['ceiling_numer'] / CAMPAIGN_BUDGET['ceiling_denom'],
+    launcher_constant='experiments/gcp-rdma/gcp_budget.py:fleet_ceiling_cents',
     source='https://cloud.google.com/products/compute/pricing/storage-optimized',
     recheck='re-check the price before admission; the 2026-11-02 value is not the invoice')
 
+# The operator alarm sits a fixed margin above the code ceiling; the create
+# refusal at ceiling_usd is the hard stop.
+STOP_MARGIN_USD = 2.00
+
+
+def _stage(stage_id, name, driver, window_hours, stop_rule):
+    ceiling = fleet_ceiling_usd(window_hours)
+    return dict(id=stage_id, name=name, driver=driver, hosts=CAMPAIGN_BUDGET['hosts'],
+                window_hours=window_hours,
+                host_hours=CAMPAIGN_BUDGET['hosts'] * window_hours,
+                compute_usd=USD(round(gcp_budget.fleet_ceiling_cents(
+                    window_hours, CAMPAIGN_BUDGET['hosts'])
+                    * CAMPAIGN_BUDGET['ceiling_denom'] / CAMPAIGN_BUDGET['ceiling_numer'])),
+                ceiling_usd=ceiling, stop_usd=round(ceiling + STOP_MARGIN_USD, 2),
+                stop_rule=stop_rule)
+
+
 STAGES = [
-    dict(id='stage1', name='correctness', driver='manual_sui.py', hosts=3,
-         window_hours=5, host_hours=15, compute_usd=49.31,
-         ceiling_usd=60.42, stop_usd=63.00, entry_remaining_usd=0.00,
-         stop_rule='stop the campaign on the first failed case'),
-    dict(id='stage2', name='measurement', driver='manual_sui.py', hosts=3,
-         window_hours=6, host_hours=18, compute_usd=59.17,
-         ceiling_usd=72.50, stop_usd=75.00, entry_remaining_usd=75.00,
-         stop_rule='no cell starts after 4 h 54 min of the window'),
-    dict(id='stage3', name='synthetic workload set', driver='stage3_campaign.py',
-         hosts=3, window_hours=2, host_hours=6, compute_usd=19.72,
-         ceiling_usd=24.17, stop_usd=26.00, entry_remaining_usd=26.00,
-         stop_rule='no cell starts after 1 h 25 min of the window'),
+    _stage('stage1', 'correctness', 'manual_sui.py', 5,
+           'stop the campaign on the first failed case'),
+    _stage('stage2', 'measurement', 'manual_sui.py', 6,
+           'no cell starts after 4 h 54 min of the window'),
+    _stage('stage3', 'synthetic workload set', 'stage3_campaign.py', 2,
+           'no cell starts after 1 h 25 min of the window'),
 ]
+_RUNNING = round(CAMPAIGN_BUDGET['cap_usd'] * 100) - round(CAMPAIGN_BUDGET['spent_usd'] * 100)
+for _entry in STAGES:
+    _RUNNING -= round(_entry['ceiling_usd'] * 100)
+    _entry['entry_remaining_usd'] = USD(_RUNNING + round(_entry['ceiling_usd'] * 100))
 
 REVISIONS = dict(
     engine='2bff0e8a4628aa65363bc0e3b1d24817ee90585e',
@@ -185,7 +218,10 @@ STAGE1_CASES = [
     dict(id='S1-3', case='owner process crash', tiers=['native', 'synchronous'], points=1,
          est_minutes=16, driver='manual_sui.py'),
     dict(id='S1-4', case='W1 resume after controller loss', tiers=['native', 'synchronous'],
-         points=3, est_minutes=36, driver='fault_inject.py'),
+         points=3, cells=5, est_minutes=30, driver='manual_sui.py --controller-loss',
+         note=('three points x two tiers, less S1-4-during-flush-native: native '
+               'forces durable_at_completion, so that point is refused at parse and '
+               'is not applicable')),
     dict(id='S1-5', case='leases and fencing', tiers=['native'], points=1,
          est_minutes=30, driver='manual_sui.py'),
     dict(id='S1-6', case='retirement and relocation', tiers=['native', 'synchronous'],
@@ -196,36 +232,63 @@ STAGE1_CASES = [
          points=1, est_minutes=20, driver='manual_sui.py'),
 ]
 
+def _mechanism_cells(family):
+    """The stage-2 mechanism rows of one plan family, as the driver builds them."""
+    return [cell for cell in stage2_mechanism.cells() if cell.get('family') == family]
+
+
+def _mechanism_row(family, case, est_minutes):
+    """One stage-2 row whose cell count, tiers and widths come from the code."""
+    cells = _mechanism_cells(family)
+    if not cells:
+        raise ValueError('no mechanism cell for ' + family)
+    return dict(id=family, case=case, cells=len(cells), synthetic=True,
+                tiers=sorted({cell['tier'] for cell in cells}),
+                driver='fault_cells.py', est_minutes=est_minutes)
+
+
+def _m6_row():
+    cells = _mechanism_cells('M6')
+    widths = sorted({1 if cell['runs'][0]['mix'].get('get_many', 0) == 0
+                     else cell['runs'][0]['batch'] for cell in cells})
+    concurrency = sorted({cell['runs'][0]['concurrency'] for cell in cells})
+    return dict(_mechanism_row('M6', 'read-path lock wait under Sui multi_get', 27),
+                keyspaces=['synthetic (one keyspace covers objects and executed_effects)'],
+                widths=widths, concurrency=concurrency, tiers=['native'])
+
+
 STAGE2_CASES = [
     dict(id='M1', case='real Sui replay baseline, catch-up and paced', cells=7,
+         driver='manual_sui.py -- --driver-concurrency N [--pacing-ms 245]',
          driver_concurrency=[1, 2, 4, 8, 16], tiers=['native', 'synchronous'],
          est_minutes=58),
-    dict(id='M2', case='value cache', cells=4,
+    dict(id='M2', case='value cache', cells=4, driver='manual_sui.py',
          arms=['1000 native', '128 native', '0 native', '1000 synchronous'],
          driver_concurrency=[4], est_minutes=20),
     dict(id='M3', case='flush mechanism, forced', cells=2, synthetic=True,
-         forced=dict(max_dirty_keys=16, snapshot_written_bytes=64 << 20,
-                     max_maps=3, fragment_mib=64), tiers=['native', 'synchronous'],
-         est_minutes=10),
+         driver='manual_sui.py -- --max-dirty-keys 16 --max-maps 3 --fragment-mib 64',
+         forced=dict(max_dirty_keys=16, max_maps=3, fragment_mib=64),
+         tiers=['native', 'synchronous'], est_minutes=10),
     dict(id='M4', case='blob-cache mechanism, forced', cells=2, synthetic=True,
+         driver='manual_sui.py -- --index-blob-cache-mib N --index-blob-cache-min-bytes 0',
          forced=dict(index_blob_cache_min_bytes=0, fragment_mib=64,
                      index_blob_cache_mib=[0, 1024]),
          tiers=['native', 'synchronous'], est_minutes=10),
-    dict(id='M5', case='coordinator disk use', cells=0,
-         note='sampled during M1-M4 plus one 30 min hold', est_minutes=30),
-    dict(id='M6', case='read-path lock wait under Sui multi_get', cells=15,
-         keyspaces=['objects', 'executed_effects'], widths=[1, 4, 8, 26],
-         concurrency=[1, 2, 4, 8, 16], tiers=['native'], est_minutes=45),
-    dict(id='M7', case='W1 resume after controller loss', cells=6,
-         points=3, tiers=['native', 'synchronous'], driver_concurrency=[4],
+    dict(id='M5', case='coordinator disk use', cells=1, hold_minutes=30,
+         driver='manual_sui.py',
+         note='one 30 min coordinator hold with disk sampling (M5 hold mode)',
          est_minutes=30),
-    dict(id='M8', case='fencing latency', cells=8, cases=4,
+    _m6_row(),
+    dict(id='M7', case='W1 resume after controller loss', cells=5,
+         points=3, driver='manual_sui.py --controller-loss',
+         tiers=['native', 'synchronous'], driver_concurrency=[4], est_minutes=30,
+         note='as S1-4: during-flush at native is not applicable'),
+    dict(id='M8', case='fencing latency', cells=8, cases=4, driver='fault_cells.py',
          tiers=['native', 'synchronous'], est_minutes=24),
-    dict(id='M9', case='retirement and relocation, forced', cells=4, synthetic=True,
-         forced=dict(fragment_mib=64, snapshot_written_bytes=64 << 20),
-         tiers=['native', 'synchronous'], driver_concurrency=[4], est_minutes=32),
-    dict(id='M13', case='132 KB-batch Synchronous threshold', cells=1, synthetic=True,
-         tiers=['synchronous'], driver_concurrency=[4], est_minutes=5),
+    dict(_mechanism_row('M9', 'retirement and relocation, forced', 16),
+         forced=dict(fragment_mib=64), driver_concurrency=[4]),
+    dict(_mechanism_row('M13', '132 KB-batch Synchronous threshold', 5),
+         driver_concurrency=[4]),
 ]
 
 STAGE3_CASES = dict(
@@ -266,6 +329,24 @@ STAGE3_CASES = dict(
              tier='native', total_c=16, value_cache=1000, cells=1),
         dict(id='S3-C2', arm='native', family='point read', size=8192,
              tier='native', callers=8, value_cache=1000, cells=1)])
+
+
+def _stage3_totals(cases):
+    """The approved composition: 55 distributed (arm A) and 17 native (arm B)."""
+    distributed = sum(case['cells'] for case in cases['distributed'])
+    native = sum(case['cells'] for case in cases['native_reference'])
+    cache_on = {case['arm']: case['cells'] for case in cases['cache_on_reference']}
+    if set(cache_on) != {'distributed', 'native'} or any(cells != 1 for cells in cache_on.values()):
+        raise ValueError('stage 3 needs exactly one distributed and one native cache-on cell')
+    total = distributed + native + sum(cache_on.values())
+    if cases['cell_total'] != total:
+        raise ValueError('stage 3 cell rows do not sum to cell_total')
+    return {'distributed_cells': distributed + cache_on['distributed'],
+            'native_cells': native + cache_on['native'],
+            'total_cells': total}
+
+
+STAGE3_CASES['totals'] = _stage3_totals(STAGE3_CASES)
 
 EVIDENCE = dict(
     files=['campaign-manifest.json', 'campaign-ledger.json', 'run-manifest.json',
