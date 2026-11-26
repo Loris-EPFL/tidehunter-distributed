@@ -831,6 +831,18 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     }
 }
 
+#[test]
+fn the_unlocked_probe_sees_a_disk_held_by_another_description() {
+    let temp = tempdir::TempDir::new("unlocked-probe").expect("temp dir");
+    let disk = temp.path().join("nvme9n1");
+    File::create(&disk).expect("create the disk");
+    let holder = File::open(&disk).expect("open the holder");
+    holder.lock().expect("hold the disk lock");
+    assert!(!unlocked(&disk), "a held disk reports as unlocked");
+    holder.unlock().expect("release the disk lock");
+    assert!(unlocked(&disk), "a released disk reports as locked");
+}
+
 /// Fake sysfs and /dev for controller `nvme9`: a plain disk `nvme9n1`, a
 /// multipath head `nvme9n2` linking to it, a hidden path disk, a disk of
 /// `nvme8`, a node `nvme9n3` now naming another device, and a visible disk
