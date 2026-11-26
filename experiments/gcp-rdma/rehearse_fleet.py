@@ -191,10 +191,13 @@ class Rehearsal:
                    '-v', str(ENGINE) + ':/rehearsal/src:ro',
                    '-v', str(directory) + ':/rehearsal/work',
                    '-v', str(directory / 'mnt') + ':/mnt/tidehunter',
-                   # The guest image installs libfabric 1.50 beside the sealed
-                   # runtime; the rehearsal mounts the prefix the seal built.
+                   # The guest image installs libfabric 1.50 into the default
+                   # loader path; the rehearsal mounts the sealed prefix there,
+                   # because the worker replaces LD_LIBRARY_PATH with the
+                   # package's own runtime/lib.
                    '-v', str(Path(self.args.package) / 'fabric') + ':/rehearsal/fabric:ro',
-                   '-e', 'LD_LIBRARY_PATH=/rehearsal/fabric/lib',
+                   '-v', str(Path(self.args.package) / 'fabric/lib/libfabric.so.1')
+                   + ':/usr/lib64/libfabric.so.1:ro',
                    '-e', 'REHEARSAL_IDENTITY=/rehearsal/work/identity.json',
                    '-e', gcp_api.REHEARSAL_ENDPOINT + '=' + guest_endpoint,
                    IMAGE, '/opt/tidehunter-python/bin/python3',
