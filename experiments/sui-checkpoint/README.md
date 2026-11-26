@@ -714,20 +714,27 @@ python3 disk_collector.py --root /owned/remote --namespace live/perpetual \
 ### W1 controller-loss injector
 
 `fault_inject.py` implements the S1-4/M7 fault. It selects exactly one verified
-host controller by NQN, transport, address and service, snapshots the last
-completed checkpoint, then deletes that controller through its own sysfs
-`delete_controller` file. It never disconnects globally and never signals an
-owner process. After deletion it waits for a new controller with the same
-identity, requires the checkpoint sequence to advance, re-reads the pre-fault
-checkpoint summary and requires byte-identical canonical JSON. With
-`--metrics-url` it also requires the aggregate live family to advance without
-new data-plane errors.
+host controller, snapshots the last completed checkpoint, then deletes that
+controller through its own sysfs `delete_controller` file. It never disconnects
+globally and never signals an owner process. After deletion it waits for a new
+controller with the same identity, requires the checkpoint sequence to advance,
+re-reads the pre-fault checkpoint summary and requires byte-identical canonical
+JSON. With `--metrics-url` it also requires the aggregate live family to advance
+without new data-plane errors.
+
+It runs on the initiator, because the deleted object is the local controller:
+the coordinator host holds one controller per owner target. `--nqn` names one
+exact controller; `--service` with `--service-max` names the owner's contiguous
+live service window instead (`4420 + 64 * partition` up to fifteen ports) and
+keeps the lowest NQN, recording every candidate. The engine's live target NQNs
+carry a database scope and an epoch-derived suffix, so the window form is the
+one a campaign cell uses.
 
 ```sh
-python3 fault_inject.py --nqn nqn.2026-01.campaign:owner-1 --transport rdma \
-  --address 10.0.1.11 --service 4420 --sui-rpc 127.0.0.1:9000 \
+python3 fault_inject.py --service 4420 --service-max 4435 --transport rdma \
+  --address 10.0.1.11 --sui-rpc 127.0.0.1:9000 \
   --metrics-url http://127.0.0.1:9000/metrics \
-  --owner-pid 4242 --timeout 30 --output faults.json
+  --timeout 30 --output faults.json
 ```
 
 The record retains reconnect and write-progress seconds, checkpoint hashes,
@@ -735,6 +742,11 @@ readback equality, live counter deltas and owned-process liveness. It exits
 nonzero when any verification fails, but still writes the record.
 `duplicate_count` is `null` with an explicit reason: no host-side duplicate
 counter exists; engine reconciliation is inspected from its own logs.
+
+The campaign does not call this module directly:
+`experiments/gcp-rdma/manual_sui.py --controller-loss <point>` waits for the
+point on an observed live sample and runs this script through the same host
+executor, so the cell keeps the gate series and the injector record together.
 
 ### Atomic six-host startup (no human SSM call)
 

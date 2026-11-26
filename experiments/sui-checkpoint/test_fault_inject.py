@@ -61,6 +61,47 @@ class ControllerSelection(unittest.TestCase):
                          fault_inject.canonical({'b': 2, 'a': 1}))
         self.assertNotEqual(fault_inject.canonical({'a': 1}), fault_inject.canonical({'a': 2}))
 
+    def test_service_window_selects_the_lowest_NQN_and_keeps_candidates(self):
+        first = 'nqn.2026-01.test:db-a-p00000001-sub-01'
+        second = 'nqn.2026-01.test:db-b-p00000001-sub-02'
+        inventory_rows = {
+            'nvme1': dict(nqn=second, transport='rdma',
+                          address=f'traddr={ADDRESS},trsvcid={SERVICE}', inode=1),
+            'nvme2': dict(nqn=first, transport='rdma',
+                          address=f'traddr={ADDRESS},trsvcid={SERVICE + 3}', inode=2),
+            'nvme3': dict(nqn='nqn.2026-01.test:other', transport='rdma',
+                          address=f'traddr=10.0.0.9,trsvcid={SERVICE}', inode=3),
+            'nvme4': dict(nqn='nqn.2026-01.test:outside', transport='rdma',
+                          address=f'traddr={ADDRESS},trsvcid={SERVICE + 16}', inode=4),
+            'nvme5': dict(nqn='nqn.2026-01.test:tcp', transport='tcp',
+                          address=f'traddr={ADDRESS},trsvcid={SERVICE}', inode=5),
+        }
+        name, identity, candidates = fault_inject.select_scoped(
+            inventory_rows, transport='rdma', address=ADDRESS,
+            service=SERVICE, service_max=SERVICE + 15)
+        self.assertEqual(name, 'nvme2')
+        self.assertEqual(identity['nqn'], first)
+        self.assertEqual(candidates, [first, second])
+        with self.assertRaises(ValueError):
+            fault_inject.select_scoped(inventory_rows, transport='rdma',
+                                       address='10.0.0.7', service=SERVICE,
+                                       service_max=SERVICE + 15)
+        with self.assertRaises(ValueError):
+            fault_inject.select_scoped(inventory_rows, transport='rdma',
+                                       address=ADDRESS, service=SERVICE + 5,
+                                       service_max=SERVICE + 1)
+
+    def test_a_window_target_requires_no_NQN_but_needs_a_bounded_window(self):
+        base = dict(transport='rdma', address=ADDRESS, service=SERVICE,
+                    sui_rpc='127.0.0.1:9000', metrics_url=None,
+                    owner_pid=[], timeout=10.0)
+        fault_inject.validate_spec(SimpleNamespace(nqn=None, service_max=SERVICE + 15, **base))
+        fault_inject.validate_spec(SimpleNamespace(nqn=NQN, service_max=None, **base))
+        for service_max in (None, SERVICE - 1):
+            with self.subTest(service_max=service_max), self.assertRaises(ValueError):
+                fault_inject.validate_spec(
+                    SimpleNamespace(nqn=None, service_max=service_max, **base))
+
 
 class InjectionRun(unittest.TestCase):
     def fixture(self, root):
@@ -71,7 +112,8 @@ class InjectionRun(unittest.TestCase):
 
     def args(self, **changes):
         base = dict(nqn=NQN, transport='rdma', address=ADDRESS, service=SERVICE,
-                    sui_rpc='127.0.0.1:9000', metrics_url='http://127.0.0.1:9000/metrics',
+                    service_max=None, sui_rpc='127.0.0.1:9000',
+                    metrics_url='http://127.0.0.1:9000/metrics',
                     owner_pid=[os.getpid()], timeout=10.0)
         base.update(changes)
         return SimpleNamespace(**base)
@@ -129,6 +171,33 @@ class InjectionRun(unittest.TestCase):
             self.assertFalse(record['ok'])
             self.assertIn('did not reconnect', record['reason'])
             self.assertIn('processes_after', record)
+
+    def test_service_window_injection_records_candidates_and_selected_nqn(self):
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            state = dict(deleted=False, calls=0)
+            def snapshot():
+                return inventory('nvme2', 2) if state['deleted'] else inventory()
+            def delete(controller, identity, attrs):
+                self.assertEqual((controller, identity['inode']),
+                                 ('nvme1', 1))
+                state['deleted'] = True
+            def latest(address):
+                state['calls'] += 1
+                return 10 if state['calls'] == 1 else 11
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(
+                    self.args(nqn=None, service_max=SERVICE + 15), snapshot=snapshot,
+                    delete=delete, latest=latest,
+                    metrics=lambda url: 'tidehunter_nvmeof_live_namespace_connects_total 2\n',
+                    clock=clock.monotonic, sleep=clock.sleep,
+                    read_checkpoint=lambda address, sequence: {})
+            self.assertTrue(record['ok'], record)
+            self.assertEqual(record['target']['nqn'], NQN)
+            self.assertEqual(record['target']['service_max'], SERVICE + 15)
+            self.assertEqual(record['target']['candidates'], [NQN])
 
     def test_refused_delete_keeps_the_record_without_injection(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,12 @@ continue, that a previously read checkpoint summary reads back byte-identical,
 and that the aggregate live counters advanced. The injector never disconnects
 globally and never signals an owner process.
 
+It runs on the initiator, because the controller object being deleted is the
+local one: the coordinator host holds one controller per owner target. The
+target is either one exact NQN (`--nqn`) or the owner's contiguous live service
+window (`--service` to `--service-max`); the window form keeps the lowest NQN
+and records every candidate.
+
 Exit status is nonzero when any verification fails; the JSON record is written
 in both outcomes so the campaign retains the failed case.
 """
@@ -44,8 +50,11 @@ class InjectionError(ValueError):
 
 
 def validate_spec(args):
-    if not isinstance(args.nqn, str) or not manage.NQN.fullmatch(args.nqn):
-        raise ValueError('invalid target NQN')
+    if args.nqn is not None:
+        if not isinstance(args.nqn, str) or not manage.NQN.fullmatch(args.nqn):
+            raise ValueError('invalid target NQN')
+    elif not (type(args.service_max) is int and args.service <= args.service_max <= 65535):
+        raise ValueError('an exact NQN or a bounded service window is required')
     if args.transport not in ('tcp', 'rdma'):
         raise ValueError('transport must be tcp or rdma')
     if not 1 <= args.service <= 65535:
@@ -64,6 +73,33 @@ def select_controller(inventory, *, nqn, transport, address, service):
     if len(matches) != 1:
         raise ValueError(f'expected one matching controller, found {len(matches)}')
     return matches[0]
+
+
+def select_scoped(inventory, *, transport, address, service, service_max):
+    """Select the lowest-NQN controller inside one owner's live service window.
+
+    A live owner host publishes one target per database partition inside a
+    contiguous service window (`deployment.prepare` sets the base as
+    `4420 + 64 * partition`), so the window names the owner host while one
+    controller is still needed. The lowest NQN makes that choice explicit and
+    the whole candidate list is retained as evidence.
+    """
+    if not (type(service) is int and type(service_max) is int and 1 <= service <= service_max <= 65535):
+        raise ValueError('invalid service window')
+    matches = []
+    for name, identity in inventory.items():
+        if identity['transport'] != transport:
+            continue
+        fields = dict(item.split('=', 1) for item in identity['address'].split(',') if '=' in item)
+        if fields.get('traddr') != address or not fields.get('trsvcid', '').isdigit():
+            continue
+        if service <= int(fields['trsvcid']) <= service_max:
+            matches.append((identity['nqn'], name, identity))
+    if not matches:
+        raise ValueError('no controller inside the owner service window')
+    matches.sort(key=lambda row: (row[0], row[1]))
+    nqn, name, identity = matches[0]
+    return name, identity, sorted(row[0] for row in matches)
 
 
 def hostnqn(controller):
@@ -169,10 +205,21 @@ def run(args, *, snapshot=None, delete=None,
         record['reason'] = 'an owned process was not alive before injection'
         return record
     inventory = snapshot()
-    controller, identity = select_controller(inventory, nqn=args.nqn, transport=args.transport,
-        address=address, service=args.service)
+    candidates = None
+    if args.nqn is None:
+        controller, identity, candidates = select_scoped(
+            inventory, transport=args.transport, address=address,
+            service=args.service, service_max=args.service_max)
+    else:
+        controller, identity = select_controller(inventory, nqn=args.nqn,
+            transport=args.transport, address=address, service=args.service)
+    deleted_nqn = identity['nqn']
     deleted_hostnqn = hostnqn(controller)
-    record['target'].update(controller=controller, inode=identity['inode'], hostnqn=deleted_hostnqn)
+    record['target'].update(controller=controller, inode=identity['inode'],
+        hostnqn=deleted_hostnqn, nqn=deleted_nqn, transport=args.transport,
+        address=address, service=args.service, service_max=args.service_max)
+    if candidates is not None:
+        record['target']['candidates'] = candidates
     before_sequence = latest(args.sui_rpc)
     if before_sequence < 0:
         raise ValueError('negative checkpoint sequence')
@@ -196,7 +243,7 @@ def run(args, *, snapshot=None, delete=None,
         return record
     record['outage_started_seconds'] = started
     try:
-        reconnect, reconnect_observations = wait_for_reconnect(nqn=args.nqn,
+        reconnect, reconnect_observations = wait_for_reconnect(nqn=deleted_nqn,
             transport=args.transport, address=address, service=args.service,
             removed_inode=identity['inode'], timeout=args.timeout,
             snapshot=snapshot, clock=clock, sleep=sleep)
@@ -252,7 +299,10 @@ def run(args, *, snapshot=None, delete=None,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--nqn', required=True, help='owner target NQN to lose')
+    parser.add_argument('--nqn', help='exact owner target NQN to lose')
+    parser.add_argument('--service-max', type=int,
+                        help='upper bound of the owner target service window; '
+                             'required when --nqn is absent')
     parser.add_argument('--transport', choices=('tcp', 'rdma'), default='rdma')
     parser.add_argument('--address', required=True)
     parser.add_argument('--service', type=int, default=4420)
