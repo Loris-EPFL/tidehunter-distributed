@@ -389,27 +389,51 @@ class Rehearsal:
         self.step('manual_sui S1-4 mid-frame native', ok, detail)
         self.check_launch_addresses('manual_sui_loss')
 
+    def launch_files(self, wanted):
+        """One cell's prepared `launch.yaml` files, read through the guest image.
+
+        The guest creates its preparation as root with `0700`, so the laptop
+        cannot traverse it; a container that mounts the campaign read-only can.
+        """
+        campaign = self.campaign_mount()
+        if not campaign.is_dir():
+            return []
+        script = ('find /c -type f -name launch.yaml | while read f; do '
+                  'case "$f" in *"/' + wanted + '/"*) echo "== $f"; cat "$f";; esac; done')
+        result = run(['docker', 'run', '--rm', '-v', str(campaign) + ':/c:ro', IMAGE,
+                      'sh', '-c', script], check=False)
+        files, name, buffer = [], None, []
+        for line in (result.stdout or '').splitlines():
+            if line.startswith('== '):
+                if name is not None:
+                    files.append((name, '\n'.join(buffer)))
+                name, buffer = line[3:], []
+            elif name is not None:
+                buffer.append(line)
+        if name is not None:
+            files.append((name, '\n'.join(buffer)))
+        return files
+
     def check_launch_addresses(self, cell, config_dir=None):
         """The prepared launch must listen on the control IP and export the RDMA IP."""
         wanted = config_dir or (cell + '-external-config')
-        # `rglob` takes one component pattern on Python 3.12; select the node
-        # directories of this cell's preparation explicitly.
-        matches = [path for path in sorted(self.campaign_mount().rglob('launch.yaml'))
-                   if path.parent.name.startswith('node-') and wanted in path.parts]
-        if not matches:
+        files = self.launch_files(wanted)
+        if not files:
             raise Failure(f'{cell}: no prepared owner launch file under a {wanted} directory')
-        for path in matches:
-            text = path.read_text()
-            partition = int(path.parent.name.rsplit('-', 1)[-1])
+        for name, text in files:
+            marker = name.rsplit('/node-', 1)
+            if len(marker) != 2 or not marker[1][:1].isdigit():
+                raise Failure(f'{cell}: {name} is not a node launch file')
+            partition = int(marker[1].split('/')[0])
             if not 0 <= partition < len(self.fleet_hosts) - 1:
-                raise Failure(f'{cell}: {path} names partition {partition} outside the fleet')
+                raise Failure(f'{cell}: {name} names partition {partition} outside the fleet')
             expected = self.fleet_hosts[1 + partition]
             if f"listen: {expected['internal_ip']}:9400" not in text \
                     and f"listen: {expected['internal_ip']}:{9400 + partition}" not in text:
-                raise Failure(f'{cell}: {path} does not listen on the owner control '
+                raise Failure(f'{cell}: {name} does not listen on the owner control '
                               f"address {expected['internal_ip']}")
             if f"address: {expected['rdma_ip']}" not in text:
-                raise Failure(f'{cell}: {path} does not export the RDMA target '
+                raise Failure(f'{cell}: {name} does not export the RDMA target '
                               f"address {expected['rdma_ip']}")
 
     def fault_cells(self):
