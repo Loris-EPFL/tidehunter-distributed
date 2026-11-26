@@ -89,7 +89,6 @@ REQUIRED = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.to
             "experiments/kv-comparison/nvme_campaign_owner.py",
             "experiments/kv-comparison/nvme_campaign_native.py",
             "experiments/kv-comparison/nvme_campaign_trace.py",
-            "benchmarks/kv-research/src/backends/tidehunter/nvmeof_campaign.rs",
             "benchmarks/kv-research/src/backends/tidehunter/live_qualification.rs",
             "tidehunter/src/distributed/nvmeof/live_storage.rs",
             "tidehunter/src/distributed/nvmeof/live_io.rs",
