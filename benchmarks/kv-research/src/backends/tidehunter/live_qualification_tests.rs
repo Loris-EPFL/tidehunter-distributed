@@ -162,3 +162,29 @@ fn adoption_window_counts_only_the_child_initiator_controller() {
         "another subsystem's churn is not the child's"
     );
 }
+
+#[test]
+fn controller_loss_is_opt_in_and_never_implicit() {
+    let base = serde_json::json!({
+        "coordinator_path": "/unused",
+        "namespace": vec![1; 16],
+        "expected_route": "tcp",
+        "durability_tier": "native",
+        "value_bytes": 256
+    });
+    let input: Input = serde_json::from_value(base.clone()).unwrap();
+    assert!(
+        !input.controller_loss,
+        "a caller that does not supervise the loss must not request it"
+    );
+    let mut enabled = base.clone();
+    enabled["controller_loss"] = serde_json::json!(true);
+    let input: Input = serde_json::from_value(enabled).unwrap();
+    assert!(input.controller_loss, "the supervisor opts in explicitly");
+    let mut unknown = base;
+    unknown["controller-loss"] = serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<Input>(unknown).is_err(),
+        "an unknown key stays rejected"
+    );
+}

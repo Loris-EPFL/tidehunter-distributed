@@ -468,14 +468,13 @@ def qualify(args):
         if not supervisor.records or not all(row["injected"] for row in supervisor.records):
             raise RuntimeError("controller-loss injection was not confirmed for every tier")
         qualifications = sorted(output.rglob("qualification.json"))
-        if len(qualifications) != 2:
-            raise RuntimeError(f"expected two tier proofs, found {len(qualifications)}")
         for proof_path in qualifications:
             tier_proof = json.loads(proof_path.read_text())
             loss = tier_proof.get("controller_loss") or {}
             if (tier_proof.get("checks", {}).get("w1_controller_loss") is not True
                     or loss.get("resumed", {}).get("sysfs_inode") in (None, loss.get("deleted", {}).get("sysfs_inode"))):
                 raise RuntimeError(f"controller-loss resume unproven in {proof_path}")
+        proofs_complete = len(qualifications) == 2
         after = inventory()
         dump(output / "after.json", after)
         result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
@@ -487,12 +486,12 @@ def qualify(args):
         dump(root / "summary.json", {"wal_replay": result})
         print(f"wal_replay: {json.dumps(result, sort_keys=True)}", flush=True)
         failed = (not result["complete"] or not result["fixture_removed"]
-                  or not result["inventory_restored"])
+                  or not result["inventory_restored"] or not proofs_complete)
         if failed:
             trace.capture_failure(root / "failure-trace")
         if not result["fixture_removed"] or not result["inventory_restored"]:
             raise RuntimeError("Single-owner kernel TCP cleanup unconfirmed")
-        return 0 if result["complete"] and signal.getsignal(signal.SIGTERM) != signal.SIG_IGN else 1
+        return 0 if result["complete"] and proofs_complete and signal.getsignal(signal.SIGTERM) != signal.SIG_IGN else 1
     finally:
         # Never leave the nvmet tracepoints or the kprobe armed for a later
         # proof on the same runner, including a failed run.
