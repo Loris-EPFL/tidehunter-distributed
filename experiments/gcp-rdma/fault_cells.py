@@ -56,6 +56,12 @@ import stage2_mechanism as mechanism
 BINARY = 'storage-node'
 OWNER_READY_SECONDS = 180
 GATE_TIMEOUT_SECONDS = 600
+# A failed attempt uploads what it still holds before the fleet is deleted. The
+# local coordinator database, TLS material and any bulk storage tree never
+# travel, and one oversized file must not consume the whole failure budget.
+FAILURE_ARTIFACT_LIMIT = 128 << 20
+FAILURE_ARTIFACT_SKIP = ('host-*.tar.gz',)
+FAILURE_SKIP_PARTS = ('coordinator', 'tls', 'storage')
 GATE_WRITES = 200
 FENCE_WRITES = 20
 WAL = re.compile(r'^wal_([0-9a-f]{16})$')
@@ -1034,6 +1040,42 @@ def cell_ids():
     return [cell['id'] for cell in mechanism.cells()]
 
 
+def failure_artifacts(output, config_dir):
+    """Every retained file of a failed attempt, within a bounded curated tree.
+
+    A cell that dies at owner provisioning registers no part, so the curated
+    pass-path list names files it never wrote. The failed attempt's coordinator
+    standard output and replay logs are then the only evidence that the run
+    reached the kernel wall. Walk the attempt's own trees and skip only what is
+    rebuildable or private: the coordinator database, TLS material and bulk
+    storage.
+    """
+    rows, seen, skipped = [], set(), []
+    for root, label in ((Path(output), ''), (Path(config_dir), 'external/')):
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob('*')):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(part in FAILURE_SKIP_PARTS for part in relative.parts):
+                continue
+            if any(path.match(pattern) for pattern in FAILURE_ARTIFACT_SKIP):
+                skipped.append(dict(path=str(path),
+                                    reason='rebuildable owner archive'))
+                continue
+            if path.stat().st_size > FAILURE_ARTIFACT_LIMIT:
+                skipped.append(dict(path=str(path),
+                                    reason='above the failure upload bound'))
+                continue
+            name = label + relative.as_posix()
+            if name in seen:
+                continue
+            seen.add(name)
+            rows.append(campaign_upload.artifact(path, name))
+    return rows, skipped
+
+
 def cell_artifacts(output, parts):
     """Every retained file of one cell: compact records and per-sample files.
 
@@ -1246,7 +1288,9 @@ def main():
             reason = 'one or more cell checks failed'
             ledger.fail(entry, reason)
             if evidence is not None:
-                evidence.persist_failure(entry, artifacts, reason)
+                failed, skipped = failure_artifacts(output, config_dir)
+                entry['failure_skipped'] = skipped
+                evidence.persist_failure(entry, failed, reason)
             ledger.save()
     except Exception as error:
         # The failure upload keeps this attempt's receipt, specs and samples: a
@@ -1254,7 +1298,9 @@ def main():
         # set here and never inside the exit path below.
         ledger.fail(entry, error)
         if evidence is not None:
-            evidence.persist_failure(entry, cell_artifacts(output, parts), error)
+            failed, skipped = failure_artifacts(output, config_dir)
+            entry['failure_skipped'] = skipped
+            evidence.persist_failure(entry, failed, error)
         ledger.save()
         raise
     print(json.dumps(dict(cell=cell['id'], ok=ok, receipt=str(receipt_path))))

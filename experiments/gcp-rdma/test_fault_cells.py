@@ -1,6 +1,7 @@
 """Operator driver tests: parsing, gates, receipts and the dry-run CLI."""
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -445,6 +446,81 @@ class ReopenPath(unittest.TestCase):
                 driver.crash()
             self.assertEqual(captured['gate'], gate)
             self.assertEqual(captured['kill'], kill)
+
+
+class FailureUpload(unittest.TestCase):
+    """A wall-failing cell registers no part, so its logs must still travel."""
+
+    def tree(self, root):
+        output = Path(root) / 'S1-2S-publication-native'
+        run = output / 'measure' / 'run' / 'experiment'
+        run.mkdir(parents=True)
+        (output / 'measure' / 'run.log').write_text(
+            'nvmet is not on mounted configfs\n')
+        (run / 'replay.log').write_text(
+            'ProvisionDatabase: nvmet is not on mounted configfs\n')
+        (output / 'measure' / 'coordinator').mkdir()
+        (output / 'measure' / 'coordinator' / 'db').write_text('private')
+        (output / 'measure' / 'tls').mkdir()
+        (output / 'measure' / 'tls' / 'key.pem').write_text('private')
+        config = Path(root) / 'S1-2S-publication-native-external-config'
+        config.mkdir()
+        (config / 'config.json').write_text('{}')
+        (config / 'host-bench-0.tar.gz').write_text('rebuildable')
+        return output, config
+
+    def test_failure_artifacts_take_the_logs_and_skip_private_trees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, config = self.tree(tmp)
+            rows, skipped = fault_cells.failure_artifacts(output, config)
+            names = {row['name'] for row in rows}
+            self.assertIn('measure/run.log', names)
+            self.assertIn('measure/run/experiment/replay.log', names)
+            self.assertIn('external/config.json', names)
+            self.assertNotIn('measure/coordinator/db', names)
+            self.assertNotIn('measure/tls/key.pem', names)
+            self.assertNotIn('external/host-bench-0.tar.gz', names)
+            self.assertEqual(skipped, [dict(
+                path=str(config / 'host-bench-0.tar.gz'),
+                reason='rebuildable owner archive')])
+
+    def test_failure_artifacts_bound_one_oversized_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output, config = self.tree(tmp)
+            (config / 'host-bench-0.tar.gz').unlink()
+            big = output / 'measure' / 'huge.log'
+            big.write_bytes(b'')
+            os.truncate(big, fault_cells.FAILURE_ARTIFACT_LIMIT + 1)
+            rows, skipped = fault_cells.failure_artifacts(output, config)
+            self.assertNotIn('measure/huge.log', {row['name'] for row in rows})
+            self.assertEqual(skipped, [dict(path=str(big),
+                                            reason='above the failure upload bound')])
+
+    def test_a_failed_attempt_uploads_evidence_and_a_failed_ledger(self):
+        from test_gcs_ledger import FakeObjectStore
+        with tempfile.TemporaryDirectory() as tmp:
+            output, config = self.tree(tmp)
+            rows, skipped = fault_cells.failure_artifacts(output, config)
+            ledger = fault_cells.ledger_module.Ledger(Path(tmp) / 'campaign-ledger.json')
+            entry = ledger.begin(stage='stage1', cell_id='S1-2S-publication-native',
+                                 config_hash='hash', unit='S1-2S-publication-native')
+            entry['failure_skipped'] = skipped
+            store = FakeObjectStore()
+            fault_cells.campaign_upload.Evidence(
+                store, 'campaign-hybrid-sui-2026-11-25').persist_failure(
+                    entry, rows, RuntimeError('wall'))
+            keys = {row['key'] for row in entry['failure_evidence']['uploaded']}
+            base = ('campaign-hybrid-sui-2026-11-25/stage1/evidence/'
+                    'S1-2S-publication-native/attempt-1/')
+            self.assertIn(base + 'measure/run.log', keys)
+            self.assertIn(base + 'measure/run/experiment/replay.log', keys)
+            payload = store.objects[
+                'campaign-hybrid-sui-2026-11-25/campaign-ledger.json'][0]
+            stored = fault_cells.ledger_module.Ledger.from_bytes(payload)
+            self.assertEqual(stored.status('stage1', 'S1-2S-publication-native'),
+                             'failed')
+            self.assertIn('wall', stored.entries[
+                ('stage1', 'S1-2S-publication-native')]['failure'])
 
 
 class UploadedPass(unittest.TestCase):
