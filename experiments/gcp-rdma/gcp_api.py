@@ -40,13 +40,14 @@ def metadata_token():
         return json.load(response)['access_token']
 
 
-def token_expiry(expire_time, *, now=time.monotonic):
+def token_expiry(expire_time, *, now=None):
     """Monotonic instant to refresh by, from an IAM `expireTime`.
 
     A response without a parsable expiry is treated as the shortest admitted
     lifetime, so the next request mints a new token instead of trusting an
     unknown one.
     """
+    now = now or time.monotonic
     fallback = now() + TOKEN_LIFETIME_SECONDS - 2 * TOKEN_REFRESH_MARGIN_SECONDS
     if not isinstance(expire_time, str) or not expire_time:
         return fallback

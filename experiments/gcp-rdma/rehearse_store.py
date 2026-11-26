@@ -190,22 +190,25 @@ class TooLarge(Exception):
 
 
 def _multipart(body_path, boundary, workdir):
-    """Split one multipart body: return (attributes, data path, data size)."""
-    delimiter = b'--' + boundary.encode()
+    """Split one multipart body: return (attributes, data path, data size, digest).
+
+    A boundary delimiter is `CRLF--boundary` (RFC 2046), so payload bytes that
+    merely contain the boundary token stay inside the data part.
+    """
+    first = b'--' + boundary.encode()
+    marker = b'\r\n--' + boundary.encode()
     with open(body_path, 'rb') as stream, \
             mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as memory:
-        start = memory.find(delimiter)
-        if start < 0:
+        if memory[:len(first)] != first:
             raise ValueError('multipart boundary missing')
-        position = start + len(delimiter) + 2
-        header_end = memory.find(b'\r\n\r\n', position)
-        json_end = memory.find(delimiter, header_end + 4)
+        header_end = memory.find(b'\r\n\r\n', len(first))
+        json_end = memory.find(marker, header_end + 4)
         if header_end < 0 or json_end < 0:
             raise ValueError('multipart attribute part is malformed')
-        attributes = json.loads(memory[header_end + 4:json_end - 2])
-        position = json_end + len(delimiter) + 2
+        attributes = json.loads(memory[header_end + 4:json_end])
+        position = json_end + len(marker)
         data_header_end = memory.find(b'\r\n\r\n', position)
-        data_end = memory.find(delimiter, data_header_end + 4)
+        data_end = memory.find(marker, data_header_end + 4)
         if data_header_end < 0 or data_end < 0:
             raise ValueError('multipart data part is malformed')
         handle, name = tempfile.mkstemp(dir=str(workdir))
@@ -213,8 +216,8 @@ def _multipart(body_path, boundary, workdir):
         written = 0
         with os.fdopen(handle, 'wb') as output:
             cursor = data_header_end + 4
-            while cursor < data_end - 2:
-                chunk = memory[cursor:min(cursor + 1 << 20, data_end - 2)]
+            while cursor < data_end:
+                chunk = memory[cursor:min(cursor + 1 << 20, data_end)]
                 output.write(chunk)
                 digest.update(chunk)
                 written += len(chunk)

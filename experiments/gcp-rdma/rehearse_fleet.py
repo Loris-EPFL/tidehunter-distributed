@@ -104,10 +104,6 @@ class Rehearsal:
         if not ok:
             raise Failure(f'{name}: {detail}')
 
-    def boundary(self, name, ok, detail=''):
-        # A cell that stops at the kernel NVMe-oF wall is a rehearsal pass.
-        self.step(name, ok, detail)
-
     # ---- preflight -----------------------------------------------------
     def stage_build(self):
         """Copy the frozen guest build and overlay this branch's harness sources.
@@ -179,12 +175,7 @@ class Rehearsal:
         return hosts
 
     def start_guests(self, fleet, deadline):
-        import rehearse_store  # noqa: F401  (the module is imported for clarity)
-        guest_env = dict(os.environ)
-        del guest_env[gcp_api.REHEARSAL_ENDPOINT]
-        guest_env[gcp_api.REHEARSAL_ENDPOINT] = 'http://' + self.gateway + ':' + str(self.server.port)
-        store = gcp_api.campaign_client({'project_id': PROJECT}).objects(BUCKET)
-        # The runtime and package objects exist; a gate is released after this.
+        guest_endpoint = 'http://' + self.gateway + ':' + str(self.server.port)
         for host in fleet:
             directory = self.work / 'guests' / host['name']
             (directory / 'mnt').mkdir(parents=True, exist_ok=True)
@@ -196,17 +187,17 @@ class Rehearsal:
             docker('run', '-d', '--name', host['name'],
                    '--network', self.networks['control'], '--ip', host['internal_ip'],
                    '--hostname', host['name'],
+                   '--ulimit', 'nofile=1048576:1048576',
                    '-v', str(ENGINE) + ':/rehearsal/src:ro',
                    '-v', str(directory) + ':/rehearsal/work',
                    '-v', str(directory / 'mnt') + ':/mnt/tidehunter',
                    '-e', 'REHEARSAL_IDENTITY=/rehearsal/work/identity.json',
-                   '-e', gcp_api.REHEARSAL_ENDPOINT + '=' + guest_env[gcp_api.REHEARSAL_ENDPOINT],
+                   '-e', gcp_api.REHEARSAL_ENDPOINT + '=' + guest_endpoint,
                    IMAGE, '/opt/tidehunter-python/bin/python3',
                    '/rehearsal/src/experiments/gcp-rdma/rehearse_guest.py')
             docker('network', 'connect', '--ip', host['rdma_ip'],
                    self.networks['data'], host['name'])
             self.containers.append(host['name'])
-        return store
 
     # ---- operator sequence ---------------------------------------------
     def publish(self):
@@ -219,8 +210,9 @@ class Rehearsal:
                                       time.gmtime(time.time() + self.args.hours * 3600))
         self.spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2, 'backends': ['native']}
         self.fleet_hosts = self.fleet()
-        store = self.start_guests(self.fleet_hosts, self.deadline)
-        self.store = store
+        self.start_guests(self.fleet_hosts, self.deadline)
+        store = self.store = gcp_api.campaign_client(
+            {'project_id': PROJECT}).objects(BUCKET)
         state = {'run_id': self.run_id, 'campaign': 'rehearsal', 'role': 'campaign',
                  'source_sha256': self.source_sha256, 'deadline': self.deadline,
                  'host_count': 3, 'bucket': BUCKET, 'owner_nonce': '0' * 32,
@@ -276,10 +268,19 @@ class Rehearsal:
         print((result.stderr or '')[-8000:], file=sys.stderr, flush=True)
         return result
 
+    def guest_mount(self, host):
+        """One guest's `/mnt/tidehunter` as seen from the laptop."""
+        return self.work / 'guests' / host['name'] / 'mnt'
+
+    def campaign_mount(self):
+        """H0's staged campaign directory as seen from the laptop."""
+        return self.guest_mount(self.fleet_hosts[0]) / self.run_id / 'campaign'
+
     def owner_logs(self):
         lines = []
+        root_relative = GUEST_ROOT.relative_to('/mnt/tidehunter')
         for host in self.fleet_hosts[1:]:
-            root = self.work / 'guests' / host['name'] / 'mnt' / self.run_id / 'sui'
+            root = self.guest_mount(host) / root_relative
             for log in sorted(root.glob('owner-*.log')):
                 text = log.read_text(errors='replace')
                 lines.append((host['name'], log.name, text))
@@ -322,14 +323,12 @@ class Rehearsal:
         self.step('manual_sui S1-0 (checkpoints 4)', ok, detail)
         self.check_launch_addresses('manual_sui')
 
-    def check_launch_addresses(self, cell):
+    def check_launch_addresses(self, cell, config_dir='out/manual_sui-external-config'):
         """The prepared launch must listen on the control IP and export the RDMA IP."""
-        output = self.work / 'cells' / cell
-        matches = list(output.glob('*-external-config/*/node-*/launch.yaml'))
+        matches = sorted((self.campaign_mount() / config_dir).glob('*/node-*/launch.yaml'))
         if not matches:
-            matches = list((output / 'external').glob('*/node-*/launch.yaml'))
-        if not matches:
-            raise Failure(f'{cell}: no prepared owner launch file to inspect')
+            raise Failure(f'{cell}: no prepared owner launch file under '
+                          f'{self.campaign_mount() / config_dir}')
         for path in matches:
             text = path.read_text()
             partition = int(path.parent.name.rsplit('-', 1)[-1])
