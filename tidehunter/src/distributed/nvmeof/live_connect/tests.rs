@@ -1021,7 +1021,13 @@ fn controller_evidence_is_the_geometry_the_check_observed_and_is_recorded_once()
             evidence.sysfs_device,
             evidence.sysfs_inode
         ),
-        (5, 127, KEEP_ALIVE_TMO_SECS, directory.dev(), directory.ino())
+        (
+            5,
+            127,
+            KEEP_ALIVE_TMO_SECS,
+            directory.dev(),
+            directory.ino()
+        )
     );
     // A second record would replace what the client verified: it must fail.
     assert!(controller.record_queue_geometry(temp.path()).is_err());
