@@ -1093,12 +1093,8 @@ async def create(config, args):
     """Create the placement policy and every owned host of one reviewed fleet."""
     if args.package is not None:
         # Derive the source from the package the guests will verify, and refuse
-        # a differing explicit value before any cloud call creates a host. A
-        # campaign package must also carry the pinned nvmet module: without it
-        # S1-0 cannot pass, so refuse before a host is rented.
+        # a differing explicit value before any cloud call creates a host.
         args.source_sha256 = package_source_sha256(args.package, args.source_sha256)
-        if (args.role or 'campaign') == 'campaign':
-            mailbox_exec.admit_package_nvmet_fix(Path(args.package))
     if args.state.exists():
         state = _recorded_fleet(config, args, rebind=True)
     else:
@@ -1107,6 +1103,10 @@ async def create(config, args):
                           source_sha256=args.source_sha256, owner_nonce=uuid.uuid4().hex,
                           role=args.role)
         Compute(config, state, args.state, gcloud)
+    if args.package is not None and args.role == 'campaign':
+        # A campaign package must carry the pinned nvmet module: without it
+        # S1-0 cannot pass, so refuse before a host is rented.
+        mailbox_exec.admit_package_nvmet_fix(Path(args.package))
     image_path = args.image or config.get('image')
     if args.dry_run:
         policy = policy_body(state)
