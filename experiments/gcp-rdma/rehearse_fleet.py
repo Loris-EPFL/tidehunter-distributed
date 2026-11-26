@@ -119,7 +119,10 @@ def second_package(source, destination):
     source, destination = Path(source).resolve(), Path(destination)
     if destination.exists():
         raise Failure('the second package destination already exists: ' + str(destination))
-    shutil.copytree(source / 'package', destination / 'package')
+    # Admission re-reads the sealed runtime directory and the qualification
+    # inventory beside it; both must travel with the receipt.
+    for name in ('package', 'qualification'):
+        shutil.copytree(source / name, destination / name)
     receipt = json.loads((source / 'package-receipt.json').read_text())
     bundle = destination / 'package' / 'bundle.tar.gz'
     bundle.unlink()

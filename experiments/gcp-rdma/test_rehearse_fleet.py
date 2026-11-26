@@ -35,6 +35,8 @@ class Package:
     def __init__(self, root):
         self.root = root
         (root / 'package').mkdir(parents=True)
+        (root / 'qualification').mkdir()
+        (root / 'qualification/receipt.json').write_text('{"status": "completed"}')
         (root / 'package/manifest.json').write_text(json.dumps({'files': {}}))
         write_bundle(root / 'package/bundle.tar.gz',
                      {'manifest.json': b'{"files": {}}',
@@ -62,6 +64,8 @@ class SecondPackage(unittest.TestCase):
         self.assertEqual(result, self.destination)
         self.assertEqual((result / 'package/manifest.json').read_bytes(),
                          (self.source / 'package/manifest.json').read_bytes())
+        self.assertEqual((result / 'qualification/receipt.json').read_bytes(),
+                         (self.source / 'qualification/receipt.json').read_bytes())
         second = result / 'package/bundle.tar.gz'
         self.assertEqual(bundle_bytes(second),
                          bundle_bytes(self.source / 'package/bundle.tar.gz'))

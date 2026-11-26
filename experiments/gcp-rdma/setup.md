@@ -926,29 +926,40 @@ cp /absolute/checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix/\
 sha256sum $NVMET_FIX/nvmet.ko   # 5ba7b96c3b232e7fc0d1200b674d6210324d87ed406f8b51f4b323609ccc233a
 ```
 
+A reseal writes a fresh output directory, because `prepare.py` refuses an
+existing one. This attempt used `package3`, `build-guest3` and
+`build-guest-target`; the checklist's `PACKAGE` and `BUILD` name them. The build
+image carries no Rust toolchain of its own, so mount the workstation's rustup
+home and pin the workspace toolchain (1.96.1).
+
 ```sh
+NEW_PACKAGE=$CAMPAIGN_ROOT/package3
+NEW_BUILD=$CAMPAIGN_ROOT/build-guest3
+NEW_TARGET=$CAMPAIGN_ROOT/build-guest-target
 python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.REVIEWED_SPECS["nvmeof_path_compact"],open(sys.argv[1],"x"),sort_keys=True,indent=2)' $CAMPAIGN_ROOT/package-spec.json
 python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import mailbox_exec; json.dump(mailbox_exec.sui_spec(2,["native","tidehunter_nvme_rdma"]),open(sys.argv[1],"x"),sort_keys=True,indent=2)' $CAMPAIGN_ROOT/runtime-spec.json
 docker build -f experiments/gcp-rdma/Dockerfile.build -t tidehunter-gcp-build experiments/gcp-rdma
 python3 experiments/gcp-rdma/prepare.py --engine "$PWD" --revision "$(git rev-parse HEAD)" \
-  --output $CAMPAIGN_ROOT/package --spec $CAMPAIGN_ROOT/package-spec.json \
+  --output $NEW_PACKAGE --spec $CAMPAIGN_ROOT/package-spec.json \
   --deadline 14400 --build-container tidehunter-gcp-build \
   --nvmet-fix-prefix $NVMET_FIX
-cp $CAMPAIGN_ROOT/package-spec.json $CAMPAIGN_ROOT/package/spec.json
-sha256sum $CAMPAIGN_ROOT/package/manifest.json
+cp $CAMPAIGN_ROOT/package-spec.json $NEW_PACKAGE/spec.json
+sha256sum $NEW_PACKAGE/package/manifest.json
 # the Sui bundle, built in the same guest-ABI container (glibc 2.34)
-docker run --rm -v "$PWD:/work" -v "$CAMPAIGN_ROOT:/campaign" -v "$SUI:/sui" \
-  -w /work -e CARGO_BUILD_JOBS=2 -e RUSTUP_TOOLCHAIN=1.96.1 \
-  tidehunter-gcp-build python3 experiments/sui-checkpoint/build.py prepare \
-  --sui /sui --engine /work --output /campaign/build
-docker run --rm -v "$PWD:/work" -v "$CAMPAIGN_ROOT:/campaign" \
-  -w /work -e CARGO_BUILD_JOBS=2 -e RUSTUP_TOOLCHAIN=1.96.1 \
-  tidehunter-gcp-build python3 experiments/sui-checkpoint/build.py build \
-  --output /campaign/build --target /campaign/build-target
+BUILD_CONTAINER=(docker run --rm --user "$(id -u):$(id -g)"
+  -e HOME="$HOME" -e PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+  -e CARGO_BUILD_JOBS=2 -e RUSTUP_TOOLCHAIN=1.96.1
+  -v "$HOME:$HOME" -v "$PWD:/work" -v "$CAMPAIGN_ROOT:/campaign" -v "$SUI:/sui"
+  -w /work tidehunter-gcp-build:latest)
+"${BUILD_CONTAINER[@]}" python3 experiments/sui-checkpoint/build.py prepare \
+  --sui /sui --engine /work --output /campaign/$(basename $NEW_BUILD) --jobs 2
+"${BUILD_CONTAINER[@]}" python3 experiments/sui-checkpoint/build.py build \
+  --output /campaign/$(basename $NEW_BUILD) \
+  --target /campaign/$(basename $NEW_TARGET) --deadline 10800
 # bind the manifest to that exact bundle (local only; it must run before any cell
 # is recorded, because it refuses a ledger that already holds a cell)
 python3 experiments/gcp-rdma/campaign_manifest.py \
-  --directory $CAMPAIGN_ROOT --build $CAMPAIGN_ROOT/build
+  --directory $CAMPAIGN_ROOT --build $NEW_BUILD
 ```
 
 #### Fleet operations
@@ -1021,8 +1032,8 @@ Variables for every command below:
 CAMPAIGN=campaign-hybrid-sui-2026-11-25
 RUN=bench-68bbf96a569f1513            # gcp_manual_compute.fleet_run_id(CAMPAIGN)
 CAMPAIGN_ROOT=/absolute/checkpoint-work/cluster-campaign-2026-11-25
-PACKAGE=$CAMPAIGN_ROOT/package
-BUILD=$CAMPAIGN_ROOT/build
+PACKAGE=$CAMPAIGN_ROOT/package3             # resealed from this tip, nvmet fix inside
+BUILD=$CAMPAIGN_ROOT/build-guest3           # guest ABI 2.34, bound in campaign-manifest.json
 FIXTURE=/absolute/checkpoint-fixtures/sui-genesis-1775/fixture
 SCHEMA=$CAMPAIGN_ROOT/schema-run/experiment/native-schema
 BUCKET=gs://mysten-research-bench-artifacts/$CAMPAIGN
