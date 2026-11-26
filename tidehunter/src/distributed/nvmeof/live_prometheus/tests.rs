@@ -23,6 +23,10 @@ fn scrape_aggregates_counters_and_latest_nonfixture_fence() {
     producer.record_timing(LiveTimingStage::AdoptionAsync, 4_000_000_000, 2);
     producer.record_timing(LiveTimingStage::AdoptionSettle, 6_000_000_000, 3);
     producer.record_adoption_history_full_settle();
+    producer.record_resume_attempt();
+    producer.record_resume_attempt();
+    producer.record_resume_rewrite(3);
+    producer.record_resume_refused();
     producer.record_lease_profile(crate::distributed::tcp::LeaseProfile {
         reserve_ns: 1_000_000_000,
         namespace_sync_ns: 2_000_000_000,
@@ -79,6 +83,10 @@ fn scrape_aggregates_counters_and_latest_nonfixture_fence() {
         ("adoption_settle_seconds_total", 6.0),
         ("adoption_settle_samples_total", 3.0),
         ("adoption_history_full_settles_total", 1.0),
+        ("resume_attempts_total", 2.0),
+        ("resume_rewrites_total", 1.0),
+        ("resume_frames_total", 3.0),
+        ("resume_refused_total", 1.0),
         ("lease_reserve_seconds_total", 1.0),
         ("lease_namespace_sync_seconds_total", 2.0),
         ("lease_publish_seconds_total", 3.0),

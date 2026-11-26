@@ -133,6 +133,30 @@ fn fields(s: &LiveNvmeStats) -> Vec<(&'static str, u64, bool, &'static str)> {
             "Successful settles forced by full leased prefix history",
         ),
         (
+            "resume_attempts_total",
+            c.resume_attempts,
+            false,
+            "Write-resume attempts that reached the reconnect",
+        ),
+        (
+            "resume_rewrites_total",
+            c.resume_rewrites,
+            false,
+            "Write resumes that rewrote retained frames",
+        ),
+        (
+            "resume_frames_total",
+            c.resume_frames,
+            false,
+            "Retained frames rewritten by write resumes",
+        ),
+        (
+            "resume_refused_total",
+            c.resume_refused,
+            false,
+            "Write resumes refused by a decision check or by the budget",
+        ),
+        (
             "leased_failed_writes_total",
             c.leased_failed_writes,
             false,
