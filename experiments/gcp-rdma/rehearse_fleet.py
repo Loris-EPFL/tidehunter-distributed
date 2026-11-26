@@ -503,7 +503,10 @@ class Rehearsal:
     def prepare_stage3_external(self, output):
         """Prepare stage-3's external deployment with the branch's prepare_external."""
         directory = output / 'external'
-        directory.mkdir(parents=True, exist_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
+        # `prepare_external.py` creates its own fresh output directory.
+        if directory.exists():
+            shutil.rmtree(directory)
         database = self.stage3_database()
         control = [host['internal_ip'] for host in self.fleet_hosts[1:]]
         live = [host['rdma_ip'] for host in self.fleet_hosts[1:]]
