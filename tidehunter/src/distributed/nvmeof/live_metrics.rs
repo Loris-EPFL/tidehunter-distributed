@@ -35,6 +35,9 @@ pub struct LiveNamespaceIdentity {
 pub(crate) struct LiveControllerEvidence {
     pub(crate) queue_count: u32,
     pub(crate) sqsize: u32,
+    /// The keep-alive timeout the connect requested, in seconds.
+    #[serde(default)]
+    pub(crate) keep_alive_tmo: u32,
     pub(crate) sysfs_device: u64,
     pub(crate) sysfs_inode: u64,
 }

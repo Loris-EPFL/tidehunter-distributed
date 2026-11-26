@@ -138,7 +138,7 @@ fn old_connect_target_defaults_geometry_and_pins_connect_options() {
     }))
     .unwrap();
     assert_eq!(target.geometry, LiveQueueGeometry::default());
-    let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,ctrl_loss_tmo=0,nr_io_queues=4,queue_size=128";
+    let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,ctrl_loss_tmo=0,keep_alive_tmo=5,nr_io_queues=4,queue_size=128";
     assert_eq!(
         connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
         expected
@@ -1017,10 +1017,11 @@ fn controller_evidence_is_the_geometry_the_check_observed_and_is_recorded_once()
         (
             evidence.queue_count,
             evidence.sqsize,
+            evidence.keep_alive_tmo,
             evidence.sysfs_device,
             evidence.sysfs_inode
         ),
-        (5, 127, directory.dev(), directory.ino())
+        (5, 127, KEEP_ALIVE_TMO_SECS, directory.dev(), directory.ino())
     );
     // A second record would replace what the client verified: it must fail.
     assert!(controller.record_queue_geometry(temp.path()).is_err());
@@ -1030,7 +1031,13 @@ fn controller_evidence_is_the_geometry_the_check_observed_and_is_recorded_once()
     keys.sort();
     assert_eq!(
         keys,
-        ["queue_count", "sqsize", "sysfs_device", "sysfs_inode"]
+        [
+            "keep_alive_tmo",
+            "queue_count",
+            "sqsize",
+            "sysfs_device",
+            "sysfs_inode"
+        ]
     );
 }
 

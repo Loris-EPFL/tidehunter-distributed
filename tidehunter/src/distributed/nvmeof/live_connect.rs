@@ -45,16 +45,25 @@ pub struct LiveConnectTarget {
     pub geometry: LiveQueueGeometry,
 }
 
+/// The controller keep-alive timeout this engine requests, in seconds.
+///
+/// The kernel default is also 5 s, but a resume reconnects with the same host
+/// NQN, so the target can refuse it with `-EALREADY` until its own keep-alive
+/// expires. A longer value would delay that expiry and can spend the resume
+/// budget, so the value is pinned explicitly and recorded in the route evidence.
+pub(crate) const KEEP_ALIVE_TMO_SECS: u32 = 5;
+
 fn connect_options(target: &LiveConnectTarget, host_nqn: &str, host_id: [u8; 16]) -> String {
     let geometry = target.geometry;
     let mut options = format!(
-        "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},ctrl_loss_tmo=0,nr_io_queues={},queue_size={}",
+        "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},ctrl_loss_tmo=0,keep_alive_tmo={},nr_io_queues={},queue_size={}",
         target.nqn,
         transport(target.transport),
         target.address,
         target.service,
         host_nqn,
         uuid_string(host_id),
+        KEEP_ALIVE_TMO_SECS,
         geometry.io_queues,
         geometry.queue_size
     );
@@ -425,9 +434,35 @@ impl LiveNamespaceResolver {
         Some(LiveControllerEvidence {
             queue_count,
             sqsize,
+            keep_alive_tmo: KEEP_ALIVE_TMO_SECS,
             sysfs_device: self.device,
             sysfs_inode: self.inode,
         })
+    }
+    /// Whether the pinned controller is verifiably not live: its state file is
+    /// not `live`, its sysfs entry vanished or was reused, or its pinned
+    /// directory is gone. A controller the kernel is still deleting counts as
+    /// lost, because no new I/O can succeed on it.
+    ///
+    /// This reads sysfs, so callers run it only on an error path, after an
+    /// ambiguous errno. An unreadable state is not proof of loss: it keeps the
+    /// fatal verdict.
+    pub(crate) fn lost(&self) -> bool {
+        let pinned = self.pinned();
+        if std::fs::metadata(&pinned).is_err() {
+            return true;
+        }
+        match std::fs::metadata(self.controller_root.join(&self.name)) {
+            Ok(meta) if meta.ino() == self.inode && meta.dev() == self.device => {}
+            // A vanished or renumbered sysfs entry cannot be this controller.
+            Ok(_) => return true,
+            Err(error) if vanished(&error) => return true,
+            Err(_) => return false,
+        }
+        match attr(&pinned.join("state")) {
+            Ok(state) => state != "live",
+            Err(error) => vanished(&error),
+        }
     }
     fn pinned(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))

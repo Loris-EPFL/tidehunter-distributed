@@ -82,6 +82,23 @@ impl LiveControllerLease {
     pub(crate) fn evidence(&self) -> Option<LiveControllerEvidence> {
         self.resolver.evidence()
     }
+    /// Whether this lease's pinned controller is verifiably not live, or its
+    /// namespace node vanished. Reads sysfs and stat, so it is an error-path
+    /// check only: a caller runs it after an `EIO`/`EBADF` to tell a media
+    /// verdict from a controller the kernel has already stopped.
+    pub(crate) fn controller_lost(&self) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.local_fixture {
+            return false;
+        }
+        if self.resolver.lost() {
+            return true;
+        }
+        match std::fs::metadata(&self.binding.namespace_path) {
+            Ok(_) => false,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
+    }
     pub fn open_namespace(&self) -> io::Result<LiveNamespace> {
         #[cfg(any(test, feature = "test-utils"))]
         if self.local_fixture {
@@ -472,6 +489,49 @@ impl LiveControllerPool {
                 self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
             state = next;
             result?;
+        }
+    }
+
+    /// Evict the cached controller of one subsystem after its data path broke,
+    /// so the next acquisition connects a fresh controller instead of reusing
+    /// the dead lease and its namespace. The namespace cache is cleared with the
+    /// entry, so the old lease can open no further member.
+    ///
+    /// The entry is retired even while a detached queue still holds the lease:
+    /// the kernel has already stopped that controller, so no new I/O can use
+    /// it. A failed delete restores the entry unusable and returns the error; a
+    /// caller that is resuming a write must then fail-stop.
+    pub(crate) fn evict_lost(&self, nqn: &str, deadline: Instant) -> io::Result<()> {
+        let key = nqn.to_owned();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?;
+        match state.entries.get(&key) {
+            // Nothing cached: the next acquisition connects its own controller.
+            None => return Ok(()),
+            // A pending connect owns its entry, a closing one is already being
+            // retired, and a quarantined outcome has no controller to retire.
+            // The caller's next open observes the same state it would without
+            // this eviction.
+            Some(Entry::Pending(_) | Entry::Closing { .. } | Entry::Quarantined) => return Ok(()),
+            Some(Entry::Ready { .. }) => {}
+        }
+        let controller = Self::begin_close(&mut state, &key)?;
+        let (state, result) =
+            self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
+        drop(state);
+        result
+    }
+
+    /// The lease a subsystem currently caches, if it is `Ready`. A test reads
+    /// it before and after a data break to prove the resume evicted the lost
+    /// controller instead of reopening on it.
+    #[cfg(test)]
+    pub(crate) fn cached_lease(&self, nqn: &str) -> Option<Arc<LiveControllerLease>> {
+        match self.state.lock().ok()?.entries.get(nqn) {
+            Some(Entry::Ready { lease, .. }) => Some(lease.clone()),
+            _ => None,
         }
     }
 

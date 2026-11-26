@@ -200,10 +200,17 @@ impl LiveClientConfig {
 pub(crate) struct LiveWriteQueue {
     target: crate::distributed::nvmeof::live_connect::LiveConnectTarget,
     io: crate::distributed::nvmeof::live_io::LiveIo,
-    _lease: Option<std::sync::Arc<crate::distributed::nvmeof::live_pool::LiveControllerLease>>,
+    /// The controller lease this queue's namespace was opened through. Read on
+    /// an error path to tell a media verdict from a controller the kernel has
+    /// already stopped.
+    lease: Option<std::sync::Arc<crate::distributed::nvmeof::live_pool::LiveControllerLease>>,
     // Only a failed, admitted leased write owns this snapshot. Detachment moves
     // it with the DMA queue; terminal counts are published once, without timing.
     failed_accounting: Option<FailedWriteAccounting>,
+    /// Test override for the controller-lost probe: a local-file fixture has no
+    /// kernel controller to inspect.
+    #[cfg(test)]
+    controller_lost: Option<bool>,
     #[cfg(test)]
     drain_pause: Option<WriteDrainPause>,
 }
@@ -533,6 +540,57 @@ impl LiveWriteQueue {
             && target.service == binding.service
             && target.transport == binding.transport
     }
+
+    /// Whether this queue's pinned controller is verifiably gone for `error`.
+    ///
+    /// A local-file fixture has no kernel controller, so it never reports a
+    /// loss unless a test overrides the probe.
+    fn pinned_controller_lost(
+        &self,
+        error: &crate::distributed::nvmeof::live_io::LiveIoError,
+    ) -> bool {
+        lost_controller(
+            error,
+            self.io.last_write_errno(),
+            self.lease.as_ref(),
+            #[cfg(test)]
+            self.controller_lost,
+        )
+    }
+}
+
+/// Whether `error` names a break of `lease`'s controller rather than a media
+/// verdict.
+///
+/// Only `EIO` and `EBADF` are ambiguous: they are what a cancelled command and
+/// a dead namespace gendisk return, and also what a media error returns. Every
+/// other errno answers with one comparison and no sysfs read, so the write path
+/// pays nothing until a break is already being classified. `last_write_errno`
+/// is the completed write's errno, which an unknown write records separately.
+///
+/// Both inputs are passed in, so an error path that already holds the queue
+/// mutably (buffer admission) can still classify without a second borrow.
+fn lost_controller(
+    error: &crate::distributed::nvmeof::live_io::LiveIoError,
+    last_write_errno: Option<i32>,
+    lease: Option<&std::sync::Arc<crate::distributed::nvmeof::live_pool::LiveControllerLease>>,
+    #[cfg(test)] override_lost: Option<bool>,
+) -> bool {
+    let errno = match error {
+        crate::distributed::nvmeof::live_io::LiveIoError::Io(error) => error.raw_os_error(),
+        // A failed write CQE reports no errno of its own: the queue records
+        // the completed write's errno next to it.
+        crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite => last_write_errno,
+        _ => None,
+    };
+    if !errno.is_some_and(super::is_lost_io_errno) {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(lost) = override_lost {
+        return lost;
+    }
+    lease.is_some_and(|lease| lease.controller_lost())
 }
 
 impl super::Client {
@@ -1308,8 +1366,10 @@ impl super::Client {
             self.live_writer = Some(LiveWriteQueue {
                 target,
                 io,
-                _lease: None,
+                lease: None,
                 failed_accounting: None,
+                #[cfg(test)]
+                controller_lost: None,
                 #[cfg(test)]
                 drain_pause: None,
             });
@@ -1395,8 +1455,10 @@ impl super::Client {
         self.live_writer = Some(LiveWriteQueue {
             target,
             io,
-            _lease: Some(lease),
+            lease: Some(lease),
             failed_accounting: None,
+            #[cfg(test)]
+            controller_lost: None,
             #[cfg(test)]
             drain_pause: None,
         });
@@ -1579,6 +1641,12 @@ impl super::Client {
             writer.io.override_submit_result(errno);
         }
         let before = writer.io.stats();
+        // The admission failure below needs the pinned controller, but the
+        // buffer borrow outlives the match arms: take what the probe reads
+        // first, so the cold error path needs no second borrow of the queue.
+        let lease = writer.lease.clone();
+        #[cfg(test)]
+        let override_lost = writer.controller_lost;
         let mut buffer = match writer.io.write_buffer(len) {
             Ok(buffer) => buffer,
             Err(error) => {
@@ -1588,8 +1656,19 @@ impl super::Client {
                         _ => LiveWriteFailure::Failed,
                     });
                 }
-                // Buffer admission never carries a device errno.
-                return Err(resume::classify_io_error(error, None));
+                // Buffer admission carries no device errno of its own, but the
+                // queue can refuse the write because its namespace is gone: the
+                // test seam and a dead gendisk report `EIO` here. The probe
+                // still decides the ambiguous class; every other error is
+                // admission backpressure.
+                let lost = lost_controller(
+                    &error,
+                    None,
+                    lease.as_ref(),
+                    #[cfg(test)]
+                    override_lost,
+                );
+                return Err(resume::classify_io_error(error, None, lost));
             }
         };
         encode(&mut buffer).inspect_err(|_| {
@@ -1619,7 +1698,10 @@ impl super::Client {
                 }
                 let errno = writer.io.last_write_errno();
                 return Err(match outcome {
-                    Err(error) => resume::classify_io_error(error, errno),
+                    Err(error) => {
+                        let lost = writer.pinned_controller_lost(&error);
+                        resume::classify_io_error(error, errno, lost)
+                    }
                     _ => super::TcpError::new("live leased write admission full"),
                 });
             }
@@ -1814,12 +1896,18 @@ impl super::Client {
                 counters.record_unknown_write();
             }
             let errno = writer.io.last_write_errno();
-            return Err(resume::classify_io_error(error, errno));
+            let lost = writer.pinned_controller_lost(&error);
+            return Err(resume::classify_io_error(error, errno, lost));
         }
         let after = writer.io.stats();
         // The latest completed write's errno, read once under the queue borrow:
         // a lost controller is transient, a rejected or short write is not.
         let write_errno = writer.io.last_write_errno();
+        // One answer for every unknown-write verdict of this pass: whether the
+        // pinned controller is verifiably gone for that errno.
+        let write_lost = writer.pinned_controller_lost(
+            &crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
+        );
         let harvested = !self.live_leased.completions.is_empty();
         if harvested {
             // A CQE proves the kept queue still progresses, so a deadline that
@@ -1842,14 +1930,16 @@ impl super::Client {
                     }
                     // A flush CQE reports `UnknownWrite` both for a late
                     // deadline and for a device error, so the errno decides:
-                    // `EIO`/`ENOSPC`/`EFBIG`/`EINVAL` are the filesystem's
-                    // verdict and a retry is never issued, while a lost
-                    // controller is the same resumable break as a write. Only
-                    // a deadline that recorded no error is the probe of 7.3.
+                    // `ENOSPC`/`EFBIG`/`EINVAL` are the filesystem's verdict
+                    // and a retry is never issued. `EIO` is a cancelled command
+                    // when the controller is verifiably gone, and a media
+                    // verdict otherwise. Only a deadline that recorded no error
+                    // is the probe of 7.3.
                     return Err(match write_errno {
                         Some(errno) => resume::classify_io_error(
                             crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
                             Some(errno),
+                            write_lost,
                         ),
                         None if timed_out => super::TcpError::with_kind(
                             std::io::ErrorKind::TimedOut,
@@ -1892,6 +1982,7 @@ impl super::Client {
                 return Err(resume::classify_io_error(
                     crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
                     write_errno,
+                    write_lost,
                 ));
             };
             if let Some(timeline) = timeline {
@@ -1912,6 +2003,7 @@ impl super::Client {
                 return Err(resume::classify_io_error(
                     crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
                     write_errno,
+                    write_lost,
                 ));
             }
             if let Some(counters) = &self.live_counters {
@@ -2011,7 +2103,8 @@ impl super::Client {
                             counters.record_unknown_write();
                         }
                         let errno = writer.io.last_write_errno();
-                        return Err(resume::classify_io_error(error, errno));
+                        let lost = writer.pinned_controller_lost(&error);
+                        return Err(resume::classify_io_error(error, errno, lost));
                     }
                 };
                 self.live_leased.next_flight_id = id;
@@ -2149,12 +2242,11 @@ impl super::Client {
             }
             return Ok(());
         }
-        let io = &mut self
+        let writer = self
             .live_writer
             .as_mut()
-            .ok_or_else(|| super::TcpError::new("live queue missing"))?
-            .io;
-        let waited = io.wait(if polled {
+            .ok_or_else(|| super::TcpError::new("live queue missing"))?;
+        let waited = writer.io.wait(if polled {
             std::time::Duration::ZERO
         } else {
             remaining
@@ -2164,8 +2256,9 @@ impl super::Client {
             Err(error) => {
                 // A wait on a lost queue is a transient break; keep its class so
                 // the caller can resume instead of failing the database.
-                let errno = io.last_write_errno();
-                return Err(resume::classify_io_error(error, errno));
+                let errno = writer.io.last_write_errno();
+                let lost = writer.pinned_controller_lost(&error);
+                return Err(resume::classify_io_error(error, errno, lost));
             }
         };
         if let Some(counters) = &self.live_counters {
@@ -2695,6 +2788,11 @@ impl super::Client {
     /// Fail the next submission before any SQE, as a lost controller does.
     pub(crate) fn leased_test_fail_submit(&mut self, errno: i32) {
         self.live_leased.next_submit_result = Some(errno);
+    }
+    /// Override the controller-lost probe on the bound queue, so a local-file
+    /// fixture drives the `EIO` classes without a kernel target.
+    pub(crate) fn leased_test_controller_lost(&mut self, lost: bool) {
+        self.live_writer.as_mut().unwrap().controller_lost = Some(lost);
     }
     /// Override the next group flush's CQE with `result`, a raw negative errno.
     pub(crate) fn leased_test_fail_flush(&mut self, result: i32) {

@@ -504,6 +504,16 @@ pub(crate) fn is_transient_errno(errno: i32) -> bool {
     ]
     .contains(&errno)
 }
+
+/// Whether an errno is ambiguous between a media error and a controller the
+/// kernel has already stopped. `EIO` is what a cancelled in-flight command and a
+/// dead namespace gendisk return (`NVME_SC_HOST_ABORTED_CMD` and `GD_DEAD` both
+/// map to `BLK_STS_IOERR`), and `EBADF` is a closed namespace descriptor. Such
+/// an errno is a transient break only when the pinned controller is verified not
+/// live; otherwise it stays a media verdict.
+pub(crate) fn is_lost_io_errno(errno: i32) -> bool {
+    matches!(errno, libc::EIO | libc::EBADF)
+}
 impl From<&str> for WireError {
     fn from(message: &str) -> Self {
         Self::other(message)

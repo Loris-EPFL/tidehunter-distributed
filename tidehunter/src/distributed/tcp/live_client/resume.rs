@@ -31,7 +31,7 @@ use super::super::LiveLeased;
 use super::{LiveWriteQueue, PendingAdoption, PendingTarget, RetainedFrame};
 use crate::distributed::nvmeof::live_io::{LiveIoError, LiveIoResult, LiveWriteSync};
 
-use super::super::{Client, TcpError, is_transient_break, is_transient_errno};
+use super::super::{Client, TcpError, is_lost_io_errno, is_transient_break, is_transient_errno};
 
 /// One reconnect after the first break. A link that flaps twice inside one
 /// write is not transient, so its second break fail-stops.
@@ -116,7 +116,11 @@ impl Client {
     /// Classify a queue error at the boundary, before its kind is lost: a lost
     /// controller is a transient break, a rejected or unknown write is not.
     pub(crate) fn io_error(&self, error: LiveIoError) -> TcpError {
-        classify_io_error(error, self.latest_write_errno())
+        let lost = self
+            .live_writer
+            .as_ref()
+            .is_some_and(|writer| writer.pinned_controller_lost(&error));
+        classify_io_error(error, self.latest_write_errno(), lost)
     }
 
     /// Errno of the latest completed namespace write, if that write failed.
@@ -279,6 +283,10 @@ impl Client {
         match kind {
             BreakKind::Data => {
                 self.detach_live_queue()?;
+                // A cached lease and its namespace are the ones that just
+                // failed. Evict them before any open, so the rewrite reconnects
+                // through the registry instead of reusing the dead controller.
+                self.evict_lost_controllers(deadline)?;
                 let frames = self.rewrite_retained(deadline)?;
                 if let Some(counters) = &self.live_counters
                     && frames != 0
@@ -573,6 +581,42 @@ impl Client {
                 )
             }),
         }
+    }
+
+    /// Evict the pool entry of every subsystem an open extent writes, so the
+    /// resume opens a fresh controller instead of the cached lease and
+    /// namespace of the one that just failed.
+    ///
+    /// Runs once per data break, after the dead queue was detached and before
+    /// any open, under the worker's own client borrow. The pool takes its
+    /// existing state lock; this adds no lock and touches no per-frame path. A
+    /// failed teardown fails the resume, and the writer fail-stops.
+    fn evict_lost_controllers(&mut self, deadline: Instant) -> Result<(), TcpError> {
+        let Some(pool) = self.live_pool.clone() else {
+            return Ok(());
+        };
+        let mut nqns: Vec<String> = Vec::new();
+        for extent in [
+            self.live_leased.current.as_ref(),
+            self.live_leased.closing.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let nqn = &extent.lease.binding.nqn;
+            if !nqns.contains(nqn) {
+                nqns.push(nqn.clone());
+            }
+        }
+        for nqn in nqns {
+            pool.evict_lost(&nqn, deadline).map_err(|error| {
+                TcpError::with_kind(
+                    io::ErrorKind::Other,
+                    format!("live write resume cannot evict the lost controller: {error}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Rewrite every retained frame in ascending order, one command at a time.
@@ -950,13 +994,24 @@ impl Client {
 
 /// Classify a queue error without borrowing the client, so it can run while the
 /// write queue is mutably borrowed. `errno` is the latest completed write's
-/// errno, read by the caller under that borrow.
-pub(super) fn classify_io_error(error: LiveIoError, errno: Option<i32>) -> TcpError {
+/// errno, read by the caller under that borrow. `controller_lost` says the
+/// caller verified that the pinned controller is not live, which decides the
+/// ambiguous `EIO`/`EBADF` class only.
+pub(super) fn classify_io_error(
+    error: LiveIoError,
+    errno: Option<i32>,
+    controller_lost: bool,
+) -> TcpError {
     match error {
         // Classify here, before `io::ErrorKind` folds the errno into
         // `Uncategorized`: a lost device is a resumable break, a rejected
-        // command is not.
-        LiveIoError::Io(error) if error.raw_os_error().is_some_and(is_transient_errno) => {
+        // command is not. `EIO` and `EBADF` are a break only when the caller
+        // proved the controller is gone; otherwise they keep the media verdict.
+        LiveIoError::Io(error)
+            if error.raw_os_error().is_some_and(|errno| {
+                is_transient_errno(errno) || (controller_lost && is_lost_io_errno(errno))
+            }) =>
+        {
             TcpError::with_kind(
                 io::ErrorKind::ConnectionAborted,
                 format!("live NVMe operation lost its controller: {error}"),
@@ -968,10 +1023,14 @@ pub(super) fn classify_io_error(error: LiveIoError, errno: Option<i32>) -> TcpEr
             "live NVMe operation deadline expired at submission",
         ),
         LiveIoError::UnknownWrite => match errno {
-            Some(errno) if is_transient_errno(errno) => TcpError::with_kind(
-                io::ErrorKind::ConnectionAborted,
-                format!("leased write failed: the controller is gone, errno {errno}"),
-            ),
+            Some(errno)
+                if is_transient_errno(errno) || (controller_lost && is_lost_io_errno(errno)) =>
+            {
+                TcpError::with_kind(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("leased write failed: the controller is gone, errno {errno}"),
+                )
+            }
             Some(errno) => TcpError::with_kind(
                 io::ErrorKind::Other,
                 format!("leased write failed, errno {errno}"),
