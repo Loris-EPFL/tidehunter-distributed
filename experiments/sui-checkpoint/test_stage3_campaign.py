@@ -12,6 +12,7 @@ import tempfile
 import threading
 import textwrap
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
@@ -673,6 +674,70 @@ class CommandLine(unittest.TestCase):
                 self.run_main('--root', tmp, '--binary', 'kv', '--mode', 'rehearsal',
                               '--external', f'native={tmp}')
         self.assertIn('rehearsal mode', str(raised.exception))
+
+
+class ClusterDispatch(unittest.TestCase):
+    """The laptop stages each tier's local preparation, then runs on H0."""
+
+    def preparation(self, directory, tier, binary_sha):
+        directory.mkdir(parents=True)
+        manifest = {'schema': 1, 'protocol': 9, 'owners': 2,
+                    'transport': {'kind': 'tcp'},
+                    'live_transport': 'rdma', 'durability_tier': tier,
+                    'storage_binary_sha256': binary_sha,
+                    'hosts': [{'partition': partition,
+                               'commands': [['node', 'a']],
+                               'ready_files': ['/a/ready'],
+                               'archive': '/a.tar.gz', 'archive_sha256': 'a' * 64,
+                               'guest_root': '/mnt/tidehunter/sui'}
+                              for partition in range(2)]}
+        config = {'root': '/mnt/tidehunter/native', 'databases': {'live/x': {
+            'storage': {'partitions': [0, 1]},
+            'endpoints': [{'partition': 0, 'address': '10.90.0.12:9400'},
+                          {'partition': 1, 'address': '10.90.0.13:9401'}],
+            'tls': {'transport': {'kind': 'tcp'}},
+            'live_nvme': {'leased_durability': tier},
+            'read_cache_bytes': 0}}}
+        (directory / 'external-manifest.json').write_text(json.dumps(manifest))
+        (directory / 'config.json').write_text(json.dumps(config))
+
+    def test_each_external_tree_is_staged_local_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / 'storage-node'
+            binary.write_bytes(b'binary')
+            external = root / 'external-native'
+            synchronous = root / 'external-synchronous'
+            self.preparation(external, 'native', ledger_module.sha256_file(binary))
+            self.preparation(synchronous, 'synchronous', ledger_module.sha256_file(binary))
+            state = root / 'fleet.json'
+            state.write_text(json.dumps({'run_id': 'bench-' + 'a' * 16, 'host_count': 3,
+                                         'fleet': [{'index': 0}]}))
+            config = root / 'config.json'
+            config.write_text('{}')
+            remote = mock.Mock()
+            remote.send_file.return_value = (0, b'', b'')
+            remote.run_driver.return_value = (0, b'{}', b'')
+            argv = ['stage3_campaign.py', '--root', str(root / 'out'),
+                    '--binary', str(binary), '--external', 'native=' + str(external),
+                    '--external', 'synchronous=' + str(synchronous),
+                    '--native-root', '/mnt/tidehunter/native',
+                    '--guest-root', '/mnt/tidehunter/sui', '--owners', 'H1,H2',
+                    '--zone', 'us-central1-a',
+                    '--bucket-prefix', 'gs://mysten-research-bench-artifacts/campaign',
+                    '--fleet-state', str(state), '--fleet-config', str(config)]
+            with mock.patch.object(stage3_campaign.mailbox_exec, 'open_executor',
+                                   return_value=remote), \
+                    mock.patch.object(stage3_campaign.mailbox_exec, 'coordinator_of',
+                                      return_value='bench-' + 'a' * 16 + '-0'), \
+                    mock.patch.object(stage3_campaign.sys, 'argv', argv):
+                self.assertEqual(stage3_campaign.main(), 0)
+        self.assertEqual(remote.stage_tree.call_args_list, [
+            mock.call('bench-' + 'a' * 16 + '-0', external,
+                      Path('/mnt/tidehunter/bench-' + 'a' * 16 + '/campaign/external/native')),
+            mock.call('bench-' + 'a' * 16 + '-0', synchronous,
+                      Path('/mnt/tidehunter/bench-' + 'a' * 16
+                           + '/campaign/external/synchronous'))])
 
 
 class BucketPrefix(unittest.TestCase):

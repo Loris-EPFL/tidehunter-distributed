@@ -863,7 +863,7 @@ def main():
         external = []
         for item in args.external or []:
             tier, _, local = item.partition('=')
-            remote.stage_tree(coordinator, campaign / 'external' / tier, Path(local))
+            remote.stage_tree(coordinator, Path(local), campaign / 'external' / tier)
             external.append(tier + '=' + str(campaign / 'external' / tier))
         remote.send_file(coordinator, campaign / 'fleet-state.json', Path(args.fleet_state))
         remote.send_file(coordinator, campaign / 'config.json', Path(args.fleet_config).resolve())

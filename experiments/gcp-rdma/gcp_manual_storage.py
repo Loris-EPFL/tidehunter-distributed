@@ -101,9 +101,13 @@ class DelegatedArtifacts(ObjectStore):
         self._token_lock = threading.Lock()
         self._cached_token = None
         self._token_cache_until = 0.0
-        # The coordinator copy already runs as the guest identity, so it takes
-        # the metadata token directly and never shells out to `gcloud`.
-        provider = gcp_api.metadata_token if guest else self._token
+        # The free rehearsal serves a local store for every client, so no
+        # identity is delegated. A real coordinator copy already runs as the
+        # guest identity and takes the metadata token directly.
+        if gcp_api.rehearsal_endpoint() is not None:
+            provider = lambda: 'rehearsal'
+        else:
+            provider = gcp_api.metadata_token if guest else self._token
         api = GoogleApi(PROJECT, token_provider=provider, opener=self._bounded_open)
         super().__init__(api, bucket)
 
