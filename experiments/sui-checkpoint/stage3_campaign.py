@@ -877,8 +877,9 @@ def main():
         extra = ['--on-coordinator', '--guest-token',
                  '--fleet-state', str(campaign / 'fleet-state.json'),
                  '--fleet-config', str(campaign / 'config.json')]
-        if external:
-            extra += ['--external', *external]
+        # One `--external` per tier: argparse takes one value per flag.
+        for value in external:
+            extra += ['--external', value]
         argv = mailbox_exec.with_flags(argv, extra)
         code, out, err = remote.run_driver(
             coordinator,

@@ -732,6 +732,12 @@ class ClusterDispatch(unittest.TestCase):
                                       return_value='bench-' + 'a' * 16 + '-0'), \
                     mock.patch.object(stage3_campaign.sys, 'argv', argv):
                 self.assertEqual(stage3_campaign.main(), 0)
+        argv_sent = remote.run_driver.call_args.args[2]
+        self.assertEqual(argv_sent.count('--external'), 2)
+        for index, item in enumerate(argv_sent):
+            if item == '--external':
+                self.assertIn('=', argv_sent[index + 1])
+                self.assertNotIn('--external', argv_sent[index + 1])
         self.assertEqual(remote.stage_tree.call_args_list, [
             mock.call('bench-' + 'a' * 16 + '-0', external,
                       Path('/mnt/tidehunter/bench-' + 'a' * 16 + '/campaign/external/native')),
