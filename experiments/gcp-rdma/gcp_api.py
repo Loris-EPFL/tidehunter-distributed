@@ -1,7 +1,9 @@
 """Small, bounded Compute Engine and Cloud Storage JSON REST clients."""
 import datetime
 import hashlib
+import ipaddress
 import json
+import os
 import subprocess
 import threading
 import time
@@ -91,6 +93,32 @@ def delegated_token(api, account):
     return provider
 
 
+REHEARSAL_ENDPOINT = 'TIDEHUNTER_REHEARSAL_STORE'
+
+
+def rehearsal_endpoint():
+    """The explicit local store of the free fleet rehearsal, or None.
+
+    The value must be plain HTTP on a loopback or private address, so it can
+    never name a cloud endpoint. Only the rehearsal driver sets it.
+    """
+    value = os.environ.get(REHEARSAL_ENDPOINT)
+    if not value:
+        return None
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != 'http' or not parsed.hostname:
+        raise ValueError(f'{REHEARSAL_ENDPOINT} must be a plain HTTP endpoint')
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        if parsed.hostname != 'localhost':
+            raise ValueError(f'{REHEARSAL_ENDPOINT} must name a loopback or private address')
+    else:
+        if not (address.is_loopback or address.is_private):
+            raise ValueError(f'{REHEARSAL_ENDPOINT} must name a loopback or private address')
+    return value.rstrip('/')
+
+
 def campaign_client(config, *, guest=False):
     """The one campaign credential path.
 
@@ -98,7 +126,7 @@ def campaign_client(config, *, guest=False):
     campaign service account with a refreshing token. A local rehearsal names
     an explicit store endpoint and uses its own token; it has no cloud identity.
     """
-    endpoint = config.get('store_endpoint')
+    endpoint = config.get('store_endpoint') or rehearsal_endpoint()
     if endpoint is not None:
         return GoogleApi(config['project_id'], token_provider=lambda: 'rehearsal',
                          endpoint=endpoint)
@@ -113,9 +141,12 @@ class GoogleApi:
         if not project:
             raise ValueError('project_id is required')
         self.project = project
-        self.token_provider = token_provider or (lambda: local_token(project))
+        self.endpoint = (endpoint or rehearsal_endpoint() or STORAGE_ENDPOINT).rstrip('/')
+        if token_provider is None:
+            token_provider = ((lambda: 'rehearsal') if self.endpoint != STORAGE_ENDPOINT
+                              else (lambda: local_token(project)))
+        self.token_provider = token_provider
         self.opener = opener or urllib.request.urlopen
-        self.endpoint = (endpoint or STORAGE_ENDPOINT).rstrip('/')
 
     def _request(self, method, url, body=None, headers=None, read_retries=3):
         headers = dict(headers or {})

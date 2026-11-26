@@ -33,7 +33,51 @@ class Response(io.BytesIO):
         self.close()
 
 
+class SlowProcess(Process):
+    """A token process that outlives its first timeout."""
+
+    def __init__(self, token, *, slow):
+        super().__init__(token)
+        self.slow = slow
+
+    def communicate(self, timeout=None):
+        self.observed = timeout
+        if self.slow:
+            self.slow -= 1
+            raise subprocess.TimeoutExpired('gcloud', timeout)
+        return self.token, b''
+
+
 class DelegatedArtifactsTest(TestCase):
+    def test_a_slow_impersonation_call_is_not_an_abort(self):
+        # 26 November 2026: three 30 s token timeouts aborted a run after its
+        # live pair had already passed. A slow token call is bounded, not fatal.
+        process = SlowProcess(b'token-one', slow=1)
+        with mock.patch('gcp_manual_storage.subprocess.Popen', return_value=process) as spawn, \
+                mock.patch('gcp_manual_storage.os.killpg'):
+            store = DelegatedArtifacts(deadline=time.time() + 600)
+            self.assertEqual(store._token(), 'token-one')
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(process.observed, gcp_manual_storage.TOKEN_SOCKET_SECONDS)
+        self.assertGreater(gcp_manual_storage.TOKEN_SOCKET_SECONDS, 30)
+
+    def test_a_token_call_that_exceeds_the_deadline_still_raises(self):
+        process = SlowProcess(b'token', slow=gcp_manual_storage.TOKEN_ATTEMPTS)
+        with mock.patch('gcp_manual_storage.subprocess.Popen', return_value=process), \
+                mock.patch('gcp_manual_storage.os.killpg'):
+            store = DelegatedArtifacts(deadline=time.time() + 600)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                store._token()
+
+    def test_the_rehearsal_store_needs_no_cloud_token(self):
+        with mock.patch.dict('os.environ',
+                             {gcp_manual_storage.gcp_api.REHEARSAL_ENDPOINT:
+                              'http://127.0.0.1:9'}), \
+                mock.patch('gcp_manual_storage.subprocess.Popen') as spawn:
+            store = DelegatedArtifacts(deadline=time.time() + 60)
+            self.assertEqual(store._token(), 'rehearsal')
+        spawn.assert_not_called()
+
     def test_http_requests_share_cached_guest_token(self):
         seen = []
         def open_request(request, timeout):

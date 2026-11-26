@@ -111,7 +111,8 @@ class Cluster:
 
     def __init__(self, *, remote, build_root, output, guest_root, config_dir,
                  owners, tier, transport='tcp', live_transport='rdma',
-                 schema=None, port=24000, coordinator_cache_mib=0,
+                 schema=None, port=manual_sui.OWNER_CONTROL_PORT,
+                 coordinator_cache_mib=0,
                  shard_cache_mib=0):
         self.remote, self.owners = remote, list(owners)
         self.build_root = Path(build_root).resolve()
@@ -176,6 +177,9 @@ class Cluster:
         if self.config_dir.exists():
             raise ValueError('external config directory must be fresh')
         self.output.mkdir(parents=True, exist_ok=True)
+        control, live = manual_sui.fleet_hosts(
+            getattr(self.remote, 'fleet', None), self.owners,
+            transport=self.transport, live_transport=self.live_transport)
         command = [sys.executable,
                    str(self.build_root / 'sources/tidehunter-sharded-wal/experiments/'
                        'sui-checkpoint/prepare_external.py'),
@@ -183,7 +187,8 @@ class Cluster:
                    '--output', str(self.config_dir),
                    '--db-root', str(self.root('measure')),
                    '--guest-root', str(self.guest_root),
-                   '--hosts', ','.join(self.owners), '--owners', str(len(self.owners)),
+                   '--hosts', ','.join(control), '--live-hosts', ','.join(live),
+                   '--owners', str(len(self.owners)),
                    '--port', str(self.port), '--transport', self.transport,
                    '--durability-tier', self.tier, '--live-transport', self.live_transport,
                    '--coordinator-cache-mib', str(self.coordinator_cache_mib),

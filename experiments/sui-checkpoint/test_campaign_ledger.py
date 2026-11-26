@@ -121,6 +121,32 @@ class ArtifactGate(unittest.TestCase):
             self.assertEqual(entry['status'], 'passed')
 
 
+class NotReached(unittest.TestCase):
+    """A point the replay cannot produce is labelled, not failed."""
+
+    def test_a_not_reached_cell_is_recorded_and_runs_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ledger.json'
+            record = ledger.Ledger(path)
+            entry = record.begin(stage='stage1', cell_id='S1-4-during-flush-synchronous',
+                                 config_hash='h')
+            record.not_reached(entry, 'not reached: no flush in replay')
+            record.save()
+            loaded = ledger.Ledger(path)
+            loaded.load()
+            self.assertEqual(loaded.status('stage1', 'S1-4-during-flush-synchronous'),
+                             'not_reached')
+            self.assertIn('no flush in replay',
+                          loaded.entries[('stage1', 'S1-4-during-flush-synchronous')]['failure'])
+            planned = ledger.plan([dict(id='S1-4-during-flush-synchronous', stage='stage1',
+                                        config_hash='h')], loaded)
+            self.assertEqual([row['id'] for row in planned],
+                             ['S1-4-during-flush-synchronous'])
+
+    def test_the_status_is_part_of_the_admitted_set(self):
+        self.assertIn('not_reached', ledger.STATUSES)
+
+
 class Planning(unittest.TestCase):
     def ledger(self, statuses, hashes=None):
         value = ledger.Ledger()

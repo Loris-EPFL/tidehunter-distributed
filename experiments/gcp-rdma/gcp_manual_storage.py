@@ -114,6 +114,10 @@ class DelegatedArtifacts(ObjectStore):
         return remaining
 
     def _token(self):
+        # The free fleet rehearsal serves a local store and has no cloud
+        # identity, so there is nothing to delegate.
+        if gcp_api.rehearsal_endpoint() is not None:
+            return 'rehearsal'
         # Check the current mutable deadline even when a cached token is available.
         while True:
             remaining = self._remaining()

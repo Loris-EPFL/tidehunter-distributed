@@ -1113,6 +1113,45 @@ class OperatorFleetTests(unittest.TestCase):
                 '--role', 'qualification', '--source-sha256', SOURCE,
                 state=Path(self.temp.name) / 'fourth.json'))
 
+    def receipt_package(self, source=SOURCE):
+        package = Path(self.temp.name) / ('package-' + source[:8])
+        package.mkdir()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': source, 'sha256': 'c' * 64,
+             'manifest_sha256': 'e' * 64, 'source_revision': 'b' * 40}))
+        return package
+
+    def test_the_fleet_source_is_derived_from_the_package_receipt(self):
+        package = self.receipt_package()
+        self.assertEqual(gcp_manual_compute.package_source_sha256(package), SOURCE)
+        self.assertEqual(gcp_manual_compute.package_source_sha256(package, SOURCE), SOURCE)
+        with self.assertRaisesRegex(ValueError, 'is not the package receipt source'):
+            gcp_manual_compute.package_source_sha256(package, 'd' * 64)
+        missing = Path(self.temp.name) / 'no-receipt'
+        missing.mkdir()
+        with self.assertRaisesRegex(ValueError, 'package receipt unavailable'):
+            gcp_manual_compute.package_source_sha256(missing)
+
+    def test_create_refuses_a_bundle_source_before_any_host_exists(self):
+        package = self.receipt_package()
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                                    'backends': ['native']}))
+        calls = []
+        with mock.patch.object(gcp_manual_compute, 'admit_image') as admit, \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=lambda argv, **kwargs: calls.append(argv)), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', 'd' * 64, '--package', str(package),
+                '--spec', str(spec), '--revision', 'b' * 40))
+        self.assertEqual(code, 1)
+        self.assertIn('is not the package receipt source', error.getvalue())
+        admit.assert_not_called()
+        self.assertEqual(calls, [])
+        self.assertFalse(self.state_path.exists())
+
     def test_campaign_role_requires_the_receipt(self):
         with mock.patch.object(gcp_manual_compute, 'admit_image',
                                side_effect=ValueError('image qualification is not configured')), \

@@ -179,8 +179,9 @@ class MailboxDouble(host_exec.HostExecution):
     sysfs, no JSON-RPC and no engine are needed.
     """
 
-    def __init__(self, root, guest_root, *, record=None, code=0):
+    def __init__(self, root, guest_root, *, record=None, code=0, fleet=None):
         self.root, self.guest_root = Path(root), Path(guest_root)
+        self.fleet = fleet
         self.record = dict(INJECTOR_RECORD if record is None else record)
         self.code = code
         self.requests = []
@@ -199,6 +200,46 @@ class MailboxDouble(host_exec.HostExecution):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    timeout=120)
         return completed.returncode, completed.stdout, completed.stderr
+
+
+FLEET = [{'index': index, 'role': 'coordinator' if index == 0 else 'owner',
+          'name': 'bench-' + 'a' * 16 + '-' + str(index), 'id': str(500 + index),
+          'zone': 'us-central1-a', 'internal_ip': '10.128.0.' + str(4 + index),
+          'rdma_ip': '10.20.0.' + str(21 + index)} for index in range(3)]
+
+
+class FleetAddresses(unittest.TestCase):
+    """The control and live-target addresses of one fleet state."""
+
+    def test_tcp_control_uses_the_default_subnet_and_rdma_uses_the_fabric(self):
+        control, live = manual_sui.fleet_hosts(
+            FLEET, [FLEET[1]['name'], FLEET[2]['name']],
+            transport='tcp', live_transport='rdma')
+        self.assertEqual(control, ['10.128.0.5', '10.128.0.6'])
+        self.assertEqual(live, ['10.20.0.22', '10.20.0.23'])
+
+    def test_a_verbs_control_fabric_binds_the_irdma_address(self):
+        control, live = manual_sui.fleet_hosts(
+            FLEET, [FLEET[1]['name'], FLEET[2]['name']],
+            transport='efa', live_transport='rdma')
+        self.assertEqual(control, ['10.20.0.22', '10.20.0.23'])
+        self.assertEqual(live, control)
+
+    def test_a_tcp_live_transport_stays_on_the_default_subnet(self):
+        control, live = manual_sui.fleet_hosts(
+            FLEET, [FLEET[1]['name']], transport='tcp', live_transport='tcp')
+        self.assertEqual(control, ['10.128.0.5'])
+        self.assertEqual(live, control)
+
+    def test_a_rehearsal_keeps_the_addresses_it_was_given(self):
+        self.assertEqual(manual_sui.fleet_hosts(None, ['10.0.0.2'], transport='tcp',
+                                                live_transport='rdma'),
+                         (['10.0.0.2'], ['10.0.0.2']))
+
+    def test_an_unknown_host_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'not a host of this fleet'):
+            manual_sui.fleet_hosts(FLEET, ['owner-x'], transport='tcp',
+                                   live_transport='rdma')
 
 
 class LauncherShape(unittest.TestCase):
@@ -292,8 +333,11 @@ class LauncherHandshake(unittest.TestCase):
         launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
         prepare = next(command for command in launcher.local_commands
                        if 'prepare_external' in ' '.join(command))
-        self.assertIn('--hosts 10.0.0.2,10.0.0.3', ' '.join(prepare))
-        self.assertIn('--owners 2', ' '.join(prepare))
+        text = ' '.join(prepare)
+        self.assertIn('--hosts 10.0.0.2,10.0.0.3', text)
+        self.assertIn('--live-hosts 10.0.0.2,10.0.0.3', text)
+        self.assertIn('--port 9400', text)
+        self.assertIn('--owners 2', text)
         run = next(command for command in launcher.local_commands
                    if '/run.py' in ' '.join(command))
         text = ' '.join(run)
@@ -301,6 +345,43 @@ class LauncherHandshake(unittest.TestCase):
         self.assertIn('--external-resources', text)
         self.assertIn('--external-stage-dir', text)
         self.assertIn('--durability-tier native', text)
+
+    def test_the_prepared_launch_listens_on_the_control_port_and_exports_the_fabric(self):
+        launcher = self.launcher()
+        launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        launches = sorted(launcher.config_dir.glob('*/node-*/launch.yaml'))
+        self.assertEqual([path.parent.name for path in launches], ['node-0', 'node-1'])
+        # The owner control port is 9400 and each partition adds its index.
+        self.assertIn('listen: 10.0.0.2:9400', launches[0].read_text())
+        self.assertIn('listen: 10.0.0.3:9401', launches[1].read_text())
+        self.assertNotIn('listen: coordinator', launches[0].read_text())
+
+    def test_a_fleet_state_resolves_the_launch_files_to_the_guest_addresses(self):
+        remote = MailboxDouble(self.root, self.root / 'guest', fleet=FLEET)
+        # The campaign control transport is TCP on the default subnet; the live
+        # NVMe-oF target is exported on the falcon-rdma subnet.
+        launcher = self.launcher(remote=remote, transport='tcp')
+        launcher.run(manual_sui.plan(FLEET[0]['name'],
+                                     [FLEET[1]['name'], FLEET[2]['name']]))
+        prepare = next(command for command in launcher.local_commands
+                       if 'prepare_external' in ' '.join(command))
+        text = ' '.join(prepare)
+        self.assertIn('--hosts 10.128.0.5,10.128.0.6', text)
+        self.assertIn('--live-hosts 10.20.0.22,10.20.0.23', text)
+        launches = sorted(launcher.config_dir.glob('*/node-*/launch.yaml'))
+        self.assertEqual([path.parent.name for path in launches], ['node-0', 'node-1'])
+        self.assertIn('listen: 10.128.0.5:9400', launches[0].read_text())
+        self.assertIn('listen: 10.128.0.6:9401', launches[1].read_text())
+        self.assertIn('address: 10.20.0.22', launches[0].read_text())
+        self.assertIn('address: 10.20.0.23', launches[1].read_text())
+
+    def test_a_verbs_cell_listens_on_the_irdma_address(self):
+        remote = MailboxDouble(self.root, self.root / 'guest', fleet=FLEET)
+        launcher = self.launcher(remote=remote)
+        launcher.run(manual_sui.plan(FLEET[0]['name'],
+                                     [FLEET[1]['name'], FLEET[2]['name']]))
+        launches = sorted(launcher.config_dir.glob('*/node-*/launch.yaml'))
+        self.assertIn('listen: 10.20.0.22:9400', launches[0].read_text())
 
     def test_run_command_repeats_the_shared_knobs_once_and_matches_the_config(self):
         launcher = self.launcher(coordinator_cache_mib=0, shard_cache_mib=0)

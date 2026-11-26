@@ -326,6 +326,48 @@ class DeploymentContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 analyze.summarize(root)
 
+class GuestAbiCeiling(unittest.TestCase):
+    """A host build needs GLIBC 2.38/2.39; the guest loader has 2.34."""
+
+    def test_the_guest_ceiling_is_recorded_next_to_the_check(self):
+        self.assertEqual(build.GUEST_ABI_CEILING['GLIBC'], (2, 34))
+        self.assertEqual(build.GUEST_ABI_CEILING['GLIBCXX'], (3, 4, 29))
+
+    def test_a_host_build_above_the_guest_glibc_is_refused(self):
+        versions = ("\nVersion needs section '.gnu.version_r' contains 3 entries:\n"
+                    '  0000: Version: 1  Name: GLIBC_2.39\n'
+                    '  0001: Version: 1  Name: GLIBC_2.34\n')
+        required, failures = build.guest_abi('sui-node-remote', versions)
+        self.assertEqual(required['GLIBC'], '2.39')
+        self.assertTrue(any('GLIBC_2.39' in item and 'GLIBC_2.34' in item
+                            for item in failures))
+
+    def test_a_guest_build_is_admitted(self):
+        versions = ("\nVersion needs section '.gnu.version_r' contains 2 entries:\n"
+                    '  0000: Version: 1  Name: GLIBC_2.34\n'
+                    '  0001: Version: 1  Name: GLIBCXX_3.4.29\n')
+        required, failures = build.guest_abi('storage-node', versions)
+        self.assertEqual(required, {'GLIBC': '2.34', 'GLIBCXX': '3.4.29',
+                                    'CXXABI': None, 'OPENSSL': None})
+        self.assertEqual(failures, [])
+
+    def test_the_check_reads_real_readelf_output(self):
+        import subprocess
+        text = subprocess.check_output(['readelf', '--version-info', '/bin/ls'],
+                                       text=True)
+        required, failures = build.guest_abi('ls', text)
+        self.assertIsNotNone(required['GLIBC'])
+        # The host's own /bin/ls needs a newer glibc than the guest on most
+        # workstations; the check must report it instead of passing silently.
+        if build.abi_version(required['GLIBC']) > build.GUEST_ABI_CEILING['GLIBC']:
+            self.assertTrue(failures)
+
+    def test_a_missing_version_section_is_a_failure(self):
+        required, failures = build.guest_abi('static', 'no version info here')
+        self.assertEqual(set(required), set(build.GUEST_ABI_CEILING))
+        self.assertTrue(all(value is None for value in required.values()))
+
+
 class CheckpointSourceBoundaries(unittest.TestCase):
     support_relative = 'experiments/sui-checkpoint/checkpoint_support.py'
 
