@@ -657,6 +657,69 @@ unchanged, including `--driver-concurrency`, `--pacing-ms`, `--checkpoints`,
 `--checkpoints N` replay still verifies the complete frozen source and reuses
 its digest at N for the paired native and remote replays.
 
+### W1 controller loss inside a replay cell (`--controller-loss`)
+
+`--controller-loss <mid-frame|after-adoption|during-flush>` turns one replay
+into an S1-4 or M7 cell. The launcher starts the replay unchanged, then waits
+for the point on an observed live sample. The injector's own precondition and
+every point need a completed checkpoint, so a sample counts only when the
+checkpoint watermark is at least 1. The point itself is the edge of the live
+counter the engine exports for that moment:
+
+| Point | Observed edge |
+|---|---|
+| `mid-frame` | `tidehunter_nvmeof_live_completed_write_ops_total` advanced |
+| `after-adoption` | an adoption exchange counter advanced |
+| `during-flush` | `leased_flushes_total` or `leased_flush_covered_frames_total` advanced |
+
+Sampling is one second by default
+(`--controller-loss-probe-seconds`), and the wait is bounded by
+`--controller-loss-gate-timeout` (default: `2 * --deadline + 600 s`, because the
+paired native replay may run the whole deadline first). A point that
+is never observed fails the cell with its whole sample series; it never injects
+at an unproven time.
+
+When the point fires, the launcher runs the package `fault_inject.py` on the
+host that holds the controller, through the same executor as every other guest
+command. That host is the coordinator by default, because the coordinator is
+the only NVMe-oF initiator in this deployment; `--controller-loss-host`
+overrides it for a rehearsal. The target is owner `--controller-loss-owner`
+(default 1) at the owner's live service window; `--controller-loss-nqn` pins
+one exact target instead.
+
+The cell id is `S1-4-<point>-<tier>` for `--stage stage1` and
+`M7-<point>-<tier>` for `--stage stage2`; the launcher derives it, refuses a
+mismatch, and hashes the point into the cell's config hash so a changed point
+reruns the cell. It passes only when the replay completes, the audit is equal,
+the injector reports typed recovery (reconnect, write progress, identical
+readback, no fail-stop, no new data-plane error), and a new verified controller
+connection followed the loss. The gate series and the injector record travel as
+cell evidence under `controller-loss/`.
+
+```sh
+python3 experiments/gcp-rdma/manual_sui.py --stage stage2 \
+  --cell-id M7-mid-frame-native --controller-loss mid-frame \
+  --fleet-state $STATE --fleet-config experiments/gcp-rdma/config.json \
+  --build $CAMPAIGN_ROOT/build --fixture $FIXTURE --schema $SCHEMA \
+  --output $CAMPAIGN_ROOT/stage2/M7-mid-frame-native \
+  --guest-root /mnt/tidehunter/sui-run-$RUN --coordinator $RUN-0 \
+  --owners $RUN-1,$RUN-2 --durability-tier native \
+  --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
+  --ledger $CAMPAIGN_ROOT/campaign-ledger.json --resume
+```
+
+`mid-frame` and `after-adoption` both fire on the real workload: a leased frame
+completion is recorded per completed write I/O, and the coordinator submits an
+adoption of the written prefix as soon as delivered receipts advance it.
+
+`during-flush` can only fire when the write path submits a covering namespace
+flush. That needs a frame at or above `leased_flush_min_frame_bytes` (64 KiB)
+on the Synchronous tier; the Native tier acknowledges every frame at
+completion and never flushes, so a Native `during-flush` cell fails closed on
+the observation, and a replayed checkpoint group smaller than 64 KiB does the
+same on Synchronous. A cell whose point is not reachable therefore fails closed
+instead of claiming the point.
+
 Resume: pass a stable `--ledger /absolute/campaign-ledger.json` and `--resume`.
 The launcher records the cell (`--cell-id`, default `sui-replay`) as running
 before it prepares or installs anything, and marks it passed only after the

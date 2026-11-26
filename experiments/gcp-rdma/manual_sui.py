@@ -19,6 +19,15 @@ the bucket and relays the terminal receipt. `host_exec.GcloudSsh` remains only
 for a rehearsal that passes `--gcloud-ssh`. Every owner archive is extracted
 into the same absolute guest root on every host, as the engine manifest
 requires.
+
+`--controller-loss <point>` adds one W1 injection to a replay cell (plan S1-4
+and M7). The launcher starts the replay unchanged, waits for the point on an
+observed live sample (the checkpoint watermark plus the exported counter edge
+for that moment), runs the package `fault_inject.py` on the host that holds the
+controller through the same executor, and keeps the sample series and the
+injector record as cell evidence. The cell passes only when the replay
+completes, its audit is equal, the injector reports typed recovery, and a new
+verified controller connection followed the loss.
 """
 import argparse
 import json
@@ -46,10 +55,260 @@ import proc_sampler
 OWNER_READY_SECONDS = 120
 BINARY_SET = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit',
               'rocksdb-audit'}
+INJECTOR = Path(__file__).resolve().parents[1] / 'sui-checkpoint/fault_inject.py'
+LIVE_PREFIX = 'tidehunter_nvmeof_live_'
+# The plan's three injection points, and the exported live counter whose edge
+# observes each one. The engine owns the write path, so these counters are the
+# only external view of the moment the controller is lost.
+CONTROLLER_LOSS_POINTS = ('mid-frame', 'after-adoption', 'during-flush')
+CONTROLLER_LOSS_COUNTERS = {
+    'mid-frame': ('completed_write_ops_total',),
+    'after-adoption': ('adoption_async_exchanges_total', 'adoption_sync_exchanges_total'),
+    'during-flush': ('leased_flushes_total', 'leased_flush_covered_frames_total'),
+}
+CONTROLLER_LOSS_CASE = {'stage1': 'S1-4', 'stage2': 'M7'}
+MAX_CONTROLLER_LOSS_SAMPLES = 2048
 
 
 class LaunchError(RuntimeError):
     pass
+
+
+def live_window(owner_index):
+    """One owner host's live target service window (`deployment.prepare`)."""
+    if type(owner_index) is not int or owner_index < 0:
+        raise ValueError('owner index must be a nonnegative integer')
+    base = 4420 + 64 * owner_index
+    return base, base + 15
+
+
+def controller_loss_cell(stage, point, tier):
+    """The plan's cell id for one injection point and tier."""
+    if point not in CONTROLLER_LOSS_POINTS:
+        raise ValueError('unknown controller-loss point')
+    case = CONTROLLER_LOSS_CASE.get(stage)
+    if case is None:
+        raise ValueError('controller loss is a stage 1 or stage 2 cell')
+    return f'{case}-{point}-{tier}'
+
+
+def controller_loss_cell_id(stage, point, tier, cell_id='sui-replay'):
+    """The operator's cell id, or the plan's id when the default was left in place."""
+    expected = controller_loss_cell(stage, point, tier)
+    if cell_id in (None, 'sui-replay'):
+        return expected
+    if cell_id != expected:
+        raise ValueError(f'a {point} cell of {stage} at {tier} is {expected}, not {cell_id}')
+    return cell_id
+
+
+def controller_loss_addresses(fixture):
+    """The live coordinator's JSON-RPC and metrics endpoints.
+
+    `run.py` replays the remote backend with the fixture's `remote` mode, so its
+    endpoints are the ones the injector and the gate must observe.
+    """
+    config = checkpoint.configuration(Path(fixture), 'remote')
+    values = []
+    for name in ('json-rpc-address', 'metrics-address'):
+        value = config.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f'the fixture remote config has no {name}')
+        values.append(value)
+    return values[0], values[1]
+
+
+def live_counter(text, name):
+    """One aggregate live counter sample; duplicates fail closed."""
+    values = []
+    for line in text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        metric, _, value = line.partition(' ')
+        if metric == LIVE_PREFIX + name:
+            values.append(float(value))
+    if len(values) > 1:
+        raise ValueError(f'duplicate Prometheus metric: {LIVE_PREFIX + name}')
+    return values[0] if values else None
+
+
+def live_sample(text, names):
+    return {name: live_counter(text, name) for name in names}
+
+
+class ControllerLoss:
+    """One plan injection point, waited for on an observed live sample.
+
+    The plan names three moments inside the engine's write path. `run.py`
+    publishes no inner-engine event, so a point fires on the edge of the live
+    counter that the engine exports for that moment, and only after a completed
+    checkpoint exists (the injector's own precondition). Every sample is kept:
+    a point that never fires fails the cell with the observation series instead
+    of injecting at an unproven time.
+    """
+    def __init__(self, *, point, host, address, service, service_max, transport,
+                 metrics_url, rpc_address, output, nqn=None, timeout=30.0,
+                 gate_timeout=1200.0, probe_seconds=1.0, now=time.monotonic,
+                 latest=None, metrics=None):
+        if point not in CONTROLLER_LOSS_POINTS:
+            raise ValueError('unknown controller-loss point')
+        self.point = point
+        self.host = host
+        self.address = address
+        self.service, self.service_max = service, service_max
+        self.transport = transport
+        self.metrics_url = metrics_url
+        self.rpc_address = rpc_address
+        self.output = Path(output)
+        self.nqn = nqn
+        self.timeout = timeout
+        self.gate_timeout = gate_timeout
+        self.probe_seconds = probe_seconds
+        self.now = now
+        self.latest = latest or _latest_checkpoint
+        self.metrics = metrics or _scrape_metrics
+        self.samples = []
+        self.started = None
+        self.next_probe = 0.0
+        self.evidence = None
+        self.done = False
+
+    def sample(self):
+        row = dict(unix_ns=time.time_ns(), seconds=None, watermark=None,
+                   counters={}, reason=None)
+        try:
+            row['watermark'] = int(self.latest(self.rpc_address))
+        except (OSError, RuntimeError, ValueError) as error:
+            row['reason'] = f'checkpoint RPC sample failed: {error}'
+        try:
+            text = self.metrics(self.metrics_url)
+            row['counters'] = live_sample(text, CONTROLLER_LOSS_COUNTERS[self.point])
+        except (OSError, ValueError) as error:
+            row['reason'] = f'live metrics sample failed: {error}'
+        return row
+
+    def fires(self, previous, current):
+        """Whether this sample is the point's observed edge."""
+        if current['watermark'] is None or current['watermark'] < 1:
+            return False, 'no completed checkpoint'
+        if previous is None:
+            return False, 'one sample'
+        for name in CONTROLLER_LOSS_COUNTERS[self.point]:
+            before = previous['counters'].get(name)
+            after = current['counters'].get(name)
+            if after is None:
+                return False, f'{LIVE_PREFIX + name} is absent from the scrape'
+            if before is not None and after > before:
+                return True, None
+        return False, 'no edge in ' + ', '.join(CONTROLLER_LOSS_COUNTERS[self.point])
+
+    def poll(self, remote):
+        """Probe once and inject when the point fires; True means injected."""
+        if self.done:
+            return True
+        now = self.now()
+        if self.started is None:
+            self.started = now
+        if now < self.next_probe:
+            return False
+        self.next_probe = now + self.probe_seconds
+        row = self.sample()
+        row['seconds'] = now - self.started
+        previous = self.samples[-1] if self.samples else None
+        if len(self.samples) < MAX_CONTROLLER_LOSS_SAMPLES:
+            self.samples.append(row)
+        fired, reason = self.fires(previous, row)
+        if fired:
+            self.inject(remote, row)
+            return True
+        if now - self.started > self.gate_timeout:
+            self.evidence = dict(point=self.point, host=self.host, injected=False,
+                                 reason=reason, gate_timeout=self.gate_timeout,
+                                 samples=self.samples)
+            self.write_evidence()
+            raise LaunchError(f'controller-loss point {self.point} was not observed '
+                              f'before its gate deadline: {reason}')
+        return False
+
+    def argv(self, output):
+        argv = [sys.executable, str(INJECTOR),
+                '--transport', self.transport, '--address', self.address,
+                '--service', str(self.service), '--service-max', str(self.service_max),
+                '--sui-rpc', self.rpc_address, '--timeout', str(self.timeout),
+                '--output', str(output)]
+        if self.nqn is not None:
+            argv += ['--nqn', self.nqn]
+        if self.metrics_url:
+            argv += ['--metrics-url', self.metrics_url]
+        return argv
+
+    def inject(self, remote, gate):
+        """Run the package injector on the controller's host and retain its record."""
+        output = self.output / 'controller-loss' / f'{self.point}.json'
+        remote.shell(self.host, f'mkdir -p {shlex.quote(str(output.parent))}')
+        command = 'exec ' + ' '.join(shlex.quote(str(part)) for part in self.argv(output))
+        code, out, err = remote.run(self.host, command, check=False)
+        record = None
+        try:
+            record = json.loads(remote.read_bytes(self.host, output))
+        except (host_exec.HostCommandError, ValueError) as error:
+            record = dict(ok=False, reason=f'injector record unavailable: {error}')
+        self.evidence = dict(
+            point=self.point, host=self.host, address=self.address,
+            service=self.service, service_max=self.service_max,
+            transport=self.transport, nqn=self.nqn, injected=True,
+            exit_code=code, stdout=out.decode('utf-8', 'replace')[-4000:],
+            stderr=err.decode('utf-8', 'replace')[-4000:],
+            gate=gate, samples=self.samples, injector=record)
+        write_json(self.output / 'controller-loss' / f'{self.point}.json', record)
+        self.done = True
+
+    def write_evidence(self):
+        write_json(self.output / 'controller-loss' / 'evidence.json', self.evidence)
+
+
+def _latest_checkpoint(address):
+    import fault_inject
+    return fault_inject.latest_checkpoint(address)
+
+
+def _scrape_metrics(url):
+    import fault_inject
+    return fault_inject.scrape_metrics(url)
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+    os.replace(temporary, path)
+
+
+def controller_loss_verdict(evidence):
+    """The plan's S1-4/M7 conditions that the injector record can prove."""
+    failures = []
+    if evidence is None:
+        return ['no controller-loss evidence was recorded']
+    if evidence.get('injected') is not True:
+        return ['the injection point was not reached: ' + str(evidence.get('reason'))]
+    if evidence.get('exit_code') != 0:
+        failures.append(f'the injector exited {evidence.get("exit_code")}')
+    record = evidence.get('injector') or {}
+    if record.get('ok') is not True:
+        failures.append('the injector refused or failed: ' + str(record.get('reason')))
+    if record.get('fail_stop_count'):
+        failures.append('an owned process fail-stopped during the injection')
+    if record.get('readback_equal') is not True:
+        failures.append('the pre-fault checkpoint summary did not read back identically')
+    delta = record.get('live_delta') or {}
+    if delta.get('available') is not True:
+        failures.append('the aggregate live counters are not a usable before/after pair')
+    elif (delta.get('errors') or 0) > 0:
+        failures.append('live data-plane errors increased during the injection')
+    elif (delta.get('namespace_connects') or 0) < 1:
+        failures.append('no new verified controller connection followed the injection')
+    return failures
 
 
 def plan(coordinator, owners):
@@ -71,7 +330,7 @@ class SuiLauncher:
                  disk_sample_seconds=10, port=24000, ledger=None,
                  cell_id='sui-replay', stage='stage1', resume=False,
                  store=None, bucket=None, prefix=None, write_profile_limit=0,
-                 resident_reads=None, allow_local_ledger=False):
+                 resident_reads=None, allow_local_ledger=False, controller_loss=None):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -112,6 +371,7 @@ class SuiLauncher:
         self.write_profile_limit = write_profile_limit
         self.resident_reads = Path(resident_reads).resolve() if resident_reads else None
         self.allow_local_ledger = allow_local_ledger
+        self.controller_loss = controller_loss
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
@@ -299,7 +559,16 @@ class SuiLauncher:
                        shard_cache_mib=self.shard_cache_mib,
                        write_profile_limit=self.write_profile_limit,
                        resident_reads=(build.digest(self.resident_reads)
-                                       if self.resident_reads else None)),
+                                       if self.resident_reads else None),
+                       controller_loss=(None if self.controller_loss is None else dict(
+                           point=self.controller_loss.point,
+                           host=self.controller_loss.host,
+                           address=self.controller_loss.address,
+                           service=self.controller_loss.service,
+                           service_max=self.controller_loss.service_max,
+                           nqn=self.controller_loss.nqn,
+                           timeout=self.controller_loss.timeout,
+                           gate_timeout=self.controller_loss.gate_timeout))),
             engine_rev=self.manifest.get('source_archive_sha256'),
             sui_rev=self.manifest.get('source_archive_sha256'),
             binary_ids=self.manifest['binaries'])
@@ -331,6 +600,10 @@ class SuiLauncher:
         for pattern in ('*.prom', '*-samples.jsonl', 'samples.csv', 'resources.csv'):
             for path in sorted(experiment.glob(pattern)):
                 rows.append(upload_module.artifact(path, self.evidence_name(path)))
+        # The controller-loss record and its gate series are cell evidence, not
+        # a per-sample stream: they stay under evidence/ with the summary.
+        for path in sorted((self.output / 'controller-loss').glob('*.json')):
+            rows.append(upload_module.artifact(path, self.evidence_name(path)))
         return rows
 
     def persist(self, entry, artifacts):
@@ -435,7 +708,15 @@ class SuiLauncher:
                     self.stop()
                     self.write_resources(binding)
                     resources_written = True
+                    if self.controller_loss is not None and not self.controller_loss.done:
+                        raise LaunchError(
+                            f'controller-loss point {self.controller_loss.point} was not '
+                            'observed before the replay requested its final evidence')
+                if resources_written and (self.controller_loss is None
+                                          or self.controller_loss.done):
                     break
+                if self.controller_loss is not None and not resources_written:
+                    self.controller_loss.poll(self.remote)
                 if time.monotonic() > deadline:
                     raise TimeoutError('run.py did not request resource evidence')
                 time.sleep(0.2)
@@ -445,6 +726,8 @@ class SuiLauncher:
                 self.stop()
             if child.poll() is None:
                 code = child.wait()
+        if self.controller_loss is not None:
+            self.controller_loss.write_evidence()
         if code != 0:
             raise LaunchError(f'run.py failed with exit status {code}')
         if not resources_written:
@@ -453,6 +736,19 @@ class SuiLauncher:
                        owners=self.owners,
                        build_manifest_sha256=build.digest(
                            self.build_root / 'build-manifest.json'))
+        if self.controller_loss is not None:
+            failures = controller_loss_verdict(self.controller_loss.evidence)
+            results = json.loads((self.output / 'experiment/results.json').read_text())
+            if results.get('complete') is not True:
+                failures.append('run.py did not record a complete replay')
+            if (results.get('audit') or {}).get('all_equal') is not True:
+                failures.append('the replay audit is absent or not equal')
+            if failures:
+                raise LaunchError('controller-loss cell failed: ' + '; '.join(failures))
+            receipt['controller_loss'] = dict(
+                point=self.controller_loss.point,
+                host=self.controller_loss.host,
+                injector_ok=(self.controller_loss.evidence.get('injector') or {}).get('ok'))
         (self.output / 'launcher-receipt.json').write_text(
             json.dumps(receipt, indent=2) + '\n')
         return receipt
@@ -516,11 +812,37 @@ def main():
                         help='service account that writes the campaign prefix')
     parser.add_argument('--allow-local-ledger', action='store_true',
                         help='local rehearsal only: pass a cell without an uploaded bundle')
+    parser.add_argument('--controller-loss', choices=CONTROLLER_LOSS_POINTS,
+                        help='inject one W1 controller loss during the remote replay; '
+                             'the cell is S1-4-<point>-<tier> (stage1) or '
+                             'M7-<point>-<tier> (stage2)')
+    parser.add_argument('--controller-loss-owner', type=int, default=1,
+                        help='1-based owner whose target controller is deleted')
+    parser.add_argument('--controller-loss-host',
+                        help='host that holds the controller (default: the coordinator, '
+                             'the only NVMe-oF initiator; override for a rehearsal)')
+    parser.add_argument('--controller-loss-nqn',
+                        help='exact target NQN; default selects the lowest NQN inside '
+                             'the owner service window')
+    parser.add_argument('--controller-loss-timeout', type=float, default=30.0,
+                        help='injector reconnect and write-progress deadline in seconds')
+    parser.add_argument('--controller-loss-gate-timeout', type=float,
+                        help='deadline for observing the point; default: 2 * deadline + 600 s')
+    parser.add_argument('--controller-loss-probe-seconds', type=float, default=1.0,
+                        help='live sample interval while waiting for the point')
     parser.add_argument('run_args', nargs=argparse.REMAINDER,
                         help='extra run.py arguments after --')
     args = parser.parse_args()
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
+    if args.controller_loss is not None:
+        try:
+            args.cell_id = controller_loss_cell_id(
+                args.stage, args.controller_loss, args.durability_tier, args.cell_id)
+        except ValueError as error:
+            raise SystemExit(str(error)) from None
+        if not 1 <= args.controller_loss_owner <= 2:
+            raise SystemExit('--controller-loss-owner must be 1 or 2')
     if not args.gcloud_ssh and not args.on_coordinator:
         # The replay runs on H0: run.py starts the producer, the native control
         # and the remote coordinator, and they must reach the owners.
@@ -549,6 +871,23 @@ def main():
         resume_ledger.load()
         if store is not None:
             resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
+    controller_loss = None
+    if args.controller_loss is not None:
+        owner = args.controller_loss_owner - 1
+        service, service_max = live_window(owner)
+        rpc_address, metrics_address = controller_loss_addresses(args.fixture)
+        controller_loss = ControllerLoss(
+            point=args.controller_loss,
+            host=args.controller_loss_host or hosts['coordinator'],
+            address=hosts['owners'][owner], service=service, service_max=service_max,
+            transport=args.live_transport,
+            metrics_url='http://' + metrics_address + '/metrics',
+            rpc_address=rpc_address, output=output, nqn=args.controller_loss_nqn,
+            timeout=args.controller_loss_timeout,
+            gate_timeout=(args.controller_loss_gate_timeout
+                          if args.controller_loss_gate_timeout is not None
+                          else 2 * args.deadline + 600.0),
+            probe_seconds=args.controller_loss_probe_seconds)
     launcher = SuiLauncher(
         remote=mailbox_exec.open_executor(args),
         build_root=args.build, fixture=args.fixture, output=output,
@@ -566,7 +905,8 @@ def main():
         resume=args.resume, store=store, bucket=bucket, prefix=prefix,
         write_profile_limit=args.write_profile_limit,
         resident_reads=args.resident_reads,
-        allow_local_ledger=args.allow_local_ledger)
+        allow_local_ledger=args.allow_local_ledger,
+        controller_loss=controller_loss)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
 

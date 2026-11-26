@@ -8,10 +8,12 @@ sampling; no cloud account, no engine and no nvmet are required.
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 import gcp_api
@@ -134,7 +136,7 @@ class FakeBuild:
                                             manifest, binding, [start, finish])
             (Path(args.output) / 'experiment').mkdir(exist_ok=True)
             (Path(args.output) / 'experiment/results.json').write_text(
-                json.dumps(dict(complete=True)))
+                json.dumps(dict(complete=True, audit=dict(all_equal=True))))
             (Path(args.output) / 'receipt.json').write_text(json.dumps(dict(complete=True)))
             (Path(args.output) / 'evidence.tar.gz').write_bytes(b'evidence')
             """))
@@ -156,6 +158,43 @@ class FakeBuild:
         (schema / 'shape.json').write_text('{}')
         (schema / 'shape.yaml').write_text('key_spaces: []\n')
         return root / 'native-schema'
+
+
+INJECTOR_RECORD = {
+    'schema': 1, 'kind': 'w1_controller_loss', 'ok': True, 'reason': None,
+    'readback_equal': True, 'fail_stop_count': 0, 'reconnect_seconds': 0.2,
+    'live_delta': {'available': True, 'errors': 0, 'namespace_connects': 1},
+}
+
+
+class MailboxDouble(host_exec.HostExecution):
+    """A mailbox-shaped executor: one recorded request per host command.
+
+    Shell commands run locally against a per-host guest root, and the
+    controller-loss request is answered with a canned injector record, so no
+    sysfs, no JSON-RPC and no engine are needed.
+    """
+
+    def __init__(self, root, guest_root, *, record=None, code=0):
+        self.root, self.guest_root = Path(root), Path(guest_root)
+        self.record = dict(INJECTOR_RECORD if record is None else record)
+        self.code = code
+        self.requests = []
+
+    def execute(self, host, command, *, stdin=None):
+        self.requests.append(dict(host=host, command=command))
+        if 'fault_inject.py' in command:
+            words = shlex.split(command)
+            output = Path(words[words.index('--output') + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(self.record))
+            return self.code, json.dumps(dict(ok=self.record.get('ok'))).encode(), b''
+        translated = command.replace(str(self.guest_root),
+                                     str(self.root / 'hosts' / host / 'guest'))
+        completed = subprocess.run(['bash', '-c', translated], input=stdin,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=120)
+        return completed.returncode, completed.stdout, completed.stderr
 
 
 class LauncherShape(unittest.TestCase):
@@ -348,6 +387,239 @@ class LauncherHandshake(unittest.TestCase):
         (stage / 'remote-starting.json').write_text('{}')
         with self.assertRaisesRegex(ValueError, 'fresh'):
             self.launcher().run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+
+
+class ControllerLossCells(unittest.TestCase):
+    def test_cell_ids_follow_the_plan_and_refuse_a_mismatch(self):
+        self.assertEqual(manual_sui.controller_loss_cell_id(
+            'stage1', 'mid-frame', 'native'), 'S1-4-mid-frame-native')
+        self.assertEqual(manual_sui.controller_loss_cell_id(
+            'stage2', 'during-flush', 'synchronous'), 'M7-during-flush-synchronous')
+        self.assertEqual(manual_sui.controller_loss_cell_id(
+            'stage2', 'after-adoption', 'native', 'M7-after-adoption-native'),
+            'M7-after-adoption-native')
+        with self.assertRaises(ValueError):
+            manual_sui.controller_loss_cell_id('stage2', 'mid-frame', 'native',
+                                               'S1-4-mid-frame-native')
+        with self.assertRaises(ValueError):
+            manual_sui.controller_loss_cell('stage3', 'mid-frame', 'native')
+
+    def test_live_window_matches_the_prepared_owner_pool(self):
+        self.assertEqual(manual_sui.live_window(0), (4420, 4435))
+        self.assertEqual(manual_sui.live_window(1), (4484, 4499))
+        with self.assertRaises(ValueError):
+            manual_sui.live_window(-1)
+
+    def test_the_gate_fires_only_on_its_own_counter_edge(self):
+        clock = [0.0]
+        state = dict(watermark=2, writes=10, adoptions=0, flushes=0)
+        def metrics(url):
+            return ('tidehunter_nvmeof_live_completed_write_ops_total %d\n'
+                    'tidehunter_nvmeof_live_adoption_async_exchanges_total %d\n'
+                    'tidehunter_nvmeof_live_adoption_sync_exchanges_total 0\n'
+                    'tidehunter_nvmeof_live_leased_flushes_total %d\n'
+                    'tidehunter_nvmeof_live_leased_flush_covered_frames_total 0\n'
+                    % (state['writes'], state['adoptions'], state['flushes']))
+        cases = {'mid-frame': 'writes', 'after-adoption': 'adoptions',
+                 'during-flush': 'flushes'}
+        for point, knob in cases.items():
+            with self.subTest(point=point):
+                state.update(watermark=2, writes=10, adoptions=0, flushes=0)
+                gate = manual_sui.ControllerLoss(
+                    point=point, host='h0', address='10.0.0.2',
+                    service=4420, service_max=4435, transport='rdma',
+                    metrics_url='http://127.0.0.1:9000/metrics',
+                    rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+                    now=lambda: clock[0], latest=lambda address: state['watermark'],
+                    metrics=metrics)
+                clock[0] = 0.0
+                self.assertFalse(gate.poll(None))
+                clock[0] = 1.0
+                self.assertFalse(gate.poll(None))
+                state[knob] += 1
+                clock[0] = 2.0
+                fired, reason = gate.fires(gate.samples[-2], gate.sample())
+                self.assertTrue(fired, reason)
+
+    def test_the_gate_fails_closed_without_a_completed_checkpoint(self):
+        gate = manual_sui.ControllerLoss(
+            point='mid-frame', host='h0', address='10.0.0.2', service=4420,
+            service_max=4435, transport='rdma', metrics_url='',
+            rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+            now=lambda: 0.0, latest=lambda address: 0,
+            metrics=lambda url: '')
+        fired, reason = gate.fires(None, gate.sample())
+        self.assertFalse(fired)
+        self.assertIn('no completed checkpoint', reason)
+
+    def test_a_missing_counter_fails_closed(self):
+        gate = manual_sui.ControllerLoss(
+            point='during-flush', host='h0', address='10.0.0.2', service=4420,
+            service_max=4435, transport='rdma', metrics_url='http://x/metrics',
+            rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+            now=lambda: 0.0, latest=lambda address: 5,
+            metrics=lambda url: 'tidehunter_nvmeof_live_errors_total 0\n')
+        previous = gate.sample()
+        current = gate.sample()
+        fired, reason = gate.fires(previous, current)
+        self.assertFalse(fired)
+        self.assertIn('absent from the scrape', reason)
+
+    def test_duplicate_counters_are_refused(self):
+        text = ('tidehunter_nvmeof_live_completed_write_ops_total 1\n'
+                'tidehunter_nvmeof_live_completed_write_ops_total 2\n')
+        with self.assertRaises(ValueError):
+            manual_sui.live_sample(text, ('completed_write_ops_total',))
+        self.assertEqual(manual_sui.live_sample(
+            'tidehunter_nvmeof_live_completed_write_ops_total 7\n',
+            ('completed_write_ops_total',)), {'completed_write_ops_total': 7.0})
+
+
+class ControllerLossInjection(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.build = FakeBuild(self.root / 'build')
+        self.fixture = self.build.fixture(self.root)
+        self.schema = self.build.schema(self.root)
+        self.saved = manual_sui.proc_sampler.SAMPLE_SECONDS
+        manual_sui.proc_sampler.SAMPLE_SECONDS = 0.2
+        self.addCleanup(setattr, manual_sui.proc_sampler, 'SAMPLE_SECONDS', self.saved)
+
+    def gate(self, remote, point='mid-frame', output=None, **overrides):
+        state = dict(watermark=0, writes=0, adoptions=0, flushes=0)
+        def latest(address):
+            state['watermark'] += 1
+            return state['watermark']
+        def metrics(url):
+            for knob in ('writes', 'adoptions', 'flushes'):
+                state[knob] += 1
+            return ('tidehunter_nvmeof_live_completed_write_ops_total %d\n'
+                    'tidehunter_nvmeof_live_adoption_async_exchanges_total %d\n'
+                    'tidehunter_nvmeof_live_adoption_sync_exchanges_total 0\n'
+                    'tidehunter_nvmeof_live_leased_flushes_total %d\n'
+                    'tidehunter_nvmeof_live_leased_flush_covered_frames_total 0\n'
+                    % (state['writes'], state['adoptions'], state['flushes']))
+        values = dict(
+            point=point, host='coordinator', address='10.0.0.2',
+            service=4420, service_max=4435, transport='rdma',
+            metrics_url='http://127.0.0.1:9000/metrics',
+            rpc_address='127.0.0.1:9000',
+            output=Path(output or self.root / 'run'), gate_timeout=30.0,
+            probe_seconds=0.2, now=time.monotonic, latest=latest, metrics=metrics)
+        values.update(overrides)
+        return manual_sui.ControllerLoss(**values)
+
+    def launcher(self, remote, gate, output=None, **overrides):
+        values = dict(
+            remote=remote,
+            build_root=self.build.root, fixture=self.fixture,
+            output=Path(output or self.root / 'run'), guest_root=self.root / 'guest',
+            stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
+            resources=self.root / 'resources.json', tier='native', owners=2,
+            deadline=900, transport='efa', live_transport='rdma', schema=self.schema,
+            controller_loss=gate)
+        values.update(overrides)
+        return manual_sui.SuiLauncher(**values)
+
+    def test_an_observed_point_injects_and_passes_the_cell(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        gate = self.gate(remote)
+        receipt = self.launcher(remote, gate, ledger=ledger, cell_id='S1-4-mid-frame-native',
+                                allow_local_ledger=True).run(
+            manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertTrue(receipt['complete'])
+        self.assertEqual(receipt['controller_loss']['point'], 'mid-frame')
+        self.assertTrue(receipt['controller_loss']['injector_ok'])
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'passed')
+        injector = [row for row in remote.requests if 'fault_inject.py' in row['command']]
+        self.assertEqual(len(injector), 1)
+        self.assertEqual(injector[0]['host'], 'coordinator')
+        words = shlex.split(injector[0]['command'])
+        self.assertIn('--service-max', words)
+        self.assertEqual(words[words.index('--service-max') + 1], '4435')
+        self.assertEqual(words[words.index('--address') + 1], '10.0.0.2')
+        self.assertNotIn('--nqn', words)
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertTrue(evidence['injected'])
+        self.assertGreaterEqual(len(evidence['samples']), 2)
+        self.assertEqual(evidence['injector']['ok'], True)
+        self.assertTrue((self.root / 'run/controller-loss/mid-frame.json').is_file())
+        names = {row['name'] for row in self.launcher(remote, gate).artifacts()}
+        self.assertIn('controller-loss/evidence.json', names)
+        self.assertIn('controller-loss/mid-frame.json', names)
+
+    def test_an_unobserved_point_fails_the_cell_and_keeps_the_series(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        gate = self.gate(remote, point='during-flush', gate_timeout=0.2,
+                         metrics=lambda url: 'tidehunter_nvmeof_live_leased_flushes_total 0\n',
+                         latest=lambda address: 3)
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'was not observed'):
+            self.launcher(remote, gate, ledger=ledger,
+                          cell_id='S1-4-during-flush-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-during-flush-native'), 'failed')
+        self.assertIn('was not observed',
+                      ledger.entries[('stage1', 'S1-4-during-flush-native')]['failure'])
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertFalse(evidence['injected'])
+        self.assertTrue(evidence['samples'])
+        self.assertTrue(all(not row['counters'].get('leased_flushes_total')
+                            or row['counters']['leased_flushes_total'] == 0
+                            for row in evidence['samples']))
+        self.assertFalse([row for row in remote.requests if 'fault_inject.py' in row['command']])
+
+    def test_a_failed_injector_record_fails_the_cell(self):
+        record = dict(INJECTOR_RECORD, ok=False, reason='owner controller did not reconnect',
+                      live_delta={'available': True, 'errors': 0, 'namespace_connects': 0})
+        remote = MailboxDouble(self.root, self.root / 'guest', record=record, code=1)
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'did not reconnect'):
+            self.launcher(remote, self.gate(remote), ledger=ledger,
+                          cell_id='S1-4-mid-frame-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'failed')
+
+    def test_a_new_connection_is_required_after_the_loss(self):
+        record = dict(INJECTOR_RECORD,
+                      live_delta={'available': True, 'errors': 0, 'namespace_connects': 0})
+        remote = MailboxDouble(self.root, self.root / 'guest', record=record)
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'no new verified controller'):
+            self.launcher(remote, self.gate(remote), ledger=ledger,
+                          cell_id='S1-4-mid-frame-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'failed')
+
+    def test_a_changed_point_invalidates_a_passed_cell(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        self.launcher(remote, self.gate(remote), ledger=ledger,
+                      cell_id='S1-4-mid-frame-native',
+                      allow_local_ledger=True).run(hosts)
+        skipped = self.launcher(remote, self.gate(remote), ledger=ledger, resume=True,
+                                cell_id='S1-4-mid-frame-native',
+                                allow_local_ledger=True).run(hosts)
+        self.assertTrue(skipped['skipped'])
+        # A different point hashes differently, so the same cell reruns in a
+        # fresh output instead of being skipped.
+        changed = self.launcher(remote, self.gate(remote, point='during-flush',
+                                                 output=self.root / 'run2'),
+                                output=self.root / 'run2', ledger=ledger, resume=True,
+                                stage_dir=self.root / 'stages2',
+                                config_dir=self.root / 'external-config2',
+                                resources=self.root / 'resources2.json',
+                                cell_id='S1-4-mid-frame-native',
+                                allow_local_ledger=True).run(hosts)
+        self.assertNotIn('skipped', changed)
+        self.assertEqual(ledger.entries[('stage1', 'S1-4-mid-frame-native')]['attempts'], 2)
 
 
 if __name__ == '__main__':
