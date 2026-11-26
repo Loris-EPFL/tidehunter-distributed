@@ -1641,10 +1641,11 @@ impl super::Client {
             writer.io.override_submit_result(errno);
         }
         let before = writer.io.stats();
-        // The admission failure below needs the pinned controller, but the
-        // buffer borrow outlives the match arms: take what the probe reads
-        // first, so the cold error path needs no second borrow of the queue.
-        let lease = writer.lease.clone();
+        // The admission failure below classifies with the same probe as a
+        // completion, but the buffer borrow outlives the match arms. Borrow the
+        // lease field instead of the queue: a disjoint field borrow costs
+        // nothing on the frame path, and the probe runs only on a failure.
+        let lease = writer.lease.as_ref();
         #[cfg(test)]
         let override_lost = writer.controller_lost;
         let mut buffer = match writer.io.write_buffer(len) {
@@ -1664,7 +1665,7 @@ impl super::Client {
                 let lost = lost_controller(
                     &error,
                     None,
-                    lease.as_ref(),
+                    lease,
                     #[cfg(test)]
                     override_lost,
                 );
@@ -1903,11 +1904,13 @@ impl super::Client {
         // The latest completed write's errno, read once under the queue borrow:
         // a lost controller is transient, a rejected or short write is not.
         let write_errno = writer.io.last_write_errno();
-        // One answer for every unknown-write verdict of this pass: whether the
-        // pinned controller is verifiably gone for that errno.
-        let write_lost = writer.pinned_controller_lost(
-            &crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
-        );
+        // One answer for every unknown-write verdict of this pass, and only
+        // when the errno is ambiguous: a completed write with another errno
+        // never pays for the controller probe.
+        let write_lost = write_errno.is_some_and(super::is_lost_io_errno)
+            && writer.pinned_controller_lost(
+                &crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite,
+            );
         let harvested = !self.live_leased.completions.is_empty();
         if harvested {
             // A CQE proves the kept queue still progresses, so a deadline that
