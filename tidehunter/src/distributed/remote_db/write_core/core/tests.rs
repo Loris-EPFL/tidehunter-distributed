@@ -167,7 +167,7 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
                 .unwrap();
         });
         for _ in 0..4 {
-            starting.recv_timeout(Duration::from_secs(1)).unwrap();
+            starting.recv_timeout(WAIT).unwrap();
         }
         wait_for("admission waiter queued", || {
             core.admission.queued_waiters() == 1
@@ -175,11 +175,10 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
         core.begin_failure(&LocalDbError::new("injected waiter failure"));
         core.finish_failure();
         for _ in 0..4 {
+            let result = finishing.recv_timeout(WAIT).unwrap();
             assert!(
-                finishing
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap()
-                    .is_err()
+                result.is_err(),
+                "a waiter outlived the injected failure: {result:?}"
             );
         }
     });
