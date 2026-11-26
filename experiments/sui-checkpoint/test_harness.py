@@ -660,10 +660,12 @@ class RunnerKnobs(unittest.TestCase):
                       max_dirty_keys=1024, snapshot_written_bytes=8 << 30, max_maps=3,
                       max_index_maps=3,
                       index_blob_cache_min_bytes=None, index_blob_cache_bytes=0,
-                      read_profile_limit=0, native_write_profile_limit=0)
+                      read_profile_limit=0, native_write_profile_limit=0,
+                      mutex_count=1)
         values.update(changes)
         return run.runtime_environment(
             {'PATH': '/bin', 'TH_MAX_MAPS': '99',
+             'TH_DEFAULT_MUTEX_COUNT': '1024',
              'SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY': '16'}, **values)
 
     def test_explicit_values_override_inherited_engine_knobs(self):
@@ -676,6 +678,8 @@ class RunnerKnobs(unittest.TestCase):
         self.assertNotIn('TH_VALUE_CACHE_SIZE', env)
         self.assertNotIn('SUI_CHECKPOINT_EXECUTION_PACING_MS', env)
         self.assertEqual(env['TH_SYNC_WRITES'], 'false')
+        self.assertEqual(env['TH_DEFAULT_MUTEX_COUNT'], '1',
+                         'the frozen layout replaces an inherited fork default')
         self.assertEqual(self.environment(tier='synchronous')['TH_SYNC_WRITES'], 'true')
         self.assertEqual(env['TH_SNAPSHOT_WRITTEN_BYTES'], str(8 << 30))
         self.assertNotIn('TH_INDEX_BLOB_CACHE_MIN_BYTES', env,
@@ -695,7 +699,7 @@ class RunnerKnobs(unittest.TestCase):
                 default_value_cache_size=1000, max_dirty_keys=1024,
                 snapshot_written_bytes=8 << 30, max_maps=3, max_index_maps=3,
                 index_blob_cache_min_bytes=0, index_blob_cache_bytes=0,
-                read_profile_limit=0, native_write_profile_limit=0)
+                read_profile_limit=0, native_write_profile_limit=0, mutex_count=1)
 
     def test_value_and_index_map_limits_are_independent_and_never_panic(self):
         env = self.environment(max_maps=5, max_index_maps=3)
@@ -942,7 +946,8 @@ class LifecycleChecks(unittest.TestCase):
                            default_value_cache_size=1000, max_dirty_keys=1024,
                            snapshot_written_bytes=8 << 30, max_maps=3,
                            max_index_maps=3, index_blob_cache_min_bytes=None,
-                           read_profile_limit=0, native_write_profile_limit=0)
+                           read_profile_limit=0, native_write_profile_limit=0,
+                           mutex_count=1)
         off = run.runtime_environment({'PATH': '/bin'}, index_blob_cache_bytes=0,
                                       **environment)
         self.assertNotIn('TH_INDEX_BLOB_CACHE_BYTES', off)
@@ -1641,15 +1646,16 @@ class EngineDefaults(unittest.TestCase):
                       snapshot_written_bytes=8 << 30, max_maps=None,
                       max_index_maps=None, index_blob_cache_min_bytes=None,
                       index_blob_cache_bytes=0, read_profile_limit=0,
-                      native_write_profile_limit=0)
+                      native_write_profile_limit=0, mutex_count=1)
         values.update(changes)
         return run.runtime_environment({'PATH': '/bin', 'TH_MAX_MAPS': '99'}, **values)
 
-    def test_the_map_and_mutex_rows_stay_unset_by_default(self):
+    def test_the_map_rows_stay_unset_and_the_mutex_row_is_pinned(self):
         env = self.environment()
         self.assertNotIn('TH_MAX_MAPS', env)
         self.assertNotIn('TH_MAX_INDEX_MAPS', env)
-        self.assertNotIn('TH_DEFAULT_MUTEX_COUNT', env)
+        self.assertEqual(env['TH_DEFAULT_MUTEX_COUNT'], '1',
+                         'the frozen fixture layout is explicit, not inherited')
         self.assertEqual(env['TH_FRAG_SIZE'], str(1024 * deployment.MIB))
 
     def test_a_declared_map_limit_is_written_and_validated(self):
@@ -1659,6 +1665,51 @@ class EngineDefaults(unittest.TestCase):
         for field in ('max_maps', 'max_index_maps'):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'panics below 3'):
                 self.environment(**{field: 2})
+
+
+class FrozenMutexCount(unittest.TestCase):
+    """The replay declares the frozen fixture's keyspace layout."""
+
+    def fixture(self, root, *, mutexes=1, name='checkpoint_content', extra=None):
+        shape = (Path(root) / 'producer' / 'store' / 'live' / 'checkpoints'
+                 / 'shape_v2.yaml')
+        shape.parent.mkdir(parents=True)
+        lines = ['key_spaces:', '- inner:', '    id: 0', f'    name: {name}',
+                 '    key_indexing: !Fixed 32', f'    mutexes: {mutexes}',
+                 '    key_type: !Uniform', '      cells_per_mutex: 1']
+        if extra is not None:
+            lines += ['- inner:', '    id: 1', f'    name: {extra[0]}',
+                      f'    mutexes: {extra[1]}']
+        shape.write_text('\n'.join(lines) + '\n')
+        return Path(root)
+
+    def test_the_count_comes_from_the_checkpoint_content_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp, mutexes=3, extra=('other', 7))
+            self.assertEqual(run.frozen_mutex_count(root), 3)
+
+    def test_a_shape_without_the_checkpoint_row_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp, name='other')
+            with self.assertRaisesRegex(ValueError, 'checkpoint_content'):
+                run.frozen_mutex_count(root)
+
+    def test_two_shapes_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp)
+            source = next((root / 'producer').rglob('shape_v2.yaml'))
+            second = (root / 'producer' / 'other' / 'live' / 'checkpoints'
+                      / 'shape_v2.yaml')
+            second.parent.mkdir(parents=True)
+            shutil.copy2(source, second)
+            with self.assertRaisesRegex(ValueError, 'exactly one'):
+                run.frozen_mutex_count(root)
+
+    def test_the_declared_range_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.fixture(tmp, mutexes=0)
+            with self.assertRaisesRegex(ValueError, '1..4096'):
+                run.frozen_mutex_count(root)
 
 
 class ReviewedCellAdmission(unittest.TestCase):

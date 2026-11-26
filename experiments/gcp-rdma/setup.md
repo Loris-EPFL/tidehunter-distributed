@@ -1151,6 +1151,10 @@ python3 experiments/gcp-rdma/fault_cells.py --cell S1-2S-publication-native \
 Give every knob once, to the launcher: do not repeat `--owners`,
 `--durability-tier`, `--fragment-mib`, `--coordinator-cache-mib`,
 `--shard-cache-mib`, `--write-profile-limit` or `--resident-reads` after `--`.
+The runner pins the frozen keyspace layout itself: it reads the fixture's
+`checkpoint_content` shape and sets `TH_DEFAULT_MUTEX_COUNT` from it (1 in this
+fixture), because the engine refuses a reopen that declares another count. The
+value is recorded in the result knobs and is not an operator knob.
 `--zone` belongs to `--gcloud-ssh` only; a campaign run takes the zone from the
 fleet state. No `--resume` is needed: the bucket ledger is always merged and a
 passed cell with the same config hash is skipped. `fault_cells.py --dry-run`

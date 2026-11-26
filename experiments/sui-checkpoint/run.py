@@ -11,6 +11,7 @@ import math
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -626,6 +627,32 @@ def external_durability_error(config, tier):
     return None
 
 
+def frozen_mutex_count(fixture):
+    """The mutex count the frozen producer's checkpoint keyspace declares.
+
+    The producer database is frozen data: its `checkpoint_content` shape records
+    one mutex per keyspace, and the engine refuses a reopen that declares another
+    count because it would misroute existing cells. A replay must therefore
+    declare exactly that count instead of inheriting a fork default.
+    """
+    shapes = sorted((Path(fixture) / 'producer').rglob('live/checkpoints/shape_v2.yaml'))
+    if len(shapes) != 1:
+        raise ValueError('the fixture must carry exactly one checkpoint keyspace shape')
+    current = None
+    for line in shapes[0].read_text().splitlines():
+        named = re.fullmatch(r'\s+name: (\S+)', line)
+        if named is not None:
+            current = named.group(1)
+            continue
+        counted = re.fullmatch(r'\s+mutexes: (\d+)', line)
+        if counted is not None and current == 'checkpoint_content':
+            count = int(counted.group(1))
+            if not 1 <= count <= 4096:
+                raise ValueError('the frozen mutex count is outside 1..4096')
+            return count
+    raise ValueError('the frozen checkpoint shape declares no checkpoint_content mutex count')
+
+
 INDEX_BLOB_CACHE_ENV = 'TH_INDEX_BLOB_CACHE_BYTES'
 INDEX_BLOB_CACHE_MIN_ENV = 'TH_INDEX_BLOB_CACHE_MIN_BYTES'
 # The frozen Sui row keeps this floor when no value is given; record it as the
@@ -650,12 +677,16 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
                         value_cache_size, default_value_cache_size, max_dirty_keys,
                         snapshot_written_bytes, max_maps, max_index_maps,
                         index_blob_cache_min_bytes, index_blob_cache_bytes,
-                        read_profile_limit, native_write_profile_limit):
+                        read_profile_limit, native_write_profile_limit, mutex_count):
     """One explicit env for the replay; unknown inherited TH_* is refused.
 
     A knob this runner does not pin stays unset, so the engine's fork default is
-    what the cell measures. `TH_MAX_MAPS`, `TH_MAX_INDEX_MAPS` and the mutex
-    count are therefore written only when a cell sets them.
+    what the cell measures; `TH_MAX_MAPS` and `TH_MAX_INDEX_MAPS` are therefore
+    written only when a cell sets them. The mutex count is different: the frozen
+    fixture and native schema record one mutex per keyspace, and the engine
+    refuses a reopen that declares another count because it would misroute
+    existing cells. It is therefore pinned from the frozen layout
+    (`frozen_mutex_count`), never inherited and never left to the fork default.
     """
     for name, value in (('max_maps', max_maps), ('max_index_maps', max_index_maps)):
         if value is not None and (type(value) is not int or not 3 <= value <= 32):
@@ -668,6 +699,7 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
            if not key.startswith(ENGINE_PREFIXES)}
     env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
                TH_SYNC_WRITES='true' if tier == 'synchronous' else 'false',
+               TH_DEFAULT_MUTEX_COUNT=str(mutex_count),
                TH_FRAG_SIZE=str(fragment_mib*deployment.MIB),
                TH_DEFAULT_MAX_DIRTY_KEYS=str(max_dirty_keys),
                TH_DEFAULT_VALUE_CACHE_SIZE=str(default_value_cache_size),
@@ -1291,6 +1323,7 @@ def main():
         configs[mode]=config
         (root/f'{mode}.yaml').write_text(yaml.dump(config,Dumper=checkpoint.ExperimentDumper))
     native_root,remote_root=(Path(configs[m]['db-path']) for m in ('native','remote'))
+    mutex_count = frozen_mutex_count(fixture)
     env = runtime_environment(os.environ,
         tier=args.durability_tier, fragment_mib=args.fragment_mib,
         driver_concurrency=args.driver_concurrency, pacing_ms=args.pacing_ms,
@@ -1302,7 +1335,8 @@ def main():
         index_blob_cache_min_bytes=args.index_blob_cache_min_bytes,
         index_blob_cache_bytes=args.index_blob_cache_mib * deployment.MIB,
         read_profile_limit=args.read_profile_limit,
-        native_write_profile_limit=args.native_write_profile_limit)
+        native_write_profile_limit=args.native_write_profile_limit,
+        mutex_count=mutex_count)
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
     owned=Owned(output,env)
     producer_env = checkpoint.source_environment(prior)
@@ -1318,7 +1352,9 @@ def main():
         knobs=dict(driver_concurrency=args.driver_concurrency, pacing_ms=args.pacing_ms,
                    pacing_available=pacing_available, checkpoints=args.checkpoints,
                    checkpoint_limit=tip, source_checkpoint_limit=source_tip,
-                   fragment_mib=args.fragment_mib, value_cache_size=args.value_cache_size,
+                   fragment_mib=args.fragment_mib, mutex_count=mutex_count,
+                   mutex_count_source='frozen fixture checkpoint_content layout',
+                   value_cache_size=args.value_cache_size,
                    default_value_cache_size=args.default_value_cache_size,
                    max_dirty_keys=args.max_dirty_keys,
                    snapshot_written_bytes=args.snapshot_written_bytes,
