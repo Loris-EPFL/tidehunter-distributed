@@ -20,6 +20,7 @@ from pathlib import Path
 import shutil
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -175,6 +176,7 @@ def install_package(store, identity, root):
 
 def main():
     import gcp_api
+    import gcp_poweroff
     import gcp_runtime
     import gcp_worker
 
@@ -183,6 +185,17 @@ def main():
     gcp_worker.metadata = metadata
     gcp_runtime.verify_fleet = verify_fleet
     gcp_worker.prepare_storage = prepare_storage
+
+    def recorded_poweroff(reason):
+        """Stand in for the ACPI stop: record the decision and end the guest."""
+        record = {'schema_version': 1, 'action': 'poweroff', 'reason': reason,
+                  'instance_id': str(identity['id']), 'instance_name': identity['name'],
+                  'recorded_epoch': time.time()}
+        path = Path('/rehearsal/work/poweroff.json')
+        path.write_text(json.dumps(record, sort_keys=True) + '\n')
+        print('rehearsal guest ' + identity['name'] + ': poweroff ' + reason, flush=True)
+        os._exit(0)
+
     api = gcp_api.GoogleApi(identity['project_id'], token_provider=lambda: 'rehearsal',
                             endpoint=endpoint)
     store = api.objects(identity['bucket'])
@@ -194,6 +207,10 @@ def main():
     runtime = install_package(store, identity, root)
     print('rehearsal guest ' + identity['name'] + ': gate released, package installed',
           flush=True)
+    threading.Thread(target=gcp_poweroff.serve_idle,
+                     kwargs={'config': runtime, 'host': identity, 'api': api,
+                             'poweroff_action': recorded_poweroff},
+                     daemon=True).start()
     gcp_worker.serve(runtime, api=api)
 
 

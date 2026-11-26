@@ -61,6 +61,22 @@ def token_expiry(expire_time, *, now=None):
     return now() + max(0, remaining - TOKEN_REFRESH_MARGIN_SECONDS)
 
 
+def mint_delegated_token(api, account):
+    """Mint one delegated token now and return (access token, expireTime)."""
+    if not isinstance(account, str) or not account:
+        raise ValueError('a delegated service account is required')
+    url = ('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/'
+           + urllib.parse.quote(account, safe='') + ':generateAccessToken')
+    body = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                       'lifetime': f'{TOKEN_LIFETIME_SECONDS}s'}).encode()
+    response = json.loads(api._request('POST', url, body,
+                                       {'Content-Type': 'application/json'}))
+    token = response.get('accessToken')
+    if not isinstance(token, str) or not token:
+        raise ValueError('IAM Credentials did not return an access token')
+    return token, response.get('expireTime')
+
+
 def delegated_token(api, account):
     """A provider that mints one delegated token and refreshes it before expiry.
 
@@ -71,8 +87,6 @@ def delegated_token(api, account):
     """
     if not isinstance(account, str) or not account:
         raise ValueError('a delegated service account is required')
-    url = ('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/'
-           + urllib.parse.quote(account, safe='') + ':generateAccessToken')
     lock = threading.Lock()
     state = {'token': None, 'refresh_at': 0.0}
 
@@ -80,18 +94,69 @@ def delegated_token(api, account):
         with lock:
             if state['token'] is not None and time.monotonic() < state['refresh_at']:
                 return state['token']
-            body = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
-                               'lifetime': f'{TOKEN_LIFETIME_SECONDS}s'}).encode()
-            response = json.loads(api._request('POST', url, body,
-                                               {'Content-Type': 'application/json'}))
-            token = response.get('accessToken')
-            if not isinstance(token, str) or not token:
-                raise ValueError('IAM Credentials did not return an access token')
+            token, expire_time = mint_delegated_token(api, account)
             state['token'] = token
-            state['refresh_at'] = token_expiry(response.get('expireTime'))
+            state['refresh_at'] = token_expiry(expire_time)
             return token
 
     return provider
+
+
+def token_remaining_seconds(expire_time):
+    """Wall-clock seconds until an IAM expireTime, or None when unparsable."""
+    if not isinstance(expire_time, str) or not expire_time:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(expire_time.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return (parsed - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+
+
+def require_paid_credentials(config, step, *, api=None, now=None):
+    """Refuse a paid step unless the user and the bench guest can mint now.
+
+    The workstation incident that motivated this gate was an expired rapt: every
+    stop path failed because it needed `gcloud` credentials. A paid step must
+    prove both identities with a live mint before it reserves anything. The
+    returned receipt records only hashes and the issue instant, never a token.
+    """
+    if not isinstance(step, str) or not step:
+        raise ValueError('a paid step name is required')
+    project = config.get('project_id') if isinstance(config, dict) else None
+    account = config.get('service_account') if isinstance(config, dict) else None
+    if not isinstance(project, str) or not project:
+        raise ValueError('a paid step requires project_id')
+    if not isinstance(account, str) or not account:
+        raise ValueError('a paid step requires service_account')
+    issued = time.time() if now is None else now
+    if type(issued) not in (int, float) or issued <= 0:
+        raise ValueError('invalid credential issue time')
+    try:
+        user_token = local_token(project)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError('gcloud auth login is required before a paid step') from exc
+    if not isinstance(user_token, str) or not user_token:
+        raise ValueError('gcloud auth did not return a user access token')
+    client = api or GoogleApi(project, token_provider=lambda: user_token)
+    guest_token, expire_time = mint_delegated_token(client, account)
+    remaining = token_remaining_seconds(expire_time)
+    if remaining is None or remaining <= TOKEN_REFRESH_MARGIN_SECONDS:
+        raise ValueError('delegated bench-guest token is not fresh')
+    return {'schema_version': 1, 'step': step, 'issued_epoch': issued,
+            'issued_utc': datetime.datetime.fromtimestamp(
+                issued, datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'user_token_sha256': hashlib.sha256(user_token.encode()).hexdigest(),
+            'guest_token_sha256': hashlib.sha256(guest_token.encode()).hexdigest(),
+            'guest_expire_time': expire_time,
+            'guest_remaining_seconds': int(remaining)}
+
+
+def record_credential_receipt(path, receipt):
+    """Write one gate receipt next to the step's durable output."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n')
 
 
 REHEARSAL_ENDPOINT = 'TIDEHUNTER_REHEARSAL_STORE'

@@ -35,6 +35,7 @@ import workflow_input
 import q0_campaign
 from q1_package import PROFILE as Q1_PROFILE
 from cloud_campaign import NVMEOF_PATH_SELECTIONS, REDRAIN_AB_SELECTION
+import gcp_api
 from gcp_api import ApiError
 from gcp_manual_storage import ACCOUNT, PROJECT, CredentialUnavailable, DelegatedArtifacts, TRANSPORT
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'sui-checkpoint'))
@@ -1481,6 +1482,13 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     source = receipt['source_sha256']
     gcp_runtime._sha(source)
     out = Path(output)
+    # Requalification and the campaign are paid. Both identities must mint a
+    # token now; otherwise stop before the output tree or any reservation.
+    credentials = await asyncio.to_thread(
+        gcp_api.require_paid_credentials, config,
+        'requalify' if qualification_only else 'campaign')
+    gcp_api.record_credential_receipt(
+        out.with_name(out.name + '-credentials-gate.json'), credentials)
     out.mkdir(parents=True, exist_ok=False)
     # Preflight does not make mutations or allocate and can refresh local credentials.
     await asyncio.to_thread(gcp_manual_preflight.permission_preflight, config, api=preflight_api)

@@ -221,6 +221,64 @@ remain required; powering off does not delete a VM or its boot disk. This
 reduces idle compute cost when the workstation loses credentials after a run;
 it does not replace the deadline for failures before durable export.
 
+#### Guest idle stop, short deadlines and the credential gate
+
+Every guest stops itself when the campaign is idle, so an expired workstation
+login cannot leave compute running. The idle window is `idle_stop_seconds` in
+`runtime.json` (default 1800, allowed 60 to 3600). Thirty minutes covers the
+5-7 minute input staging of one dispatch and an operator pause. The coordinator
+is idle only when no mailbox request is running and no admitted driver script
+under `<package_root>/source/` is active. A dispatched orchestrator request
+counts as activity for its whole duration; the request's own timeout bounds a
+hung request. The coordinator writes `runs/RUN/poweroff/heartbeat.json` while it
+is not idle. The owners do not scan their own processes; they stop when that
+heartbeat is stale, because the owner process groups are detached and only the
+coordinator knows whether more work is coming. An
+explicit operator takeover defers the idle stop, as it defers the terminal
+stop. Idle decisions are per-guest objects under `runs/RUN/poweroff/decisions/`.
+The guard is a separate systemd unit (`tidehunter-idle-RUN`) that the bootstrap
+starts next to the worker. It reads the worker's local SQLite mailbox state and
+the pending request objects, so it survives a worker crash and keeps
+`gcp_worker.py` out of the image recipe hash.
+
+A guest stop is `systemctl poweroff` from the guest OS. Compute Engine then sets
+the VM to `TERMINATED` and releases the compute resources; disk charges
+continue. `instanceTerminationAction=DELETE` applies only to preemption and to
+automatic termination by `terminationTime` or `maxRunDuration`; it does not
+apply to a guest stop. A stop also clears the scheduled termination timestamp,
+so the boot disk remains until the operator runs `delete`. The absolute
+deadline is still a guest stop: the bootstrap installs an `--on-calendar` unit
+that powers off at `deadline_utc`, and the worker does the same after its loop.
+The provider DELETE remains the backstop when the guest cannot run. A stopped
+guest can be restarted on the same boot disk: the bootstrap reuses an installed
+package whose source snapshot matches the admitted checksum and skips
+extraction, and the worker re-verifies the package manifest before it serves.
+The relevant limits are in the [stop documentation](https://cloud.google.com/compute/docs/instances/stop-start-instance#stop-vm-guest-os)
+and the [run-time limit documentation](https://cloud.google.com/compute/docs/instances/limit-vm-runtime).
+
+Fleets use one short stage window. `gcp_manual_compute.py create` defaults to
+`--minutes 90`; `--hours`, `--minutes` and `--deadline` are exclusive. The
+mailbox bounds every stage request by the remaining fleet deadline, so each
+stage's window is the fleet deadline. There is no supported in-place extension
+on a RUNNING VM: `gcloud compute instances set-scheduling` accepts
+`--termination-time` only on a `TERMINATED` VM ([reference](https://cloud.google.com/sdk/gcloud/reference/compute/instances/set-scheduling)),
+and `gcloud compute instances update` requires a `RESTART` for every scheduling
+property ([updatable properties](https://cloud.google.com/compute/docs/instances/update-instance-properties#updatable-properties));
+a Local SSD instance cannot take a restart-requiring update while it runs. A
+longer stage therefore uses a fresh short fleet.
+
+Every paid step (requalify, create, and each stage dispatch) calls
+`gcp_api.require_paid_credentials`. It mints a user token with
+`gcloud auth print-access-token` and a delegated bench-guest token with IAM
+Credentials. It refuses to continue when either mint fails or the delegated
+token expires within the 60-second refresh margin. It writes a receipt with the
+issue time and token hashes, never the tokens: `<state>.credentials.json` for
+create, `credentials-gate.json` next to the fleet state for a stage, and
+`<output>-credentials-gate.json` for requalify or campaign. Run
+`gcloud auth login` immediately before every paid stage. A cached access token
+is not proof that the refresh credential is usable; the incident's `invalid_rapt`
+required an interactive login.
+
 The pre-suite headroom probe creates 45 writable disposable sparse-file
 namespaces on each of five owners, with unique NQNs and host ACLs. The coordinator
 requests 1x32 queues, checks sysfs 2/31, and samples MR/QP/CQ/PD every 15
@@ -853,7 +911,7 @@ sha256sum $CAMPAIGN_ROOT/package/manifest.json
 
 ```sh
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE --hosts 3 --hours 5 \
+  --campaign $CAMPAIGN --state $STATE --hosts 3 --minutes 90 \
   --source-sha256 $BUNDLE --image $IMAGE --dry-run
 ```
 
@@ -867,7 +925,7 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py create \
 
 ```sh
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE --hosts 3 --hours 5 \
+  --campaign $CAMPAIGN --state $STATE --hosts 3 --minutes 90 \
   --source-sha256 $BUNDLE \
   --package $CAMPAIGN_ROOT/package --spec $CAMPAIGN_ROOT/runtime-spec.json \
   --revision $(git rev-parse HEAD) \
@@ -875,10 +933,14 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py create \
   --guest-root /mnt/tidehunter/sui-run-$RUN
 ```
 
-   `--hours 1..6` sets the absolute deadline; `--deadline <UTC ISO 8601>`
-   pins an exact time instead. A lost watcher cannot leak cost past that
-   deadline, because the provider deletes the instance itself. The command
-   prints the fleet with the internal and RDMA address of each host.
+   `--minutes` sets one short stage window and defaults to 90. `--hours`
+   and `--deadline <UTC ISO 8601>` are the explicit alternatives. The guest
+   powers off at the absolute deadline; the provider DELETE remains the
+   backstop when the guest cannot run. A stopped guest clears the scheduled
+   termination time, so run `delete` to remove its boot disk. There is no
+   supported in-place extension on a RUNNING VM; a longer stage uses a fresh
+   short fleet. The command prints the fleet with the internal and RDMA
+   address of each host.
 
    Without `--package` the gates stay shut: that is the shape the
    qualification fleet uses, where `manual_campaign.run` releases them with the
@@ -1053,20 +1115,25 @@ gcloud compute instances list --filter="labels.campaign=$CAMPAIGN" --format='val
 
 ### Operator checklist for one campaign run
 
-One fleet serves all three stages. Every command below runs on the workstation;
-the mailbox executor submits the work to the hosts, so no step needs SSH, IAP or
-a route to the internal addresses.
+Each fleet serves one short stage window (default 90 minutes). Delete it and
+create the next short fleet when a stage needs a new window; there is no
+in-place extension on a running VM. Every command below runs on the
+workstation; the mailbox executor submits the work to the hosts, so no step
+needs SSH, IAP or a route to the internal addresses. Run `gcloud auth login`
+immediately before each paid stage: steps 1, 3, 5, 6 and 7 refuse to start
+unless both the user and the delegated bench-guest identity can mint a token,
+and each writes a credential receipt.
 
 | Step | Command | Evidence it leaves |
 | --- | --- | --- |
 | 0. Seal | `prepare.py` (focused package) + `build.py prepare/build` (Sui bundle) | `package/manifest.json` sha256, `build-manifest.json` |
-| 1. Requalify | `manual_campaign.run(..., qualification_only=True)` on its own 3 hosts | `runs/<qualify run>/qualification/image-receipt.json` |
+| 1. Requalify | `manual_campaign.run(..., qualification_only=True)` on its own 3 hosts | image receipt, `<output>-credentials-gate.json` |
 | 2. Pin | `gcp_image_receipt.py --config experiments/gcp-rdma/config.json` | `image_qualification` in `config.json` |
-| 3. Create | `gcp_manual_compute.py create --package ... --spec ...` | fleet state, published package and runtime, gate per host |
+| 3. Create | `gcp_manual_compute.py create --minutes 90 --package ... --spec ...` | fleet state, `<state>.credentials.json`, published package and runtime, gate per host |
 | 4. Ready | `gcp_manual_compute.py ready --state $STATE` | `worker-ready.json` per host with Local SSD evidence |
-| 5. Stage 1 | `manual_sui.py --fleet-state $STATE`, `fault_cells.py --cell S1-*` | stage-1 ledger entries, `evidence/` and `raw/` |
-| 6. Stage 2 | `fault_cells.py --cell M6-*` (or `M9-*`, `M13-*`) | stage-2 ledger entries |
-| 7. Stage 3 | `stage3_campaign.py --mode cluster --calibrate --resume` | stage-3 ledger entries, probe and calibration |
+| 5. Stage 1 | `manual_sui.py --fleet-state $STATE`, `fault_cells.py --cell S1-*` | `credentials-gate.json`, stage-1 ledger entries, `evidence/` and `raw/` |
+| 6. Stage 2 | `fault_cells.py --cell M6-*` (or `M9-*`, `M13-*`) | `credentials-gate.json`, stage-2 ledger entries |
+| 7. Stage 3 | `stage3_campaign.py --mode cluster --calibrate --resume` | `credentials-gate.json`, stage-3 ledger entries, probe and calibration |
 | 8. Delete | `gcp_manual_compute.py delete --state $STATE` | delete proof per host, disk and policy |
 | 9. Verify | four `gcloud ... list --filter` commands | no row for hosts, disks, policy or campaign label |
 
@@ -1082,7 +1149,7 @@ python3 experiments/gcp-rdma/gcp_image_receipt.py --spec /absolute/qualify/recei
   --object runs/<qualify run id>/qualification/image-receipt.json --generation <generation>
 # 3. create the three campaign hosts and boot the workers
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE --hosts 3 --hours 5 --source-sha256 $BUNDLE \
+  --campaign $CAMPAIGN --state $STATE --hosts 3 --minutes 90 --source-sha256 $BUNDLE \
   --package $CAMPAIGN_ROOT/package --spec $CAMPAIGN_ROOT/runtime-spec.json \
   --revision $(git rev-parse HEAD) --guest-root /mnt/tidehunter/sui-run-$RUN
 # 4. wait for every worker
@@ -1135,6 +1202,22 @@ bundle (1.1 GB), the fixture (752 MB), the native schema, the external
 preparations and the storage binary. The bucket ledger is authoritative; a
 resumed cell merges it before it starts, and a passed cell whose knobs changed
 reruns in a fresh output tree.
+
+### Local idle-stop rehearsal
+
+The free rehearsal runs the real worker and the real idle decision in three
+Rocky 9 containers. Only the ACPI poweroff is a recorded action inside each
+container.
+
+```sh
+python3 experiments/gcp-rdma/rehearse_fleet.py --cells idle_stop
+```
+
+The command uses a 60-second test window. It PASSes only when a dispatched
+request longer than the window keeps all three containers up, and when all
+three record `poweroff_idle` after the request ends and the window expires. A
+full rehearsal keeps the production 1800-second window unless `--idle-seconds`
+is given explicitly.
 
 ### Image requalification for the campaign fleet
 

@@ -494,6 +494,20 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('remaining = int(deadline - time.time())', script)
         self.assertIn("if remaining <= 0: raise TimeoutError('worker startup expired')", script)
         self.assertIn("'--on-calendar='", script)
+        self.assertIn("'/usr/bin/systemctl', 'poweroff'", script)
+        self.assertIn("'--unit=tidehunter-idle-'", script)
+        self.assertIn("'serve-idle'", script)
+
+    def test_a_restarted_guest_reuses_the_matching_package(self):
+        script = gcp_bootstrap.startup_script('valid-bucket', 'run', 'a' * 64,
+                                              '2030-01-01T00:00:00Z')
+        self.assertIn("if target.exists():", script)
+        self.assertIn("if not target.is_dir(): raise ValueError('package target is not a directory')",
+                      script)
+        self.assertNotIn('package target already exists', script)
+        self.assertIn("if json.loads(config_path.read_text()) != runtime:", script)
+        self.assertIn("if hashlib.sha256((target / 'source.zip').read_bytes()).hexdigest() "
+                      "!= c['source_sha256']:", script)
 
 
 class CampaignCommandTests(unittest.TestCase):

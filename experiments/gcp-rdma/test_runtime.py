@@ -903,6 +903,15 @@ class SuiRuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.RuntimeSafetyError):
             self.build(spec)
 
+    def test_the_idle_window_is_recorded_and_bounded(self):
+        spec = {'suite': 'sui', 'mode': 'sui', 'owners': 2, 'backends': ['native']}
+        config = self.build(spec)
+        self.assertEqual(config['idle_stop_seconds'], runtime.IDLE_STOP_SECONDS)
+        for value in (59, 3601, '900'):
+            with self.subTest(value=value), \
+                    self.assertRaises(runtime.RuntimeSafetyError):
+                runtime.validate_runtime(dict(config, idle_stop_seconds=value))
+
 
 if __name__ == '__main__':
     unittest.main()

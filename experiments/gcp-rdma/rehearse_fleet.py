@@ -13,7 +13,11 @@ local (see `rehearse_guest.py`). The laptop runs the real operator sequence:
      schema through the mailbox, runs `prepare_external.py` on the guest,
      installs the owner archives and starts the owner process groups;
   4. dispatch one `fault_cells.py` cell and the `stage3_campaign.py` cluster
-     probe the same way.
+     probe the same way;
+  5. optionally exercise the idle guard (`--cells idle_stop`): a request longer
+     than the test idle window holds every guest up, and every guest records
+     its poweroff after the request ends and the window expires. The poweroff
+     is a recorded action inside each container, not a real stop.
 
 The containers have no nvmet, so every cell must stop exactly at kernel NVMe-oF
 provisioning. A cell passes only when it reached the owner start and an owner
@@ -251,7 +255,8 @@ class Rehearsal:
             {'project_id': PROJECT, 'project_number': PROJECT_NUMBER,
              'bucket': BUCKET, 'service_account':
                  'bench-guest@mysten-research.iam.gserviceaccount.com',
-             'machine_type': MACHINE_TYPE}, indent=2) + '\n')
+             'machine_type': MACHINE_TYPE,
+             'idle_stop_seconds': self.args.idle_seconds}, indent=2) + '\n')
         config = json.loads(self.config_path.read_text())
         # The receipt source is the fleet identity; a build-bundle SHA would
         # bind every gate to an identity no guest can match.
@@ -533,6 +538,63 @@ class Rehearsal:
             raise Failure('the schema names no database')
         return json.loads(manifests[0].read_text())['namespace']
 
+    # ---- idle guard ----------------------------------------------------
+    def guest_file(self, host, name):
+        return self.work / 'guests' / host['name'] / name
+
+    def poweroff_record(self, host):
+        path = self.guest_file(host, 'poweroff.json')
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def idle_stop(self):
+        """A long request holds the fleet; an idle fleet records poweroff.
+
+        The rehearsal window is intentionally short (`--idle-seconds`). The
+        worker and the real decision code run unchanged; only the ACPI poweroff
+        is a recorded action (`rehearse_guest.recorded_poweroff`).
+        """
+        idle = self.args.idle_seconds
+        coordinator = self.fleet_hosts[0]['name']
+        args = type('Args', (), {
+            'gcloud_ssh': False, 'zone': ZONE, 'fleet_state': self.state_path,
+            'fleet_config': self.config_path, 'guest_token': False,
+            'iap': False, 'tunnel_through_iap': False})()
+        remote = mailbox_exec.open_executor(args)
+        hold = idle + 20
+        marker = self.guest_file(self.fleet_hosts[0], 'long-request.started')
+        reference = remote.submit(
+            coordinator, f'echo started > /rehearsal/work/long-request.started; sleep {hold}',
+            timeout_seconds=hold + 60)
+        deadline = time.monotonic() + 60
+        while not marker.exists():
+            if time.monotonic() > deadline:
+                raise Failure('the long request did not start')
+            time.sleep(1)
+        # The request must still be running when the idle window has passed.
+        time.sleep(idle + 10)
+        stopped = [host['name'] for host in self.fleet_hosts
+                   if self.poweroff_record(host) is not None]
+        self.step('idle stop: a long request holds the fleet', not stopped,
+                  ('running=' + coordinator + ', no poweroff after '
+                   + str(idle + 10) + ' s') if not stopped
+                  else 'stopped during the request: ' + ', '.join(stopped))
+        remote.finish(coordinator, reference)
+        # H0 stops one window after its last activity; the owners observe a
+        # stale heartbeat one poll window later, so allow two windows.
+        deadline = time.monotonic() + 2 * idle + 120
+        pending = {host['name'] for host in self.fleet_hosts}
+        while pending and time.monotonic() < deadline:
+            pending = {name for name in pending
+                       if self.poweroff_record(next(h for h in self.fleet_hosts
+                                                    if h['name'] == name)) is None}
+            if pending:
+                time.sleep(2)
+        records = {host['name']: self.poweroff_record(host) for host in self.fleet_hosts}
+        reasons = {name: (record or {}).get('reason') for name, record in records.items()}
+        ok = not pending and all(reason == 'poweroff_idle' for reason in reasons.values())
+        self.step('idle stop: every guest powered off when idle', ok,
+                  ', '.join(f'{name}={reasons[name]}' for name in sorted(reasons)))
+
     # ---- teardown and summary ------------------------------------------
     def stop(self):
         for name in reversed(self.containers):
@@ -589,10 +651,16 @@ def main():
     parser.add_argument('--fault-cell', default='M6-w1-c16')
     parser.add_argument('--cells',
                         default='manual_sui,manual_sui_controller_loss,fault_cells,stage3',
-                        help='comma-separated cells to run')
+                        help='comma-separated cells to run; add idle_stop for the '
+                             'guest idle guard (use it alone with a short window)')
+    parser.add_argument('--idle-seconds', type=int, default=None,
+                        help='guest idle window; defaults to 60 for --cells idle_stop '
+                             'and 1800 otherwise')
     parser.add_argument('--keep', action='store_true',
                         help='keep the containers and the store for inspection')
     args = parser.parse_args()
+    if args.idle_seconds is None:
+        args.idle_seconds = 60 if args.cells.strip() == 'idle_stop' else 1800
     if args.revision is None:
         args.revision = run(['git', '-C', str(ENGINE), 'rev-parse', 'HEAD']).stdout.strip()
     rehearsal = Rehearsal(args)

@@ -149,6 +149,66 @@ class ObjectCopy(unittest.TestCase):
             gcp_api.ObjectStore(api, 'bucket').copy('a', 'b')
 
 
+class PaidCredentialGate(unittest.TestCase):
+    def config(self):
+        return {'project_id': 'mysten-research',
+                'service_account': 'bench-guest@mysten-research.iam.gserviceaccount.com'}
+
+    def test_the_gate_mints_both_identities_and_records_hashes(self):
+        import hashlib
+        api = FakeIam([('guest-token', expire_in(3600))])
+        with mock.patch.object(gcp_api, 'local_token', return_value='user-token'):
+            receipt = gcp_api.require_paid_credentials(
+                self.config(), 'create', api=api, now=1000)
+        self.assertEqual(receipt['issued_epoch'], 1000)
+        self.assertEqual(receipt['step'], 'create')
+        self.assertEqual(receipt['user_token_sha256'],
+                         hashlib.sha256(b'user-token').hexdigest())
+        self.assertEqual(receipt['guest_token_sha256'],
+                         hashlib.sha256(b'guest-token').hexdigest())
+        self.assertTrue(receipt['guest_expire_time'].endswith('Z'))
+        self.assertGreater(receipt['guest_remaining_seconds'], 60)
+        self.assertNotIn('user-token', json.dumps(receipt))
+        self.assertNotIn('guest-token', json.dumps(receipt))
+
+    def test_the_gate_refuses_an_unfresh_delegation(self):
+        api = FakeIam([('guest-token', expire_in(10))])
+        with mock.patch.object(gcp_api, 'local_token', return_value='user-token'):
+            with self.assertRaisesRegex(ValueError, 'not fresh'):
+                gcp_api.require_paid_credentials(self.config(), 'stage1', api=api, now=1000)
+
+    def test_the_gate_refuses_a_missing_user_or_guest_identity(self):
+        with mock.patch.object(gcp_api, 'local_token', return_value=''):
+            with self.assertRaisesRegex(ValueError, 'user access token'):
+                gcp_api.require_paid_credentials(self.config(), 'create', now=1000)
+        with self.assertRaises(ValueError):
+            gcp_api.require_paid_credentials(
+                {'project_id': 'p'}, 'create', now=1000)
+
+    def test_a_rejected_impersonation_propagates(self):
+        class Denied:
+            def _request(self, *args, **kwargs):
+                raise gcp_api.ApiError(401, 'invalid_rapt')
+        with mock.patch.object(gcp_api, 'local_token', return_value='user-token'):
+            with self.assertRaises(gcp_api.ApiError):
+                gcp_api.require_paid_credentials(self.config(), 'create',
+                                                 api=Denied(), now=1000)
+
+    def test_the_receipt_is_written_next_to_the_step(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fleet.json.credentials.json'
+            gcp_api.record_credential_receipt(path, {'step': 'create', 'issued_epoch': 1})
+            self.assertEqual(json.loads(path.read_text()),
+                             {'step': 'create', 'issued_epoch': 1})
+
+    def test_remaining_seconds_handles_bad_expiry(self):
+        self.assertIsNone(gcp_api.token_remaining_seconds(None))
+        self.assertIsNone(gcp_api.token_remaining_seconds('not-a-time'))
+        self.assertGreater(gcp_api.token_remaining_seconds(expire_in(120)), 100)
+
+
 class RehearsalEndpoint(unittest.TestCase):
     def test_a_loopback_endpoint_is_admitted(self):
         with mock.patch.dict('os.environ', {gcp_api.REHEARSAL_ENDPOINT:

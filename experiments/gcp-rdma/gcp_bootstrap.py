@@ -58,27 +58,32 @@ if (runtime['run_id'] != c['run_id'] or runtime['source_sha256'] != c['source_sh
     runtime['package'] != package or package['source_sha256'] != c['source_sha256'] or
     package['object_key'] != base + 'package.tar'):
     raise ValueError('runtime/package binding mismatch')
-raw = get(package['object_key'], package['generation'])
-if hashlib.sha256(raw).hexdigest() != package['sha256']: raise ValueError('package checksum mismatch')
 root = pathlib.Path('/mnt/tidehunter') / c['run_id']
-root.mkdir(mode=0o700, parents=True, exist_ok=True)
 target = root / 'package'
-if target.exists(): raise ValueError('package target already exists')
-target.mkdir(mode=0o700)
-archive = root / 'package.tar'
-with archive.open('xb') as f: f.write(raw)
-with tarfile.open(archive, 'r:gz') as tar:
-    names, size = set(), 0
-    for member in tar:
-        p = pathlib.PurePosixPath(member.name)
-        size += member.size
-        if (p.is_absolute() or '..' in p.parts or not member.isfile() or member.name in names or
-            size > 536870912 or len(names) >= 20000): raise ValueError('unsafe package archive')
-        names.add(member.name)
-        path = target.joinpath(*p.parts)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tar.extractfile(member) as source, path.open('xb') as destination: shutil.copyfileobj(source, destination)
-        path.chmod(0o755 if member.mode & 0o111 else 0o644)
+if target.exists():
+    # A guest that stopped itself can restart on the same boot disk. Reuse the
+    # installed package: the source below must match the admitted snapshot, and
+    # the worker re-verifies the whole package manifest before it serves.
+    if not target.is_dir(): raise ValueError('package target is not a directory')
+else:
+    raw = get(package['object_key'], package['generation'])
+    if hashlib.sha256(raw).hexdigest() != package['sha256']: raise ValueError('package checksum mismatch')
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target.mkdir(mode=0o700)
+    archive = root / 'package.tar'
+    with archive.open('xb') as f: f.write(raw)
+    with tarfile.open(archive, 'r:gz') as tar:
+        names, size = set(), 0
+        for member in tar:
+            p = pathlib.PurePosixPath(member.name)
+            size += member.size
+            if (p.is_absolute() or '..' in p.parts or not member.isfile() or member.name in names or
+                size > 536870912 or len(names) >= 20000): raise ValueError('unsafe package archive')
+            names.add(member.name)
+            path = target.joinpath(*p.parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tar.extractfile(member) as source, path.open('xb') as destination: shutil.copyfileobj(source, destination)
+            path.chmod(0o755 if member.mode & 0o111 else 0o644)
 if hashlib.sha256((target / 'source.zip').read_bytes()).hexdigest() != c['source_sha256']:
     raise ValueError('source snapshot checksum mismatch')
 with zipfile.ZipFile(target / 'source.zip') as source:
@@ -104,16 +109,22 @@ def startup_script(bucket, run_id, source_sha256, deadline_utc):
 set -euo pipefail
 export PATH=''' + shlex.quote(gcp_runtime.GUEST_PATH) + '''
 exec ''' + shlex.quote(gcp_runtime.GUEST_PYTHON) + ''' - <<'TIDEHUNTER_BOOTSTRAP'
-''' + preamble + '''# Stop this run's control worker; GCE DELETE bounds the VM and separate workload units.
+''' + preamble + '''# Power off this guest at the absolute deadline. A guest stop releases the
+# compute resources without operator credentials; GCE DELETE remains the
+# backstop when this startup script never reached the guest.
 subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-expire-' + c['run_id'],
                 '--on-calendar=' + datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-                '/usr/bin/systemctl', 'stop', 'tidehunter-worker-' + c['run_id'] + '.service'], check=True, timeout=30)
+                '/usr/bin/systemctl', 'poweroff'], check=True, timeout=30)
 ''' + _fetch_program() + '''
 subprocess.run(['mount', '--bind', str(target), str(target)], check=True, timeout=30)
 subprocess.run(['mount', '-o', 'remount,bind,ro', str(target)], check=True, timeout=30)
 config_path = root / 'runtime.json'
-with config_path.open('x') as f: json.dump(runtime, f, sort_keys=True)
-os.chmod(config_path, 0o600)
+if config_path.exists():
+    if json.loads(config_path.read_text()) != runtime:
+        raise ValueError('existing runtime differs from the admitted runtime')
+else:
+    with config_path.open('x') as f: json.dump(runtime, f, sort_keys=True)
+    os.chmod(config_path, 0o600)
 worker = target / 'source/experiments/gcp-rdma/gcp_worker.py'
 remaining = int(deadline - time.time())
 if remaining <= 0: raise TimeoutError('worker startup expired')
@@ -124,5 +135,17 @@ subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-worker-'
                 '--property=LimitMEMLOCK=infinity', '--property=RuntimeMaxSec=' + str(remaining),
                 '--property=TimeoutStopSec=1',
                 c['guest_python'], str(worker), str(config_path)], check=True, timeout=30)
+# The idle guard is a separate process so a worker crash cannot leave compute
+# running and so gcp_worker.py stays out of the image recipe hash.
+guard = target / 'source/experiments/gcp-rdma/gcp_poweroff.py'
+guard_remaining = int(deadline - time.time())
+if guard_remaining <= 0: raise TimeoutError('idle guard startup expired')
+subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-idle-' + c['run_id'],
+                '--setenv=PATH=' + c['guest_path'],
+                '--property=Restart=on-failure', '--property=RestartSec=3',
+                '--property=KillMode=control-group',
+                '--property=RuntimeMaxSec=' + str(guard_remaining),
+                '--property=TimeoutStopSec=1',
+                c['guest_python'], str(guard), 'serve-idle', str(config_path)], check=True, timeout=30)
 TIDEHUNTER_BOOTSTRAP
 ''')

@@ -28,6 +28,14 @@ MACHINE_RAM_MIB = {'z4m-highmem-16': 122_000_000_000 // 2**20,
 REPLAY_HOST_RESERVE_MIB = 8 * 1024  # Kernel, services, and host page cache.
 REPLAY_OBSERVED_PEAK_MIB = 16 * 1024  # P13 peaked at its cap; the uncapped peak is unknown.
 REPLAY_CLIENT_TARGET_MIB = 32 * 1024
+# A guest stops itself after this much time with no mailbox request and no
+# coordinator driver. The value is recorded in runtime.json, bounded, and can be
+# shortened only for the free local rehearsal. Thirty minutes covers the 5-7
+# minute input staging of one dispatch plus an operator pause; the incident this
+# guard addresses idled for five hours.
+IDLE_STOP_SECONDS = 1800
+IDLE_MIN_SECONDS = 60
+IDLE_MAX_SECONDS = 3600
 
 
 def replay_client_memory_mib(machine_type, requested=None):
@@ -164,6 +172,9 @@ def validate_runtime(config):
     if (type(grace) is not int or type(hard_cap) is not int or grace < 0
             or hard_cap < grace or hard_cap > 21600):
         raise RuntimeSafetyError('invalid guest poweroff timing')
+    idle = config.get('idle_stop_seconds', IDLE_STOP_SECONDS)
+    if type(idle) is not int or not IDLE_MIN_SECONDS <= idle <= IDLE_MAX_SECONDS:
+        raise RuntimeSafetyError('invalid guest idle stop window')
     package = config['package']
     if (package.get('source_sha256') != config['source_sha256']
         or package.get('object_key') != 'runs/' + config['run_id'] + '/package.tar'
@@ -299,6 +310,9 @@ def build_runtime_config(launch_config, fleet, package_receipt, spec, deadline_u
     for key in ('poweroff_grace_seconds', 'poweroff_hard_cap_seconds'):
         if key in launch_config:
             config[key] = launch_config[key]
+    # The guard runs on every guest, so its window is part of the immutable
+    # runtime, not a worker default that could drift from the launch record.
+    config['idle_stop_seconds'] = launch_config.get('idle_stop_seconds', IDLE_STOP_SECONDS)
     if 'live_qualification' in launch_config:
         config['live_qualification'] = launch_config['live_qualification']
     if policy is not None:

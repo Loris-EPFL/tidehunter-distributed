@@ -793,6 +793,14 @@ class ManualCampaignTest(unittest.TestCase):
 
 
 class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # The gate has its own tests; these cases exercise the run lifecycle.
+        self.credentials = patch.object(
+            manual.gcp_api, 'require_paid_credentials',
+            return_value={'schema_version': 1, 'step': 'campaign', 'issued_epoch': 0})
+        self.credentials.start()
+        self.addCleanup(self.credentials.stop)
+
     async def test_status_poll_retries_credentials_until_success(self):
         state = parent()
         state['deadline'] = manual._utc(time.time() + 300)

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -94,7 +95,9 @@ class Store:
             attrs['sha256'] = sha256
             index['objects'][key] = {'generation': generation, 'size': size,
                                      'sha256': sha256, 'metadata': attrs,
-                                     'contentType': content_type}
+                                     'contentType': content_type,
+                                     'timeCreated': time.strftime(
+                                         '%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
             self._save(index)
         return self.head(key)
 
@@ -122,7 +125,8 @@ class Store:
             raise Missing()
         return {'name': key, 'generation': str(record['generation']),
                 'size': record['size'], 'metadata': dict(record['metadata']),
-                'contentType': record['contentType'], 'bucket': self.root.name}
+                'contentType': record['contentType'], 'bucket': self.root.name,
+                'timeCreated': record.get('timeCreated')}
 
     def read(self, key, generation=None, max_bytes=MAX_BYTES):
         descriptor = self._lock(False)
