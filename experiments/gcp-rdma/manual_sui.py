@@ -136,15 +136,22 @@ def controller_loss_cell_id(stage, point, tier, cell_id='sui-replay'):
 def controller_loss_addresses(fixture):
     """The live coordinator's JSON-RPC and metrics endpoints.
 
-    `run.py` replays the remote backend with the fixture's `remote` mode, so its
-    endpoints are the ones the injector and the gate must observe.
+    `run.py` replays the remote backend from the fixture's `distributed.yaml`
+    and writes its own `<output>/remote.yaml`; the fixture carries no
+    `remote.yaml`, so the distributed template is the campaign's source.
     """
-    config = checkpoint.configuration(Path(fixture), 'remote')
+    fixture = Path(fixture)
+    for name in ('remote', 'distributed'):
+        if (fixture / f'{name}.yaml').is_file():
+            config = checkpoint.configuration(fixture, name)
+            break
+    else:
+        raise ValueError('the fixture has no remote or distributed config')
     values = []
     for name in ('json-rpc-address', 'metrics-address'):
         value = config.get(name)
         if not isinstance(value, str) or not value:
-            raise ValueError(f'the fixture remote config has no {name}')
+            raise ValueError(f'the fixture {name} is missing')
         values.append(value)
     return values[0], values[1]
 

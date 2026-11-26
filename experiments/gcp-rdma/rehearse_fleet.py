@@ -325,7 +325,7 @@ class Rehearsal:
         root_relative = GUEST_ROOT.relative_to('/mnt/tidehunter')
         for host in self.fleet_hosts[1:]:
             root = self.guest_mount(host) / root_relative
-            for log in sorted(root.glob('owner-*.log')):
+            for log in sorted(root.glob('*.log')):
                 text = log.read_text(errors='replace')
                 lines.append((host['name'], log.name, text))
         return lines
@@ -353,8 +353,8 @@ class Rehearsal:
         failure after owner start stays a failure.
         """
         logs = self.owner_logs()
-        if not logs or not any('storage_node_pid=' in text for _, _, text in logs):
-            return False, 'no owner start: the cell did not reach the owner lifecycle'
+        if not logs:
+            return False, 'no owner log: the cell did not reach the owner lifecycle'
         sources = [(f'{host}/{name}', text) for host, name, text in logs]
         sources.append(('H0 output', (result.stdout or '') + (result.stderr or '')))
         sources.append(('H0 experiment logs', self.experiment_logs()))

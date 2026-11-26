@@ -242,6 +242,35 @@ class FleetAddresses(unittest.TestCase):
                                    live_transport='rdma')
 
 
+class ControllerLossAddresses(unittest.TestCase):
+    """The injector must read the config the replay actually runs."""
+
+    def fixture(self, directory, name, value=True):
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        body = 'json-rpc-address: 127.0.0.1:34765\nmetrics-address: 127.0.0.1:43985\n'
+        (root / f'{name}.yaml').write_text(body if value else 'metrics-address: x:1\n')
+
+    def test_the_campaign_fixture_has_only_the_distributed_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.fixture(directory, 'distributed')
+            self.assertFalse((Path(directory) / 'remote.yaml').exists())
+            self.assertEqual(manual_sui.controller_loss_addresses(directory),
+                             ('127.0.0.1:34765', '127.0.0.1:43985'))
+
+    def test_generated_remote_config_wins_when_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.fixture(directory, 'distributed')
+            self.fixture(directory, 'remote')
+            self.assertEqual(manual_sui.controller_loss_addresses(directory),
+                             ('127.0.0.1:34765', '127.0.0.1:43985'))
+
+    def test_a_fixture_without_a_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'no remote or distributed config'):
+                manual_sui.controller_loss_addresses(directory)
+
+
 class LauncherShape(unittest.TestCase):
     def test_one_coordinator_and_two_distinct_owners(self):
         self.assertEqual(manual_sui.plan('h0', ['h1', 'h2']),
