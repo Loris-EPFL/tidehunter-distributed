@@ -781,6 +781,27 @@ class TierPreparation(unittest.TestCase):
             self.assertEqual(manifest['transport'], {'kind': 'tcp'})
             self.assertEqual(manifest['live_transport'], 'rdma')
 
+    def test_the_tier_parent_exists_when_the_preparer_runs(self):
+        """A fresh campaign root has no `external` parent directory."""
+        seen = []
+
+        def fake_run(command, **kwargs):
+            if '--durability-tier' not in command:
+                return self.real_run(command, **kwargs)
+            output = Path(command[command.index('--output') + 1])
+            seen.append(output.parent.is_dir())
+            preparation(output, command[command.index('--durability-tier') + 1],
+                        guest=Path(command[command.index('--guest-root') + 1]))
+            return mock.Mock(returncode=0)
+
+        self.assertFalse((self.base / 'root').exists())
+        with mock.patch.object(stage3_campaign.subprocess, 'run', fake_run):
+            stage3_campaign.prepare_externals(
+                root=self.base / 'root', build=self.build, schema=self.schema,
+                fleet_state=self.state, owners=['H1', 'H2'],
+                guest_root=Path('/mnt/tidehunter/sui-run-bench'))
+        self.assertEqual(seen, [True, True])
+
     def test_a_retry_in_the_same_fleet_reuses_the_preparation(self):
         self.prepare()
         before = len(self.commands)

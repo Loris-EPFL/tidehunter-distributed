@@ -823,6 +823,9 @@ def prepare_externals(*, root, build, schema, fleet_state, owners, guest_root):
     if not source.is_file():
         raise SystemExit(f'the build bundle has no prepare_external.py: {source}')
     control, live = fleet_addresses(fleet_state, owners)
+    # `deployment.prepare` creates only the tier directory, not its parent, and
+    # a fresh campaign root has no `external` directory yet.
+    (root / 'external').mkdir(parents=True, exist_ok=True)
     items = []
     for tier in stage3_specs.TIERS:
         directory = root / 'external' / tier
