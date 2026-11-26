@@ -103,8 +103,10 @@ def wait_gate(store, prefix, identity, deadline):
         if (not isinstance(script, str)
                 or hashlib.sha256(script.encode()).hexdigest() != gate.get('sha256')):
             raise ValueError('gate checksum mismatch')
-        if 'gcp_worker.py' not in script:
-            raise ValueError('gate script does not start the worker')
+        # The real gate verifies the identity, reads this script's object and
+        # executes it. Its body must be the bootstrap that starts the worker.
+        if 'gate.json' not in script or 'exec' not in script:
+            raise ValueError('gate script does not release the bootstrap')
         return gate
     raise TimeoutError('gate was not released before the deadline')
 
