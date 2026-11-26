@@ -1220,6 +1220,60 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertEqual([kind for kind, verb, _ in api.mutations if verb == 'delete'],
                          ['instance'] * 3 + ['policy'])
 
+    def test_a_resume_of_the_recorded_fleet_creates_and_deletes_nothing(self):
+        api = FakeMcp(None, self.config, self.state_path)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__):
+            self.create()
+            state = json.loads(self.state_path.read_text())
+            mutations = list(api.mutations)
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3',
+                '--deadline', state['deadline'], '--source-sha256', SOURCE))
+        # Every host and boot disk of the run is present, so the prefix is
+        # untouched and the recorded fleet is resumed instead of re-created.
+        self.assertEqual(report['control_purge']['present'],
+                         [kind + ':' + state['run_id'] + '-' + str(index)
+                          for index in range(3) for kind in ('instance', 'disk')])
+        self.assertIsNone(report['control_purge']['removed'])
+        self.assertEqual(api.mutations, mutations)
+        self.assertEqual(len(json.loads(self.state_path.read_text())['instances']), 3)
+
+    def test_a_capacity_rejection_deletes_the_partial_fleet(self):
+        class Capacity(FakeMcp):
+            """No z4m capacity for the third host."""
+
+            async def __call__(self, argv):
+                if argv[:3] == ['compute', 'instances', 'create'] and argv[3].endswith('-2'):
+                    return {'text': json.dumps({'error': {
+                        'code': 'ZONE_RESOURCE_POOL_EXHAUSTED',
+                        'errors': [{'code': 'ZONE_RESOURCE_POOL_EXHAUSTED'}]}})}
+                return await super().__call__(argv)
+
+        api = Capacity(None, self.config, self.state_path)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            code = gcp_manual_compute.main(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', SOURCE))
+        self.assertEqual(code, 1)
+        self.assertIn('ZONE_RESOURCE_POOL_EXHAUSTED', error.getvalue())
+        # The two hosts that did exist are gone rather than billing to the
+        # deadline, and the policy with them.
+        self.assertEqual(api.resources['instance'], {})
+        self.assertEqual(api.resources['disk'], {})
+        self.assertEqual(api.resources['policy'], {})
+        self.assertEqual([kind for kind, verb, _ in api.mutations if verb == 'delete'],
+                         ['instance', 'instance', 'policy'])
+        state = json.loads(self.state_path.read_text())
+        rejected = next(record for record in state['instances']
+                        if record['name'].endswith('-2'))
+        self.assertEqual(rejected['create_rejection'], 'ZONE_RESOURCE_POOL_EXHAUSTED')
+        self.assertFalse(rejected['uncertain'])
+
     def test_create_calls_the_infrastructure_preflight(self):
         transport = FakeMcp(None, self.config, self.state_path).__call__
         with mock.patch.object(gcp_manual_compute, 'admit_image',

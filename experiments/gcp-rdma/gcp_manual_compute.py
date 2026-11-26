@@ -1146,21 +1146,22 @@ async def create(config, args):
         save(args.state, state)
         await compute.create_policy()
     fleet = []
-    for index in range(state['host_count']):
-        record = next((item for item in state['instances'] if item.get('name') == state['run_id'] + '-' + str(index)), None)
-        if record is not None and record.get('fleet') and not record.get('uncertain'):
-            fleet.append(record['fleet'])
-            continue
-        fleet.append(await compute.create_vm(index, image['path'], state['deadline'], gate))
     released = None
     try:
+        for index in range(state['host_count']):
+            record = next((item for item in state['instances'] if item.get('name') == state['run_id'] + '-' + str(index)), None)
+            if record is not None and record.get('fleet') and not record.get('uncertain'):
+                fleet.append(record['fleet'])
+                continue
+            fleet.append(await compute.create_vm(index, image['path'], state['deadline'], gate))
         if await compute.admit_guests() != fleet:
             raise ComputeError('guest fleet identity changed before admission')
         if args.role == 'campaign' and args.package is not None:
             released = _release_workers(config, state, args, fleet, args.state)
     except BaseException:
-        # The hosts exist and bill. A publication that raises must not leave
-        # them waiting on a closed gate until the DELETE deadline.
+        # The hosts exist and bill. A partial fleet, a failed publication or a
+        # refused admission must not leave them waiting on a closed gate until
+        # the DELETE deadline.
         await _abandon_fleet(compute, state, args.state)
         raise
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
