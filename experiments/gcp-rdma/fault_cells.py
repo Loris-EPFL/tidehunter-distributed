@@ -180,6 +180,9 @@ class Cluster:
         control, live = manual_sui.fleet_hosts(
             getattr(self.remote, 'fleet', None), self.owners,
             transport=self.transport, live_transport=self.live_transport)
+        # Every later host key is the prepared manifest's address, so the
+        # deployment and the executor name the same host.
+        self.owners = list(control)
         command = [sys.executable,
                    str(self.build_root / 'sources/tidehunter-sharded-wal/experiments/'
                        'sui-checkpoint/prepare_external.py'),
