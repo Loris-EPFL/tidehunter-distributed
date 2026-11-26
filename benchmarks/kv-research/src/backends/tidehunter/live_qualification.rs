@@ -4,7 +4,7 @@ use crate::workload::{key_bytes, value_bytes};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +16,11 @@ struct Input {
     expected_route: String,
     durability_tier: String,
     value_bytes: usize,
+    /// Ask the external kernel supervisor to delete the active write
+    /// controller and require a W1 resume. Off for every caller that does not
+    /// supervise the injection.
+    #[serde(default)]
+    controller_loss: bool,
 }
 // This is diagnostic state, never a successful qualification receipt. Updating
 // it is best-effort so an evidence I/O error cannot replace the actual failure.
@@ -1091,6 +1096,196 @@ fn qualify_abrupt_child(
     Ok(child_evidence)
 }
 
+/// The controller of the database's active write queue, as the engine's own
+/// route evidence names it, with the namespace descriptor this process holds.
+struct ActiveWriteController {
+    nqn: String,
+    controller: String,
+    instance: u64,
+    sysfs_inode: u64,
+    namespace_path: PathBuf,
+    namespace_descriptors: usize,
+}
+
+impl ActiveWriteController {
+    fn from_route(route: &serde_json::Value) -> BackendResult<Self> {
+        let identity = route["namespace_identity"]
+            .as_object()
+            .ok_or("active write namespace identity unavailable")?;
+        let nqn = identity["nqn"]
+            .as_str()
+            .ok_or("active write NQN unavailable")?;
+        let instance = identity["controller_instance"]
+            .as_u64()
+            .ok_or("active write controller instance unavailable")?;
+        let sysfs_inode = identity["controller"]["sysfs_inode"]
+            .as_u64()
+            .ok_or("active write controller inode unavailable")?;
+        let namespace_path = PathBuf::from(
+            identity["namespace_path"]
+                .as_str()
+                .ok_or("active write namespace path unavailable")?,
+        );
+        Ok(Self {
+            nqn: nqn.to_owned(),
+            controller: format!("nvme{instance}"),
+            instance,
+            sysfs_inode,
+            namespace_descriptors: open_descriptors(&namespace_path)?,
+            namespace_path,
+        })
+    }
+
+    /// The kernel state of the pinned controller, or `None` once its sysfs
+    /// entry is gone.
+    fn state(&self) -> Option<String> {
+        std::fs::read_to_string(format!("/sys/class/nvme/{}/state", self.controller))
+            .ok()
+            .map(|state| state.trim().to_owned())
+    }
+
+    fn sysfs_matches(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(format!("/sys/class/nvme/{}", self.controller))
+            .is_ok_and(|meta| meta.ino() == self.sysfs_inode)
+    }
+
+    fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "nqn": self.nqn,
+            "controller": self.controller,
+            "controller_instance": self.instance,
+            "sysfs_inode": self.sysfs_inode,
+            "namespace_path": self.namespace_path,
+            "namespace_descriptors": self.namespace_descriptors,
+            "state": self.state(),
+        })
+    }
+}
+
+/// The number of this process's open descriptors that name `path`.
+fn open_descriptors(path: &Path) -> BackendResult<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        match std::fs::read_link(entry.path()) {
+            Ok(target) if target == path => count += 1,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("read {}: {error}", entry.path().display()).into());
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Delete the active write controller from outside and require a W1 resume.
+///
+/// The request file names the controller, its sysfs inode, its namespace and
+/// this process, so an external supervisor deletes exactly the controller that
+/// serves the writes. This proof asserts the pre-delete facts itself: the pin
+/// is `live`, its sysfs inode matches the route evidence, and this process
+/// holds an open descriptor on the namespace. After the deletion the next write
+/// must resume through a new verified controller for the same NQN, with a new
+/// sysfs inode and no data-plane error.
+fn qualify_controller_loss(
+    input: &Input,
+    db: &std::sync::Arc<sui::Db>,
+    ks: tidehunter::key_shape::KeySpace,
+    output: &Path,
+    progress: &mut QualificationProgress,
+    clean: &serde_json::Value,
+) -> BackendResult<serde_json::Value> {
+    let routes = writer_routes(clean)?;
+    check(
+        routes.len() == 1,
+        "controller loss requires exactly one active write route",
+    )?;
+    let controller = ActiveWriteController::from_route(&routes[0])?;
+    check(
+        controller.state().as_deref() == Some("live"),
+        "the active write controller is not live before the loss",
+    )?;
+    check(
+        controller.sysfs_matches(),
+        "the active write controller inode differs from the route evidence",
+    )?;
+    check(
+        controller.namespace_descriptors > 0,
+        "the coordinator holds no descriptor on the active write namespace",
+    )?;
+    let request = serde_json::json!({
+        "schema": 1, "kind": "w1_controller_loss_request",
+        "phase": "controller_loss",
+        "pid": std::process::id(),
+        "host_nqn": routes[0]["host_nqn"],
+        "address": routes[0]["address"],
+        "service": routes[0]["service"],
+        "target": controller.evidence(),
+    });
+    let request_path = output.join("controller-loss-ready.json");
+    fs::write(&request_path, serde_json::to_vec_pretty(&request)?)?;
+    fs::File::open(output)?.sync_all()?;
+    progress.mark("controller_loss_requested", Some(db));
+    // The supervisor deletes the controller it was told about. The kernel's own
+    // sysfs state is the signal: the pinned entry is gone, or no longer live.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = controller.state();
+        if !controller.sysfs_matches() || state.as_deref().is_some_and(|state| state != "live") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            "the active write controller was not deleted before the deadline",
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    progress.mark("controller_loss_observed", Some(db));
+    let lost_key = key_bytes(&input.namespace, 41, 1);
+    let lost_value = value_bytes(&input.namespace, 43, 1, 65536, 1.0);
+    db.insert(ks, lost_key.clone(), lost_value.clone())
+        .map_err(native_error)?;
+    read_expected(db, ks, &lost_key, Some(&lost_value))?;
+    let after = stats(db)?;
+    check(
+        delta(clean, &after, "resume_attempts")? >= 1,
+        "the controller loss did not start a write-resume episode",
+    )?;
+    check(
+        delta(clean, &after, "namespace_connects")? >= 1,
+        "the controller loss did not connect a new verified controller",
+    )?;
+    check(
+        delta(clean, &after, "errors")? == 0,
+        "the controller-loss resume recorded a data-plane error",
+    )?;
+    let identities = controller_identities(&after)?;
+    let (instance, inode) = identities
+        .get(&controller.nqn)
+        .copied()
+        .ok_or("the resumed write path recorded no controller for the lost NQN")?;
+    check(
+        inode != controller.sysfs_inode,
+        "the resumed write path reused the deleted controller's sysfs inode",
+    )?;
+    verify_routes(&after, &input.expected_route)?;
+    Ok(serde_json::json!({
+        "kind": "w1_controller_loss",
+        "deleted": controller.evidence(),
+        "resumed": {
+            "controller_instance": instance,
+            "sysfs_inode": inode,
+            "resume_attempts": delta(clean, &after, "resume_attempts")?,
+            "resume_rewrites": delta(clean, &after, "resume_rewrites")?,
+            "resume_frames": delta(clean, &after, "resume_frames")?,
+            "namespace_connects": delta(clean, &after, "namespace_connects")?,
+        },
+        "after": after,
+    }))
+}
+
 pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
     let (input, input_bytes) = read_input(input_path)?;
     validate_tier(&input)?;
@@ -1268,6 +1463,21 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         "live I/O errors or unknown writes",
     )?;
     verify_routes(&before_close, &input.expected_route)?;
+    // The external supervisor deletes the controller the engine's own writer
+    // route names, and the next write must resume through a new one. It runs
+    // after every clean-state check and before the graceful close.
+    let controller_loss = if input.controller_loss {
+        Some(qualify_controller_loss(
+            &input,
+            &db,
+            ks,
+            output,
+            &mut progress,
+            &before_close,
+        )?)
+    } else {
+        None
+    };
     progress.mark("before_graceful_close", Some(&db));
     db.wait_for_background_threads_to_finish()
         .map_err(native_error)?;
@@ -1433,7 +1643,9 @@ pub(super) fn run(input_path: &Path, output: &Path) -> BackendResult<()> {
         },
         "after_crash_reads": after_crash_reads, "target_reuse": target_reuse,
         "target_shutdown": target_shutdown,
-        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_write_protect":true,"cache_miss_hit":true,"target_reuse":true,"abrupt_controller_adoption":true}
+        "controller_loss": controller_loss,
+        "controller_loss_requested": input.controller_loss,
+        "checks": {"scalar_write_delete":true,"mixed_batch":true,"ordered_batch_missing_exists":true,"checkpoint_iteration":true,"flush_reopen":true,"abrupt_tail_recovery":true,"fence_write_protect":true,"cache_miss_hit":true,"target_reuse":true,"abrupt_controller_adoption":true,"w1_controller_loss":controller_loss.is_some()}
     });
     fs::write(
         output.join("qualification.json"),

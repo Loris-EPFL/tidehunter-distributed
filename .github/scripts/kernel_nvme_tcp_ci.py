@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -257,6 +258,114 @@ def interrupted(signum, _frame):
     raise RuntimeError(f"CI proof interrupted by signal {signum}")
 
 
+class ControllerLossSupervisor(threading.Thread):
+    """Delete the active write controller each tier's proof asks for.
+
+    The qualification proof writes `controller-loss-ready.json` naming its own
+    process, the controller, that controller's sysfs inode and its namespace.
+    This thread answers every request once: it re-proves the inode and the
+    coordinator's namespace descriptor, writes `delete_controller`, waits for
+    the sysfs entry to disappear, and records the injection next to the
+    request. A request that does not describe a live controller, or a
+    controller that does not disappear, is an error, never a pass.
+    """
+
+    def __init__(self, root, deadline, *, poll=0.1):
+        super().__init__(name="controller-loss-supervisor", daemon=True)
+        self.root = Path(root)
+        self.deadline = deadline
+        self.poll = poll
+        self.stop_event = threading.Event()
+        self.records = []
+        self.error = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        seen = set()
+        try:
+            while not self.stop_event.wait(self.poll):
+                for request in sorted(self.root.rglob("controller-loss-ready.json")):
+                    if request in seen:
+                        continue
+                    seen.add(request)
+                    self.records.append(inject_controller_loss(request))
+                if time.monotonic() >= self.deadline:
+                    break
+        except BaseException as error:  # reported by the caller, never masked
+            self.error = error
+
+
+def inject_controller_loss(request_path, *, controller_root=Path("/sys/class/nvme"),
+                           proc_root=Path("/proc"), delete=None, wait_seconds=30.0):
+    """Delete one requested controller after proving it serves this write path.
+
+    The roots and the delete action are injectable so a test drives the whole
+    decision without a kernel controller. `delete` receives the controller's
+    sysfs directory and must remove it, as the kernel does.
+    """
+    request = json.loads(Path(request_path).read_text())
+    target = request.get("target") or {}
+    controller = target.get("controller")
+    inode = target.get("sysfs_inode")
+    namespace = target.get("namespace_path")
+    pid = request.get("pid")
+    nqn = target.get("nqn")
+    if request.get("kind") != "w1_controller_loss_request":
+        raise RuntimeError(f"unexpected controller-loss request kind: {request.get('kind')!r}")
+    if not (isinstance(controller, str) and re.fullmatch(r"nvme[0-9]+", controller)):
+        raise RuntimeError(f"invalid controller name: {controller!r}")
+    if target.get("state") != "live":
+        raise RuntimeError(f"the requested controller is not live: {target.get('state')!r}")
+    if not (isinstance(inode, int) and isinstance(pid, int) and pid > 0
+            and isinstance(namespace, str)):
+        raise RuntimeError("incomplete controller-loss request identity")
+    path = Path(controller_root) / controller
+    live_inode = path.stat().st_ino
+    if live_inode != inode:
+        raise RuntimeError("the requested controller inode differs from the live one")
+    descriptor_dir = Path(proc_root) / str(pid) / "fd"
+    try:
+        descriptors = list(descriptor_dir.iterdir())
+    except OSError as error:
+        raise RuntimeError(
+            'the coordinator holds no descriptor on the requested namespace: '
+            f'{error}') from error
+    held = []
+    for descriptor in descriptors:
+        try:
+            if os.readlink(descriptor) == namespace:
+                held.append(descriptor.name)
+        except OSError:
+            continue
+    if not held:
+        raise RuntimeError("the coordinator holds no descriptor on the requested namespace")
+    evidence = {"schema": 1, "kind": "w1_controller_loss_injection",
+                "requested": True, "injected": False,
+                "controller": controller, "sysfs_inode": inode, "nqn": nqn,
+                "namespace_path": namespace, "coordinator_pid": pid,
+                "coordinator_descriptors": sorted(held),
+                "request": str(request_path)}
+    started = time.monotonic()
+    if delete is None:
+        (path / "delete_controller").write_text("1\n")
+    else:
+        delete(path)
+    evidence["delete_issued"] = True
+    deadline = started + wait_seconds
+    while path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    evidence["removed"] = not path.exists()
+    evidence["removed_seconds"] = time.monotonic() - started
+    evidence["injected"] = evidence["removed"]
+    Path(request_path).with_name("controller-loss-injection.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+    if not evidence["removed"]:
+        raise RuntimeError(f"controller {controller} did not disappear after delete_controller")
+    return evidence
+
+
 def run(args):
     sys.path.insert(0, str(ROOT / "experiments/kv-comparison"))
     import local_multiowner_check
@@ -337,22 +446,42 @@ def qualify(args):
     seconds = 180
     trace = NvmetTrace()
     trace.arm()
+    supervisor = ControllerLossSupervisor(output, time.monotonic() + seconds)
+    supervisor.start()
     try:
         try:
             proof, evidence = _kernel_live_worker(
                 output, args.binary, "tcp", seconds, time.time() + seconds,
-                owner_wal_file_bytes=8 * 1024**2)
+                owner_wal_file_bytes=8 * 1024**2, controller_loss=True)
         except BaseException:
             # Capture while the buffer still holds the failing tier's events,
             # then let the proof's own exception carry the verdict.
             trace.disarm()
             trace.capture_failure(root / "failure-trace")
             raise
+        finally:
+            supervisor.stop()
+            supervisor.join(timeout=10)
         trace.disarm()
+        if supervisor.error is not None:
+            raise RuntimeError(f"controller-loss supervision failed: {supervisor.error!r}")
+        if not supervisor.records or not all(row["injected"] for row in supervisor.records):
+            raise RuntimeError("controller-loss injection was not confirmed for every tier")
+        qualifications = sorted(output.rglob("qualification.json"))
+        if len(qualifications) != 2:
+            raise RuntimeError(f"expected two tier proofs, found {len(qualifications)}")
+        for proof_path in qualifications:
+            tier_proof = json.loads(proof_path.read_text())
+            loss = tier_proof.get("controller_loss") or {}
+            if (tier_proof.get("checks", {}).get("w1_controller_loss") is not True
+                    or loss.get("resumed", {}).get("sysfs_inode") in (None, loss.get("deleted", {}).get("sysfs_inode"))):
+                raise RuntimeError(f"controller-loss resume unproven in {proof_path}")
         after = inventory()
         dump(output / "after.json", after)
         result = {"complete": proof["complete"], "fixture_removed": proof["fixture_removed"],
                   "inventory_restored": before == after, "evidence": str(evidence.relative_to(root)),
+                  "controller_loss": {"injections": len(supervisor.records),
+                                      "tiers": len(qualifications)},
                   "elapsed_seconds": round(time.monotonic() - started, 3),
                   "nvmet_trace": "armed" if trace.root is not None else "unavailable"}
         dump(root / "summary.json", {"wal_replay": result})

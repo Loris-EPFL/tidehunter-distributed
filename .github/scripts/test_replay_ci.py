@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,45 @@ def write_cleanup_state(state, proof, prewrite=None, before=None):
             continue
         (state / name).mkdir()
         kernel.dump(state / name / "proof.json", value)
+
+
+def write_tier_proofs(output, *, resumed_inode=2):
+    """Write one qualification receipt per tier, as the worker does."""
+    for tier in ("native", "synchronous"):
+        native = output / f"kernel-live-test-{tier}" / tier / "native"
+        native.mkdir(parents=True)
+        kernel.dump(native / "qualification.json", {
+            "controller_loss": {
+                "deleted": {"controller": "nvme1", "sysfs_inode": 1},
+                "resumed": {"controller_instance": 2, "sysfs_inode": resumed_inode},
+            },
+            "checks": {"w1_controller_loss": True},
+        })
+
+
+class InjectedSupervisor:
+    """A supervisor double: it answers one request per tier."""
+
+    def __init__(self, root, deadline):
+        self.records = []
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def join(self, timeout=None):
+        self.records = [{"injected": True}, {"injected": True}]
+
+    error = None
+
+
+class MissingSupervisor(InjectedSupervisor):
+    """A supervisor double that answered no request."""
+
+    def join(self, timeout=None):
+        self.records = []
 
 
 class ReplayCITests(unittest.TestCase):
@@ -104,14 +144,18 @@ class ReplayCITests(unittest.TestCase):
                 args = argparse.Namespace(state=state, binary=state / "binary")
                 calls = []
 
-                def worker(output, binary, route, seconds, deadline, *, owner_wal_file_bytes):
+                def worker(output, binary, route, seconds, deadline, *,
+                           owner_wal_file_bytes, controller_loss):
                     self.assertEqual((binary, route), (args.binary, "tcp"))
                     self.assertEqual(owner_wal_file_bytes, 8 * 1024**2)
+                    self.assertTrue(controller_loss)
                     self.assertEqual(output.name, "wal_replay")
                     calls.append(output.name)
+                    write_tier_proofs(output)
                     return ({"complete": complete, "fixture_removed": clean}, output / "evidence")
 
                 with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                        patch.object(kernel, "ControllerLossSupervisor", InjectedSupervisor), \
                         patch.object(kernel.signal, "signal"), \
                         patch.object(kernel, "inventory", side_effect=[{}, {} if restored else {"leak": True}, {}]):
                     if clean and restored:
@@ -124,6 +168,94 @@ class ReplayCITests(unittest.TestCase):
                 summary = json.loads((state / "single-owner/summary.json").read_text())
                 self.assertEqual(list(summary), expected)
                 self.assertEqual(summary["wal_replay"]["inventory_restored"], restored)
+                self.assertEqual(summary["wal_replay"]["controller_loss"],
+                                 {"injections": 2, "tiers": 2})
+
+    def test_a_controller_loss_without_a_proven_resume_gates_the_qualification(self):
+        import argparse
+        import local_dry_run_targets
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            args = argparse.Namespace(state=state, binary=state / "binary")
+
+            def worker(output, *_args, **_kwargs):
+                write_tier_proofs(output, resumed_inode=1)
+                return ({"complete": True, "fixture_removed": True}, output / "evidence")
+
+            with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                    patch.object(kernel, "ControllerLossSupervisor", InjectedSupervisor), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(kernel, "inventory", return_value={}):
+                with self.assertRaisesRegex(RuntimeError, "controller-loss resume unproven"):
+                    kernel.qualify(args)
+
+    def test_an_uninjected_controller_loss_gates_the_qualification(self):
+        import argparse
+        import local_dry_run_targets
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            args = argparse.Namespace(state=state, binary=state / "binary")
+
+            def worker(output, *_args, **_kwargs):
+                write_tier_proofs(output)
+                return ({"complete": True, "fixture_removed": True}, output / "evidence")
+
+            with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                    patch.object(kernel, "ControllerLossSupervisor", MissingSupervisor), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(kernel, "inventory", return_value={}):
+                with self.assertRaisesRegex(RuntimeError, "injection was not confirmed"):
+                    kernel.qualify(args)
+
+    def test_controller_loss_injection_deletes_only_the_requested_controller(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sysfs = root / "sys-class-nvme"
+            controller = sysfs / "nvme7"
+            controller.mkdir(parents=True)
+            (controller / "state").write_text("live\n")
+            live_inode = controller.stat().st_ino
+            kept = sysfs / "nvme8"
+            kept.mkdir()
+            (kept / "state").write_text("live\n")
+            namespace = root / "dev" / "nvme7n1"
+            namespace.parent.mkdir()
+            namespace.write_text("")
+            fd = root / "proc" / "4242" / "fd"
+            fd.mkdir(parents=True)
+            (fd / "3").symlink_to(namespace)
+
+            def request(name, *, inode=live_inode, pid=4242):
+                path = root / name
+                path.write_text(json.dumps({
+                    "kind": "w1_controller_loss_request", "pid": pid,
+                    "target": {"controller": "nvme7", "sysfs_inode": inode,
+                               "nqn": "nqn.2026-01.test:owner",
+                               "namespace_path": str(namespace), "state": "live"}}))
+                return path
+
+            deleted = []
+            def delete(path):
+                deleted.append(path.name)
+                shutil.rmtree(path)
+            roots = dict(controller_root=sysfs, proc_root=root / "proc", delete=delete)
+            # A stale inode and a process without the namespace are refused
+            # before any delete is issued.
+            for name, values, message in (
+                    ("stale.json", dict(inode=live_inode + 1), "inode differs"),
+                    ("no-descriptor.json", dict(pid=4243), "no descriptor")):
+                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                    kernel.inject_controller_loss(request(name, **values), **roots)
+            self.assertEqual(deleted, [])
+            record = kernel.inject_controller_loss(request("ready.json"), **roots)
+            self.assertEqual(deleted, ["nvme7"])
+            self.assertTrue(record["injected"])
+            self.assertEqual(record["coordinator_descriptors"], ["3"])
+            self.assertFalse(controller.exists(), "the requested controller is deleted")
+            self.assertTrue(kept.is_dir(), "an unrelated controller is never touched")
+            evidence = json.loads((root / "controller-loss-injection.json").read_text())
+            self.assertEqual(evidence, record)
+
 
     def test_prewrite_pass_gates_the_run(self):
         import argparse

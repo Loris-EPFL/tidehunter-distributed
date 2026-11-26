@@ -725,7 +725,7 @@ def _kernel_live_prepare_input(guest, control_endpoint, transport, addr, service
 
 
 def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
-                        owner_wal_file_bytes=None):
+                        owner_wal_file_bytes=None, controller_loss=False):
     import hashlib
     import shutil
     import signal
@@ -911,7 +911,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             input_path = directory / "qualification.json"
             input_path.write_text(json.dumps({"remote_config": remote, "coordinator_path": str(directory / "database"),
                 "namespace": list(uuid.uuid4().bytes), "expected_route": transport,
-                "durability_tier": tier, "value_bytes": 1024}))
+                "durability_tier": tier, "value_bytes": 1024,
+                "controller_loss": controller_loss}))
             budget = remaining(seconds) - 75
             if budget <= 0:
                 raise TimeoutError("insufficient cleanup reserve")

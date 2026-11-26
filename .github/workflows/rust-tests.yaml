@@ -298,6 +298,7 @@ jobs:
             echo "### Kernel NVMe/TCP recovery proofs"
             echo "Kernel: $(uname -r)"
             echo "Single-owner abrupt-crash recovery (gating): both history modes, both tiers."
+            echo "Single-owner controller loss (gating): the active write controller is deleted and the next write must resume through a new controller."
             if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/single-owner/summary.json" ]; then
               echo '```json'
               cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/single-owner/summary.json"
