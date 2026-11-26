@@ -86,9 +86,9 @@ class Failure(RuntimeError):
     pass
 
 
-def run(argv, *, check=True, capture=True, env=None):
+def run(argv, *, check=True, capture=True, env=None, errors='strict'):
     result = subprocess.run([str(item) for item in argv], text=True,
-                            capture_output=capture, env=env, timeout=1800)
+                            errors=errors, capture_output=capture, env=env, timeout=1800)
     if check and result.returncode != 0:
         raise Failure('command failed: ' + ' '.join(map(str, argv)) + '\n'
                       + (result.stderr or '')[-4000:])
@@ -478,9 +478,10 @@ class Rehearsal:
         relative = ('root' if self.current_cell == 'root'
                     else 'out/' + self.current_cell)
         script = ('find ' + shlex.quote('/c/' + relative)
-                  + ' -type f -name "*.log" -print -exec cat {} \\; 2>/dev/null')
+                  + ' -type d -name full_node_db -prune -o -type f -name "*.log"'
+                  + ' -print -exec cat {} \\; 2>/dev/null')
         result = run(['docker', 'run', '--rm', '-v', str(campaign) + ':/c:ro', IMAGE,
-                      'sh', '-c', script], check=False)
+                      'sh', '-c', script], check=False, errors='replace')
         return result.stdout or ''
 
     def wall(self, cell, result):

@@ -8,6 +8,7 @@ predicate before the publish. Both run here without Docker or a cloud store.
 import hashlib
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -186,6 +187,43 @@ class WallScope(unittest.TestCase):
         self.assertIn('/c/root', command)
         self.assertNotIn('/c/out', command)
 
+    def test_experiment_logs_skip_database_wal_files(self):
+        command = self.log_command('manual_sui')
+        self.assertIn('-type d -name full_node_db -prune', command)
+
+    def test_a_binary_database_log_cannot_abort_the_evidence_read(self):
+        experiment = self.campaign / 'out' / 'manual_sui' / 'experiment'
+        experiment.mkdir(parents=True)
+        (experiment / 'remote.log').write_text(
+            'owner 0: nvmet is not on mounted configfs\n')
+        wal = self.campaign / 'out' / 'manual_sui' / 'remote' / 'full_node_db' / 'live'
+        wal.mkdir(parents=True)
+        (wal / '001775.log').write_bytes(b'\xff\xfeRocksDB WAL\x00')
+        script = self.log_command('manual_sui').replace('/c/', str(self.campaign) + '/')
+        result = subprocess.run(['sh', '-c', script], text=True, errors='replace',
+                                capture_output=True, check=True)
+        self.assertIn('nvmet', result.stdout)
+        self.assertNotIn('001775.log', result.stdout)
+
+    def test_experiment_logs_read_invalid_bytes_with_replacement(self):
+        captured = {}
+
+        class Result:
+            stdout = 'nvmet'
+
+        def fake_run(argv, **kwargs):
+            captured.update(kwargs)
+            return Result()
+
+        rehearsal = self.rehearsal('manual_sui')
+        original = rehearse_fleet.run
+        rehearse_fleet.run = fake_run
+        try:
+            rehearsal.experiment_logs()
+        finally:
+            rehearse_fleet.run = original
+        self.assertEqual(captured.get('errors'), 'replace')
+
     def test_another_cells_marker_does_not_pass_a_cell(self):
         rehearsal = self.rehearsal('fault_cells_M6-w1-c16')
         rehearsal.owner_logs = lambda: [('H1', 'owner.log', 'owner started')]
@@ -195,6 +233,12 @@ class WallScope(unittest.TestCase):
         ok, detail = rehearsal.wall('fault_cells', result)
         self.assertFalse(ok)
         self.assertIn('no kernel NVMe-oF failure', detail)
+
+
+class RunDecoding(unittest.TestCase):
+    def test_non_utf8_process_output_is_replaced(self):
+        result = rehearse_fleet.run(['sh', '-c', 'printf "a\\377b"'], errors='replace')
+        self.assertEqual(result.stdout, 'a\ufffdb')
 
 
 if __name__ == '__main__':
