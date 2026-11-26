@@ -510,7 +510,8 @@ class KernelGeometryAdmissionTests(unittest.TestCase):
     GEOMETRY = {"io_queues": 1, "queue_size": 32, "poll_queues": 0}
 
     def setUp(self):
-        self.live = {"host_id": [1] * 16, "address": "10.99.0.2", "service": 4420}
+        self.live = {"host_id": [1] * 16, "address": "10.99.0.2", "service": 4420,
+                     "io_timeout_ms": 30000}
         self.first = campaign.effective_live_owner(self.live, "aa" * 16, 0)
         self.second = campaign.effective_live_owner(self.live, "bb" * 16, 0)
 
@@ -521,7 +522,8 @@ class KernelGeometryAdmissionTests(unittest.TestCase):
                     "controller_instance": instance,
                     "nqn": owner["subsystem_scope"] + "sub-00000000-0000-0000-0000-000000000001",
                     "controller": {"queue_count": queue_count, "sqsize": sqsize,
-                                   "sysfs_device": 22, "sysfs_inode": inode}}}
+                                   "sysfs_device": 22, "sysfs_inode": inode,
+                                   "keep_alive_tmo": 5}}}
 
     def lifecycles(self, first=None, second=None):
         return [("writer_routes", [self.route(self.first, 0)] if first is None else first, self.first),
@@ -530,7 +532,8 @@ class KernelGeometryAdmissionTests(unittest.TestCase):
 
     def admit(self, lifecycles, record=None):
         record = {} if record is None else record
-        targets._admit_kernel_geometry(record, lifecycles, self.GEOMETRY)
+        targets._admit_kernel_geometry(record, lifecycles, self.GEOMETRY,
+                                       self.live["io_timeout_ms"])
         return record
 
     def refuse(self, lifecycles, pattern):
@@ -557,11 +560,23 @@ class KernelGeometryAdmissionTests(unittest.TestCase):
         self.refuse(self.lifecycles(first=[route]), "controller record missing at writer_routes")
 
     def test_incomplete_or_mistyped_controller_record_is_refused(self):
-        for change in ({"sysfs_inode": None}, {"queue_count": "2"}, {"extra": 1}):
+        for change in ({"sysfs_inode": None}, {"queue_count": "2"}, {"keep_alive_tmo": None},
+                       {"extra": 1}):
             with self.subTest(change=change):
                 route = self.route(self.first, 0)
                 route["namespace_identity"]["controller"].update(change)
                 self.refuse(self.lifecycles(first=[route]), "controller record missing")
+
+    def test_wrong_keep_alive_is_refused(self):
+        route = self.route(self.first, 0)
+        route["namespace_identity"]["controller"]["keep_alive_tmo"] = 4
+        self.refuse(self.lifecycles(first=[route]),
+                    "keep_alive_tmo=4; the engine derives 5 for io_timeout_ms=30000")
+
+    def test_keep_alive_matches_the_resume_budget(self):
+        for io_timeout_ms, expected in ((50, 1), (1000, 2), (2000, 4), (2500, 5), (30000, 5)):
+            with self.subTest(io_timeout_ms=io_timeout_ms):
+                self.assertEqual(targets.kernel_keep_alive_tmo(io_timeout_ms), expected)
 
     def test_wrong_queue_count_is_refused(self):
         self.refuse(self.lifecycles(first=[self.route(self.first, 0, queue_count=5)]),

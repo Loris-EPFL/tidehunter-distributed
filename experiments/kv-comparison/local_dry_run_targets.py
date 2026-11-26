@@ -549,17 +549,31 @@ def _kernel_live_ports(address, *, commissioning_address, control_address, state
     raise TargetError(f"no free adjacent non-ephemeral kernel NVMe services ({busy} bind conflicts)")
 
 
-def _admit_kernel_geometry(record, lifecycles, geometry):
+def kernel_keep_alive_tmo(io_timeout_ms):
+    """The keep-alive the engine requests for this resume budget.
+
+    Mirrors `live_connect::keep_alive_tmo`: the largest whole second below
+    `2 x io_timeout_ms`, clamped to the kernel range 1..=5. The target's
+    keep-alive expiry must fit inside the resume budget of two I/O deadlines.
+    """
+    if type(io_timeout_ms) is not int or io_timeout_ms <= 0:
+        raise TargetError("kernel io_timeout_ms must be a positive integer")
+    return max(1, min(5, io_timeout_ms // 500))
+
+
+def _admit_kernel_geometry(record, lifecycles, geometry, io_timeout_ms):
     """Admit the controllers the client itself recorded, per database lifecycle.
 
     Each lifecycle is (step, routes, effective owner). A route must name the owner and carry exactly
-    one controller record of the configured geometry. One controller serves several routes, so routes
-    may repeat a (sysfs_device, sysfs_inode) pair, but all routes of one pair must agree on controller
-    instance, subsystem, host and geometry. The kernel reuses instance numbers: the same name under
-    another pair is a new controller and is admitted.
+    one controller record of the configured geometry and keep-alive. One controller serves several
+    routes, so routes may repeat a (sysfs_device, sysfs_inode) pair, but all routes of one pair must
+    agree on controller instance, subsystem, host, geometry and keep-alive. The kernel reuses
+    instance numbers: the same name under another pair is a new controller and is admitted.
     """
     queue_count = geometry["io_queues"] + geometry["poll_queues"] + 1
     sqsize = geometry["queue_size"] - 1
+    keep_alive_tmo = kernel_keep_alive_tmo(io_timeout_ms)
+    controller_keys = {"queue_count", "sqsize", "sysfs_device", "sysfs_inode", "keep_alive_tmo"}
     import cloud_campaign as campaign
 
     admitted = []
@@ -575,10 +589,15 @@ def _admit_kernel_geometry(record, lifecycles, geometry):
             controller = identity.get("controller")
             instance = identity.get("controller_instance")
             if (not isinstance(controller, dict)
-                    or set(controller) != {"queue_count", "sqsize", "sysfs_device", "sysfs_inode"}
+                    or set(controller) != controller_keys
                     or any(type(value) is not int for value in controller.values())
                     or type(instance) is not int or instance < 0):
                 raise TargetError(f"live controller geometry not proven: controller record missing at {step}")
+            if controller["keep_alive_tmo"] != keep_alive_tmo:
+                raise TargetError(
+                    f"live controller geometry not proven: {step} controller nvme{instance} has "
+                    f"keep_alive_tmo={controller['keep_alive_tmo']}; the engine derives "
+                    f"{keep_alive_tmo} for io_timeout_ms={io_timeout_ms}")
             if (controller["queue_count"], controller["sqsize"]) != (queue_count, sqsize):
                 raise TargetError(f"live controller geometry not proven: {step} controller nvme{instance} has "
                                   f"queue_count={controller['queue_count']}, sqsize={controller['sqsize']}; "
@@ -586,7 +605,7 @@ def _admit_kernel_geometry(record, lifecycles, geometry):
             # The sysfs device is shared by every sysfs entry: only the pair names one directory.
             pair = (controller["sysfs_device"], controller["sysfs_inode"])
             facts = (instance, identity["nqn"], route["host_nqn"], tuple(route["host_id"]),
-                     controller["queue_count"], controller["sqsize"])
+                     controller["queue_count"], controller["sqsize"], controller["keep_alive_tmo"])
             if pairs.setdefault(pair, facts) != facts:
                 raise TargetError(f"live controller geometry not proven: {step} controller nvme{instance} "
                                   "has routes that disagree on instance, subsystem, host or geometry")
@@ -951,7 +970,8 @@ def _kernel_live_worker(output, binary, transport, seconds, deadline_epoch, *,
             reuse, lifecycles = _admit_kernel_reuse(proof, remote, addr, service, transport, launch["listen"])
             reprovisioned_database = reuse["database"]
             record["target_reuse"] = {key: reuse[key] for key in ("dropped_database", "database")}
-            _admit_kernel_geometry(record, lifecycles, KERNEL_QUEUE_GEOMETRY)
+            _admit_kernel_geometry(record, lifecycles, KERNEL_QUEUE_GEOMETRY,
+                                   remote["live_nvme"]["io_timeout_ms"])
             record["qualification_sha256"] = hashlib.sha256(
                 (evidence / "native/qualification.json").read_bytes()).hexdigest()
             record["qualified"] = True
