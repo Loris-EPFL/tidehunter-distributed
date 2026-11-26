@@ -392,8 +392,10 @@ class Rehearsal:
     def check_launch_addresses(self, cell, config_dir=None):
         """The prepared launch must listen on the control IP and export the RDMA IP."""
         wanted = config_dir or (cell + '-external-config')
-        matches = [path for path in sorted(self.campaign_mount().rglob('node-*/launch.yaml'))
-                   if wanted in path.parts]
+        # `rglob` takes one component pattern on Python 3.12; select the node
+        # directories of this cell's preparation explicitly.
+        matches = [path for path in sorted(self.campaign_mount().rglob('launch.yaml'))
+                   if path.parent.name.startswith('node-') and wanted in path.parts]
         if not matches:
             raise Failure(f'{cell}: no prepared owner launch file under a {wanted} directory')
         for path in matches:
