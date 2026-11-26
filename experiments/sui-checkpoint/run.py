@@ -20,6 +20,7 @@ import time
 import urllib.request
 import yaml
 import build
+import campaign_ledger
 import deployment
 import disk_collector as disk
 import checkpoint_support as checkpoint
@@ -170,9 +171,79 @@ def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, d
         time.sleep(min(.1, max(0, end - time.monotonic())))
 
 
+def hold_node(owned, child, shards, *, address, seconds, disk_sample,
+              interval_seconds, destination, poll_seconds=1.0):
+    """M5: keep the certified measured node resident and sample its disk.
+
+    The node is past its final metric cut, so it serves no new checkpoint; the
+    hold observes the on-disk coordinator geometry while the database stays
+    open. A process that exits, or a scrape that fails, fails the cell. The
+    snapshot and relocation triggers the plan names are not exposed by the
+    engine: the control-region snapshot runs on a one-hour timer or a write
+    threshold, and relocation is requested by the Sui pruner after retained
+    epochs. Both are recorded, never claimed.
+    """
+    if not callable(disk_sample):
+        raise ValueError('a hold needs disk sampling')
+    start = time.monotonic()
+    samples, next_sample = [], start
+    end = start + seconds
+    while True:
+        now = time.monotonic()
+        if now >= end:
+            break
+        for process in (child, *shards):
+            state = sample(process)
+            if state.get('exited') or state.get('core_dumping'):
+                status = (f"exited with code {state['exit_code']}"
+                          if state.get('exited') else 'is core-dumping')
+                raise RuntimeError(f'owned process {state["pid"]} {status} during the hold')
+        if now >= next_sample:
+            try:
+                samples.append(disk_sample())
+            except (OSError, ValueError) as error:
+                samples.append(dict(unavailable=str(error)))
+            next_sample = now + interval_seconds
+        time.sleep(min(poll_seconds, max(0.0, end - time.monotonic())))
+    try:
+        final = disk_sample()
+    except (OSError, ValueError) as error:
+        final = dict(unavailable=str(error))
+    samples.append(final)
+    metrics = None
+    metrics_error = None
+    for _ in range(60):
+        try:
+            with urllib.request.urlopen(f'http://{address}/metrics', timeout=5) as response:
+                metrics = response.read(32 << 20).decode()
+            destination.write_text(metrics)
+            break
+        except OSError as error:
+            metrics_error = str(error)
+            time.sleep(0.5)
+    return dict(
+        requested_seconds=seconds, seconds=time.monotonic() - start,
+        interval_seconds=interval_seconds, disk_samples=samples, final=final,
+        final_metrics=str(destination) if metrics is not None else None,
+        final_metrics_available=metrics is not None,
+        final_metrics_reason=metrics_error,
+        triggers=dict(
+            snapshot=dict(
+                triggered=False,
+                reason='the control-region snapshot runs on a 3600 s timer or a '
+                       'written-byte threshold; the engine exposes no external trigger'),
+            relocation=dict(
+                triggered=False,
+                reason='relocation is requested by the Sui pruner after retained '
+                       'epochs; the frozen fixture is epoch 0, so this cell cannot '
+                       'reach one')),
+        scope='the measured remote node stays open after its final metric cut; '
+              'disk samples cover the hold window and are not a quiescent measurement')
+
+
 def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
            disk_sample=None, disk_interval_seconds=10, bound=None,
-           short_run=False, certified_epoch=None):
+           short_run=False, certified_epoch=None, hold_seconds=0):
     if bound is None:
         bound = tip
     if short_run and certified_epoch is None:
@@ -257,6 +328,15 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
         metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
             remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
     # SIGTERM only after committed indexer frontiers; audit subsequently reopens all stores.
+    held = None
+    if hold_seconds:
+        if short_run:
+            raise ValueError('a hold needs the measured node alive; a short replay '
+                             'exits at its bound')
+        held = hold_node(owned, child, shards, address=config['metrics-address'],
+                         seconds=hold_seconds, disk_sample=disk_sample,
+                         interval_seconds=disk_interval_seconds,
+                         destination=owned.root / f'{mode}-hold.prom')
     owned.stop(child)
     if child.returncode not in (0, -signal.SIGTERM):
         raise RuntimeError(f'{mode}: shutdown required forced kill or failed')
@@ -279,7 +359,8 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
         certified_source=('producer' if short_run else 'measured node'),
         peak_sampled_rss_bytes=max(sum(p.get('VmRSS', 0) for p in [r['node'], *r['shards']]) for r in samples),
         process_io_final=samples[-1], host_before=samples[0]['host'], host_after=samples[-1]['host'],
-        disk_samples=disk_samples if disk_sample else None, disk_final=final_disk)
+        disk_samples=disk_samples if disk_sample else None, disk_final=final_disk,
+        hold=held)
 
 
 def command_json(command, destination, env, deadline=600):
@@ -570,10 +651,16 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
                         snapshot_written_bytes, max_maps, max_index_maps,
                         index_blob_cache_min_bytes, index_blob_cache_bytes,
                         read_profile_limit, native_write_profile_limit):
-    """One explicit env for the replay; unknown inherited TH_* is refused."""
-    if not 3 <= max_maps <= 32 or not 3 <= max_index_maps <= 32:
-        raise ValueError('TH_MAX_MAPS and TH_MAX_INDEX_MAPS must be 3..32; '
-                         'the WAL mapper panics below 3')
+    """One explicit env for the replay; unknown inherited TH_* is refused.
+
+    A knob this runner does not pin stays unset, so the engine's fork default is
+    what the cell measures. `TH_MAX_MAPS`, `TH_MAX_INDEX_MAPS` and the mutex
+    count are therefore written only when a cell sets them.
+    """
+    for name, value in (('max_maps', max_maps), ('max_index_maps', max_index_maps)):
+        if value is not None and (type(value) is not int or not 3 <= value <= 32):
+            raise ValueError(f'{name} must be 3..32 when set; the WAL mapper '
+                             'panics below 3')
     unknown = {key for key in os_environ if key.startswith('TH_') and key not in MANAGED_ENV}
     if unknown:
         raise ValueError('unknown TH_ runner knob(s): ' + ', '.join(sorted(unknown)))
@@ -582,14 +669,15 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
     env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='4', USE_TIDEHUNTER='1',
                TH_SYNC_WRITES='true' if tier == 'synchronous' else 'false',
                TH_FRAG_SIZE=str(fragment_mib*deployment.MIB),
-               TH_MAX_MAPS=str(max_maps),
-               TH_MAX_INDEX_MAPS=str(max_index_maps),
-               TH_DEFAULT_MUTEX_COUNT='1',
                TH_DEFAULT_MAX_DIRTY_KEYS=str(max_dirty_keys),
                TH_DEFAULT_VALUE_CACHE_SIZE=str(default_value_cache_size),
                TH_SNAPSHOT_WRITTEN_BYTES=str(snapshot_written_bytes),
                SUI_TH_READ_PROFILE_LIMIT=str(read_profile_limit),
                SUI_TH_NATIVE_WRITE_PROFILE_LIMIT=str(native_write_profile_limit))
+    if max_maps is not None:
+        env['TH_MAX_MAPS'] = str(max_maps)
+    if max_index_maps is not None:
+        env['TH_MAX_INDEX_MAPS'] = str(max_index_maps)
     if driver_concurrency is not None:
         env['SUI_CHECKPOINT_EXECUTION_MAX_CONCURRENCY'] = str(driver_concurrency)
     if pacing_ms:
@@ -604,6 +692,43 @@ def runtime_environment(os_environ, *, tier, fragment_mib, driver_concurrency, p
 
 
 PACING_ENV = 'SUI_CHECKPOINT_EXECUTION_PACING_MS'
+
+
+def cell_admission(args):
+    """Refuse a reviewed cell whose knobs differ from its reviewed row.
+
+    A cell row fixes the tier, the geometry, the map and hold limits and the
+    run.py flags the cell needs. Nothing here adds a knob: it refuses a run
+    that would carry a different id than the one it measures.
+    """
+    row = campaign_ledger.cell(args.cell_id)
+    if row is None:
+        return None
+    if args.durability_tier != row['tier']:
+        raise ValueError(f"{row['id']} is a {row['tier']} cell, not "
+                         f"{args.durability_tier}")
+    for name, actual, declared in (
+            ('--fragment-mib', args.fragment_mib, row['fragment_mib']),
+            ('--coordinator-cache-mib', args.coordinator_cache_mib,
+             row['coordinator_cache_mib']),
+            ('--max-maps', args.max_maps, row['max_maps']),
+            ('--max-index-maps', args.max_index_maps, row['max_index_maps']),
+            ('--hold-seconds', args.hold_seconds, row['hold_seconds'])):
+        if actual != declared:
+            raise ValueError(f"{row['id']} requires {name} {declared!r}, not {actual!r}")
+    for flag, value in row['run'].items():
+        actual = getattr(args, flag[2:].replace('-', '_'))
+        if value is None:
+            expected = True
+        elif isinstance(actual, bool):
+            expected = value not in ('0', 'false', 'False')
+        elif actual is None:
+            expected = value
+        else:
+            expected = type(actual)(value)
+        if actual != expected:
+            raise ValueError(f"{row['id']} requires {flag} {value!r}, not {actual!r}")
+    return row
 
 
 def _mentions(path, needle):
@@ -972,7 +1097,9 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--deadline', type=int, default=900)
     parser.add_argument('--port', type=int, default=24000)
-    parser.add_argument('--coordinator-cache-mib', type=int, default=8)
+    parser.add_argument('--coordinator-cache-mib', type=int,
+                        default=campaign_ledger.DEFAULT_COORDINATOR_CACHE_MIB,
+                        help='coordinator read cache in MiB; the campaign default is 0 (off)')
     parser.add_argument('--shard-cache-mib', type=int, default=0)
     parser.add_argument('--local-transport', choices=('tcp', *deployment.SOFTWARE_TRANSPORTS), default='tcp',
                         help='loopback correctness provider; never hardware EFA evidence')
@@ -982,8 +1109,10 @@ def main():
                         help='distinct RF1 owner processes/hosts per database (default 2; no five-owner assumption)')
     parser.add_argument('--durability-tier', choices=('native', 'synchronous'), default='synchronous',
                         help='store acknowledgement tier; native is the Sui production default (db sync disabled)')
-    parser.add_argument('--fragment-mib', type=int, default=8,
-                        help='engine fragment size in MiB; the production campaign geometry is 1024')
+    parser.add_argument('--fragment-mib', type=int,
+                        default=campaign_ledger.DEFAULT_FRAGMENT_MIB,
+                        help='engine fragment size in MiB; the production campaign '
+                             'geometry is 1024 and the synthetic M3/M4 rows use 64')
     parser.add_argument('--driver-concurrency', type=int, default=4,
                         help='Sui checkpoint-execution-max-concurrency; the fixture value is 4')
     parser.add_argument('--pacing-ms', type=int, default=0,
@@ -998,10 +1127,12 @@ def main():
                         help='TH_DEFAULT_MAX_DIRTY_KEYS base; Sui multiplies it per keyspace')
     parser.add_argument('--snapshot-written-bytes', type=int, default=8 << 30,
                         help='TH_SNAPSHOT_WRITTEN_BYTES native snapshot threshold')
-    parser.add_argument('--max-maps', type=int, default=3,
-                        help='TH_MAX_MAPS replay/value WAL maps; the engine panics below 3')
-    parser.add_argument('--max-index-maps', type=int, default=3,
-                        help='TH_MAX_INDEX_MAPS index WAL maps; the engine panics below 3')
+    parser.add_argument('--max-maps', type=int, default=None,
+                        help='TH_MAX_MAPS replay/value WAL maps; unset keeps the fork '
+                             'default, and the engine panics below 3')
+    parser.add_argument('--max-index-maps', type=int, default=None,
+                        help='TH_MAX_INDEX_MAPS index WAL maps; unset keeps the fork '
+                             'default, and the engine panics below 3')
     parser.add_argument('--index-blob-cache-min-bytes', type=int,
                         help='TH_INDEX_BLOB_CACHE_MIN_BYTES; omit to keep the engine 64 MiB '
                              'default, 0 admits every qualifying blob')
@@ -1015,6 +1146,10 @@ def main():
                         help='last K checkpoints read back through the reopened node')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
                         help='coordinator disk inventory interval in seconds, 0 disables collection')
+    parser.add_argument('--hold-seconds', type=int, default=0,
+                        help='M5: keep the certified measured node resident this long, '
+                             'sampling its disk, then take a final metrics scrape; needs '
+                             'a positive --disk-sample-seconds')
     parser.add_argument('--read-profile-limit', type=int, default=0,
                         help='maximum profiled remote read RPCs per DB, 0 disables diagnostics')
     parser.add_argument('--write-profile-limit', type=int, default=0,
@@ -1024,11 +1159,15 @@ def main():
     parser.add_argument('--external-config', type=Path)
     parser.add_argument('--external-resources', type=Path, help='controller-owned final per-host resource evidence')
     parser.add_argument('--external-stage-dir', type=Path, help='controller handshake directory, required in external mode')
-    parser.add_argument('--cell-id', help='campaign ledger cell identity (recorded, not interpreted)')
+    parser.add_argument('--cell-id',
+                        help='campaign cell identity; a reviewed id (see '
+                             'campaign_ledger.MANUAL_SUI_CELLS) fixes the cell knobs '
+                             'and the criteria it must prove')
     args = parser.parse_args()
     if any((args.external_config, args.external_resources, args.external_stage_dir)) and not all(
             (args.external_config, args.external_resources, args.external_stage_dir)):
         raise ValueError('external config, resources and stage directory must be supplied together')
+    cell_admission(args)
     if not 30 <= args.deadline <= 3600 or not 1024 <= args.port <= 65000:
         raise ValueError('deadline/port outside bounds')
     if not 1 <= args.owners <= 16:
@@ -1055,10 +1194,14 @@ def main():
         raise ValueError('default value cache size must be 0..1000000 entries')
     if not 1 <= args.max_dirty_keys <= 1000000:
         raise ValueError('max dirty keys must be 1..1000000')
-    if not 3 <= args.max_maps <= 32:
+    if args.max_maps is not None and not 3 <= args.max_maps <= 32:
         raise ValueError('max maps must be 3..32; the WAL mapper panics below 3')
-    if not 3 <= args.max_index_maps <= 32:
+    if args.max_index_maps is not None and not 3 <= args.max_index_maps <= 32:
         raise ValueError('max index maps must be 3..32; the WAL mapper panics below 3')
+    if not 0 <= args.hold_seconds <= 86400:
+        raise ValueError('hold seconds must be 0..86400')
+    if args.hold_seconds and not args.disk_sample_seconds:
+        raise ValueError('a hold needs disk sampling; give --disk-sample-seconds above 0')
     if not 0 <= args.snapshot_written_bytes <= 1 << 40:
         raise ValueError('snapshot written bytes must be 0..1 TiB')
     if (args.index_blob_cache_min_bytes is not None
@@ -1308,7 +1451,11 @@ def main():
             matches_production=args.fragment_mib == 1024)
         result['remote']=replay(owned,bins/'sui-node-remote',root,'remote',tip,replay_digest,remote_extra,shards,args.deadline,
             bound=bound, short_run=short_run, certified_epoch=prefix_epoch,
-            disk_sample=disk_sample, disk_interval_seconds=args.disk_sample_seconds)
+            disk_sample=disk_sample, disk_interval_seconds=args.disk_sample_seconds,
+            hold_seconds=args.hold_seconds)
+        result['hold'] = result['remote']['hold']
+        result['live_transport'] = (
+            (result.get('external_manifest') or {}).get('live_transport') or 'tcp')
         result['disk'] = dict(geometry=result['disk_geometry'],
             samples=result['remote']['disk_samples'], final=result['remote']['disk_final'])
         budget = (result['disk']['final'] or {}).get('budget') if result['disk']['final'] else None
@@ -1388,6 +1535,14 @@ def main():
         for name, expected in manifest['binaries'].items():
             if build.digest(bins/name) != expected:
                 raise ValueError('binary changed during replay/audit')
+        from analyze import cell_checks, metrics as read_metrics
+        final_by_mode = {mode: read_metrics(output / f'{mode}-final.prom')
+                         for mode in ('native', 'remote')}
+        checks = cell_checks(result, final_by_mode, sorted(schema),
+                             checkpoint_count=tip + 1)
+        result['cell_checks'] = checks
+        if checks['failures']:
+            raise RuntimeError('cell criteria failed: ' + '; '.join(checks['failures']))
         result['complete']=True
     except BaseException as error:
         result['failure']=str(error)

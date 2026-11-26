@@ -11,10 +11,13 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import gcp_api
 import gcs_ledger
@@ -67,7 +70,8 @@ class FakeBuild:
         scripts = sources / 'sui-checkpoint'
         scripts.mkdir(parents=True)
         for name in ('build.py', 'deployment.py', 'prepare_external.py',
-                     'checkpoint_support.py', 'disk_collector.py'):
+                     'checkpoint_support.py', 'disk_collector.py',
+                     'campaign_ledger.py'):
             shutil.copy2(CHECKPOINT / name, scripts / name)
         shutil.copy2(EXPERIMENTS / 'resident_config.py', sources / 'resident_config.py')
         shutil.copy2(EXPERIMENTS / 'portable_transport.py', sources / 'portable_transport.py')
@@ -86,9 +90,11 @@ class FakeBuild:
                 time.sleep(0.05)
             """))
         owner.chmod(0o755)
+        (root / 'source-manifest.json').write_text(json.dumps(
+            {'tidehunter-sharded-wal': {'files': {}}, 'sui': {'files': {}}}))
         manifest = {'protocol': 9, 'fabric': True,
                     'source_archive_sha256': 'a' * 64,
-                    'source_manifest_sha256': 'b' * 64,
+                    'source_manifest_sha256': digest(root / 'source-manifest.json'),
                     'binaries': {path.name: digest(path) for path in self.binaries.iterdir()}}
         (root / 'build-manifest.json').write_text(json.dumps(manifest))
         (scripts / 'run.py').write_text(textwrap.dedent("""\
@@ -784,6 +790,255 @@ class ControllerLossInjection(unittest.TestCase):
                                 allow_local_ledger=True).run(hosts)
         self.assertNotIn('skipped', changed)
         self.assertEqual(ledger.entries[('stage1', 'S1-4-mid-frame-native')]['attempts'], 2)
+
+
+class ReviewedCellRows(unittest.TestCase):
+    """The reviewed table drives the launcher refusal (F8, F25)."""
+
+    def args(self, **overrides):
+        values = dict(stage='stage1', durability_tier='native', fragment_mib=1024,
+                      coordinator_cache_mib=0, hold_seconds=0)
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_a_reviewed_row_admits_its_own_geometry(self):
+        manual_sui.cell_row_checks(manual_sui.ledger_module.cell('S1-1-native'),
+                                   self.args())
+        manual_sui.cell_row_checks(
+            manual_sui.ledger_module.cell('M3-synchronous'),
+            self.args(stage='stage2', durability_tier='synchronous',
+                      fragment_mib=64))
+        manual_sui.cell_row_checks(manual_sui.ledger_module.cell('M5-hold'),
+                                   self.args(stage='stage2', hold_seconds=1800))
+
+    def test_a_reviewed_row_refuses_an_off_plan_geometry(self):
+        for cell_id, knobs, needle in (
+                ('S1-1-native', dict(fragment_mib=8), '1024'),
+                ('S1-1-native', dict(coordinator_cache_mib=8), 'coordinator-cache-mib'),
+                ('M3-native', dict(stage='stage2', fragment_mib=1024), '64'),
+                ('M5-hold', dict(stage='stage2', hold_seconds=0), 'hold-seconds'),
+                ('S1-1-native', dict(durability_tier='synchronous'), 'native cell')):
+            with self.subTest(cell=cell_id, knob=needle):
+                with self.assertRaisesRegex(SystemExit, needle):
+                    manual_sui.cell_row_checks(
+                        manual_sui.ledger_module.cell(cell_id), self.args(**knobs))
+
+    def test_the_list_option_prints_the_reviewed_table_without_a_build(self):
+        command = [sys.executable, str(HERE / 'manual_sui.py'), '--list', 'stage2']
+        completed = subprocess.run(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=60, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        table = json.loads(completed.stdout)
+        ids = {row['id'] for row in table['cells']}
+        self.assertIn('M5-hold', ids)
+        self.assertIn('M2-cache0-native', ids)
+        self.assertNotIn('S1-1-native', ids)
+        self.assertEqual(table['count'], len(table['cells']))
+
+
+class AttemptOutputs(unittest.TestCase):
+    """A retry derives its own attempt-scoped output tree (F20)."""
+
+    def test_the_first_attempt_keeps_the_operator_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(manual_sui.attempt_output(Path(tmp) / 'run', 1),
+                             Path(tmp) / 'run')
+
+    def test_a_retry_takes_the_next_free_attempt_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / 'run'
+            base.mkdir()
+            self.assertEqual(manual_sui.attempt_output(base, 1),
+                             Path(tmp) / 'run-attempt-2')
+            (Path(tmp) / 'run-attempt-2').mkdir()
+            self.assertEqual(manual_sui.attempt_output(base, 2),
+                             Path(tmp) / 'run-attempt-3')
+            self.assertEqual(manual_sui.attempt_output(base, 4),
+                             Path(tmp) / 'run-attempt-4')
+
+
+class HandshakeBounds(unittest.TestCase):
+    """The launcher's own wait covers the replays, audits and hold (F26)."""
+
+    def test_the_cap_covers_two_replays_and_eight_audits(self):
+        self.assertEqual(manual_sui.handshake_cap(900),
+                         2 * 900 + 8 * 600 + 900)
+        self.assertEqual(manual_sui.handshake_cap(900, lifecycle=True),
+                         3 * 900 + 8 * 600 + 900)
+        self.assertEqual(manual_sui.handshake_cap(900, hold_seconds=1800),
+                         2 * 900 + 1800 + 8 * 600 + 900)
+
+    def test_an_invalid_bound_is_refused(self):
+        with self.assertRaises(ValueError):
+            manual_sui.handshake_cap(10)
+        with self.assertRaises(ValueError):
+            manual_sui.handshake_cap(900, hold_seconds=-1)
+
+
+class FailureEvidence(unittest.TestCase):
+    """A failed attempt uploads its evidence and ledger before the fleet dies."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_persist_failure_uploads_what_exists_and_saves_the_ledger(self):
+        store = FakeObjectStore()
+        prefix = 'campaign-hybrid-sui-2026-11-25'
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        entry = ledger.begin(stage='stage1', cell_id='S1-1-native',
+                             config_hash='h')
+        present = self.root / 'results.json'
+        present.write_text('{"failure": "boom"}')
+        row = manual_sui.upload_module.artifact(present, 'experiment/results.json')
+        missing = dict(path=str(self.root / 'absent.json'), name='absent.json',
+                       size=0, sha256='0' * 64)
+        evidence = manual_sui.upload_module.Evidence(store, prefix)
+        result = evidence.persist_failure(entry, [row, missing],
+                                          RuntimeError('boom'), ledger=ledger)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(entry['status'], 'failed')
+        self.assertEqual(entry['failure'], 'boom')
+        self.assertEqual(entry['attempts'], 1)
+        self.assertEqual([item['key'].split('/attempt-1/', 1)[1]
+                          for item in result['uploaded']],
+                         ['experiment/results.json'])
+        key = (f'{prefix}/stage1/evidence/S1-1-native/attempt-1/'
+               'experiment/results.json')
+        self.assertIn(key, store.objects)
+        stored, _ = gcs_ledger.ObjectStoreLedger(store).get(
+            f'{prefix}/campaign-ledger.json')
+        recovered = manual_sui.ledger_module.Ledger.from_bytes(stored)
+        self.assertEqual(recovered.status('stage1', 'S1-1-native'), 'failed')
+        self.assertEqual(recovered.entries[('stage1', 'S1-1-native')]['failure'],
+                         'boom')
+        self.assertEqual(ledger.entries[('stage1', 'S1-1-native')]['status'], 'failed')
+
+    def test_persist_failure_never_raises_over_the_original_error(self):
+        store = FakeObjectStore()
+        store.put = lambda *args, **kwargs: (_ for _ in ()).throw(
+            gcp_api.ApiError(503, 'unavailable'))
+        store.head = lambda *args, **kwargs: (_ for _ in ()).throw(
+            gcp_api.ApiError(503, 'unavailable'))
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        entry = ledger.begin(stage='stage1', cell_id='S1-1-native', config_hash='h')
+        present = self.root / 'results.json'
+        present.write_text('{}')
+        row = manual_sui.upload_module.artifact(present, 'experiment/results.json')
+        evidence = manual_sui.upload_module.Evidence(store, 'prefix')
+        result = evidence.persist_failure(entry, [row], RuntimeError('boom'),
+                                          ledger=ledger)
+        self.assertTrue(result['errors'])
+        self.assertTrue(any('unavailable' in item for item in result['errors']))
+        self.assertEqual(entry['status'], 'failed')
+
+    def test_the_launcher_failure_path_uploads_results_and_the_ledger(self):
+        build = FakeBuild(self.root / 'build')
+        fixture = build.fixture(self.root)
+        schema = build.schema(self.root)
+        store = FakeObjectStore()
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        prefix = 'campaign-hybrid-sui-2026-11-25'
+        launcher = manual_sui.SuiLauncher(
+            remote=host_exec.GcloudSsh('us-central1-a'), build_root=build.root,
+            fixture=fixture, output=self.root / 'run', guest_root=self.root / 'guest',
+            stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
+            resources=self.root / 'resources.json', tier='native', owners=2,
+            deadline=900, transport='efa', live_transport='rdma', schema=schema,
+            ledger=ledger, cell_id='S1-1-native', store=store,
+            bucket='mysten-research-bench-artifacts', prefix=prefix,
+            allow_local_ledger=False)
+        def execute(hosts):
+            (launcher.output / 'experiment').mkdir(parents=True)
+            (launcher.output / 'experiment/results.json').write_text(
+                '{"failure": "audit differs"}')
+            raise manual_sui.LaunchError('audit differs')
+        with mock.patch.object(launcher, 'execute', execute):
+            with self.assertRaisesRegex(manual_sui.LaunchError, 'audit differs'):
+                launcher.run(manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-1-native'), 'failed')
+        uploaded = [key for key in store.objects if '/attempt-1/' in key]
+        self.assertTrue(any(key.endswith('experiment/results.json')
+                            for key in uploaded))
+        stored, _ = gcs_ledger.ObjectStoreLedger(store).get(
+            f'{prefix}/campaign-ledger.json')
+        self.assertEqual(
+            manual_sui.ledger_module.Ledger.from_bytes(stored).status(
+                'stage1', 'S1-1-native'), 'failed')
+
+    def test_owner_archives_and_oversized_files_stay_out_of_the_upload(self):
+        build = FakeBuild(self.root / 'build')
+        fixture = build.fixture(self.root)
+        schema = build.schema(self.root)
+        launcher = manual_sui.SuiLauncher(
+            remote=host_exec.GcloudSsh('us-central1-a'), build_root=build.root,
+            fixture=fixture, output=self.root / 'run', guest_root=self.root / 'guest',
+            stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
+            resources=self.root / 'resources.json', tier='native', owners=2,
+            deadline=900, transport='efa', live_transport='rdma', schema=schema)
+        launcher.config_dir.mkdir(parents=True)
+        (launcher.config_dir / 'host-0.tar.gz').write_bytes(b'archive')
+        names = {row['name'] for row in launcher.failure_artifacts()}
+        self.assertNotIn('external/host-0.tar.gz', names)
+        self.assertEqual(launcher.failure_skipped[0]['reason'],
+                         'rebuildable owner archive')
+
+
+class NotReachedIsTerminal(unittest.TestCase):
+    """A second unreached point is invalid, and a required cell exits non-zero."""
+
+    def test_the_second_not_reached_attempt_is_terminal_and_never_reruns(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        build = FakeBuild(root / 'build')
+        fixture = build.fixture(root)
+        schema = build.schema(root)
+        ledger = manual_sui.ledger_module.Ledger(root / 'ledger.json')
+        saved = manual_sui.proc_sampler.SAMPLE_SECONDS
+        manual_sui.proc_sampler.SAMPLE_SECONDS = 0.2
+        self.addCleanup(setattr, manual_sui.proc_sampler, 'SAMPLE_SECONDS', saved)
+        def gate(remote, output):
+            state = dict(watermark=0)
+            def latest(address):
+                state['watermark'] += 1
+                return state['watermark']
+            return manual_sui.ControllerLoss(
+                point='during-flush', host='coordinator', address='10.0.0.2',
+                service=4420, service_max=4435, transport='rdma',
+                metrics_url='http://127.0.0.1:9000/metrics',
+                rpc_address='127.0.0.1:9000', output=output, gate_timeout=0.2,
+                probe_seconds=0.2, now=time.monotonic, latest=latest,
+                metrics=lambda url: 'tidehunter_nvmeof_live_leased_flushes_total 0\n',
+                not_reached=True)
+        def launcher(directory, remote):
+            return manual_sui.SuiLauncher(
+                remote=remote, build_root=build.root, fixture=fixture,
+                output=root / directory, guest_root=root / 'guest',
+                stage_dir=root / (directory + '-stages'),
+                config_dir=root / (directory + '-config'),
+                resources=root / (directory + '-resources.json'),
+                tier='synchronous', owners=2, deadline=900, transport='efa',
+                live_transport='rdma', schema=schema,
+                controller_loss=gate(remote, root / directory), ledger=ledger,
+                cell_id='S1-4-during-flush-synchronous',
+                allow_local_ledger=True)
+        hosts = manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3'])
+        first = launcher('run1', MailboxDouble(root, root / 'guest')).run(hosts)
+        self.assertEqual(first['status'], 'not_reached')
+        self.assertFalse(first['terminal'])
+        self.assertEqual(ledger.status('stage1', 'S1-4-during-flush-synchronous'),
+                         'not_reached')
+        second = launcher('run2', MailboxDouble(root, root / 'guest')).run(hosts)
+        self.assertTrue(second['terminal'])
+        self.assertEqual(ledger.status('stage1', 'S1-4-during-flush-synchronous'),
+                         'invalid')
+        remote = MailboxDouble(root, root / 'guest')
+        third = launcher('run3', remote).run(hosts)
+        self.assertTrue(third['skipped'])
+        self.assertEqual(third['status'], 'invalid')
+        self.assertFalse(remote.requests)
 
 
 if __name__ == '__main__':

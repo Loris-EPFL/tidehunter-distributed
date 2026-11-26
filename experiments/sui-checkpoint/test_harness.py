@@ -1631,6 +1631,137 @@ class ExternalResourceBoundaries(unittest.TestCase):
             self.validate()
 
 
+class EngineDefaults(unittest.TestCase):
+    """No cell pins a fork default unless its reviewed row declares it (F9)."""
+
+    def environment(self, **changes):
+        values = dict(tier='native', fragment_mib=1024, driver_concurrency=4,
+                      pacing_ms=0, value_cache_size=None,
+                      default_value_cache_size=1000, max_dirty_keys=1024,
+                      snapshot_written_bytes=8 << 30, max_maps=None,
+                      max_index_maps=None, index_blob_cache_min_bytes=None,
+                      index_blob_cache_bytes=0, read_profile_limit=0,
+                      native_write_profile_limit=0)
+        values.update(changes)
+        return run.runtime_environment({'PATH': '/bin', 'TH_MAX_MAPS': '99'}, **values)
+
+    def test_the_map_and_mutex_rows_stay_unset_by_default(self):
+        env = self.environment()
+        self.assertNotIn('TH_MAX_MAPS', env)
+        self.assertNotIn('TH_MAX_INDEX_MAPS', env)
+        self.assertNotIn('TH_DEFAULT_MUTEX_COUNT', env)
+        self.assertEqual(env['TH_FRAG_SIZE'], str(1024 * deployment.MIB))
+
+    def test_a_declared_map_limit_is_written_and_validated(self):
+        env = self.environment(max_maps=3, max_index_maps=4)
+        self.assertEqual(env['TH_MAX_MAPS'], '3')
+        self.assertEqual(env['TH_MAX_INDEX_MAPS'], '4')
+        for field in ('max_maps', 'max_index_maps'):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'panics below 3'):
+                self.environment(**{field: 2})
+
+
+class ReviewedCellAdmission(unittest.TestCase):
+    """A reviewed cell id fixes the knobs the cell may carry (F8, F25)."""
+
+    def namespace(self, cell_id, **overrides):
+        values = dict(cell_id=cell_id, durability_tier='native', fragment_mib=1024,
+                      coordinator_cache_mib=0, max_maps=None, max_index_maps=None,
+                      hold_seconds=0, checkpoints=None, lifecycle_checks=False,
+                      tail_checkpoints=64, value_cache_size=None,
+                      default_value_cache_size=1000, driver_concurrency=4,
+                      pacing_ms=0, max_dirty_keys=1024, index_blob_cache_mib=0,
+                      index_blob_cache_min_bytes=None)
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_each_reviewed_row_admits_its_own_knobs(self):
+        rows = {
+            'S1-0': dict(checkpoints=4),
+            'S1-1-native': dict(lifecycle_checks=True),
+            'S1-7-cache0-native': dict(value_cache_size=0),
+            'S1-7-blob1024-native': dict(index_blob_cache_mib=1024,
+                                         index_blob_cache_min_bytes=0),
+            'M1-paced-c4-native': dict(pacing_ms=245),
+            'M2-cache128-native': dict(default_value_cache_size=128),
+            'M3-native': dict(fragment_mib=64, max_maps=3, max_index_maps=3,
+                              max_dirty_keys=16),
+            'M4-synchronous': dict(fragment_mib=64, index_blob_cache_mib=1024,
+                                   index_blob_cache_min_bytes=0),
+            'M5-hold': dict(hold_seconds=1800),
+        }
+        for cell_id, knobs in rows.items():
+            with self.subTest(cell=cell_id):
+                tier = 'synchronous' if cell_id == 'M4-synchronous' else 'native'
+                row = run.cell_admission(self.namespace(cell_id, durability_tier=tier,
+                                                        **knobs))
+                self.assertEqual(row['id'], cell_id)
+        self.assertIsNone(run.cell_admission(self.namespace(None)))
+
+    def test_a_row_refuses_a_knob_it_does_not_declare(self):
+        cases = (
+            ('S1-1-native', dict(fragment_mib=8), 'fragment-mib'),
+            ('S1-1-native', dict(coordinator_cache_mib=8), 'coordinator-cache-mib'),
+            ('S1-1-native', dict(lifecycle_checks=False), 'lifecycle-checks'),
+            ('M3-native', dict(fragment_mib=1024, max_maps=3, max_index_maps=3), 'fragment-mib'),
+            ('M3-native', dict(fragment_mib=64, max_maps=3, max_index_maps=3,
+                               max_dirty_keys=1024), 'max-dirty-keys'),
+            ('M5-hold', dict(hold_seconds=0), 'hold-seconds'),
+            ('S1-0', dict(checkpoints=None), 'checkpoints'),
+            ('M2-cache0-native', dict(value_cache_size=None), 'value-cache-size'),
+        )
+        for cell_id, knobs, needle in cases:
+            with self.subTest(cell=cell_id, knob=needle):
+                with self.assertRaisesRegex(ValueError, needle):
+                    run.cell_admission(self.namespace(cell_id, **knobs))
+
+    def test_a_wrong_tier_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'is a native cell, not synchronous'):
+            run.cell_admission(self.namespace('S1-1-native',
+                                              durability_tier='synchronous'))
+
+
+class HoldWindow(unittest.TestCase):
+    """M5: the certified node stays resident while its disk is sampled (F6)."""
+
+    def test_the_hold_samples_disk_and_takes_a_final_scrape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reads = iter(range(1000))
+            def disk_sample():
+                return dict(unix_ns=time.time_ns(),
+                            databases={'live/db': dict(allocated_bytes=next(reads))})
+            with patch.object(run, 'sample', return_value=dict(pid=1)), \
+                    patch.object(run.urllib.request, 'urlopen',
+                                 return_value=io.BytesIO(b'last_executed_checkpoint 3\n')):
+                hold = run.hold_node(object(), object(), [],
+                                     address='127.0.0.1:1', seconds=0.3,
+                                     disk_sample=disk_sample, interval_seconds=0.05,
+                                     destination=root / 'remote-hold.prom',
+                                     poll_seconds=0.01)
+            self.assertGreaterEqual(hold['seconds'], 0.3)
+            self.assertGreaterEqual(len(hold['disk_samples']), 2)
+            self.assertTrue(hold['disk_samples'][-1]['databases'])
+            self.assertTrue(hold['final_metrics_available'])
+            self.assertEqual(hold['requested_seconds'], 0.3)
+            self.assertEqual((root / 'remote-hold.prom').read_text(),
+                             'last_executed_checkpoint 3\n')
+            self.assertFalse(hold['triggers']['snapshot']['triggered'])
+            self.assertFalse(hold['triggers']['relocation']['triggered'])
+            self.assertIn('no external trigger', hold['triggers']['snapshot']['reason'])
+
+    def test_a_dead_node_fails_the_hold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(run, 'sample',
+                              return_value=dict(pid=7, exited=True, exit_code=9)):
+                with self.assertRaisesRegex(RuntimeError, 'exited with code 9'):
+                    run.hold_node(object(), object(), [], address='127.0.0.1:1',
+                                  seconds=0.2,
+                                  disk_sample=lambda: dict(databases={}),
+                                  interval_seconds=0.05,
+                                  destination=Path(tmp) / 'remote-hold.prom',
+                                  poll_seconds=0.01)
+
 
 if __name__=='__main__':
     unittest.main()

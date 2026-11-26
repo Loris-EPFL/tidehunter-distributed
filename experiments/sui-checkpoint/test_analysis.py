@@ -434,5 +434,154 @@ class AggregateReplacement(unittest.TestCase):
         self.assertFalse(analyze.adapter_means({'remote_timing_available': 0})['write_commit']['available'])
 
 
+NAMESPACE = 'live/db'
+
+
+def scrape(*, cache_mib=0, hits=0, misses=5, batches=6, live=True, protect=2):
+    """One measured-node scrape with the adapter, keyspace and live families."""
+    rows = [
+        f'tidehunter_adapter{{namespace="{NAMESPACE}",stat="{name}"}} {value}'
+        for name, value in (
+            ('value_cache_hits', hits), ('value_cache_misses', misses),
+            ('cache_hits', hits), ('cache_misses', misses),
+            ('cache_entries', 0), ('cache_budget_bytes', cache_mib * 1024 * 1024),
+            ('read_calls', misses), ('read_keys', misses), ('read_rpcs', misses),
+            ('write_commit_calls', batches))]
+    rows += [
+        f'tidehunter_keyspace_read_cache{{keyspace="objects",keyspace_id="3",'
+        f'namespace="{NAMESPACE}",stat="{name}"}} {value}'
+        for name, value in (('hits', hits), ('misses', misses),
+                            ('inserts', 0), ('evictions', 0))]
+    if live:
+        rows += [
+            f'tidehunter_nvmeof_live_{name} {value}'
+            for name, value in (
+                ('completed_read_ops_total', 4), ('completed_write_ops_total', 5),
+                ('namespace_connects_total', 2), ('target_observed_partitions', 2),
+                ('target_fixture_partitions', 0), ('target_owned_namespaces', 2),
+                ('target_exposed_total', 2), ('target_write_protect_total', protect),
+                ('target_errors_total', 0), ('lease_exchanges_total', 3))]
+    return analyze.parse_metrics('\n'.join(rows) + '\n')
+
+
+class PerCellCriteria(unittest.TestCase):
+    """A criterion is pass, fail, missing counter or explicitly not exported."""
+
+    def result(self, cell_id, **overrides):
+        value = dict(cell_id=cell_id, live_transport='rdma',
+                     cache=dict(coordinator_bytes=0), checkpoint_limit=1,
+                     hold=None)
+        value.update(overrides)
+        return value
+
+    def checks(self, cell_id, values, **overrides):
+        return analyze.cell_checks(self.result(cell_id, **overrides),
+                                   {'remote': values}, [NAMESPACE],
+                                   checkpoint_count=2)
+
+    def test_the_admission_cell_proves_the_rdma_live_path_and_lists_the_rest(self):
+        checks = self.checks('S1-0', scrape())
+        self.assertEqual(checks['failures'], [])
+        admission = checks['checks']['admission']
+        self.assertEqual(admission['rdma_live_path']['state'], 'pass')
+        self.assertEqual(admission['write_protect_readback']['state'], 'pass')
+        self.assertEqual(admission['lease_protocol']['state'], 'not_exported')
+        self.assertEqual(admission['no_tcp_fallback']['state'], 'not_exported')
+        self.assertEqual(admission['orphan_export']['state'], 'not_exported')
+        for key in ('lease_protocol', 'no_tcp_fallback', 'orphan_export'):
+            self.assertIn(f'admission.{key}', checks['not_exported'])
+
+    def test_a_missing_live_family_fails_the_admission_cell(self):
+        checks = self.checks('S1-0', scrape(live=False))
+        self.assertTrue(any('admission' in item for item in checks['failures']))
+        self.assertEqual(checks['checks']['admission']['rdma_live_path']['state'],
+                         'missing_counter')
+
+    def test_a_fixture_target_never_passes_an_admission_cell(self):
+        values = scrape()
+        values['tidehunter_nvmeof_live_target_fixture_partitions'] = 2
+        checks = self.checks('S1-0', values)
+        self.assertTrue(any('fixture target' in item for item in checks['failures']))
+        self.assertEqual(checks['checks']['admission']['rdma_live_path']['state'], 'fail')
+
+    def test_a_cache_off_cell_must_record_no_hit(self):
+        self.assertEqual(self.checks('S1-7-cache0-native', scrape())['failures'], [])
+        checks = self.checks('S1-7-cache0-native', scrape(hits=3))
+        self.assertTrue(any('disabled coordinator read cache' in item
+                            for item in checks['failures']))
+
+    def test_a_cache_on_cell_needs_a_hit_and_a_budget(self):
+        checks = self.checks('S1-7-cache1000-native',
+                             scrape(hits=2, misses=3, cache_mib=1024),
+                             cache=dict(coordinator_bytes=1024 * 1024))
+        self.assertEqual(checks['failures'], [])
+        self.assertEqual(checks['checks']['cache']['counters']['state'], 'pass')
+        empty = self.checks('S1-7-cache1000-native',
+                            scrape(hits=0, misses=3, cache_mib=1024),
+                            cache=dict(coordinator_bytes=1024 * 1024))
+        self.assertTrue(any('no value-cache hit' in item for item in empty['failures']))
+
+    def test_value_identity_and_checkpoint_refill_are_not_exported(self):
+        checks = self.checks('S1-7-cache0-native', scrape())
+        self.assertEqual(checks['checks']['cache']['value_identity']['state'],
+                         'not_exported')
+        self.assertIn('cache.checkpoint_refill', checks['not_exported'])
+
+    def test_a_missing_keyspace_population_fails_the_cache_cell(self):
+        values = {metric: value for metric, value in scrape().items()
+                  if not metric.startswith('tidehunter_keyspace_read_cache')}
+        checks = self.checks('S1-7-cache0-native', values)
+        self.assertEqual(checks['checks']['cache']['keyspace_population']['state'],
+                         'missing_counter')
+        self.assertTrue(any('cache' in item for item in checks['failures']))
+
+    def test_a_missing_value_cache_counter_fails_the_m2_cell(self):
+        values = scrape()
+        del values[f'tidehunter_adapter{{namespace="{NAMESPACE}",stat="value_cache_hits"}}']
+        checks = self.checks('M2-cache1000-native', values)
+        self.assertTrue(any('value_cache' in item for item in checks['failures']))
+        self.assertEqual(checks['checks']['value_cache']['state'], 'missing_counter')
+
+    def test_m2_reports_the_hit_rate_over_the_observed_population(self):
+        checks = self.checks('M2-cache1000-native', scrape(hits=3, misses=1))
+        self.assertEqual(checks['failures'], [])
+        row = checks['checks']['value_cache']['evidence']['accounting']['namespaces'][NAMESPACE]
+        self.assertEqual((row['value_cache_hits'], row['value_cache_misses']), (3, 1))
+        self.assertEqual(row['hit_rate'], 0.75)
+        evidence = checks['checks']['value_cache']['evidence']
+        self.assertIn('owner_fetch_fraction', evidence)
+        self.assertIn('no hit counter', evidence['per_cell_value_cache'])
+
+    def test_three_write_batches_per_checkpoint_is_required(self):
+        self.assertEqual(self.checks('M1-c4-native', scrape(batches=6))['failures'], [])
+        checks = self.checks('M1-c4-native', scrape(batches=4))
+        self.assertTrue(any('reads 2.0, not 3' in item for item in checks['failures']))
+
+    def test_a_lifecycle_cell_needs_the_reopen_evidence(self):
+        checks = self.checks('S1-1-native', scrape())
+        self.assertEqual(checks['checks']['lifecycle']['state'], 'missing_counter')
+        self.assertTrue(any('lifecycle' in item for item in checks['failures']))
+        lifecycle = dict(status='clean-reopen-verified', audit_reopen=dict(equal=True),
+                         tail_replay=dict(state_unchanged=True))
+        self.assertEqual(self.checks('S1-1-native', scrape(),
+                                     lifecycle=lifecycle)['failures'], [])
+
+    def test_the_hold_cell_needs_a_sampled_hold(self):
+        hold = dict(requested_seconds=1800, seconds=1801,
+                    disk_samples=[dict(databases={}), dict(databases={})],
+                    final=dict(databases={NAMESPACE: {}}),
+                    final_metrics_available=True,
+                    triggers=dict(snapshot=dict(triggered=False),
+                                  relocation=dict(triggered=False)))
+        self.assertEqual(self.checks('M5-hold', scrape(), hold=hold)['failures'], [])
+        self.assertIn('hold', [item.split(':')[0] for item in
+                              self.checks('M5-hold', scrape())['failures']])
+
+    def test_an_unreviewed_cell_records_checks_but_requires_none(self):
+        checks = self.checks('sui-replay', scrape(live=False))
+        self.assertEqual(checks['requires'], [])
+        self.assertEqual(checks['failures'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

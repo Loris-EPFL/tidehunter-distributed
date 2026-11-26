@@ -595,6 +595,11 @@ def summarize_verified(verified):
     summary['remote_over_native']=summary['modes']['remote']['foreground_seconds']/summary['modes']['native']['foreground_seconds']
     for namespace, comparison in audit['databases'].items():
         summary['table_counts'][namespace]={name:entry['records'] for name,entry in comparison['native']['tables'].items()}
+    namespaces = (result['remote'].get('final_metrics_freshness') or {}).get(
+        'required_namespaces') or sorted(audit['databases'])
+    summary['cell_checks'] = cell_checks(
+        result, final_by_mode, namespaces,
+        checkpoint_count=int(result['checkpoint_limit']) + 1)
     summary['limits']=[
         'Foreground watermark sampling is 250ms resolution, not individual checkpoint latency.',
         'Execution-start log spacing is scheduling/start timing, never completion/service p99.',
@@ -890,9 +895,377 @@ def validate_archive_members(archive):
         names.add(member.name)
 
 
+# ---- reviewed per-cell criteria -------------------------------------------------
+#
+# A cell passes only on its declared criteria, and a criterion that needs an
+# exported counter fails the cell when that counter is absent. A criterion the
+# engine does not export is recorded as `not_exported` with its evidence: it is
+# never decoded as a zero and never silently dropped. The states are:
+#   `pass`, `fail`, `missing_counter` (required, absent) and `not_exported`.
+KEYSPACE_CACHE = 'tidehunter_keyspace_read_cache'
+VALUE_CACHE_COUNTERS = ('value_cache_hits', 'value_cache_misses')
+READ_CACHE_COUNTERS = ('cache_hits', 'cache_misses', 'cache_entries',
+                       'cache_budget_bytes', 'read_calls', 'read_keys', 'read_rpcs')
+LIVE_PATH_COUNTERS = ('completed_read_ops_total', 'completed_write_ops_total',
+                      'namespace_connects_total', 'target_observed_partitions',
+                      'target_fixture_partitions')
 
 
+def _state(state, reason=None, **evidence):
+    return dict(state=state, reason=reason, evidence=evidence)
 
+
+def keyspace_cache_stats(values):
+    """Per-keyspace coordinator read-cache counters, keyed by (namespace, keyspace).
+
+    The family also carries an undeclared-keyspace population, so a keyspace
+    total can never exceed its namespace total; it is not required to equal it.
+    """
+    result = {}
+    for metric, value in values.items():
+        if not metric.startswith(KEYSPACE_CACHE + '{'):
+            continue
+        labels = _labels(metric)
+        if not {'keyspace', 'keyspace_id', 'stat'} <= set(labels):
+            raise ValueError('keyspace read-cache metric lacks its identity labels')
+        stat = labels['stat']
+        if stat not in ('hits', 'misses', 'inserts', 'evictions'):
+            raise ValueError('unknown keyspace read-cache stat: ' + stat)
+        namespace = labels.get('namespace')
+        key = (namespace, labels['keyspace'])
+        row = result.setdefault(key, {})
+        if stat in row:
+            raise ValueError('duplicate keyspace read-cache counter')
+        nonnegative(value, metric)
+        row[stat] = int(value)
+    return result
+
+
+def cache_accounting(values, namespaces=None):
+    """Value-cache and coordinator read-cache counters of the audited namespaces."""
+    stats = adapter_stats(values)
+    selected = (sorted(stats) if namespaces is None
+                else [name for name in sorted(stats) if name in set(namespaces)])
+    rows, missing = {}, []
+    for namespace in selected:
+        entry = stats[namespace]
+        row = {}
+        for name in VALUE_CACHE_COUNTERS + READ_CACHE_COUNTERS:
+            value = entry.get(name)
+            if value is None:
+                missing.append(f'{namespace}:{name}')
+            row[name] = None if value is None else int(value)
+        hits, misses = row['value_cache_hits'], row['value_cache_misses']
+        row['reader_lookups'] = (hits + misses
+                                 if hits is not None and misses is not None else None)
+        row['hit_rate'] = (hits / row['reader_lookups']
+                           if row['reader_lookups'] else None)
+        rows[namespace] = row
+    return dict(available=bool(rows), namespaces=rows, missing=sorted(missing),
+                scope='coordinator value-reader outcomes (`value_cache_hits`/`_misses`) '
+                      'and coordinator read-cache counters from one adapter scrape; '
+                      'a resident per-cell LRU value never reaches the reader, so a '
+                      'lookup total can be below the API key count, never above it')
+
+
+def value_cache_check(values, namespaces):
+    """M2: every audited namespace reports its hit and miss population."""
+    accounting = cache_accounting(values, namespaces)
+    if not accounting['available']:
+        return _state('missing_counter', 'no audited adapter namespace was published')
+    required = [f'{name}:{counter}' for name in sorted(namespaces)
+                for counter in VALUE_CACHE_COUNTERS]
+    absent = [name for name in required if name in accounting['missing']]
+    if absent:
+        return _state('missing_counter',
+                      'the value-cache hit/miss counters are absent',
+                      missing=absent)
+    lookups = {name: row['reader_lookups']
+               for name, row in accounting['namespaces'].items()}
+    if not any(lookups.values()):
+        return _state('fail', 'no value-cache lookup was observed; a hit rate '
+                              'needs an observed population', lookups=lookups)
+    fraction = owner_fetch_fraction(live_nvmeof_stats(values),
+                                    coordinator_stats(values))
+    return _state('pass', None, accounting=accounting,
+                  owner_fetch_fraction=fraction,
+                  per_cell_value_cache='not_exported: the per-cell native LRU that '
+                                       'TH_VALUE_CACHE_SIZE sizes records no hit '
+                                       'counter; value_cache_hits/_misses are the '
+                                       'coordinator value-reader read-cache outcomes, '
+                                       'so an M2 arm is identified by its configured '
+                                       'size and by the owner fetch fraction')
+
+
+def cache_invariants(values, namespaces, *, coordinator_cache_mib):
+    """S1-7: what the exported cache counters can and cannot prove."""
+    accounting = cache_accounting(values, namespaces)
+    details = {}
+    absent = [name for name in accounting['missing']
+              if name.split(':', 1)[1] in VALUE_CACHE_COUNTERS + READ_CACHE_COUNTERS]
+    if not accounting['available'] or absent:
+        details['counters'] = _state(
+            'missing_counter', 'the cache counters are absent',
+            missing=absent or ['no audited adapter namespace was published'])
+    else:
+        totals = {counter: sum(row[counter] or 0 for row in accounting['namespaces'].values())
+                  for counter in VALUE_CACHE_COUNTERS + READ_CACHE_COUNTERS}
+        forced = []
+        if coordinator_cache_mib == 0:
+            # A disabled read cache records a miss for every lookup and holds no
+            # entry; any hit or retained entry is a contradiction.
+            if totals['value_cache_hits']:
+                forced.append('a disabled coordinator read cache recorded '
+                              f"{totals['value_cache_hits']} hit(s)")
+            if totals['cache_entries']:
+                forced.append('a disabled coordinator read cache held '
+                              f"{totals['cache_entries']} entry(ies)")
+            if not totals['value_cache_misses']:
+                forced.append('a disabled coordinator read cache recorded no lookup')
+        else:
+            if not totals['value_cache_hits']:
+                forced.append('a cache-on cell observed no value-cache hit')
+            if not totals['cache_budget_bytes']:
+                forced.append('a cache-on cell reports a zero cache budget')
+        over = []
+        keys = keyspace_cache_stats(values)
+        for namespace, row in accounting['namespaces'].items():
+            for counter in ('hits', 'misses'):
+                observed = sum(stats.get(counter, 0) for (name, _), stats in keys.items()
+                               if name == namespace)
+                total = row['value_cache_' + counter] or 0
+                if observed > total:
+                    over.append(f'{namespace}:{counter} {observed} > {total}')
+        if over:
+            forced.append('per-keyspace counters exceed the namespace total: '
+                          + ', '.join(over))
+        details['counters'] = (_state('fail', '; '.join(forced), totals=totals)
+                               if forced else _state('pass', None, totals=totals))
+        details['keyspace_population'] = (
+            _state('pass', None, keyspaces=sorted({name for _, name in keys}))
+            if keys else
+            _state('missing_counter',
+                   'the per-keyspace read-cache counter family is absent, so a '
+                   'hit or miss cannot be checked against its keyspace'))
+    details['value_identity'] = _state(
+        'not_exported',
+        'the engine exports no per-value residency identity, so "a value is '
+        'never in both the native per-cell LRU and the distributed read cache" '
+        'cannot be decided from a scrape; the full state audit proves the values')
+    details['checkpoint_refill'] = _state(
+        'not_exported',
+        'the engine exports no checkpoint-read refill counter; the read path '
+        'passes refill=false for a checkpoint view but records no count')
+    return details
+
+
+def admission_checks(values, *, live_transport):
+    """S1-0: the RDMA live path and each criterion the scrape can decide."""
+    live = live_nvmeof_stats(values)
+    details = {}
+    if not live['available']:
+        details['rdma_live_path'] = _state(
+            'missing_counter', 'the aggregate tidehunter_nvmeof_live_* family is absent')
+        details['write_protect_readback'] = details['rdma_live_path']
+        details['lease_protocol'] = details['rdma_live_path']
+        details['orphan_export'] = details['rdma_live_path']
+        details['no_tcp_fallback'] = details['rdma_live_path']
+        return details
+    counters = live['counters']
+    absent = [name for name in LIVE_PATH_COUNTERS if name not in counters]
+    if absent:
+        details['rdma_live_path'] = _state(
+            'missing_counter', 'the live path counters are absent', missing=absent)
+    elif live_transport != 'rdma':
+        details['rdma_live_path'] = _state(
+            'fail', 'the cell did not configure the RDMA live transport',
+            live_transport=live_transport)
+    elif not counters['completed_read_ops_total'] or not counters['completed_write_ops_total']:
+        details['rdma_live_path'] = _state(
+            'fail', 'the live path served no completed read and write operation',
+            completed_read_ops=counters['completed_read_ops_total'],
+            completed_write_ops=counters['completed_write_ops_total'])
+    elif not counters['namespace_connects_total']:
+        details['rdma_live_path'] = _state(
+            'fail', 'no verified live controller connection was recorded')
+    elif not counters['target_observed_partitions']:
+        details['rdma_live_path'] = _state(
+            'fail', 'no recorded target snapshot exists; the live target was never observed')
+    elif counters['target_fixture_partitions'] and (counters['target_fixture_partitions']
+                                                    >= counters['target_observed_partitions']):
+        details['rdma_live_path'] = _state(
+            'fail', 'every observed partition is a fixture target; no kernel '
+                    'namespace was exported',
+            observed_partitions=counters['target_observed_partitions'],
+            fixture_partitions=counters['target_fixture_partitions'])
+    else:
+        details['rdma_live_path'] = _state('pass', None, live_transport=live_transport,
+                                           counters={name: counters[name]
+                                                     for name in LIVE_PATH_COUNTERS})
+    details['no_tcp_fallback'] = _state(
+        'not_exported',
+        'the engine exports no transport-fallback counter; the prepared deployment '
+        'names the RDMA live transport and the live family advanced',
+        live_transport=live_transport,
+        namespace_connects=counters.get('namespace_connects_total'))
+    protected = counters.get('target_write_protect_total')
+    target_errors = counters.get('target_errors_total')
+    if protected is None or target_errors is None:
+        details['write_protect_readback'] = _state(
+            'missing_counter', 'the target write-protect counters are absent')
+    elif target_errors:
+        details['write_protect_readback'] = _state(
+            'fail', 'the recorded target snapshot carries errors',
+            target_errors=target_errors)
+    elif not protected:
+        details['write_protect_readback'] = _state(
+            'not_observed', 'the replay opened no write-protected namespace; the '
+                            'S1-0 admission sequence applies and reads back the '
+                            'attribute, a plain replay does not',
+            target_owned_namespaces=counters.get('target_owned_namespaces'),
+            target_exposed_total=counters.get('target_exposed_total'))
+    else:
+        details['write_protect_readback'] = _state(
+            'pass', None, target_write_protect_total=protected,
+            target_errors_total=target_errors,
+            scope='each success is a kernel write-protect admin command whose '
+                  'identify readback matched in the engine commissioning path')
+    leases = counters.get('lease_exchanges_total')
+    if leases is None:
+        details['lease_protocol'] = _state('missing_counter',
+                                          'the lease exchange counter is absent')
+    else:
+        details['lease_protocol'] = _state(
+            'not_exported',
+            'the lease protocol revision is a source constant (37), not a metric; '
+            'the handshake itself is counted',
+            lease_exchanges_total=leases,
+            protocol_revision='37 (tidehunter/src/distributed/remote_db/coordinator_lease.rs)')
+    details['orphan_export'] = _state(
+        'not_exported',
+        'the target snapshot is recorded at the open fence, not after the close, '
+        'so an orphan export cannot be observed from a scrape',
+        target_owned_namespaces=counters.get('target_owned_namespaces'),
+        target_exposed_total=counters.get('target_exposed_total'))
+    return details
+
+
+def write_batch_check(values, namespaces, checkpoint_count):
+    """Write batches per completed checkpoint, from the adapter commit counter."""
+    if not isinstance(checkpoint_count, int) or checkpoint_count < 1:
+        raise ValueError('a checkpoint population is required')
+    stats = adapter_stats(values)
+    absent = [f'{name}:write_commit_calls' for name in sorted(namespaces)
+              if name not in stats or stats[name].get('write_commit_calls') is None]
+    if absent:
+        return _state('missing_counter', 'the write-commit counter is absent',
+                      missing=absent)
+    batches = int(sum(stats[name]['write_commit_calls'] for name in stats
+                      if name in set(namespaces)))
+    ratio = batches / checkpoint_count
+    payload = dict(batches=batches, checkpoints=checkpoint_count,
+                   write_batches_per_checkpoint=ratio,
+                   source='sum of write_commit_calls across the audited namespaces '
+                          'divided by replayed checkpoints; upstream writes three '
+                          'batches per checkpoint')
+    if ratio != 3:
+        return _state('fail', f'write batches per checkpoint reads {ratio}, not 3',
+                      **payload)
+    return _state('pass', None, **payload)
+
+
+def lifecycle_check(result):
+    """S1-1/S1-8: the reopen evidence must be present and verified."""
+    lifecycle = result.get('lifecycle')
+    if lifecycle is None:
+        return _state('missing_counter',
+                      'the cell requires --lifecycle-checks; the run has no reopen evidence')
+    if lifecycle.get('status') != 'clean-reopen-verified':
+        return _state('fail', 'the reopen evidence is not verified',
+                      status=lifecycle.get('status'))
+    if (lifecycle.get('audit_reopen') or {}).get('equal') is not True:
+        return _state('fail', 'the reopen audit is not equal')
+    if (lifecycle.get('tail_replay') or {}).get('state_unchanged') is not True:
+        return _state('fail', 'the tail replay changed state')
+    return _state('pass', None, durable_cut=lifecycle.get('durable_cut'),
+                  no_new_export=lifecycle.get('no_new_export'),
+                  tail_checkpoints=lifecycle.get('tail_checkpoints'))
+
+
+def hold_check(result):
+    """M5: the measured node stayed resident and its disk was sampled."""
+    hold = result.get('hold')
+    if hold is None:
+        return _state('missing_counter',
+                      'the cell requires --hold-seconds; the run has no hold evidence')
+    if hold.get('seconds', 0) < hold.get('requested_seconds', 0):
+        return _state('fail', 'the hold ended before its requested window',
+                      seconds=hold.get('seconds'),
+                      requested_seconds=hold.get('requested_seconds'))
+    samples = hold.get('disk_samples') or []
+    if len(samples) < 2:
+        return _state('fail', 'the hold produced fewer than two disk samples',
+                      samples=len(samples))
+    if not (hold.get('final') or {}).get('databases'):
+        return _state('fail', 'the hold has no final per-database disk sample')
+    if not hold.get('final_metrics_available'):
+        return _state('fail', 'the hold took no final metrics scrape')
+    return _state('pass', None, seconds=hold.get('seconds'),
+                  samples=len(samples), final=hold.get('final'),
+                  triggers=hold.get('triggers'))
+
+
+def cell_checks(result, values_by_mode, namespaces, *, checkpoint_count):
+    """Evaluate the cell's reviewed criteria from the exported evidence.
+
+    `values_by_mode` maps `native` and `remote` to the parsed final scrapes.
+    The remote scrape is the measured node. An unknown cell id (a local
+    rehearsal) records the checks but requires none of them.
+    """
+    import campaign_ledger
+    row = campaign_ledger.cell(result.get('cell_id'))
+    live_transport = ((result.get('external_manifest') or {}).get('live_transport')
+                      or result.get('live_transport') or 'tcp')
+    checks = dict(
+        admission=admission_checks(values_by_mode['remote'],
+                                   live_transport=live_transport),
+        cache=cache_invariants(values_by_mode['remote'], namespaces,
+                               coordinator_cache_mib=int(
+                                   (result.get('cache') or {}).get('coordinator_bytes', 0))
+                               // int(1024 * 1024)),
+        value_cache=value_cache_check(values_by_mode['remote'], namespaces),
+        write_batches=write_batch_check(values_by_mode['remote'], namespaces,
+                                        checkpoint_count),
+        lifecycle=lifecycle_check(result),
+        hold=hold_check(result))
+    required = list(row['requires']) if row else []
+    failures, not_exported, not_observed = [], {}, {}
+    for name in required:
+        entry = checks.get(name)
+        if entry is None:
+            failures.append(f'{name}: no check exists for this criterion')
+            continue
+        nested = [(key, value) for key, value in entry.items()
+                  if isinstance(value, dict) and 'state' in value]
+        states = ([value['state'] for _, value in nested] if nested else [entry['state']])
+        if any(state == 'fail' for state in states):
+            failures.append(name + ': ' + '; '.join(
+                value['reason'] for _, value in (nested or [(name, entry)])
+                if value['state'] == 'fail'))
+        elif any(state == 'missing_counter' for state in states):
+            failures.append(name + ': ' + '; '.join(
+                value['reason'] for _, value in (nested or [(name, entry)])
+                if value['state'] == 'missing_counter'))
+        for key, value in (nested or [(name, entry)]):
+            if value['state'] == 'not_exported':
+                not_exported[f'{name}.{key}' if nested else name] = value['reason']
+            elif value['state'] == 'not_observed':
+                not_observed[f'{name}.{key}' if nested else name] = value['reason']
+    return dict(cell_id=result.get('cell_id'), stage=(row['stage'] if row else None),
+                requires=required, checks=checks, failures=failures,
+                not_exported=not_exported, not_observed=not_observed,
+                scope='declared criteria only; a counter the engine does not export '
+                      'is listed, never decoded as zero')
 
 
 def main():

@@ -28,6 +28,16 @@ controller through the same executor, and keeps the sample series and the
 injector record as cell evidence. The cell passes only when the replay
 completes, its audit is equal, the injector reports typed recovery, and a new
 verified controller connection followed the loss.
+
+`--list [stage1|stage2]` prints the reviewed cell table from
+`campaign_ledger.MANUAL_SUI_CELLS`: the id, tier, production geometry, hold
+window, required criteria and the exact `run.py` arguments. A campaign run (one
+with `--bucket-prefix`) must name a reviewed `--cell-id`, and the launcher
+refuses a fragment size, coordinator cache or hold that its row does not
+declare. The campaign ledger is always loaded and merged with the bucket copy,
+so a passed cell is never rerun; a retry derives its own `-attempt-<n>` output
+tree, and a failed attempt uploads its evidence and ledger before the fleet is
+deleted (`campaign_upload.Evidence.persist_failure`).
 """
 import argparse
 import json
@@ -72,6 +82,39 @@ CONTROLLER_LOSS_COUNTERS = {
 }
 CONTROLLER_LOSS_CASE = {'stage1': 'S1-4', 'stage2': 'M7'}
 MAX_CONTROLLER_LOSS_SAMPLES = 2048
+# `run.py` bounds each audit command at 600 s; a cell runs at most 8 of them
+# (state and RocksDB, for both modes, before and after a reopen) and adds one
+# 900 s slack window. The launcher's own wait must cover that plus the replays
+# and a hold, or it would kill a healthy coordinator while it audits.
+AUDIT_SECONDS = 600
+AUDIT_COMMANDS = 8
+HANDSHAKE_SLACK_SECONDS = 900
+
+
+# A failure uploads its evidence before the fleet is deleted. The per-host owner
+# archives are rebuildable from the frozen build and are hundreds of MiB, so
+# they stay out; a very large stray file is listed, never silently skipped.
+FAILURE_ARTIFACT_LIMIT = 512 << 20
+FAILURE_ARTIFACT_SKIP = ('host-*.tar.gz',)
+
+
+def handshake_cap(deadline, *, hold_seconds=0, lifecycle=False):
+    """Bound the coordinator by its replays, audits and hold (F26).
+
+    A lifecycle cell runs the native replay, the remote replay and the reopen,
+    each under the cell deadline; the plain cell runs two. Every audit command
+    is bounded at `AUDIT_SECONDS`.
+    """
+    for name, value in (('deadline', deadline), ('hold', hold_seconds)):
+        if type(value) is not int or value < 0:
+            raise ValueError(f'{name} must be a nonnegative integer')
+    if deadline < 30:
+        raise ValueError('deadline must be at least 30 s')
+    replays = 3 if lifecycle else 2
+    return (replays * deadline + hold_seconds + AUDIT_COMMANDS * AUDIT_SECONDS
+            + HANDSHAKE_SLACK_SECONDS)
+
+
 # The engine exports the write-resume family; the M7 cell proves resent frames
 # from these four deltas of one remote before/after scrape.
 RESUME_COUNTERS = ('resume_attempts_total', 'resume_rewrites_total',
@@ -408,13 +451,14 @@ def plan(coordinator, owners):
 
 class SuiLauncher:
     def __init__(self, *, remote, build_root, fixture, output, guest_root, stage_dir,
-                 config_dir, resources, tier='native', owners=2, fragment_mib=8,
-                 deadline=900, extra_run=(), transport='efa', live_transport='rdma',
-                 coordinator_cache_mib=8, shard_cache_mib=0, schema=None,
-                 disk_sample_seconds=10, port=OWNER_CONTROL_PORT, ledger=None,
-                 cell_id='sui-replay', stage='stage1', resume=False,
+                 config_dir, resources, tier='native', owners=2,
+                 fragment_mib=None, deadline=900, extra_run=(), transport='efa',
+                 live_transport='rdma', coordinator_cache_mib=None, shard_cache_mib=0,
+                 schema=None, disk_sample_seconds=10, port=OWNER_CONTROL_PORT,
+                 ledger=None, cell_id='sui-replay', stage='stage1', resume=False,
                  store=None, bucket=None, prefix=None, write_profile_limit=0,
-                 resident_reads=None, allow_local_ledger=False, controller_loss=None):
+                 resident_reads=None, allow_local_ledger=False, controller_loss=None,
+                 hold_seconds=0):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -425,12 +469,15 @@ class SuiLauncher:
         self.resources = Path(resources).resolve()
         self.tier = tier
         self.owners = owners
-        self.fragment_mib = fragment_mib
+        self.fragment_mib = (ledger_module.DEFAULT_FRAGMENT_MIB
+                             if fragment_mib is None else fragment_mib)
         self.deadline = deadline
         self.extra_run = [item for item in extra_run if item != '--']
         self.transport = transport
         self.live_transport = live_transport
-        self.coordinator_cache_mib = coordinator_cache_mib
+        self.coordinator_cache_mib = (ledger_module.DEFAULT_COORDINATOR_CACHE_MIB
+                                      if coordinator_cache_mib is None
+                                      else coordinator_cache_mib)
         self.shard_cache_mib = shard_cache_mib
         self.schema = Path(schema).resolve() if schema else None
         self.disk_sample_seconds = disk_sample_seconds
@@ -456,6 +503,8 @@ class SuiLauncher:
         self.resident_reads = Path(resident_reads).resolve() if resident_reads else None
         self.allow_local_ledger = allow_local_ledger
         self.controller_loss = controller_loss
+        self.hold_seconds = hold_seconds
+        self.failure_skipped = []
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
@@ -468,6 +517,10 @@ class SuiLauncher:
                 and self.tier == 'synchronous')
         if set(self.manifest['binaries']) != BINARY_SET:
             raise ValueError('frozen build lacks the exact campaign executable set')
+        source_manifest = self.build_root / 'source-manifest.json'
+        if (not source_manifest.is_file()
+                or build.digest(source_manifest) != self.manifest.get('source_manifest_sha256')):
+            raise ValueError('the frozen build source manifest is missing or differs')
         for name, expected in self.manifest['binaries'].items():
             if build.digest(self.build_root / 'binaries' / name) != expected:
                 raise ValueError(f'frozen binary differs: {name}')
@@ -649,6 +702,8 @@ class SuiLauncher:
                         for path in sorted(self.schema.rglob('*')) if path.is_file()}
         return ledger_module.config_hash(
             spec=dict(build_manifest=build.digest(self.build_root / 'build-manifest.json'),
+                      package_manifest=build.digest(self.build_root / 'source-manifest.json'),
+                      source_archive=self.manifest.get('source_archive_sha256'),
                       fixture=build.digest(self.fixture / 'experiment/results.json'),
                       schema=schema_files),
             knobs=dict(transport=self.transport, live_transport=self.live_transport,
@@ -656,6 +711,10 @@ class SuiLauncher:
                        fragment_mib=self.fragment_mib, run_args=self.extra_run,
                        coordinator_cache_mib=self.coordinator_cache_mib,
                        shard_cache_mib=self.shard_cache_mib,
+                       deadline=self.deadline,
+                       disk_sample_seconds=self.disk_sample_seconds,
+                       port=self.port,
+                       hold_seconds=self.hold_seconds,
                        write_profile_limit=self.write_profile_limit,
                        resident_reads=(build.digest(self.resident_reads)
                                        if self.resident_reads else None),
@@ -722,11 +781,85 @@ class SuiLauncher:
         os.replace(temporary, path)
         return receipt
 
-    def not_reached(self, error):
+    def failure_artifacts(self):
+        """Every artifact the failed attempt left, existing files only.
+
+        The boot disk is deleted at the stage deadline, so a failure uploads
+        what it has before the fleet goes away. Private TLS material, bulk
+        DB/WAL trees and the rebuildable per-host owner archives never travel;
+        a missing path is skipped, never invented.
+        """
+        rows, seen, skipped = [], set(), []
+        roots = ((self.output, ''), (self.config_dir, 'external/'),
+                 (self.stage_dir, 'stages/'))
+        for root, label in roots:
+            root = Path(root)
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob('*')):
+                if not path.is_file():
+                    continue
+                parts = path.relative_to(root).parts
+                if any(part in ('tls', 'storage') for part in parts):
+                    continue
+                if any(path.match(pattern) for pattern in FAILURE_ARTIFACT_SKIP):
+                    skipped.append(dict(path=str(path),
+                                        reason='rebuildable owner archive'))
+                    continue
+                if path.stat().st_size > FAILURE_ARTIFACT_LIMIT:
+                    skipped.append(dict(path=str(path),
+                                        reason='above the failure upload bound'))
+                    continue
+                name = label + str(path.relative_to(root))
+                if name in seen:
+                    continue
+                seen.add(name)
+                rows.append(upload_module.artifact(path, name))
+        if (self.resources.is_file()
+                and self.resources.stat().st_size <= FAILURE_ARTIFACT_LIMIT
+                and self.evidence_name(self.resources) not in seen):
+            rows.append(upload_module.artifact(
+                self.resources, self.evidence_name(self.resources)))
+        self.failure_skipped = skipped
+        return rows
+
+    def record_failure(self, entry, error):
+        """Upload the failed attempt's evidence and ledger; never mask the error."""
+        if self.store is None:
+            return None
+        try:
+            artifacts = self.failure_artifacts()
+            entry['failure_skipped'] = self.failure_skipped
+            upload = upload_module.Evidence(self.store, self.prefix).persist_failure(
+                entry, artifacts, error, ledger=self.ledger)
+        except BaseException as upload_error:  # the caller's error is the report
+            print(f'failure evidence upload skipped: {upload_error}', file=sys.stderr)
+            return None
+        print(json.dumps(dict(cell_id=self.cell_id, stage=self.stage,
+                              status='failed', attempt=entry['attempts'],
+                              upload=upload)))
+        return upload
+
+    def record_observation(self, entry):
+        """Upload a non-failure attempt's evidence and ledger, never masking."""
+        if self.store is None:
+            return None
+        try:
+            evidence = upload_module.Evidence(self.store, self.prefix)
+            receipts = evidence.upload(self.failure_artifacts(),
+                                       stage=entry['stage'], cell_id=entry['id'],
+                                       attempt=entry['attempts'])
+            evidence.save(self.ledger)
+        except BaseException as upload_error:
+            print(f'observation upload skipped: {upload_error}', file=sys.stderr)
+            return None
+        return receipts
+
+    def not_reached(self, error, *, terminal=False):
         """Record a cell the replay could not produce; it is not a failure."""
         receipt = dict(complete=False, not_reached=True, status='not_reached',
                        cell_id=self.cell_id, stage=self.stage, tier=self.tier,
-                       reason=str(error))
+                       reason=str(error), terminal=terminal)
         print(json.dumps(receipt))
         return receipt
 
@@ -739,10 +872,22 @@ class SuiLauncher:
             except NotReached as error:
                 return self.not_reached(error)
         previous = self.ledger.entries.get((self.stage, self.cell_id))
-        if (self.resume and previous and previous['status'] == 'passed'
+        if previous and previous['status'] == 'invalid':
+            # A cell whose injection point was not reached twice is terminal;
+            # rerunning it would spend the fleet on the same observation.
+            receipt = dict(complete=False, status='invalid', terminal=True,
+                           skipped=True, cell_id=self.cell_id, tier=self.tier,
+                           attempt=previous['attempts'],
+                           reason=previous.get('failure'))
+            print(json.dumps(receipt))
+            return receipt
+        # A passed cell with the same binding is never rerun, whether or not the
+        # operator passed --resume: the merged bucket ledger is the record.
+        if (previous and previous['status'] == 'passed'
                 and previous['config_hash'] == identity):
             receipt = dict(complete=True, skipped=True, cell_id=self.cell_id,
-                           tier=self.tier, owners=self.owners)
+                           tier=self.tier, owners=self.owners,
+                           attempt=previous['attempts'])
             print(json.dumps(receipt))
             return receipt
         self.admit(hosts)
@@ -765,11 +910,20 @@ class SuiLauncher:
             self.ledger.save()
             return receipt
         except NotReached as error:
-            self.ledger.not_reached(entry, str(error))
+            # A point the replay cannot produce runs once more; a second miss is
+            # terminal, so a resume loop cannot spend the fleet on it.
+            terminal = entry['attempts'] >= 2
+            if terminal:
+                self.ledger.invalidate(
+                    entry, f'not reached on attempt {entry["attempts"]}: {error}')
+            else:
+                self.ledger.not_reached(entry, str(error))
+            self.record_observation(entry)
             self.ledger.save()
-            return self.not_reached(error)
+            return self.not_reached(error, terminal=terminal)
         except BaseException as error:
             self.ledger.fail(entry, error)
+            self.record_failure(entry, error)
             self.ledger.save()
             raise
 
@@ -793,6 +947,8 @@ class SuiLauncher:
                    '--external-resources', str(self.resources),
                    '--external-stage-dir', str(self.stage_dir),
                    '--cell-id', self.cell_id]
+        if self.hold_seconds:
+            command += ['--hold-seconds', str(self.hold_seconds)]
         if self.resident_reads is not None:
             command += ['--resident-reads', str(self.resident_reads)]
         return command + list(self.extra_run)
@@ -812,7 +968,9 @@ class SuiLauncher:
         marker = self.stage_dir / 'resources-required.json'
         resources_written = False
         try:
-            deadline = time.monotonic() + 3 * self.deadline + 1800
+            deadline = time.monotonic() + handshake_cap(
+                self.deadline, hold_seconds=self.hold_seconds,
+                lifecycle=('--lifecycle-checks' in self.extra_run))
             while child.poll() is None:
                 if marker.exists():
                     required = json.loads(marker.read_text())
@@ -869,7 +1027,85 @@ class SuiLauncher:
         return receipt
 
 
+def attempt_output(output, attempt):
+    """Attempt-scoped output family; a retry never reuses a directory (F20).
+
+    The ledger's attempt number is authoritative. The base name is kept, so an
+    operator can see which cell an attempt belongs to, and a suffix is added
+    until a free name is found; the stage, config and resource paths derive
+    from the returned path.
+    """
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError('attempt must be a positive integer')
+    output = Path(output)
+    if attempt == 1 and not output.exists():
+        return output
+    number = max(attempt, 2)
+    while True:
+        candidate = output.with_name(f'{output.name}-attempt-{number}')
+        if not candidate.exists():
+            return candidate
+        number += 1
+
+
+def cell_row_checks(cell, args):
+    """Refuse a reviewed cell whose launcher knobs differ from its row (F8)."""
+    if args.stage != cell['stage']:
+        raise SystemExit(f"{cell['id']} is a {cell['stage']} cell; "
+                         f"give --stage {cell['stage']}")
+    if args.durability_tier != cell['tier']:
+        raise SystemExit(f"{cell['id']} is a {cell['tier']} cell, not "
+                         f"{args.durability_tier}")
+    for flag, actual, declared in (
+            ('--fragment-mib', args.fragment_mib, cell['fragment_mib']),
+            ('--coordinator-cache-mib', args.coordinator_cache_mib,
+             cell['coordinator_cache_mib']),
+            ('--hold-seconds', args.hold_seconds, cell['hold_seconds'])):
+        if actual != declared:
+            raise SystemExit(f"{cell['id']} declares {flag} {declared}, "
+                             f"not {actual}; the campaign geometry is fixed")
+
+
+def cell_table(stage='all'):
+    """The reviewed cell table as printable rows, one per cell."""
+    rows = []
+    for cell in ledger_module.cells(None if stage == 'all' else stage):
+        run = ' '.join(ledger_module.run_arguments(cell))
+        rows.append(dict(id=cell['id'], stage=cell['stage'], tier=cell['tier'],
+                         fragment_mib=cell['fragment_mib'],
+                         coordinator_cache_mib=cell['coordinator_cache_mib'],
+                         max_maps=cell['max_maps'], max_index_maps=cell['max_index_maps'],
+                         hold_seconds=cell['hold_seconds'],
+                         requires=','.join(cell['requires']) or '-',
+                         run=run or '-'))
+    return rows
+
+
+def list_cells(stage='all'):
+    """Print the reviewed table and exit zero."""
+    if stage not in (*ledger_module.REVIEWED_STAGES, 'all'):
+        raise SystemExit('--list takes stage1, stage2 or all')
+    rows = cell_table(stage)
+    print(json.dumps(dict(cells=rows, count=len(rows)), indent=1))
+    return 0
+
+
+def list_request(argv):
+    """The requested stage of `--list [stage]` / `--list=stage`, else None."""
+    for index, item in enumerate(argv):
+        if item == '--list':
+            following = argv[index + 1] if index + 1 < len(argv) else None
+            return (following if following and not following.startswith('-')
+                    else 'all')
+        if item.startswith('--list='):
+            return item.split('=', 1)[1]
+    return None
+
+
 def main():
+    stage = list_request(sys.argv[1:])
+    if stage is not None:
+        return list_cells(stage)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--fixture', type=Path, required=True)
@@ -880,28 +1116,41 @@ def main():
                         help='absolute owner storage root, identical on both owners')
     parser.add_argument('--coordinator', required=True)
     parser.add_argument('--owners', required=True, help='owner1,owner2')
-    parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
+    parser.add_argument('--zone',
+                        help='zone of the three hosts; only --gcloud-ssh needs it, a '
+                             'campaign run takes the zone from the fleet state')
     parser.add_argument('--external-config-dir', type=Path)
     parser.add_argument('--stage-dir', type=Path)
     parser.add_argument('--resources', type=Path)
     parser.add_argument('--ledger', type=Path,
-                        help='campaign ledger (default: beside the run output)')
+                        help='campaign ledger (default: beside the run output); it is '
+                             'always loaded and merged with the bucket copy')
     parser.add_argument('--resume', action='store_true',
-                        help='skip this cell if the ledger has it passed with the same binding')
-    parser.add_argument('--cell-id', default='sui-replay')
+                        help='accepted for older command lines; the ledger is always '
+                             'merged and a passed cell is always skipped')
+    parser.add_argument('--cell-id',
+                        help='reviewed campaign cell id (required for a bucket run); '
+                             '--list prints the reviewed table')
     parser.add_argument('--stage', default='stage1')
+    parser.add_argument('--list', nargs='?', const='all', choices=('stage1', 'stage2', 'all'),
+                        help='print the reviewed manual_sui cell table and exit')
     parser.add_argument('--transport', choices=('tcp', 'tcp-trusted',
                         *deployment.HARDWARE_TRANSPORTS), default='efa')
     parser.add_argument('--live-transport', choices=deployment.LIVE_TRANSPORTS,
                         default='rdma')
     parser.add_argument('--durability-tier', choices=('native', 'synchronous'),
                         default='native')
-    parser.add_argument('--fragment-mib', type=int, default=8)
+    parser.add_argument('--fragment-mib', type=int,
+                        default=ledger_module.DEFAULT_FRAGMENT_MIB)
     parser.add_argument('--deadline', type=int, default=900)
     parser.add_argument('--disk-sample-seconds', type=int, default=10)
+    parser.add_argument('--hold-seconds', type=int, default=0,
+                        help='M5 hold: keep the measured node resident this long; a '
+                             'reviewed cell declares its own value')
     parser.add_argument('--port', type=int, default=OWNER_CONTROL_PORT,
                         help='owner control port; each partition adds its index')
-    parser.add_argument('--coordinator-cache-mib', type=int, default=8)
+    parser.add_argument('--coordinator-cache-mib', type=int,
+                        default=ledger_module.DEFAULT_COORDINATOR_CACHE_MIB)
     parser.add_argument('--shard-cache-mib', type=int, default=0)
     parser.add_argument('--write-profile-limit', type=int, default=0,
                         help='bounded append profiling per owning connection, 0 disables')
@@ -960,6 +1209,15 @@ def main():
             raise SystemExit(str(error)) from None
         if not 1 <= args.controller_loss_owner <= 2:
             raise SystemExit('--controller-loss-owner must be 1 or 2')
+    cell = ledger_module.cell(args.cell_id) if args.cell_id else None
+    if cell is not None:
+        cell_row_checks(cell, args)
+    elif args.bucket_prefix:
+        # One reviewed id per cell: two different cells must never share an id
+        # and be skipped as one, and a campaign result needs its declared knobs.
+        raise SystemExit(
+            f'{args.cell_id or "no --cell-id"} is not a reviewed manual_sui '
+            'cell; --list prints the reviewed ids')
     if not args.gcloud_ssh and not args.on_coordinator:
         # The replay runs on H0: run.py starts the producer, the native control
         # and the remote coordinator, and they must reach the owners.
@@ -972,6 +1230,7 @@ def main():
             files=files,
             values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
                     '--output': Path('out') / args.output.name,
+                    '--ledger': 'campaign-ledger.json',
                     '--resident-reads': 'resident-reads.json'})
     if not args.bucket_prefix and not args.allow_local_ledger:
         raise SystemExit('a passed cell needs a verified evidence upload; give '
@@ -981,13 +1240,20 @@ def main():
         store, bucket, prefix = upload_module.open_store(
             args.bucket_prefix, args.impersonation_account, guest=args.guest_token)
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
-    if Path(ledger_path).exists() and not args.resume:
-        raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
     resume_ledger = ledger_module.Ledger(ledger_path)
-    if args.resume:
+    # The bucket ledger is the campaign record: load and merge it on every run,
+    # not only with --resume, so a passed cell is never rerun on a new fleet.
+    if Path(ledger_path).exists():
         resume_ledger.load()
-        if store is not None:
-            resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
+    if store is not None:
+        resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
+    cell_id = args.cell_id or 'sui-replay'
+    previous = resume_ledger.entries.get((args.stage, cell_id))
+    attempt = (previous['attempts'] + 1) if previous else 1
+    if args.on_coordinator or args.gcloud_ssh:
+        # A retry derives its own attempt-scoped tree; the base name still names
+        # the cell, and the ledger path stays stable (F20).
+        output = attempt_output(output, attempt)
     remote = mailbox_exec.open_executor(args)
     controller_loss = None
     if args.controller_loss is not None:
@@ -1024,15 +1290,20 @@ def main():
         coordinator_cache_mib=args.coordinator_cache_mib,
         shard_cache_mib=args.shard_cache_mib, schema=args.schema,
         disk_sample_seconds=args.disk_sample_seconds, port=args.port,
-        ledger=resume_ledger, cell_id=args.cell_id, stage=args.stage,
+        ledger=resume_ledger, cell_id=cell_id, stage=args.stage,
         resume=args.resume, store=store, bucket=bucket, prefix=prefix,
         write_profile_limit=args.write_profile_limit,
         resident_reads=args.resident_reads,
         allow_local_ledger=args.allow_local_ledger,
-        controller_loss=controller_loss)
+        controller_loss=controller_loss, hold_seconds=args.hold_seconds)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
+    if receipt.get('status') in ('not_reached', 'invalid'):
+        # A required cell that cannot start or reach its point is not a clean
+        # stage result (F22).
+        return 1 if cell is not None else 0
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

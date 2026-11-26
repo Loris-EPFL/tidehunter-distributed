@@ -191,5 +191,78 @@ class Planning(unittest.TestCase):
                 self.assertNotEqual(value, ledger.config_hash(**(base | {field: changed})))
 
 
+class ReviewedCells(unittest.TestCase):
+    """The reviewed manual_sui table fixes ids, geometry and criteria (F8, F25)."""
+
+    def test_every_id_is_unique_and_reaches_its_row(self):
+        rows = ledger.MANUAL_SUI_CELLS
+        ids = [row['id'] for row in rows]
+        self.assertEqual(len(ids), len(set(ids)))
+        for row in rows:
+            self.assertIn(row['stage'], ledger.REVIEWED_STAGES)
+            self.assertIn(row['tier'], ('native', 'synchronous'))
+            self.assertEqual(ledger.cell(row['id']), row)
+        self.assertIsNone(ledger.cell('not-a-reviewed-cell'))
+
+    def test_the_stage_one_lifecycle_and_cache_rows_exist_per_tier(self):
+        ids = {row['id'] for row in ledger.MANUAL_SUI_CELLS}
+        for required in ('S1-0', 'S1-1-native', 'S1-1-synchronous',
+                         'S1-7-cache0-native', 'S1-7-cache128-native',
+                         'S1-7-cache1000-native', 'S1-7-cache1000-synchronous',
+                         'S1-7-blob1024-native', 'S1-8-native', 'S1-8-synchronous',
+                         'S1-4-mid-frame-native', 'S1-4-after-adoption-synchronous',
+                         'S1-4-during-flush-synchronous'):
+            self.assertIn(required, ids)
+        self.assertNotIn('S1-4-during-flush-native', ids,
+                         'a native flush edge is unreachable')
+
+    def test_the_production_geometry_is_the_default_and_the_mechanism_rows_force_theirs(self):
+        for row in ledger.MANUAL_SUI_CELLS:
+            expected_fragment = 64 if row['id'].startswith(('M3-', 'M4-')) else 1024
+            self.assertEqual(row['fragment_mib'], expected_fragment, row['id'])
+            self.assertEqual(row['coordinator_cache_mib'], 0, row['id'])
+        for row in ledger.MANUAL_SUI_CELLS:
+            if row['id'].startswith('M3-'):
+                self.assertEqual((row['max_maps'], row['max_index_maps']), (3, 3))
+            else:
+                self.assertEqual((row['max_maps'], row['max_index_maps']), (None, None))
+        hold = ledger.cell('M5-hold')
+        self.assertEqual(hold['hold_seconds'], 1800)
+        self.assertIn('hold', hold['requires'])
+
+    def test_run_arguments_round_trip(self):
+        self.assertEqual(ledger.run_arguments(ledger.cell('S1-0')),
+                         ['--checkpoints', '4'])
+        self.assertEqual(ledger.run_arguments(ledger.cell('S1-1-native')),
+                         ['--lifecycle-checks', '--tail-checkpoints', '64'])
+        self.assertEqual(ledger.run_arguments(ledger.cell('M1-c4-native')),
+                         ['--driver-concurrency', '4'])
+
+    def test_a_reviewed_stage_is_the_only_filter(self):
+        self.assertEqual({row['stage'] for row in ledger.cells('stage1')}, {'stage1'})
+        self.assertEqual({row['stage'] for row in ledger.cells('stage2')}, {'stage2'})
+        with self.assertRaises(ValueError):
+            ledger.cells('stage3')
+
+
+class TerminalInvalid(unittest.TestCase):
+    """A second `not_reached` attempt is terminal (F22)."""
+
+    def test_an_invalid_cell_is_never_planned_again(self):
+        cells = [cell('a'), cell('b')]
+        value = ledger.Ledger()
+        entry = value.begin(stage='stage3', cell_id='a', config_hash='h')
+        value.invalidate(entry, 'not reached on attempt 2: no flush edge')
+        self.assertEqual([row['id'] for row in ledger.plan(cells, value)], ['b'])
+        self.assertEqual([row['id'] for row in ledger.plan(cells, value, only=['a'])], [])
+
+    def test_a_pending_not_reached_cell_still_runs_once_more(self):
+        cells = [cell('a')]
+        value = ledger.Ledger()
+        entry = value.begin(stage='stage3', cell_id='a', config_hash='h')
+        value.not_reached(entry, 'no flush edge')
+        self.assertEqual([row['id'] for row in ledger.plan(cells, value)], ['a'])
+
+
 if __name__ == '__main__':
     unittest.main()

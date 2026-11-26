@@ -9,6 +9,12 @@ SHA-256, `Ledger.mark_passed(..., store=ObjectStoreLedger)` re-verifies every
 key, and `gcs_ledger.save_ledger` writes `<prefix>/campaign-ledger.json` with a
 generation precondition, merging a concurrent copy. `--allow-local-ledger` is
 the one local-rehearsal escape and never uploads.
+
+A failed attempt uses `Evidence.persist_failure(entry, artifacts, error)`: it
+uploads every artifact that still exists under the same attempt-scoped keys,
+saves the ledger entry `failed` with the original error and attempt, and never
+raises over the caller's error. The fleet deletes its boot disk at the stage
+deadline, so this upload is the only copy of a failure.
 """
 from pathlib import Path
 import sys
@@ -59,36 +65,38 @@ class Evidence:
         object is a hard failure, never an overwrite. The local file is read
         again after the upload and must keep its hash.
         """
-        receipts = []
-        for artifact in artifacts:
-            path = Path(artifact['path'])
-            data = path.read_bytes()
-            digest = ledger_module.sha256_bytes(data)
-            if len(data) != artifact['size'] or digest != artifact['sha256']:
-                raise ValueError(f'evidence changed before upload: {path}')
-            key = self.key(stage, cell_id, artifact['name'], attempt)
-            try:
-                receipt = self.store.put(key, data, if_generation_match=0,
-                                         metadata={'kind': 'cell-evidence',
-                                                   'cell': cell_id})
-                generation = int(receipt['generation'])
-                if (int(receipt.get('size', -1)) != len(data)
-                        or receipt.get('metadata', {}).get('sha256') != digest):
-                    raise ValueError(f'evidence upload receipt differs: {key}')
-            except gcp_api.ApiError as error:
-                if error.status not in (409, 412):
-                    raise
-                head = self.store.head(key)
-                if (int(head.get('size', -1)) != len(data)
-                        or head.get('metadata', {}).get('sha256') != digest):
-                    raise ValueError(f'uploaded evidence differs: {key}') from None
-                generation = int(head['generation'])
-            if ledger_module.sha256_file(path) != digest:
-                raise ValueError(f'local evidence mirror changed during upload: {path}')
-            artifact['key'] = key
-            receipts.append(dict(key=key, path=str(path), size=len(data),
-                                 sha256=digest, generation=generation))
-        return receipts
+        return [self._upload_one(artifact, stage=stage, cell_id=cell_id,
+                                 attempt=attempt) for artifact in artifacts]
+
+    def _upload_one(self, artifact, *, stage, cell_id, attempt):
+        """One attempt-scoped object: upload, verify the receipt, re-read the file."""
+        path = Path(artifact['path'])
+        data = path.read_bytes()
+        digest = ledger_module.sha256_bytes(data)
+        if len(data) != artifact['size'] or digest != artifact['sha256']:
+            raise ValueError(f'evidence changed before upload: {path}')
+        key = self.key(stage, cell_id, artifact['name'], attempt)
+        try:
+            receipt = self.store.put(key, data, if_generation_match=0,
+                                     metadata={'kind': 'cell-evidence',
+                                               'cell': cell_id})
+            generation = int(receipt['generation'])
+            if (int(receipt.get('size', -1)) != len(data)
+                    or receipt.get('metadata', {}).get('sha256') != digest):
+                raise ValueError(f'evidence upload receipt differs: {key}')
+        except gcp_api.ApiError as error:
+            if error.status not in (409, 412):
+                raise
+            head = self.store.head(key)
+            if (int(head.get('size', -1)) != len(data)
+                    or head.get('metadata', {}).get('sha256') != digest):
+                raise ValueError(f'uploaded evidence differs: {key}') from None
+            generation = int(head['generation'])
+        if ledger_module.sha256_file(path) != digest:
+            raise ValueError(f'local evidence mirror changed during upload: {path}')
+        artifact['key'] = key
+        return dict(key=key, path=str(path), size=len(data),
+                    sha256=digest, generation=generation)
 
     def save(self, ledger):
         generation = gcs_ledger.save_ledger(self.store, ledger, self.ledger_key)
@@ -124,6 +132,63 @@ class Evidence:
                     ledger=dict(key=self.ledger_key, generation=generation,
                                 size=head['size'], sha256=head['sha256'], local=local),
                     evidence=receipts)
+
+    def persist_failure(self, entry, artifacts, error, *, ledger=None):
+        """Record a failed attempt: upload what exists, then the bucket ledger.
+
+        Every existing artifact of the failed attempt goes to its own
+        attempt-scoped key, so a retry never overwrites an older object and the
+        evidence outlives the deleted boot disk. Artifacts that do not exist are
+        skipped; an upload that fails is listed and does not stop the rest. The
+        ledger entry is saved `failed` with the original error and attempt under
+        the generation precondition, merging the bucket copy. This method never
+        raises over the caller's original error: a store failure is printed and
+        the caller's exception stands.
+        """
+        receipts, upload_errors = [], []
+        try:
+            stage = entry['stage']
+        except (KeyError, TypeError):
+            print('failure evidence skipped: the entry has no stage', file=sys.stderr)
+            return dict(uploaded=[], errors=['entry has no stage'], ledger=None)
+        for artifact in artifacts or ():
+            try:
+                if not Path(artifact['path']).is_file():
+                    continue
+                receipts.append(self._upload_one(
+                    artifact, stage=stage, cell_id=entry['id'],
+                    attempt=entry['attempts']))
+            except BaseException as upload_error:
+                upload_errors.append(f'{artifact.get("name") or artifact.get("path")}: '
+                                     f'{upload_error}')
+                print(f'failure evidence upload failed: {upload_errors[-1]}',
+                      file=sys.stderr)
+        entry['failure_evidence'] = dict(uploaded=receipts, errors=upload_errors)
+        target = ledger
+        try:
+            if target is None:
+                target = ledger_module.Ledger()
+                try:
+                    data, _ = self.ledger_store.get(self.ledger_key)
+                except KeyError:
+                    data = None
+                if data:
+                    target = ledger_module.Ledger.from_bytes(data)
+                target.path = None
+            target.fail(entry, error)
+            target.entries[(stage, entry['id'])] = entry
+            gcs_ledger.save_ledger(self.store, target, self.ledger_key)
+        except BaseException as ledger_error:
+            upload_errors.append(f'ledger: {ledger_error}')
+            print(f'failure ledger write failed: {ledger_error}', file=sys.stderr)
+        try:
+            if ledger is not None:
+                ledger.fail(entry, error)
+                ledger.save()
+        except BaseException as local_error:
+            print(f'local failure ledger write failed: {local_error}', file=sys.stderr)
+        return dict(uploaded=receipts, errors=upload_errors,
+                    ledger=dict(key=self.ledger_key))
 
 
 def pass_local(ledger, entry, artifacts):
