@@ -49,6 +49,9 @@ PAIR_SECONDS = 1200
 PAIR_CLEANUP_SECONDS = 300
 WORKER_READY_SECONDS = 180
 FLEET_SECONDS = 21600
+# Qualification-only spends one preparation (900 s) plus the pair phase (480 s)
+# plus teardown; one hour is the reviewed ceiling, not the suite's window.
+QUALIFICATION_SECONDS = 3600
 EXPORT_RESERVE_SECONDS = 900
 # Export reserve is inside the campaign; this margin leaves time after its
 # deadline for the terminal receipt and cleanup before VM expiry.
@@ -318,8 +321,10 @@ def reservation_seconds(spec):
     return hours * 3600
 
 
-def reservation_quote(spec, machine):
-    duration = reservation_seconds(spec)
+def reservation_quote(spec, machine, seconds=None):
+    duration = reservation_seconds(spec) if seconds is None else seconds
+    if type(duration) is not int or duration <= 0:
+        raise ValueError('a reservation window must be a positive integer')
     hosts = spec.get('owner_hosts', 5) + 1
     rate = MACHINE_RATE_NANODOLLARS[machine]
     compute = (rate * hosts * duration * 100 + 3600 * 10**9 - 1) // (3600 * 10**9)
@@ -580,19 +585,18 @@ def _put_json(store, key, value):
     return {'object': key, 'generation': str(meta['generation']), 'sha256': _digest(raw)}
 
 
-def _stage(store, bucket, state, receipt, wheels=None, *, qualification=False):
-    """Stage the same locally admitted source and archive for each child."""
+def _stage(store, state, receipt, wheels=None):
+    """Stage the same locally admitted source and archive for each child.
+
+    The runtime is written later, after the fleet's numeric IDs and addresses
+    are admitted, because the guest bootstrap and the idle guard both validate
+    that one document before starting anything.
+    """
     prefix = 'runs/' + state['run_id'] + '/'
     package = dict(receipt)
     package['object_key'] = prefix + 'package.tar'
     package['generation'] = campaign.upload_file(store, package['archive_path'], package['sha256'], package['object_key'])
     _put_json(store, prefix + 'package.json', package)
-    # The qualification bootstrap only uses these identity fields. Normal fleet
-    # runtime is written later, once all numeric IDs and addresses are admitted.
-    if qualification:
-        runtime = {'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
-                   'deadline_utc': state['deadline'], 'bucket': bucket, 'package': package}
-        _put_json(store, prefix + 'runtime.json', runtime)
     if wheels is not None:
         entries = []
         for item in wheels:
@@ -1220,11 +1224,22 @@ async def _headroom(mailbox, fleet, state, package_root, rdma_device, output):
     return result
 
 
-async def _suite(store, config, state, path, fleet, package, spec, output, rdma_device):
-    runtime = gcp_runtime.build_runtime_config(
-        config, fleet, package, spec, state['deadline'], run_id=state['run_id'],
-        campaign_deadline_utc=_utc(campaign.parse_time(state['deadline']).timestamp() - CAMPAIGN_MARGIN_SECONDS),
+def _fleet_runtime(config, fleet, package, spec, state):
+    """The one admitted runtime document of a qualification fleet.
+
+    The fleet bootstrap waits for this object after the pair phase and starts
+    the worker and the idle guard from the copy it writes locally.
+    """
+    return gcp_runtime.build_runtime_config(
+        dict(config, run_id=state['run_id']), fleet, package, spec, state['deadline'],
+        run_id=state['run_id'],
+        campaign_deadline_utc=_utc(campaign.parse_time(state['deadline']).timestamp()
+                                   - CAMPAIGN_MARGIN_SECONDS),
         placement_policy={'name': state['policy']['name'], 'id': state['policy']['id']})
+
+
+async def _suite(store, config, state, path, fleet, package, spec, output, rdma_device):
+    runtime = _fleet_runtime(config, fleet, package, spec, state)
     state['runtime_sha256'] = _digest(_json(runtime))
     await _blocking(campaign.save, path, state)
     await _blocking(_put_json, store, 'runs/' + state['run_id'] + '/runtime.json', runtime)
@@ -1456,7 +1471,9 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
     spec = copy.deepcopy(spec)
     host_count = spec.get('owner_hosts', 5) + 1
     config = dict(config, machine_type=config.get('machine_type', 'z4m-highmem-16'))
-    duration, compute, ceiling = reservation_quote(spec, config['machine_type'])
+    duration, compute, ceiling = reservation_quote(
+        spec, config['machine_type'],
+        seconds=QUALIFICATION_SECONDS if qualification_only else None)
     weekly_limit = json.loads(Path(__file__).with_name('budget.json').read_text()).get('weekly_limit_cents')
     if type(weekly_limit) is not int or weekly_limit <= 0:
         raise ValueError('budget.json requires a positive integer weekly_limit_cents')
@@ -1504,7 +1521,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
               'children': {}, 'phase': 'initial', 'cleanup_verified': False,
               'budget': {'ceiling_cents': ceiling, 'compute_cents': compute,
                          'non_compute_quote_cents': surcharge_cents, 'weekly_limit_cents': weekly_limit,
-                         'reservation_hours': spec.get('reservation_hours', 6)},
+                         'reservation_hours': duration / 3600},
               'reservation': {'cents': ceiling, 'region': 'us-central1',
                               'instances': host_count,
                               'vcpus': int(config['machine_type'].rsplit('-', 1)[-1]) * host_count,
@@ -1543,7 +1560,7 @@ async def run(config, *, package_dir, revision, spec, wheels, base_image,
         await _blocking(_record, path, parent, 'fleet')
         fleet_state, fleet_path = await _blocking(_new_child, parent, path, 'fleet', duration)
         fleet_state['host_count'] = host_count
-        package, prep_sha = await _blocking(_stage, store, config['bucket'], fleet_state, receipt, wheels)
+        package, prep_sha = await _blocking(_stage, store, fleet_state, receipt, wheels)
         fleet_state['package'] = package
         fleet_state['preparation_sha256'] = prep_sha
         await _blocking(campaign.save, fleet_path, fleet_state)

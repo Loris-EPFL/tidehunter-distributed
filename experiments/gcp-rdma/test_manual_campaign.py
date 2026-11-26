@@ -606,17 +606,16 @@ class ManualCampaignTest(unittest.TestCase):
             wheel.write_bytes(b'wheel')
             receipt = {'archive_path': str(archive), 'sha256': hashlib.sha256(b'package').hexdigest(),
                        'source_sha256': state['source_sha256']}
-            package, prep_sha = manual._stage(store, CONFIG['bucket'], state, receipt,
-                [{'path': str(wheel), 'sha256': hashlib.sha256(b'wheel').hexdigest()}], qualification=True)
+            package, prep_sha = manual._stage(store, state, receipt,
+                [{'path': str(wheel), 'sha256': hashlib.sha256(b'wheel').hexdigest()}])
             prefix = 'runs/' + state['run_id'] + '/'
             self.assertEqual(store.get(package['object_key'], generation=package['generation']), b'package')
             raw = store.get(prefix + 'preparation.json')
             self.assertEqual(hashlib.sha256(raw).hexdigest(), prep_sha)
             descriptor = json.loads(raw)['wheels'][0]
             self.assertEqual(store.get(descriptor['object_key'], generation=descriptor['generation']), b'wheel')
-            self.assertEqual(json.loads(store.get(prefix + 'runtime.json'))['package'], package)
             with self.assertRaises(ValueError):
-                manual._stage(Store(), CONFIG['bucket'], state, dict(receipt, sha256='f' * 64))
+                manual._stage(Store(), state, dict(receipt, sha256='f' * 64))
 
     def test_terminal_export_rejects_foreign_or_unbound_objects(self):
         store, state = Store(), parent()
@@ -1609,7 +1608,8 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                     async def create_vm(self, index, boot_image, deadline, startup):
                         events.append(('create', index, boot_image, deadline))
                         host = {'name': self.state['run_id'] + '-' + str(index), 'id': str(index + 1),
-                                'index': index, 'zone': 'us-central1-a', 'internal_ip': '10.1.0.' + str(index + 1),
+                                'index': index, 'role': 'coordinator' if index == 0 else 'owner',
+                                'zone': 'us-central1-a', 'internal_ip': '10.1.0.' + str(index + 1),
                                 'rdma_ip': '10.2.0.' + str(index + 1)}
                         self.state['instances'].append({'name': host['name'], 'id': host['id'], 'fleet': host})
                         gcp_campaign.save(self.path, self.state)
@@ -1649,6 +1649,7 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
                                   return_value={'id': '42', 'status': 'READY', 'selfLink': 'https://example/' + image}), \
                      patch.object(manual.gcp_budget, 'reserve', return_value={}), \
                      patch.object(manual, '_stage', return_value=({'manifest_sha256': manifest}, 'f' * 64)), \
+                     patch.object(manual, '_fleet_runtime', return_value={'package_root': '/package'}), \
                      patch.object(manual, '_admit_boot_images', new_callable=AsyncMock), \
                      patch.object(manual.qualify, 'fleet_startup_script', return_value='script'), \
                      patch.object(manual, '_wait_status', side_effect=status), \
@@ -2188,6 +2189,12 @@ class AsyncSafetyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state['children']['fleet']['qualification_receipt'],
                              {**result['image_qualification'],
                               'bucket': CONFIG['bucket']})
+            # Qualification-only admits the reviewed one-hour window, not the
+            # four-hour suite reservation.
+            window = gcp_campaign.parse_time(state['deadline']).timestamp() - time.time()
+            self.assertLessEqual(window, manual.QUALIFICATION_SECONDS + 5)
+            self.assertGreater(window, manual.QUALIFICATION_SECONDS - 120)
+            self.assertEqual(manual.QUALIFICATION_SECONDS, 3600)
 
 
 class ReviewedKvMatrixRegressionTests(unittest.TestCase):

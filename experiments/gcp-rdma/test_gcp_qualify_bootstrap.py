@@ -59,6 +59,17 @@ class QualificationBootstrapTests(unittest.TestCase):
                                           live_transports=['local_file'])
 
 
+    def test_fleet_startup_starts_the_idle_guard_after_the_worker(self):
+        members = [{'name': f'run-1-{i}', 'id': str(i + 1), 'rdma_ip': f'10.0.0.{i + 1}'}
+                   for i in range(6)]
+        args = ('test-bucket', 'run-1', 'a' * 64, '2030-01-01T00:00:00Z', 'b' * 64, 'c' * 64)
+        script = bootstrap.fleet_startup_script(
+            *args, members=members[:2], rdma_device='irdma0',
+            machine_type='z4m-highmem-16')
+        self.assertIn('gcp_poweroff.py', script)
+        self.assertIn("'serve-idle'", script)
+        self.assertLess(script.index('gcp_worker.py'), script.index("'serve-idle'"))
+
     def test_fleet_startup_admits_two_or_six_distinct_members(self):
         members = [{'name': f'run-1-{i}', 'id': str(i + 1), 'rdma_ip': f'10.0.0.{i + 1}'}
                    for i in range(6)]

@@ -1043,6 +1043,35 @@ def cell_ids():
     return [cell['id'] for cell in mechanism.cells()]
 
 
+def cell_table(stage='all'):
+    """The reviewed fault cells of one stage, as printable rows."""
+    if stage not in ('stage1', 'stage2', 'all'):
+        raise SystemExit('--list takes stage1, stage2 or all')
+    return [dict(id=cell['id'], stage=cell['stage'], tier=cell['tier'],
+                 family=cell['family'], synthetic=bool(cell.get('synthetic')),
+                 note=cell.get('note'))
+            for cell in mechanism.cells()
+            if stage == 'all' or cell['stage'] == stage]
+
+
+def list_request(argv):
+    """The requested stage of `--list [stage]` / `--list=stage`, else None."""
+    for index, item in enumerate(argv):
+        if item == '--list':
+            following = argv[index + 1] if index + 1 < len(argv) else None
+            return (following if following and not following.startswith('-')
+                    else 'all')
+        if item.startswith('--list='):
+            return item.split('=', 1)[1]
+    return None
+
+
+def list_cells(stage='all'):
+    rows = cell_table(stage)
+    print(json.dumps(dict(cells=rows, count=len(rows)), indent=1))
+    return 0
+
+
 def failure_artifacts(output, config_dir):
     """Every retained file of a failed attempt, within a bounded curated tree.
 
@@ -1127,6 +1156,9 @@ def attempt_paths(output, config_dir, attempt):
 
 
 def main():
+    stage = list_request(sys.argv[1:])
+    if stage is not None:
+        return list_cells(stage)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cell', required=True, choices=cell_ids())
     parser.add_argument('--build', type=Path, required=True)

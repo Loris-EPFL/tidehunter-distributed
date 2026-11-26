@@ -15,6 +15,8 @@ import gcp_api
 import gcp_lease
 import gcp_manual_compute
 import mailbox_exec
+import manual_campaign
+import prepare
 from gcp_campaign import GUEST_SERVICE_ACCOUNT
 from gcp_manual_compute import Compute, ComputeError
 
@@ -1042,6 +1044,8 @@ class OperatorFleetTests(unittest.TestCase):
              mock.patch.object(gcp_manual_compute, 'gcloud',
                                new=FakeMcp(None, self.config, self.state_path).__call__), \
              mock.patch.object(gcp_manual_compute.gcp_api, 'GoogleApi') as api, \
+             mock.patch.object(gcp_manual_compute, 'admit_create_package',
+                               return_value={}), \
              mock.patch.object(mailbox_exec, 'publish') as publish, \
              mock.patch.object(mailbox_exec, 'release') as release:
             api.return_value.objects.return_value = store
@@ -1076,6 +1080,8 @@ class OperatorFleetTests(unittest.TestCase):
         spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 1,
                                     'backends': ['native']}))
         with mock.patch('gcp_api.campaign_client') as api, \
+             mock.patch.object(gcp_manual_compute, 'admit_create_package',
+                               return_value={}), \
              mock.patch.object(gcp_manual_compute, 'gcloud',
                                new=FakeMcp(None, self.config, self.state_path).__call__), \
              mock.patch.object(mailbox_exec, 'release') as release:
@@ -1199,7 +1205,9 @@ class OperatorFleetTests(unittest.TestCase):
                 stale.append(f'runs/{run_id}/qualification/{run_id}-{index}/{leaf}')
         stale += [f'runs/{run_id}/package.tar', f'runs/{run_id}/package.json',
                   f'runs/{run_id}/runtime.json',
-                  f'runs/{run_id}/transfer/200/cmd-000001-0123456789ab/stdin']
+                  f'runs/{run_id}/transfer/200/cmd-000001-0123456789ab/stdin',
+                  f'runs/{run_id}/poweroff/heartbeat.json',
+                  f'runs/{run_id}/poweroff/needs-delete/200.json']
         for key in stale:
             self.store.put(key, b'old attempt', if_generation_match=0)
         live = f'{CAMPAIGN}/stage1/evidence/S1-1/attempt-1/results.json'
@@ -1245,6 +1253,22 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertEqual(state['deadline'], state['instances'][0]['launch_spec']['deadline'])
         self.assertIsNotNone(state.get('policy'))
 
+    def test_verify_and_delete_report_a_needs_delete_marker(self):
+        api = FakeMcp(None, self.config, self.state_path)
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__):
+            self.create()
+        state = json.loads(self.state_path.read_text())
+        key = f'runs/{state["run_id"]}/poweroff/needs-delete/200.json'
+        self.store.put(key, b'{}', if_generation_match=0)
+        with mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__):
+            verified = self.output(self.cli('verify'))
+            deleted = self.output(self.cli('delete'))
+        self.assertEqual(verified['needs_delete'], [key])
+        self.assertEqual(deleted['needs_delete'], [key])
+        self.assertEqual(deleted['budget_spend']['stage'], 'campaign')
+
     def test_a_recreate_of_a_live_fleet_refuses_a_new_identity(self):
         with mock.patch.object(gcp_manual_compute, 'admit_image',
                                return_value={'path': IMAGE, 'id': '1'}), \
@@ -1270,6 +1294,8 @@ class OperatorFleetTests(unittest.TestCase):
         api = FakeMcp(None, self.config, self.state_path)
         with mock.patch.object(gcp_manual_compute, 'admit_image',
                                return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'admit_create_package',
+                               return_value={}), \
              mock.patch.object(gcp_manual_compute, 'gcloud', new=api.__call__), \
              mock.patch.object(mailbox_exec, 'publish',
                                side_effect=RuntimeError('bucket 403')):
@@ -1477,6 +1503,60 @@ class OperatorFleetTests(unittest.TestCase):
         missing.mkdir()
         with self.assertRaisesRegex(ValueError, 'package receipt unavailable'):
             gcp_manual_compute.package_source_sha256(missing)
+
+    def test_create_refuses_a_package_revision_before_any_cloud_call(self):
+        package = self.receipt_package()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+             'source_revision': 'b' * 40, 'nvmet_fix': NVMET_FIX}))
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                                    'backends': ['native']}))
+        calls = []
+        with mock.patch.object(gcp_manual_compute, 'admit_image') as admit, \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=lambda argv, **kwargs: calls.append(argv)), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            for extra in ((), ('--dry-run',)):
+                code = gcp_manual_compute.main(self.cli(
+                    'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                    '--source-sha256', SOURCE, '--package', str(package),
+                    '--spec', str(spec), '--revision', 'c' * 40, *extra))
+                self.assertEqual(code, 1)
+        self.assertIn('source revision differs from --revision', error.getvalue())
+        admit.assert_not_called()
+        self.assertEqual(calls, [])
+        self.assertFalse(self.state_path.exists())
+
+    def test_create_applies_the_publish_snapshot_rule_before_a_host(self):
+        package = self.receipt_package()
+        with mock.patch.object(prepare.cloud_package, 'admit_source',
+                               return_value={'revision': 'b' * 40}) as source, \
+             mock.patch.object(manual_campaign, '_check_snapshot') as snapshot:
+            receipt = gcp_manual_compute.admit_create_package(package, 'b' * 40)
+        self.assertEqual(receipt['source_revision'], 'b' * 40)
+        source.assert_called_once()
+        snapshot.assert_called_once_with({'revision': 'b' * 40}, 'b' * 40)
+
+    def test_create_reserves_the_window_receipt_and_delete_records_the_spend(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.output(self.cli('create', '--campaign', CAMPAIGN, '--hosts', '3',
+                                 '--hours', '5', '--stage', 'stage1',
+                                 '--source-sha256', SOURCE))
+        state = json.loads(self.state_path.read_text())
+        receipt_key = f'budget/reservations/{state["run_id"]}/stage1.json'
+        reservation = json.loads(self.store.get(receipt_key))
+        self.assertEqual(reservation['ceiling_cents'], 6042)
+        self.assertEqual(state['stage'], 'stage1')
+        with mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            report = self.output(self.cli('delete'))
+        self.assertEqual(report['budget_spend']['run_id'], state['run_id'])
+        self.assertEqual(report['budget_spend']['stage'], 'stage1')
+        self.assertEqual(report['needs_delete'], [])
 
     def test_create_refuses_a_bundle_source_before_any_host_exists(self):
         package = self.receipt_package()

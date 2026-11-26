@@ -847,3 +847,29 @@ class ZoneBinding(unittest.TestCase):
         with patch.object(sys, 'argv', argv), redirect_stdout(stream):
             self.assertEqual(fault_cells.main(), 0)
         self.assertIsNone(json.loads(stream.getvalue())['zone'])
+
+
+class CellList(unittest.TestCase):
+    """The operator list is the code's cell table, split by stage."""
+
+    def listed(self, argv):
+        stream = io.StringIO()
+        with patch.object(sys, 'argv', argv), redirect_stdout(stream):
+            self.assertEqual(fault_cells.main(), 0)
+        return json.loads(stream.getvalue())
+
+    def test_stage_one_lists_the_eighteen_reviewed_fault_cells(self):
+        value = self.listed(['fault_cells.py', '--list', 'stage1'])
+        self.assertEqual(value['count'], 18)
+        self.assertEqual(
+            {family: sum(cell['family'] == family for cell in value['cells'])
+             for family in ('S1-2', 'S1-3', 'S1-5', 'S1-6')},
+            {'S1-2': 4, 'S1-3': 2, 'S1-5': 8, 'S1-6': 4})
+        self.assertTrue(all(cell['stage'] == 'stage1' for cell in value['cells']))
+
+    def test_stage_two_lists_only_its_mechanism_cells(self):
+        value = self.listed(['fault_cells.py', '--list=stage2'])
+        self.assertEqual(value['count'], 12)
+        self.assertEqual({cell['family'] for cell in value['cells']},
+                         {'M6', 'M9', 'M13'})
+        self.assertNotIn('M8', {cell['id'].split('-')[0] for cell in value['cells']})

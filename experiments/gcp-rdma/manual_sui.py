@@ -101,6 +101,8 @@ HANDSHAKE_SLACK_SECONDS = 900
 # they stay out; a very large stray file is listed, never silently skipped.
 FAILURE_ARTIFACT_LIMIT = 512 << 20
 FAILURE_ARTIFACT_SKIP = ('host-*.tar.gz',)
+# One owner log is retained up to this many bytes; a larger log keeps its tail.
+OWNER_LOG_LIMIT = 4 << 20
 
 
 def handshake_cap(deadline, *, hold_seconds=0, lifecycle=False):
@@ -842,6 +844,63 @@ class SuiLauncher:
         os.replace(temporary, path)
         return receipt
 
+    def collect_owner_logs(self):
+        """Copy each owner's bounded `owner-*.log` off the host before it dies.
+
+        The boot disk is deleted at the stage deadline, so a failure that
+        happens before `run.py` writes anything would otherwise upload no
+        reason at all. Each host is read through the same executor as the
+        cell, one bounded tail per file, and a bad host never masks the cell
+        failure.
+        """
+        rows = []
+        external = getattr(self, 'external', None) or {}
+        if self.remote is None or not external.get('hosts'):
+            return rows
+        root = Path(self.output) / 'owner-logs'
+        for record in external['hosts']:
+            host = record.get('host')
+            if not isinstance(host, str) or not host:
+                continue
+            try:
+                code, listing, error = self.remote.run(
+                    host, f'ls -1 {shlex.quote(str(self.guest_root))}/owner-*.log 2>/dev/null',
+                    check=False)
+                if code != 0:
+                    rows.append(dict(host=host, error=error.decode('utf-8', 'replace')[-2000:]))
+                    continue
+                for name in sorted(set(listing.decode('utf-8', 'replace').split())):
+                    if not Path(name).name.startswith('owner-'):
+                        continue
+                    quoted = shlex.quote(name)
+                    size_code, size_out, _ = self.remote.run(
+                        host, f'stat -c %s {quoted} 2>/dev/null', check=False)
+                    if size_code != 0 or not size_out.strip().isdigit():
+                        rows.append(dict(host=host, name=Path(name).name,
+                                         error='stat failed'))
+                        continue
+                    size = int(size_out.strip())
+                    truncated = size > OWNER_LOG_LIMIT
+                    if truncated:
+                        read_code, data, _ = self.remote.run(
+                            host, f'tail -c {OWNER_LOG_LIMIT} {quoted}', check=False)
+                    else:
+                        read_code, data, _ = self.remote.run(host, f'cat {quoted}', check=False)
+                    if read_code != 0:
+                        rows.append(dict(host=host, name=Path(name).name,
+                                         error='read failed'))
+                        continue
+                    destination = root / host / Path(name).name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(data)
+                    rows.append(dict(host=host, name=Path(name).name,
+                                     bytes=len(data), truncated=truncated))
+            except BaseException as error:  # a dead executor must not mask the cell error
+                rows.append(dict(host=host, error=str(error)[-2000:]))
+        if rows:
+            write_json(root / 'index.json', dict(limit=OWNER_LOG_LIMIT, files=rows))
+        return rows
+
     def failure_artifacts(self):
         """Every artifact the failed attempt left, existing files only.
 
@@ -984,6 +1043,8 @@ class SuiLauncher:
             return self.not_reached(error, terminal=terminal)
         except BaseException as error:
             self.ledger.fail(entry, error)
+            if getattr(self, 'namespaces', None) or getattr(self, 'started', False):
+                self.collect_owner_logs()
             self.record_failure(entry, error)
             self.ledger.save()
             raise
@@ -1196,7 +1257,7 @@ def main():
     parser.add_argument('--list', nargs='?', const='all', choices=('stage1', 'stage2', 'all'),
                         help='print the reviewed manual_sui cell table and exit')
     parser.add_argument('--transport', choices=('tcp', 'tcp-trusted',
-                        *deployment.HARDWARE_TRANSPORTS), default='efa')
+                        *deployment.HARDWARE_TRANSPORTS), default='tcp')
     parser.add_argument('--live-transport', choices=deployment.LIVE_TRANSPORTS,
                         default='rdma')
     parser.add_argument('--durability-tier', choices=('native', 'synchronous'),
@@ -1264,6 +1325,10 @@ def main():
     parser.add_argument('run_args', nargs=argparse.REMAINDER,
                         help='extra run.py arguments after --')
     args = parser.parse_args()
+    expected_transport = campaign_manifest.TOPOLOGY['control_transport']
+    if args.transport != expected_transport:
+        raise SystemExit(f'--transport {args.transport} differs from the campaign '
+                         f'topology {expected_transport}')
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
     if args.controller_loss is not None:

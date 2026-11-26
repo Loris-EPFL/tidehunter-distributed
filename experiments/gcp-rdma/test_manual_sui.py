@@ -965,6 +965,102 @@ class HandshakeBounds(unittest.TestCase):
             manual_sui.handshake_cap(900, hold_seconds=-1)
 
 
+class ControlTransport(unittest.TestCase):
+    """The campaign topology fixes the control plane; the CLI cannot deviate."""
+
+    def argv(self, transport=None):
+        values = ['manual_sui.py', '--build', '/b', '--fixture', '/f', '--schema', '/s',
+                  '--output', '/o', '--guest-root', '/g', '--coordinator', 'h0',
+                  '--owners', 'h1,h2']
+        return values + ([] if transport is None else ['--transport', transport])
+
+    def test_the_default_control_transport_is_the_manifest_topology(self):
+        with mock.patch.object(sys, 'argv', self.argv()), \
+             mock.patch.object(manual_sui.deployment, 'canonical_transport',
+                               return_value={'fabric': {'backend': 'tcp'}}), \
+             mock.patch.object(manual_sui.mailbox_exec, 'dispatch',
+                               return_value=0) as dispatch:
+            self.assertEqual(manual_sui.main(), 0)
+        self.assertEqual(dispatch.call_args.args[0].transport, 'tcp')
+
+    def test_a_control_transport_outside_the_topology_is_refused(self):
+        with mock.patch.object(sys, 'argv', self.argv('efa')), \
+             mock.patch.object(manual_sui.mailbox_exec, 'dispatch') as dispatch, \
+             self.assertRaisesRegex(SystemExit, 'differs from the campaign topology'):
+            manual_sui.main()
+        dispatch.assert_not_called()
+
+
+class OwnerLogs(unittest.TestCase):
+    """A failure copies each owner's log before the boot disk is deleted."""
+
+    GUEST = '/mnt/tidehunter/sui-run'
+
+    class Remote:
+        def __init__(self, files):
+            self.files, self.reads = files, []
+
+        def run(self, host, command, stdin=None, check=True):
+            path = next((token.strip("'") for token in command.split()
+                         if token.strip("'").startswith('/') and '/owner-' in token), '')
+            name = path.rsplit('/', 1)[-1]
+            if command.startswith('ls -1 '):
+                rows = [f'{OwnerLogs.GUEST}/{name}' for name in self.files.get(host, {})]
+                return 0, ('\n'.join(rows) + ('\n' if rows else '')).encode(), b''
+            data = self.files[host][name]
+            if command.startswith('stat -c %s '):
+                return 0, str(len(data)).encode(), b''
+            self.reads.append((host, name, command.split(' ', 1)[0]))
+            if command.startswith('tail -c '):
+                limit = int(command.split(' ', 3)[2])
+                return 0, data[-limit:], b''
+            return 0, data, b''
+
+    def launcher(self, files):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        launcher = object.__new__(manual_sui.SuiLauncher)
+        launcher.remote = self.Remote(files)
+        launcher.output = root / 'out'
+        launcher.guest_root = Path(self.GUEST)
+        launcher.external = {'hosts': [{'host': 'h1'}, {'host': 'h2'}]}
+        launcher.stage, launcher.cell_id, launcher.tier = 'stage1', 'sui-replay', 'native'
+        launcher.owners = 2
+        return launcher, root
+
+    def test_each_owner_log_lands_bounded_under_owner_logs(self):
+        launcher, root = self.launcher({
+            'h1': {'owner-0-0.log': b'alpha', 'owner-0-1.log': b'0123456789'},
+            'h2': {'owner-1-0.log': b'bravo'}})
+        with mock.patch.object(manual_sui, 'OWNER_LOG_LIMIT', 5):
+            rows = launcher.collect_owner_logs()
+        self.assertEqual([row['name'] for row in rows],
+                         ['owner-0-0.log', 'owner-0-1.log', 'owner-1-0.log'])
+        self.assertEqual((root / 'out/owner-logs/h1/owner-0-0.log').read_bytes(), b'alpha')
+        self.assertEqual((root / 'out/owner-logs/h1/owner-0-1.log').read_bytes(), b'56789')
+        self.assertTrue(rows[1]['truncated'])
+        self.assertFalse(rows[0]['truncated'])
+        index = json.loads((root / 'out/owner-logs/index.json').read_text())
+        self.assertEqual(index['limit'], 5)
+        self.assertIn(('h1', 'owner-0-1.log', 'tail'), launcher.remote.reads)
+
+    def test_a_failed_cell_collects_the_logs_before_the_upload(self):
+        launcher, _root = self.launcher({'h1': {}, 'h2': {}})
+        launcher.namespaces = {'h1': []}
+        launcher.started = False
+        launcher.execute = mock.Mock(side_effect=manual_sui.LaunchError('owner readiness expired'))
+        launcher.admit = mock.Mock()
+        launcher.identity = mock.Mock(return_value='h')
+        launcher.ledger = manual_sui.ledger_module.Ledger(Path(tempfile.mkdtemp()) / 'ledger.json')
+        calls = []
+        launcher.collect_owner_logs = mock.Mock(side_effect=lambda: calls.append('logs'))
+        launcher.record_failure = mock.Mock(side_effect=lambda *_: calls.append('upload'))
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'owner readiness expired'):
+            launcher.run(manual_sui.plan('h0', ['h1', 'h2']))
+        self.assertEqual(calls, ['logs', 'upload'])
+
+
 class FailureEvidence(unittest.TestCase):
     """A failed attempt uploads its evidence and ledger before the fleet dies."""
 

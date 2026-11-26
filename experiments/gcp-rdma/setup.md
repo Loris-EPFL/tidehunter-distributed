@@ -704,7 +704,7 @@ python3 experiments/gcp-rdma/manual_sui.py \
   --guest-root /mnt/tidehunter/sui-run-<run-id> \
   --fleet-state /absolute/fleet-stage1.json \
   --fleet-config experiments/gcp-rdma/config.json \
-  --transport efa --live-transport rdma --durability-tier native \
+  --transport tcp --live-transport rdma --durability-tier native \
   --cell-id S1-0-native --stage stage1 \
   --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
   --ledger /absolute/campaign-ledger.json -- --checkpoints 4
@@ -770,6 +770,7 @@ cell evidence under `controller-loss/`.
 ```sh
 python3 experiments/gcp-rdma/manual_sui.py --stage stage2 \
   --cell-id M7-mid-frame-native --controller-loss mid-frame \
+  --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $CAMPAIGN_ROOT/build --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M7-mid-frame-native \
@@ -962,6 +963,12 @@ python3 experiments/gcp-rdma/campaign_manifest.py \
   --directory $CAMPAIGN_ROOT --build $NEW_BUILD
 ```
 
+`--print-upload` prints the two exact `gcloud storage cp` commands for the
+manifest and the ledger, each with
+`--impersonate-service-account=bench-guest@mysten-research.iam.gserviceaccount.com`
+and `--if-generation-match=0`; it runs nothing. Upload the manifest before the
+first rented host, and the ledger only when its bucket copy does not exist.
+
 #### Fleet operations
 
 `create` admits the image first and refuses a fleet when `config.json` has no
@@ -995,7 +1002,10 @@ SSH step exists: the guests have no external address and IAP is not enabled.
 `delete` removes the three hosts, their boot disks and the placement policy,
 then proves each absence. It also removes the boot disks of hosts that the idle
 guard or the deadline powered off: a guest stop leaves the VM `TERMINATED` and
-clears its scheduled termination time, so only `delete` frees the disk. A
+clears its scheduled termination time, so only `delete` frees the disk. The
+idle guard writes `runs/$RUN/poweroff/needs-delete/<instance-id>.json` before it
+powers off, and `verify` and `delete` print that marker list as `needs_delete`;
+a nonempty list means a boot disk may still bill. A
 `cleanup incomplete` error is not success: keep the state file, because the next
 `delete` resumes from the recorded intents and finishes the deletion.
 
@@ -1003,7 +1013,15 @@ clears its scheduled termination time, so only `delete` frees the disk. A
 
 Each stage runs on its own fleet with its own window: stage 1 five hours,
 stage 2 six hours, stage 3 two hours. `create` takes exactly one of `--hours`
-or `--deadline`. There is no supported in-place extension on a RUNNING VM, so
+or `--deadline`, and takes `--stage` (stage1, stage2, stage3). Before the first
+host it records the window ceiling as the immutable receipt
+`budget/reservations/<run-id>/<stage>.json` and refuses when `spent_usd` plus
+every receipt would cross the campaign cap. `delete` writes
+`budget/spend/<run-id>/<stage>.json` with the elapsed estimate, or keeps the
+reserved ceiling when no receipt exists. A stage whose window was already
+spent cannot reserve again under the same run id; a fresh attempt needs a fresh
+campaign id. There is no supported in-place
+extension on a RUNNING VM, so
 a longer stage needs a fresh fleet with a fresh window; the idle guard bounds a
 fleet that the operator abandons. Every driver loads the bucket ledger, merges
 it, and skips a passed cell with the same config hash, so a rerun never repeats
@@ -1041,6 +1059,10 @@ LEDGER=$CAMPAIGN_ROOT/campaign-ledger.json
 STATE1=$CAMPAIGN_ROOT/fleet-stage1.json
 STATE2=$CAMPAIGN_ROOT/fleet-stage2.json
 STATE3=$CAMPAIGN_ROOT/fleet-stage3.json
+# The revision the package was sealed at, never the current checkout's HEAD:
+# `create` refuses a --revision that differs from package-receipt.json and a
+# checkout that differs from the sealed closure.
+REVISION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_revision"])' $PACKAGE/package-receipt.json)
 ```
 
 #### 0. Image receipt (skip while the pinned receipt is admitted)
@@ -1071,9 +1093,9 @@ python3 experiments/gcp-rdma/gcp_image_receipt.py --spec /absolute/qualify/recei
 ```sh
 gcloud auth login
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE1 --hosts 3 --hours 5 \
+  --campaign $CAMPAIGN --state $STATE1 --hosts 3 --hours 5 --stage stage1 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
-  --revision $(git rev-parse HEAD) \
+  --revision "$REVISION" \
   --guest-root /mnt/tidehunter-kv-comparison/$RUN \
   --guest-root /mnt/tidehunter/sui-run-$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE1
@@ -1102,8 +1124,25 @@ python3 experiments/gcp-rdma/manual_sui.py --list stage1
 ```
 
 ```sh
+for stage in stage1 stage2; do
+  python3 experiments/gcp-rdma/manual_sui.py --list $stage
+  python3 experiments/gcp-rdma/fault_cells.py --list $stage
+done
+```
+
+Stage 1 has 16 `manual_sui.py` cells and 18 `fault_cells.py` cells (S1-2S 4,
+S1-3S 2, S1-5S 8, S1-6S 4); stage 2 has the rows `--list stage2` prints. Every
+row is one cell: pass its id as `--cell-id` (manual_sui) or `--cell`
+(fault_cells), its `tier` as `--durability-tier` when the driver does not derive
+it, and its `run` column after `--` on manual_sui. `S1-4` and `M7` rows also
+take `--controller-loss <point>`; `S1-5S` rows are the plan's `M8` view and are
+recorded once, in stage 1. The examples below show one row of each kind; the
+loop above is the authoritative list.
+
+```sh
 gcloud auth login
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0-native \
+  --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-0-native --guest-root /mnt/tidehunter/sui-run-$RUN \
@@ -1113,6 +1152,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0-native 
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --cell-id S1-0-synchronous --durability-tier synchronous \
+  --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-0-synchronous \
@@ -1123,6 +1163,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --cell-id S1-1-native --durability-tier native \
+  --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-1-native --guest-root /mnt/tidehunter/sui-run-$RUN \
@@ -1133,6 +1174,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --cell-id S1-4-mid-frame-native --controller-loss mid-frame \
   --durability-tier native \
+  --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-4-mid-frame-native \
@@ -1141,6 +1183,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 
 python3 experiments/gcp-rdma/fault_cells.py --cell S1-2S-publication-native \
+  --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-2S-publication-native \
@@ -1184,9 +1227,9 @@ recorded intents.
 ```sh
 gcloud auth login
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE2 --hosts 3 --hours 6 \
+  --campaign $CAMPAIGN --state $STATE2 --hosts 3 --hours 6 --stage stage2 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
-  --revision $(git rev-parse HEAD) \
+  --revision "$REVISION" \
   --guest-root /mnt/tidehunter-kv-comparison/$RUN \
   --guest-root /mnt/tidehunter/sui-run-$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE2
@@ -1196,12 +1239,17 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py ready --state $STATE2
 #### 5. Stage-2 cells
 
 The mechanism cells are `fault_cells.py` cells (`M6-*`, `M9-*`, `M13-*`), and
-the remaining reviewed rows are `manual_sui.py --list stage2` cells. `M3` and
-`M4` declare a 64 MiB fragment and their own run arguments, so pass both:
+the remaining reviewed rows are `manual_sui.py --list stage2` cells.
+`fault_cells.py --list stage2` prints every mechanism cell id; run every row it
+prints, and every `manual_sui.py --list stage2` row, before deleting the fleet.
+`M8` is the alias view of the stage-1 `S1-5S` cell set and has no stage-2 run.
+`M3` and `M4` declare a 64 MiB fragment and their own run arguments, so pass
+both:
 
 ```sh
 gcloud auth login
 python3 experiments/gcp-rdma/fault_cells.py --cell M6-w1-c16 \
+  --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M6-w1-c16 \
@@ -1210,6 +1258,7 @@ python3 experiments/gcp-rdma/fault_cells.py --cell M6-w1-c16 \
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M3-native \
   --durability-tier native --fragment-mib 64 \
+  --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M3-native --guest-root /mnt/tidehunter/sui-run-$RUN \
@@ -1219,6 +1268,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M3-native \
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M4-native \
   --durability-tier native --fragment-mib 64 \
+  --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M4-native --guest-root /mnt/tidehunter/sui-run-$RUN \
@@ -1228,6 +1278,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M4-native \
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M5-hold \
   --hold-seconds 1800 --disk-sample-seconds 10 \
+  --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M5-hold --guest-root /mnt/tidehunter/sui-run-$RUN \
@@ -1254,9 +1305,9 @@ gcloud compute instances list --filter="labels.campaign=$CAMPAIGN" --format='val
 ```sh
 gcloud auth login
 python3 experiments/gcp-rdma/gcp_manual_compute.py create \
-  --campaign $CAMPAIGN --state $STATE3 --hosts 3 --hours 2 \
+  --campaign $CAMPAIGN --state $STATE3 --hosts 3 --hours 2 --stage stage3 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
-  --revision $(git rev-parse HEAD) \
+  --revision "$REVISION" \
   --guest-root /mnt/tidehunter-kv-comparison/$RUN \
   --guest-root /mnt/tidehunter/sui-run-$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE3
@@ -1313,9 +1364,10 @@ Retain `raw/` for 90 days only; keep `evidence/` and the ledger. A failed cell
 uploads its evidence and a `failed` ledger entry, so a retry writes
 `attempt-<n+1>` in a fresh output tree.
 
-The launcher stages every local input through the bucket on each cell: the build
-bundle (1.1 GB), the fixture (752 MB), the native schema, the external
-preparations and the storage binary.
+The launcher stages each local input through the bucket once per run under a
+digest-addressed key: the build bundle (1.1 GB), the fixture (752 MB), the
+native schema, the external preparations and the storage binary. A later cell
+reuses the key when its digest matches.
 
 ### Local idle-stop rehearsal
 
@@ -1350,9 +1402,12 @@ The one-fleet path is the reviewed orchestrator: it boots a fleet with the
 qualification gate, qualifies every member, starts the ordinary worker, admits
 the receipt, and then (unless `qualification_only` is set) runs the suite on the
 same hosts. Qualification-only spends the minimum: `PREPARATION_SECONDS` (900 s
-cap) plus the pair phase (480 s) plus teardown, about 30 minutes of a three-host
-`z4m-highmem-16` fleet, roughly **USD 6** at 3.29 USD/h per host including the
-surcharge margin. The full Q0 suite on the same fleet is roughly USD 39-48.
+cap) plus the pair phase (480 s) plus teardown, about 30 minutes of a
+`z4m-highmem-16` fleet. It admits one reviewed hour (`QUALIFICATION_SECONDS`),
+not the Q0 suite's four-hour window, and the fleet bootstrap starts
+`gcp_poweroff.py serve-idle` from the same runtime after the worker, so a dead
+laptop stops the fleet at the idle window instead of `terminationTime`. The full
+Q0 suite on the same fleet is roughly USD 39-48.
 
 ```sh
 python3 -c 'import json,sys; sys.path.insert(0,"experiments/gcp-rdma"); import manual_campaign as m; json.dump(m.q0_spec(json.loads(open(sys.argv[2]).read())),open(sys.argv[1],"x"),sort_keys=True,indent=2)' \

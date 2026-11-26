@@ -16,6 +16,7 @@ every passed cell `stale`.
 import argparse
 import json
 from pathlib import Path
+import shlex
 import sys
 
 sys.dont_write_bytecode = True
@@ -203,33 +204,60 @@ TOPOLOGY = dict(
     owner_extents_mib=16,
     coordinator_index_fragment_mib=1024)
 
+def _manual_stage1(prefix):
+    """The reviewed manual_sui stage-1 cells of one plan family."""
+    return [cell for cell in campaign_ledger.cells('stage1')
+            if cell['id'].startswith(prefix + '-')]
+
+
+def _fault_stage1(family):
+    """The reviewed fault_cells stage-1 cells of one plan family."""
+    return [cell for cell in stage2_mechanism.cells()
+            if cell['stage'] == 'stage1' and cell['family'] == family]
+
+
+def _cell_tiers(cells):
+    return sorted({cell['tier'] for cell in cells})
+
+
+def _manual_row(case, case_id, est_minutes, **extra):
+    cells = _manual_stage1(case_id)
+    if not cells:
+        raise ValueError('no manual_sui stage-1 cell for ' + case_id)
+    return dict({'id': case_id, 'case': case, 'cells': len(cells),
+                 'tiers': _cell_tiers(cells), 'est_minutes': est_minutes,
+                 'driver': 'manual_sui.py'}, **extra)
+
+
+def _fault_row(case, case_id, est_minutes, **extra):
+    cells = _fault_stage1(case_id)
+    if not cells:
+        raise ValueError('no fault_cells stage-1 cell for ' + case_id)
+    return dict({'id': case_id, 'case': case, 'cells': len(cells),
+                 'tiers': _cell_tiers(cells), 'est_minutes': est_minutes,
+                 'driver': 'fault_cells.py'}, **extra)
+
+
 STAGE1_CASES = [
-    dict(id='S1-0', case='admission and qualification', tiers=['native', 'synchronous'],
-         points=1, est_minutes=30, driver='manual_sui.py'),
-    dict(id='S1-1', case='clean lifecycle', tiers=['native', 'synchronous'], points=1,
-         est_minutes=20, driver='manual_sui.py',
-         pass_criteria=['audit digest equals the producer digest',
-                        'a clean reopen creates no new export',
-                        'the durable cut does not extend after flush_durable',
-                        'the tail replay is idempotent',
-                        'all ten RPC index pipelines commit at the frozen tip']),
-    dict(id='S1-2', case='coordinator crash', tiers=['native', 'synchronous'], points=2,
-         est_minutes=32, driver='manual_sui.py'),
-    dict(id='S1-3', case='owner process crash', tiers=['native', 'synchronous'], points=1,
-         est_minutes=16, driver='manual_sui.py'),
-    dict(id='S1-4', case='W1 resume after controller loss', tiers=['native', 'synchronous'],
-         points=3, cells=5, est_minutes=30, driver='manual_sui.py --controller-loss',
-         note=('three points x two tiers, less S1-4-during-flush-native: native '
-               'forces durable_at_completion, so that point is refused at parse and '
-               'is not applicable')),
-    dict(id='S1-5', case='leases and fencing', tiers=['native'], points=1,
-         est_minutes=30, driver='manual_sui.py'),
-    dict(id='S1-6', case='retirement and relocation', tiers=['native', 'synchronous'],
-         points=2, est_minutes=16, driver='manual_sui.py'),
-    dict(id='S1-7', case='cache correctness', tiers=['native', 'synchronous'], points=1,
-         est_minutes=15, driver='manual_sui.py'),
-    dict(id='S1-8', case='full Sui audit after faults', tiers=['native', 'synchronous'],
-         points=1, est_minutes=20, driver='manual_sui.py'),
+    _manual_row('admission and qualification', 'S1-0', 30),
+    _manual_row('clean lifecycle', 'S1-1', 20,
+                pass_criteria=['audit digest equals the producer digest',
+                               'a clean reopen creates no new export',
+                               'the durable cut does not extend after flush_durable',
+                               'the tail replay is idempotent',
+                               'all ten RPC index pipelines commit at the frozen tip']),
+    _fault_row('coordinator crash', 'S1-2', 32),
+    _fault_row('owner process crash', 'S1-3', 16),
+    _manual_row('W1 resume after controller loss', 'S1-4', 30,
+                points=3, driver='manual_sui.py --controller-loss',
+                note=('three points x two tiers, less S1-4-during-flush-native: native '
+                      'forces durable_at_completion, so that point is refused at parse and '
+                      'is not applicable')),
+    _fault_row('leases and fencing', 'S1-5', 30,
+               note='also the plan M8 view; M8 is this S1-5S fence set, never a rerun'),
+    _fault_row('retirement and relocation', 'S1-6', 16),
+    _manual_row('cache correctness', 'S1-7', 15),
+    _manual_row('full Sui audit after faults', 'S1-8', 20),
 ]
 
 def _mechanism_cells(family):
@@ -283,8 +311,11 @@ STAGE2_CASES = [
          points=3, driver='manual_sui.py --controller-loss',
          tiers=['native', 'synchronous'], driver_concurrency=[4], est_minutes=30,
          note='as S1-4: during-flush at native is not applicable'),
-    dict(id='M8', case='fencing latency', cells=8, cases=4, driver='fault_cells.py',
-         tiers=['native', 'synchronous'], est_minutes=24),
+    dict(id='M8', case='fencing latency', cells=0, cases=4, driver='fault_cells.py',
+         alias_of='S1-5S', alias_stage='stage1', tiers=['native', 'synchronous'],
+         est_minutes=0,
+         note='the plan view of stage-1 S1-5S; the eight fence runs are recorded once, '
+              'under stage 1, never rerun in stage 2'),
     dict(_mechanism_row('M9', 'retirement and relocation, forced', 16),
          forced=dict(fragment_mib=64), driver_concurrency=[4]),
     dict(_mechanism_row('M13', '132 KB-batch Synchronous threshold', 5),
@@ -427,6 +458,27 @@ def write(directory=DEFAULT_DIRECTORY, *, campaign_id=CAMPAIGN_ID, revisions=Non
                 storage=value['storage'])
 
 
+def upload_commands(directory=DEFAULT_DIRECTORY, *, campaign_id=CAMPAIGN_ID):
+    """The exact `gcloud storage cp` argv lines; this function runs nothing.
+
+    Both objects are written once per campaign, so the generation precondition
+    is `0`: an existing manifest or a started ledger is never overwritten by an
+    upload of a stale local copy.
+    """
+    directory = Path(directory)
+    prefix = f'{campaign_id}'
+    commands = []
+    for name in ('campaign-manifest.json', 'campaign-ledger.json'):
+        path = (directory / name).resolve()
+        if not path.is_file():
+            raise ValueError(f'{path} is missing; write the manifest first')
+        commands.append(
+            'gcloud storage cp ' + shlex.quote(str(path))
+            + f' gs://{BUCKET}/{prefix}/{name}'
+            + f' --impersonate-service-account={ACCOUNT} --if-generation-match=0')
+    return commands
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, default=DEFAULT_DIRECTORY)
@@ -436,7 +488,13 @@ def main():
     parser.add_argument('--bundle-sha256')
     parser.add_argument('--build-manifest-sha256')
     parser.add_argument('--source-archive-sha256')
+    parser.add_argument('--print-upload', action='store_true',
+                        help='print the two generation-preconditioned upload commands '
+                             'and exit; never uploads')
     args = parser.parse_args()
+    if args.print_upload:
+        print('\n'.join(upload_commands(args.directory, campaign_id=args.campaign_id)))
+        return
     revisions = build_revisions(args.build) if args.build else {}
     revisions.update({key: value for key, value in (
         ('bundle_sha256', args.bundle_sha256),

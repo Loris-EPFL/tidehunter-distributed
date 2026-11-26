@@ -45,6 +45,8 @@ def _script(bucket, run_id, source_sha256, deadline_utc, manifest_sha256, mode, 
         "signal.setitimer(signal.ITIMER_REAL, remaining_startup)\n")
     fetch = gcp_bootstrap._fetch_program()
     if mode == 'fleet':
+        # Qualify first: the suite writes the full runtime after admitting the
+        # receipt, and the worker start below waits for that document.
         fetch = fetch.replace(
             "runtime, package = wait(base + 'runtime.json'), wait(base + 'package.json')",
             "package = wait(base + 'package.json')\nruntime = {**c, 'package': package}")
@@ -84,6 +86,16 @@ subprocess.run(['/usr/bin/systemd-run', '--unit=tidehunter-worker-' + c['run_id'
                 '--property=LimitMEMLOCK=infinity', '--property=RuntimeMaxSec=' + str(remaining),
                 '--property=TimeoutStopSec=1', c['guest_python'], str(worker), str(config_path)],
                check=True, timeout=30)
+guard = target / 'source/experiments/gcp-rdma/gcp_poweroff.py'
+guard_remaining = int(deadline - time.time())
+if guard_remaining <= 0: raise TimeoutError('idle guard startup expired')
+subprocess.run(['/usr/bin/systemd-run', '--collect', '--unit=tidehunter-idle-' + c['run_id'],
+                '--setenv=PATH=' + c['guest_path'],
+                '--property=Restart=on-failure', '--property=RestartSec=3',
+                '--property=KillMode=control-group',
+                '--property=RuntimeMaxSec=' + str(guard_remaining),
+                '--property=TimeoutStopSec=1',
+                c['guest_python'], str(guard), 'serve-idle', str(config_path), '--mode', 'fleet'], check=True, timeout=30)
 """ if mode == 'fleet' else '') +
             "signal.setitimer(signal.ITIMER_REAL, 0)\n")
     recovery = """

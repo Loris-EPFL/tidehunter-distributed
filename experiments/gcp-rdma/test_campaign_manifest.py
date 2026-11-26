@@ -65,12 +65,22 @@ class ManifestBindings(unittest.TestCase):
         self.assertEqual([case['id'] for case in cases['stage1']],
                          [f'S1-{index}' for index in range(9)])
         # The stage-2 rows are the cells the drivers build, not the plan's older
-        # per-keyspace count, and their minutes fit the 6 h window.
-        self.assertEqual(sum(case['cells'] for case in cases['stage2']), 41)
-        self.assertEqual(sum(case['est_minutes'] for case in cases['stage2']), 230)
+        # per-keyspace count, and their minutes fit the 6 h window. M8 is the
+        # stage-1 S1-5S alias, not a stage-2 run.
+        self.assertEqual(sum(case['cells'] for case in cases['stage2']), 33)
+        self.assertEqual(sum(case['est_minutes'] for case in cases['stage2']), 206)
         self.assertEqual({case['id']: case['cells'] for case in cases['stage2']},
                          {'M1': 7, 'M2': 4, 'M3': 2, 'M4': 2, 'M5': 1, 'M6': 9,
-                          'M7': 5, 'M8': 8, 'M9': 2, 'M13': 1})
+                          'M7': 5, 'M8': 0, 'M9': 2, 'M13': 1})
+        alias = next(case for case in cases['stage2'] if case['id'] == 'M8')
+        self.assertEqual((alias['alias_of'], alias['alias_stage']), ('S1-5S', 'stage1'))
+        self.assertEqual(sum(case['cells'] for case in cases['stage1']), 34)
+        self.assertEqual({case['id']: case['driver'] for case in cases['stage1']},
+                         {'S1-0': 'manual_sui.py', 'S1-1': 'manual_sui.py',
+                          'S1-2': 'fault_cells.py', 'S1-3': 'fault_cells.py',
+                          'S1-4': 'manual_sui.py --controller-loss',
+                          'S1-5': 'fault_cells.py', 'S1-6': 'fault_cells.py',
+                          'S1-7': 'manual_sui.py', 'S1-8': 'manual_sui.py'})
         controller_loss = [case for case in cases['stage1'] + cases['stage2']
                            if case['id'] in ('S1-4', 'M7')]
         self.assertEqual([case['cells'] for case in controller_loss], [5, 5])
@@ -178,6 +188,21 @@ class LocalFiles(unittest.TestCase):
             self.assertEqual((directory / 'campaign-ledger.json').read_bytes(), first)
             value = json.loads((directory / 'campaign-manifest.json').read_text())
             self.assertEqual(value['revisions']['bundle_sha256'], 'a' * 64)
+
+    def test_print_upload_prints_generation_pinned_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest.write(tmp)
+            commands = manifest.upload_commands(tmp)
+            self.assertEqual(len(commands), 2)
+            for command, name in zip(commands, ('campaign-manifest.json',
+                                                'campaign-ledger.json')):
+                self.assertTrue(command.startswith('gcloud storage cp '))
+                self.assertIn(str(Path(tmp) / name), command)
+                self.assertIn(
+                    f' gs://mysten-research-bench-artifacts/{manifest.CAMPAIGN_ID}/{name} ',
+                    command)
+                self.assertIn('--impersonate-service-account=' + manifest.ACCOUNT, command)
+                self.assertTrue(command.endswith('--if-generation-match=0'))
 
     def test_another_campaign_id_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):

@@ -414,14 +414,53 @@ def poweroff(reason):
     subprocess.run(['/usr/bin/systemctl', 'poweroff'], check=True, timeout=30)
 
 
+def needs_delete_key(config, host):
+    return ('runs/' + config['run_id'] + '/poweroff/needs-delete/'
+            + str(host['id']) + '.json')
+
+
+def publish_needs_delete(config, host, store, reason, now=None):
+    """Mark a stopped guest: its boot disk bills until `delete` frees it.
+
+    A guest poweroff clears the scheduled termination time, so the VM and its
+    disk have no automatic delete backstop. The marker is advisory and a
+    restarting guard may overwrite it, so it is not an immutable object.
+    """
+    record = {'schema_version': 1, 'run_id': config['run_id'],
+              'source_sha256': config['source_sha256'],
+              'instance_id': str(host['id']), 'instance_name': host.get('name'),
+              'reason': reason, 'observed_epoch': time.time() if now is None else now}
+    store.put(needs_delete_key(config, host), gcp_runtime._encode(record),
+              content_type='application/json')
+    return record
+
+
+def _poweroff_marked(config, host, store, reason, action):
+    """Write the disk-billing marker, then stop even if the write failed."""
+    try:
+        publish_needs_delete(config, host, store, reason)
+    except Exception as exc:
+        print(f'needs-delete marker deferred: {type(exc).__name__}: {exc}',
+              file=sys.stderr, flush=True)
+    action(reason)
+
+
 def serve_idle(config, *, host=None, api=None, poll_seconds=None, poweroff_action=None,
-               clock=time.time, sleep=time.sleep, state_root=STATE_ROOT):
+               clock=time.time, sleep=time.sleep, state_root=STATE_ROOT,
+               mode='campaign'):
     """Guest poweroff guard: terminal evidence, idle window, absolute deadline.
 
     This runs as its own process, not inside the mailbox worker. It survives a
     worker crash and keeps `gcp_worker.py` out of the image recipe hash. It
     reads the mailbox state from the bucket instead of the worker's memory.
+
+    `mode='fleet'` is the qualification fleet's guard. It is started by
+    `gcp_qualify_bootstrap` from the same admitted runtime the worker uses, so
+    the full validation below still applies; the mode records that this fleet
+    has no campaign terminal receipt and must stop on the idle window.
     """
+    if mode not in ('campaign', 'fleet'):
+        raise ValueError('invalid idle guard mode')
     gcp_runtime.validate_runtime(config)
     host = host or identify(config)
     api = api or gcp_api.GoogleApi(config['project_id'], token_provider=gcp_api.metadata_token)
@@ -434,7 +473,7 @@ def serve_idle(config, *, host=None, api=None, poll_seconds=None, poweroff_actio
         now = clock()
         if now >= deadline:
             log_decision(config, host, store, now, 'poweroff_deadline')
-            action('poweroff_deadline')
+            _poweroff_marked(config, host, store, 'poweroff_deadline', action)
             return 'poweroff_deadline'
         try:
             newest, active_until = mailbox_activity(
@@ -455,7 +494,7 @@ def serve_idle(config, *, host=None, api=None, poll_seconds=None, poweroff_actio
                   file=sys.stderr, flush=True)
             log_decision(config, host, store, now, 'unknown')
         if terminal in ('poweroff_no_acknowledgement', 'poweroff_hard_cap'):
-            action(terminal)
+            _poweroff_marked(config, host, store, terminal, action)
             return terminal
         if terminal != 'operator_takeover':
             try:
@@ -469,13 +508,21 @@ def serve_idle(config, *, host=None, api=None, poll_seconds=None, poweroff_actio
                 log_decision(config, host, store, now, 'unknown')
             else:
                 if idle == 'idle_poweroff':
-                    action('poweroff_idle')
+                    _poweroff_marked(config, host, store, 'poweroff_idle', action)
                     return 'poweroff_idle'
         sleep(poll)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3 or sys.argv[1] != 'serve-idle':
-        raise SystemExit('usage: gcp_poweroff.py serve-idle RUNTIME_CONFIG')
-    with open(sys.argv[2], encoding='utf-8') as stream:
-        serve_idle(json.load(stream))
+    argv = sys.argv[1:]
+    if argv[:1] != ['serve-idle'] or len(argv) not in (2, 4):
+        raise SystemExit('usage: gcp_poweroff.py serve-idle RUNTIME_CONFIG '
+                         '[--mode campaign|fleet]')
+    mode = 'campaign'
+    if len(argv) == 4:
+        if argv[2] != '--mode' or argv[3] not in ('campaign', 'fleet'):
+            raise SystemExit('usage: gcp_poweroff.py serve-idle RUNTIME_CONFIG '
+                             '[--mode campaign|fleet]')
+        mode = argv[3]
+    with open(argv[1], encoding='utf-8') as stream:
+        serve_idle(json.load(stream), mode=mode)

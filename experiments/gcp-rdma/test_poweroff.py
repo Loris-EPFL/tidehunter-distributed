@@ -331,6 +331,21 @@ class IdleGuardTests(unittest.TestCase):
         self.assertEqual(action, [(60, 'poweroff_idle')])
         beat = poweroff.heartbeat_epoch(self.config, self.store)
         self.assertEqual(beat, 30)
+        marker = 'runs/bench-test/poweroff/needs-delete/1.json'
+        self.assertIn(marker, self.store.items)
+        record = json.loads(self.store.items[marker][1])
+        self.assertEqual((record['reason'], record['instance_id']),
+                         ('poweroff_idle', '1'))
+
+    def test_the_deadline_stop_also_marks_the_disk_for_delete(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(poweroff.gcp_runtime, 'validate_runtime'), \
+                mock.patch.object(poweroff.gcp_runtime, '_deadline', return_value=0):
+            result, action = self.guard(root)
+        self.assertEqual(result, 'poweroff_deadline')
+        marker = 'runs/bench-test/poweroff/needs-delete/1.json'
+        self.assertEqual(json.loads(self.store.items[marker][1])['reason'],
+                         'poweroff_deadline')
 
     def test_a_long_request_holds_the_guard_until_its_timeout(self):
         key = 'runs/bench-test/mailbox/1/requests/op.json'

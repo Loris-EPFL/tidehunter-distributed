@@ -234,11 +234,23 @@ def _control_object(name, run_id):
     if not isinstance(name, str) or not name.startswith(prefix):
         return False
     leaf = name[len(prefix):]
-    if leaf in ('package.tar', 'package.json', 'runtime.json') or leaf.startswith('transfer/'):
+    if (leaf in ('package.tar', 'package.json', 'runtime.json')
+            or leaf.startswith('transfer/') or leaf.startswith('poweroff/')):
         return True
     parts = leaf.split('/')
     return (len(parts) == 3 and parts[0] == 'qualification'
             and parts[2] in ('worker-ready.json', 'gate.json'))
+
+
+def needs_delete_markers(store, run_id):
+    """The idle guard's markers that name a fleet whose boot disks may bill."""
+    prefix = 'runs/' + run_id + '/poweroff/needs-delete/'
+    rows = []
+    for item in store.list(prefix):
+        name = item.get('name')
+        if isinstance(name, str) and name.startswith(prefix):
+            rows.append(name)
+    return sorted(rows)
 
 
 def fleet_run_id(campaign):
@@ -262,13 +274,15 @@ def fleet_deadline(hours, now=None):
 
 
 def new_state(config, *, campaign, run_id, deadline, hosts, source_sha256, owner_nonce,
-              role='campaign'):
+              role='campaign', stage='campaign'):
     """Build the persisted fleet identity before any cloud mutation."""
     campaign = campaign_identity(campaign)
     if campaign is None:
         raise ValueError('the operator fleet requires a campaign id')
     if role not in FLEET_ROLES:
         raise ValueError('the fleet role must be campaign or qualification')
+    if (not isinstance(stage, str) or not re.fullmatch(r'[a-z0-9-]{1,32}', stage)):
+        raise ValueError('the fleet stage must be a lowercase name')
     if type(hosts) is not int or hosts not in FLEET_HOSTS:
         raise ValueError('the operator fleet must have two or three hosts')
     if role == 'qualification' and hosts != 2:
@@ -280,7 +294,8 @@ def new_state(config, *, campaign, run_id, deadline, hosts, source_sha256, owner
     if not isinstance(owner_nonce, str) or not re.fullmatch(r'[0-9a-f]{32}', owner_nonce):
         raise ValueError('the fleet owner nonce must be 128 random bits')
     parse_time(deadline)
-    return {'run_id': run_id, 'campaign': campaign, 'role': role, 'source_sha256': source_sha256,
+    return {'run_id': run_id, 'campaign': campaign, 'role': role,
+            'stage': stage, 'source_sha256': source_sha256,
             'owner_nonce': owner_nonce, 'deadline': deadline, 'host_count': hosts,
             'instances': []}
 
@@ -379,6 +394,23 @@ def package_source_sha256(package_dir, explicit=None):
             f'--source-sha256 {explicit} is not the package receipt source {source}: '
             'the guest gate binds the package receipt source SHA-256')
     return source
+
+
+def admit_create_package(package_dir, revision):
+    """Refuse a package the executing checkout did not seal at this revision.
+
+    `publish` applies the same two rules after the hosts exist; applying them
+    here means a mismatch costs a refusal, never a rented stage window.
+    """
+    import manual_campaign
+    import prepare
+    package = Path(package_dir).resolve(strict=True)
+    receipt = json.loads((package / 'package-receipt.json').read_text())
+    if not isinstance(receipt, dict) or receipt.get('source_revision') != revision:
+        raise ValueError('package receipt source revision differs from --revision')
+    source = prepare.cloud_package.admit_source(package / 'package')
+    manual_campaign._check_snapshot(source, revision)
+    return receipt
 
 
 def admit_image(config, api=None):
@@ -1121,6 +1153,10 @@ def _recorded_fleet(config, args, *, rebind=False):
         raise ValueError('recorded fleet campaign or host count differs from this command')
     if state.get('role', 'campaign') != args.role:
         raise ValueError('recorded fleet role differs from this command')
+    recorded_stage = state.get('stage', 'campaign')
+    if args.stage is not None and args.stage != recorded_stage:
+        raise ValueError('recorded fleet stage differs from this command')
+    args.stage = recorded_stage
     if args.source_sha256 is not None and state.get('source_sha256') != args.source_sha256 and not rebind:
         raise ValueError('recorded fleet source differs from this command')
     if args.deadline is not None and parse_time(state['deadline']) != parse_time(args.deadline) and not rebind:
@@ -1135,19 +1171,22 @@ async def create(config, args):
         # Derive the source from the package the guests will verify, and refuse
         # a differing explicit value before any cloud call creates a host.
         args.source_sha256 = package_source_sha256(args.package, args.source_sha256)
+        if args.role == 'campaign':
+            # A campaign package must carry the pinned nvmet module: without it
+            # the S1-0 admission cells cannot pass, so refuse before a host is
+            # rented.
+            mailbox_exec.admit_package_nvmet_fix(Path(args.package))
+        # A package sealed by another checkout or revision fails in `publish`
+        # after the hosts exist; refuse it here, before --dry-run prints a plan.
+        admit_create_package(args.package, args.revision)
     if args.state.exists():
         state = _recorded_fleet(config, args, rebind=True)
     else:
         state = new_state(config, campaign=args.campaign, run_id=args.run_id,
                           deadline=args.deadline, hosts=args.hosts,
                           source_sha256=args.source_sha256, owner_nonce=uuid.uuid4().hex,
-                          role=args.role)
+                          role=args.role, stage=args.stage)
         Compute(config, state, args.state, gcloud)
-    if args.package is not None and args.role == 'campaign':
-        # A campaign package must carry the pinned nvmet module: without it
-        # the S1-0 admission cells cannot pass, so refuse before a host is
-        # rented.
-        mailbox_exec.admit_package_nvmet_fix(Path(args.package))
     image_path = args.image or config.get('image')
     if args.dry_run:
         policy = policy_body(state)
@@ -1186,8 +1225,16 @@ async def create(config, args):
     compute = Compute(config, state, args.state, gcloud)
     budget = None
     if not state.get('instances'):
-        # The conservative campaign cap is checked before the first rented host.
-        budget = gcp_budget.admit_campaign(_window_hours(state), state['host_count'])
+        # Check the conservative cap and record this window as an immutable
+        # receipt before the first rented host. A retry of the same run and
+        # stage reuses its receipt; a different window is a conflict.
+        store = gcp_api.campaign_client(config).objects(config['bucket'])
+        window = _window_hours(state)
+        budget = gcp_budget.admit_campaign(
+            window, state['host_count'], store=store,
+            run_id=state['run_id'], stage=args.stage)
+        gcp_budget.reserve_window(store, state['run_id'], args.stage,
+                                  window, state['host_count'])
     gate = startup_script(config, state)
     policy = policy_body(state)
     if not state.get('policy'):
@@ -1303,11 +1350,14 @@ async def verify(config, args):
                       'disk_size_gb': disk.get('sizeGb'), 'status': vm.get('status')})
     if len(hosts) != state['host_count']:
         raise ComputeError('recorded host count differs from the fleet size')
+    store = gcp_api.campaign_client(config).objects(config['bucket'])
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                       'placement': {'name': actual['name'], 'id': _id(actual['id']),
                                     'collocation': actual['groupPlacementPolicy']['collocation'],
                                     'max_distance': actual['groupPlacementPolicy']['maxDistance']},
-                      'hosts': hosts}, sort_keys=True, indent=2))
+                      'hosts': hosts,
+                      'needs_delete': needs_delete_markers(store, state['run_id'])},
+                     sort_keys=True, indent=2))
     return 0
 
 
@@ -1320,9 +1370,22 @@ async def delete(config, args):
     # expired lease of the same run is dead and must not block the next fleet.
     store = gcp_api.campaign_client(config).objects(config['bucket'])
     lease = await compute.purge_expired_lease(store)
+    markers = needs_delete_markers(store, state['run_id'])
+    try:
+        spend = gcp_budget.record_spend(store, state['run_id'],
+                                        state.get('stage', 'campaign'))
+        spend_error = None
+    except (ValueError, gcp_api.ApiError) as exc:
+        # The fleet is already gone; a receipt failure must not read as a
+        # failed deletion, but it must be visible.
+        spend, spend_error = None, str(exc)
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                       'cleanup': result, 'hosts': len(state['instances']),
-                      'lease_purged': bool(lease)}, sort_keys=True, indent=2))
+                      'lease_purged': bool(lease),
+                      'needs_delete': markers,
+                      'budget_spend': spend,
+                      'budget_spend_error': spend_error},
+                     sort_keys=True, indent=2))
     return 0
 
 
@@ -1344,6 +1407,9 @@ def parse(argv=None):
     parser.add_argument('--deadline')
     parser.add_argument('--image')
     parser.add_argument('--role', choices=FLEET_ROLES)
+    parser.add_argument('--stage',
+                        help='campaign stage this fleet serves; the budget receipt key '
+                             'is run id plus stage (default: campaign)')
     parser.add_argument('--source-sha256')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--package', type=Path,
@@ -1376,6 +1442,7 @@ def parse(argv=None):
             parser.error('create requires exactly one of --hours or --deadline')
         if not args.state.exists():
             args.role = args.role or 'campaign'
+            args.stage = args.stage or 'campaign'
             if args.role == 'qualification' and args.hosts != 2:
                 parser.error('a qualification fleet has exactly two hosts')
             if args.role == 'qualification' and args.image is None:
