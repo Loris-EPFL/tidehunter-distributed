@@ -3,7 +3,7 @@
 The free rehearsal replaces only the service behind `gcp_api.ObjectStore`. This
 test proves that the replacement keeps the contract the campaign depends on:
 generations, `ifGenerationMatch` preconditions, SHA-256 metadata, streaming
-uploads, listing and media reads.
+uploads, server-side copies, listing and media reads.
 """
 import hashlib
 import json
@@ -72,6 +72,38 @@ class LocalStore(unittest.TestCase):
             self.store.put(name, name.encode(), if_generation_match=0)
         names = [item['name'] for item in self.store.list('runs/a/')]
         self.assertEqual(names, ['runs/a/one.json', 'runs/a/two.json'])
+
+    def test_a_server_side_copy_keeps_the_bytes_and_a_new_generation(self):
+        data = b'x' * 4096
+        self.store.put('runs/a/staged.tar.gz', data, if_generation_match=0,
+                       metadata={'kind': 'staged-tree'})
+        copied = self.store.copy('runs/a/staged.tar.gz',
+                                 'runs/a/mailbox/1/stdin',
+                                 if_generation_match=0)
+        self.assertEqual(copied['name'], 'runs/a/mailbox/1/stdin')
+        self.assertEqual(int(copied['size']), len(data))
+        self.assertEqual(copied['metadata']['sha256'],
+                         hashlib.sha256(data).hexdigest())
+        self.assertEqual(copied['metadata']['kind'], 'staged-tree')
+        self.assertNotEqual(copied['generation'],
+                            self.store.head('runs/a/staged.tar.gz')['generation'])
+        self.assertEqual(self.store.get('runs/a/mailbox/1/stdin'), data)
+        self.assertEqual(self.store.get('runs/a/staged.tar.gz'), data)
+
+    def test_a_copy_into_an_existing_destination_is_refused(self):
+        self.store.put('runs/a/staged.tar.gz', b'first', if_generation_match=0)
+        self.store.put('runs/a/transfer', b'second', if_generation_match=0)
+        with self.assertRaises(gcp_api.ApiError) as raised:
+            self.store.copy('runs/a/staged.tar.gz', 'runs/a/transfer',
+                            if_generation_match=0)
+        self.assertEqual(raised.exception.status, 412)
+        self.assertEqual(self.store.get('runs/a/transfer'), b'second')
+
+    def test_a_copy_of_a_missing_source_is_refused(self):
+        with self.assertRaises(gcp_api.ApiError) as raised:
+            self.store.copy('runs/a/missing', 'runs/a/transfer',
+                            if_generation_match=0)
+        self.assertEqual(raised.exception.status, 404)
 
     def test_delete_honours_its_precondition(self):
         self.store.put('runs/a/object.json', b'first', if_generation_match=0)

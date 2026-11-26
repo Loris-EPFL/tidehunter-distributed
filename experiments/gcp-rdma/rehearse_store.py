@@ -4,8 +4,9 @@
 The free fleet rehearsal runs the real `gcp_api.ObjectStore` client, the real
 mailbox, the real worker and the real drivers. Only the service behind those
 clients is local: this module keeps generations, `ifGenerationMatch`
-preconditions and SHA-256 metadata in one directory, and serves the four
-requests the client makes. Nothing here talks to a cloud API.
+preconditions and SHA-256 metadata in one directory, and serves the five
+requests the client makes, including the server-side copy a staged tree uses.
+Nothing here talks to a cloud API.
 """
 import fcntl
 import hashlib
@@ -158,6 +159,22 @@ class Store:
         return [self.head(name) for name in selected], (
             selected[-1] if len(names) > limit else None)
 
+    def copy(self, source, destination, *, if_generation_match=None):
+        """One server-side copy: same bytes and metadata, a new generation."""
+        with self._locked(True):
+            index = self._index()
+            record = index['objects'].get(source)
+            if record is None:
+                raise Missing()
+            self._check(index['objects'].get(destination), if_generation_match)
+            generation = index['next']
+            index['next'] = generation + 1
+            index['objects'][destination] = dict(
+                record, generation=generation,
+                timeCreated=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+            self._save(index)
+        return self.head(destination)
+
     def delete(self, key, *, if_generation_match=None):
         with self._locked(True):
             index = self._index()
@@ -292,6 +309,22 @@ def serve_handler(store):
 
         def do_POST(self):
             path, query = self._split()
+            if '/copyTo/b/' in path:
+                source_path, _, rest = path.partition('/copyTo/b/')
+                if '/o/' not in source_path:
+                    return self._error(404, 'unsupported copy source')
+                bucket, _, destination = rest.partition('/o/')
+                if bucket != store.root.name or not destination:
+                    return self._error(404, 'unknown copy destination')
+                try:
+                    return self._reply(200, store.copy(
+                        urllib.parse.unquote(source_path.split('/o/', 1)[1]),
+                        urllib.parse.unquote(destination),
+                        if_generation_match=query.get('ifGenerationMatch')))
+                except Missing:
+                    return self._error(404, 'no such object')
+                except Precondition:
+                    return self._error(412, 'generation precondition failed')
             if '/upload/storage/' not in path:
                 return self._error(404, 'unsupported upload path')
             length = int(self.headers.get('Content-Length', '0'))
