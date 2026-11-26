@@ -13,6 +13,11 @@ from gcp_manual_image import _json
 from gcp_api import GoogleApi
 from gcp_campaign import GUEST_SERVICE_ACCOUNT, require_permissions
 
+# A cold OAuth refresh can exceed thirty seconds and abort a requalification
+# before any host exists (observed 2026-11-26 03:00Z). Every read here completes
+# in about one second once the token is warm.
+GCLOUD_CALL_SECONDS = 120
+
 USER_PROJECT_PERMISSIONS = (
     'compute.instances.create', 'compute.instances.get', 'compute.instances.list',
     'compute.instances.delete', 'compute.instances.stop', 'compute.instances.setMetadata',
@@ -73,7 +78,8 @@ async def infrastructure_preflight(config, base_image, execute):
 
     async def describe(arguments, expected_name):
         response = await asyncio.wait_for(execute(arguments + [
-            '--project=mysten-research', '--quiet', '--format=json']), timeout=30)
+            '--project=mysten-research', '--quiet', '--format=json']),
+            timeout=GCLOUD_CALL_SECONDS)
         value = _json(response)
         if not isinstance(value, dict) or value.get('name') != expected_name:
             raise ValueError('resource description name mismatch')
@@ -134,7 +140,8 @@ async def quota_preflight(config, execute):
     """Read regional quota; admission sums reservations under its GCS CAS."""
     response = await asyncio.wait_for(execute([
         'compute', 'regions', 'describe', 'us-central1',
-        '--project=' + config['project_id'], '--quiet', '--format=json']), timeout=30)
+        '--project=' + config['project_id'], '--quiet', '--format=json']),
+        timeout=GCLOUD_CALL_SECONDS)
     region = _json(response)
     if not isinstance(region, dict) or region.get('name') != 'us-central1':
         raise ValueError('regional quota identity mismatch')

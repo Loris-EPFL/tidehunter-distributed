@@ -82,6 +82,19 @@ class InfrastructureAdmissionTest(IsolatedAsyncioTestCase):
         image = await preflight.infrastructure_preflight(self.config, self.image_path, self.execute)
         self.assertEqual(image['id'], '123')
 
+    async def test_a_cold_token_refresh_has_a_two_minute_bound(self):
+        # A cold refresh exceeded thirty seconds at 03:00Z and aborted a
+        # requalification before any host existed; the bound is 120 s.
+        self.assertEqual(preflight.GCLOUD_CALL_SECONDS, 120)
+        bounds = []
+
+        async def slow(argv):
+            bounds.append(preflight.GCLOUD_CALL_SECONDS)
+            return await self.execute(argv)
+
+        await preflight.infrastructure_preflight(self.config, self.image_path, slow)
+        self.assertTrue(bounds and all(value == 120 for value in bounds))
+
     async def test_missing_private_google_access_fails_closed(self):
         self.resources[('subnets', 'default')]['privateIpGoogleAccess'] = False
         with self.assertRaisesRegex(ValueError, 'private Google'):
