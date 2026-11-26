@@ -99,6 +99,25 @@ fn write_extent_bytes(path: &std::path::Path, start: u64, segment_bytes: u64, by
     write_file_bytes(path, start % segment_bytes, bytes);
 }
 
+/// Zero the last retained frame of the owner file, so the owner can prove only
+/// the prefix below it and the resume must resend it. Without the tear the
+/// owner's probe adopts the frame it can read, and nothing is owed.
+fn tear_retained_tail(client: &Client, cursor: u64) {
+    let extent = client
+        .live_leased
+        .current
+        .as_ref()
+        .expect("an open extent");
+    let segment = extent.lease.extent.segment.bytes;
+    let path = extent.lease.extent.segment.path.clone();
+    let frame = client.leased_test_retained().1 as u64;
+    assert!(
+        frame > 0 && frame <= cursor,
+        "a retained tail of {frame} bytes must sit below the cursor {cursor}"
+    );
+    write_extent_bytes(&path, cursor - frame, segment, &vec![0u8; frame as usize]);
+}
+
 /// The owner's adopted frontier of `extent`, read with the resume's own probe.
 /// The probe asks at the extent's start, so the owner answers from memory and
 /// adopts nothing: only the bytes above the returned frontier are owed a
@@ -741,6 +760,283 @@ fn failed_flush_eio_is_not_resumed() {
         "a flush data error is never retried"
     );
     assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// A pool of its own, so a resume test can observe the controller it evicts and
+/// the fresh one the layout caches again.
+fn controller_pool() -> (
+    tempdir::TempDir,
+    Arc<crate::distributed::nvmeof::live_pool::LiveControllerPool>,
+) {
+    use crate::distributed::nvmeof::live_connect::{LiveConnectionRegistry, RegistryMode};
+    let directory = tempdir::TempDir::new("w1-controller-loss").expect("a private pool directory");
+    let registry =
+        LiveConnectionRegistry::open(&directory.path().join("registry"), RegistryMode::Retire)
+            .expect("a fresh connection registry");
+    let pool = crate::distributed::nvmeof::live_pool::LiveControllerPool::new(registry, 2, 1)
+        .expect("a controller pool");
+    (directory, Arc::new(pool))
+}
+
+/// A submission that reports `EIO` after the pinned controller has been deleted
+/// is a data break, not a media verdict: the resume rewrites the unadopted
+/// suffix from the retained frames, so the prefix the owner already adopted
+/// stays byte-identical and the caller never sees an error.
+#[test]
+fn eio_from_a_deleting_controller_resumes_with_identical_bytes() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first frame");
+    // One frame is written and released but not adopted: the resume owns a
+    // retained suffix to rewrite, exactly as after a controller loss.
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the second frame completes");
+    assert_eq!(
+        client.leased_test_retained().0,
+        1,
+        "the unadopted frame is retained"
+    );
+    let (start, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let clean = owned_bytes(&client, start, cursor);
+    // The torn tail is the frame the resume must resend: the owner proves only
+    // the prefix below it.
+    tear_retained_tail(&client, cursor);
+    // The dead namespace gendisk answers `EIO` before any SQE, and the pinned
+    // controller is not live: a stopped controller, not a media verdict.
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_submit(libc::EIO);
+    submit(&mut client, &fixture, 2);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the EIO submission is resumed");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the rewritten suffix");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume episode");
+    assert_eq!(
+        counts.resume_rewrites, 1,
+        "the unadopted frame is rewritten: retained={:?} steps={:?} rewrites={:?} frames={} attempts={}",
+        client.leased_test_retained(), client.leased_test_attempt_steps(),
+        client.leased_test_rewrites(), counts.resume_frames, counts.resume_attempts
+    );
+    assert_eq!(counts.resume_frames, 1, "exactly one frame was resent");
+    assert_eq!(counts.resume_refused, 0, "the resume was not refused");
+    assert!(
+        !client.live_write_failed,
+        "a resumed error never poisons the writer"
+    );
+    assert_eq!(
+        owned_bytes(&client, start, cursor),
+        clean,
+        "the written prefix is byte-identical after the rewrite"
+    );
+    assert_eq!(released.len(), 3, "every frame was released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// The same `EIO`, but the pinned controller is still live: it is the device's
+/// media verdict, so the writer fail-stops and nothing is retried.
+#[test]
+fn eio_with_a_live_controller_fail_stops() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client.leased_test_controller_lost(false);
+    client.leased_test_fail_write(-libc::EIO);
+    submit(&mut client, &fixture, 1);
+    let error = client
+        .drain_leased_flights(&mut released, None)
+        .expect_err("a live controller's EIO is a media verdict");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "a media EIO is not a transient break: {error}"
+    );
+    assert!(
+        error.to_string().contains("errno 5"),
+        "the refusal names the device errno: {error}"
+    );
+    assert!(client.live_write_failed, "the writer fail-stops");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 0, "no resume episode ran");
+    assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// `EREMOTEIO` is a typed target or media rejection. It stays fatal even when
+/// the pinned controller is verifiably gone, because the ambiguous class is
+/// exactly `EIO`/`EBADF`.
+#[test]
+fn eremoteio_fail_stops_even_when_the_controller_is_gone() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_write(-libc::EREMOTEIO);
+    submit(&mut client, &fixture, 1);
+    let error = client
+        .drain_leased_flights(&mut released, None)
+        .expect_err("a target rejection is never retried");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "EREMOTEIO is not a transient break: {error}"
+    );
+    assert!(
+        error.to_string().contains("errno 121"),
+        "the refusal names the target errno: {error}"
+    );
+    assert!(client.live_write_failed, "the writer fail-stops");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 0, "no resume episode ran");
+    assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// A data break evicts the lost controller before it reopens: the pool caches a
+/// fresh lease, so the rewrite cannot land on the namespace of the controller
+/// the kernel already stopped.
+#[test]
+fn data_break_evicts_the_cached_controller_before_the_reopen() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let (_pool_directory, pool) = controller_pool();
+    client.set_live_pool(pool.clone());
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    let nqn = client
+        .live_leased
+        .current
+        .as_ref()
+        .expect("an open extent")
+        .lease
+        .binding
+        .nqn
+        .clone();
+    let cached = pool
+        .cached_lease(&nqn)
+        .expect("the first queue cached its controller");
+    // A written, released, but unadopted frame gives the resume a suffix to
+    // rewrite through the controller it reconnects.
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the second frame completes");
+    let (start, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let clean = owned_bytes(&client, start, cursor);
+    tear_retained_tail(&client, cursor);
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_submit(libc::EIO);
+    submit(&mut client, &fixture, 2);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the EIO submission is resumed");
+    let reopened = pool
+        .cached_lease(&nqn)
+        .expect("the resume cached the controller it reconnected");
+    assert!(
+        !Arc::ptr_eq(&cached, &reopened),
+        "the resume must evict the lost controller before it reopens"
+    );
+    assert_eq!(
+        owned_bytes(&client, start, cursor),
+        clean,
+        "the rewritten suffix went through the new controller byte-identically"
+    );
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the rewritten suffix");
+}
+
+/// A lease that lapses while the EIO resume runs still fails the database, even
+/// after the dead controller was evicted: the right to write is checked before
+/// the first rewritten frame.
+#[test]
+fn eio_resume_fails_stop_when_the_lease_lapses_mid_episode() {
+    use crate::distributed::remote_db::coordinator_lease::LeaseValidity;
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let (_pool_directory, pool) = controller_pool();
+    client.set_live_pool(pool.clone());
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    let nqn = client
+        .live_leased
+        .current
+        .as_ref()
+        .expect("an open extent")
+        .lease
+        .binding
+        .nqn
+        .clone();
+    let validity = Arc::new(LeaseValidity::fresh_for_test());
+    client.set_lease_validity(Arc::clone(&validity));
+    // A written, released, but unadopted frame makes the resume rewrite, so the
+    // lapse lands inside the data step instead of after an empty one.
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the second frame completes");
+    let (_, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    tear_retained_tail(&client, cursor);
+    // The lapse lands after the probe, at the boundary before the rewrite.
+    client.leased_test_lapse_lease_after_step(3, validity);
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_submit(libc::EIO);
+    let error = match client.submit_leased_group(
+        1,
+        vec![fixture.batch(2)],
+        &WriteTimeline::default(),
+        2,
+        true,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a lapsed lease refuses the rewrite"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "coordinator lease lapsed on owner partition 2",
+        "the refusal names the lapse"
+    );
+    assert!(client.live_write_failed, "the writer fail-stops");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 2, "one attempt and its retry");
+    assert_eq!(counts.resume_refused, 1, "the refusal is counted");
+    assert_eq!(counts.resume_rewrites, 0, "no rewrite episode completed");
+    assert_eq!(counts.resume_frames, 0, "no frame was resent");
+    assert_eq!(
+        client.leased_test_attempt_steps(),
+        [3, 2],
+        "the first attempt stops at the rewrite step and the retry at its probe"
+    );
+    assert!(
+        pool.cached_lease(&nqn).is_none(),
+        "the lost controller was evicted, and the refused resume cached nothing"
+    );
 }
 
 /// A session break while a group flush is in flight keeps the queue, so
