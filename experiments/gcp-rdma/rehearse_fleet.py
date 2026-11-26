@@ -311,28 +311,42 @@ class Rehearsal:
                 lines.append((host['name'], log.name, text))
         return lines
 
+    def experiment_logs(self):
+        """The coordinator's replay logs on H0, read through the guest image.
+
+        The guest writes them as root, so the laptop reads them with a container
+        that mounts the same campaign directory read-only.
+        """
+        campaign = self.campaign_mount()
+        if not campaign.is_dir():
+            return []
+        result = run(['docker', 'run', '--rm', '-v', str(campaign) + ':/c:ro', IMAGE,
+                      'sh', '-c', 'for f in /c/out/*/experiment/*.log; do '
+                                  'echo "== $f"; cat "$f"; done'], check=False)
+        return result.stdout or ''
+
     def wall(self, cell, result):
         """A cell passes only when it stopped at kernel NVMe-oF provisioning.
 
-        The owners start before the engine provisions the NVMe-oF target, so
-        the failure normally appears in the coordinator's output on H0. Owner
-        logs are accepted too, because a target bind can fail there first.
-        Another failure after owner start stays a failure.
+        The owners start before the engine provisions the target, so the failure
+        appears in the coordinator's replay log on H0 (`nvmet` on `configfs`),
+        and can also appear in an owner log or the printed output. Another
+        failure after owner start stays a failure.
         """
         logs = self.owner_logs()
         if not logs or not any('storage_node_pid=' in text for _, _, text in logs):
             return False, 'no owner start: the cell did not reach the owner lifecycle'
-        coordinator = (result.stdout or '') + (result.stderr or '')
         sources = [(f'{host}/{name}', text) for host, name, text in logs]
-        sources.append(('H0 coordinator', coordinator))
+        sources.append(('H0 output', (result.stdout or '') + (result.stderr or '')))
+        sources.append(('H0 experiment logs', self.experiment_logs()))
         for label, text in sources:
             for marker in WALL_MARKERS:
                 if marker in text:
                     line = next(row for row in text.splitlines() if marker in row)
                     return True, (f'stopped at kernel NVMe-oF provisioning '
                                   f'({label}): {line.strip()[:200]}')
-        tail = (coordinator.strip().splitlines() or ['<empty>'])[-3:]
-        return False, 'no kernel NVMe-oF failure; coordinator last lines: ' + ' | '.join(tail)
+        tail = ((result.stdout or '') + (result.stderr or '')).strip().splitlines() or ['<empty>']
+        return False, 'no kernel NVMe-oF failure; last lines: ' + ' | '.join(tail[-3:])
 
     def manual_sui(self):
         output = self.work / 'cells' / 'manual_sui'
