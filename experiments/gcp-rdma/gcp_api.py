@@ -241,6 +241,22 @@ class ObjectStore:
     def delete(self, key, *, if_generation_match):
         return self.api._request('DELETE', self._url(key, {'ifGenerationMatch': str(if_generation_match)}))
 
+    def copy(self, source, destination, *, if_generation_match=None):
+        """Copy one object server-side; the destination keeps the metadata.
+
+        `if_generation_match` applies to the destination, so a copy never
+        replaces an object another writer published.
+        """
+        url = (self.base + '/' + urllib.parse.quote(source, safe='') + '/copyTo/b/'
+               + urllib.parse.quote(self.bucket, safe='') + '/o/'
+               + urllib.parse.quote(destination, safe=''))
+        if if_generation_match is not None:
+            url += '?' + urllib.parse.urlencode({'ifGenerationMatch': str(if_generation_match)})
+        result = json.loads(self.api._request('POST', url, b'', {'Content-Type': 'application/json'}))
+        if result.get('name') != destination or not result.get('generation'):
+            raise ValueError('GCS copy receipt mismatch')
+        return result
+
     def get(self, key, *, generation=None, max_bytes=256 * 1024 * 1024):
         meta = self.head(key) if generation is None else json.loads(self.api._request('GET', self._url(key, {'generation': generation})))
         if int(meta['size']) > max_bytes:

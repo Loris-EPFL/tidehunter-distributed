@@ -57,6 +57,12 @@ MAX_BLOB = 16 * 1024 * 1024 * 1024
 # the wait. Each window re-reads the receipt key and nothing else.
 WAIT_SECONDS = 120
 READY_SECONDS = 900
+# The build bundle (1.1 GB), the fixture (752 MB) and the schema are the same
+# bytes for every cell of a fleet, so they are staged under a digest-addressed
+# key once per run and the guest records what it already holds.
+STAGE_ROOT = '.staged'
+# The pinned campaign nvmet module (experiments/nvmeof/kernel_fix.MODULE_SHA).
+NVMET_FIX_MODULE_SHA256 = '5ba7b96c3b232e7fc0d1200b674d6210324d87ed406f8b51f4b323609ccc233a'
 
 
 class MailboxError(host_exec.HostCommandError):
@@ -95,6 +101,57 @@ def upload_identical(store, key, path, sha256):
             or int(head.get('size', -1)) != path.stat().st_size):
         raise MailboxError(f'{key}: immutable blob already holds other bytes')
     return head
+
+
+def tree_digest(path):
+    """One content digest of a directory tree, independent of mtimes.
+
+    A stat-only signature would restage the same 1.85 GB after a copy; hashing
+    the bytes costs a few seconds on a workstation and is the only value that
+    proves the guest holds this tree.
+    """
+    root = Path(path)
+    digest = hashlib.sha256()
+    for entry in sorted(root.rglob('*'), key=lambda item: item.relative_to(root).as_posix()):
+        name = entry.relative_to(root).as_posix()
+        if entry.is_symlink():
+            digest.update(b'L\0' + name.encode() + b'\0' + os.readlink(entry).encode() + b'\0')
+        elif entry.is_dir():
+            digest.update(b'D\0' + name.encode() + b'\0')
+        elif entry.is_file():
+            digest.update(b'F\0' + name.encode() + b'\0'
+                          + str(entry.stat().st_size).encode() + b'\0')
+            with entry.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        else:
+            raise ValueError(f'{entry}: unsupported entry in a campaign tree')
+    return digest.hexdigest()
+
+
+def admit_nvmet_fix(receipt):
+    """The campaign package must carry the pinned nvmet kernel module.
+
+    The guests bind the stock CIQ module otherwise, and a short `IOCB_NOWAIT`
+    read on the buffered target can return `-EREMOTEIO`, so S1-0 cannot pass.
+    A package is either resealed with `prepare.py --nvmet-fix-prefix
+    checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix` or it is not
+    a campaign package.
+    """
+    fix = receipt.get('nvmet_fix') if isinstance(receipt, dict) else None
+    module = fix.get('module_sha256') if isinstance(fix, dict) else None
+    if not isinstance(module, str) or not module.startswith(NVMET_FIX_MODULE_SHA256[:16]):
+        raise ValueError(
+            'campaign package carries no pinned nvmet fix; reseal it with '
+            'prepare.py --nvmet-fix-prefix '
+            'checkpoint-work/benchmark-results/pinned-artifacts/nvmet-fix')
+    return fix
+
+
+def admit_package_nvmet_fix(package_dir):
+    """Read one sealed receipt and require the pinned module before any host."""
+    receipt = json.loads((Path(package_dir) / 'package-receipt.json').read_text())
+    return admit_nvmet_fix(receipt)
 
 
 def replace_object(store, key, data, *, content_type='application/json'):
@@ -332,32 +389,95 @@ class MailboxExec(host_exec.HostExecution):
                   f'cat > {shlex.quote(str(destination))}', local,
             operation_id=operation_id)
 
-    def stage_tree(self, host, local_dir, guest_dir, *, operation_id=None):
-        """Copy one local directory to a guest directory as one bucket blob.
+    def staging_key(self, name, digest):
+        """The one bucket key of a tree under this run, addressed by its digest."""
+        return f'runs/{self.run_id}/staging/{name}/{digest}.tar.gz'
 
-        The build bundle (1.1 GB) and the fixture (752 MB) reach the coordinator
-        this way: one upload from the workstation, one download on the guest,
-        never a copy held in the launcher's memory.
-        """
-        local_dir = Path(local_dir)
-        if not local_dir.is_dir():
-            raise ValueError(f'{local_dir}: not a campaign directory')
-        index = self.index_of(host)
-        operation_id = operation_id or self.next_operation()
+    def _stage_archive(self, key, local_dir, digest):
+        """Publish one tree under its digest key; never upload the same bytes twice."""
+        try:
+            head = self.store.head(key)
+        except Exception as exc:
+            if getattr(exc, 'status', None) != 404:
+                raise
+        else:
+            if (head.get('metadata') or {}).get('tree_sha256') == digest:
+                return head
+            raise MailboxError(f'{key}: staged tree object holds another digest')
         handle, name = tempfile.mkstemp(suffix='.tar.gz')
         os.close(handle)
         archive = Path(name)
         try:
             with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
-                for entry in sorted(local_dir.iterdir()):
+                for entry in sorted(Path(local_dir).iterdir()):
                     bundle.add(entry, arcname=entry.name, recursive=True)
-            destination = Path(guest_dir)
-            return self.send_local(
-                host, f'mkdir -p {shlex.quote(str(destination))} && '
-                      f'tar -xzf - -C {shlex.quote(str(destination))}', archive,
-                operation_id=operation_id)
+            try:
+                return self.store.upload(
+                    key, archive, content_type='application/gzip', if_generation_match=0,
+                    metadata={'tree_sha256': digest})
+            except Exception as exc:
+                if getattr(exc, 'status', None) != 412:
+                    raise
+                head = self.store.head(key)
+                if (head.get('metadata') or {}).get('tree_sha256') != digest:
+                    raise MailboxError(f'{key}: staged tree object holds another digest') from exc
+                return head
         finally:
             archive.unlink()
+
+    def _discard_transfer(self, key):
+        """Drop the per-operation copy; the digest-addressed tree stays."""
+        try:
+            head = self.store.head(key)
+            self.store.delete(key, if_generation_match=head['generation'])
+        except Exception as exc:
+            if getattr(exc, 'status', None) == 404:
+                return
+            print(f'{key}: transfer copy not removed: {exc}', file=sys.stderr)
+
+    def stage_tree(self, host, local_dir, guest_dir, *, operation_id=None):
+        """Copy one local directory to a guest directory once per run.
+
+        The build bundle (1.1 GB), the fixture (752 MB) and the schema are the
+        same bytes for every cell of a fleet. The first cell uploads the tree
+        under a digest-addressed key and the guest records that digest in a
+        `.staged` marker; every later cell transfers nothing. A guest that does
+        not hold the tree receives one server-side copy of the staged object,
+        not a second upload from the workstation.
+        """
+        local_dir = Path(local_dir)
+        if not local_dir.is_dir():
+            raise ValueError(f'{local_dir}: not a campaign directory')
+        index = self.index_of(host)
+        destination = Path(guest_dir)
+        marker = destination.parent / STAGE_ROOT / destination.name
+        digest = tree_digest(local_dir)
+        code, out, _err = self.execute(
+            host, f'cat {shlex.quote(str(marker))} 2>/dev/null || true')
+        if code == 0 and out.decode('utf-8', 'replace').strip() == digest:
+            return (0, b'', b'')
+        key = self.staging_key(destination.name, digest)
+        self._stage_archive(key, local_dir, digest)
+        staged = self.store.head(key)
+        operation_id = operation_id or self.next_operation()
+        blob = {'object': self.transfer_key(index, operation_id, 'stdin'),
+                'sha256': (staged.get('metadata') or {}).get('sha256'),
+                'size': int(staged.get('size', -1))}
+        if not isinstance(blob['sha256'], str) or blob['size'] < 0:
+            raise MailboxError(f'{key}: staged tree receipt is incomplete')
+        copied = self.store.copy(key, blob['object'], if_generation_match=0)
+        if str(copied.get('size', -1)) != str(blob['size']):
+            raise MailboxError(f'{blob["object"]}: staged copy size mismatch')
+        reference = self.mailbox.submit(
+            index, [SHELL, '-c',
+                    f'mkdir -p {shlex.quote(str(destination))} {shlex.quote(str(marker.parent))} && '
+                    f'tar -xzf - -C {shlex.quote(str(destination))} && '
+                    f'printf %s {digest} > {shlex.quote(str(marker))}'],
+            operation_id=operation_id, timeout_seconds=self.command_timeout(None),
+            stdin=blob, stdout_object=self.transfer_key(index, operation_id, 'stdout'))
+        result = self.finish(host, reference)
+        self._discard_transfer(blob['object'])
+        return result
 
     def run_driver(self, host, script, argv=(), *, timeout_seconds=None, operation_id=None):
         """Run one admitted orchestrator script on the coordinator host.
@@ -441,6 +561,8 @@ def publish(store, config, state, package_dir, revision, spec, fleet, *, guest_r
     admission = dict(spec, mode='focused') if spec.get('suite') == 'sui' else spec
     receipt, _source = manual_campaign._admit_package(Path(package_dir).resolve(strict=True),
                                                       revision, admission)
+    if admission.get('suite') == 'sui':
+        admit_nvmet_fix(receipt)
     prefix = 'runs/' + state['run_id'] + '/'
     key = prefix + 'package.tar'
     package = dict(receipt, object_key=key)
@@ -572,4 +694,5 @@ def open_executor(args):
 
 __all__ = ['MailboxError', 'MailboxTimeout', 'MailboxRefused', 'MailboxUnknownHost',
            'MailboxExec', 'sui_spec', 'publish', 'release', 'gate_script', 'load_config',
-           'open_executor', 'rewrite', 'with_flags', 'coordinator_of', 'dispatch']
+           'open_executor', 'rewrite', 'with_flags', 'coordinator_of', 'dispatch',
+           'tree_digest', 'admit_nvmet_fix', 'admit_package_nvmet_fix']

@@ -1,7 +1,9 @@
 """The bucket-mailbox executor against a real worker and a real subprocess."""
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import shlex
 import sys
 import tempfile
@@ -32,7 +34,7 @@ class Store:
         self.next_generation = 1
 
     def put(self, key, data, *, content_type='application/octet-stream',
-            if_generation_match=None, **kwargs):
+            if_generation_match=None, metadata=None, **kwargs):
         # GCS precondition: 0 means "must not exist"; any other value must be
         # the current generation. A match replaces the object.
         if if_generation_match is not None:
@@ -46,17 +48,18 @@ class Store:
         data = bytes(data)
         generation = str(self.next_generation)
         self.next_generation += 1
+        attributes = dict(metadata or {})
+        attributes['sha256'] = hashlib.sha256(data).hexdigest()
         self.objects[key] = {'generation': generation, 'data': data,
-                             'sha256': hashlib.sha256(data).hexdigest()}
-        return {'generation': generation, 'size': len(data),
-                'metadata': {'sha256': self.objects[key]['sha256']}}
+                             'sha256': attributes['sha256'], 'metadata': attributes}
+        return {'generation': generation, 'size': len(data), 'metadata': attributes}
 
     def head(self, key):
         if key not in self.objects:
             raise Error(404)
         record = self.objects[key]
         return {'name': key, 'generation': record['generation'], 'size': len(record['data']),
-                'metadata': {'sha256': record['sha256']}}
+                'metadata': record['metadata']}
 
     def get(self, key, *, generation=None, max_bytes=256 * 1024 * 1024):
         meta = self.head(key)
@@ -70,7 +73,7 @@ class Store:
     def upload(self, key, path, *, content_type='application/octet-stream',
                if_generation_match=None, metadata=None, deadline_check=None):
         return self.put(key, Path(path).read_bytes(), content_type=content_type,
-                        if_generation_match=if_generation_match)
+                        if_generation_match=if_generation_match, metadata=metadata)
 
     def download(self, key, path, *, generation=None, max_bytes=256 * 1024 * 1024,
                  deadline_check=None):
@@ -78,6 +81,18 @@ class Store:
 
     def list(self, prefix):
         return iter([self.head(key) for key in sorted(self.objects) if key.startswith(prefix)])
+
+    def copy(self, source, destination, *, if_generation_match=None):
+        if if_generation_match == 0 and destination in self.objects:
+            raise Error(412)
+        record = self.objects[source]
+        generation = str(self.next_generation)
+        self.next_generation += 1
+        self.objects[destination] = {'generation': generation, 'data': record['data'],
+                                     'sha256': record['sha256'],
+                                     'metadata': dict(record['metadata'])}
+        return {'name': destination, 'generation': generation,
+                'size': len(record['data']), 'metadata': record['metadata']}
 
     def delete(self, key, *, if_generation_match):
         del self.objects[key]
@@ -255,6 +270,80 @@ class Campaign(unittest.TestCase):
         self.assertEqual((guest / 'build-manifest.json').read_text(), '{"protocol": 9}')
         self.assertEqual((guest / 'binaries/sui-node-native').read_bytes(), b'binary')
 
+    def test_tree_digest_is_content_addressed_not_time_addressed(self):
+        first = Path(self.scratch.name) / 'tree-a'
+        second = Path(self.scratch.name) / 'tree-b'
+        for root in (first, second):
+            (root / 'binaries').mkdir(parents=True)
+            (root / 'manifest.json').write_text('{"protocol": 9}')
+            (root / 'binaries/tool').write_bytes(b'binary')
+        self.assertEqual(mailbox_exec.tree_digest(first), mailbox_exec.tree_digest(second))
+        os.utime(second / 'manifest.json', (1, 1))
+        self.assertEqual(mailbox_exec.tree_digest(first), mailbox_exec.tree_digest(second))
+        (second / 'manifest.json').write_text('{"protocol": 8}')
+        self.assertNotEqual(mailbox_exec.tree_digest(first), mailbox_exec.tree_digest(second))
+
+    def test_a_tree_is_staged_once_per_run_and_reused_by_the_next_cell(self):
+        build = Path(self.scratch.name) / 'build'
+        (build / 'binaries').mkdir(parents=True)
+        (build / 'build-manifest.json').write_text('{"protocol": 9}')
+        (build / 'binaries/sui-node-native').write_bytes(b'binary')
+        guest = Path(self.scratch.name) / 'guest/build'
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        staged = [key for key in self.store.objects if key.startswith(f'runs/{RUN}/staging/')]
+        self.assertEqual(len(staged), 1)
+        self.assertEqual([key for key in self.store.objects if key.endswith('/stdin')], [])
+        requests = len(self.requests())
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        # The guest reports the same digest, so the second cell transfers nothing.
+        self.assertEqual(len(self.requests()), requests + 1)
+        self.assertEqual([key for key in self.store.objects
+                          if key.startswith(f'runs/{RUN}/staging/')], staged)
+        self.assertEqual((guest / 'binaries/sui-node-native').read_bytes(), b'binary')
+        self.assertEqual((guest.parent / '.staged/build').read_text(),
+                         mailbox_exec.tree_digest(build))
+
+    def test_a_changed_tree_is_staged_under_a_new_digest_key(self):
+        build = Path(self.scratch.name) / 'build'
+        build.mkdir()
+        (build / 'build-manifest.json').write_text('{"protocol": 9}')
+        guest = Path(self.scratch.name) / 'guest/build'
+        before = mailbox_exec.tree_digest(build)
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        (build / 'build-manifest.json').write_text('{"protocol": 8}')
+        after = mailbox_exec.tree_digest(build)
+        self.assertNotEqual(before, after)
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        self.assertEqual(sorted(key for key in self.store.objects
+                                if key.startswith(f'runs/{RUN}/staging/')),
+                         sorted([f'runs/{RUN}/staging/build/{before}.tar.gz',
+                                 f'runs/{RUN}/staging/build/{after}.tar.gz']))
+        self.assertEqual((guest / 'build-manifest.json').read_text(), '{"protocol": 8}')
+
+    def test_a_guest_without_the_tree_receives_a_server_side_copy(self):
+        build = Path(self.scratch.name) / 'build'
+        build.mkdir()
+        (build / 'build-manifest.json').write_text('{"protocol": 9}')
+        guest = Path(self.scratch.name) / 'guest/build'
+        self.client.stage_tree(FLEET[0]['name'], build, guest)
+        staged = [key for key in self.store.objects if key.startswith(f'runs/{RUN}/staging/')]
+        # A re-created fleet keeps the run id but starts with an empty local SSD.
+        shutil.rmtree(guest.parent)
+        uploads = []
+        original = self.store.upload
+
+        def counted(key, path, **kwargs):
+            uploads.append(key)
+            return original(key, path, **kwargs)
+
+        with mock.patch.object(self.store, 'upload', side_effect=counted):
+            self.client.stage_tree(FLEET[0]['name'], build, guest)
+        # The workstation uploads nothing: the staged object is copied in GCS.
+        self.assertEqual(uploads, [])
+        self.assertEqual([key for key in self.store.objects
+                          if key.startswith(f'runs/{RUN}/staging/')], staged)
+        self.assertEqual((guest / 'build-manifest.json').read_text(), '{"protocol": 9}')
+
     def test_run_driver_executes_the_admitted_script_on_the_host(self):
         script = Path(self.scratch.name) / 'driver.py'
         script.write_text('import json,sys\nprint(json.dumps({"argv": sys.argv[1:]}))\n')
@@ -413,7 +502,8 @@ class PublishTests(unittest.TestCase):
         archive.write_bytes(b'package archive')
         return {'source_sha256': SOURCE, 'source_revision': 'd' * 40,
                 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
-                'manifest_sha256': 'e' * 64, 'archive_path': str(archive)}
+                'manifest_sha256': 'e' * 64, 'archive_path': str(archive),
+                'nvmet_fix': {'module_sha256': mailbox_exec.NVMET_FIX_MODULE_SHA256}}
 
     def admit(self, directory):
         seen = {}
