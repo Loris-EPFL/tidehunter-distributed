@@ -286,6 +286,20 @@ class Rehearsal:
         env[gcp_api.REHEARSAL_ENDPOINT] = self.local_endpoint
         return env
 
+    def reset_cell(self, name):
+        """Remove the previous cell's guest roots and output, so evidence is this cell's.
+
+        `wall()` accepts an owner log only when this cell produced it; a stale
+        log from an earlier cell would otherwise pass a cell that never started.
+        """
+        for host in self.fleet_hosts[1:]:
+            docker('exec', host['name'], 'rm', '-rf', str(GUEST_ROOT))
+        out = f'/mnt/tidehunter/{self.run_id}/campaign/out'
+        docker('exec', self.fleet_hosts[0]['name'], 'rm', '-rf',
+               out + '/' + name, out + '/' + name + '-external-config',
+               out + '/' + name + '-stages', out + '/' + name + '-ledger.json',
+               out + '/' + name + '-resources.json')
+
     def dispatch(self, cell, argv, timeout):
         print('$ ' + ' '.join(shlex.quote(str(part)) for part in argv), flush=True)
         result = subprocess.run([str(part) for part in argv], text=True,
@@ -352,6 +366,7 @@ class Rehearsal:
 
     def manual_sui(self):
         output = self.work / 'cells' / 'manual_sui'
+        self.reset_cell('manual_sui')
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
@@ -375,6 +390,7 @@ class Rehearsal:
         the same kernel wall first.
         """
         output = self.work / 'cells' / 'manual_sui_loss'
+        self.reset_cell('manual_sui_loss')
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
@@ -448,6 +464,7 @@ class Rehearsal:
 
     def fault_cells(self):
         output = self.work / 'cells' / 'fault_cells'
+        self.reset_cell('external')
         argv = [sys.executable, HERE / 'fault_cells.py',
                 '--cell', self.args.fault_cell,
                 '--build', self.build, '--fixture', self.args.fixture,
@@ -463,6 +480,7 @@ class Rehearsal:
 
     def stage3(self):
         output = self.work / 'cells' / 'stage3'
+        self.reset_cell('out')
         external = self.prepare_stage3_external(output)
         argv = [sys.executable, ENGINE / 'experiments/sui-checkpoint/stage3_campaign.py',
                 '--root', output, '--binary', Path(self.build) / 'binaries/storage-node',
