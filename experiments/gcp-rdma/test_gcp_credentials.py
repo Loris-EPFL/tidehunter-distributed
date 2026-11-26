@@ -7,6 +7,7 @@ before the recorded expiry, because a cell runs for hours.
 import json
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 import gcp_api
@@ -108,6 +109,44 @@ class CampaignClient(unittest.TestCase):
     def test_a_configuration_without_an_account_is_refused(self):
         with self.assertRaises(ValueError):
             gcp_api.campaign_client({'project_id': 'mysten-research'})
+
+
+class ObjectCopy(unittest.TestCase):
+    """A server-side copy keeps the digest metadata and the destination precondition."""
+
+    class Api:
+        endpoint = gcp_api.STORAGE_ENDPOINT
+        token_provider = staticmethod(lambda: 'token')
+
+        def __init__(self):
+            self.calls = []
+
+        def _request(self, method, url, body=None, headers=None, read_retries=3):
+            self.calls.append((method, url, body))
+            destination = urllib.parse.unquote(
+                url.split('/copyTo/b/bucket/o/', 1)[1].split('?', 1)[0])
+            return json.dumps({'name': destination, 'generation': '42', 'size': '17',
+                               'metadata': {'sha256': 'a' * 64}}).encode()
+
+    def test_the_copy_names_the_source_and_destination_precondition(self):
+        api = self.Api()
+        store = gcp_api.ObjectStore(api, 'bucket')
+        receipt = store.copy('runs/r/staging/build/d.tar.gz',
+                             'runs/r/transfer/7/op/stdin', if_generation_match=0)
+        method, url, body = api.calls[0]
+        self.assertEqual(method, 'POST')
+        self.assertIn('/b/bucket/o/runs%2Fr%2Fstaging%2Fbuild%2Fd.tar.gz/copyTo/b/bucket/o/'
+                      'runs%2Fr%2Ftransfer%2F7%2Fop%2Fstdin', url)
+        self.assertIn('ifGenerationMatch=0', url)
+        self.assertEqual(body, b'')
+        self.assertEqual(receipt['generation'], '42')
+
+    def test_a_receipt_for_another_object_is_refused(self):
+        api = self.Api()
+        api._request = lambda *a, **k: json.dumps(
+            {'name': 'other', 'generation': '42'}).encode()
+        with self.assertRaisesRegex(ValueError, 'copy receipt mismatch'):
+            gcp_api.ObjectStore(api, 'bucket').copy('a', 'b')
 
 
 class RehearsalEndpoint(unittest.TestCase):
