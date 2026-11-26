@@ -112,6 +112,15 @@ impl WriteCore {
         let inputs = [(operation, mutations)];
         let started = Instant::now();
         let deadline = started + self.config.timeout;
+        #[cfg(test)]
+        let deadline = if std::mem::take(&mut self.test_hooks.lock().expire_next_write_deadline) {
+            // Already expired: the resolution wait below fails at its first
+            // predicate check, which is how a real deadline behaves once it
+            // passes. Tests use this to time a caller out without a delay.
+            started
+        } else {
+            deadline
+        };
         // One re-application is allowed: a retry whose observed generation
         // aborted before publishing must behave as a fresh write, which is what
         // the original caller asked for either way.
