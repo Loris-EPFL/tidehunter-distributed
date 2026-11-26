@@ -140,5 +140,62 @@ class PurgeControlObjects(unittest.TestCase):
         self.assertEqual(store.deleted, [])
 
 
+class WallScope(unittest.TestCase):
+    """A cell passes only on evidence its own output tree produced."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.campaign = Path(self.temp.name)
+
+    def rehearsal(self, cell):
+        rehearsal = rehearse_fleet.Rehearsal.__new__(rehearse_fleet.Rehearsal)
+        rehearsal.current_cell = cell
+        rehearsal.campaign_mount = lambda: self.campaign
+        return rehearsal
+
+    def log_command(self, cell):
+        captured = []
+
+        class Result:
+            stdout = 'host kernel: nvmet is not on mounted configfs'
+
+        def fake_run(argv, **kwargs):
+            captured.append(argv[-1])
+            return Result()
+
+        rehearsal = self.rehearsal(cell)
+        original = rehearse_fleet.run
+        rehearse_fleet.run = fake_run
+        try:
+            text = rehearsal.experiment_logs()
+        finally:
+            rehearse_fleet.run = original
+        self.assertEqual(len(captured), 1)
+        self.assertIn('nvmet', text)
+        return captured[0]
+
+    def test_experiment_logs_read_only_the_current_cell(self):
+        command = self.log_command('fault_cells_M6-w1-c16')
+        self.assertIn('/c/out/fault_cells_M6-w1-c16', command)
+        self.assertNotIn('/c/out/*', command)
+        self.assertNotIn('/c/out/manual_sui', command)
+
+    def test_stage3_reads_only_its_own_root(self):
+        command = self.log_command('root')
+        self.assertIn('/c/root', command)
+        self.assertNotIn('/c/out', command)
+
+    def test_another_cells_marker_does_not_pass_a_cell(self):
+        rehearsal = self.rehearsal('fault_cells_M6-w1-c16')
+        rehearsal.owner_logs = lambda: [('H1', 'owner.log', 'owner started')]
+        rehearsal.experiment_logs = lambda: ''
+        result = type('R', (), {'stdout': 'kv-research: invalid type: map, '
+                                          'expected path string', 'stderr': ''})()
+        ok, detail = rehearsal.wall('fault_cells', result)
+        self.assertFalse(ok)
+        self.assertIn('no kernel NVMe-oF failure', detail)
+
+
 if __name__ == '__main__':
     unittest.main()

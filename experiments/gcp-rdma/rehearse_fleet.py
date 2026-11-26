@@ -176,6 +176,8 @@ class Rehearsal:
         self.store = None
         self.config = None
         self.package = Path(args.package)
+        # The cell whose output tree `wall()` may read; set by `reset_cell`.
+        self.current_cell = None
         # The guests mount the sealed libfabric prefix from the first package:
         # a re-create rebinds the archive and runtime, never the fabric.
         self.fabric = Path(args.package) / 'fabric'
@@ -423,7 +425,9 @@ class Rehearsal:
 
         `wall()` accepts an owner log only when this cell produced it; a stale
         log from an earlier cell would otherwise pass a cell that never started.
+        The current output name also scopes the H0 log read to this cell.
         """
+        self.current_cell = output_name
         for host in self.fleet_hosts[1:]:
             docker('exec', host['name'], 'rm', '-rf', str(GUEST_ROOT))
         campaign = f'/mnt/tidehunter/{self.run_id}/campaign'
@@ -463,17 +467,20 @@ class Rehearsal:
         return lines
 
     def experiment_logs(self):
-        """The coordinator's replay logs on H0, read through the guest image.
+        """The current cell's logs on H0, read through the guest image.
 
-        The guest writes them as root, so the laptop reads them with a container
-        that mounts the same campaign directory read-only.
+        Only this cell's own tree is read. A marker in an earlier cell's log
+        must never pass a cell that failed before provisioning.
         """
         campaign = self.campaign_mount()
-        if not campaign.is_dir():
-            return []
+        if not campaign.is_dir() or self.current_cell is None:
+            return ''
+        relative = ('root' if self.current_cell == 'root'
+                    else 'out/' + self.current_cell)
+        script = ('find ' + shlex.quote('/c/' + relative)
+                  + ' -type f -name "*.log" -print -exec cat {} \\; 2>/dev/null')
         result = run(['docker', 'run', '--rm', '-v', str(campaign) + ':/c:ro', IMAGE,
-                      'sh', '-c', 'for f in /c/out/*/experiment/*.log; do '
-                                  'echo "== $f"; cat "$f"; done'], check=False)
+                      'sh', '-c', script], check=False)
         return result.stdout or ''
 
     def wall(self, cell, result):
