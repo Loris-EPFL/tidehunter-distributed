@@ -68,6 +68,7 @@ import campaign_ledger as ledger_module
 import campaign_upload
 import gcp_manual_storage
 import host_exec
+import mailbox_exec
 import manual_sui
 import proc_sampler
 import stage3_specs
@@ -738,7 +739,7 @@ def save(ledger, bucket):
         bucket.save(ledger)
 
 
-def bucket_store(prefix, account, deadline_seconds):
+def bucket_store(prefix, account, deadline_seconds, *, guest=False):
     """One reviewed credential path: the delegated guest ObjectStore."""
     if account != gcp_manual_storage.ACCOUNT:
         raise SystemExit('only the reviewed guest identity is delegated: '
@@ -752,7 +753,7 @@ def bucket_store(prefix, account, deadline_seconds):
     if type(deadline_seconds) is not int or deadline_seconds <= 0:
         raise SystemExit('--bucket-deadline-seconds must be a positive integer')
     store = gcp_manual_storage.DelegatedArtifacts(
-        bucket, deadline=time.time() + deadline_seconds)
+        bucket, deadline=time.time() + deadline_seconds, guest=guest)
     return Bucket(store, key_prefix.strip('/'))
 
 
@@ -796,7 +797,20 @@ def main():
     parser.add_argument('--owners', help='owner hosts, comma separated (H1,H2)')
     parser.add_argument('--native-host', help='owner host that runs arm B; defaults to owners[0]')
     parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
-    parser.add_argument('--iap', action='store_true', help='tunnel remote commands through IAP')
+    parser.add_argument('--iap', action='store_true',
+                        help='rehearsal only: tunnel remote commands through IAP')
+    parser.add_argument('--fleet-state', type=Path,
+                        help='gcp_manual_compute.py fleet state; the campaign mailbox executor')
+    parser.add_argument('--fleet-config', type=Path,
+                        help='gcp-rdma config.json that names the project and bucket')
+    parser.add_argument('--gcloud-ssh', action='store_true',
+                        help='rehearsal only: run through `gcloud compute ssh`')
+    parser.add_argument('--on-coordinator', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--guest-token', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--coordinator-seconds', type=int,
+                        help='bound on the coordinator run; defaults to the fleet deadline')
     parser.add_argument('--bucket-prefix',
                         help='gs://mysten-research-bench-artifacts/<campaign prefix>')
     parser.add_argument('--impersonate-service-account', default=gcp_manual_storage.ACCOUNT)
@@ -836,6 +850,43 @@ def main():
             raise SystemExit('--binary is not the storage binary the external '
                              'preparation was built from')
     owner_hosts = plan_hosts(args.owners.split(',')) if cluster else []
+    if cluster and not args.gcloud_ssh and not args.on_coordinator:
+        # Stage-3 arm A and the probe are local children of this driver and must
+        # dial the owners, so the campaign runs on the coordinator host. Arm B
+        # already runs on `--native-host` through the same seam.
+        remote = mailbox_exec.open_executor(args)
+        coordinator = mailbox_exec.coordinator_of(args.fleet_state)
+        state = json.loads(Path(args.fleet_state).read_text())
+        campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
+        binary = Path(args.binary)
+        remote.send_file(coordinator, campaign / 'binaries' / binary.name, binary)
+        external = []
+        for item in args.external or []:
+            tier, _, local = item.partition('=')
+            remote.stage_tree(coordinator, campaign / 'external' / tier, Path(local))
+            external.append(tier + '=' + str(campaign / 'external' / tier))
+        remote.send_file(coordinator, campaign / 'fleet-state.json', Path(args.fleet_state))
+        remote.send_file(coordinator, campaign / 'config.json', Path(args.fleet_config).resolve())
+        stale = set(args.external or [])
+        argv = [item for item in sys.argv[1:]
+                if item not in stale and item not in ('--external', '--on-coordinator')]
+        argv = mailbox_exec.rewrite(
+            argv, {'--root': campaign / 'root',
+                   '--binary': campaign / 'binaries' / binary.name,
+                   '--ledger': campaign / 'campaign-ledger.json'})
+        extra = ['--on-coordinator', '--guest-token',
+                 '--fleet-state', str(campaign / 'fleet-state.json'),
+                 '--fleet-config', str(campaign / 'config.json')]
+        if external:
+            extra += ['--external', *external]
+        argv = mailbox_exec.with_flags(argv, extra)
+        code, out, err = remote.run_driver(
+            coordinator,
+            f'/mnt/tidehunter/{state["run_id"]}/package/source/experiments/sui-checkpoint/stage3_campaign.py',
+            argv, timeout_seconds=args.coordinator_seconds)
+        sys.stdout.write(out.decode('utf-8', 'replace'))
+        sys.stderr.write(err.decode('utf-8', 'replace'))
+        return code
     path = args.ledger or root / 'campaign-ledger.json'
     if Path(path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {path}')
@@ -843,7 +894,7 @@ def main():
     if args.resume:
         ledger.load()
     bucket = (bucket_store(args.bucket_prefix, args.impersonate_service_account,
-                           args.bucket_deadline_seconds)
+                           args.bucket_deadline_seconds, guest=args.guest_token)
               if args.bucket_prefix else None)
     if args.resume and bucket is not None:
         ledger = bucket.merge(ledger)
@@ -859,7 +910,7 @@ def main():
                         stale_root=root / 'stage3' / 'stale', mode=args.mode)
     remote = owners = None
     if cluster:
-        remote_transport = host_exec.GcloudSsh(args.zone, iap=args.iap)
+        remote_transport = mailbox_exec.open_executor(args)
         local.remote = remote_transport
         remote = HostRunner(remote=remote_transport,
                             host=args.native_host or owner_hosts[0],

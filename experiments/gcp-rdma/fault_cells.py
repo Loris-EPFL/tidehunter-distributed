@@ -19,8 +19,11 @@ frozen `storage-node` (`kv-research`) binary:
 Cell definitions, specs and check lists live in
 `experiments/sui-checkpoint/stage2_mechanism.py`; this module performs the
 lifecycle and records timestamps. Remote commands go through
-`host_exec.HostExecution`, the same seam the Sui stages use, so a bucket-mailbox
-executor or a test double is a constructor swap.
+`host_exec.HostExecution`, the same seam the Sui stages use; the campaign
+executor is `mailbox_exec.MailboxExec`. The coordinator process is a local child
+that must reach the owners, so this driver runs on the coordinator host as one
+bounded request (`--on-coordinator`); `--gcloud-ssh` selects the SSH rehearsal
+instead.
 
 Every cell here is a synthetic mechanism cell over the campaign topology, not a
 Sui-adapter result. `--dry-run` prints the plan without touching a host.
@@ -46,6 +49,7 @@ import campaign_manifest
 import campaign_upload
 import disk_collector
 import host_exec
+import mailbox_exec
 import manual_sui
 import stage2_mechanism as mechanism
 
@@ -1066,7 +1070,20 @@ def main():
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true',
                         help='print the plan and exit; no host is touched')
-    parser.add_argument('--tunnel-through-iap', action='store_true')
+    parser.add_argument('--tunnel-through-iap', action='store_true',
+                        help='rehearsal only: SSH to hosts with a reachable address')
+    parser.add_argument('--fleet-state', type=Path,
+                        help='gcp_manual_compute.py fleet state; the campaign mailbox executor')
+    parser.add_argument('--fleet-config', type=Path,
+                        help='gcp-rdma config.json that names the project and bucket')
+    parser.add_argument('--gcloud-ssh', action='store_true',
+                        help='rehearsal only: run through `gcloud compute ssh`')
+    parser.add_argument('--on-coordinator', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--guest-token', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--coordinator-seconds', type=int,
+                        help='bound on the coordinator run; defaults to the fleet deadline')
     args = parser.parse_args()
 
     cell = mechanism.find(args.cell)
@@ -1094,9 +1111,19 @@ def main():
     store = prefix = None
     if args.bucket_prefix:
         store, _, prefix = campaign_upload.open_store(
-            args.bucket_prefix, args.impersonation_account)
+            args.bucket_prefix, args.impersonation_account, guest=args.guest_token)
     hosts = manual_sui.plan(args.coordinator, args.owners.split(','))
-    cluster = Cluster(remote=host_exec.GcloudSsh(args.zone, iap=args.tunnel_through_iap),
+    if not args.gcloud_ssh and not args.on_coordinator:
+        # The coordinator process is local and dials the owners, so this cell
+        # runs on H0 with the same knob set.
+        return mailbox_exec.dispatch(
+            args, coordinator=args.coordinator,
+            script_relative='experiments/gcp-rdma/fault_cells.py',
+            trees=[('build', args.build), ('fixture', args.fixture), ('schema', args.schema)],
+            values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
+                    '--output': Path('out') / args.output.name,
+                    '--config-dir': 'external', '--ledger': 'campaign-ledger.json'})
+    cluster = Cluster(remote=mailbox_exec.open_executor(args),
                       build_root=args.build, output=output,
                       guest_root=args.guest_root, config_dir=config_dir,
                       owners=hosts['owners'], tier=tier, transport=args.transport,

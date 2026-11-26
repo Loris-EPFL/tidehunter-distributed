@@ -9,11 +9,16 @@ its host, starts the owner process groups, runs the paired `run.py` with
 groups it started.
 
 Remote commands go through `host_exec.HostExecution`, the one seam shared with
-`stage3_campaign.py` and `fault_cells.py`. The default implementation is
-`host_exec.GcloudSsh` (`gcloud compute ssh --command`), so another executor — a
-bucket mailbox, a test double — is a constructor swap. Every owner archive is
-extracted into the same absolute guest root on every host, as the engine
-manifest requires.
+`stage3_campaign.py` and `fault_cells.py`. The campaign executor is
+`mailbox_exec.MailboxExec`: one immutable bucket request per host command,
+because the guests have no external address and IAP is not enabled. The
+orchestrator itself runs on the coordinator host as one bounded request
+(`--on-coordinator`), because `run.py` and the Sui nodes it starts must reach
+the owners; the workstation only stages the build, fixture and schema through
+the bucket and relays the terminal receipt. `host_exec.GcloudSsh` remains only
+for a rehearsal that passes `--gcloud-ssh`. Every owner archive is extracted
+into the same absolute guest root on every host, as the engine manifest
+requires.
 """
 import argparse
 import json
@@ -35,6 +40,7 @@ import campaign_upload as upload_module
 import checkpoint_support as checkpoint
 import deployment
 import host_exec
+import mailbox_exec
 import proc_sampler
 
 OWNER_READY_SECONDS = 120
@@ -463,7 +469,7 @@ def main():
                         help='absolute owner storage root, identical on both owners')
     parser.add_argument('--coordinator', required=True)
     parser.add_argument('--owners', required=True, help='owner1,owner2')
-    parser.add_argument('--zone', required=True)
+    parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
     parser.add_argument('--external-config-dir', type=Path)
     parser.add_argument('--stage-dir', type=Path)
     parser.add_argument('--resources', type=Path)
@@ -489,7 +495,20 @@ def main():
                         help='bounded append profiling per owning connection, 0 disables')
     parser.add_argument('--resident-reads', type=Path,
                         help='resident-read policy forwarded to the owners and the runner')
-    parser.add_argument('--tunnel-through-iap', action='store_true')
+    parser.add_argument('--tunnel-through-iap', action='store_true',
+                        help='rehearsal only: SSH to hosts with a reachable address')
+    parser.add_argument('--fleet-state', type=Path,
+                        help='gcp_manual_compute.py fleet state; the campaign mailbox executor')
+    parser.add_argument('--fleet-config', type=Path,
+                        help='gcp-rdma config.json that names the project and bucket')
+    parser.add_argument('--gcloud-ssh', action='store_true',
+                        help='rehearsal only: run through `gcloud compute ssh`')
+    parser.add_argument('--on-coordinator', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--guest-token', action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--coordinator-seconds', type=int,
+                        help='bound on the coordinator run; defaults to the fleet deadline')
     parser.add_argument('--bucket-prefix',
                         help='campaign object prefix, gs://mysten-research-bench-artifacts/'
                              '<campaign-id>; a cell passes only after its verified upload')
@@ -502,13 +521,26 @@ def main():
     args = parser.parse_args()
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
+    if not args.gcloud_ssh and not args.on_coordinator:
+        # The replay runs on H0: run.py starts the producer, the native control
+        # and the remote coordinator, and they must reach the owners.
+        files = ([('resident-reads.json', args.resident_reads)]
+                 if args.resident_reads is not None else [])
+        return mailbox_exec.dispatch(
+            args, coordinator=args.coordinator,
+            script_relative='experiments/gcp-rdma/manual_sui.py',
+            trees=[('build', args.build), ('fixture', args.fixture), ('schema', args.schema)],
+            files=files,
+            values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
+                    '--output': Path('out') / args.output.name,
+                    '--resident-reads': 'resident-reads.json'})
     if not args.bucket_prefix and not args.allow_local_ledger:
         raise SystemExit('a passed cell needs a verified evidence upload; give '
                          '--bucket-prefix, or --allow-local-ledger for a local rehearsal')
     store = bucket = prefix = None
     if args.bucket_prefix:
         store, bucket, prefix = upload_module.open_store(
-            args.bucket_prefix, args.impersonation_account)
+            args.bucket_prefix, args.impersonation_account, guest=args.guest_token)
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
     if Path(ledger_path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
@@ -518,7 +550,7 @@ def main():
         if store is not None:
             resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
     launcher = SuiLauncher(
-        remote=host_exec.GcloudSsh(args.zone, iap=args.tunnel_through_iap),
+        remote=mailbox_exec.open_executor(args),
         build_root=args.build, fixture=args.fixture, output=output,
         guest_root=args.guest_root,
         stage_dir=args.stage_dir or output.with_name(output.name + '-stages'),

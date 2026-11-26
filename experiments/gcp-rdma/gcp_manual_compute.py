@@ -6,6 +6,13 @@ An uncertain create is never retried and an empty list cannot resolve it.
 
 The module also carries the operator CLI for the reviewed two- and three-host
 fleets. ``create --dry-run`` prints the exact request bodies without a call.
+
+Every host boots one identity-bound gate script and nothing else. Once the
+fleet identity is admitted, ``create --package`` publishes the sealed worker
+package and the runtime, then releases each gate with
+``gcp_bootstrap.startup_script``; the guest installs the package read-only and
+starts the mailbox worker. ``ready`` waits for every worker to publish its
+readiness object before any campaign driver runs.
 """
 import argparse
 import asyncio
@@ -20,6 +27,9 @@ import sys
 import time
 import uuid
 
+import gcp_api
+import gcp_bootstrap
+import mailbox_exec
 from gcp_campaign import (BOOT_DISK_GIB, GUEST_SERVICE_ACCOUNT, campaign_mark,
                           campaign_identity, has_delete_expiry, instance_body,
                           owned_disk, owned_instance, parse_time, save)
@@ -34,13 +44,9 @@ GCLOUD_SECONDS = 600
 FLEET_HOSTS = (2, 3)
 FLEET_ROLES = ('campaign', 'qualification')
 MAX_FLEET_HOURS = 6
-# The guests carry no workload bootstrap: the operator copies the build and the
-# fixture and starts the launcher over SSH. This line identifies the host on the
-# serial console after a lost watcher.
-STARTUP_SCRIPT = (
-    '#!/bin/bash\n'
-    'set -euo pipefail\n'
-    'echo "tidehunter campaign host ${HOSTNAME} ready"\n')
+def startup_script(config, state):
+    """The identity-bound gate every host boots with; it runs no workload yet."""
+    return mailbox_exec.gate_script(config['bucket'], state)
 IMAGE_PATH = re.compile(r'projects/[a-z0-9-]+/global/images/[a-z0-9-]+')
 # F7 attempts 4/5: at most 146.140965 s from delete to observed absence.
 # Allow 153.859035 s margin; the whole cleanup remains bounded by 600 s.
@@ -959,10 +965,11 @@ async def create(config, args):
         Compute(config, state, args.state, gcloud)
     image_path = args.image or config.get('image')
     policy = policy_body(state)
+    gate = startup_script(config, state)
     if args.dry_run:
         preview = dict(state, policy={'name': policy['name']})
         bodies = [launch_spec(config, candidate(config), preview, index, image_path,
-                              STARTUP_SCRIPT, '0' * 32, policy['name'])[1]
+                              gate, '0' * 32, policy['name'])[1]
                   for index in range(state['host_count'])]
         print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                           'role': state.get('role', 'campaign'), 'host_count': state['host_count'],
@@ -986,12 +993,53 @@ async def create(config, args):
         if record is not None and record.get('fleet') and not record.get('uncertain'):
             fleet.append(record['fleet'])
             continue
-        fleet.append(await compute.create_vm(index, image['path'], state['deadline'], STARTUP_SCRIPT))
+        fleet.append(await compute.create_vm(index, image['path'], state['deadline'], gate))
     if await compute.admit_guests() != fleet:
         raise ComputeError('guest fleet identity changed before admission')
+    released = None
+    if args.role == 'campaign' and args.package is not None:
+        released = _release_workers(config, state, args, fleet, args.state)
     print(json.dumps({'run_id': state['run_id'], 'campaign': state['campaign'],
                       'role': state.get('role', 'campaign'), 'image': image, 'policy': policy['name'],
-                      'hosts': fleet}, sort_keys=True, indent=2))
+                      'hosts': fleet, 'workers_released': released}, sort_keys=True, indent=2))
+    return 0
+
+
+def _release_workers(config, state, args, fleet, path):
+    """Publish the sealed package and runtime, then open every host's gate.
+
+    The gates were released only after the guest and image identities were
+    admitted, and the objects exist before them, so a host cannot start a
+    worker against a missing or differing package.
+    """
+    store = gcp_api.GoogleApi(config['project_id']).objects(config['bucket'])
+    spec = json.loads(Path(args.spec).read_text())
+    mailbox_exec.publish(store, config, state, Path(args.package).resolve(strict=True),
+                         args.revision, spec, fleet,
+                         guest_roots=[str(item) for item in args.guest_root] or None)
+    released = []
+    for host in fleet:
+        mailbox_exec.release(store, state, host,
+                             gcp_bootstrap.startup_script(config['bucket'], state['run_id'],
+                                                          state['source_sha256'], state['deadline']))
+        released.append(host['name'])
+    state['workers_released'] = released
+    save(path, state)
+    return released
+
+
+async def ready(config, args):
+    """Wait for every guest worker to publish its readiness object."""
+    state = _recorded_fleet(config, args)
+    if not state.get('workers_released'):
+        raise ComputeError('no gate was released for this fleet; create it with --package')
+    remote = mailbox_exec.MailboxExec.from_state(
+        args.state, gcp_api.GoogleApi(config['project_id']), bucket=config['bucket'],
+        timeout_seconds=args.worker_seconds)
+    prepared = remote.wait_workers(require=args.require_manifest_sha256)
+    print(json.dumps({'run_id': state['run_id'], 'hosts': sorted(prepared),
+                      'storage': {name: item.get('storage') for name, item in prepared.items()}},
+                     sort_keys=True, indent=2))
     return 0
 
 
@@ -1042,7 +1090,7 @@ def candidate(config):
 
 def parse(argv=None):
     parser = argparse.ArgumentParser(description='Owned two- or three-host campaign fleet.')
-    parser.add_argument('action', choices=('create', 'verify', 'delete'))
+    parser.add_argument('action', choices=('create', 'ready', 'verify', 'delete'))
     parser.add_argument('--config', type=Path, default=Path(__file__).with_name('config.json'))
     parser.add_argument('--state', type=Path, required=True)
     parser.add_argument('--campaign')
@@ -1053,9 +1101,27 @@ def parse(argv=None):
     parser.add_argument('--role', choices=FLEET_ROLES)
     parser.add_argument('--source-sha256')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--package', type=Path,
+                        help='sealed package directory (prepare.py output) to publish')
+    parser.add_argument('--spec', type=Path,
+                        help='reviewed campaign specification the package was built for')
+    parser.add_argument('--revision', help='full source revision the package was sealed at')
+    parser.add_argument('--guest-root', action='append', default=[],
+                        help='guest directory the campaign owns; repeatable')
+    parser.add_argument('--worker-seconds', type=int, default=900,
+                        help='bound on the worker readiness wait')
+    parser.add_argument('--require-manifest-sha256',
+                        help='require every worker to report this sealed manifest')
     args = parser.parse_args(argv)
     if args.dry_run and args.action != 'create':
         parser.error('--dry-run applies to create only')
+    if args.package is not None and (args.spec is None or args.revision is None):
+        parser.error('--package needs --spec and --revision')
+    if args.action == 'ready' and not args.state.exists():
+        parser.error('ready needs the recorded fleet state')
+    if args.action != 'ready' and (args.worker_seconds != 900
+                                   or args.require_manifest_sha256 is not None):
+        parser.error('--worker-seconds and --require-manifest-sha256 apply to ready only')
     if args.action == 'create':
         if args.campaign is None:
             parser.error('create requires --campaign')
@@ -1081,7 +1147,8 @@ def parse(argv=None):
 def main(argv=None):
     args = parse(argv)
     config = json.loads(args.config.read_text())
-    action = {'create': create, 'verify': verify, 'delete': delete}[args.action]
+    action = {'create': create, 'ready': ready, 'verify': verify,
+              'delete': delete}[args.action]
     try:
         return asyncio.run(action(config, args))
     except (ComputeError, ValueError, TimeoutError, OSError) as exc:

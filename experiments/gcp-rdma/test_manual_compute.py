@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import copy
 import datetime as dt
+import hashlib
 import io
 import json
 import subprocess
@@ -11,8 +12,39 @@ from unittest import mock
 from pathlib import Path
 
 import gcp_manual_compute
+import mailbox_exec
 from gcp_campaign import GUEST_SERVICE_ACCOUNT
 from gcp_manual_compute import Compute, ComputeError
+
+
+class Store:
+    """One bucket: enough of ObjectStore for the release path."""
+
+    def __init__(self):
+        self.objects = {}
+        self.next_generation = 1
+
+    def put(self, key, data, *, if_generation_match=None, **kwargs):
+        if if_generation_match == 0 and key in self.objects:
+            raise ValueError('generation mismatch')
+        generation = str(self.next_generation)
+        self.next_generation += 1
+        self.objects[key] = (generation, bytes(data))
+        return {'generation': generation, 'size': len(data),
+                'metadata': {'sha256': hashlib.sha256(bytes(data)).hexdigest()}}
+
+    def head(self, key):
+        if key not in self.objects:
+            raise KeyError(key)
+        generation, data = self.objects[key]
+        return {'name': key, 'generation': generation, 'size': len(data),
+                'metadata': {'sha256': hashlib.sha256(data).hexdigest()}}
+
+    def get(self, key, *, generation=None, max_bytes=None):
+        return self.objects[key][1]
+
+    def upload(self, key, path, **kwargs):
+        return self.put(key, Path(path).read_bytes(), **kwargs)
 
 
 def flag(argv, name):
@@ -850,7 +882,8 @@ class OperatorFleetTests(unittest.TestCase):
         for index in range(3):
             argv, body = gcp_manual_compute.launch_spec(
                 self.config, self.config['candidates'][0], state, index, IMAGE,
-                gcp_manual_compute.STARTUP_SCRIPT, 'd' * 32, state['policy']['name'])
+                gcp_manual_compute.startup_script(self.config, state), 'd' * 32,
+                state['policy']['name'])
             self.assertEqual(argv[3], body['name'])
             disk, params = body['disks'][0], body['disks'][0]['initializeParams']
             self.assertEqual(dictionary(flag(argv, '--create-disk')), {
@@ -871,7 +904,8 @@ class OperatorFleetTests(unittest.TestCase):
             self.assertEqual(flag(argv, '--resource-policies'), state['policy']['name'])
         with self.assertRaises(ValueError):
             gcp_manual_compute.launch_spec(self.config, self.config['candidates'][0], state, 3, IMAGE,
-                                           gcp_manual_compute.STARTUP_SCRIPT, 'd' * 32, state['policy']['name'])
+                                           gcp_manual_compute.startup_script(self.config, state), 'd' * 32,
+                state['policy']['name'])
 
     def test_three_host_create_verify_and_delete(self):
         calls = []
@@ -924,6 +958,108 @@ class OperatorFleetTests(unittest.TestCase):
         state = json.loads(self.state_path.read_text())
         self.assertTrue(all(item['deleted'] and item['disk_deleted'] for item in state['instances']))
         self.assertTrue(state['policy']['deleted'])
+
+    def test_the_fleet_boots_the_identity_bound_gate_only(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.create()
+        state = json.loads(self.state_path.read_text())
+        gate = gcp_manual_compute.startup_script(self.config, state)
+        self.assertIn('/qualification/', gate)
+        self.assertIn('gate.json', gate)
+        self.assertNotIn('echo "tidehunter campaign host', gate)
+        self.assertNotIn('workers_released', state)
+        for record in state['instances']:
+            self.assertEqual(record['startup_sha256'], hashlib.sha256(gate.encode()).hexdigest())
+
+    def test_create_with_a_package_publishes_and_releases_every_gate(self):
+        package = Path(self.temp.name) / 'package'
+        package.mkdir()
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
+                                    'backends': ['native']}))
+        store = Store()
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__), \
+             mock.patch.object(gcp_manual_compute.gcp_api, 'GoogleApi') as api, \
+             mock.patch.object(mailbox_exec, 'publish') as publish, \
+             mock.patch.object(mailbox_exec, 'release') as release:
+            api.return_value.objects.return_value = store
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN, '--hosts', '3', '--hours', '5',
+                '--source-sha256', SOURCE, '--package', str(package), '--spec', str(spec),
+                '--revision', 'b' * 40, '--guest-root', '/mnt/tidehunter/sui-run'))
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(report['workers_released'],
+                         [state['run_id'] + '-' + str(index) for index in range(3)])
+        self.assertEqual(state['workers_released'], report['workers_released'])
+        publish.assert_called_once()
+        published = publish.call_args
+        self.assertEqual(published.args[2]['run_id'], state['run_id'])
+        self.assertEqual(published.kwargs['guest_roots'], ['/mnt/tidehunter/sui-run'])
+        self.assertEqual([call.args[2]['name'] for call in release.call_args_list],
+                         report['workers_released'])
+        for call in release.call_args_list:
+            self.assertIn('TIDEHUNTER_BOOTSTRAP', call.args[3])
+            self.assertIn(state['run_id'], call.args[3])
+            self.assertIn('gcp_worker.py', call.args[3])
+
+    def test_a_qualification_fleet_is_never_released_here(self):
+        ready = {'status': 'READY', 'id': '1937849582956621267',
+                 'selfLink': 'https://www.googleapis.com/compute/v1/' + IMAGE, 'diskSizeGb': '80'}
+        package = Path(self.temp.name) / 'package'
+        package.mkdir()
+        spec = Path(self.temp.name) / 'spec.json'
+        spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 1,
+                                    'backends': ['native']}))
+        with mock.patch('gcp_api.GoogleApi') as api, \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__), \
+             mock.patch.object(mailbox_exec, 'release') as release:
+            api.return_value.request.return_value = ready
+            report = self.output(self.cli(
+                'create', '--campaign', CAMPAIGN + '-qualify', '--hosts', '2', '--hours', '1',
+                '--role', 'qualification', '--image', IMAGE, '--source-sha256', SOURCE,
+                '--package', str(package), '--spec', str(spec), '--revision', 'b' * 40))
+        self.assertIsNone(report['workers_released'])
+        release.assert_not_called()
+
+    def test_ready_refuses_an_unreleased_fleet_and_waits_for_every_worker(self):
+        with mock.patch.object(gcp_manual_compute, 'admit_image',
+                               return_value={'path': IMAGE, 'id': '1'}), \
+             mock.patch.object(gcp_manual_compute, 'gcloud',
+                               new=FakeMcp(None, self.config, self.state_path).__call__):
+            self.create()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gcp_manual_compute.main(self.cli('ready')), 1)
+        state = json.loads(self.state_path.read_text())
+        state['workers_released'] = [record['name'] for record in state['instances']]
+        self.state_path.write_text(json.dumps(state))
+        receipt = {'complete': True, 'run_id': state['run_id'], 'source_sha256': SOURCE,
+                   'deadline_utc': state['deadline'], 'manifest_sha256': 'e' * 64,
+                   'storage': {'device': '/dev/nvme0n1'}}
+        with mock.patch.object(gcp_manual_compute.gcp_api, 'GoogleApi'), \
+             mock.patch.object(mailbox_exec.MailboxExec, 'from_state') as from_state:
+            from_state.return_value.wait_workers.return_value = {
+                record['fleet']['name']: dict(receipt, instance_name=record['fleet']['name'],
+                                              instance_id=record['fleet']['id'])
+                for record in state['instances']}
+            report = self.output(self.cli('ready', '--require-manifest-sha256', 'e' * 64))
+        from_state.return_value.wait_workers.assert_called_once_with(require='e' * 64)
+        self.assertEqual(report['hosts'], sorted(record['fleet']['name'] for record in state['instances']))
+
+    def test_package_flags_are_validated_before_any_call(self):
+        for extra, message in (((['--package', '/tmp/p'],), '--spec'),
+                               ((['--worker-seconds', '5'],), 'ready only')):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    gcp_manual_compute.parse(self.cli('create', '--campaign', CAMPAIGN,
+                                                      '--hosts', '3', '--hours', '5',
+                                                      '--source-sha256', SOURCE, *extra[0]))
 
     def test_recorded_fleet_refuses_a_different_campaign_or_size(self):
         with mock.patch.object(gcp_manual_compute, 'admit_image',
