@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -36,6 +37,7 @@ import time
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
+OWNER_CONTROL_PORT = 9400
 ENGINE = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ENGINE / 'experiments' / 'kv-comparison'))
@@ -428,10 +430,18 @@ class Rehearsal:
             if not 0 <= partition < len(self.fleet_hosts) - 1:
                 raise Failure(f'{cell}: {name} names partition {partition} outside the fleet')
             expected = self.fleet_hosts[1 + partition]
-            if f"listen: {expected['internal_ip']}:9400" not in text \
-                    and f"listen: {expected['internal_ip']}:{9400 + partition}" not in text:
-                raise Failure(f'{cell}: {name} does not listen on the owner control '
-                              f"address {expected['internal_ip']}")
+            listens = re.findall(r'^listen: (\S+):(\d+)$', text, flags=re.MULTILINE)
+            if len(listens) != 1:
+                raise Failure(f'{cell}: {name} names no single listen address')
+            address, port = listens[0]
+            port = int(port)
+            owners = len(self.fleet_hosts) - 1
+            # One owner listens on 9400 + database * owners + partition.
+            if (address != expected['internal_ip'] or port < OWNER_CONTROL_PORT
+                    or (port - OWNER_CONTROL_PORT - partition) % owners != 0):
+                raise Failure(f'{cell}: {name} listens on {address}:{port}, not the owner '
+                              f"control address {expected['internal_ip']} in the "
+                              f'{OWNER_CONTROL_PORT}+2n+{partition} window')
             if f"address: {expected['rdma_ip']}" not in text:
                 raise Failure(f'{cell}: {name} does not export the RDMA target '
                               f"address {expected['rdma_ip']}")
