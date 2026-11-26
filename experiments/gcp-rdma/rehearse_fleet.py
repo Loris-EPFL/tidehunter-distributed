@@ -269,7 +269,7 @@ class Rehearsal:
         return env
 
     def dispatch(self, cell, argv, timeout):
-        print('$ ' + ' '.join(shlex.quote(part) for part in argv), flush=True)
+        print('$ ' + ' '.join(shlex.quote(str(part)) for part in argv), flush=True)
         result = subprocess.run([str(part) for part in argv], text=True,
                                 capture_output=True, env=self.cell_env(),
                                 timeout=timeout)
