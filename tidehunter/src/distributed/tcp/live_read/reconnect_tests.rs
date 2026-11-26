@@ -55,6 +55,15 @@ fn cached_permanent_pool(lane: &Lane) -> (Arc<LiveControllerPool>, LiveExportInf
             &lane._dir.path().join(format!("wal-{file}")),
         )
         .unwrap();
+        // A controller-loss retry evicts the cached entry and asks the pool to
+        // connect again: keep that reconnect on the local fixture, not the
+        // host's fabrics control device.
+        pool.register_local_target(
+            &target,
+            crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadShared,
+            lane._dir.path().join(format!("wal-{file}")),
+        )
+        .unwrap();
         first.get_or_insert(target);
     }
     let first = first.expect("file 0 is cached");
@@ -212,6 +221,202 @@ fn a_refused_replacement_keeps_its_kind_and_the_next_read_recovers() {
         lane.client.session_present(),
         Some(true),
         "the recovered read installed a usable session"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// A read whose grant's controller was verifiably deleted is an idempotent
+/// retry: the lane evicts the dead lease, reconnects through the pool and
+/// returns the same member bytes. The subsystem is not quarantined.
+#[test]
+fn a_lost_controller_read_reconnects_and_returns_the_same_member() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    assert_eq!(
+        lane.collect(1)[0]
+            .result
+            .as_ref()
+            .expect("the first read serves from the pool"),
+        &vec![frame.clone()],
+        "the pooled controller serves the member"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let nqn = lane.cache.grants[index]
+        .lease
+        .as_ref()
+        .expect("the pooled grant holds its lease")
+        .binding()
+        .nqn
+        .clone();
+    let cached = pool
+        .cached_lease(&nqn)
+        .expect("the read cached its controller");
+    // The kernel cancelled the member with EIO, and the pinned controller is
+    // not live: a stopped controller, not a media verdict.
+    lane.cache.grants[index].controller_lost = Some(true);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(-libc::EIO);
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the lost controller is resumed"),
+        &vec![frame],
+        "the retry returns the identical member bytes"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a lost controller must not quarantine the subsystem"
+    );
+    let reopened = pool
+        .cached_lease(&nqn)
+        .expect("the retry connected a new controller");
+    assert!(
+        !Arc::ptr_eq(&cached, &reopened),
+        "the retry evicted the dead controller before it reopened"
+    );
+    // The shutdown contract requires every externally held lease released.
+    drop(cached);
+    drop(reopened);
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The same EIO with a controller that is still live is the device's verdict:
+/// the subsystem is quarantined and the read fails.
+#[test]
+fn a_live_controller_read_eio_stays_fatal() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the pooled controller serves the first member"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    lane.cache.grants[index].controller_lost = Some(false);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(-libc::EIO);
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    let error = done[0]
+        .result
+        .as_ref()
+        .expect_err("a live controller's EIO is fatal");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Other,
+        "a media EIO keeps its fatal class: {error}"
+    );
+    assert!(
+        lane.cache.failed_subsystems.contains(&(1, 0)),
+        "a media EIO still quarantines the subsystem"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The inline route never sets up a controller. A lost controller evicts the
+/// dead lease and declines the member with a transient class, so the caller
+/// submits it through the lane and the lane reconnects.
+#[test]
+fn a_lost_controller_inline_read_declines_without_quarantining() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the first read caches the grant"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let nqn = lane.cache.grants[index]
+        .lease
+        .as_ref()
+        .expect("the pooled grant holds its lease")
+        .binding()
+        .nqn
+        .clone();
+    lane.cache.grants[index].controller_lost = Some(true);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(-libc::EIO);
+    let error = lane
+        .cache
+        .read_inline_cached(
+            &lane.client,
+            &a,
+            Instant::now() + Duration::from_secs(10),
+            None,
+        )
+        .expect_err("the inline route cannot set up a controller");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::ConnectionAborted,
+        "the caller recognizes the decline: {error}"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "the lane must stay free to reconnect"
+    );
+    let grant = lane
+        .cache
+        .grants
+        .iter()
+        .find(|grant| grant.lease.is_some())
+        .expect("the pooled grant remains for retirement");
+    assert!(
+        grant.broken && grant.lost,
+        "the dead grant is broken and marked lost"
+    );
+    assert!(
+        pool.cached_lease(&nqn).is_none(),
+        "the dead lease was evicted"
+    );
+    // The lane now reconnects and serves the member.
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the lane reconnects the lost controller"),
+        &vec![frame],
+        "the lane returns the identical member bytes"
     );
     lane.cache.close(&mut lane.client, 1).unwrap();
     lane.client.live_pool = None;

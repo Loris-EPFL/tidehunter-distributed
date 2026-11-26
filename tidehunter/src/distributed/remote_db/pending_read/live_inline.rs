@@ -289,10 +289,15 @@ impl ReadService {
                     // flight below owns its buffer until the terminal CQE, so
                     // no retry can touch it; the caller gets a typed timeout.
                     self.state.note_read_timeout(node);
-                } else if !super::member_read_is_retired(&mapped) {
+                } else if mapped.kind() != std::io::ErrorKind::ConnectionAborted
+                    && !super::member_read_is_retired(&mapped)
+                {
                     // A retired member address is not a lane failure: the value
                     // path re-resolves it once, so poisoning here would
                     // fail-stop the engine and kill the only recovery route.
+                    // A lost controller is not a lane failure either: the
+                    // inline route never sets up a controller, so it declines
+                    // below and the lane reconnects.
                     super::super::record_first_failure(
                         &self.state.first_failure,
                         Some(position.address.partition),
@@ -370,6 +375,20 @@ impl ReadService {
         drop(flight);
         self.state.flight_ready[slot].retire();
         self.state.notify_admission();
-        result.map(Some)
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                // The cached grant's controller was verifiably deleted. This
+                // route never sets up a controller, so decline the member: the
+                // caller submits it through the lane, which reconnects and
+                // retries the idempotent read inside its own budget.
+                self.live_inline_fallback(
+                    node,
+                    |d| &d.live_inline_fallback_grant,
+                    "live_inline_fallback_controller_lost",
+                    trace,
+                )
+            }
+            other => other.map(Some),
+        }
     }
 }

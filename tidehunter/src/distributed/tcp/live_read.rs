@@ -59,6 +59,11 @@ const POOL_RETRY: Duration = Duration::from_millis(1);
 /// allowed only when no member of the request reached the ring, so no buffer
 /// can still receive DMA; the retry must also start before the call deadline.
 const MAX_READ_START_RETRIES: u8 = 2;
+
+/// At most this many controller reconnects per read request. The request's own
+/// absolute deadline bounds them; a second lost controller in one request is a
+/// transient error for the caller, not a silent third attempt.
+const MAX_READ_CONTROLLER_LOSSES: u8 = 1;
 pub(super) struct LiveReadTiming {
     counters: Arc<crate::distributed::nvmeof::live_metrics::LiveNvmeCounters>,
     stage: LiveTimingStage,
@@ -325,6 +330,13 @@ struct Grant {
     last_used: u64,
     /// Its ring failed: never submit again, retire when drained.
     broken: bool,
+    /// Its controller was verifiably lost, so the broken grant must not poison
+    /// `failed_subsystems`: the subsystem may reconnect through the pool.
+    lost: bool,
+    /// Test override for the controller-lost probe: a local-file grant has no
+    /// kernel controller to inspect.
+    #[cfg(test)]
+    controller_lost: Option<bool>,
     // Both rings drop first: the lease outlives every descriptor on it.
     // `None` only for grants over local files in tests.
     lease: Option<Arc<LiveControllerLease>>,
@@ -450,6 +462,9 @@ struct InFlightRequest {
     /// Submission-time retries already spent; the bound is
     /// [`MAX_READ_START_RETRIES`].
     retries: u8,
+    /// Controller reconnects already spent; the bound is
+    /// [`MAX_READ_CONTROLLER_LOSSES`].
+    controller_losses: u8,
     /// Deadline of the latest submitted flight; `None` while no flight is
     /// outstanding.
     io_deadline: Option<Instant>,
@@ -672,6 +687,7 @@ impl LiveReadCache {
             positions: request.positions,
             deadline: request.deadline,
             retries: 0,
+            controller_losses: 0,
             io_deadline: None,
             trace: request.trace,
             slots: vec![Slot::Pending; members],
@@ -709,7 +725,7 @@ impl LiveReadCache {
                 Ok(completions) => {
                     fold_stats(client.live_counters.as_deref(), &mut self.grants[index]);
                     for completion in completions {
-                        self.complete_flight(completion)?;
+                        self.complete_flight(client, completion)?;
                     }
                 }
                 Err(error) => self.fail_grant(client, index, &error),
@@ -853,6 +869,7 @@ impl LiveReadCache {
         }
         let mut grant = self.grants.remove(index);
         if grant.broken
+            && !grant.lost
             && let GrantScope::Subsystem {
                 generation,
                 subsystem,
@@ -1483,6 +1500,9 @@ impl LiveReadCache {
             recorded,
             last_used: 0,
             broken: false,
+            lost: false,
+            #[cfg(test)]
+            controller_lost: None,
             lease: Some(lease),
         })
     }
@@ -1646,16 +1666,23 @@ impl LiveReadCache {
         self.requests.get(&token)?.io_deadline
     }
 
-    fn complete_flight(&mut self, completion: LiveCompletion) -> Result<(), TcpError> {
+    fn complete_flight(
+        &mut self,
+        client: &mut Client,
+        completion: LiveCompletion,
+    ) -> Result<(), TcpError> {
         let Some(flight) = self.flights.remove(&completion.id) else {
             return Err(TcpError::new("unexpected live read completion"));
         };
-        let Some(state) = self.release_flight(flight.token) else {
+        if self.release_flight(flight.token).is_none() {
+            return Err(TcpError::new("live read completion without a request"));
+        }
+        let mut cancel = false;
+        let mut io_failed = false;
+        let Some(state) = self.requests.get_mut(&flight.token) else {
             return Err(TcpError::new("live read completion without a request"));
         };
         state.last_cqe = Some(completion.completed_at);
-        let mut cancel = false;
-        let mut io_failed = false;
         match completion.result {
             Ok(LiveIoResult::Reads(records)) => {
                 if state.error.is_none()
@@ -1670,6 +1697,16 @@ impl LiveReadCache {
                 cancel = true;
             }
             Err(error) => {
+                // A lost controller resumes an idempotent read: the members
+                // return to pending, the dead lease is evicted and the next
+                // admission reconnects. Every other class (EIO from a live
+                // controller, EREMOTEIO, a broken ring) stays fatal.
+                if self.requeue_lost_controller_read(client, &flight, &error)? {
+                    return Ok(());
+                }
+                let Some(state) = self.requests.get_mut(&flight.token) else {
+                    return Err(TcpError::new("live read completion without a request"));
+                };
                 io_failed = matches!(
                     error,
                     crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
@@ -1701,6 +1738,97 @@ impl LiveReadCache {
             }
         }
         Ok(())
+    }
+
+    /// Requeue a read whose grant's controller was verifiably deleted.
+    ///
+    /// Returns `true` when the failure was handled here: the failed members are
+    /// pending again, the dead lease was evicted and the broken grant will not
+    /// poison `failed_subsystems`, so the next admission connects a new
+    /// controller. Returns `false` for every other class, which keeps today's
+    /// fatal verdict. A request that already spent its one reconnect, or whose
+    /// absolute deadline passed, fails with a transient kind so the caller can
+    /// retry the idempotent read instead of losing the authority.
+    fn requeue_lost_controller_read(
+        &mut self,
+        client: &mut Client,
+        flight: &Flight,
+        error: &LiveIoError,
+    ) -> Result<bool, TcpError> {
+        let errno = match error {
+            LiveIoError::Io(error) => error.raw_os_error(),
+            _ => None,
+        };
+        if !errno.is_some_and(super::is_lost_io_errno) {
+            return Ok(false);
+        }
+        let Some(grant) = self.grants.iter().find(|grant| grant.id == flight.grant) else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let override_lost = grant.controller_lost;
+        let probe = |lease: &Arc<LiveControllerLease>| {
+            #[cfg(test)]
+            if let Some(lost) = override_lost {
+                return lost;
+            }
+            lease.controller_lost()
+        };
+        let Some(lease) = grant.lease.as_ref().filter(|lease| probe(lease)) else {
+            return Ok(false);
+        };
+        // One String and no Arc clone: only the lost-controller error path.
+        let nqn = lease.binding().nqn.clone();
+        let Some(state) = self.requests.get(&flight.token) else {
+            return Ok(false);
+        };
+        let deadline = state.deadline;
+        let retry = state.error.is_none()
+            && state.controller_losses < MAX_READ_CONTROLLER_LOSSES
+            && Instant::now() < deadline;
+        if !retry {
+            if let Some(state) = self.requests.get_mut(&flight.token) {
+                state.fail(TcpError::with_kind(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "live read lost its controller again within one request",
+                ));
+            }
+            return Ok(true);
+        }
+        // Retire the dead controller before the retry, so the next admission
+        // connects a new one instead of reusing the cached dead lease.
+        let Some(pool) = client.live_pool.as_ref() else {
+            return Ok(false);
+        };
+        if let Err(error) = pool.evict_lost(&nqn, deadline) {
+            if let Some(state) = self.requests.get_mut(&flight.token) {
+                state.fail(TcpError::with_kind(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("live read cannot evict the lost controller: {error}"),
+                ));
+            }
+            return Ok(true);
+        }
+        let Some(state) = self.requests.get_mut(&flight.token) else {
+            return Ok(false);
+        };
+        state.controller_losses += 1;
+        for &position in &flight.positions {
+            state.slots[position] = Slot::Pending;
+        }
+        state.pending += flight.positions.len();
+        if let Some(first) = flight.positions.iter().min() {
+            state.first_pending = state.first_pending.min(*first);
+        }
+        if let Some(grant) = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == flight.grant)
+        {
+            grant.broken = true;
+            grant.lost = true;
+        }
+        Ok(true)
     }
 
     /// Hand the member frames of one harvested flight to their request slots.

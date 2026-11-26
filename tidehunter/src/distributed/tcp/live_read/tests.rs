@@ -152,6 +152,9 @@ pub(crate) fn install_existing_local(
         recorded,
         last_used: 0,
         broken: false,
+        lost: false,
+        #[cfg(test)]
+        controller_lost: None,
         lease: None,
     });
     cache.next_grant += 1;
@@ -585,6 +588,9 @@ fn lane(slots: usize) -> Lane {
             recorded,
             last_used: 0,
             broken: false,
+            lost: false,
+            #[cfg(test)]
+            controller_lost: None,
             lease: None,
         });
     }
@@ -707,6 +713,9 @@ fn subsystem_lane() -> Lane {
         recorded: LiveIoStats::default(),
         last_used: 0,
         broken: false,
+        lost: false,
+        #[cfg(test)]
+        controller_lost: None,
         lease: None,
     });
     lane.client.expected.wal_file_bytes = 8192;
@@ -838,6 +847,9 @@ fn subsystem_grant_reads_two_files_as_two_flights_and_checks_generation() {
         recorded: LiveIoStats::default(),
         last_used: 0,
         broken: false,
+        lost: false,
+        #[cfg(test)]
+        controller_lost: None,
         lease: None,
     };
     second.recorded = second.io.stats();
@@ -889,6 +901,7 @@ fn failed_subsystem_is_not_reopened_and_new_epoch_drops_old_failures() {
         positions: vec![a],
         deadline: Instant::now() + Duration::from_secs(1),
         retries: 0,
+        controller_losses: 0,
         io_deadline: None,
         trace: None,
         slots: vec![Slot::Pending],

@@ -217,6 +217,7 @@ fn an_open_live_exports_deadline_does_not_quarantine_the_subsystem() {
         positions: vec![position],
         deadline: Instant::now() + Duration::from_secs(10),
         retries: 0,
+        controller_losses: 0,
         io_deadline: None,
         trace: None,
         slots: vec![Slot::Pending],

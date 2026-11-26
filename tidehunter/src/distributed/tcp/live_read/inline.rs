@@ -6,6 +6,64 @@
 use super::*;
 use minibytes::Bytes;
 
+/// One inline read failure. A lost controller is retried inside the same call;
+/// every other class keeps its existing verdict and poisons the caller.
+enum InlineFailure {
+    Transient(TcpError),
+    LostController(TcpError),
+}
+
+impl From<TcpError> for InlineFailure {
+    fn from(error: TcpError) -> Self {
+        Self::Transient(error)
+    }
+}
+
+/// Whether this failed inline read lost its controller.
+///
+/// True only for `EIO`/`EBADF` from a grant whose pinned controller is
+/// verifiably not live. The grant is marked broken but **not** poisoning, and
+/// its dead lease is evicted, so the retry opens a new controller. A failed
+/// eviction reports false: the reconnect is impossible, so the fatal class
+/// stands.
+fn inline_controller_lost(
+    grant: &mut Grant,
+    client: &Client,
+    error: &LiveIoError,
+    deadline: Instant,
+) -> bool {
+    let errno = match error {
+        LiveIoError::Io(error) => error.raw_os_error(),
+        _ => None,
+    };
+    if !errno.is_some_and(crate::distributed::tcp::is_lost_io_errno) {
+        return false;
+    }
+    #[cfg(test)]
+    let override_lost = grant.controller_lost;
+    let probe = |lease: &Arc<LiveControllerLease>| {
+        #[cfg(test)]
+        if let Some(lost) = override_lost {
+            return lost;
+        }
+        lease.controller_lost()
+    };
+    let Some(lease) = grant.lease.as_ref().filter(|lease| probe(lease)) else {
+        return false;
+    };
+    // One String and no Arc clone: only the lost-controller error path.
+    let nqn = lease.binding().nqn.clone();
+    let Some(pool) = client.live_pool.as_ref() else {
+        return false;
+    };
+    if pool.evict_lost(&nqn, deadline).is_err() {
+        return false;
+    }
+    grant.broken = true;
+    grant.lost = true;
+    true
+}
+
 impl LiveReadCache {
     /// Only an exclusive idle lane may borrow its cached grant. No control
     /// exchange, controller setup, eviction or pin release runs on this path.
@@ -63,6 +121,14 @@ impl LiveReadCache {
     /// still poisons. Today `NotFound` can only come from geometry/resolve or
     /// a completed reply; if a `NotFound` ever arrives from the I/O layer
     /// itself, narrow the exemption to the geometry and resolve stages.
+    ///
+    /// # Lost controller
+    ///
+    /// This path never sets up a controller. When the cached grant's controller
+    /// was verifiably deleted, it evicts the dead lease, marks the grant broken
+    /// without poisoning its subsystem, and returns a `ConnectionAborted`
+    /// class. The caller declines the inline route, and the lane retries the
+    /// idempotent read and reconnects inside its own budget.
     pub(crate) fn read_inline_cached(
         &mut self,
         client: &Client,
@@ -70,7 +136,14 @@ impl LiveReadCache {
         deadline: Instant,
         trace: Option<&ReadTraceChild>,
     ) -> Result<Vec<Bytes>, TcpError> {
-        let result = self.read_inline_cached_inner(client, position, deadline, trace);
+        let result = match self.read_inline_cached_inner(client, position, deadline, trace) {
+            Ok(bytes) => Ok(bytes),
+            Err(InlineFailure::Transient(error)) => Err(error),
+            Err(InlineFailure::LostController(error)) => Err(TcpError::with_kind(
+                std::io::ErrorKind::ConnectionAborted,
+                error.to_string(),
+            )),
+        };
         if result.is_err()
             && let Some(counters) = &client.live_counters
         {
@@ -85,7 +158,7 @@ impl LiveReadCache {
         position: &VersionPosition,
         deadline: Instant,
         trace: Option<&ReadTraceChild>,
-    ) -> Result<Vec<Bytes>, TcpError> {
+    ) -> Result<Vec<Bytes>, InlineFailure> {
         let index = self
             .find_grant(position)
             .ok_or_else(|| TcpError::new("inline live grant disappeared"))?;
@@ -116,7 +189,11 @@ impl LiveReadCache {
         };
         match result.map_err(live_error)? {
             LiveSubmitOutcome::Submitted => {}
-            LiveSubmitOutcome::Full => return Err(TcpError::new("inline live credit disappeared")),
+            LiveSubmitOutcome::Full => {
+                return Err(InlineFailure::Transient(TcpError::new(
+                    "inline live credit disappeared",
+                )));
+            }
         }
         if let Some(counters) = &client.live_counters {
             counters.record_grant_hit();
@@ -140,22 +217,8 @@ impl LiveReadCache {
             let waited = grant.inline_io_mut().wait(timeout);
             if let Err(error) = waited {
                 drain_failed_io(grant);
-                grant.broken = true;
-                if let GrantScope::Subsystem {
-                    generation,
-                    subsystem,
-                    ..
-                } = &grant.scope
-                {
-                    self.failed_subsystems.insert((*generation, *subsystem));
-                }
-                fold_stats(client.live_counters.as_deref(), grant);
-                return Err(live_error(error));
-            }
-            let completions = match grant.inline_io_mut().progress() {
-                Ok(completions) => completions,
-                Err(error) => {
-                    drain_failed_io(grant);
+                let lost = inline_controller_lost(grant, client, &error, deadline);
+                if !lost {
                     grant.broken = true;
                     if let GrantScope::Subsystem {
                         generation,
@@ -165,8 +228,36 @@ impl LiveReadCache {
                     {
                         self.failed_subsystems.insert((*generation, *subsystem));
                     }
+                }
+                fold_stats(client.live_counters.as_deref(), grant);
+                return Err(if lost {
+                    InlineFailure::LostController(live_error(error))
+                } else {
+                    InlineFailure::Transient(live_error(error))
+                });
+            }
+            let completions = match grant.inline_io_mut().progress() {
+                Ok(completions) => completions,
+                Err(error) => {
+                    drain_failed_io(grant);
+                    let lost = inline_controller_lost(grant, client, &error, deadline);
+                    if !lost {
+                        grant.broken = true;
+                        if let GrantScope::Subsystem {
+                            generation,
+                            subsystem,
+                            ..
+                        } = &grant.scope
+                        {
+                            self.failed_subsystems.insert((*generation, *subsystem));
+                        }
+                    }
                     fold_stats(client.live_counters.as_deref(), grant);
-                    return Err(live_error(error));
+                    return Err(if lost {
+                        InlineFailure::LostController(live_error(error))
+                    } else {
+                        InlineFailure::Transient(live_error(error))
+                    });
                 }
             };
             fold_stats(client.live_counters.as_deref(), grant);
@@ -180,35 +271,50 @@ impl LiveReadCache {
                         started: completion.completed_at,
                     });
                 if completion.id != flight {
-                    return Err(TcpError::new("unexpected inline live completion"));
+                    return Err(InlineFailure::Transient(TcpError::new(
+                        "unexpected inline live completion",
+                    )));
                 }
                 let result = match completion.result {
                     Ok(result) => result,
                     Err(error) => {
-                        if matches!(
+                        let io_error = matches!(
                             error,
                             crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
-                        ) && let GrantScope::Subsystem {
-                            generation,
-                            subsystem,
-                            ..
-                        } = &grant.scope
+                        );
+                        let lost =
+                            io_error && inline_controller_lost(grant, client, &error, deadline);
+                        if io_error
+                            && !lost
+                            && let GrantScope::Subsystem {
+                                generation,
+                                subsystem,
+                                ..
+                            } = &grant.scope
                         {
                             grant.broken = true;
                             self.failed_subsystems.insert((*generation, *subsystem));
                         }
-                        return Err(live_error(error));
+                        return Err(if lost {
+                            InlineFailure::LostController(live_error(error))
+                        } else {
+                            InlineFailure::Transient(live_error(error))
+                        });
                     }
                 };
                 let LiveIoResult::Reads(mut records) = result else {
-                    return Err(TcpError::new("unexpected live write completion"));
+                    return Err(InlineFailure::Transient(TcpError::new(
+                        "unexpected live write completion",
+                    )));
                 };
                 if records.len() != 1 {
-                    return Err(TcpError::new("live read count mismatch"));
+                    return Err(InlineFailure::Transient(TcpError::new(
+                        "live read count mismatch",
+                    )));
                 }
-                let bytes = records
-                    .pop()
-                    .ok_or_else(|| TcpError::new("missing live read result"))?;
+                let bytes = records.pop().ok_or_else(|| {
+                    InlineFailure::Transient(TcpError::new("missing live read result"))
+                })?;
                 if let Some(trace) = trace {
                     trace.event("live_member_completed");
                 }
@@ -225,6 +331,8 @@ impl LiveReadCache {
         {
             self.failed_subsystems.insert((*generation, *subsystem));
         }
-        Err(TcpError::new("inline live read did not retire"))
+        Err(InlineFailure::Transient(TcpError::new(
+            "inline live read did not retire",
+        )))
     }
 }
