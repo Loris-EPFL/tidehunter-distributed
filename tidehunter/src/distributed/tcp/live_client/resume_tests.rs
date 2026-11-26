@@ -103,11 +103,7 @@ fn write_extent_bytes(path: &std::path::Path, start: u64, segment_bytes: u64, by
 /// the prefix below it and the resume must resend it. Without the tear the
 /// owner's probe adopts the frame it can read, and nothing is owed.
 fn tear_retained_tail(client: &Client, cursor: u64) {
-    let extent = client
-        .live_leased
-        .current
-        .as_ref()
-        .expect("an open extent");
+    let extent = client.live_leased.current.as_ref().expect("an open extent");
     let segment = extent.lease.extent.segment.bytes;
     let path = extent.lease.extent.segment.path.clone();
     let frame = client.leased_test_retained().1 as u64;
@@ -824,10 +820,14 @@ fn eio_from_a_deleting_controller_resumes_with_identical_bytes() {
     let counts = counters(&fixture);
     assert_eq!(counts.resume_attempts, 1, "one resume episode");
     assert_eq!(
-        counts.resume_rewrites, 1,
+        counts.resume_rewrites,
+        1,
         "the unadopted frame is rewritten: retained={:?} steps={:?} rewrites={:?} frames={} attempts={}",
-        client.leased_test_retained(), client.leased_test_attempt_steps(),
-        client.leased_test_rewrites(), counts.resume_frames, counts.resume_attempts
+        client.leased_test_retained(),
+        client.leased_test_attempt_steps(),
+        client.leased_test_rewrites(),
+        counts.resume_frames,
+        counts.resume_attempts
     );
     assert_eq!(counts.resume_frames, 1, "exactly one frame was resent");
     assert_eq!(counts.resume_refused, 0, "the resume was not refused");
