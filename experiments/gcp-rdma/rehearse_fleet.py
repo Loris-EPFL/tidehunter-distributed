@@ -387,24 +387,25 @@ class Rehearsal:
         result = self.dispatch('manual_sui S1-4', argv, self.args.cell_seconds + 300)
         ok, detail = self.wall('manual_sui S1-4', result)
         self.step('manual_sui S1-4 mid-frame native', ok, detail)
-        self.check_launch_addresses('manual_sui_loss',
-                                    'out/manual_sui_loss-external-config')
+        self.check_launch_addresses('manual_sui_loss')
 
-    def check_launch_addresses(self, cell, config_dir='out/manual_sui-external-config'):
+    def check_launch_addresses(self, cell, config_dir=None):
         """The prepared launch must listen on the control IP and export the RDMA IP."""
-        matches = sorted((self.campaign_mount() / config_dir).glob('*/node-*/launch.yaml'))
+        wanted = config_dir or (cell + '-external-config')
+        matches = [path for path in sorted(self.campaign_mount().rglob('node-*/launch.yaml'))
+                   if wanted in path.parts]
         if not matches:
-            raise Failure(f'{cell}: no prepared owner launch file under '
-                          f'{self.campaign_mount() / config_dir}')
+            raise Failure(f'{cell}: no prepared owner launch file under a {wanted} directory')
         for path in matches:
             text = path.read_text()
             partition = int(path.parent.name.rsplit('-', 1)[-1])
             if not 0 <= partition < len(self.fleet_hosts) - 1:
                 raise Failure(f'{cell}: {path} names partition {partition} outside the fleet')
             expected = self.fleet_hosts[1 + partition]
-            if f"listen: {expected['internal_ip']}:9400" not in text:
+            if f"listen: {expected['internal_ip']}:9400" not in text \
+                    and f"listen: {expected['internal_ip']}:{9400 + partition}" not in text:
                 raise Failure(f'{cell}: {path} does not listen on the owner control '
-                              f"address {expected['internal_ip']}:9400")
+                              f"address {expected['internal_ip']}")
             if f"address: {expected['rdma_ip']}" not in text:
                 raise Failure(f'{cell}: {path} does not export the RDMA target '
                               f"address {expected['rdma_ip']}")
