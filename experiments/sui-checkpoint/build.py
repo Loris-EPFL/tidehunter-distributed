@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -317,6 +318,32 @@ def verify_staged(root, identities):
                 raise ValueError(f'frozen source changed: {path}')
 
 
+# The selected HPC guest image carries glibc 2.34 and libstdc++ 3.4.29. A host
+# build needs 2.38/2.39 and the guest loader then refuses every binary, so the
+# build must refuse it here instead of shipping an unusable bundle.
+GUEST_ABI_CEILING = {'GLIBC': (2, 34), 'GLIBCXX': (3, 4, 29),
+                     'CXXABI': (1, 3, 15), 'OPENSSL': (3, 0, 0)}
+
+
+def abi_version(text):
+    return tuple(int(part) for part in text.split('.'))
+
+
+def guest_abi(name, versions):
+    """The highest required version per ABI family, and the guest admission."""
+    needs = (versions.split('Version needs section', 1)[-1]
+             if 'Version needs section' in versions else '')
+    required, failures = {}, []
+    for family, ceiling in GUEST_ABI_CEILING.items():
+        found = sorted(set(re.findall(r'\b' + family + r'_(\d+(?:\.\d+)+)', needs)),
+                       key=abi_version)
+        required[family] = found[-1] if found else None
+        if found and abi_version(found[-1]) > ceiling:
+            failures.append(f'{name} requires {family}_{found[-1]}, newer than the guest '
+                            f'{family}_{".".join(str(part) for part in ceiling)}')
+    return required, failures
+
+
 def cargo_executable(log, name, kind):
     """Select only the artifact Cargo emitted for this successful invocation."""
     paths = set()
@@ -385,13 +412,24 @@ def build(args):
     compile_one('state-audit', engine / 'experiments/sui-checkpoint/audit', ['--features', 'fabric'] if plan['fabric'] else [], 'sui-sharded-state-audit')
     verify_staged(root, identities)
     portability = {}
-    for binary in bins.iterdir():
+    guest_requirements, guest_failures = {}, []
+    for binary in sorted(bins.iterdir()):
         portability[binary.name] = {
             'elf_versions': subprocess.check_output(['readelf', '--version-info', str(binary)], timeout=30).decode(),
             'dynamic_libraries': subprocess.check_output(['ldd', str(binary)], env=env, timeout=30).decode(),
         }
+        guest_requirements[binary.name], failures = guest_abi(
+            binary.name, portability[binary.name]['elf_versions'])
+        guest_failures += failures
     save(root/'portability.json', portability)
-    save(root / 'build-manifest.json', dict(plan, commands=commands,
+    if guest_requirements and all('GLIBC' not in item for item in guest_requirements.values()):
+        guest_failures.append('no GLIBC version requirement was found; the ABI check did not run')
+    if guest_failures:
+        raise ValueError('guest ABI ceiling exceeded: ' + '; '.join(guest_failures))
+    save(root / 'build-manifest.json', dict(plan, guest_abi=dict(
+             ceiling={family: '.'.join(str(part) for part in value)
+                      for family, value in GUEST_ABI_CEILING.items()},
+             binaries=guest_requirements), commands=commands,
          binaries={p.name: digest(p) for p in bins.iterdir()},
          environment={k: v for k, v in env.items() if k in ('USE_TIDEHUNTER', 'GIT_REVISION') or k.startswith(('CARGO_', 'RUST', 'CC', 'CXX', 'LD_LIBRARY_PATH', 'LIBRARY_PATH', 'PKG_CONFIG'))},
          resolved_locks={str(p.relative_to(root / 'sources')): digest(p) for p in (sui / 'Cargo.lock', engine / 'Cargo.lock')},
@@ -403,7 +441,11 @@ def build(args):
             archive.add(path,arcname=path.name)
     save(root/'build-receipt.json', {'bundle_sha256':digest(root/'build-bundle.tar.gz'),
          'build_manifest_sha256':digest(root/'build-manifest.json'),
-         'source_archive_sha256':plan['source_archive_sha256']})
+         'source_archive_sha256':plan['source_archive_sha256'],
+         'guest_abi':{'checked':True,
+                      'ceiling':{family:'.'.join(str(part) for part in value)
+                                 for family,value in GUEST_ABI_CEILING.items()},
+                      'requirements':guest_requirements}})
 
 
 def main():

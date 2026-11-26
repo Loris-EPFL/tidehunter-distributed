@@ -163,7 +163,11 @@ class FakeBuild:
 INJECTOR_RECORD = {
     'schema': 1, 'kind': 'w1_controller_loss', 'ok': True, 'reason': None,
     'readback_equal': True, 'fail_stop_count': 0, 'reconnect_seconds': 0.2,
-    'live_delta': {'available': True, 'errors': 0, 'namespace_connects': 1},
+    'live_delta': {'available': True, 'errors': 0, 'namespace_connects': 1,
+                   'by_counter': {'resume_attempts_total': 2,
+                                  'resume_rewrites_total': 1,
+                                  'resume_frames_total': 7,
+                                  'resume_refused_total': 0}},
 }
 
 
@@ -551,27 +555,74 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertIn('controller-loss/evidence.json', names)
         self.assertIn('controller-loss/mid-frame.json', names)
 
-    def test_an_unobserved_point_fails_the_cell_and_keeps_the_series(self):
+    def test_an_unobserved_mid_frame_point_fails_the_cell_and_keeps_the_series(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        gate = self.gate(remote, gate_timeout=0.2,
+                         metrics=lambda url: 'tidehunter_nvmeof_live_completed_write_ops_total 0\n',
+                         latest=lambda address: 3)
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'was not observed'):
+            self.launcher(remote, gate, ledger=ledger,
+                          cell_id='S1-4-mid-frame-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'failed')
+        self.assertIn('was not observed',
+                      ledger.entries[('stage1', 'S1-4-mid-frame-native')]['failure'])
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertFalse(evidence['injected'])
+        self.assertTrue(evidence['samples'])
+        self.assertTrue(all(not row['counters'].get('completed_write_ops_total')
+                            for row in evidence['samples']))
+        self.assertFalse([row for row in remote.requests if 'fault_inject.py' in row['command']])
+
+    def test_a_synchronous_flush_point_that_never_fires_is_not_reached(self):
         remote = MailboxDouble(self.root, self.root / 'guest')
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
         gate = self.gate(remote, point='during-flush', gate_timeout=0.2,
                          metrics=lambda url: 'tidehunter_nvmeof_live_leased_flushes_total 0\n',
                          latest=lambda address: 3)
-        with self.assertRaisesRegex(manual_sui.LaunchError, 'was not observed'):
-            self.launcher(remote, gate, ledger=ledger,
-                          cell_id='S1-4-during-flush-native',
-                          allow_local_ledger=True).run(
-                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
-        self.assertEqual(ledger.status('stage1', 'S1-4-during-flush-native'), 'failed')
-        self.assertIn('was not observed',
-                      ledger.entries[('stage1', 'S1-4-during-flush-native')]['failure'])
-        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
-        self.assertFalse(evidence['injected'])
-        self.assertTrue(evidence['samples'])
-        self.assertTrue(all(not row['counters'].get('leased_flushes_total')
-                            or row['counters']['leased_flushes_total'] == 0
-                            for row in evidence['samples']))
+        receipt = self.launcher(remote, gate, ledger=ledger, tier='synchronous',
+                                cell_id='S1-4-during-flush-synchronous',
+                                allow_local_ledger=True).run(
+            manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertTrue(receipt['not_reached'])
+        self.assertFalse(receipt['complete'])
+        self.assertIn('no flush in replay', receipt['reason'])
+        self.assertEqual(ledger.status('stage1', 'S1-4-during-flush-synchronous'),
+                         'not_reached')
         self.assertFalse([row for row in remote.requests if 'fault_inject.py' in row['command']])
+
+    def test_the_native_flush_point_is_refused_at_admission(self):
+        with self.assertRaisesRegex(ValueError, 'during-flush is unreachable at the native tier'):
+            manual_sui.controller_loss_admission('during-flush', 'native')
+        manual_sui.controller_loss_admission('during-flush', 'synchronous')
+        manual_sui.controller_loss_admission('mid-frame', 'native')
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        gate = self.gate(remote, point='during-flush')
+        with self.assertRaisesRegex(ValueError, 'native tier'):
+            self.launcher(remote, gate, allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertFalse(remote.requests)
+
+    def test_the_evidence_carries_the_four_resume_deltas(self):
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        gate = self.gate(remote)
+        receipt = self.launcher(remote, gate, cell_id='S1-4-mid-frame-native',
+                                allow_local_ledger=True).run(
+            manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(receipt['controller_loss']['point'], 'mid-frame')
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertEqual(evidence['resume'], {'resume_attempts_total': 2,
+                                              'resume_rewrites_total': 1,
+                                              'resume_frames_total': 7,
+                                              'resume_refused_total': 0})
+        missing = dict(INJECTOR_RECORD, live_delta={'available': True, 'errors': 0,
+                                                    'namespace_connects': 1})
+        failures = manual_sui.controller_loss_verdict(
+            dict(point='mid-frame', injected=True, exit_code=0,
+                 injector=missing, resume={}))
+        self.assertTrue(any('write-resume counters' in item for item in failures))
 
     def test_a_failed_injector_record_fails_the_cell(self):
         record = dict(INJECTOR_RECORD, ok=False, reason='owner controller did not reconnect',
@@ -608,10 +659,13 @@ class ControllerLossInjection(unittest.TestCase):
                                 cell_id='S1-4-mid-frame-native',
                                 allow_local_ledger=True).run(hosts)
         self.assertTrue(skipped['skipped'])
-        # A different point hashes differently, so the same cell reruns in a
-        # fresh output instead of being skipped.
-        changed = self.launcher(remote, self.gate(remote, point='during-flush',
-                                                 output=self.root / 'run2'),
+        # A different injection target hashes differently, so the same cell
+        # reruns in a fresh output instead of being skipped.
+        changed = self.launcher(remote, self.gate(
+                                    remote,
+                                    nqn='nqn.2014-08.org.nvmexpress:uuid:'
+                                        '00000000-0000-0000-0000-000000000001',
+                                    output=self.root / 'run2'),
                                 output=self.root / 'run2', ledger=ledger, resume=True,
                                 stage_dir=self.root / 'stages2',
                                 config_dir=self.root / 'external-config2',

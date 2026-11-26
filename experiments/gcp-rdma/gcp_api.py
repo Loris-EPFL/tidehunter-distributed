@@ -1,13 +1,21 @@
 """Small, bounded Compute Engine and Cloud Storage JSON REST clients."""
+import datetime
 import hashlib
 import json
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+
+STORAGE_ENDPOINT = 'https://storage.googleapis.com'
+# IAM Credentials mints delegated tokens of at most one hour. Refresh early so
+# a long cell never sends an expired token.
+TOKEN_LIFETIME_SECONDS = 3600
+TOKEN_REFRESH_MARGIN_SECONDS = 60
 
 
 class ApiError(RuntimeError):
@@ -30,13 +38,84 @@ def metadata_token():
         return json.load(response)['access_token']
 
 
+def token_expiry(expire_time, *, now=time.monotonic):
+    """Monotonic instant to refresh by, from an IAM `expireTime`.
+
+    A response without a parsable expiry is treated as the shortest admitted
+    lifetime, so the next request mints a new token instead of trusting an
+    unknown one.
+    """
+    fallback = now() + TOKEN_LIFETIME_SECONDS - 2 * TOKEN_REFRESH_MARGIN_SECONDS
+    if not isinstance(expire_time, str) or not expire_time:
+        return fallback
+    try:
+        parsed = datetime.datetime.fromisoformat(expire_time.replace('Z', '+00:00'))
+    except ValueError:
+        return fallback
+    remaining = (parsed - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if remaining <= 0:
+        return now()
+    return now() + max(0, remaining - TOKEN_REFRESH_MARGIN_SECONDS)
+
+
+def delegated_token(api, account):
+    """A provider that mints one delegated token and refreshes it before expiry.
+
+    The workstation cannot read the campaign bucket as its own user, so every
+    laptop-side client acts as the bench-guest service account. A token minted
+    once and held for the run expires after an hour and a long cell then fails
+    with 401; this provider mints again shortly before the recorded expiry.
+    """
+    if not isinstance(account, str) or not account:
+        raise ValueError('a delegated service account is required')
+    url = ('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/'
+           + urllib.parse.quote(account, safe='') + ':generateAccessToken')
+    lock = threading.Lock()
+    state = {'token': None, 'refresh_at': 0.0}
+
+    def provider():
+        with lock:
+            if state['token'] is not None and time.monotonic() < state['refresh_at']:
+                return state['token']
+            body = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                               'lifetime': f'{TOKEN_LIFETIME_SECONDS}s'}).encode()
+            response = json.loads(api._request('POST', url, body,
+                                               {'Content-Type': 'application/json'}))
+            token = response.get('accessToken')
+            if not isinstance(token, str) or not token:
+                raise ValueError('IAM Credentials did not return an access token')
+            state['token'] = token
+            state['refresh_at'] = token_expiry(response.get('expireTime'))
+            return token
+
+    return provider
+
+
+def campaign_client(config, *, guest=False):
+    """The one campaign credential path.
+
+    A guest uses its own metadata identity. The workstation delegates to the
+    campaign service account with a refreshing token. A local rehearsal names
+    an explicit store endpoint and uses its own token; it has no cloud identity.
+    """
+    endpoint = config.get('store_endpoint')
+    if endpoint is not None:
+        return GoogleApi(config['project_id'], token_provider=lambda: 'rehearsal',
+                         endpoint=endpoint)
+    if guest:
+        return GoogleApi(config['project_id'], token_provider=metadata_token)
+    account = config.get('service_account')
+    return GoogleApi(config['project_id']).impersonated(account)
+
+
 class GoogleApi:
-    def __init__(self, project, *, token_provider=None, opener=None):
+    def __init__(self, project, *, token_provider=None, opener=None, endpoint=None):
         if not project:
             raise ValueError('project_id is required')
         self.project = project
         self.token_provider = token_provider or (lambda: local_token(project))
         self.opener = opener or urllib.request.urlopen
+        self.endpoint = (endpoint or STORAGE_ENDPOINT).rstrip('/')
 
     def _request(self, method, url, body=None, headers=None, read_retries=3):
         headers = dict(headers or {})
@@ -80,13 +159,9 @@ class GoogleApi:
         return json.loads(self._request('POST', url, body, {'Content-Type': 'application/json'})).get('permissions', [])
 
     def impersonated(self, account):
-        url = 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/' + urllib.parse.quote(account, safe='') + ':generateAccessToken'
-        body = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'], 'lifetime': '600s'}).encode()
-        response = json.loads(self._request('POST', url, body, {'Content-Type': 'application/json'}))
-        token = response.get('accessToken')
-        if not isinstance(token, str) or not token:
-            raise ValueError('IAM Credentials did not return an access token')
-        return GoogleApi(self.project, token_provider=lambda: token, opener=self.opener)
+        """A client that acts as `account` with a token refreshed before expiry."""
+        return GoogleApi(self.project, token_provider=delegated_token(self, account),
+                         opener=self.opener, endpoint=self.endpoint)
 
     def bucket_permissions(self, bucket, permissions):
         url = 'https://storage.googleapis.com/storage/v1/b/' + urllib.parse.quote(bucket, safe='') + '/iam/testPermissions?'
@@ -102,7 +177,7 @@ class ObjectStore:
         if not bucket:
             raise ValueError('bucket is required')
         self.api, self.bucket = api, bucket
-        self.base = 'https://storage.googleapis.com/storage/v1/b/' + urllib.parse.quote(bucket, safe='') + '/o'
+        self.base = api.endpoint + '/storage/v1/b/' + urllib.parse.quote(bucket, safe='') + '/o'
 
     def _url(self, key, query=None):
         url = self.base + '/' + urllib.parse.quote(key, safe='')
@@ -120,7 +195,9 @@ class ObjectStore:
         query = {'uploadType': 'multipart'}
         if if_generation_match is not None:
             query['ifGenerationMatch'] = str(if_generation_match)
-        url = 'https://storage.googleapis.com/upload/storage/v1/b/' + urllib.parse.quote(self.bucket, safe='') + '/o?' + urllib.parse.urlencode(query)
+        url = (self.api.endpoint + '/upload/storage/v1/b/'
+               + urllib.parse.quote(self.bucket, safe='') + '/o?'
+               + urllib.parse.urlencode(query))
         result = json.loads(self.api._request('POST', url, body, {'Content-Type': 'multipart/related; boundary=' + boundary}))
         if result.get('metadata', {}).get('sha256') != digest or int(result.get('size', -1)) != len(data) or not result.get('generation'):
             raise ValueError('GCS upload receipt mismatch')
@@ -177,7 +254,9 @@ class ObjectStore:
         query = {'uploadType': 'multipart'}
         if if_generation_match is not None:
             query['ifGenerationMatch'] = str(if_generation_match)
-        url = 'https://storage.googleapis.com/upload/storage/v1/b/' + urllib.parse.quote(self.bucket, safe='') + '/o?' + urllib.parse.urlencode(query)
+        url = (self.api.endpoint + '/upload/storage/v1/b/'
+               + urllib.parse.quote(self.bucket, safe='') + '/o?'
+               + urllib.parse.urlencode(query))
         headers = {'Authorization': 'Bearer ' + self.api.token_provider(),
                    'Content-Type': 'multipart/related; boundary=' + boundary,
                    'Content-Length': str(len(prefix) + size + len(suffix))}

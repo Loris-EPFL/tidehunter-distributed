@@ -149,6 +149,10 @@ def live_nvmeof_deltas(before, after):
                 completed_write_bytes=deltas.get('completed_write_bytes_total'),
                 errors=deltas.get('errors_total'),
                 namespace_connects=deltas.get('namespace_connects_total'),
+                resume_attempts=deltas.get('resume_attempts_total'),
+                resume_rewrites=deltas.get('resume_rewrites_total'),
+                resume_frames=deltas.get('resume_frames_total'),
+                resume_refused=deltas.get('resume_refused_total'),
                 scope='same-host before/after aggregate deltas; unavailable samples remain absent')
 
 

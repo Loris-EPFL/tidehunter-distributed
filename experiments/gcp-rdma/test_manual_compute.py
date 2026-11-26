@@ -977,6 +977,9 @@ class OperatorFleetTests(unittest.TestCase):
     def test_create_with_a_package_publishes_and_releases_every_gate(self):
         package = Path(self.temp.name) / 'package'
         package.mkdir()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+             'source_revision': 'b' * 40, 'archive_path': str(package / 'bundle.tar.gz')}))
         spec = Path(self.temp.name) / 'spec.json'
         spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 2,
                                     'backends': ['native']}))
@@ -1013,10 +1016,13 @@ class OperatorFleetTests(unittest.TestCase):
                  'selfLink': 'https://www.googleapis.com/compute/v1/' + IMAGE, 'diskSizeGb': '80'}
         package = Path(self.temp.name) / 'package'
         package.mkdir()
+        (package / 'package-receipt.json').write_text(json.dumps(
+            {'source_sha256': SOURCE, 'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
+             'source_revision': 'b' * 40, 'archive_path': str(package / 'bundle.tar.gz')}))
         spec = Path(self.temp.name) / 'spec.json'
         spec.write_text(json.dumps({'suite': 'sui', 'mode': 'sui', 'owners': 1,
                                     'backends': ['native']}))
-        with mock.patch('gcp_api.GoogleApi') as api, \
+        with mock.patch('gcp_api.campaign_client') as api, \
              mock.patch.object(gcp_manual_compute, 'gcloud',
                                new=FakeMcp(None, self.config, self.state_path).__call__), \
              mock.patch.object(mailbox_exec, 'release') as release:
@@ -1076,7 +1082,7 @@ class OperatorFleetTests(unittest.TestCase):
     def test_qualification_role_admits_a_ready_image_only(self):
         ready = {'status': 'READY', 'id': '1937849582956621267',
                  'selfLink': 'https://www.googleapis.com/compute/v1/' + IMAGE, 'diskSizeGb': '80'}
-        with mock.patch('gcp_api.GoogleApi') as api, \
+        with mock.patch('gcp_api.campaign_client') as api, \
              mock.patch.object(gcp_manual_compute, 'admit_image') as receipt_admission, \
              mock.patch.object(gcp_manual_compute, 'gcloud',
                                new=FakeMcp(None, self.config, self.state_path).__call__):
@@ -1089,7 +1095,7 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertEqual(report['role'], 'qualification')
         self.assertEqual(len(report['hosts']), 2)
         self.assertEqual(json.loads(self.state_path.read_text())['role'], 'qualification')
-        with mock.patch('gcp_api.GoogleApi') as api:
+        with mock.patch('gcp_api.campaign_client') as api:
             api.return_value.request.return_value = dict(ready, status='PENDING')
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(gcp_manual_compute.main(self.cli(

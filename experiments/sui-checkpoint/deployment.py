@@ -146,7 +146,7 @@ def live_transport_for(transport, live_transport):
 def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache,
             shard_cache=0, guest_root=None, write_profile_limit=0, resident_reads=None,
             owners=None, owner_transports=None, owner_tier=None, owner_wal='harness',
-            live_nvme=None, live_transport=None, live_geometry=None):
+            live_nvme=None, live_transport=None, live_geometry=None, live_addresses=None):
     if owner_tier not in (None, 'native', 'synchronous'):
         raise ValueError('owner tier must be native or synchronous')
     if owner_wal not in ('harness', 'engine_default'):
@@ -171,6 +171,15 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         raise ValueError('hardware fabric needs explicit external mode')
     if (guest_root is not None or any(host != '127.0.0.1' for host in hosts)) and len(set(hosts)) != owners:
         raise ValueError(f'exactly {owners} distinct external hosts are required')
+    # The control listen address and the live NVMe-oF target address are
+    # separate NICs on a two-network guest: TCP control uses the default subnet
+    # and NVMe/RDMA exports the target on the falcon-rdma subnet.
+    live_addresses = list(hosts) if live_addresses is None else list(live_addresses)
+    if (len(live_addresses) != owners
+            or any(not isinstance(value, str) or not value for value in live_addresses)
+            or ((guest_root is not None or any(host != '127.0.0.1' for host in hosts))
+                and len(set(live_addresses)) != owners)):
+        raise ValueError(f'exactly {owners} distinct live target addresses are required')
     if set(shape_yamls) != set(schema):
         raise ValueError('canonical engine YAML must cover every selected namespace')
     resident = resident_read_config(resident_reads)
@@ -208,7 +217,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         owner_identities = {partition: live_owner_identity(live, namespace, database, partition)
                             for partition in range(owners)}
         endpoints = []
-        for partition, host in enumerate(hosts):
+        for partition, (host, live_host) in enumerate(zip(hosts, live_addresses)):
             address = f'{host}:{port + number * owners + partition}'
             node_dir = directory / slug / f'node-{partition}'
             node_dir.mkdir(parents=True)
@@ -216,7 +225,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             base = 64 * partition
             host_config = dict(
                 root=str(runtime_node / 'storage'), max_databases=16,
-                live_target_pool=dict(address=host, transport=live_transport,
+                live_target_pool=dict(address=live_host, transport=live_transport,
                     public_port_base=1000 + base, public_service_base=4420 + base,
                     commissioning_port_base=1016 + base,
                     commissioning_service_base=4436 + base),

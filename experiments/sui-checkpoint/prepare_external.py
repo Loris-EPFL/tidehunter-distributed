@@ -17,7 +17,8 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--db-root',type=Path,required=True,help='future coordinator remote Sui db-path')
     parser.add_argument('--guest-root',type=Path,required=True,help='fresh absolute namespace root, identical path on all hosts')
-    parser.add_argument('--hosts',required=True,help='distinct private IPv4 owner addresses, comma separated (one per owner)')
+    parser.add_argument('--hosts',required=True,help='distinct private IPv4 owner control addresses, comma separated (one per owner)')
+    parser.add_argument('--live-hosts',help='distinct owner NVMe-oF target addresses; defaults to --hosts')
     parser.add_argument('--owners',type=int,help='expected owner count; defaults to the number of --hosts')
     parser.add_argument('--port',type=int,default=24000)
     parser.add_argument('--transport',choices=('tcp', 'tcp-trusted', *deployment.HARDWARE_TRANSPORTS),default='tcp')
@@ -37,8 +38,10 @@ def main():
                         help='maximum profiled append RPCs per owning connection, 0 disables diagnostics')
     args=parser.parse_args()
     hosts=args.hosts.split(',')
+    live_hosts=hosts if args.live_hosts is None else args.live_hosts.split(',')
     owners=len(hosts) if args.owners is None else args.owners
-    if (not 1<=owners<=16 or len(set(hosts))!=owners or any(not host for host in hosts)
+    if (not 1<=owners<=16 or len(set(hosts))!=owners or len(set(live_hosts))!=owners
+            or any(not host for host in hosts) or any(not host for host in live_hosts)
             or not args.guest_root.is_absolute() or not args.db_root.is_absolute()):
         raise ValueError('distinct owner hosts and absolute owned roots required')
     if not 1024<=args.port<=65000 or any(not 0<=v<=128 for v in (args.coordinator_cache_mib,args.shard_cache_mib)):
@@ -65,7 +68,7 @@ def main():
         shard_cache=args.shard_cache_mib*deployment.MIB,guest_root=args.guest_root,
         write_profile_limit=args.write_profile_limit,resident_reads=resident,owners=owners,
         owner_tier=args.durability_tier, live_transport=args.live_transport,
-        live_geometry=geometry, owner_wal=args.owner_wal)
+        live_geometry=geometry, owner_wal=args.owner_wal, live_addresses=live_hosts)
     host_records=[]
     for partition,host in enumerate(hosts):
         selected=[node for node in nodes if node['partition']==partition]

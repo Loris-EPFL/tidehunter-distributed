@@ -285,7 +285,7 @@ def admit_ready_image(config, image, api=None):
     if (not isinstance(image, str) or not IMAGE_PATH.fullmatch(image)
             or not image.startswith('projects/' + config.get('project_id', '') + '/global/images/')):
         raise ValueError('image must be a pinned image of the configured project')
-    api = api or gcp_api.GoogleApi(config['project_id'])
+    api = api or gcp_api.campaign_client(config)
     info = api.request('GET', 'global/images/' + image.rsplit('/', 1)[-1])
     if not isinstance(info, dict) or info.get('status') != 'READY' or not str(info.get('id', '')).isdigit():
         raise ValueError('configured image is not READY with a numeric ID')
@@ -297,13 +297,35 @@ def admit_ready_image(config, image, api=None):
     return info
 
 
+def package_source_sha256(package_dir, explicit=None):
+    """The source SHA the fleet binds: the sealed package receipt's own value.
+
+    A fleet created with the build bundle's SHA instead binds every host to an
+    identity no guest gate can match, and each worker exits before its first
+    cell. Both values are 64-hex, so only the receipt can tell them apart.
+    """
+    receipt_path = Path(package_dir) / 'package-receipt.json'
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f'{receipt_path}: package receipt unavailable') from exc
+    source = receipt.get('source_sha256') if isinstance(receipt, dict) else None
+    if not isinstance(source, str) or re.fullmatch(r'[0-9a-f]{64}', source) is None:
+        raise ValueError('the package receipt carries no source SHA-256')
+    if explicit is not None and explicit != source:
+        raise ValueError(
+            f'--source-sha256 {explicit} is not the package receipt source {source}: '
+            'the guest gate binds the package receipt source SHA-256')
+    return source
+
+
 def admit_image(config, api=None):
     """Refuse to create a campaign fleet unless the image carries a current receipt."""
     import gcp_api
     import gcp_image
     image = config.get('image', '')
+    api = api or gcp_api.campaign_client(config)
     info = admit_ready_image(config, image, api=api)
-    api = api or gcp_api.GoogleApi(config['project_id'])
     qualification = gcp_image.admit_image(api, config, info)
     gcp_image.admit_nvme_transports(qualification, ['tidehunter_nvme_rdma'])
     return {'path': image, 'id': str(info['id'])}
@@ -955,6 +977,10 @@ def _recorded_fleet(config, args):
 
 async def create(config, args):
     """Create the placement policy and every owned host of one reviewed fleet."""
+    if args.package is not None:
+        # Derive the source from the package the guests will verify, and refuse
+        # a differing explicit value before any cloud call creates a host.
+        args.source_sha256 = package_source_sha256(args.package, args.source_sha256)
     if args.state.exists():
         state = _recorded_fleet(config, args)
     else:
@@ -1012,7 +1038,7 @@ def _release_workers(config, state, args, fleet, path):
     admitted, and the objects exist before them, so a host cannot start a
     worker against a missing or differing package.
     """
-    store = gcp_api.GoogleApi(config['project_id']).objects(config['bucket'])
+    store = gcp_api.campaign_client(config).objects(config['bucket'])
     spec = json.loads(Path(args.spec).read_text())
     mailbox_exec.publish(store, config, state, Path(args.package).resolve(strict=True),
                          args.revision, spec, fleet,
@@ -1034,7 +1060,7 @@ async def ready(config, args):
     if not state.get('workers_released'):
         raise ComputeError('no gate was released for this fleet; create it with --package')
     remote = mailbox_exec.MailboxExec.from_state(
-        args.state, gcp_api.GoogleApi(config['project_id']), bucket=config['bucket'],
+        args.state, gcp_api.campaign_client(config), bucket=config['bucket'],
         timeout_seconds=args.worker_seconds)
     prepared = remote.wait_workers(require=args.require_manifest_sha256)
     print(json.dumps({'run_id': state['run_id'], 'hosts': sorted(prepared),
@@ -1139,8 +1165,9 @@ def parse(argv=None):
         args.deadline = args.deadline or fleet_deadline(args.hours)
         if parse_time(args.deadline) <= dt.datetime.now(dt.timezone.utc):
             parser.error('the fleet deadline must be in the future')
-        if args.source_sha256 is None and not args.state.exists():
-            parser.error('create requires --source-sha256')
+        if (args.source_sha256 is None and not args.state.exists()
+                and args.package is None):
+            parser.error('create requires --source-sha256 or --package')
     return args
 
 

@@ -33,8 +33,16 @@ class Store:
 
     def put(self, key, data, *, content_type='application/octet-stream',
             if_generation_match=None, **kwargs):
-        if if_generation_match is not None and key in self.objects:
-            raise Error(412)
+        # GCS precondition: 0 means "must not exist"; any other value must be
+        # the current generation. A match replaces the object.
+        if if_generation_match is not None:
+            current = self.objects.get(key)
+            expected = str(if_generation_match)
+            if expected == '0':
+                if current is not None:
+                    raise Error(412)
+            elif current is None or current['generation'] != expected:
+                raise Error(412)
         data = bytes(data)
         generation = str(self.next_generation)
         self.next_generation += 1
@@ -382,7 +390,8 @@ class SwapTests(unittest.TestCase):
             path.write_text(json.dumps(state))
             config = Path(directory) / 'config.json'
             config.write_text(json.dumps({'project_id': 'mysten-research', 'bucket': 'bucket'}))
-            with mock.patch.object(mailbox_exec.gcp_api, 'GoogleApi', return_value=Api()):
+            with mock.patch.object(mailbox_exec.gcp_api, 'campaign_client',
+                                   return_value=Api()):
                 remote = mailbox_exec.open_executor(
                     self.args(fleet_state=path, fleet_config=config))
         self.assertIsInstance(remote, mailbox_exec.MailboxExec)
@@ -399,57 +408,77 @@ class PublishTests(unittest.TestCase):
     def state(self):
         return {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline()}
 
-    def receipt(self):
+    def receipt(self, directory):
+        archive = Path(directory) / 'bundle.tar.gz'
+        archive.write_bytes(b'package archive')
         return {'source_sha256': SOURCE, 'source_revision': 'd' * 40,
-                'sha256': 'c' * 64, 'manifest_sha256': 'e' * 64,
-                'archive_path': '/package/bundle.tar.gz'}
+                'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+                'manifest_sha256': 'e' * 64, 'archive_path': str(archive)}
 
-    def test_a_sui_package_is_admitted_as_the_focused_package(self):
+    def admit(self, directory):
         seen = {}
 
         def admit(path, revision, spec):
             seen['path'], seen['revision'], seen['spec'] = path, revision, spec
-            return self.receipt(), '/source'
+            return self.receipt(directory), '/source'
+        return seen, mock.patch.object(mailbox_exec.manual_campaign, '_admit_package',
+                                       side_effect=admit)
 
-        def stage(store, bucket, state, receipt):
-            seen['bucket'], seen['staged'] = bucket, receipt
-            package = dict(receipt, object_key=f'runs/{state["run_id"]}/package.tar',
-                           generation='5')
-            return package, None
+    def test_a_sui_package_is_admitted_as_the_focused_package(self):
         store = Store()
         spec = mailbox_exec.sui_spec(2, ['native'])
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(mailbox_exec.manual_campaign, '_admit_package', side_effect=admit), \
-                    mock.patch.object(mailbox_exec.manual_campaign, '_stage', side_effect=stage):
+            seen, admit = self.admit(directory)
+            with admit:
                 runtime, reference = mailbox_exec.publish(
                     store, self.config(), self.state(), directory, 'd' * 40, spec, FLEET,
                     guest_roots=['/mnt/tidehunter/sui'])
         self.assertEqual(seen['spec'], dict(spec, mode='focused'))
         self.assertEqual(seen['revision'], 'd' * 40)
-        self.assertEqual(seen['bucket'], 'bucket')
         self.assertEqual(runtime['spec'], spec)
         self.assertEqual(runtime['guest_roots'], ['/mnt/tidehunter/sui'])
-        self.assertEqual(runtime['package']['generation'], '5')
+        self.assertEqual(runtime['package']['object_key'], f'runs/{RUN}/package.tar')
+        self.assertEqual(runtime['package']['generation'], '1')
         self.assertEqual(reference['object'], f'runs/{RUN}/runtime.json')
         self.assertEqual(json.loads(store.get(f'runs/{RUN}/runtime.json')), runtime)
 
-    def test_a_retried_publish_keeps_one_runtime_object(self):
+    def test_a_retried_publish_reuses_an_identical_package_and_runtime(self):
         store, state = Store(), self.state()
         spec = mailbox_exec.sui_spec(2, ['native'])
-        package = dict(self.receipt(), object_key=f'runs/{RUN}/package.tar', generation='5')
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(mailbox_exec.manual_campaign, '_admit_package',
-                                  return_value=(self.receipt(), '/source')), \
-                mock.patch.object(mailbox_exec.manual_campaign, '_stage',
-                                  return_value=(package, None)):
-            first, _ = mailbox_exec.publish(store, self.config(), state, directory,
-                                            'd' * 40, spec, FLEET)
-            second, reference = mailbox_exec.publish(store, self.config(), state,
-                                                     directory, 'd' * 40, spec, FLEET)
+        with tempfile.TemporaryDirectory() as directory:
+            seen, admit = self.admit(directory)
+            with admit:
+                first, _ = mailbox_exec.publish(store, self.config(), state, directory,
+                                                'd' * 40, spec, FLEET)
+                second, reference = mailbox_exec.publish(store, self.config(), state,
+                                                         directory, 'd' * 40, spec, FLEET)
         self.assertEqual(first, second)
-        self.assertEqual(reference['generation'], '1')
+        self.assertEqual(reference['generation'],
+                         json.loads(store.get(f'runs/{RUN}/runtime.json')) == first
+                         and store.head(f'runs/{RUN}/runtime.json')['generation'])
         self.assertEqual([key for key in store.objects if key.endswith('runtime.json')],
                          [f'runs/{RUN}/runtime.json'])
+        self.assertEqual([key for key in store.objects if key.endswith('package.tar')],
+                         [f'runs/{RUN}/package.tar'])
+
+    def test_a_changed_source_replaces_the_previous_runtime_and_gate(self):
+        store, state = Store(), self.state()
+        spec = mailbox_exec.sui_spec(2, ['native'])
+        with tempfile.TemporaryDirectory() as directory:
+            seen, admit = self.admit(directory)
+            with admit:
+                mailbox_exec.publish(store, self.config(), state, directory,
+                                     'd' * 40, spec, FLEET)
+                mailbox_exec.release(store, state, FLEET[0], 'first script')
+                changed = dict(state, source_sha256='c' * 64)
+                mailbox_exec.release(store, changed, FLEET[0], 'second script')
+        gate = json.loads(store.get(f'runs/{RUN}/qualification/{FLEET[0]["name"]}/gate.json'))
+        self.assertEqual(gate['source_sha256'], 'c' * 64)
+        self.assertEqual(gate['sha256'], hashlib.sha256(b'second script').hexdigest())
+        # The second release replaced the object; the store hands out one new
+        # generation for every write, so the gate is no longer the first copy.
+        self.assertGreater(int(store.head(
+            f'runs/{RUN}/qualification/{FLEET[0]["name"]}/gate.json')['generation']), 1)
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -504,8 +533,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         campaign = Path(f'/mnt/tidehunter/{RUN}/campaign')
         self.assertEqual(remote.stage_tree.call_args_list,
-                         [mock.call(FLEET[0]['name'], campaign / 'build', '/local/build'),
-                          mock.call(FLEET[0]['name'], campaign / 'fixture', '/local/fixture')])
+                         [mock.call(FLEET[0]['name'], '/local/build', campaign / 'build'),
+                          mock.call(FLEET[0]['name'], '/local/fixture', campaign / 'fixture')])
         self.assertIn(mock.call(FLEET[0]['name'], campaign / 'fleet-state.json', path),
                       remote.send_file.call_args_list)
         self.assertIn(mock.call(FLEET[0]['name'], campaign / 'config.json', config),

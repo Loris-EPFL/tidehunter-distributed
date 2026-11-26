@@ -75,6 +75,48 @@ class MailboxUnknownHost(MailboxError):
     """The host is not one of this fleet's admitted guests."""
 
 
+def upload_identical(store, key, path, sha256):
+    """Upload one file and accept an existing object that holds the same bytes.
+
+    A re-create under the same deterministic run ID publishes the same package
+    again. The first attempt's object already exists, so an unconditional
+    `ifGenerationMatch=0` fails 412 before any host starts; identical bytes are
+    the same admitted input, not a conflict.
+    """
+    path = Path(path)
+    try:
+        return store.upload(key, path, content_type='application/octet-stream',
+                            if_generation_match=0)
+    except Exception as exc:
+        if getattr(exc, 'status', None) != 412:
+            raise
+    head = store.head(key)
+    if ((head.get('metadata') or {}).get('sha256') != sha256
+            or int(head.get('size', -1)) != path.stat().st_size):
+        raise MailboxError(f'{key}: immutable blob already holds other bytes')
+    return head
+
+
+def replace_object(store, key, data, *, content_type='application/json'):
+    """Publish mutable state: reuse identical bytes, else replace with a CAS write.
+
+    The run ID is deterministic, so a second create finds the previous attempt's
+    `runtime.json` and per-host `gate.json`. Identical bytes are reused. A
+    changed source or script replaces the object, because a fresh guest that
+    reads the stale gate aborts its bootstrap and never starts a worker.
+    """
+    try:
+        return store.put(key, data, content_type=content_type, if_generation_match=0)
+    except Exception as exc:
+        if getattr(exc, 'status', None) != 412:
+            raise
+    head = store.head(key)
+    if store.get(key, generation=head['generation']) == data:
+        return head
+    return store.put(key, data, content_type=content_type,
+                     if_generation_match=head['generation'])
+
+
 def sui_spec(owners, backends):
     """The runtime specification that admits the worker for the Sui campaign.
 
@@ -112,7 +154,10 @@ class MailboxExec(host_exec.HostExecution):
         self.timeout_seconds = timeout_seconds
         self.hosts = {}
         for host in self.fleet:
-            for value in (host['name'], host['internal_ip']):
+            # A driver may name a host by its fleet name or by either admitted
+            # NIC address: the control fabric of a verbs cell binds the RDMA
+            # address, and TCP binds the default-subnet address.
+            for value in (host['name'], host['internal_ip'], host['rdma_ip']):
                 if value in self.hosts:
                     raise ValueError(f'ambiguous campaign host {value}')
                 self.hosts[value] = host['index']
@@ -262,8 +307,7 @@ class MailboxExec(host_exec.HostExecution):
         with path.open('rb') as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                 digest.update(chunk)
-        meta = self.store.upload(key, path, content_type='application/octet-stream',
-                                 if_generation_match=0)
+        meta = upload_identical(self.store, key, path, digest.hexdigest())
         if (int(meta.get('size', -1)) != size
                 or (meta.get('metadata') or {}).get('sha256') != digest.hexdigest()):
             raise MailboxError(f'{key}: uploaded blob receipt mismatch')
@@ -397,14 +441,19 @@ def publish(store, config, state, package_dir, revision, spec, fleet, *, guest_r
     admission = dict(spec, mode='focused') if spec.get('suite') == 'sui' else spec
     receipt, _source = manual_campaign._admit_package(Path(package_dir).resolve(strict=True),
                                                       revision, admission)
-    package, _preparation = manual_campaign._stage(store, config['bucket'], state, receipt)
+    prefix = 'runs/' + state['run_id'] + '/'
+    key = prefix + 'package.tar'
+    package = dict(receipt, object_key=key)
+    package['generation'] = str(upload_identical(store, key, receipt['archive_path'],
+                                                 receipt['sha256'])['generation'])
+    replace_object(store, prefix + 'package.json', gcp_runtime._encode(package))
     runtime = gcp_runtime.build_runtime_config(
         dict(config, run_id=state['run_id']), fleet, package, spec, state['deadline'],
         run_id=state['run_id'], guest_roots=guest_roots)
-    # _put_once makes a retried publish compare bytes instead of failing 412.
-    meta = gcp_runtime._put_once(store, 'runs/' + state['run_id'] + '/runtime.json',
-                                 gcp_runtime._encode(runtime))
-    return runtime, {'object': 'runs/' + state['run_id'] + '/runtime.json',
+    # A re-create under the same run ID may carry a different source; the
+    # runtime must then replace the previous copy, and identical bytes reuse it.
+    meta = replace_object(store, prefix + 'runtime.json', gcp_runtime._encode(runtime))
+    return runtime, {'object': prefix + 'runtime.json',
                      'generation': str(meta['generation'])}
 
 
@@ -415,9 +464,8 @@ def release(store, state, host, script):
     gate = {'run_id': state['run_id'], 'source_sha256': state['source_sha256'],
             'instance_id': str(host['id']), 'deadline_utc': state['deadline'],
             'script': script, 'sha256': hashlib.sha256(script.encode()).hexdigest()}
-    gcp_runtime._put_once(
-        store, 'runs/' + state['run_id'] + '/qualification/' + host['name'] + '/gate.json',
-        gcp_runtime._encode(gate))
+    replace_object(store, 'runs/' + state['run_id'] + '/qualification/' + host['name']
+                   + '/gate.json', gcp_runtime._encode(gate))
     return gate
 
 
@@ -459,7 +507,7 @@ def dispatch(args, *, coordinator, script_relative, trees=(), files=(), values=N
     state = json.loads(state_path.read_text())
     campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
     for name, local in trees:
-        remote.stage_tree(coordinator, campaign / name, local)
+        remote.stage_tree(coordinator, local, campaign / name)
     for name, local in files:
         remote.send_file(coordinator, campaign / name, local)
     remote.send_file(coordinator, campaign / 'fleet-state.json', state_path)
@@ -515,8 +563,10 @@ def open_executor(args):
     if args.fleet_state is None:
         raise SystemExit('a campaign run needs --fleet-state, or --gcloud-ssh for a rehearsal')
     config = load_config(args.fleet_config)
-    provider = gcp_api.metadata_token if getattr(args, 'guest_token', False) else None
-    api = gcp_api.GoogleApi(config['project_id'], token_provider=provider)
+    # The workstation cannot read the campaign bucket as its own user. Every
+    # laptop-side client delegates to the campaign service account; the
+    # coordinator uses its own metadata identity.
+    api = gcp_api.campaign_client(config, guest=bool(getattr(args, 'guest_token', False)))
     return MailboxExec.from_state(args.fleet_state, api, bucket=config['bucket'])
 
 

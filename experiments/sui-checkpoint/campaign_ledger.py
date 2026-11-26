@@ -13,9 +13,13 @@ and SHA-256 locally and, when a store is supplied, the uploaded object.
 `running` at load time means the process died mid-cell; `reconcile` turns it
 into `failed` so `plan` reruns it.
 
+`not_reached` is a cell whose injection point the replay cannot produce (for
+example a synchronous flush edge that never appears); it is not a correctness
+result and it runs again like any other unfinished cell.
+
 `plan` is the resume decision:
   * `passed` with the current config hash is skipped;
-  * `failed`, `invalid`, `pending`, stale and interrupted cells run again;
+  * `failed`, `invalid`, `not_reached`, `pending`, stale and interrupted cells run again;
   * all members of a unit run together when any member must run;
   * `only` and `from_` narrow or shift the plan without breaking unit grouping.
 """
@@ -27,7 +31,7 @@ import socket
 import tempfile
 import time
 
-STATUSES = ('pending', 'running', 'passed', 'failed', 'invalid')
+STATUSES = ('pending', 'running', 'passed', 'failed', 'invalid', 'not_reached')
 PASSED = 'passed'
 
 
@@ -169,6 +173,12 @@ class Ledger:
 
     def invalidate(self, entry, reason):
         entry.update(status='invalid', failure=str(reason),
+                     finished_unix_ns=time.time_ns(), updated_ns=time.time_ns())
+        return entry
+
+    def not_reached(self, entry, reason):
+        """Record a cell the replay could not produce; not a failure."""
+        entry.update(status='not_reached', failure=str(reason),
                      finished_unix_ns=time.time_ns(), updated_ns=time.time_ns())
         return entry
 

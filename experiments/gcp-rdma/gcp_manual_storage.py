@@ -25,6 +25,11 @@ TRANSPORT = 'json-rest-with-SDK-delegation'
 MAX_JSON_BYTES = 16 * 1024 * 1024
 TOKEN_ATTEMPTS = 3
 TOKEN_CACHE_SECONDS = 60
+# A cold `gcloud auth print-access-token --impersonate-service-account` waits on
+# the SDK cache and the network. 30 s expired three attempts in a row after a
+# passed pair (26 November 2026), so the run aborted before it minted its own
+# receipt. One attempt may use 120 s; only the absolute deadline ends the wait.
+TOKEN_SOCKET_SECONDS = 120
 SOCKET_SECONDS = 10
 # An upload streams its body in 1 MiB chunks; one socket write sends one chunk.
 # With 10 s a chunk needs about 105 KiB/s, and a slower uplink fails the launch
@@ -143,7 +148,7 @@ class DelegatedArtifacts(ObjectStore):
                                        start_new_session=True)
             timed_out = False
             try:
-                timeout = min(30, self._remaining())
+                timeout = min(TOKEN_SOCKET_SECONDS, self._remaining())
                 stdout, _ = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True

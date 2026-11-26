@@ -53,6 +53,10 @@ import mailbox_exec
 import proc_sampler
 
 OWNER_READY_SECONDS = 120
+# The owner control plane listens here on every partition; `deployment.prepare`
+# adds the partition index to this base. The coordinator is a client and does
+# not listen, so it has no port of its own.
+OWNER_CONTROL_PORT = 9400
 BINARY_SET = {'sui-node-native', 'sui-node-remote', 'storage-node', 'state-audit',
               'rocksdb-audit'}
 INJECTOR = Path(__file__).resolve().parents[1] / 'sui-checkpoint/fault_inject.py'
@@ -68,10 +72,37 @@ CONTROLLER_LOSS_COUNTERS = {
 }
 CONTROLLER_LOSS_CASE = {'stage1': 'S1-4', 'stage2': 'M7'}
 MAX_CONTROLLER_LOSS_SAMPLES = 2048
+# The engine exports the write-resume family; the M7 cell proves resent frames
+# from these four deltas of one remote before/after scrape.
+RESUME_COUNTERS = ('resume_attempts_total', 'resume_rewrites_total',
+                   'resume_frames_total', 'resume_refused_total')
 
 
 class LaunchError(RuntimeError):
     pass
+
+
+class NotReached(LaunchError):
+    """A cell whose point the replay cannot produce; not a correctness failure."""
+
+
+def controller_loss_admission(point, tier):
+    """Refuse a point that this durability tier cannot produce at all."""
+    if point is None:
+        return
+    if point not in CONTROLLER_LOSS_POINTS:
+        raise ValueError('unknown controller-loss point')
+    if point == 'during-flush' and tier == 'native':
+        raise ValueError(
+            'during-flush is unreachable at the native tier: native forces '
+            'durable_at_completion, so the replay has no flush edge')
+
+
+def resume_deltas(delta):
+    """The four write-resume counter deltas of one injector before/after pair."""
+    counters = (delta or {}).get('by_counter') or {}
+    return {name: (counters[name] if isinstance(counters.get(name), (int, float)) else None)
+            for name in RESUME_COUNTERS}
 
 
 def live_window(owner_index):
@@ -144,12 +175,13 @@ class ControllerLoss:
     counter that the engine exports for that moment, and only after a completed
     checkpoint exists (the injector's own precondition). Every sample is kept:
     a point that never fires fails the cell with the observation series instead
-    of injecting at an unproven time.
+    of injecting at an unproven time. A synchronous `during-flush` point has no
+    guaranteed flush, so an unobserved point records the cell as not reached.
     """
     def __init__(self, *, point, host, address, service, service_max, transport,
                  metrics_url, rpc_address, output, nqn=None, timeout=30.0,
-                 gate_timeout=1200.0, probe_seconds=1.0, now=time.monotonic,
-                 latest=None, metrics=None):
+                 gate_timeout=1200.0, probe_seconds=1.0, not_reached=False,
+                 now=time.monotonic, latest=None, metrics=None):
         if point not in CONTROLLER_LOSS_POINTS:
             raise ValueError('unknown controller-loss point')
         self.point = point
@@ -164,6 +196,7 @@ class ControllerLoss:
         self.timeout = timeout
         self.gate_timeout = gate_timeout
         self.probe_seconds = probe_seconds
+        self.not_reached = not_reached
         self.now = now
         self.latest = latest or _latest_checkpoint
         self.metrics = metrics or _scrape_metrics
@@ -226,9 +259,14 @@ class ControllerLoss:
                                  reason=reason, gate_timeout=self.gate_timeout,
                                  samples=self.samples)
             self.write_evidence()
-            raise LaunchError(f'controller-loss point {self.point} was not observed '
-                              f'before its gate deadline: {reason}')
+            raise self.miss(f'not observed before its gate deadline: {reason}')
         return False
+
+    def miss(self, reason):
+        """The exception for a point this replay did not reach."""
+        if self.not_reached:
+            return NotReached('not reached: no flush in replay (' + reason + ')')
+        return LaunchError(f'controller-loss point {self.point} was {reason}')
 
     def argv(self, output):
         argv = [sys.executable, str(INJECTOR),
@@ -259,6 +297,7 @@ class ControllerLoss:
             transport=self.transport, nqn=self.nqn, injected=True,
             exit_code=code, stdout=out.decode('utf-8', 'replace')[-4000:],
             stderr=err.decode('utf-8', 'replace')[-4000:],
+            resume=resume_deltas((record or {}).get('live_delta')),
             gate=gate, samples=self.samples, injector=record)
         write_json(self.output / 'controller-loss' / f'{self.point}.json', record)
         self.done = True
@@ -308,7 +347,45 @@ def controller_loss_verdict(evidence):
         failures.append('live data-plane errors increased during the injection')
     elif (delta.get('namespace_connects') or 0) < 1:
         failures.append('no new verified controller connection followed the injection')
+    resume = evidence.get('resume') or resume_deltas(delta)
+    missing = sorted(name for name in RESUME_COUNTERS if resume.get(name) is None)
+    if missing:
+        failures.append('the remote scrape lacks the write-resume counters: '
+                        + ', '.join(missing))
     return failures
+
+
+def fleet_hosts(fleet, names, *, transport, live_transport):
+    """Resolve owner fleet names to their control and live-target addresses.
+
+    A campaign guest has two NICs: `internal_ip` on the default subnet and
+    `rdma_ip` on the falcon-rdma subnet. TCP uses the default subnet. A verbs
+    control fabric and NVMe/RDMA use the falcon-rdma subnet, because the verbs
+    provider binds the IRDMA NIC and `nvmet` exports its target there.
+    `prepare_external.py` writes the control listen address and, separately,
+    the live target pool address from these two lists.
+    """
+    names = list(names)
+    if not isinstance(fleet, (list, tuple)) or not fleet:
+        # A rehearsal passes reachable addresses instead of fleet names.
+        return names, names
+    by_name = {host['name']: host for host in fleet if isinstance(host, dict)}
+    verbs = deployment.canonical_transport(transport).get('fabric', {}).get('backend') == 'verbs'
+    control_key = 'rdma_ip' if verbs else 'internal_ip'
+    live_key = 'rdma_ip' if live_transport == 'rdma' else 'internal_ip'
+    control, live = [], []
+    for name in names:
+        host = by_name.get(name)
+        if host is None:
+            raise ValueError(f'{name}: not a host of this fleet state')
+        for key in (control_key, live_key):
+            if not isinstance(host.get(key), str) or not host[key]:
+                raise ValueError(f'{name}: fleet state has no {key}')
+        control.append(host[control_key])
+        live.append(host[live_key])
+    if len(set(control)) != len(control) or len(set(live)) != len(live):
+        raise ValueError('owner control and live-target addresses must be distinct')
+    return control, live
 
 
 def plan(coordinator, owners):
@@ -327,7 +404,7 @@ class SuiLauncher:
                  config_dir, resources, tier='native', owners=2, fragment_mib=8,
                  deadline=900, extra_run=(), transport='efa', live_transport='rdma',
                  coordinator_cache_mib=8, shard_cache_mib=0, schema=None,
-                 disk_sample_seconds=10, port=24000, ledger=None,
+                 disk_sample_seconds=10, port=OWNER_CONTROL_PORT, ledger=None,
                  cell_id='sui-replay', stage='stage1', resume=False,
                  store=None, bucket=None, prefix=None, write_profile_limit=0,
                  resident_reads=None, allow_local_ledger=False, controller_loss=None):
@@ -375,6 +452,13 @@ class SuiLauncher:
 
     # ---- admission -----------------------------------------------------
     def admit(self, hosts):
+        if self.controller_loss is not None:
+            controller_loss_admission(self.controller_loss.point, self.tier)
+            # The launcher owns the tier decision: only a synchronous replay can
+            # reach a flush edge, and only then is an unobserved point benign.
+            self.controller_loss.not_reached = (
+                self.controller_loss.point == 'during-flush'
+                and self.tier == 'synchronous')
         if set(self.manifest['binaries']) != BINARY_SET:
             raise ValueError('frozen build lacks the exact campaign executable set')
         for name, expected in self.manifest['binaries'].items():
@@ -408,11 +492,13 @@ class SuiLauncher:
             return
         if self.config_dir.exists():
             raise ValueError('external config directory must be fresh')
+        control, live = self.endpoints()
         command = [sys.executable, str(self.source / 'prepare_external.py'),
                    '--build', str(self.build_root), '--schema', str(self.schema),
                    '--output', str(self.config_dir), '--db-root', str(self.remote_root()),
                    '--guest-root', str(self.guest_root),
-                   '--hosts', ','.join(self.hosts), '--owners', str(self.owners),
+                   '--hosts', ','.join(control), '--live-hosts', ','.join(live),
+                   '--owners', str(self.owners),
                    '--port', str(self.port), '--transport', self.transport,
                    '--durability-tier', self.tier, '--live-transport', self.live_transport,
                    '--coordinator-cache-mib', str(self.coordinator_cache_mib),
@@ -425,6 +511,12 @@ class SuiLauncher:
         self.external = json.loads(manifest_path.read_text())
         if self.external.get('owners') != self.owners:
             raise ValueError('prepared owner count differs')
+
+    def endpoints(self):
+        """The owner control and live-target addresses this replay dials."""
+        return fleet_hosts(getattr(self.remote, 'fleet', None), self.hosts,
+                           transport=self.transport,
+                           live_transport=self.live_transport)
 
     def install(self):
         for record in self.external['hosts']:
@@ -623,11 +715,22 @@ class SuiLauncher:
         os.replace(temporary, path)
         return receipt
 
+    def not_reached(self, error):
+        """Record a cell the replay could not produce; it is not a failure."""
+        receipt = dict(complete=False, not_reached=True, status='not_reached',
+                       cell_id=self.cell_id, stage=self.stage, tier=self.tier,
+                       reason=str(error))
+        print(json.dumps(receipt))
+        return receipt
+
     def run(self, hosts):
         identity = self.identity()
         if self.ledger is None:
             self.admit(hosts)
-            return self.execute(hosts)
+            try:
+                return self.execute(hosts)
+            except NotReached as error:
+                return self.not_reached(error)
         previous = self.ledger.entries.get((self.stage, self.cell_id))
         if (self.resume and previous and previous['status'] == 'passed'
                 and previous['config_hash'] == identity):
@@ -654,6 +757,10 @@ class SuiLauncher:
                                          key=receipt['upload']['ledger']['key'])
             self.ledger.save()
             return receipt
+        except NotReached as error:
+            self.ledger.not_reached(entry, str(error))
+            self.ledger.save()
+            return self.not_reached(error)
         except BaseException as error:
             self.ledger.fail(entry, error)
             self.ledger.save()
@@ -709,9 +816,8 @@ class SuiLauncher:
                     self.write_resources(binding)
                     resources_written = True
                     if self.controller_loss is not None and not self.controller_loss.done:
-                        raise LaunchError(
-                            f'controller-loss point {self.controller_loss.point} was not '
-                            'observed before the replay requested its final evidence')
+                        raise self.controller_loss.miss(
+                            'not observed before the replay requested its final evidence')
                 if resources_written and (self.controller_loss is None
                                           or self.controller_loss.done):
                     break
@@ -738,6 +844,8 @@ class SuiLauncher:
                            self.build_root / 'build-manifest.json'))
         if self.controller_loss is not None:
             failures = controller_loss_verdict(self.controller_loss.evidence)
+            if not failures and not self.controller_loss.evidence.get('resume'):
+                failures.append('the controller-loss evidence lacks the resume deltas')
             results = json.loads((self.output / 'experiment/results.json').read_text())
             if results.get('complete') is not True:
                 failures.append('run.py did not record a complete replay')
@@ -784,7 +892,8 @@ def main():
     parser.add_argument('--fragment-mib', type=int, default=8)
     parser.add_argument('--deadline', type=int, default=900)
     parser.add_argument('--disk-sample-seconds', type=int, default=10)
-    parser.add_argument('--port', type=int, default=24000)
+    parser.add_argument('--port', type=int, default=OWNER_CONTROL_PORT,
+                        help='owner control port; each partition adds its index')
     parser.add_argument('--coordinator-cache-mib', type=int, default=8)
     parser.add_argument('--shard-cache-mib', type=int, default=0)
     parser.add_argument('--write-profile-limit', type=int, default=0,
@@ -837,6 +946,7 @@ def main():
     output = args.output.resolve()
     if args.controller_loss is not None:
         try:
+            controller_loss_admission(args.controller_loss, args.durability_tier)
             args.cell_id = controller_loss_cell_id(
                 args.stage, args.controller_loss, args.durability_tier, args.cell_id)
         except ValueError as error:
@@ -871,15 +981,19 @@ def main():
         resume_ledger.load()
         if store is not None:
             resume_ledger = upload_module.Evidence(store, prefix).merge(resume_ledger)
+    remote = mailbox_exec.open_executor(args)
     controller_loss = None
     if args.controller_loss is not None:
         owner = args.controller_loss_owner - 1
         service, service_max = live_window(owner)
+        _control, live = fleet_hosts(getattr(remote, 'fleet', None), hosts['owners'],
+                                     transport=args.transport,
+                                     live_transport=args.live_transport)
         rpc_address, metrics_address = controller_loss_addresses(args.fixture)
         controller_loss = ControllerLoss(
             point=args.controller_loss,
             host=args.controller_loss_host or hosts['coordinator'],
-            address=hosts['owners'][owner], service=service, service_max=service_max,
+            address=live[owner], service=service, service_max=service_max,
             transport=args.live_transport,
             metrics_url='http://' + metrics_address + '/metrics',
             rpc_address=rpc_address, output=output, nqn=args.controller_loss_nqn,
@@ -887,9 +1001,11 @@ def main():
             gate_timeout=(args.controller_loss_gate_timeout
                           if args.controller_loss_gate_timeout is not None
                           else 2 * args.deadline + 600.0),
-            probe_seconds=args.controller_loss_probe_seconds)
+            probe_seconds=args.controller_loss_probe_seconds,
+            not_reached=(args.controller_loss == 'during-flush'
+                         and args.durability_tier == 'synchronous'))
     launcher = SuiLauncher(
-        remote=mailbox_exec.open_executor(args),
+        remote=remote,
         build_root=args.build, fixture=args.fixture, output=output,
         guest_root=args.guest_root,
         stage_dir=args.stage_dir or output.with_name(output.name + '-stages'),
