@@ -180,6 +180,9 @@ pub struct LiveIo {
     next_completion_result: Option<i32>,
     #[cfg(test)]
     next_submit_result: Option<i32>,
+    /// Fails the next `submit_pending_write` like the kernel submit syscall.
+    #[cfg(test)]
+    next_pending_submit_result: Option<i32>,
     /// `(offset, len)` of every accepted write, in submission order. Test only:
     /// a resume test proves where a rewrite landed.
     #[cfg(test)]
@@ -250,6 +253,8 @@ impl LiveIo {
             next_completion_result: None,
             #[cfg(test)]
             next_submit_result: None,
+            #[cfg(test)]
+            next_pending_submit_result: None,
             #[cfg(test)]
             submitted_writes: Vec::new(),
             #[cfg(test)]
@@ -361,6 +366,12 @@ impl LiveIo {
     #[cfg(test)]
     pub(crate) fn override_submit_result(&mut self, errno: i32) {
         self.next_submit_result = Some(errno);
+    }
+    /// Test only: fail the next `submit_pending_write` with `errno`, as the
+    /// kernel submit syscall does for a queue whose controller was deleted.
+    #[cfg(test)]
+    pub(crate) fn override_pending_submit_result(&mut self, errno: i32) {
+        self.next_pending_submit_result = Some(errno);
     }
     /// Test only: `(offset, len)` of every accepted write, in order.
     #[cfg(test)]
@@ -941,6 +952,11 @@ impl LiveIo {
     /// Flush a leased writer's SQE without waiting for its CQE. False means a
     /// transient submit left work queued; the caller retains ownership and retries.
     pub(crate) fn submit_pending_write(&mut self) -> Result<bool, LiveIoError> {
+        #[cfg(test)]
+        if let Some(errno) = self.next_pending_submit_result.take() {
+            self.stats.errors += 1;
+            return Err(LiveIoError::Io(io::Error::from_raw_os_error(errno)));
+        }
         self.flush_submissions()?;
         Ok(self.ring.queued() == 0)
     }
@@ -980,9 +996,11 @@ impl LiveIo {
         self.stats.submit_calls += u64::from(submitted != 0);
         for _ in 0..submitted {
             let Some(token) = self.queued.pop_front() else {
+                eprintln!("live io: submitted SQE has no queued token");
                 std::process::abort()
             };
             let Some(op) = self.operations.get_mut(&token) else {
+                eprintln!("live io: queued token {token} has no operation");
                 std::process::abort()
             };
             self.stats.queue_ns += started.duration_since(op.queued).as_nanos();
@@ -1054,6 +1072,7 @@ impl LiveIo {
                 break;
             };
             let Some(op) = self.operations.remove(&user_data) else {
+                eprintln!("live io: CQE {user_data} has no operation");
                 std::process::abort()
             };
             let Operation {
@@ -1065,6 +1084,7 @@ impl LiveIo {
                 ..
             } = op;
             let Some(req) = self.requests.get_mut(&request) else {
+                eprintln!("live io: operation names missing request {request}");
                 std::process::abort()
             };
             if let (Some(trace), Some(queue)) = (&req.trace, self.trace_queue) {
@@ -1153,6 +1173,7 @@ impl LiveIo {
             req.remaining -= 1;
             if req.remaining == 0 {
                 let Some(mut req) = self.requests.remove(&request) else {
+                    eprintln!("live io: request {request} retired twice");
                     std::process::abort()
                 };
                 self.used_bytes -= req.charge;
@@ -1213,6 +1234,10 @@ impl LiveIo {
                     .values()
                     .any(|r| expired(r.deadline) || r.cancelled_at.is_some_and(expired)))
         {
+            eprintln!(
+                "live io: {} operations did not retire within the drain bound",
+                self.operations.len()
+            );
             std::process::abort();
         }
         Ok(())
@@ -1234,6 +1259,10 @@ impl LiveIo {
 impl Drop for LiveIo {
     fn drop(&mut self) {
         if !self.operations.is_empty() {
+            eprintln!(
+                "live io: dropped with {} operations outstanding",
+                self.operations.len()
+            );
             std::process::abort();
         }
     }

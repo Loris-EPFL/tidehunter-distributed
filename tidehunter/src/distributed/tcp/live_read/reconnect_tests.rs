@@ -263,6 +263,9 @@ fn a_lost_controller_read_reconnects_and_returns_the_same_member() {
     let cached = pool
         .cached_lease(&nqn)
         .expect("the read cached its controller");
+    // A local-file lease has no kernel controller to probe: the test reports
+    // the deletion the kernel would report.
+    cached.force_controller_lost(true);
     // The kernel cancelled the member with EIO, and the pinned controller is
     // not live: a stopped controller, not a media verdict.
     lane.cache.grants[index].controller_lost = Some(true);
@@ -404,8 +407,8 @@ fn a_lost_controller_inline_read_declines_without_quarantining() {
         "the dead grant is broken and marked lost"
     );
     assert!(
-        pool.cached_lease(&nqn).is_none(),
-        "the dead lease was evicted"
+        pool.cached_lease(&nqn).is_some(),
+        "the fixture lease reports live, so the decline never depended on its eviction"
     );
     // The lane now reconnects and serves the member.
     lane.submit(vec![a]);
@@ -417,6 +420,169 @@ fn a_lost_controller_inline_read_declines_without_quarantining() {
             .expect("the lane reconnects the lost controller"),
         &vec![frame],
         "the lane returns the identical member bytes"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// A namespace open that reports the deleting controller is the first evidence
+/// of a real controller loss and arrives before any EIO. The read must requeue
+/// its member and reconnect instead of failing the subsystem.
+#[test]
+fn a_verify_report_of_a_dead_controller_requeues_the_read() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.cache.fail_next_open_lost_controller();
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0].result.as_ref().expect("the lost open is retried"),
+        &vec![frame],
+        "the retry returns the identical member bytes"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a lost open must not quarantine the subsystem"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// One controller loss spends one reconnect for the whole request, not one per
+/// flight: two flights of the same request on the same dead lease both requeue.
+#[test]
+fn one_controller_loss_requeues_every_flight_of_the_request() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    lane.client
+        .live_config
+        .as_mut()
+        .expect("the lane client is configured")
+        .max_inflight_requests = 8;
+    let (a, b) = (lane.a, lane.b);
+    lane.submit(vec![a, b]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the warm read caches one subsystem grant for both files"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the warm read cached its grant");
+    lane.cache.grants[index].controller_lost = Some(true);
+    let first = lane.cache.next_flight;
+    lane.cache.grants[index]
+        .io
+        .override_completion_result(first, -libc::EIO);
+    lane.cache.grants[index]
+        .io
+        .override_completion_result(first + 1, -libc::EIO);
+    let (fa, fb) = (
+        member_frame(&lane.first, &a),
+        member_frame(&lane.second, &b),
+    );
+    lane.submit(vec![a, a, a, b, b, b]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("both lost flights of the request are requeued"),
+        &vec![fa.clone(), fa.clone(), fa, fb.clone(), fb.clone(), fb],
+        "every member of the request is served once"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "one loss never quarantines the subsystem"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The first read of another file of a subsystem reuses the cached grant. When
+/// that grant's controller is verifiably gone, the branch must retire it before
+/// the connect instead of handing the fresh grant the same dead lease.
+#[test]
+fn a_dead_stale_grant_is_dropped_before_the_connect() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    lane.submit(vec![a]);
+    assert!(lane.collect(1)[0].result.is_ok(), "the first file reads");
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    assert!(
+        lane.cache.grants[index].scope.slot(&lane.b).is_none(),
+        "the cached grant has no slot for the second file"
+    );
+    lane.cache.grants[index].controller_lost = Some(true);
+    let b = lane.b;
+    let frame = member_frame(&lane.second, &b);
+    lane.submit(vec![b]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the stale grant does not fail the read"),
+        &vec![frame],
+        "the second file reads through a fresh grant"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a dead stale grant is not a subsystem failure"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The first connect the pool makes for a read grant can fail while it verifies
+/// the controller it created. The read requeues and reconnects instead of
+/// failing the subsystem.
+#[test]
+fn a_lost_acquire_requeues_the_read() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    pool.fail_next_connect_lost();
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the lost acquire is retried"),
+        &vec![frame],
+        "the retry returns the identical member bytes"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a lost acquire must not quarantine the subsystem"
     );
     lane.cache.close(&mut lane.client, 1).unwrap();
     lane.client.live_pool = None;

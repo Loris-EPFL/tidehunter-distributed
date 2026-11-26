@@ -160,6 +160,25 @@ pub(super) fn original_removed(path: &Path, device: u64, inode: u64) -> io::Resu
     }
 }
 
+/// Whether the pinned controller is already retired, or retiring: its sysfs
+/// entry vanished or was replaced, or its kernel state is no longer `live`.
+///
+/// A store to `delete_controller` of a controller the kernel is already
+/// deleting reports `EACCES`; that is a teardown in progress, not a permission
+/// problem. An unreadable state proves nothing, so the caller keeps its error.
+pub(super) fn retired_already(path: &Path, device: u64, inode: u64) -> io::Result<bool> {
+    if original_removed(path, device, inode)? {
+        return Ok(true);
+    }
+    match attr(&path.join("state")) {
+        Ok(state) => Ok(state != "live"),
+        // The entry exists but lost its attributes, which a removed kobject
+        // leaves behind through an open directory descriptor.
+        Err(error) if vanished(&error) => Ok(true),
+        Err(error) => Err(with_context("read controller state", path, error)),
+    }
+}
+
 pub(super) fn wait_for_original_removal(
     path: &Path,
     device: u64,
@@ -200,6 +219,14 @@ pub(super) fn retire_controller(
                 match delete() {
                     Ok(()) => *state = DeletionState::Initiated,
                     Err(error) if vanished(&error) => {}
+                    Err(error)
+                        if error.kind() == io::ErrorKind::PermissionDenied
+                            && retired_already(controller_path, device, inode)? =>
+                    {
+                        // The kernel already accepted this controller's
+                        // teardown, so the attribute store is refused. Confirm
+                        // the removal below instead of reporting a failure.
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -208,10 +235,15 @@ pub(super) fn retire_controller(
             }
             Err(error)
                 if error.kind() == io::ErrorKind::InvalidData
-                    && original_removed(controller_path, device, inode)? =>
+                    && retired_already(controller_path, device, inode)? =>
             {
-                *state = DeletionState::Gone;
-                return Ok(());
+                // An identity check that fails while the controller is not live
+                // cannot prove another identity; its teardown is already in
+                // progress, so observe the removal below.
+                if original_removed(controller_path, device, inode)? {
+                    *state = DeletionState::Gone;
+                    return Ok(());
+                }
             }
             Err(error) => return Err(error),
         }

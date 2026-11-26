@@ -49,39 +49,133 @@ fn controller_name(name: &str) -> bool {
     name.strip_prefix("nvme")
         .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
+
+/// Why a pinned namespace failed verification.
+///
+/// The write and read paths resume from `ControllerLost` only: the kernel
+/// stopped, removed, or replaced the controller the lease pinned. A live
+/// controller or namespace whose identity or transport differs is a real
+/// mismatch and stays fatal.
+#[derive(Debug)]
+pub(crate) enum VerifyError {
+    ControllerLost,
+    Identity(&'static str),
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ControllerLost => f.write_str("pinned controller is not live"),
+            Self::Identity(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// A namespace the lease pinned can no longer use its controller.
+pub(crate) fn controller_lost_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        VerifyError::ControllerLost,
+    )
+}
+/// A live controller or namespace names another identity than the binding.
+pub(crate) fn identity_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, VerifyError::Identity(message))
+}
+fn vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
+}
+/// A sysfs read that failed because the entry vanished means the controller is
+/// gone, not that its identity differs.
+pub(crate) fn lost_if_vanished(error: io::Error) -> io::Error {
+    if vanished(&error) {
+        controller_lost_error()
+    } else {
+        error
+    }
+}
+fn read_attribute(path: &Path) -> io::Result<String> {
+    attribute(path).map_err(lost_if_vanished)
+}
+
+/// Whether `error` reports a controller the write or read path may reconnect.
+///
+/// Walks the source chain, so a context wrapper around the typed cause still
+/// classifies it. Never matches a message.
+pub(crate) fn controller_lost(error: &io::Error) -> bool {
+    let Some(cause) = error.get_ref() else {
+        return false;
+    };
+    let mut current: &(dyn std::error::Error + 'static) = cause;
+    loop {
+        if matches!(
+            current.downcast_ref::<VerifyError>(),
+            Some(VerifyError::ControllerLost)
+        ) {
+            return true;
+        }
+        match current.source() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
 fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::Result<()> {
-    let resolved = std::fs::canonicalize(sysfs)?;
+    verify_transport_at(
+        sysfs,
+        nqn,
+        transport,
+        Path::new("/sys/class/nvme"),
+        Path::new("/sys/class/nvme-subsystem"),
+    )
+}
+
+/// The transport check against explicit class roots, so a fixture can drive it.
+fn verify_transport_at(
+    sysfs: &Path,
+    nqn: &str,
+    transport: NvmeofTransport,
+    nvme_root: &Path,
+    subsystem_root: &Path,
+) -> io::Result<()> {
+    let resolved = std::fs::canonicalize(sysfs).map_err(lost_if_vanished)?;
     let parent = resolved
         .parent()
-        .ok_or_else(|| invalid("namespace has no sysfs parent"))?;
+        .ok_or_else(|| identity_error("namespace has no sysfs parent"))?;
     let name = parent
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| invalid("invalid namespace parent"))?;
+        .ok_or_else(|| identity_error("invalid namespace parent"))?;
     let expected = match transport {
         NvmeofTransport::Tcp => "tcp",
         NvmeofTransport::Rdma => "rdma",
     };
     let verify = |p: &Path| -> io::Result<()> {
-        if attribute(&p.join("subsysnqn"))? != nqn
-            || attribute(&p.join("transport"))? != expected
-            || attribute(&p.join("state"))? != "live"
+        if read_attribute(&p.join("subsysnqn"))? != nqn
+            || read_attribute(&p.join("transport"))? != expected
         {
-            return Err(invalid("controller identity or transport mismatch"));
+            return Err(identity_error("controller identity or transport mismatch"));
         }
-        Ok(())
+        match read_attribute(&p.join("state"))? {
+            state if state == "live" => Ok(()),
+            // A controller the kernel is deleting, resetting, or has stopped
+            // cannot serve I/O. The write and read paths reconnect from here.
+            _ => Err(controller_lost_error()),
+        }
     };
     if controller_name(name) {
-        if std::fs::canonicalize(Path::new("/sys/class/nvme").join(name))? != parent {
-            return Err(invalid("unregistered controller"));
+        if std::fs::canonicalize(nvme_root.join(name)).map_err(lost_if_vanished)? != parent {
+            return Err(controller_lost_error());
         }
         return verify(parent);
     }
     if !name.starts_with("nvme-subsys")
-        || std::fs::canonicalize(Path::new("/sys/class/nvme-subsystem").join(name))? != parent
-        || attribute(&parent.join("subsysnqn"))? != nqn
+        || std::fs::canonicalize(subsystem_root.join(name)).map_err(lost_if_vanished)? != parent
+        || read_attribute(&parent.join("subsysnqn"))? != nqn
     {
-        return Err(invalid("subsystem identity mismatch"));
+        return Err(identity_error("subsystem identity mismatch"));
     }
     let mut count = 0;
     for entry in std::fs::read_dir(parent)? {
@@ -93,16 +187,16 @@ fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::
         }
         count += 1;
         if count > 1 {
-            return Err(invalid("multiple controllers"));
+            return Err(identity_error("multiple controllers"));
         }
-        let controller = std::fs::canonicalize(entry.path())?;
-        if controller != std::fs::canonicalize(Path::new("/sys/class/nvme").join(name))? {
-            return Err(invalid("unregistered controller"));
+        let controller = std::fs::canonicalize(entry.path()).map_err(lost_if_vanished)?;
+        if controller != std::fs::canonicalize(nvme_root.join(name)).map_err(lost_if_vanished)? {
+            return Err(controller_lost_error());
         }
         verify(&controller)?;
     }
     if count != 1 {
-        return Err(invalid("no live controller"));
+        return Err(controller_lost_error());
     }
     Ok(())
 }
@@ -156,7 +250,11 @@ impl LiveNamespace {
             && bytes.is_multiple_of(u64::from(block_size))
     }
     pub fn open(binding: &LiveNamespaceBinding) -> io::Result<Self> {
-        Self::verify_opened_device(binding, Self::open_device(binding)?)
+        // The lease resolved this path on the pinned controller. A node that
+        // vanished since then is that controller's loss, not an identity
+        // mismatch: the write and read paths reconnect from it.
+        let file = Self::open_device(binding).map_err(lost_if_vanished)?;
+        Self::verify_opened_device(binding, file)
     }
 
     /// Open separately so readiness retries cannot swallow verification errors.
@@ -182,7 +280,7 @@ impl LiveNamespace {
     ) -> io::Result<Self> {
         let meta = file.metadata()?;
         if !meta.file_type().is_block_device() {
-            return Err(invalid("not a block namespace"));
+            return Err(identity_error("not a block namespace"));
         }
         let sysfs = PathBuf::from(format!(
             "/sys/dev/block/{}",
@@ -208,18 +306,18 @@ impl LiveNamespace {
             u[14],
             u[15]
         );
-        if attribute(&sysfs.join("wwid"))? != format!("uuid.{uuid}")
-            || attribute(&sysfs.join("uuid"))? != uuid
-            || attribute(&sysfs.join("nsid"))? != binding.nsid.to_string()
+        if read_attribute(&sysfs.join("wwid"))? != format!("uuid.{uuid}")
+            || read_attribute(&sysfs.join("uuid"))? != uuid
+            || read_attribute(&sysfs.join("nsid"))? != binding.nsid.to_string()
         {
-            return Err(invalid("namespace identity mismatch"));
+            return Err(identity_error("namespace identity mismatch"));
         }
         verify_transport(&sysfs, &binding.nqn, binding.transport)?;
         let fd = file.as_raw_fd();
         // SAFETY: F_GETFL reads status flags from the live descriptor.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(lost_if_vanished(io::Error::last_os_error()));
         }
         let expected_mode = if binding.access == LiveNamespaceAccess::ReadWrite {
             libc::O_RDWR
@@ -227,33 +325,33 @@ impl LiveNamespace {
             libc::O_RDONLY
         };
         if flags & sys::direct_io_flag()? == 0 || flags & libc::O_ACCMODE != expected_mode {
-            return Err(invalid("namespace descriptor access mismatch"));
+            return Err(identity_error("namespace descriptor access mismatch"));
         }
         let mut readonly: libc::c_int = 0;
         let mut block_size: libc::c_int = 0;
         let mut bytes: u64 = 0;
         // SAFETY: BLKROGET writes an int to readonly; fd and the output stay live.
         if unsafe { libc::ioctl(fd, 0x125e, &mut readonly) } < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(lost_if_vanished(io::Error::last_os_error()));
         }
         // SAFETY: BLKSSZGET writes an int to the valid pointer.
         if unsafe { libc::ioctl(fd, 0x1268, &mut block_size) } < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(lost_if_vanished(io::Error::last_os_error()));
         }
         // SAFETY: BLKGETSIZE64 writes a u64 to the valid pointer.
         if unsafe { libc::ioctl(fd, 0x80081272, &mut bytes) } < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(lost_if_vanished(io::Error::last_os_error()));
         }
         // SAFETY: NVME_IOCTL_ID uses the open descriptor without a pointer.
         let nsid = unsafe { libc::ioctl(fd, 0x4e40) };
         if nsid < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(lost_if_vanished(io::Error::last_os_error()));
         }
         if block_size != binding.block_size as i32
             || bytes != binding.bytes
             || nsid as u32 != binding.nsid
         {
-            return Err(invalid("namespace geometry or access mismatch"));
+            return Err(identity_error("namespace geometry or access mismatch"));
         }
         let mut identify = [0u8; 4096];
         let mut cmd = NvmeAdminCommand {
@@ -270,7 +368,7 @@ impl LiveNamespace {
             return Err(io::Error::last_os_error());
         }
         if result != 0 {
-            return Err(invalid("target identify failed"));
+            return Err(identity_error("target identify failed"));
         }
         verify_access_policy(binding.access, readonly != 0, identify[99] & 1 != 0)?;
         Ok(Self {

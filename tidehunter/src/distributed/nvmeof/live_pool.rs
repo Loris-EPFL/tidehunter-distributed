@@ -66,6 +66,10 @@ pub struct LiveControllerLease {
     namespaces: Mutex<LeaseNamespaces>,
     #[cfg(any(test, feature = "test-utils"))]
     local_fixture: bool,
+    /// Test override of the liveness probe: 0 uses the real probe, 1 reports
+    /// lost, 2 reports live. A local-file fixture has no kernel controller.
+    #[cfg(test)]
+    controller_lost_override: std::sync::atomic::AtomicU8,
 }
 impl LiveControllerLease {
     /// The namespace this controller was connected and verified with. Under a
@@ -87,6 +91,15 @@ impl LiveControllerLease {
     /// check only: a caller runs it after an `EIO`/`EBADF` to tell a media
     /// verdict from a controller the kernel has already stopped.
     pub(crate) fn controller_lost(&self) -> bool {
+        #[cfg(test)]
+        match self
+            .controller_lost_override
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
         #[cfg(any(test, feature = "test-utils"))]
         if self.local_fixture {
             return false;
@@ -99,6 +112,15 @@ impl LiveControllerLease {
             Err(error) => error.kind() == io::ErrorKind::NotFound,
         }
     }
+    /// Test only: drive the liveness probe without a kernel controller.
+    #[cfg(test)]
+    pub(crate) fn force_controller_lost(&self, lost: bool) {
+        self.controller_lost_override.store(
+            if lost { 1 } else { 2 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     pub fn open_namespace(&self) -> io::Result<LiveNamespace> {
         #[cfg(any(test, feature = "test-utils"))]
         if self.local_fixture {
@@ -265,6 +287,10 @@ pub struct LiveControllerPool {
     changed: Condvar,
     #[cfg(any(test, feature = "test-utils"))]
     local_targets: Mutex<HashMap<LocalTargetKey, std::path::PathBuf>>,
+    /// Test only: the next connect reports a controller the kernel stopped,
+    /// exactly as a first-connect verify does.
+    #[cfg(test)]
+    fail_next_connect_lost: std::sync::atomic::AtomicBool,
 }
 impl LiveControllerPool {
     /// Local-file pool fixture. It does not create or qualify a kernel controller.
@@ -309,6 +335,8 @@ impl LiveControllerPool {
             resolver: controller.resolver(),
             namespaces: Mutex::new(HashMap::new()),
             local_fixture: true,
+            #[cfg(test)]
+            controller_lost_override: std::sync::atomic::AtomicU8::new(0),
         });
         cache_local_member(&lease, target, LiveNamespaceAccess::ReadShared, path)?;
         let mut identity = Identity {
@@ -378,6 +406,8 @@ impl LiveControllerPool {
             changed: Condvar::new(),
             #[cfg(any(test, feature = "test-utils"))]
             local_targets: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_next_connect_lost: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -492,36 +522,101 @@ impl LiveControllerPool {
         }
     }
 
-    /// Evict the cached controller of one subsystem after its data path broke,
-    /// so the next acquisition connects a fresh controller instead of reusing
-    /// the dead lease and its namespace. The namespace cache is cleared with the
-    /// entry, so the old lease can open no further member.
+    /// Evict the cached controller of one subsystem after its data path broke.
     ///
-    /// The entry is retired even while a detached queue still holds the lease:
-    /// the kernel has already stopped that controller, so no new I/O can use
-    /// it. A failed delete restores the entry unusable and returns the error; a
-    /// caller that is resuming a write must then fail-stop.
+    /// Retires the entry only when its lease is verifiably not live: a healthy
+    /// replacement another lane cached is left alone. `deadline` is the
+    /// teardown's own bound (the callers pass `connect_timeout_ms`), never a
+    /// nearly spent operation budget. A delete that does not confirm removal
+    /// while the lease is still verifiably not live drops the entry anyway: the
+    /// durable intent stays in the registry and the next connect reconciles it,
+    /// so a slow teardown never quarantines the subsystem.
     pub(crate) fn evict_lost(&self, nqn: &str, deadline: Instant) -> io::Result<()> {
         let key = nqn.to_owned();
+        let lease = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("controller pool poisoned"))?;
+            match state.entries.get(&key) {
+                // Nothing cached: the next acquisition connects its controller.
+                None => return Ok(()),
+                // A pending connect owns its entry, a closing one is already
+                // being retired, and a quarantined outcome has no controller.
+                Some(Entry::Pending(_) | Entry::Closing { .. } | Entry::Quarantined) => {
+                    return Ok(());
+                }
+                Some(Entry::Ready { lease, .. }) => lease.clone(),
+            }
+        };
+        // The probe reads sysfs, so it runs with no pool lock held.
+        if !lease.controller_lost() {
+            return Ok(());
+        }
+        let controller = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| invalid("controller pool poisoned"))?;
+            match state.entries.get(&key) {
+                Some(Entry::Ready { lease: current, .. }) if Arc::ptr_eq(current, &lease) => {}
+                // Another lane retired or replaced it between the probe and now.
+                _ => return Ok(()),
+            }
+            Self::begin_close(&mut state, &key)?
+        };
+        let mut controller = controller;
+        let result = controller.disconnect(deadline);
+        let remaining_lost = result.is_err() && lease.controller_lost();
         let mut state = self
             .state
             .lock()
             .map_err(|_| invalid("controller pool poisoned"))?;
-        match state.entries.get(&key) {
-            // Nothing cached: the next acquisition connects its own controller.
-            None => return Ok(()),
-            // A pending connect owns its entry, a closing one is already being
-            // retired, and a quarantined outcome has no controller to retire.
-            // The caller's next open observes the same state it would without
-            // this eviction.
-            Some(Entry::Pending(_) | Entry::Closing { .. } | Entry::Quarantined) => return Ok(()),
-            Some(Entry::Ready { .. }) => {}
+        if result.is_ok() || remaining_lost {
+            state.entries.remove(&key);
+        } else if let Some(Entry::Closing { identity, lease }) = state.entries.remove(&key) {
+            // The lease is live again, so the delete failed for another reason:
+            // keep the controller for reconciliation, unusable until then.
+            state.entries.insert(
+                key.clone(),
+                Entry::Ready {
+                    identity,
+                    lease,
+                    controller,
+                    usable: false,
+                },
+            );
         }
-        let controller = Self::begin_close(&mut state, &key)?;
-        let (state, result) =
-            self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
+        self.changed.notify_all();
         drop(state);
-        result
+        if result.is_ok() || remaining_lost {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    /// Test only: the next connect fails with the typed lost-controller error,
+    /// as a first connect that verifies a controller the kernel stopped does.
+    #[cfg(test)]
+    pub(crate) fn fail_next_connect_lost(&self) {
+        self.fail_next_connect_lost
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the subsystem's cached controller is verifiably not live. Reads
+    /// sysfs, so a caller runs it only after an acquisition failed.
+    pub(crate) fn entry_lost(&self, nqn: &str) -> bool {
+        let lease = {
+            let Ok(state) = self.state.lock() else {
+                return false;
+            };
+            match state.entries.get(nqn) {
+                Some(Entry::Ready { lease, .. }) => lease.clone(),
+                _ => return false,
+            }
+        };
+        lease.controller_lost()
     }
 
     /// The lease a subsystem currently caches, if it is `Ready`. A test reads
@@ -573,6 +668,13 @@ impl LiveControllerPool {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
+        #[cfg(test)]
+        if self
+            .fail_next_connect_lost
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(crate::distributed::nvmeof::live_namespace::controller_lost_error());
+        }
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(path) = self
             .local_targets
@@ -805,6 +907,8 @@ impl LiveControllerPool {
                         .lock()
                         .map_err(|_| invalid("local target map poisoned"))?
                         .contains_key(&(target.nqn.clone(), target.nsid)),
+                    #[cfg(test)]
+                    controller_lost_override: std::sync::atomic::AtomicU8::new(0),
                 });
                 state.entries.insert(
                     key,

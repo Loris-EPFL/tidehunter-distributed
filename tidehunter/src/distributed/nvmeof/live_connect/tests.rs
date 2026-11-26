@@ -140,7 +140,12 @@ fn old_connect_target_defaults_geometry_and_pins_connect_options() {
     assert_eq!(target.geometry, LiveQueueGeometry::default());
     let expected = "nqn=nqn.2026-01.test:wal,transport=tcp,traddr=127.0.0.1,trsvcid=4420,hostnqn=nqn.2026-01.test:host,hostid=02020202-0202-0202-0202-020202020202,ctrl_loss_tmo=0,keep_alive_tmo=5,nr_io_queues=4,queue_size=128";
     assert_eq!(
-        connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+        connect_options(
+            &target,
+            "nqn.2026-01.test:host",
+            [2; 16],
+            KEEP_ALIVE_TMO_SECS
+        ),
         expected
     );
     target.geometry = LiveQueueGeometry {
@@ -149,13 +154,23 @@ fn old_connect_target_defaults_geometry_and_pins_connect_options() {
         poll_queues: 1,
     };
     assert_eq!(
-        connect_options(&target, "nqn.2026-01.test:host", [2; 16]),
+        connect_options(
+            &target,
+            "nqn.2026-01.test:host",
+            [2; 16],
+            KEEP_ALIVE_TMO_SECS
+        ),
         expected.replace(
             "nr_io_queues=4,queue_size=128",
             "nr_io_queues=1,queue_size=32,nr_poll_queues=1"
         )
     );
-    let other = connect_options(&target, "nqn.2026-01.test:other-owner", [3; 16]);
+    let other = connect_options(
+        &target,
+        "nqn.2026-01.test:other-owner",
+        [3; 16],
+        KEEP_ALIVE_TMO_SECS,
+    );
     assert!(other.contains(
         "hostnqn=nqn.2026-01.test:other-owner,hostid=03030303-0303-0303-0303-030303030303"
     ));
@@ -1147,6 +1162,7 @@ fn adoption_registry(temp: &Path) -> (LiveConnectionRegistry, PathBuf) {
         &controllers,
         &temp.join("no-udev-queue"),
         RegistryMode::Adopt,
+        KEEP_ALIVE_TMO_SECS,
     )
     .unwrap();
     (registry, controllers)
@@ -1481,6 +1497,7 @@ fn a_crash_after_reconcile_leaves_the_adoptable_controller_and_intent() {
         &root,
         &temp.path().join("no-udev-queue"),
         RegistryMode::Adopt,
+        KEEP_ALIVE_TMO_SECS,
     )
     .unwrap();
     assert!(
@@ -1556,7 +1573,7 @@ fn already_connected_outcome_retries_only_when_no_controller_remains() {
 #[test]
 fn connect_options_never_request_a_duplicate_controller() {
     let target = adoption_target("nqn.2026-01.test:wal", 1);
-    let options = connect_options(&target, ADOPT_HOST, ADOPT_HOST_ID);
+    let options = connect_options(&target, ADOPT_HOST, ADOPT_HOST_ID, KEEP_ALIVE_TMO_SECS);
     assert!(
         !options.contains("duplicate_connect"),
         "a second controller for one identity must be rejected by the kernel: {options}"
@@ -1644,4 +1661,188 @@ fn changed_endpoint_declines_adoption_and_still_retires_the_controller() {
         "the declined controller is retired with the intent's own endpoint"
     );
     assert!(!intent_path.exists());
+}
+
+/// The CI cell's teardown wrote `delete_controller` through a pinned directory
+/// descriptor after the kernel had already stopped the controller, and the
+/// store returned `EACCES`. That is a teardown already accepted, not a failure:
+/// the state machine confirms the removal instead of reporting the store.
+#[test]
+fn retirement_accepts_a_refused_delete_once_the_controller_is_not_live() {
+    let temp = tempdir::TempDir::new("controller-retire-eacces").unwrap();
+    let path = temp.path().join("controller");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("state"), "deleting\n").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut state = DeletionState::NotStarted;
+    retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + PROGRESS_CAP,
+        || Ok(()),
+        || {
+            // The kernel refuses the store and finishes the teardown.
+            std::fs::remove_dir_all(&path).unwrap();
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        },
+    )
+    .unwrap();
+    assert_eq!(state, DeletionState::Gone);
+    assert!(!path.exists());
+}
+
+/// A refused store on a controller that is still live is a real permission
+/// failure and must keep its error.
+#[test]
+fn retirement_keeps_a_refused_delete_of_a_live_controller() {
+    let temp = tempdir::TempDir::new("controller-retire-live-eacces").unwrap();
+    let path = temp.path().join("controller");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("state"), "live\n").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut state = DeletionState::NotStarted;
+    let error = retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + PROGRESS_CAP,
+        || Ok(()),
+        || Err(io::Error::from_raw_os_error(libc::EACCES)),
+    )
+    .expect_err("a live controller refuses the store for another reason");
+    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    assert_eq!(state, DeletionState::Uncertain);
+}
+
+/// A deleting controller whose removal does not confirm within the deadline
+/// keeps uncertainty instead of reporting the refused store.
+#[test]
+fn retirement_observes_a_deleting_controller_until_its_deadline() {
+    let temp = tempdir::TempDir::new("controller-retire-deleting").unwrap();
+    let path = temp.path().join("controller");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("state"), "deleting\n").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut state = DeletionState::NotStarted;
+    let error = retire_controller(
+        &mut state,
+        &path,
+        metadata.dev(),
+        metadata.ino(),
+        Instant::now() + EXPECTED_TIMEOUT,
+        || Ok(()),
+        || Err(io::Error::from_raw_os_error(libc::EACCES)),
+    )
+    .expect_err("the removal never confirms");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(state, DeletionState::Uncertain);
+}
+
+/// The resolver's own identity check reports a vanished or replaced controller
+/// as the typed lost cause, so a reconnect classifies it like an EIO.
+#[test]
+fn resolver_verify_types_a_vanished_or_replaced_controller_as_lost() {
+    let temp = tempdir::TempDir::new("resolver-verify-lost").unwrap();
+    let controllers = temp.path().join("controllers");
+    let controller = controllers.join("nvme7");
+    std::fs::create_dir_all(&controller).unwrap();
+    let target = LiveConnectTarget {
+        nqn: "nqn.2026-01.test:sub".into(),
+        uuid: [1; 16],
+        nsid: 1,
+        bytes: 4096,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: Default::default(),
+    };
+    let host_nqn = "nqn.2026-01.test:host";
+    let host_id = [2; 16];
+    let directory = File::open(&controller).unwrap();
+    let metadata = directory.metadata().unwrap();
+    let write = |hostnqn: &str| {
+        std::fs::write(controller.join("subsysnqn"), "nqn.2026-01.test:sub\n").unwrap();
+        std::fs::write(controller.join("transport"), "tcp\n").unwrap();
+        std::fs::write(controller.join("hostnqn"), format!("{hostnqn}\n")).unwrap();
+        std::fs::write(
+            controller.join("hostid"),
+            "02020202-0202-0202-0202-020202020202\n",
+        )
+        .unwrap();
+        std::fs::write(
+            controller.join("address"),
+            "traddr=127.0.0.1,trsvcid=4420\n",
+        )
+        .unwrap();
+    };
+    write(host_nqn);
+    let resolver = LiveNamespaceResolver {
+        target: target.clone(),
+        host_nqn: host_nqn.into(),
+        host_id,
+        name: "nvme7".into(),
+        directory,
+        inode: metadata.ino(),
+        device: metadata.dev(),
+        queue: OnceLock::new(),
+        controller_root: controllers.clone(),
+        udev_queue: temp.path().join("no-udev-queue"),
+        keep_alive_tmo: KEEP_ALIVE_TMO_SECS,
+    };
+    resolver.verify().expect("the matching controller verifies");
+    // A live controller with another host identity is a real mismatch.
+    write("nqn.2026-01.test:other");
+    let error = resolver
+        .verify()
+        .expect_err("another host identity is fatal");
+    assert!(!crate::distributed::nvmeof::live_namespace::controller_lost(&error));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    // The same name resolving to a replacement object is the lost cause.
+    std::fs::remove_dir_all(&controller).unwrap();
+    std::fs::create_dir_all(&controller).unwrap();
+    let error = resolver
+        .verify()
+        .expect_err("a replacement object cannot be the pinned controller");
+    assert!(
+        crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "a replaced controller is lost: {error}"
+    );
+    // A vanished name is lost as well.
+    std::fs::remove_dir_all(&controller).unwrap();
+    let error = resolver
+        .verify()
+        .expect_err("a vanished controller is lost");
+    assert!(crate::distributed::nvmeof::live_namespace::controller_lost(
+        &error
+    ));
+}
+
+/// The keep-alive never outlasts the resume budget it was chosen for.
+#[test]
+fn keep_alive_fits_the_configured_resume_budget() {
+    assert_eq!(super::keep_alive_tmo(50), 1);
+    assert_eq!(super::keep_alive_tmo(1_000), 2);
+    assert_eq!(super::keep_alive_tmo(2_000), 4);
+    assert_eq!(super::keep_alive_tmo(2_500), 5);
+    assert_eq!(super::keep_alive_tmo(30_000), 5);
+    let target: LiveConnectTarget = serde_json::from_value(serde_json::json!({
+        "nqn": "nqn.2026-01.test:wal", "uuid": vec![1; 16], "nsid": 1,
+        "bytes": 4096, "block_size": 4096, "address": "127.0.0.1",
+        "service": 4420, "transport": "tcp"
+    }))
+    .unwrap();
+    let options = connect_options(
+        &target,
+        "nqn.2026-01.test:host",
+        [2; 16],
+        super::keep_alive_tmo(1_000),
+    );
+    assert!(
+        options.contains("keep_alive_tmo=2"),
+        "the derived keep-alive reaches the connect options: {options}"
+    );
 }

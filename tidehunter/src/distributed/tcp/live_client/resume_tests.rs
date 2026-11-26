@@ -13,6 +13,11 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Linux's `EREMOTEIO`. `libc` has no such constant on every target, and the
+/// off-Linux type-check compiles this file, so the fixture names the value the
+/// Linux device returns.
+const EREMOTEIO: i32 = 121;
+
 /// One leased write client of `fixture` with the resume enabled.
 ///
 /// The I/O deadline is the resume's own budget, so it is set far above any real
@@ -891,7 +896,7 @@ fn eremoteio_fail_stops_even_when_the_controller_is_gone() {
         .drain_leased_flights(&mut released, None)
         .expect("the first frame completes");
     client.leased_test_controller_lost(true);
-    client.leased_test_fail_write(-libc::EREMOTEIO);
+    client.leased_test_fail_write(-EREMOTEIO);
     submit(&mut client, &fixture, 1);
     let error = client
         .drain_leased_flights(&mut released, None)
@@ -937,6 +942,9 @@ fn data_break_evicts_the_cached_controller_before_the_reopen() {
     let cached = pool
         .cached_lease(&nqn)
         .expect("the first queue cached its controller");
+    // A local-file lease has no kernel controller to probe: the test reports
+    // the deletion the kernel would report.
+    cached.force_controller_lost(true);
     // A written, released, but unadopted frame gives the resume a suffix to
     // rewrite through the controller it reconnects.
     submit(&mut client, &fixture, 1);
@@ -993,6 +1001,9 @@ fn eio_resume_fails_stop_when_the_lease_lapses_mid_episode() {
         .binding
         .nqn
         .clone();
+    pool.cached_lease(&nqn)
+        .expect("the first queue cached its controller")
+        .force_controller_lost(true);
     let validity = Arc::new(LeaseValidity::fresh_for_test());
     client.set_lease_validity(Arc::clone(&validity));
     // A written, released, but unadopted frame makes the resume rewrite, so the
@@ -2451,4 +2462,196 @@ fn lost_prelease_reply_is_answered_with_the_same_reservation() {
     for (sequence, (_, receipts)) in released.iter().enumerate() {
         assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
     }
+}
+
+/// A namespace open that reports the deleting controller is the first evidence
+/// a real controller loss produces, and it arrives before any submission can
+/// return `EIO`. It must take the same data break: one resume, the unadopted
+/// suffix rewritten byte-identically, and no fail-stop.
+#[test]
+fn a_verify_report_of_a_dead_controller_resumes_before_any_eio() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first frame");
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the second frame completes");
+    let (start, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let clean = owned_bytes(&client, start, cursor);
+    tear_retained_tail(&client, cursor);
+    // Drop the bound queue, so the next submission binds one and its namespace
+    // verify sees the deleting controller.
+    client.live_writer = None;
+    client.leased_test_fail_next_queue_open();
+    submit(&mut client, &fixture, 2);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the verify failure is resumed");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the rewritten suffix");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume episode");
+    assert_eq!(
+        counts.resume_rewrites, 1,
+        "the unadopted frame is rewritten"
+    );
+    assert_eq!(counts.resume_frames, 1, "exactly one frame was resent");
+    assert_eq!(counts.resume_refused, 0, "the resume was not refused");
+    assert!(
+        !client.live_write_failed,
+        "a resumed verify failure never poisons the writer"
+    );
+    assert_eq!(
+        owned_bytes(&client, start, cursor),
+        clean,
+        "the rewritten suffix is byte-identical"
+    );
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// A sampled group takes the extra `submit_pending_write` syscall. A controller
+/// lost on that syscall must resume exactly as an untraced submission does;
+/// tracing must not change the outcome of the same kernel error.
+#[test]
+fn a_sampled_group_resumes_a_lost_controller_on_submit() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first frame");
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_pending_submit(libc::EIO);
+    let timeline = WriteTimeline::default();
+    timeline.arm(1, 1).expect("the timeline arms one sample");
+    let batch = fixture.batch(1);
+    let sample = timeline.begin(0).expect("the sampled operation begins");
+    timeline.operation(sample, batch.id().operation);
+    timeline.batch(batch.id().operation, batch.version());
+    let receipts = client
+        .submit_and_drain_leased_group(1, vec![batch], &timeline, 2)
+        .expect("the sampled group resumes the lost controller");
+    assert_eq!(receipts.len(), 1, "one durable batch");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume episode");
+    assert_eq!(counts.resume_refused, 0, "the resume was not refused");
+    assert!(
+        !client.live_write_failed,
+        "a resumed sampled submit never poisons the writer"
+    );
+    assert_reads_back(&fixture, &fixture.batch(1), &receipts[0]);
+}
+
+/// The first connect the pool makes for a write queue can fail while it
+/// verifies the controller it created. That is the same data break as a failed
+/// submission, and the resume must rewrite the unadopted suffix through the
+/// controller it reconnects.
+#[test]
+fn a_lost_acquire_resumes_the_write() {
+    use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
+    use crate::distributed::nvmeof::live_connect::{LiveConnectionRegistry, RegistryMode};
+    use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
+    use crate::distributed::nvmeof::live_pool::LiveControllerPool;
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the first frame");
+    // Route the write queue through a controller pool, so the acquire path is
+    // the one that fails.
+    let (binding, segment) = {
+        let extent = client.live_leased.current.as_ref().expect("an open extent");
+        (
+            extent.lease.binding.clone(),
+            extent.lease.extent.segment.clone(),
+        )
+    };
+    let dir = tempdir::TempDir::new("w1-acquire-loss").expect("a private pool directory");
+    let registry = LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire)
+        .expect("a fresh connection registry");
+    let pool = Arc::new(LiveControllerPool::new(registry, 2, 1).expect("a controller pool"));
+    let target = LiveConnectTarget {
+        nqn: binding.nqn.clone(),
+        uuid: binding.uuid,
+        nsid: binding.nsid,
+        bytes: binding.bytes,
+        block_size: binding.block_size,
+        address: binding.address.clone(),
+        service: binding.service,
+        transport: binding.transport,
+        geometry: client
+            .live_config
+            .as_ref()
+            .expect("a configured writer")
+            .queue_geometry,
+    };
+    pool.register_local_target(
+        &target,
+        LiveNamespaceAccess::ReadWrite,
+        segment.path.clone(),
+    )
+    .expect("the fixture member");
+    client.set_live_pool(pool.clone());
+    client.live_write_local_fixture = false;
+    // One written, released, unadopted frame gives the resume a suffix.
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the second frame completes");
+    let (start, cursor, _, _) = client.leased_test_extent_ends().expect("an open extent");
+    let clean = owned_bytes(&client, start, cursor);
+    tear_retained_tail(&client, cursor);
+    // The next rebind's first connect verifies a controller the kernel stopped.
+    client.live_writer = None;
+    pool.fail_next_connect_lost();
+    submit(&mut client, &fixture, 2);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the lost acquire is resumed");
+    client
+        .settle_leased_extent(&mut released, None)
+        .expect("the owner adopts the rewritten suffix");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 1, "one resume episode");
+    assert_eq!(
+        counts.resume_rewrites, 1,
+        "the unadopted frame is rewritten"
+    );
+    assert_eq!(counts.resume_frames, 1, "exactly one frame was resent");
+    assert!(
+        !client.live_write_failed,
+        "a resumed acquire failure never poisons the writer"
+    );
+    assert_eq!(
+        owned_bytes(&client, start, cursor),
+        clean,
+        "the rewritten suffix is byte-identical"
+    );
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+    client.live_writer = None;
+    client.live_pool = None;
+    pool.shutdown(Instant::now() + std::time::Duration::from_secs(1))
+        .expect("the pooled lease is released");
 }

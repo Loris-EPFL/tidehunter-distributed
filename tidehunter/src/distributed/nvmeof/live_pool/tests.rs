@@ -297,6 +297,8 @@ fn idle_requires_released_lease_and_local_namespace_fd() {
         resolver: local_resolver(dir.path()),
         namespaces: Mutex::new(HashMap::new()),
         local_fixture: false,
+        #[cfg(test)]
+        controller_lost_override: std::sync::atomic::AtomicU8::new(0),
     });
     assert!(idle(&lease));
     let external = lease.clone();
@@ -338,6 +340,8 @@ fn ready_idle(pool: &LiveControllerPool, dir: &std::path::Path, nqn: &str) -> Li
         resolver: local_resolver(dir),
         namespaces: Mutex::new(HashMap::new()),
         local_fixture: false,
+        #[cfg(test)]
+        controller_lost_override: std::sync::atomic::AtomicU8::new(0),
     });
     let mut identity = Identity {
         target: target.clone(),
@@ -513,4 +517,123 @@ fn callers_for_a_closing_target_wait_for_the_delete_to_end() {
     });
     // The delete has already ended, so this bound is only a hang guard.
     pool.shutdown(Instant::now() + PROGRESS_CAP).unwrap();
+}
+
+/// A teardown whose delete does not confirm, on a lease that is verifiably not
+/// live, removes the entry instead of leaving an unusable quarantine. The CI
+/// cell hit exactly this: `delete_controller` refused the store, and the entry
+/// stayed unusable for the rest of the process.
+#[test]
+fn eviction_removes_a_lost_entry_whose_delete_does_not_confirm() {
+    let dir = tempdir::TempDir::new("live-pool-lost-evict").unwrap();
+    let registry_dir = dir.path().join("registry");
+    let registry = LiveConnectionRegistry::open(&registry_dir, RegistryMode::Retire).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:lost");
+    let lease = pool
+        .cached_lease(&target.nqn)
+        .expect("the fixture entry is cached");
+    assert!(lease.controller_lost(), "the fixture controller is gone");
+    // The teardown cannot remove its durable intent, so `disconnect` fails.
+    std::fs::remove_dir_all(&registry_dir).unwrap();
+    pool.evict_lost(&target.nqn, Instant::now() + PROGRESS_CAP)
+        .expect("a lost controller is retired from the pool");
+    assert!(
+        pool.state.lock().unwrap().entries.is_empty(),
+        "an unconfirmed delete of a lost controller keeps no unusable entry"
+    );
+}
+
+/// A cached controller that is still live is never deleted: another lane may
+/// have reconnected it between the break and the eviction.
+#[test]
+fn eviction_leaves_a_live_controller_cached() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    let dir = tempdir::TempDir::new("live-pool-live-evict").unwrap();
+    let registry_dir = dir.path().join("registry");
+    let registry = LiveConnectionRegistry::open(&registry_dir, RegistryMode::Retire).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = fixture_target("nqn.2026-01.test:live", 1, [1; 16], 4096);
+    let path = dir.path().join("wal");
+    std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+    pool.register_local_target(&target, LiveNamespaceAccess::ReadWrite, path)
+        .unwrap();
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let (lease, how, _) = pool
+        .acquire_shared(
+            &target,
+            HOST,
+            [2; 16],
+            LiveNamespaceAccess::ReadWrite,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(how, LivePoolAcquisition::Connected);
+    assert!(
+        !lease.controller_lost(),
+        "the local fixture lease reports a live controller"
+    );
+    // A teardown would fail now, so this proves none is attempted.
+    std::fs::remove_dir_all(&registry_dir).unwrap();
+    pool.evict_lost(&target.nqn, deadline)
+        .expect("a live controller is left alone");
+    assert!(
+        pool.cached_lease(&target.nqn).is_some(),
+        "a live replacement stays cached"
+    );
+    drop(lease);
+    assert!(pool.shutdown(Instant::now() + PROGRESS_CAP).is_err());
+}
+
+/// A first connect that fails while it verifies the controller it created
+/// leaves a typed lost cause, not a flattened `Other`, and releases its entry so
+/// the next acquire can connect.
+#[test]
+fn acquire_types_a_first_connect_loss_as_lost() {
+    let dir = tempdir::TempDir::new("live-pool-acquire-lost").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = fixture_target("nqn.2026-01.test:acquire", 1, [1; 16], 4096);
+    pool.fail_next_connect_lost();
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let error = match pool.acquire_shared(
+        &target,
+        "nqn.2026-01.test:host",
+        [2; 16],
+        LiveNamespaceAccess::ReadWrite,
+        deadline,
+    ) {
+        Ok(_) => panic!("the first connect reports the stopped controller"),
+        Err(error) => error,
+    };
+    assert!(
+        crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "the first-connect loss keeps its typed cause: {error}"
+    );
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted,
+        "the loss keeps the resumable class: {error}"
+    );
+    assert!(
+        pool.cached_lease(&target.nqn).is_none(),
+        "the failed entry is released"
+    );
+    let path = dir.path().join("wal");
+    std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+    pool.register_local_target(&target, LiveNamespaceAccess::ReadWrite, path)
+        .unwrap();
+    let (lease, how, _) = pool
+        .acquire_shared(
+            &target,
+            "nqn.2026-01.test:host",
+            [2; 16],
+            LiveNamespaceAccess::ReadWrite,
+            deadline,
+        )
+        .expect("the next acquire connects");
+    assert_eq!(how, LivePoolAcquisition::Connected);
+    drop(lease);
+    pool.shutdown(deadline).unwrap();
 }

@@ -555,8 +555,28 @@ fn drain_failed_io(grant: &mut Grant) {
     // Index/file pins may retire only after all terminal CQEs. A failed drain
     // with outstanding DMA cannot return safely; match LiveIo's fail-stop rule.
     if grant.outstanding() != 0 {
+        eprintln!(
+            "live read: grant {} still owns {} operations after its drain",
+            grant.id,
+            grant.outstanding()
+        );
         std::process::abort();
     }
+}
+
+/// Whether a grant's pinned controller is verifiably gone.
+///
+/// One oracle for the stale-grant check, the completion requeue and the inline
+/// decline. A local-file fixture reports live; tests override it per grant.
+fn grant_controller_lost(grant: &Grant) -> bool {
+    #[cfg(test)]
+    if let Some(lost) = grant.controller_lost {
+        return lost;
+    }
+    grant
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.controller_lost())
 }
 
 /// Lane state: file grants, requests in flight and unreleased owner pins.
@@ -594,6 +614,11 @@ pub(crate) struct LiveReadCache {
     /// SQE and no buffer owned), so a retry can be proved.
     #[cfg(test)]
     fail_next_read_submission: bool,
+    /// Fail the next namespace open with the typed lost-controller error.
+    /// Test-only: it models a verify that sees a dead controller before any
+    /// EIO exists.
+    #[cfg(test)]
+    fail_next_open: bool,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -634,6 +659,8 @@ impl LiveReadCache {
             inline_submitted_pause: None,
             #[cfg(test)]
             fail_next_read_submission: false,
+            #[cfg(test)]
+            fail_next_open: false,
         }
     }
 
@@ -641,6 +668,13 @@ impl LiveReadCache {
     #[cfg(test)]
     pub(crate) fn fail_next_read_submission(&mut self) {
         self.fail_next_read_submission = true;
+    }
+
+    /// Test only: the next namespace open reports a controller the kernel
+    /// stopped, exactly as `verify_transport` does for a deleting controller.
+    #[cfg(test)]
+    pub(crate) fn fail_next_open_lost_controller(&mut self) {
+        self.fail_next_open = true;
     }
 
     /// Requests admitted and not yet returned by `poll`.
@@ -951,6 +985,16 @@ impl LiveReadCache {
             let Some(error) = failure else {
                 return;
             };
+            // A verified lost controller during a namespace open is the same
+            // resumable class as one during a completion: the grant is already
+            // evicted and marked lost, so one reconnect is allowed.
+            let lost_retry = error.kind() == std::io::ErrorKind::ConnectionAborted
+                && state.controller_losses < MAX_READ_CONTROLLER_LOSSES
+                && Instant::now() < state.deadline;
+            if lost_retry {
+                state.controller_losses += 1;
+                continue;
+            }
             let retry_safe = error.kind() == std::io::ErrorKind::TimedOut
                 && state.flights == 0
                 && state.pending > 0
@@ -1137,6 +1181,12 @@ impl LiveReadCache {
         position: usize,
         connect_timeout: Duration,
     ) -> Result<Opened, TcpError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_open) {
+            return Err(super::namespace_open_error(
+                crate::distributed::nvmeof::live_namespace::controller_lost_error(),
+            ));
+        }
         let position_ref = &state.positions[position];
         let file_bytes = client.expected.wal_file_bytes;
         let file = position_ref.address.offset / file_bytes;
@@ -1186,21 +1236,28 @@ impl LiveReadCache {
         // A grant's lease can be verified dead after the write path evicted it:
         // never attach a member to that controller. Mark it lost (not a
         // subsystem failure) and fall through to a fresh connect below.
-        let reusable = self
+        let mut reusable = self
             .grants
             .iter()
             .position(|grant| !grant.broken && grant.scope.covers(position_ref));
-        let reusable = reusable.filter(|index| {
-            let dead = self.grants[*index]
-                .lease
-                .as_ref()
-                .is_some_and(|lease| lease.controller_lost());
+        if let Some(index) = reusable {
+            let lease = self.grants[index].lease.clone();
+            let dead = grant_controller_lost(&self.grants[index]);
             if dead {
-                self.grants[*index].broken = true;
-                self.grants[*index].lost = true;
+                // Retire the dead controller before the connect below: without
+                // this, `pool.acquire_shared` returns the same cached dead
+                // lease and the fresh grant cannot resolve its namespace.
+                if let (Some(pool), Some(lease)) = (client.live_pool.as_ref(), lease.as_ref()) {
+                    let teardown = super::controller_teardown_deadline(
+                        u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+                    );
+                    let _ = pool.evict_lost(&lease.binding().nqn, teardown);
+                }
+                self.grants[index].broken = true;
+                self.grants[index].lost = true;
+                reusable = None;
             }
-            !dead
-        });
+        }
         if let Some(index) = reusable {
             let grant = &mut self.grants[index];
             let _setup =
@@ -1220,7 +1277,7 @@ impl LiveReadCache {
                         if error.kind() == std::io::ErrorKind::TimedOut {
                             TcpError::with_kind(error.kind(), error.to_string())
                         } else {
-                            TcpError::component(error)
+                            super::namespace_open_error(error)
                         }
                     })?;
                 let slot = grant
@@ -1240,7 +1297,23 @@ impl LiveReadCache {
             if let Err(error) = attached {
                 // A namespace setup that hit its deadline is transient: the
                 // grant keeps its other namespaces, so a retry may attach again.
-                if error.kind() != std::io::ErrorKind::TimedOut {
+                if error.kind() == std::io::ErrorKind::ConnectionAborted {
+                    // The pinned controller is verifiably gone. Retire it and
+                    // stop using the grant without poisoning the subsystem:
+                    // the request retries and the next admission reconnects.
+                    if let Some(pool) = client.live_pool.as_ref() {
+                        let teardown = super::controller_teardown_deadline(
+                            client
+                                .live_config
+                                .as_ref()
+                                .map_or(0, |config| config.connect_timeout_ms),
+                        );
+                        let _ = pool.evict_lost(&name.nqn, teardown);
+                    }
+                    let grant = &mut self.grants[index];
+                    grant.broken = true;
+                    grant.lost = true;
+                } else if error.kind() != std::io::ErrorKind::TimedOut {
                     self.fail_grant(client, index, &error);
                 }
                 return Err(error);
@@ -1319,8 +1392,13 @@ impl LiveReadCache {
             Err(ConnectError::PoolFull(error)) => Err(pool_deadline(error)),
             Err(ConnectError::Failed(error)) => {
                 // A connect that hit its deadline is retried inside the call;
-                // caching it would fail-stop the authority on the retry.
-                if error.kind() != std::io::ErrorKind::TimedOut {
+                // caching it would fail-stop the authority on the retry. A
+                // verifiably lost controller is the same: the request retries
+                // and reconnects through a new lease.
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionAborted
+                ) {
                     self.failed_subsystems.insert((epoch, name.subsystem));
                 }
                 Err(error)
@@ -1431,13 +1509,31 @@ impl LiveReadCache {
         let (lease, acquisition, timings) = acquisition.map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 ConnectError::PoolFull(error)
+            } else if crate::distributed::nvmeof::live_namespace::controller_lost(&error)
+                || pool.entry_lost(&target.nqn)
+            {
+                // A first connect that failed its verify, or a cached dead
+                // lease: the read requeues and reconnects.
+                ConnectError::Failed(TcpError::with_kind(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("live controller pool lost the controller: {error}"),
+                ))
             } else {
                 failed_io(error)
             }
         })?;
         let (namespace, opened) = lease
             .namespace(target.nsid, target.uuid, access, connect_deadline)
-            .map_err(failed_io)?;
+            .map_err(|error| {
+                if crate::distributed::nvmeof::live_namespace::controller_lost(&error) {
+                    // Retire the dead controller before the retry, so the next
+                    // admission connects a new one instead of this lease. The
+                    // teardown keeps its own connect window.
+                    let teardown = super::controller_teardown_deadline(config.connect_timeout_ms);
+                    let _ = pool.evict_lost(&target.nqn, teardown);
+                }
+                ConnectError::Failed(super::namespace_open_error(error))
+            })?;
         drop(setup);
         if let Some(counters) = &client.live_counters {
             let ns = |d: Duration| d.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -1779,18 +1875,16 @@ impl LiveReadCache {
         let Some(grant) = self.grants.iter().find(|grant| grant.id == flight.grant) else {
             return Ok(false);
         };
-        #[cfg(test)]
-        let override_lost = grant.controller_lost;
-        let probe = |lease: &Arc<LiveControllerLease>| {
-            #[cfg(test)]
-            if let Some(lost) = override_lost {
-                return lost;
-            }
-            lease.controller_lost()
-        };
-        let Some(lease) = grant.lease.as_ref().filter(|lease| probe(lease)) else {
+        if !grant_controller_lost(grant) {
+            return Ok(false);
+        }
+        let Some(lease) = grant.lease.as_ref() else {
             return Ok(false);
         };
+        // A flight that fails after this grant was already marked lost belongs
+        // to the same loss: the first pass spent the one reconnect, so this one
+        // requeues without spending another or evicting again.
+        let already_lost = grant.lost;
         // One String and no Arc clone: only the lost-controller error path.
         let nqn = lease.binding().nqn.clone();
         let Some(state) = self.requests.get(&flight.token) else {
@@ -1798,8 +1892,9 @@ impl LiveReadCache {
         };
         let deadline = state.deadline;
         let retry = state.error.is_none()
-            && state.controller_losses < MAX_READ_CONTROLLER_LOSSES
-            && Instant::now() < deadline;
+            && (already_lost
+                || (state.controller_losses < MAX_READ_CONTROLLER_LOSSES
+                    && Instant::now() < deadline));
         if !retry {
             if let Some(state) = self.requests.get_mut(&flight.token) {
                 state.fail(TcpError::with_kind(
@@ -1809,24 +1904,35 @@ impl LiveReadCache {
             }
             return Ok(true);
         }
-        // Retire the dead controller before the retry, so the next admission
-        // connects a new one instead of reusing the cached dead lease.
-        let Some(pool) = client.live_pool.as_ref() else {
-            return Ok(false);
-        };
-        if let Err(error) = pool.evict_lost(&nqn, deadline) {
-            if let Some(state) = self.requests.get_mut(&flight.token) {
-                state.fail(TcpError::with_kind(
-                    std::io::ErrorKind::ConnectionAborted,
-                    format!("live read cannot evict the lost controller: {error}"),
-                ));
+        if !already_lost {
+            // Retire the dead controller before the retry, so the next
+            // admission connects a new one instead of the dead lease. The
+            // teardown gets its own connect window, not the read's budget.
+            let Some(pool) = client.live_pool.as_ref() else {
+                return Ok(false);
+            };
+            let teardown = super::controller_teardown_deadline(
+                client
+                    .live_config
+                    .as_ref()
+                    .map_or(0, |config| config.connect_timeout_ms),
+            );
+            if let Err(error) = pool.evict_lost(&nqn, teardown) {
+                if let Some(state) = self.requests.get_mut(&flight.token) {
+                    state.fail(TcpError::with_kind(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("live read cannot evict the lost controller: {error}"),
+                    ));
+                }
+                return Ok(true);
             }
-            return Ok(true);
         }
         let Some(state) = self.requests.get_mut(&flight.token) else {
             return Ok(false);
         };
-        state.controller_losses += 1;
+        if !already_lost {
+            state.controller_losses += 1;
+        }
         for &position in &flight.positions {
             state.slots[position] = Slot::Pending;
         }

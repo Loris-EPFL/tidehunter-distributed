@@ -410,6 +410,9 @@ pub(super) struct LeasedWriter {
     /// so no live DMA belongs to any flight. Cleared when a new frame is
     /// submitted, because that frame's CQE the new queue owes.
     queue_detached: bool,
+    /// The NQN of the queue a data break detached, so the resume evicts only
+    /// that subsystem's controller.
+    detached_nqn: Option<String>,
     /// A resume is not re-entrant: it runs on the worker thread, inside the one
     /// client guard of the operation that broke.
     resuming: bool,
@@ -482,6 +485,10 @@ pub(super) struct LeasedWriter {
     submitted_ids: Vec<u64>,
     #[cfg(test)]
     next_write_result: Option<i32>,
+    /// Fail the next queue open with the typed lost-controller error, which is
+    /// what a verify of a deleting controller returns before any EIO exists.
+    #[cfg(test)]
+    fail_next_queue_open: bool,
     #[cfg(test)]
     next_submit_result: Option<i32>,
     /// A raw CQE result that overrides the next group flush's completion.
@@ -1322,6 +1329,14 @@ impl super::Client {
             live_connect::LiveConnectTarget, live_io::LiveIo, live_namespace::LiveNamespaceAccess,
         };
         use std::time::{Duration, Instant};
+        #[cfg(test)]
+        if std::mem::take(&mut self.live_leased.fail_next_queue_open) {
+            // The kernel stopped the pinned controller while this queue was
+            // being bound: the verify reports the typed lost cause.
+            return Err(super::namespace_open_error(
+                crate::distributed::nvmeof::live_namespace::controller_lost_error(),
+            ));
+        }
         let binding = &leased.binding;
         let config = self
             .live_config
@@ -1381,15 +1396,33 @@ impl super::Client {
             .as_ref()
             .ok_or_else(|| super::TcpError::new("live controller pool unavailable"))?;
         let deadline = Instant::now() + Duration::from_millis(config.connect_timeout_ms);
-        let (lease, acquisition, _) = pool
-            .acquire_shared(
-                &target,
-                &config.host_nqn,
-                config.host_id,
-                LiveNamespaceAccess::ReadWrite,
-                deadline,
-            )
-            .map_err(super::TcpError::component)?;
+        let acquired = pool.acquire_shared(
+            &target,
+            &config.host_nqn,
+            config.host_id,
+            LiveNamespaceAccess::ReadWrite,
+            deadline,
+        );
+        let (lease, acquisition, _) = match acquired {
+            Ok(found) => found,
+            Err(error) => {
+                // A first connect can fail while it verifies the controller it
+                // created, before any entry is cached; a cached Ready lease can
+                // also be the dead one a later lane installed. Both carry the
+                // same resumable cause. Any other acquisition failure keeps its
+                // class.
+                let lost = crate::distributed::nvmeof::live_namespace::controller_lost(&error)
+                    || pool.entry_lost(&target.nqn);
+                return Err(if lost {
+                    super::TcpError::with_kind(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("live controller pool lost the controller: {error}"),
+                    )
+                } else {
+                    super::TcpError::component(error)
+                });
+            }
+        };
         let (namespace, opened) = lease
             .namespace(
                 binding.nsid,
@@ -1397,7 +1430,11 @@ impl super::Client {
                 LiveNamespaceAccess::ReadWrite,
                 deadline,
             )
-            .map_err(super::TcpError::component)?;
+            // A controller the kernel stopped while this queue was being bound
+            // is the same data break as a cancelled command: the resume
+            // evicts the dead lease and reconnects. A live identity mismatch
+            // keeps its fatal class.
+            .map_err(super::namespace_open_error)?;
         let io = LiveIo::new(
             namespace,
             config.max_inflight_requests,
@@ -1538,7 +1575,18 @@ impl super::Client {
             // ran in, so every attempt re-reads it. One `Acquire` load, and the
             // loop runs once on the unresumed path.
             self.check_lease()?;
-            self.ensure_leased_queue()?;
+            // Binding the queue verifies the opened namespace and controller.
+            // A controller the kernel stopped is a data break like a failed
+            // submission, so it takes the same resume before any frame exists.
+            if let Err(error) = self.ensure_leased_queue() {
+                if attempt < resume::MAX_RESUME_ATTEMPTS && self.break_kind(&error).is_some() {
+                    attempt += 1;
+                    self.live_leased.probe_unhealed = false;
+                    self.resume_after_break(BreakKind::Data)?;
+                    continue;
+                }
+                return Err(error);
+            }
             let config = self
                 .live_config
                 .as_ref()
@@ -1717,13 +1765,24 @@ impl super::Client {
         }
         if let Some((timeline, sample)) = trace {
             // Sampled groups pay one extra submit syscall to expose this boundary.
-            // Their completion interval can differ from untraced writes.
+            // Their completion interval can differ from untraced writes, so the
+            // same errno takes the same class here as on the untraced path.
+            let lease = writer.lease.as_ref();
+            #[cfg(test)]
+            let override_lost = writer.controller_lost;
             if writer.io.submit_pending_write().map_err(|error| {
                 if let Some(counters) = &self.live_counters {
                     counters.record_unknown_write();
                     counters.record_leased_write_failure(LiveWriteFailure::Failed);
                 }
-                super::TcpError::component(error)
+                let lost = lost_controller(
+                    &error,
+                    None,
+                    lease,
+                    #[cfg(test)]
+                    override_lost,
+                );
+                resume::classify_io_error(error, None, lost)
             })? {
                 timeline.live_group_event(
                     Some(sample),
@@ -2788,9 +2847,23 @@ impl super::Client {
     pub(crate) fn leased_test_fail_write(&mut self, result: i32) {
         self.live_leased.next_write_result = Some(result);
     }
+    /// Make the next queue open report a controller the kernel stopped, as the
+    /// namespace verify does when it reads a `deleting` state.
+    pub(crate) fn leased_test_fail_next_queue_open(&mut self) {
+        self.live_leased.fail_next_queue_open = true;
+    }
     /// Fail the next submission before any SQE, as a lost controller does.
     pub(crate) fn leased_test_fail_submit(&mut self, errno: i32) {
         self.live_leased.next_submit_result = Some(errno);
+    }
+    /// Fail the next sampled group's `submit_pending_write` with `errno`, as a
+    /// queue whose controller was deleted reports on the submit syscall.
+    pub(crate) fn leased_test_fail_pending_submit(&mut self, errno: i32) {
+        self.live_writer
+            .as_mut()
+            .expect("a bound queue")
+            .io
+            .override_pending_submit_result(errno);
     }
     /// Override the controller-lost probe on the bound queue, so a local-file
     /// fixture drives the `EIO` classes without a kernel target.

@@ -38,6 +38,8 @@ pub(super) struct RegistryInner {
     /// systemd-udevd queue path; injectable for fixture tests.
     pub(super) udev_queue: PathBuf,
     pub(super) mode: RegistryMode,
+    /// The keep-alive every connect through this registry requests.
+    pub(super) keep_alive_tmo: u32,
     pub(super) _lock: File,
     pub(super) admission: Mutex<()>,
     pub(super) uncertain: AtomicBool,
@@ -76,11 +78,26 @@ impl LiveConnectionRegistry {
     /// The mode is a required argument: an admin-only registry must never adopt
     /// a controller it does not own.
     pub(crate) fn open(directory: &Path, mode: RegistryMode) -> io::Result<Self> {
+        Self::open_with_keep_alive(
+            directory,
+            mode,
+            crate::distributed::nvmeof::live_connect::KEEP_ALIVE_TMO_SECS,
+        )
+    }
+
+    /// Opens a registry whose connects request `keep_alive_tmo`, derived from
+    /// the configured resume budget.
+    pub(crate) fn open_with_keep_alive(
+        directory: &Path,
+        mode: RegistryMode,
+        keep_alive_tmo: u32,
+    ) -> io::Result<Self> {
         Self::open_at(
             directory,
             Path::new("/sys/class/nvme"),
             Path::new("/run/udev/queue"),
             mode,
+            keep_alive_tmo,
         )
     }
 
@@ -91,6 +108,7 @@ impl LiveConnectionRegistry {
         controller_root: &Path,
         udev_queue: &Path,
         mode: RegistryMode,
+        keep_alive_tmo: u32,
     ) -> io::Result<Self> {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -117,6 +135,7 @@ impl LiveConnectionRegistry {
                 controller_root: controller_root.to_owned(),
                 udev_queue: udev_queue.to_owned(),
                 mode,
+                keep_alive_tmo,
                 _lock: lock,
                 admission: Mutex::new(()),
                 uncertain: AtomicBool::new(false),
@@ -396,6 +415,7 @@ impl LiveConnectionRegistry {
                 queue: OnceLock::new(),
                 controller_root: self.inner.controller_root.clone(),
                 udev_queue: self.inner.udev_queue.clone(),
+                keep_alive_tmo: self.inner.keep_alive_tmo,
             }),
             instance: m.instance,
             deletion,
@@ -620,6 +640,11 @@ impl LiveConnectionRegistry {
         }
         Ok(false)
     }
+    /// The keep-alive every connect through this registry requests.
+    pub(crate) fn keep_alive_tmo(&self) -> u32 {
+        self.inner.keep_alive_tmo
+    }
+
     pub fn connect(
         &self,
         target: &LiveConnectTarget,

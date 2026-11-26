@@ -535,8 +535,12 @@ impl Client {
             ));
         }
         let Some(mut queue) = self.live_writer.take() else {
+            self.live_leased.detached_nqn = None;
             return Ok(());
         };
+        // The resume evicts only this queue's controller: a rollover can put
+        // `closing` in another subsystem, whose controller stays healthy.
+        self.live_leased.detached_nqn = Some(queue.target.nqn.clone());
         self.live_leased.worker_wake_registered = false;
         // No flight in the deque is owed a CQE by any queue any more.
         self.live_leased.queue_detached = true;
@@ -595,21 +599,39 @@ impl Client {
         let Some(pool) = self.live_pool.clone() else {
             return Ok(());
         };
-        let mut nqns: Vec<String> = Vec::new();
-        for extent in [
-            self.live_leased.current.as_ref(),
-            self.live_leased.closing.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let nqn = &extent.lease.binding.nqn;
-            if !nqns.contains(nqn) {
-                nqns.push(nqn.clone());
+        // The teardown gets its own connect window, capped by the episode so it
+        // never outlives the budget the resume promised.
+        let teardown = super::super::controller_teardown_deadline(
+            self.live_config
+                .as_ref()
+                .map_or(0, |config| config.connect_timeout_ms),
+        )
+        .min(deadline);
+        let nqns: Vec<String> = match self.live_leased.detached_nqn.take() {
+            // Exactly the subsystem whose queue broke. A rollover can put
+            // `closing` in another subsystem, and its controller is healthy.
+            Some(nqn) => vec![nqn],
+            // No queue was detached (the break was an open failure): the
+            // extents name the subsystems being bound.
+            None => {
+                let mut nqns = Vec::new();
+                for extent in [
+                    self.live_leased.current.as_ref(),
+                    self.live_leased.closing.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let nqn = &extent.lease.binding.nqn;
+                    if !nqns.contains(nqn) {
+                        nqns.push(nqn.clone());
+                    }
+                }
+                nqns
             }
-        }
+        };
         for nqn in nqns {
-            pool.evict_lost(&nqn, deadline).map_err(|error| {
+            pool.evict_lost(&nqn, teardown).map_err(|error| {
                 TcpError::with_kind(
                     io::ErrorKind::Other,
                     format!("live write resume cannot evict the lost controller: {error}"),

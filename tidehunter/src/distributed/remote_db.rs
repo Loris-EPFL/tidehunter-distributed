@@ -1100,11 +1100,15 @@ impl RemoteDatabase {
         authority_lifecycle::apply_effective_initiators(&mut config);
         let config = config;
         let live_pool = {
-            let registry = super::nvmeof::live_connect::LiveConnectionRegistry::open(
-                &path.join("live-nvme-connections"),
-                super::nvmeof::live_connect::RegistryMode::Adopt,
-            )
-            .map_err(LocalDbError::component)?;
+            // The keep-alive fits the resume budget of this configuration, so
+            // a target still holding the old controller expires inside it.
+            let registry =
+                super::nvmeof::live_connect::LiveConnectionRegistry::open_with_keep_alive(
+                    &path.join("live-nvme-connections"),
+                    super::nvmeof::live_connect::RegistryMode::Adopt,
+                    super::nvmeof::live_connect::keep_alive_tmo(config.live_nvme.io_timeout_ms),
+                )
+                .map_err(LocalDbError::component)?;
             let clients = config
                 .endpoints
                 .len()

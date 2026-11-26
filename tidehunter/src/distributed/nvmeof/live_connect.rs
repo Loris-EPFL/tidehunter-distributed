@@ -4,7 +4,10 @@
 pub use super::LiveQueueGeometry;
 use super::NvmeofTransport;
 use super::live_metrics::LiveControllerEvidence;
-use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
+use super::live_namespace::{
+    LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding, controller_lost_error,
+    identity_error, lost_if_vanished,
+};
 use crate::distributed::sys;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -53,7 +56,24 @@ pub struct LiveConnectTarget {
 /// budget, so the value is pinned explicitly and recorded in the route evidence.
 pub(crate) const KEEP_ALIVE_TMO_SECS: u32 = 5;
 
-fn connect_options(target: &LiveConnectTarget, host_nqn: &str, host_id: [u8; 16]) -> String {
+/// The keep-alive the engine requests for one configured resume budget.
+///
+/// A resume reconnects with the same host NQN, and the target refuses that with
+/// `-EALREADY` until its keep-alive expires. The expiry must fit inside the
+/// resume budget of `2 x io_timeout_ms`, so the request is the largest whole
+/// second below that budget, capped at the kernel default of 5 s. The kernel's
+/// own minimum is 1 s, which a budget below 2 s cannot outlast; such a
+/// configuration simply fail-stops on a break, as before W1.
+pub(crate) fn keep_alive_tmo(io_timeout_ms: u64) -> u32 {
+    u32::try_from((io_timeout_ms / 500).clamp(1, u64::from(KEEP_ALIVE_TMO_SECS))).unwrap_or(5)
+}
+
+fn connect_options(
+    target: &LiveConnectTarget,
+    host_nqn: &str,
+    host_id: [u8; 16],
+    keep_alive_tmo: u32,
+) -> String {
     let geometry = target.geometry;
     let mut options = format!(
         "nqn={},transport={},traddr={},trsvcid={},hostnqn={},hostid={},ctrl_loss_tmo=0,keep_alive_tmo={},nr_io_queues={},queue_size={}",
@@ -63,7 +83,7 @@ fn connect_options(target: &LiveConnectTarget, host_nqn: &str, host_id: [u8; 16]
         target.service,
         host_nqn,
         uuid_string(host_id),
-        KEEP_ALIVE_TMO_SECS,
+        keep_alive_tmo,
         geometry.io_queues,
         geometry.queue_size
     );
@@ -86,19 +106,48 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(timeout)
 }
 
+/// One failed operation with its path. The typed cause stays in the source
+/// chain, so `controller_lost` still classifies a wrapped verify error.
+#[derive(Debug)]
+struct ContextError {
+    message: String,
+    cause: io::Error,
+}
+
+impl std::fmt::Display for ContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 fn with_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
-        format!("{operation} {}: {error}", path.display()),
+        ContextError {
+            message: format!("{operation} {}: {error}", path.display()),
+            cause: error,
+        },
     )
 }
 
+/// A connect failure with its cleanup verdict. The primary error stays the
+/// source, so a typed lost cause survives the cleanup note and the acquire
+/// callers can still classify it.
 fn connect_error_after_cleanup(primary: io::Error, cleanup: io::Result<()>) -> io::Error {
     match cleanup {
         Ok(()) => primary,
         Err(error) => io::Error::new(
             primary.kind(),
-            format!("{primary}; controller cleanup failed: {error}"),
+            ContextError {
+                message: format!("{primary}; controller cleanup failed: {error}"),
+                cause: primary,
+            },
         ),
     }
 }
@@ -225,6 +274,8 @@ pub(crate) struct LiveNamespaceResolver {
     controller_root: PathBuf,
     /// systemd-udevd queue path; `/run/udev/queue` in production.
     udev_queue: PathBuf,
+    /// The keep-alive the connect requested for this controller.
+    keep_alive_tmo: u32,
 }
 impl LiveController {
     /// Controller instance returned by the Linux fabrics control response.
@@ -373,7 +424,8 @@ impl LiveController {
                     error,
                 )
             })?;
-        let options = connect_options(&target, &host_nqn, host_id);
+        let keep_alive_tmo = registry.keep_alive_tmo();
+        let options = connect_options(&target, &host_nqn, host_id, keep_alive_tmo);
         write_connect_options(&mut control, &options)?;
         let mut response = String::new();
         control.read_to_string(&mut response).map_err(|error| {
@@ -408,6 +460,7 @@ impl LiveController {
                 queue: OnceLock::new(),
                 controller_root: PathBuf::from("/sys/class/nvme"),
                 udev_queue: PathBuf::from("/run/udev/queue"),
+                keep_alive_tmo,
             }),
             instance,
             deletion: DeletionState::NotStarted,
@@ -434,7 +487,7 @@ impl LiveNamespaceResolver {
         Some(LiveControllerEvidence {
             queue_count,
             sqsize,
-            keep_alive_tmo: KEEP_ALIVE_TMO_SECS,
+            keep_alive_tmo: self.keep_alive_tmo,
             sysfs_device: self.device,
             sysfs_inode: self.inode,
         })
@@ -468,25 +521,37 @@ impl LiveNamespaceResolver {
         PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
     fn verify(&self) -> io::Result<()> {
+        // Every failure is typed: a vanished or replaced controller is the
+        // resumable lost cause, a live object with other identity facts is a
+        // real mismatch. The write and read open paths classify by that cause.
+        let read = |path: &Path| attr(path).map_err(lost_if_vanished);
         let p = self.pinned();
         let meta = self.directory.metadata()?;
         if meta.ino() != self.inode || meta.dev() != self.device {
-            return Err(invalid("controller inode changed"));
+            return Err(controller_lost_error());
         }
-        let current = std::fs::metadata(self.controller_root.join(&self.name))?;
-        if current.ino() != self.inode
-            || current.dev() != self.device
-            || attr(&p.join("subsysnqn"))? != self.target.nqn
-            || attr(&p.join("transport"))? != transport(self.target.transport)
+        let current = match std::fs::metadata(self.controller_root.join(&self.name)) {
+            Ok(current) => current,
+            // The name no longer resolves: the pinned controller is gone.
+            Err(error) if vanished(&error) => return Err(controller_lost_error()),
+            Err(error) => return Err(error),
+        };
+        if current.ino() != self.inode || current.dev() != self.device {
+            // The name now resolves to a replacement, so the pinned object is
+            // gone even if the path exists.
+            return Err(controller_lost_error());
+        }
+        if read(&p.join("subsysnqn"))? != self.target.nqn
+            || read(&p.join("transport"))? != transport(self.target.transport)
         {
-            return Err(invalid("controller identity changed"));
+            return Err(identity_error("controller identity changed"));
         }
-        if attr(&p.join("hostnqn"))? != self.host_nqn
-            || attr(&p.join("hostid"))? != uuid_string(self.host_id)
+        if read(&p.join("hostnqn"))? != self.host_nqn
+            || read(&p.join("hostid"))? != uuid_string(self.host_id)
         {
-            return Err(invalid("controller host identity changed"));
+            return Err(identity_error("controller host identity changed"));
         }
-        let address = attr(&p.join("address"))?;
+        let address = read(&p.join("address"))?;
         let mut traddr = None;
         let mut trsvcid = None;
         for field in address.split(',') {
@@ -502,7 +567,7 @@ impl LiveNamespaceResolver {
             != self.target.address.parse::<IpAddr>().ok()
             || trsvcid.and_then(|s| s.parse::<u16>().ok()) != Some(self.target.service)
         {
-            return Err(invalid("controller endpoint mismatch"));
+            return Err(identity_error("controller endpoint mismatch"));
         }
         Ok(())
     }
@@ -517,11 +582,15 @@ impl LiveNamespaceResolver {
         deadline: Instant,
     ) -> io::Result<LiveNamespaceBinding> {
         loop {
+            // Deadline failures stay deadlines: the caller reports a typed
+            // timeout. A vanished or replaced controller fails `verify` (or an
+            // attribute read) with the typed lost cause before this point.
             remaining(deadline)?;
             self.verify()?;
-            let ctrl = std::fs::canonicalize(self.pinned())?;
+            let ctrl = std::fs::canonicalize(self.pinned()).map_err(lost_if_vanished)?;
             let mut candidates = Vec::new();
-            for (name, p) in owned_visible_disks(Path::new("/sys/class/block"), &ctrl, &self.name)?
+            for (name, p) in owned_visible_disks(Path::new("/sys/class/block"), &ctrl, &self.name)
+                .map_err(lost_if_vanished)?
             {
                 let Some(nsid) = scan_attribute(&p.join("nsid"))? else {
                     continue;
@@ -811,6 +880,7 @@ impl LiveController {
                 queue: OnceLock::new(),
                 controller_root: PathBuf::from("/sys/class/nvme"),
                 udev_queue: PathBuf::from("/run/udev/queue"),
+                keep_alive_tmo: KEEP_ALIVE_TMO_SECS,
             }),
             instance: 0,
             deletion: DeletionState::Gone,

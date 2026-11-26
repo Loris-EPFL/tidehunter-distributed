@@ -39,28 +39,25 @@ fn inline_controller_lost(
     if !errno.is_some_and(crate::distributed::tcp::is_lost_io_errno) {
         return false;
     }
-    #[cfg(test)]
-    let override_lost = grant.controller_lost;
-    let probe = |lease: &Arc<LiveControllerLease>| {
-        #[cfg(test)]
-        if let Some(lost) = override_lost {
-            return lost;
-        }
-        lease.controller_lost()
-    };
-    let Some(lease) = grant.lease.as_ref().filter(|lease| probe(lease)) else {
+    if !grant_controller_lost(grant) {
+        return false;
+    }
+    let Some(lease) = grant.lease.as_ref() else {
         return false;
     };
     // One String and no Arc clone: only the lost-controller error path.
     let nqn = lease.binding().nqn.clone();
-    let Some(pool) = client.live_pool.as_ref() else {
-        return false;
-    };
-    if pool.evict_lost(&nqn, deadline).is_err() {
-        return false;
-    }
     grant.broken = true;
     grant.lost = true;
+    // Best effort: a failed teardown must not turn a verifiably lost controller
+    // into a media verdict. The member is declined to the lane, whose retry
+    // reconnects; the next connect reconciles an unconfirmed intent.
+    if let Some(pool) = client.live_pool.as_ref() {
+        let teardown = client.live_config.as_ref().map_or(deadline, |config| {
+            crate::distributed::tcp::controller_teardown_deadline(config.connect_timeout_ms)
+        });
+        let _ = pool.evict_lost(&nqn, teardown);
+    }
     true
 }
 

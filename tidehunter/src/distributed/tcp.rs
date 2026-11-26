@@ -514,6 +514,28 @@ pub(crate) fn is_transient_errno(errno: i32) -> bool {
 pub(crate) fn is_lost_io_errno(errno: i32) -> bool {
     matches!(errno, libc::EIO | libc::EBADF)
 }
+
+/// A namespace open that failed because the pinned controller is gone is the
+/// same resumable break as an EIO on the queue, so the write and read paths
+/// reconnect. Every other open failure keeps its own class.
+///
+/// The cause is carried by the typed `VerifyError` inside the `io::Error`
+/// (`nvmeof::live_namespace::controller_lost`), never matched by message.
+/// The bound a lost-controller teardown gets: its own connect window, never the
+/// caller's nearly spent operation deadline.
+pub(crate) fn controller_teardown_deadline(connect_timeout_ms: u64) -> Instant {
+    Instant::now() + std::time::Duration::from_millis(connect_timeout_ms.max(1))
+}
+
+pub(crate) fn namespace_open_error(error: std::io::Error) -> TcpError {
+    if crate::distributed::nvmeof::live_namespace::controller_lost(&error) {
+        return TcpError::with_kind(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("live namespace lost its controller: {error}"),
+        );
+    }
+    TcpError::component(error)
+}
 impl From<&str> for WireError {
     fn from(message: &str) -> Self {
         Self::other(message)
