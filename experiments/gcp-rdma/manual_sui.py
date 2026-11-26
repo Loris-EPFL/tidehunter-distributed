@@ -234,7 +234,7 @@ class ControllerLoss:
     guaranteed flush, so an unobserved point records the cell as not reached.
     """
     def __init__(self, *, point, host, address, service, service_max, transport,
-                 metrics_url, rpc_address, output, nqn=None, timeout=30.0,
+                 metrics_url, rpc_address, output, nqn=None, intents=None, timeout=30.0,
                  gate_timeout=1200.0, probe_seconds=1.0, not_reached=False,
                  now=time.monotonic, latest=None, metrics=None):
         if point not in CONTROLLER_LOSS_POINTS:
@@ -248,6 +248,7 @@ class ControllerLoss:
         self.rpc_address = rpc_address
         self.output = Path(output)
         self.nqn = nqn
+        self.intents = Path(intents) if intents is not None else None
         self.timeout = timeout
         self.gate_timeout = gate_timeout
         self.probe_seconds = probe_seconds
@@ -331,6 +332,8 @@ class ControllerLoss:
                 '--output', str(output)]
         if self.nqn is not None:
             argv += ['--nqn', self.nqn]
+        if self.intents is not None:
+            argv += ['--intents', str(self.intents)]
         if self.metrics_url:
             argv += ['--metrics-url', self.metrics_url]
         return argv
@@ -387,7 +390,9 @@ class ControllerLoss:
         self.evidence = dict(
             point=self.point, host=self.host, address=self.address,
             service=self.service, service_max=self.service_max,
-            transport=self.transport, nqn=self.nqn, injected=True,
+            transport=self.transport, nqn=self.nqn,
+            intents=None if self.intents is None else str(self.intents),
+            injected=True,
             exit_code=code, stdout=out.decode('utf-8', 'replace')[-4000:],
             stderr=err.decode('utf-8', 'replace')[-4000:],
             resume=resume_deltas((record or {}).get('live_delta')),
@@ -1231,8 +1236,14 @@ def main():
                         help='host that holds the controller (default: the coordinator, '
                              'the only NVMe-oF initiator; override for a rehearsal)')
     parser.add_argument('--controller-loss-nqn',
-                        help='exact target NQN; default selects the lowest NQN inside '
-                             'the owner service window')
+                        help='exact target NQN; otherwise --controller-loss-intents '
+                             'names the coordinator intents directory that selects the '
+                             'active write controller')
+    parser.add_argument('--controller-loss-intents',
+                        help="the coordinator's live-nvme-connections directory on the "
+                             'injector host; its newest intent inside the owner service '
+                             'window names the active write controller (required when '
+                             '--controller-loss-nqn is absent)')
     parser.add_argument('--controller-loss-timeout', type=float, default=30.0,
                         help='injector reconnect and write-progress deadline in seconds')
     parser.add_argument('--controller-loss-gate-timeout', type=float,
@@ -1314,6 +1325,7 @@ def main():
             transport=args.live_transport,
             metrics_url='http://' + metrics_address + '/metrics',
             rpc_address=rpc_address, output=output, nqn=args.controller_loss_nqn,
+            intents=args.controller_loss_intents,
             timeout=args.controller_loss_timeout,
             gate_timeout=(args.controller_loss_gate_timeout
                           if args.controller_loss_gate_timeout is not None

@@ -9,9 +9,14 @@ globally and never signals an owner process.
 
 It runs on the initiator, because the controller object being deleted is the
 local one: the coordinator host holds one controller per owner target. The
-target is either one exact NQN (`--nqn`) or the owner's contiguous live service
-window (`--service` to `--service-max`); the window form keeps the lowest NQN
-and records every candidate.
+active write controller is named either exactly (`--nqn`) or by the
+coordinator's newest connection intent inside the owner's live service window
+(`--intents`); the service window alone is never enough, because several epochs
+of one database share it. Before the delete the injector proves the selected
+controller is the one serving writes: it is `live`, a process holds a
+descriptor on its namespace, and that namespace's write sectors advance. After
+the delete a new controller inode for the same NQN and a completed write-resume
+episode are required when a metrics endpoint is given.
 
 Exit status is nonzero when any verification fails; the JSON record is written
 in both outcomes so the campaign retains the failed case.
@@ -21,6 +26,8 @@ import hashlib
 import importlib.util
 import ipaddress
 import json
+import os
+import re
 import sys
 import time
 import urllib.request
@@ -54,13 +61,18 @@ def validate_spec(args):
         if not isinstance(args.nqn, str) or not manage.NQN.fullmatch(args.nqn):
             raise ValueError('invalid target NQN')
     elif not (type(args.service_max) is int and args.service <= args.service_max <= 65535):
-        raise ValueError('an exact NQN or a bounded service window is required')
+        raise ValueError('an intent target needs a bounded service window')
+    if args.nqn is None and not args.intents:
+        raise ValueError('an exact NQN (--nqn) or the coordinator intent directory '
+                         '(--intents) is required: one service window holds every epoch')
     if args.transport not in ('tcp', 'rdma'):
         raise ValueError('transport must be tcp or rdma')
     if not 1 <= args.service <= 65535:
         raise ValueError('service out of range')
     if args.timeout <= 0:
         raise ValueError('timeout must be positive')
+    if args.preflight_timeout <= 0:
+        raise ValueError('preflight timeout must be positive')
     if any(pid <= 0 for pid in args.owner_pid):
         raise ValueError('owner PIDs must be positive')
 
@@ -75,31 +87,139 @@ def select_controller(inventory, *, nqn, transport, address, service):
     return matches[0]
 
 
-def select_scoped(inventory, *, transport, address, service, service_max):
-    """Select the lowest-NQN controller inside one owner's live service window.
+def newest_write_intent(directory, *, transport, address, service, service_max):
+    """Select the coordinator's newest connection intent of one owner window.
 
-    A live owner host publishes one target per database partition inside a
-    contiguous service window (`deployment.prepare` sets the base as
-    `4420 + 64 * partition`), so the window names the owner host while one
-    controller is still needed. The lowest NQN makes that choice explicit and
-    the whole candidate list is retained as evidence.
+    The engine publishes one `live-nvme-connections/<nonce>.json` intent per
+    controller it connects, and deletes it when that controller is retired, so
+    the newest intent inside the owner's service window is the controller the
+    write path is using. Filenames are random nonces: recency is the file's
+    modification time, and the whole candidate list is retained as evidence.
     """
     if not (type(service) is int and type(service_max) is int and 1 <= service <= service_max <= 65535):
         raise ValueError('invalid service window')
+    root = Path(directory)
+    if not root.is_dir():
+        raise ValueError(f'connection intent directory is absent: {root}')
     matches = []
-    for name, identity in inventory.items():
-        if identity['transport'] != transport:
+    for path in sorted(root.glob('*.json')):
+        try:
+            intent = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError(f'unreadable connection intent {path.name}: {error}') from error
+        target = intent.get('target') if isinstance(intent, dict) else None
+        if not isinstance(target, dict):
+            raise ValueError(f'connection intent {path.name} carries no target')
+        if target.get('transport') != transport or target.get('address') != address:
             continue
-        fields = dict(item.split('=', 1) for item in identity['address'].split(',') if '=' in item)
-        if fields.get('traddr') != address or not fields.get('trsvcid', '').isdigit():
+        port = target.get('service')
+        if not (isinstance(port, int) and service <= port <= service_max):
             continue
-        if service <= int(fields['trsvcid']) <= service_max:
-            matches.append((identity['nqn'], name, identity))
+        nqn_value = target.get('nqn')
+        if not (isinstance(nqn_value, str) and manage.NQN.fullmatch(nqn_value)):
+            raise ValueError(f'connection intent {path.name} names no valid NQN')
+        matches.append((path.stat().st_mtime_ns, path.name, nqn_value))
     if not matches:
-        raise ValueError('no controller inside the owner service window')
-    matches.sort(key=lambda row: (row[0], row[1]))
-    nqn, name, identity = matches[0]
-    return name, identity, sorted(row[0] for row in matches)
+        raise ValueError('no connection intent inside the owner service window')
+    matches.sort()
+    return matches[-1][2], [row[2] for row in matches]
+
+
+NAMESPACE = re.compile(r'nvme[0-9]+n[0-9]+')
+# `/sys/block/<ns>/stat` fields 0-3 are reads, 4-7 writes; field 6 is the
+# sectors written count.
+SECTORS_WRITTEN_FIELD = 6
+
+
+def controller_namespaces(controller, *, nvme_root=None, block_root=None):
+    """The namespace block devices one host controller serves, from sysfs.
+
+    A fabrics controller's namespace device links to that controller; a native
+    multipath group links to its subsystem, which is accepted only when its
+    `subsysnqn` equals the controller's.
+    """
+    nvme_root = Path(nvme_root or manage.SYS_NVME)
+    block_root = Path(block_root or manage.SYS_BLOCK)
+    root = nvme_root / controller
+    controller_path = root.resolve(strict=True)
+    subsysnqn = (root / 'subsysnqn').read_text().strip()
+    if not subsysnqn:
+        raise ValueError('controller has an empty subsystem NQN')
+    names = []
+    for entry in sorted(block_root.iterdir()):
+        if not NAMESPACE.fullmatch(entry.name):
+            continue
+        try:
+            device = (entry / 'device').resolve(strict=True)
+        except OSError:
+            continue
+        if device == controller_path:
+            names.append(entry.name)
+            continue
+        if device.name.startswith('nvme-subsys'):
+            try:
+                if (device / 'subsysnqn').read_text().strip() == subsysnqn:
+                    names.append(entry.name)
+            except OSError:
+                continue
+    return names
+
+
+def namespace_holders(devices, *, proc_root=Path('/proc'), dev_root=Path('/dev')):
+    """Processes holding an open descriptor on one of `devices`."""
+    targets = {str(dev_root / name) for name in devices}
+    holders = []
+    for process in sorted(proc_root.iterdir()):
+        if not process.name.isdigit():
+            continue
+        try:
+            descriptors = list((process / 'fd').iterdir())
+        except OSError:
+            continue
+        open_fds = 0
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if target in targets:
+                open_fds += 1
+        if open_fds:
+            holders.append(dict(pid=int(process.name), descriptors=open_fds))
+    return holders
+
+
+def sectors_written(device, *, block_root=None):
+    """The sectors written counter of one namespace block device."""
+    block_root = Path(block_root or manage.SYS_BLOCK)
+    fields = (block_root / device / 'stat').read_text().split()
+    if len(fields) <= SECTORS_WRITTEN_FIELD:
+        raise ValueError(f'namespace {device} stat has no sectors written field')
+    return int(fields[SECTORS_WRITTEN_FIELD])
+
+
+def wait_sectors_advance(devices, *, timeout, block_root=None,
+                         clock=time.monotonic, sleep=time.sleep):
+    """Wait until one namespace's write sectors advance; bounded by `timeout`.
+
+    Returns `(advanced, rows)` where each row keeps the first and last observed
+    counter of one device, so the evidence names the write path that was live
+    when the controller was deleted.
+    """
+    before = {device: sectors_written(device, block_root=block_root) for device in devices}
+    start = clock()
+    rows = []
+    while True:
+        now = {device: sectors_written(device, block_root=block_root) for device in devices}
+        advanced = any(now[device] > before[device] for device in devices)
+        rows.append(dict(seconds=clock() - start,
+                         sectors={device: dict(before=before[device], now=now[device])
+                                  for device in devices}))
+        if advanced:
+            return True, rows
+        if clock() - start >= timeout:
+            return False, rows
+        sleep(min(.05, max(0, timeout - (clock() - start))))
 
 
 def hostnqn(controller):
@@ -107,6 +227,14 @@ def hostnqn(controller):
     if not value:
         raise ValueError('controller host NQN is empty')
     return value
+
+
+def controller_state(controller):
+    """The controller's kernel state, or None when its sysfs entry vanished."""
+    try:
+        return (manage.SYS_NVME / controller / 'state').read_text().strip()
+    except FileNotFoundError:
+        return None
 
 
 def canonical(value):
@@ -191,10 +319,14 @@ def process_state(pids):
 
 def run(args, *, snapshot=None, delete=None,
         latest=latest_checkpoint, metrics=scrape_metrics, clock=time.monotonic,
-        sleep=time.sleep, read_checkpoint=read_checkpoint):
+        sleep=time.sleep, read_checkpoint=read_checkpoint,
+        namespaces=None, holders=None, sectors=None):
     """Inject one controller loss and return the retained record."""
     snapshot = snapshot or manage.controller_snapshot
     delete = delete or manage.delete_controller
+    namespaces = namespaces or controller_namespaces
+    holders = holders or namespace_holders
+    sectors = sectors or wait_sectors_advance
     validate_spec(args)
     address = str(ipaddress.ip_address(args.address))
     record = dict(schema=1, kind='w1_controller_loss', injection='sysfs delete_controller',
@@ -206,20 +338,52 @@ def run(args, *, snapshot=None, delete=None,
         return record
     inventory = snapshot()
     candidates = None
-    if args.nqn is None:
-        controller, identity, candidates = select_scoped(
-            inventory, transport=args.transport, address=address,
+    selected_nqn = args.nqn
+    if selected_nqn is None:
+        selected_nqn, candidates = newest_write_intent(
+            args.intents, transport=args.transport, address=address,
             service=args.service, service_max=args.service_max)
-    else:
-        controller, identity = select_controller(inventory, nqn=args.nqn,
-            transport=args.transport, address=address, service=args.service)
+        record['target']['intents'] = str(args.intents)
+        record['target']['candidates'] = candidates
+    controller, identity = select_controller(inventory, nqn=selected_nqn,
+        transport=args.transport, address=address, service=args.service)
     deleted_nqn = identity['nqn']
     deleted_hostnqn = hostnqn(controller)
     record['target'].update(controller=controller, inode=identity['inode'],
         hostnqn=deleted_hostnqn, nqn=deleted_nqn, transport=args.transport,
         address=address, service=args.service, service_max=args.service_max)
-    if candidates is not None:
-        record['target']['candidates'] = candidates
+    # The deleted controller must be the one serving the coordinator's writes:
+    # it is live, a process holds its namespace open, and the namespace's write
+    # sectors advance. A stale read-only epoch fails these before any delete.
+    try:
+        state = controller_state(controller)
+        devices = namespaces(controller)
+        holding = holders(devices) if devices else []
+        advanced, sector_rows = (
+            sectors(devices, timeout=args.preflight_timeout) if devices else (False, []))
+    except (OSError, ValueError) as error:
+        record['reason'] = 'controller write-path preflight failed: ' + str(error)
+        record['finished_unix_ns'] = time.time_ns()
+        return record
+    record['preflight'] = dict(state=state, devices=devices, holders=holding,
+        sectors_advanced=advanced, sectors=sector_rows)
+    if state != 'live':
+        record['reason'] = f'the selected controller is not live: {state}'
+        record['finished_unix_ns'] = time.time_ns()
+        return record
+    if not devices:
+        record['reason'] = 'the selected controller serves no namespace block device'
+        record['finished_unix_ns'] = time.time_ns()
+        return record
+    if not holding:
+        record['reason'] = 'no process holds a descriptor on the selected controller namespace'
+        record['finished_unix_ns'] = time.time_ns()
+        return record
+    if not advanced:
+        record['reason'] = ('the selected controller namespace write sectors did not advance '
+                            f'in {args.preflight_timeout} s')
+        record['finished_unix_ns'] = time.time_ns()
+        return record
     before_sequence = latest(args.sui_rpc)
     if before_sequence < 0:
         raise ValueError('negative checkpoint sequence')
@@ -269,8 +433,18 @@ def run(args, *, snapshot=None, delete=None,
             record['live_delta'] = live_nvmeof_deltas(
                 {f'tidehunter_nvmeof_live_{k}': v for k, v in before_metrics['counters'].items()},
                 {f'tidehunter_nvmeof_live_{k}': v for k, v in after_metrics['counters'].items()})
+        # The reconnect a controller loss requires is a write resume, not just a
+        # new connection: the engine must have rewritten the unadopted suffix.
+        delta = record.get('live_delta') or {}
+        record['resume'] = {name: delta.get(name) for name in (
+            'resume_attempts', 'resume_rewrites', 'resume_frames', 'resume_refused')}
+        new_name, new_identity = select_controller(snapshot(), nqn=deleted_nqn,
+            transport=args.transport, address=address, service=args.service)
+        record['new_controller'] = dict(controller=new_name, inode=new_identity['inode'])
         record['processes_after'] = process_state(args.owner_pid)
         failures = []
+        if new_identity['inode'] == identity['inode']:
+            failures.append('the controller inode did not change after the loss')
         if not record['readback_equal']:
             failures.append('checkpoint summary readback differs')
         if any(not row['alive'] for row in record['processes_after']):
@@ -280,6 +454,13 @@ def run(args, *, snapshot=None, delete=None,
         if args.metrics_url and record.get('live_delta', {}).get('available') and (
                 record['live_delta'].get('errors') or 0) > 0:
             failures.append('live data-plane errors increased during the injection')
+        if args.metrics_url and delta.get('available'):
+            if (delta.get('resume_attempts') or 0) < 1:
+                failures.append('no write-resume episode followed the controller loss')
+            if (delta.get('resume_frames') or 0) < 1:
+                failures.append('no frame was rewritten after the controller loss')
+            if (delta.get('namespace_connects') or 0) < 1:
+                failures.append('no new verified controller connection followed the loss')
         record['fail_stop_count'] = sum(1 for row in record['processes_after'] if not row['alive'])
         record['duplicate_count'] = None
         record['duplicate_observation'] = 'unavailable: no host-side duplicate counter; engine reconciliation is inspected from its own logs'
@@ -300,6 +481,10 @@ def run(args, *, snapshot=None, delete=None,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nqn', help='exact owner target NQN to lose')
+    parser.add_argument('--intents',
+                        help="the coordinator's live-nvme-connections directory; its "
+                             'newest intent inside the owner service window names the '
+                             'active write controller')
     parser.add_argument('--service-max', type=int,
                         help='upper bound of the owner target service window; '
                              'required when --nqn is absent')
@@ -311,6 +496,8 @@ def main():
     parser.add_argument('--owner-pid', type=int, action='append', default=[],
                         help='owned process expected to stay alive; repeat per process')
     parser.add_argument('--timeout', type=float, default=30.0)
+    parser.add_argument('--preflight-timeout', type=float, default=10.0,
+                        help='bound on observing the selected namespace write advance')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     try:

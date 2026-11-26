@@ -646,7 +646,8 @@ class ControllerLossInjection(unittest.TestCase):
     def test_an_observed_point_injects_and_passes_the_cell(self):
         remote = MailboxDouble(self.root, self.root / 'guest')
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
-        gate = self.gate(remote)
+        intents = self.root / 'coordinator-intents'
+        gate = self.gate(remote, intents=intents)
         receipt = self.launcher(remote, gate, ledger=ledger, cell_id='S1-4-mid-frame-native',
                                 allow_local_ledger=True).run(
             manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
@@ -662,10 +663,12 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertEqual(words[words.index('--service-max') + 1], '4435')
         self.assertEqual(words[words.index('--address') + 1], '10.0.0.2')
         self.assertNotIn('--nqn', words)
+        self.assertEqual(words[words.index('--intents') + 1], str(intents))
         evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
         self.assertTrue(evidence['injected'])
         self.assertIn('kernel_log', evidence)
         self.assertEqual(evidence['kernel_log']['host'], 'coordinator')
+        self.assertEqual(evidence['intents'], str(intents))
         self.assertGreaterEqual(len(evidence['samples']), 2)
         self.assertEqual(evidence['injector']['ok'], True)
         self.assertTrue((self.root / 'run/controller-loss/mid-frame.json').is_file())
@@ -707,6 +710,20 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertFalse(window['lines'])
         denied = Denied()
         self.assertIsNone(gate.kernel_log(denied, None)['since'])
+    def test_a_refused_write_path_preflight_fails_the_cell(self):
+        refused = dict(INJECTOR_RECORD, ok=False,
+                       reason='no process holds a descriptor on the selected controller namespace',
+                       preflight=dict(state='live', devices=['nvme1n1'], holders=[],
+                                      sectors_advanced=False, sectors=[]))
+        remote = MailboxDouble(self.root, self.root / 'guest', record=refused, code=1)
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        gate = self.gate(remote, intents=self.root / 'coordinator-intents')
+        with self.assertRaisesRegex(manual_sui.LaunchError, 'the injector refused'):
+            self.launcher(remote, gate, ledger=ledger,
+                          cell_id='S1-4-mid-frame-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'failed')
 
     def test_an_unobserved_mid_frame_point_fails_the_cell_and_keeps_the_series(self):
         remote = MailboxDouble(self.root, self.root / 'guest')

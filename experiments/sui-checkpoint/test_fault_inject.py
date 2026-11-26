@@ -1,4 +1,5 @@
 """W1 controller-loss injector tests with a fake sysfs tree and JSON-RPC."""
+import json
 import os
 import tempfile
 import unittest
@@ -16,6 +17,26 @@ SERVICE = 4420
 def inventory(controller='nvme1', inode=1):
     return {controller: dict(nqn=NQN, transport='rdma',
                              address=f'traddr={ADDRESS},trsvcid={SERVICE}', inode=inode)}
+
+
+def intent(nqn=NQN, *, transport='rdma', address=ADDRESS, service=SERVICE):
+    return {'target': {'nqn': nqn, 'transport': transport, 'address': address,
+                       'service': service, 'nsid': 1, 'bytes': 4096, 'block_size': 4096,
+                       'uuid': [1] * 16},
+            'host_nqn': 'nqn.2026-01.test:host', 'host_id': [2] * 16}
+
+
+def metrics(reads, *, connects=1, attempts=0, frames=0):
+    """One aggregate live family with the write-resume counters the cell reads."""
+    return ('tidehunter_nvmeof_live_completed_read_ops_total %d\n'
+            'tidehunter_nvmeof_live_errors_total 0\n'
+            'tidehunter_nvmeof_live_namespace_connects_total %d\n'
+            'tidehunter_nvmeof_live_resume_attempts_total %d\n'
+            'tidehunter_nvmeof_live_resume_rewrites_total %d\n'
+            'tidehunter_nvmeof_live_resume_frames_total %d\n'
+            'tidehunter_nvmeof_live_resume_refused_total 0\n'
+            'tidehunter_nvmeof_live_read_io_samples_total 3\n') % (
+                reads, connects, attempts, 1 if attempts else 0, frames)
 
 
 class FakeClock:
@@ -61,46 +82,127 @@ class ControllerSelection(unittest.TestCase):
                          fault_inject.canonical({'b': 2, 'a': 1}))
         self.assertNotEqual(fault_inject.canonical({'a': 1}), fault_inject.canonical({'a': 2}))
 
-    def test_service_window_selects_the_lowest_NQN_and_keeps_candidates(self):
-        first = 'nqn.2026-01.test:db-a-p00000001-sub-01'
-        second = 'nqn.2026-01.test:db-b-p00000001-sub-02'
-        inventory_rows = {
-            'nvme1': dict(nqn=second, transport='rdma',
-                          address=f'traddr={ADDRESS},trsvcid={SERVICE}', inode=1),
-            'nvme2': dict(nqn=first, transport='rdma',
-                          address=f'traddr={ADDRESS},trsvcid={SERVICE + 3}', inode=2),
-            'nvme3': dict(nqn='nqn.2026-01.test:other', transport='rdma',
-                          address=f'traddr=10.0.0.9,trsvcid={SERVICE}', inode=3),
-            'nvme4': dict(nqn='nqn.2026-01.test:outside', transport='rdma',
-                          address=f'traddr={ADDRESS},trsvcid={SERVICE + 16}', inode=4),
-            'nvme5': dict(nqn='nqn.2026-01.test:tcp', transport='tcp',
-                          address=f'traddr={ADDRESS},trsvcid={SERVICE}', inode=5),
-        }
-        name, identity, candidates = fault_inject.select_scoped(
-            inventory_rows, transport='rdma', address=ADDRESS,
-            service=SERVICE, service_max=SERVICE + 15)
-        self.assertEqual(name, 'nvme2')
-        self.assertEqual(identity['nqn'], first)
-        self.assertEqual(candidates, [first, second])
-        with self.assertRaises(ValueError):
-            fault_inject.select_scoped(inventory_rows, transport='rdma',
-                                       address='10.0.0.7', service=SERVICE,
-                                       service_max=SERVICE + 15)
-        with self.assertRaises(ValueError):
-            fault_inject.select_scoped(inventory_rows, transport='rdma',
-                                       address=ADDRESS, service=SERVICE + 5,
-                                       service_max=SERVICE + 1)
 
-    def test_a_window_target_requires_no_NQN_but_needs_a_bounded_window(self):
-        base = dict(transport='rdma', address=ADDRESS, service=SERVICE,
-                    sui_rpc='127.0.0.1:9000', metrics_url=None,
-                    owner_pid=[], timeout=10.0)
-        fault_inject.validate_spec(SimpleNamespace(nqn=None, service_max=SERVICE + 15, **base))
-        fault_inject.validate_spec(SimpleNamespace(nqn=NQN, service_max=None, **base))
-        for service_max in (None, SERVICE - 1):
-            with self.subTest(service_max=service_max), self.assertRaises(ValueError):
-                fault_inject.validate_spec(
-                    SimpleNamespace(nqn=None, service_max=service_max, **base))
+class IntentSelection(unittest.TestCase):
+    def write(self, root, name, value, mtime_ns):
+        path = root / f'{name}.json'
+        path.write_text(json.dumps(value))
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+        return path
+
+    def test_the_newest_intent_of_the_window_is_the_active_writer(self):
+        old = 'nqn.2026-01.test:db-a-p00000001-sub-01'
+        new = 'nqn.2026-01.test:db-a-p00000001-sub-02'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write(root, 'old', intent(old), 1_000)
+            self.write(root, 'new', intent(new, service=SERVICE + 3), 2_000)
+            # A newer intent of another owner window or transport is not a
+            # candidate for this owner.
+            self.write(root, 'outside', intent('nqn.2026-01.test:outside', service=SERVICE + 16), 3_000)
+            self.write(root, 'tcp', intent('nqn.2026-01.test:tcp', transport='tcp'), 4_000)
+            self.write(root, 'other-address', intent('nqn.2026-01.test:x', address='10.0.0.9'), 5_000)
+            selected, candidates = fault_inject.newest_write_intent(
+                root, transport='rdma', address=ADDRESS, service=SERVICE,
+                service_max=SERVICE + 15)
+            self.assertEqual(selected, new)
+            self.assertEqual(candidates, [old, new])
+            empty = root / 'empty'
+            empty.mkdir()
+            with self.assertRaisesRegex(ValueError, 'no connection intent'):
+                fault_inject.newest_write_intent(
+                    empty, transport='rdma', address=ADDRESS, service=SERVICE,
+                    service_max=SERVICE + 15)
+
+    def test_a_corrupt_intent_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'broken.json').write_text('{not json')
+            with self.assertRaisesRegex(ValueError, 'unreadable connection intent'):
+                fault_inject.newest_write_intent(
+                    root, transport='rdma', address=ADDRESS, service=SERVICE,
+                    service_max=SERVICE + 15)
+
+
+class WritePathPreflight(unittest.TestCase):
+    def sysfs(self, root, *, subsysnqn=NQN, multipath=False):
+        nvme = root / 'sys-class-nvme'
+        block = root / 'sys-class-block'
+        controller = nvme / 'nvme1'
+        controller.mkdir(parents=True)
+        (controller / 'subsysnqn').write_text(subsysnqn + '\n')
+        (controller / 'state').write_text('live\n')
+        namespace = block / 'nvme1n1'
+        namespace.mkdir(parents=True)
+        (namespace / 'stat').write_text('0 0 0 0 0 0 8 0\n')
+        (namespace / 'device').symlink_to(controller)
+        if multipath:
+            subsystem = nvme / 'nvme-subsys0'
+            subsystem.mkdir()
+            (subsystem / 'subsysnqn').write_text(subsysnqn + '\n')
+            (namespace / 'device').unlink()
+            (namespace / 'device').symlink_to(subsystem)
+        return nvme, block
+
+    def test_a_namespace_of_the_controller_is_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nvme, block = self.sysfs(root)
+            unrelated = block / 'nvme9n1'
+            unrelated.mkdir()
+            (unrelated / 'stat').write_text('0 0 0 0 0 0 8 0\n')
+            other = nvme / 'nvme9'
+            other.mkdir()
+            (unrelated / 'device').symlink_to(other)
+            with patch.object(fault_inject.manage, 'SYS_NVME', nvme), \
+                    patch.object(fault_inject.manage, 'SYS_BLOCK', block):
+                self.assertEqual(fault_inject.controller_namespaces('nvme1'), ['nvme1n1'])
+                self.assertEqual(fault_inject.sectors_written('nvme1n1'), 8)
+
+    def test_a_multipath_member_is_selected_through_its_subsystem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nvme, block = self.sysfs(root, multipath=True)
+            with patch.object(fault_inject.manage, 'SYS_NVME', nvme), \
+                    patch.object(fault_inject.manage, 'SYS_BLOCK', block):
+                self.assertEqual(fault_inject.controller_namespaces('nvme1'), ['nvme1n1'])
+            (nvme / 'nvme-subsys0' / 'subsysnqn').write_text('nqn.2026-01.test:other\n')
+            with patch.object(fault_inject.manage, 'SYS_NVME', nvme), \
+                    patch.object(fault_inject.manage, 'SYS_BLOCK', block):
+                self.assertEqual(fault_inject.controller_namespaces('nvme1'), [])
+
+    def test_only_a_descriptor_on_the_namespace_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc, dev = root / 'proc', root / 'dev'
+            dev.mkdir()
+            (dev / 'nvme1n1').write_text('')
+            (dev / 'nvme9n1').write_text('')
+            for pid, target in ((10, dev / 'nvme1n1'), (11, dev / 'nvme9n1')):
+                fd = proc / str(pid) / 'fd'
+                fd.mkdir(parents=True)
+                (fd / '3').symlink_to(target)
+                (fd / '4').symlink_to(dev)
+            holders = fault_inject.namespace_holders(['nvme1n1'], proc_root=proc, dev_root=dev)
+            self.assertEqual(holders, [dict(pid=10, descriptors=1)])
+
+    def test_sector_advance_waits_on_the_counter_and_is_bounded(self):
+        idle = lambda device, **kwargs: 10
+        clock = FakeClock()
+        with patch.object(fault_inject, 'sectors_written', idle):
+            advanced, rows = fault_inject.wait_sectors_advance(
+                ['nvme1n1'], timeout=1, clock=clock.monotonic, sleep=clock.sleep)
+        self.assertFalse(advanced)
+        self.assertEqual(rows[-1]['sectors']['nvme1n1']['now'], 10)
+        self.assertGreater(rows[-1]['seconds'], 0)
+        values = iter([10, 10, 12])
+        moving = lambda device, **kwargs: next(values)
+        clock = FakeClock()
+        with patch.object(fault_inject, 'sectors_written', moving):
+            advanced, rows = fault_inject.wait_sectors_advance(
+                ['nvme1n1'], timeout=5, clock=clock.monotonic, sleep=clock.sleep)
+        self.assertTrue(advanced)
+        self.assertEqual(rows[-1]['sectors']['nvme1n1'], dict(before=10, now=12))
 
 
 class InjectionRun(unittest.TestCase):
@@ -108,17 +210,27 @@ class InjectionRun(unittest.TestCase):
         controller = root / 'nvme1'
         controller.mkdir()
         (controller / 'hostnqn').write_text('nqn.2026-01.test:host')
+        (controller / 'state').write_text('live\n')
         return controller
 
+    def preflight(self, *, holders=None, advanced=None):
+        return dict(
+            namespaces=lambda controller: ['nvme1n1'],
+            holders=lambda devices: ([dict(pid=42, descriptors=1)]
+                                     if holders is None else holders),
+            sectors=lambda devices, *, timeout: (
+                True if advanced is None else advanced,
+                [dict(seconds=0.0, sectors={'nvme1n1': dict(before=8, now=16)})]))
+
     def args(self, **changes):
-        base = dict(nqn=NQN, transport='rdma', address=ADDRESS, service=SERVICE,
+        base = dict(nqn=NQN, intents=None, transport='rdma', address=ADDRESS, service=SERVICE,
                     service_max=None, sui_rpc='127.0.0.1:9000',
                     metrics_url='http://127.0.0.1:9000/metrics',
-                    owner_pid=[os.getpid()], timeout=10.0)
+                    owner_pid=[os.getpid()], timeout=10.0, preflight_timeout=5.0)
         base.update(changes)
         return SimpleNamespace(**base)
 
-    def test_controller_loss_records_reconnect_progress_and_readback(self):
+    def test_controller_loss_records_preflight_reconnect_and_resume(self):
         clock = FakeClock()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -135,18 +247,25 @@ class InjectionRun(unittest.TestCase):
                 return 10 if state['calls'] == 1 else 11
             def read(address, sequence):
                 return {'sequenceNumber': str(sequence), 'digest': 'stable', 'epoch': '0'}
-            def metrics(url):
-                value = 10 if state['calls'] <= 1 else 14
-                return ('tidehunter_nvmeof_live_completed_read_ops_total %d\n'
-                        'tidehunter_nvmeof_live_errors_total 0\n'
-                        'tidehunter_nvmeof_live_namespace_connects_total 1\n'
-                        'tidehunter_nvmeof_live_read_io_samples_total 3\n') % value
+            def scraped(url):
+                if state['calls'] <= 1:
+                    return metrics(10, connects=1)
+                return metrics(14, connects=2, attempts=1, frames=1)
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(self.args(), snapshot=snapshot, delete=delete,
-                    latest=latest, metrics=metrics,
-                    clock=clock.monotonic, sleep=clock.sleep, read_checkpoint=read)
+                    latest=latest, metrics=scraped,
+                    clock=clock.monotonic, sleep=clock.sleep, read_checkpoint=read,
+                    **self.preflight())
             self.assertTrue(record['ok'], record)
             self.assertEqual(record['target']['controller'], 'nvme1')
+            self.assertEqual(record['target']['nqn'], NQN)
+            self.assertEqual(record['preflight']['state'], 'live')
+            self.assertEqual(record['preflight']['devices'], ['nvme1n1'])
+            self.assertEqual(record['preflight']['holders'], [dict(pid=42, descriptors=1)])
+            self.assertTrue(record['preflight']['sectors_advanced'])
+            self.assertEqual(record['new_controller'], dict(controller='nvme2', inode=2))
+            self.assertEqual(record['resume'], dict(resume_attempts=1, resume_rewrites=1,
+                                                   resume_frames=1, resume_refused=0))
             self.assertEqual(record['checkpoint_before'], 10)
             self.assertEqual(record['checkpoint_after'], 11)
             self.assertTrue(record['readback_equal'])
@@ -155,6 +274,62 @@ class InjectionRun(unittest.TestCase):
             self.assertEqual(record['live_delta']['completed_read_ops'], 4)
             self.assertGreaterEqual(record['reconnect_seconds'], 0)
             self.assertEqual(record['processes_after'][0]['pid'], os.getpid())
+
+    def test_a_loss_without_a_resume_episode_is_refused(self):
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            state = dict(deleted=False, calls=0)
+            def snapshot():
+                return inventory('nvme2', 2) if state['deleted'] else inventory()
+            def latest(address):
+                state['calls'] += 1
+                return 10 if state['calls'] == 1 else 11
+            def metrics_only_reconnect(url):
+                return (metrics(10, connects=1) if state['calls'] <= 1
+                        else metrics(14, connects=2))
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(self.args(), snapshot=snapshot,
+                    delete=lambda *a: state.update(deleted=True), latest=latest,
+                    metrics=metrics_only_reconnect, clock=clock.monotonic,
+                    sleep=clock.sleep,
+                    read_checkpoint=lambda address, sequence: {}, **self.preflight())
+            self.assertFalse(record['ok'])
+            self.assertIn('no write-resume episode', record['reason'])
+            self.assertIn('no frame was rewritten', record['reason'])
+
+    def test_a_stale_epoch_is_refused_before_any_delete(self):
+        clock = FakeClock()
+        deleted = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(self.args(), snapshot=inventory,
+                    delete=lambda *a: deleted.append(a), latest=lambda address: 10,
+                    metrics=lambda url: metrics(10), clock=clock.monotonic,
+                    sleep=clock.sleep, read_checkpoint=lambda address, sequence: {},
+                    **self.preflight(holders=[], advanced=False))
+            self.assertFalse(record['ok'])
+            self.assertIn('no process holds a descriptor', record['reason'])
+            self.assertFalse(deleted, 'a stale epoch must not be deleted')
+
+    def test_an_idle_namespace_is_refused_before_any_delete(self):
+        clock = FakeClock()
+        deleted = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(self.args(), snapshot=inventory,
+                    delete=lambda *a: deleted.append(a), latest=lambda address: 10,
+                    metrics=lambda url: metrics(10), clock=clock.monotonic,
+                    sleep=clock.sleep, read_checkpoint=lambda address, sequence: {},
+                    **self.preflight(advanced=False))
+            self.assertFalse(record['ok'])
+            self.assertIn('write sectors did not advance', record['reason'])
+            self.assertFalse(deleted, 'an idle namespace must not be deleted')
 
     def test_missing_reconnect_is_retained_as_failure(self):
         clock = FakeClock()
@@ -166,38 +341,47 @@ class InjectionRun(unittest.TestCase):
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(self.args(), snapshot=inventory,
                     delete=delete, latest=lambda address: 10,
-                    metrics=lambda url: '', clock=clock.monotonic, sleep=clock.sleep,
-                    read_checkpoint=lambda address, sequence: {})
+                    metrics=lambda url: metrics(10), clock=clock.monotonic,
+                    sleep=clock.sleep, read_checkpoint=lambda address, sequence: {},
+                    **self.preflight())
             self.assertFalse(record['ok'])
             self.assertIn('did not reconnect', record['reason'])
             self.assertIn('processes_after', record)
 
-    def test_service_window_injection_records_candidates_and_selected_nqn(self):
+    def test_intent_selection_records_candidates_and_selected_nqn(self):
         clock = FakeClock()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
+            intents = root / 'live-nvme-connections'
+            intents.mkdir()
+            (intents / 'a.json').write_text(json.dumps(intent('nqn.2026-01.test:old',
+                                                              service=SERVICE + 1)))
+            os.utime(intents / 'a.json', ns=(1_000_000_000, 1_000_000_000))
+            (intents / 'b.json').write_text(json.dumps(intent()))
+            os.utime(intents / 'b.json', ns=(2_000_000_000, 2_000_000_000))
             state = dict(deleted=False, calls=0)
             def snapshot():
                 return inventory('nvme2', 2) if state['deleted'] else inventory()
-            def delete(controller, identity, attrs):
-                self.assertEqual((controller, identity['inode']),
-                                 ('nvme1', 1))
-                state['deleted'] = True
             def latest(address):
                 state['calls'] += 1
                 return 10 if state['calls'] == 1 else 11
+            def scraped(url):
+                if state['calls'] <= 1:
+                    return metrics(10, connects=1)
+                return metrics(14, connects=2, attempts=1, frames=1)
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(
-                    self.args(nqn=None, service_max=SERVICE + 15), snapshot=snapshot,
-                    delete=delete, latest=latest,
-                    metrics=lambda url: 'tidehunter_nvmeof_live_namespace_connects_total 2\n',
-                    clock=clock.monotonic, sleep=clock.sleep,
-                    read_checkpoint=lambda address, sequence: {})
+                    self.args(nqn=None, intents=intents, service_max=SERVICE + 15),
+                    snapshot=snapshot, delete=lambda *a: state.update(deleted=True),
+                    latest=latest, metrics=scraped, clock=clock.monotonic,
+                    sleep=clock.sleep, read_checkpoint=lambda address, sequence: {},
+                    **self.preflight())
             self.assertTrue(record['ok'], record)
             self.assertEqual(record['target']['nqn'], NQN)
-            self.assertEqual(record['target']['service_max'], SERVICE + 15)
-            self.assertEqual(record['target']['candidates'], [NQN])
+            self.assertEqual(record['target']['intents'], str(intents))
+            self.assertEqual(record['target']['candidates'],
+                             ['nqn.2026-01.test:old', NQN])
 
     def test_refused_delete_keeps_the_record_without_injection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,21 +391,46 @@ class InjectionRun(unittest.TestCase):
                 raise ValueError('recorded controller identity changed')
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(self.args(), snapshot=inventory, delete=delete,
-                    latest=lambda address: 10, metrics=lambda url: '',
+                    latest=lambda address: 10, metrics=lambda url: metrics(10),
                     clock=FakeClock().monotonic, sleep=lambda seconds: None,
-                    read_checkpoint=lambda address, sequence: {})
+                    read_checkpoint=lambda address, sequence: {}, **self.preflight())
             self.assertFalse(record['ok'])
             self.assertIn('delete was refused', record['reason'])
             self.assertEqual(record['target']['controller'], 'nvme1')
 
     def test_dead_owner_before_injection_is_refused(self):
         record = fault_inject.run(self.args(owner_pid=[999999999]), snapshot=inventory,
-            delete=lambda *a: None, latest=lambda address: 10, metrics=lambda url: '',
+            delete=lambda *a: None, latest=lambda address: 10, metrics=lambda url: metrics(10),
             clock=FakeClock().monotonic, sleep=lambda seconds: None,
-            read_checkpoint=lambda address, sequence: {})
+            read_checkpoint=lambda address, sequence: {}, **self.preflight())
         self.assertFalse(record['ok'])
         self.assertIn('not alive', record['reason'])
         self.assertNotIn('controller', record['target'])
+
+
+class Specification(unittest.TestCase):
+    def base(self, **changes):
+        values = dict(nqn=NQN, intents=None, transport='rdma', address=ADDRESS,
+                      service=SERVICE, service_max=None, sui_rpc='127.0.0.1:9000',
+                      metrics_url=None, owner_pid=[], timeout=10.0, preflight_timeout=5.0)
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def test_the_window_alone_cannot_name_a_controller(self):
+        fault_inject.validate_spec(self.base(intents='/run/intents',
+                                             nqn=None, service_max=SERVICE + 15))
+        fault_inject.validate_spec(self.base())
+        with self.assertRaisesRegex(ValueError, 'intent directory'):
+            fault_inject.validate_spec(self.base(nqn=None, service_max=SERVICE + 15))
+        with self.assertRaisesRegex(ValueError, 'bounded service window'):
+            fault_inject.validate_spec(self.base(nqn=None, intents='/run/intents',
+                                                 service_max=None))
+        for service_max in (None, SERVICE - 1):
+            with self.subTest(service_max=service_max), self.assertRaises(ValueError):
+                fault_inject.validate_spec(self.base(nqn=None, intents='/run/intents',
+                                                     service_max=service_max))
+        with self.assertRaisesRegex(ValueError, 'preflight timeout'):
+            fault_inject.validate_spec(self.base(preflight_timeout=0))
 
 
 if __name__ == '__main__':
