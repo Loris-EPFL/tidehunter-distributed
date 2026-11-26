@@ -51,6 +51,9 @@ FUA_THRESHOLD = 64 << 10
 # Synthetic cells reuse one namespace per unit so a restart, a second
 # coordinator or a verification pass addresses the same physical keys.
 UNIT_PREFIX = 'mechanism'
+# The four fence cases the plan runs on both tiers: S1-5S, and the stage-2 M8
+# view of the same eight runs.
+FENCE_CASES = ('contend', 'lapse', 'stale', 'sealed')
 
 
 def unit_namespace(unit):
@@ -163,7 +166,7 @@ def cells():
         for cut in ('publication', 'snapshot'):
             unit = f'S1-2S-{cut}-{tier}'
             rows.append(dict(
-                id=unit, stage='stage1S', unit=unit, family='S1-2',
+                id=unit, stage='stage1', unit=unit, family='S1-2',
                 synthetic=True, tier=tier,
                 plan=dict(cut=cut, tiers='native, synchronous', cells='4'),
                 note='kill -9 the coordinator at the gated cut, reopen, full audit',
@@ -172,7 +175,7 @@ def cells():
                       _verify_run(4_096, value=4096)]))
         unit = f'S1-3S-owner-{tier}'
         rows.append(dict(
-            id=unit, stage='stage1S', unit=unit, family='S1-3',
+            id=unit, stage='stage1', unit=unit, family='S1-3',
             synthetic=True, tier=tier,
             plan=dict(cut='owner', tiers='native, synchronous', cells='2'),
             note='kill -9 one owner, restart it as a new incarnation, reopen, full audit',
@@ -182,19 +185,19 @@ def cells():
         for cut in ('unlink', 'dir-sync'):
             unit = f'S1-6S-{cut}-{tier}'
             rows.append(dict(
-                id=unit, stage='stage1S', unit=unit, family='S1-6',
+                id=unit, stage='stage1', unit=unit, family='S1-6',
                 synthetic=True, tier=tier,
                 plan=dict(cut=cut, tiers='native, synchronous', cells='4'),
                 note='kill -9 the owner at the observed retirement cut, restart, full audit',
                 runs=[_run('measure', mix=_mix(put=100), value=8192,
                            concurrency=4, measurement=65_536, deadline=1_200),
                       _verify_run(4_096)]))
-        for case in ('contend', 'lapse', 'stale', 'sealed'):
+        for case in FENCE_CASES:
             unit = f'S1-5S-{case}-{tier}'
             rows.append(dict(
-                id=unit, stage='stage1S', unit=unit, family='S1-5', case=case,
+                id=unit, stage='stage1', unit=unit, family='S1-5', case=case,
                 synthetic=True, tier=tier,
-                plan=dict(cases=['contend', 'lapse', 'stale', 'sealed'],
+                plan=dict(cases=list(FENCE_CASES),
                           tiers='native, synchronous', cells='8', also='M8'),
                 note='two coordinators on one owner database; lease lapse, stale '
                      'write, sealed read, fence latency',
@@ -208,6 +211,28 @@ def find(cell_id):
         if cell['id'] == cell_id:
             return cell
     raise ValueError('unknown mechanism cell: ' + cell_id)
+
+
+def aliases():
+    """Plan rows that are a derived view of another cell, never a second run.
+
+    The plan's M8 (fencing latency) is the S1-5S fence set: the same eight
+    runs, recorded once under stage 1 because they are stage-1 injections.
+    """
+    return {f'M8-{case}-{tier}': f'S1-5S-{case}-{tier}'
+            for tier in TIERS for case in FENCE_CASES}
+
+
+def alias_entries(ledger):
+    """The plan's M8 rows of one ledger: status and artifacts of the S1-5S cell."""
+    rows = []
+    for alias, cell_id in sorted(aliases().items()):
+        entry = ledger.entries.get(('stage1', cell_id))
+        if entry is None:
+            continue
+        rows.append(dict(entry, id=alias, stage='stage2', unit=alias,
+                         alias_of=cell_id, alias_stage='stage1'))
+    return rows
 
 
 def _key_distribution(cell):

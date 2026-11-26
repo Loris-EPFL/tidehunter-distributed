@@ -631,7 +631,9 @@ class CellDriver:
         """Stop a coordinator whose write core failed; the error rows are evidence."""
         def predicate():
             found = failures(child.rows())
-            return dict(reached=len(found) >= count, errors=len(found))
+            reached = len(found) >= count
+            return dict(reached=reached, errors=len(found),
+                        unix_ns=now_ns() if reached else None)
         gate = self.wait_for(child, predicate, timeout=timeout,
                              label=f'{count} typed write failure')
         if gate.get('reached'):
@@ -885,6 +887,15 @@ class CellDriver:
         text = first_rows[first_error].get('error_kind') if first_error is not None else None
         result['refusal_text'] = text
         result['typed_refusal'] = bool(text) and self.typed(text)
+        # The stale case's fence latency: from A's resume to the observed first
+        # typed refusal. The coordinator's sample writer flushes once a second,
+        # so this is the observation latency, never a claim of the engine's own
+        # syscall-to-refusal time.
+        failure = result.get('failure') or {}
+        gate = failure.get('gate') or {}
+        if case == 'stale' and gate.get('reached') and gate.get('unix_ns') is not None:
+            result['fence_reject_ms'] = ((gate['unix_ns'] - result['resumed_unix_ns'])
+                                         / 1e6)
         writers = (1 if result['second_acknowledged'] else 0) + \
                   (1 if (last_success is not None and first_error is not None and
                          last_success > first_error) else 0)
@@ -1049,6 +1060,27 @@ def cell_artifacts(output, parts):
     return rows
 
 
+def fleet_zone(state_path):
+    """The zone the fleet state records for its first admitted host, if any."""
+    state = json.loads(Path(state_path).read_text())
+    fleet = state.get('fleet') or [record['fleet'] for record in state.get('instances', [])
+                                   if record.get('fleet')]
+    return fleet[0].get('zone') if fleet else None
+
+
+def attempt_paths(output, config_dir, attempt):
+    """A retry writes a fresh output tree and external directory.
+
+    The coordinator requires a fresh output, and `prepare_external.py` creates
+    its directory once, so attempt two must not name attempt one's paths.
+    """
+    if attempt <= 1:
+        return output, config_dir
+    suffix = f'-attempt-{attempt}'
+    return (output.with_name(output.name + suffix),
+            config_dir.with_name(config_dir.name + suffix))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cell', required=True, choices=cell_ids())
@@ -1059,7 +1091,7 @@ def main():
     parser.add_argument('--guest-root', type=Path, required=True)
     parser.add_argument('--coordinator', required=True)
     parser.add_argument('--owners', required=True, help='owner1,owner2')
-    parser.add_argument('--zone', required=True)
+    parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
     parser.add_argument('--config-dir', type=Path,
                         help='fresh external config directory (default: beside the output)')
     parser.add_argument('--transport', choices=('tcp', 'tcp-trusted'), default='tcp')
@@ -1100,6 +1132,8 @@ def main():
         raise SystemExit(f'{cell["id"]} is a {cell["tier"]} cell; --durability-tier differs')
     output = args.output.resolve()
     config_dir = (args.config_dir or output.with_name(output.name + '-external')).resolve()
+    if args.zone is None and args.fleet_state is not None:
+        args.zone = fleet_zone(args.fleet_state)
     plan = dict(cell=cell['id'], stage=cell['stage'], unit=cell['unit'], tier=tier,
                 synthetic=True, output=str(output), config_dir=str(config_dir),
                 guest_root=str(args.guest_root), coordinator=args.coordinator,
@@ -1110,7 +1144,7 @@ def main():
                            measurement=run['measurement']) for run in cell['runs']])
     if args.dry_run:
         print(json.dumps(plan, indent=2, sort_keys=True))
-        return
+        return 0
     if args.fixture is None or args.schema is None:
         raise SystemExit('--fixture and --schema bind the ledger identity; both are required')
     if not args.bucket_prefix and not args.allow_local_ledger:
@@ -1131,20 +1165,16 @@ def main():
             values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
                     '--output': Path('out') / args.output.name,
                     '--config-dir': 'external', '--ledger': 'campaign-ledger.json'})
-    cluster = Cluster(remote=mailbox_exec.open_executor(args),
-                      build_root=args.build, output=output,
-                      guest_root=args.guest_root, config_dir=config_dir,
-                      owners=hosts['owners'], tier=tier, transport=args.transport,
-                      live_transport=args.live_transport, schema=args.schema)
-    cluster.admit()
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
     if Path(ledger_path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {ledger_path}')
     ledger, entry = ledger_module.Ledger(ledger_path), None
+    evidence = (campaign_upload.Evidence(store, prefix) if store is not None else None)
     if args.resume:
         ledger.load()
-        if store is not None:
-            ledger = campaign_upload.Evidence(store, prefix).merge(ledger)
+        if evidence is not None:
+            ledger = evidence.merge(ledger)
+    manifest = json.loads((Path(args.build) / 'build-manifest.json').read_text())
     identity = ledger_module.config_hash(
         spec=dict(build_manifest=digest(Path(args.build) / 'build-manifest.json'),
                   fixture=digest(Path(args.fixture) / 'experiment/results.json'),
@@ -1152,18 +1182,29 @@ def main():
                           for path in sorted(Path(args.schema).rglob('*')) if path.is_file()}),
         knobs=dict(tier=tier, cell=cell, transport=args.transport,
                    live_transport=args.live_transport, owners=hosts['owners']),
-        engine_rev=cluster.manifest.get('source_archive_sha256'),
-        sui_rev=cluster.manifest.get('source_archive_sha256'),
-        binary_ids=cluster.manifest['binaries'])
+        engine_rev=manifest.get('source_archive_sha256'),
+        sui_rev=manifest.get('source_archive_sha256'),
+        binary_ids=manifest['binaries'])
     previous = ledger.entries.get((cell['stage'], cell['id']))
     if (args.resume and previous and previous['status'] == 'passed'
             and previous['config_hash'] == identity):
         print(json.dumps(dict(cell=cell['id'], skipped=True)))
-        return
+        return 0
     entry = ledger.begin(stage=cell['stage'], cell_id=cell['id'],
                          config_hash=identity, unit=cell['unit'])
+    # A retry never reuses the previous attempt's tree: a fresh run needs a
+    # fresh output, and the external preparation creates its directory once.
+    output, config_dir = attempt_paths(output, config_dir, entry['attempts'])
+    plan.update(output=str(output), config_dir=str(config_dir))
     ledger.save()
+    cluster = Cluster(remote=mailbox_exec.open_executor(args),
+                      build_root=args.build, output=output,
+                      guest_root=args.guest_root, config_dir=config_dir,
+                      owners=hosts['owners'], tier=tier, transport=args.transport,
+                      live_transport=args.live_transport, schema=args.schema)
+    cluster.admit()
     driver = CellDriver(cluster, cell)
+    parts = []
     try:
         cluster.prepare()
         cluster.bind(cluster.database())
@@ -1194,21 +1235,29 @@ def main():
         receipt_path = output / 'receipt.json'
         receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
         artifacts = cell_artifacts(output, parts)
-        if not ok:
-            ledger.fail(entry, 'one or more cell checks failed')
-            ledger.save()
-        elif store is not None:
-            campaign_upload.Evidence(store, prefix).persist(ledger, entry, artifacts)
+        if ok:
+            if evidence is not None:
+                evidence.persist(ledger, entry, artifacts)
+            else:
+                campaign_upload.pass_local(ledger, entry, artifacts)
         else:
-            campaign_upload.pass_local(ledger, entry, artifacts)
-        print(json.dumps(dict(cell=cell['id'], ok=ok, receipt=str(receipt_path))))
-        raise SystemExit(0 if ok else 1)
-    except BaseException as error:
-        if entry is not None:
-            ledger.fail(entry, error)
+            reason = 'one or more cell checks failed'
+            ledger.fail(entry, reason)
+            if evidence is not None:
+                evidence.persist_failure(entry, artifacts, reason)
             ledger.save()
+    except Exception as error:
+        # The failure upload keeps this attempt's receipt, specs and samples: a
+        # fleet DELETE must not destroy the only copy. The terminal status is
+        # set here and never inside the exit path below.
+        ledger.fail(entry, error)
+        if evidence is not None:
+            evidence.persist_failure(entry, cell_artifacts(output, parts), error)
+        ledger.save()
         raise
+    print(json.dumps(dict(cell=cell['id'], ok=ok, receipt=str(receipt_path))))
+    return 0 if ok else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

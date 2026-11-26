@@ -68,9 +68,15 @@ class StageThreeSpecs(unittest.TestCase):
         for case in cases:
             family = case['case_id'].split('-')[1][:2]
             counts[family] = counts.get(family, 0) + 1
-        # A1 carries the two cache-on reference cells on top of its eight.
-        self.assertEqual(counts, {'A1': 10, 'A2': 8, 'A3': 8, 'A4': 6, 'A5': 6,
-                                  'A6': 6, 'A7': 4, 'A8': 4, 'A9': 4, 'B1': 8, 'B2': 8})
+        # The plan's cache-on pair is one cell per arm, on top of the grid.
+        self.assertEqual(counts, {'A1': 8, 'A2': 8, 'A3': 8, 'A4': 6, 'A5': 6,
+                                  'A6': 6, 'A7': 4, 'A8': 4, 'A9': 4, 'B1': 8,
+                                  'B2': 8, 'C1': 1, 'C2': 1})
+        self.assertEqual(sum(1 for case in cases if case['arm'] == 'A'), 55)
+        self.assertEqual(sum(1 for case in cases if case['arm'] == 'B'), 17)
+        self.assertEqual([case['case_id'] for case in cases
+                          if case['case_id'].startswith('S3-C')],
+                         ['S3-C1-c16-native-cache1000', 'S3-C2-c8-native-cache1000'])
 
     def test_every_non_reference_spec_declares_the_value_cache_off(self):
         reference = []
@@ -85,12 +91,16 @@ class StageThreeSpecs(unittest.TestCase):
         for case in reference:
             self.assertEqual(case['cache'], 1000)
             self.assertIn('-cache1000', case['case_id'])
-            self.assertEqual((case['arm'], case['mix'], case['size'],
-                              case['concurrency']), ('A', 'read', 8192, 16))
-        self.assertEqual({case['tier'] for case in reference},
-                         {'native', 'synchronous'})
+            self.assertEqual((case['mix'], case['size'], case['tier']),
+                             ('read', 8192, 'native'))
+        # S3-C1 is the distributed C=16 cell; S3-C2 is the native C=8 cell.
+        self.assertEqual([(case['case_id'], case['arm'], case['concurrency'])
+                          for case in reference],
+                         [('S3-C1-c16-native-cache1000', 'A', 16),
+                          ('S3-C2-c8-native-cache1000', 'B', 8)])
 
     def test_only_admitted_sizes_and_group_widths(self):
+        arms = {case['case_id']: case['arm'] for case in stage3_specs.cells()}
         with tempfile.TemporaryDirectory() as tmp:
             paths = stage3_specs.write(tmp)
             self.assertEqual(len(paths), 72)
@@ -99,7 +109,10 @@ class StageThreeSpecs(unittest.TestCase):
                 self.assertIn(document['dataset']['value_size'], (256, 8192))
                 self.assertEqual(document['dataset']['keys'], 65536)
                 self.assertEqual(document['seed'], 1775)
-                self.assertEqual(document['limits']['max_operations'], 3_000_000)
+                self.assertEqual(
+                    document['limits']['max_operations'],
+                    stage3_specs.operation_limit(
+                        document['phases']['measurement_operations']))
                 self.assertEqual(document['namespace'], 'stage3-' + document['case_id'])
                 cache = stage3_specs.declared_cache(document['case_id'])
                 self.assertIn(f'-cache{cache}', document['namespace'])
@@ -116,7 +129,7 @@ class StageThreeSpecs(unittest.TestCase):
                 if 'put_batch' in path.name or 'get_many' in path.name or 'A7' in path.name or 'A8' in path.name:
                     self.assertEqual(document['workload']['batch_size'], 26)
                     self.assertTrue(mix['put_batch'] or mix['get_many'])
-                if path.name.startswith('S3-B'):
+                if arms[document['case_id']] == 'B':
                     self.assertEqual(document['backend']['kind'], 'native')
                 else:
                     self.assertEqual(document['backend']['options']['owners'], 2)
@@ -168,6 +181,16 @@ class Counts(unittest.TestCase):
             stage3_specs.operation_counts(overrides={'read': 0})
         with self.assertRaisesRegex(ValueError, 'out of range'):
             stage3_specs.operation_counts(overrides={'read': stage3_specs.CEILING + 1})
+
+    def test_the_operation_limit_covers_the_calibration_ceiling(self):
+        ceiling = stage3_specs.CEILING
+        self.assertEqual(stage3_specs.operation_limit(ceiling),
+                         stage3_specs.KEYS + int(ceiling * stage3_specs.WARMUP_FRACTION)
+                         + ceiling)
+        self.assertGreaterEqual(stage3_specs.operation_limit(ceiling),
+                                stage3_specs.KEYS + ceiling + ceiling // 10)
+        with self.assertRaisesRegex(ValueError, 'out of range'):
+            stage3_specs.operation_limit(0)
 
     def test_calibration_is_forty_seconds_bounded(self):
         counts = stage3_specs.calibration_counts(
@@ -222,7 +245,7 @@ class ClusterSpecs(unittest.TestCase):
         root, documents = self.documents(external=self.preparations)
         distributed = [document for document in documents.values()
                        if document['backend']['kind'] == 'tidehunter']
-        self.assertEqual(len(distributed), 56)
+        self.assertEqual(len(distributed), 55)
         for document in distributed:
             options = document['backend']['options']
             tier = options['durability_tier']
@@ -253,7 +276,7 @@ class ClusterSpecs(unittest.TestCase):
         _, documents = self.documents(external=self.preparations, native_root=native)
         native_cells = [document for document in documents.values()
                         if document['backend']['kind'] == 'native']
-        self.assertEqual(len(native_cells), 16)
+        self.assertEqual(len(native_cells), 17)
         for document in native_cells:
             options = document['backend']['options']
             self.assertTrue(options['path'].startswith(f'{native}/stage3/db/'))

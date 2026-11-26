@@ -498,3 +498,253 @@ class UploadedPass(unittest.TestCase):
                     store, 'campaign-hybrid-sui-2026-11-25').persist(
                         ledger, entry, artifacts)
             self.assertEqual(ledger.status('stage2', 'M6-w1-c16'), 'running')
+
+
+class LedgerClose(unittest.TestCase):
+    """F2/F13: a clean cell closes its ledger entry; the exit code is returned."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.build = self.base / 'build'
+        self.build.mkdir()
+        (self.build / 'build-manifest.json').write_text(json.dumps(dict(
+            protocol=9, source_archive_sha256='a' * 64,
+            binaries={'storage-node': '0' * 64})))
+        self.fixture = self.base / 'fixture'
+        (self.fixture / 'experiment').mkdir(parents=True)
+        (self.fixture / 'experiment' / 'results.json').write_text('{}')
+        self.schema = self.base / 'schema'
+        self.schema.mkdir()
+        (self.schema / 'shape.yaml').write_text('key_spaces: []\n')
+        self.output = self.base / 'out' / 'M6-w1-c16'
+        self.ledger = self.base / 'out' / 'ledger.json'
+
+    def argv(self, *extra):
+        return ['fault_cells.py', '--cell', 'M6-w1-c16',
+                '--build', str(self.build), '--fixture', str(self.fixture),
+                '--schema', str(self.schema), '--output', str(self.output),
+                '--guest-root', '/mnt/tidehunter/guest', '--coordinator', 'H0',
+                '--owners', 'H1,H2', '--ledger', str(self.ledger),
+                '--allow-local-ledger', '--on-coordinator', *extra]
+
+    def run_main(self, *, verdict=True, failure=None, extra=()):
+        created = []
+
+        class Cluster:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                self.failure = failure
+                created.append(self)
+
+            def admit(self):
+                pass
+
+            def prepare(self):
+                if self.failure is not None:
+                    raise self.failure
+
+            def bind(self, namespace):
+                self.namespace = namespace
+
+            def install(self):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def database(self):
+                return 'live/checkpoints'
+
+        class Driver:
+            def __init__(self, cluster, cell):
+                self.cluster, self.cell = cluster, cell
+
+            def measure(self):
+                run = self.cell['runs'][0]
+                out = self.cluster.output / 'measure' / 'run'
+                out.mkdir(parents=True)
+                (out / 'manifest.json').write_text('{}')
+                return [dict(name='measure', role=run['role'], run=run, verdict=True,
+                             output=str(out), log='', pid=1, started_unix_ns=1,
+                             finished_unix_ns=2, exit_code=0, observations={})]
+
+        with patch.object(fault_cells, 'Cluster', Cluster), \
+                patch.object(fault_cells, 'CellDriver', Driver), \
+                patch.object(fault_cells, 'verdict_parts',
+                             lambda driver, parts: [dict(ok=verdict, checks=[])]), \
+                patch.object(fault_cells.mailbox_exec, 'open_executor',
+                             return_value=None), \
+                patch.object(sys, 'argv', self.argv(*extra)), \
+                redirect_stdout(io.StringIO()):
+            try:
+                return fault_cells.main(), created
+            except Exception as error:
+                return error, created
+
+    def status(self):
+        return (fault_cells.ledger_module.Ledger(self.ledger).load()
+                .status('stage2', 'M6-w1-c16'))
+
+    def test_a_clean_cell_passes_and_returns_zero(self):
+        code, created = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.status(), 'passed')
+        self.assertEqual(created[0].output, self.output)
+        self.assertTrue((self.output / 'receipt.json').is_file())
+
+    def test_a_failed_verdict_records_failed_and_returns_one(self):
+        code, _ = self.run_main(verdict=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.status(), 'failed')
+
+    def test_a_raised_work_error_records_failed_and_is_reraised(self):
+        error, _ = self.run_main(failure=fault_cells.CellError('gate missed'))
+        self.assertIsInstance(error, fault_cells.CellError)
+        self.assertEqual(self.status(), 'failed')
+        entry = fault_cells.ledger_module.Ledger(self.ledger).load().entries[
+            ('stage2', 'M6-w1-c16')]
+        self.assertEqual(entry['attempts'], 1)
+        self.assertIn('gate missed', entry['failure'])
+
+    def test_a_retry_writes_a_fresh_output_and_config_dir(self):
+        ledger = fault_cells.ledger_module.Ledger(self.ledger)
+        entry = ledger.begin(stage='stage2', cell_id='M6-w1-c16',
+                             config_hash='stale', unit='M6-w1-c16')
+        ledger.fail(entry, 'previous attempt')
+        ledger.save()
+        code, created = self.run_main(extra=('--resume',))
+        self.assertEqual(code, 0)
+        self.assertEqual(created[0].output,
+                         self.output.with_name(self.output.name + '-attempt-2'))
+        self.assertEqual(created[0].config_dir.name,
+                         self.output.name + '-external-attempt-2')
+        self.assertTrue((created[0].output / 'receipt.json').is_file())
+        self.assertEqual(self.status(), 'passed')
+
+
+class StaleFenceMeasurement(unittest.TestCase):
+    """F3: the stale case measures its fence latency, like the lapse case."""
+
+    class Child:
+        def __init__(self, output):
+            self.output = Path(output)
+            self.signals = []
+
+        def signal(self, value):
+            self.signals.append(value)
+
+        def stop(self):
+            pass
+
+        def rows(self):
+            return [dict(phase='measurement', outcome='success', error_kind=''),
+                    dict(phase='measurement', outcome='success', error_kind=''),
+                    dict(phase='measurement', outcome='error',
+                         error_kind='coordinator lease lapsed')]
+
+    class Second:
+        def __init__(self):
+            self.stopped = False
+
+        def rows(self):
+            return [dict(phase='measurement', outcome='success', error_kind='')]
+
+        def stop(self):
+            self.stopped = True
+
+    def test_the_stale_case_records_the_resume_to_refusal_latency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'fence-a'
+            (root / 'coordinator').mkdir(parents=True)
+            child = self.Child(root / 'run')
+            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+            cluster.output = Path(tmp)
+            cluster.owners = ['H1', 'H2']
+            cluster.local = lambda name: cluster.output / name
+            cluster.root = lambda name: cluster.local(name) / 'coordinator'
+            driver = fault_cells.CellDriver(
+                cluster, fault_cells.mechanism.find('S1-5S-stale-native'))
+            second = self.Second()
+            gate = dict(reached=True, errors=1, unix_ns=1_050_000_000)
+            with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
+                    patch.object(driver, 'launch', return_value=second), \
+                    patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
+                    patch.object(driver, 'stop_on_failure',
+                                 return_value=dict(gate=gate, exit_code=1)):
+                result = driver._contend(child, 'stale')
+        self.assertEqual(result['resumed_unix_ns'], 1_000_000_000)
+        self.assertEqual(result['fence_reject_ms'], 50.0)
+        self.assertTrue(result['stale_write_refused'])
+        self.assertTrue(result['typed_refusal'])
+        self.assertEqual(result['writers'], 1)
+        self.assertTrue(second.stopped)
+        record = fault_cells.fence_record(
+            types.SimpleNamespace(cell=driver.cell,
+                                  fence=dict(result, case='stale', tier='native')))
+        self.assertTrue(record['ok'], record)
+
+    def test_a_contend_cell_is_not_a_stale_latency_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'fence-a'
+            (root / 'coordinator').mkdir(parents=True)
+            child = self.Child(root / 'run')
+            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+            cluster.output = Path(tmp)
+            cluster.owners = ['H1', 'H2']
+            cluster.local = lambda name: cluster.output / name
+            cluster.root = lambda name: cluster.local(name) / 'coordinator'
+            driver = fault_cells.CellDriver(
+                cluster, fault_cells.mechanism.find('S1-5S-contend-native'))
+            with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
+                    patch.object(driver, 'launch', return_value=self.Second()), \
+                    patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
+                    patch.object(driver, 'stop_on_failure',
+                                 return_value=dict(gate=dict(reached=True, errors=1),
+                                                   exit_code=1)):
+                result = driver._contend(child, 'contend')
+        self.assertNotIn('fence_reject_ms', result)
+
+
+class AttemptPaths(unittest.TestCase):
+    """F20: a retry never reuses the previous attempt's tree."""
+
+    def test_the_first_attempt_keeps_the_requested_paths(self):
+        output, config = Path('/c/out/S1-5S-stale-native'), Path('/c/out/x-external')
+        self.assertEqual(fault_cells.attempt_paths(output, config, 1), (output, config))
+
+    def test_a_retry_appends_the_attempt_to_both_paths(self):
+        output, config = Path('/c/out/S1-5S-stale-native'), Path('/c/out/x-external')
+        self.assertEqual(fault_cells.attempt_paths(output, config, 3),
+                         (Path('/c/out/S1-5S-stale-native-attempt-3'),
+                          Path('/c/out/x-external-attempt-3')))
+
+
+class ZoneBinding(unittest.TestCase):
+    """F1: --zone is an SSH hint, never a mailbox-mode requirement."""
+
+    def test_the_zone_comes_from_the_fleet_state_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'fleet.json'
+            state.write_text(json.dumps({'fleet': [dict(index=0, name='H0',
+                                                       zone='us-central1-a')]}))
+            self.assertEqual(fault_cells.fleet_zone(state), 'us-central1-a')
+            state.write_text(json.dumps({'instances': [
+                dict(name='H0', fleet=dict(index=0, zone='us-central1-b'))]}))
+            self.assertEqual(fault_cells.fleet_zone(state), 'us-central1-b')
+            state.write_text(json.dumps({'instances': []}))
+            self.assertIsNone(fault_cells.fleet_zone(state))
+
+    def test_a_dry_run_without_a_zone_parses(self):
+        argv = ['fault_cells.py', '--cell', 'S1-5S-stale-native',
+                '--build', str(ROOT), '--output', '/tmp/mech-out',
+                '--guest-root', '/var/tmp/guest', '--coordinator', 'H0',
+                '--owners', 'H1,H2', '--dry-run']
+        stream = io.StringIO()
+        with patch.object(sys, 'argv', argv), redirect_stdout(stream):
+            self.assertEqual(fault_cells.main(), 0)
+        self.assertIsNone(json.loads(stream.getvalue())['zone'])

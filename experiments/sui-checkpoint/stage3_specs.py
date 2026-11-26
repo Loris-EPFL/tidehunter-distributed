@@ -26,8 +26,8 @@ Value cache: every cell declares its coordinator value-cache entry count in its
 `backend.options.value_cache_size`. kv-research applies it to the keyspace
 configuration of both the distributed and the native backend; zero disables the
 cache. The campaign runs the 70 grid cells and the native baseline with the
-cache off (`-cache0`), and adds one read-only reference pair at C=16 with 1,000
-entries (`-cache1000`).
+cache off (`-cache0`), and adds the plan's cache-on pair: S3-C1 (distributed,
+C=16) and S3-C2 (native, C=8), both `-cache1000` read-only cells.
 
 Measurement sizing (plan section 9.4): `phases.measurement_operations` is one
 value per operation family (`read`, `mixed`, `write`, `get_many`, `put_batch`),
@@ -72,6 +72,13 @@ WINDOW_SECONDS = 40
 CALIBRATION_OPERATIONS = 20_000
 PROBE_CASE = 'S3-P1-armB-c8-synchronous-probe'
 PROBE_OPERATIONS = 5_000
+# The engine's own cell deadline, the shutdown it allows itself and the driver's
+# allowance for the copy-back, upload and owner stop after it.
+DEADLINE_SECONDS = 600
+SHUTDOWN_GRACE_SECONDS = 30
+CELL_TIMEOUT_GRACE_SECONDS = 120
+DEFAULT_CELL_TIMEOUT = (DEADLINE_SECONDS + SHUTDOWN_GRACE_SECONDS
+                        + CELL_TIMEOUT_GRACE_SECONDS)
 MIXES = {
     'read': dict(read=100, put=0, delete=0, missing_read=0, get_many=0, put_batch=0),
     'mixed': dict(read=70, put=30, delete=0, missing_read=0, get_many=0, put_batch=0),
@@ -105,6 +112,29 @@ def operation_counts(default=MEASUREMENT_OPERATIONS, overrides=None):
 
 def count_for(case, counts):
     return counts[case['mix']]
+
+
+def operation_limit(measurement_operations):
+    """`limits.max_operations` for one cell: preload, warmup and measurement.
+
+    The engine admits `preload + warmup + measurement` (bootstrap `config.rs`),
+    so the limit follows the calibrated count instead of a fixed ceiling: at the
+    calibration ceiling it is 65,536 + 1.1 x 3,000,000 operations.
+    """
+    if type(measurement_operations) is not int or measurement_operations < 1:
+        raise ValueError(f'measurement operations out of range: {measurement_operations}')
+    warmup = int(measurement_operations * WARMUP_FRACTION)
+    return KEYS + warmup + measurement_operations
+
+
+def cell_timeout(path, *, grace=CELL_TIMEOUT_GRACE_SECONDS):
+    """The driver's bound on one cell: its own deadline plus the grace."""
+    limits = (json.loads(Path(path).read_text()).get('limits') or {})
+    deadline = limits.get('deadline_seconds', DEADLINE_SECONDS)
+    shutdown = limits.get('shutdown_grace_seconds', SHUTDOWN_GRACE_SECONDS)
+    if type(deadline) is not int or type(shutdown) is not int:
+        raise ValueError(f'spec limits are not integers: {path}')
+    return deadline + shutdown + grace
 
 
 def calibration_counts(rates):
@@ -219,7 +249,8 @@ def external_map(items, *, database=None):
 
 def _cells(arm, family, mix, size, distribution, tiers, callers, *, batch=None,
            cache=GRID_CACHE_ENTRIES, reference=False):
-    suffix = '' if family in ('A1', 'A2', 'A3', 'A7', 'A8', 'B1', 'B2') else '-' + mix
+    suffix = '' if family in ('A1', 'A2', 'A3', 'A7', 'A8', 'B1', 'B2',
+                              'C1', 'C2') else '-' + mix
     for tier in tiers:
         for concurrency in callers:
             case = f'S3-{family}{suffix}-c{concurrency}-{tier}-cache{cache}'
@@ -230,7 +261,12 @@ def _cells(arm, family, mix, size, distribution, tiers, callers, *, batch=None,
 
 
 def cells():
-    """The 72 campaign cells: the 70-cell grid at cache 0 plus a cache-on pair."""
+    """The 72 campaign cells: the 70-cell grid at cache 0 plus the plan's C pair.
+
+    Plan section 9.3 keeps the total at 72 with S3-C1 (distributed arm A, C=16,
+    value cache 1,000) and S3-C2 (native arm B, C=8, value cache 1,000): 55
+    arm-A and 17 arm-B cells.
+    """
     rows = []
     for family, mix in (('A1', 'read'), ('A2', 'mixed'), ('A3', 'write')):
         rows += list(_cells('A', family, mix, 8192, 'uniform', TIERS, CALLERS))
@@ -254,8 +290,12 @@ def cells():
                                  arm='B', mix=mix, size=8192, distribution='uniform',
                                  tier=tier, concurrency=callers, batch=None,
                                  cache=GRID_CACHE_ENTRIES, reference=False))
-    rows += list(_cells('A', 'A1', 'read', 8192, 'uniform', TIERS, (16,),
+    rows += list(_cells('A', 'C1', 'read', 8192, 'uniform', ('native',), (16,),
                         cache=REFERENCE_CACHE_ENTRIES, reference=True))
+    rows.append(dict(case_id='S3-C2-c8-native-cache1000', arm='B', mix='read',
+                     size=8192, distribution='uniform', tier='native',
+                     concurrency=8, batch=None, cache=REFERENCE_CACHE_ENTRIES,
+                     reference=True))
     return rows
 
 
@@ -326,8 +366,10 @@ def run_config(case, root, *, native_root=None, external=None,
                     measurement_operations=measurement_operations),
         diagnostics=dict(write_profile_limit=0, read_profile_limit=0),
         qualification_only=False, source_revision=None,
-        limits=dict(max_keys=KEYS, max_bytes=16 << 30, max_operations=3_000_000,
-                    deadline_seconds=600, shutdown_grace_seconds=30))
+        limits=dict(max_keys=KEYS, max_bytes=16 << 30,
+                    max_operations=operation_limit(measurement_operations),
+                    deadline_seconds=DEADLINE_SECONDS,
+                    shutdown_grace_seconds=SHUTDOWN_GRACE_SECONDS))
 
 
 def write_one(path, document):

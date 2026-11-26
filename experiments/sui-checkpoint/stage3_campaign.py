@@ -20,6 +20,11 @@ copied back to the campaign root, uploaded under the campaign prefix, and
 verified by size and SHA-256 before the ledger may pass the cell: `passed`
 means uploaded and verified.
 
+In cluster mode the two tier preparations are made on the coordinator host from
+`--build` and `--schema` when `--external` is absent, with the fleet's TCP
+control and RDMA live-target addresses (coordinator read cache off); a retry in
+the same fleet reuses them.
+
 Rehearsal mode (`--mode rehearsal`): every cell runs the single-host trusted TCP
 ordinary-file fixture on this host. The results and the ledger entry say
 `rehearsal`; the mode is not a campaign measurement.
@@ -122,12 +127,21 @@ def cells_for(root, *, engine_rev, sui_rev, binary_ids, spec_dir=None):
     return cells
 
 
-def artifacts(output):
+def failure_artifacts(output):
+    """Every file a failed attempt did write, named under its output tree."""
+    output = Path(output)
     rows = []
-    for path in sorted(Path(output).rglob('*')):
+    for path in sorted(output.rglob('*')):
         if path.is_file() and not path.is_symlink():
-            rows.append(dict(path=str(path), size=path.stat().st_size,
+            rows.append(dict(path=str(path),
+                             name=path.relative_to(output).as_posix(),
+                             size=path.stat().st_size,
                              sha256=ledger_module.sha256_file(path)))
+    return rows
+
+
+def artifacts(output):
+    rows = failure_artifacts(output)
     if not (Path(output) / 'summary.json').is_file():
         raise ValueError('cell produced no summary.json')
     return rows
@@ -161,7 +175,8 @@ class LocalRunner:
         self.mode = mode
         self.remote = remote
 
-    def run(self, cell, *, output, attempt, timeout=3600, watchers=()):
+    def run(self, cell, *, output, attempt, timeout=stage3_specs.DEFAULT_CELL_TIMEOUT,
+            watchers=()):
         database = self.data_root / 'stage3' / 'db' / cell['id']
         archived = archive_previous(database, self.stale_root, cell['id'] + '-db', attempt)
         command = [str(self.binary), '--config', cell['path'], '--output', str(output)]
@@ -230,7 +245,8 @@ class HostRunner:
             time.sleep(0.1)
         return None
 
-    def run(self, cell, *, output, attempt, timeout=3600, watchers=()):
+    def run(self, cell, *, output, attempt, timeout=stage3_specs.DEFAULT_CELL_TIMEOUT,
+            watchers=()):
         spec = Path(cell['path']).read_bytes()
         remote_spec = self.data_root / 'stage3' / 'spec' / f'{cell["id"]}.json'
         database = self.data_root / 'stage3' / 'db' / cell['id']
@@ -563,8 +579,12 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
         else:
             campaign_upload.pass_local(ledger, entry, produced)
         save(ledger, bucket)
-    except BaseException as error:
+    except Exception as error:
+        # A failed phase cell uploads what it did write before the ledger says
+        # failed, so the fleet DELETE cannot destroy the only copy.
         ledger.fail(entry, error)
+        if bucket is not None:
+            bucket.evidence.persist_failure(entry, failure_artifacts(output), error)
         save(ledger, bucket)
         raise
     return output
@@ -661,8 +681,10 @@ def schedule(cells):
                                            TIER_ORDER[cell['tier']]))
 
 
-def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600, watchers=()):
+def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watchers=()):
     """Run one cell from a fresh database and output; return its artifacts."""
+    if timeout is None:
+        timeout = stage3_specs.cell_timeout(cell['path'])
     archive_previous(output, stale_root, cell['id'], attempt)
     try:
         record = runner.run(cell, output=output, attempt=attempt, timeout=timeout,
@@ -675,7 +697,7 @@ def run_cell(cell, runner, *, output, stale_root, attempt, timeout=3600, watcher
 
 
 def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket=None,
-                 only=None, from_=None, stop_on_failure=True, timeout=3600,
+                 only=None, from_=None, stop_on_failure=True, timeout=None,
                  allow_local_ledger=False):
     if bucket is None and not allow_local_ledger:
         raise ValueError('a passed cell needs a verified evidence upload; '
@@ -697,6 +719,7 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
             runner = local if cell['arm'] == 'A' else remote
             if runner is None and local.mode == 'rehearsal':
                 runner = local
+            output = root / 'stage3' / 'out' / cell['id']
             try:
                 if runner is None:
                     raise ValueError(f'arm {cell["arm"]} cell {cell["id"]} has no runner')
@@ -704,7 +727,6 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                     owners.stop()
                 if cell['arm'] == 'A' and owners is not None:
                     owners.start(cell['tier'])
-                output = root / 'stage3' / 'out' / cell['id']
                 produced = run_cell(
                     cell, runner, output=output, stale_root=stale_root,
                     attempt=entry['attempts'], timeout=timeout,
@@ -716,8 +738,13 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                     campaign_upload.pass_local(ledger, entry, produced)
                 save(ledger, bucket)
                 results.append(dict(id=cell['id'], status='passed', mode=runner.mode))
-            except BaseException as error:
+            except Exception as error:
+                # The failure upload keeps the attempt's receipt, run.json and
+                # samples: a fleet DELETE must not destroy the only copy.
                 ledger.fail(entry, error)
+                if bucket is not None:
+                    bucket.evidence.persist_failure(
+                        entry, failure_artifacts(output), error)
                 save(ledger, bucket)
                 results.append(dict(id=cell['id'], status='failed', mode=runner.mode,
                                     failure=str(error)))
@@ -765,6 +792,69 @@ def plan_hosts(owners):
     return list(owners)
 
 
+def fleet_addresses(state_path, owners):
+    """The fleet's TCP control and RDMA live-target addresses, in owner order.
+
+    A created fleet records each admitted host under its instance record, so
+    the top-level `fleet` key is only present in a same-process preview.
+    """
+    state = json.loads(Path(state_path).read_text())
+    fleet = state.get('fleet') or [record['fleet'] for record in state.get('instances', [])
+                                   if record.get('fleet')]
+    if not fleet:
+        raise SystemExit(f'the fleet state names no admitted hosts: {state_path}')
+    return manual_sui.fleet_hosts(fleet, owners,
+                                  transport='tcp', live_transport='rdma')
+
+
+def prepare_externals(*, root, build, schema, fleet_state, owners, guest_root):
+    """Prepare one external NVMe-oF deployment per acknowledgement tier here.
+
+    The workstation cannot reach the owners, so the tiers that name their
+    control and live-target addresses are prepared next to the fleet state:
+    mTLS TCP control, RDMA data path, coordinator read cache off. A tier
+    directory that already loads is the preparation this fleet's owners were
+    built from, so a retry reuses it instead of re-preparing.
+    """
+    root, build, schema = Path(root), Path(build), Path(schema)
+    guest_root = Path(guest_root)
+    source = (build / 'sources' / 'tidehunter-sharded-wal' / 'experiments'
+              / 'sui-checkpoint' / 'prepare_external.py')
+    if not source.is_file():
+        raise SystemExit(f'the build bundle has no prepare_external.py: {source}')
+    control, live = fleet_addresses(fleet_state, owners)
+    items = []
+    for tier in stage3_specs.TIERS:
+        directory = root / 'external' / tier
+        if directory.is_dir():
+            stage3_specs.load_external(directory, tier=tier)
+        else:
+            command = [sys.executable, str(source),
+                       '--build', str(build), '--schema', str(schema),
+                       '--output', str(directory),
+                       '--db-root', str(root / 'stage3' / 'db'),
+                       '--guest-root', str(guest_root),
+                       '--hosts', ','.join(control), '--live-hosts', ','.join(live),
+                       '--owners', str(len(owners)),
+                       '--port', str(manual_sui.OWNER_CONTROL_PORT),
+                       '--transport', 'tcp', '--live-transport', 'rdma',
+                       '--durability-tier', tier,
+                       '--coordinator-cache-mib', '0', '--shard-cache-mib', '0']
+            subprocess.run(command, check=True, timeout=600)
+            stage3_specs.load_external(directory, tier=tier)
+        items.append((tier, directory))
+    return items
+
+
+def check_binary(binary, external):
+    """Every tier preparation and the driven binary must be one frozen build."""
+    expected = {preparation['manifest']['storage_binary_sha256']
+                for preparation in external.values()}
+    if len(expected) != 1 or ledger_module.sha256_file(binary) not in expected:
+        raise SystemExit('--binary is not the storage binary the external '
+                         'preparation was built from')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True,
@@ -778,7 +868,8 @@ def main():
     parser.add_argument('--continue-on-failure', action='store_true')
     parser.add_argument('--engine-rev', default='unknown')
     parser.add_argument('--sui-rev', default='unknown')
-    parser.add_argument('--timeout', type=int, default=3600)
+    parser.add_argument('--timeout', type=int,
+                        help='bound on one cell; default: its deadline plus the grace')
     parser.add_argument('--measurement-operations', type=int,
                         default=stage3_specs.MEASUREMENT_OPERATIONS,
                         help='one count for every family when nothing is calibrated')
@@ -788,8 +879,15 @@ def main():
                         help='do not run the phase-A arm-B synchronous probe cell')
     parser.add_argument('--mode', choices=('cluster', 'rehearsal'), default='cluster')
     parser.add_argument('--external', action='append', default=[], metavar='TIER=DIR',
-                        help='prepare_external.py output per tier, repeated (cluster)')
+                        help='prepare_external.py output per tier, repeated; '
+                             'prepared here from --build/--schema when absent')
     parser.add_argument('--external-database', help='config.json database key every cell uses')
+    parser.add_argument('--build', type=Path,
+                        help='build bundle with build-manifest.json and binaries; '
+                             'needed to prepare the tier externals')
+    parser.add_argument('--schema', type=Path,
+                        help='native schema of a source-identical run; needed to '
+                             'prepare the tier externals')
     parser.add_argument('--native-root', type=Path,
                         help='absolute store root of the owner host (cluster arm B)')
     parser.add_argument('--guest-root', type=Path,
@@ -822,9 +920,12 @@ def main():
     root = args.root.resolve()
     cluster = args.mode == 'cluster'
     if cluster:
-        required = dict(external=args.external, guest_root=args.guest_root,
-                        owners=args.owners, zone=args.zone, native_root=args.native_root,
-                        bucket_prefix=args.bucket_prefix)
+        required = dict(guest_root=args.guest_root, owners=args.owners,
+                        native_root=args.native_root, bucket_prefix=args.bucket_prefix)
+        if not args.external:
+            # The two tier preparations are made on the coordinator host from
+            # the build bundle and the native schema of this campaign.
+            required.update(build=args.build, schema=args.schema)
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise SystemExit('cluster mode needs --' + ', --'.join(
@@ -842,13 +943,9 @@ def main():
                          '--bucket-prefix, or --allow-local-ledger for a labelled rehearsal')
     external = (stage3_specs.external_map(stage3_specs.external_items(args.external),
                                           database=args.external_database)
-                if cluster else None)
+                if cluster and args.external else None)
     if external is not None:
-        expected = {preparation['manifest']['storage_binary_sha256']
-                    for preparation in external.values()}
-        if len(expected) != 1 or ledger_module.sha256_file(args.binary) not in expected:
-            raise SystemExit('--binary is not the storage binary the external '
-                             'preparation was built from')
+        check_binary(args.binary, external)
     owner_hosts = plan_hosts(args.owners.split(',')) if cluster else []
     if cluster and not args.gcloud_ssh and not args.on_coordinator:
         # Stage-3 arm A and the probe are local children of this driver and must
@@ -865,6 +962,14 @@ def main():
             tier, _, local = item.partition('=')
             remote.stage_tree(coordinator, Path(local), campaign / 'external' / tier)
             external.append(tier + '=' + str(campaign / 'external' / tier))
+        rewrite_tree = {}
+        if not args.external:
+            # The tier preparations are made on the coordinator from these two
+            # trees; the coordinator has no other copy of them.
+            for flag, local in (('--build', args.build), ('--schema', args.schema)):
+                remote.stage_tree(coordinator, Path(local),
+                                  campaign / flag.lstrip('-'))
+                rewrite_tree[flag] = campaign / flag.lstrip('-')
         remote.send_file(coordinator, campaign / 'fleet-state.json', Path(args.fleet_state))
         remote.send_file(coordinator, campaign / 'config.json', Path(args.fleet_config).resolve())
         stale = set(args.external or [])
@@ -873,7 +978,8 @@ def main():
         argv = mailbox_exec.rewrite(
             argv, {'--root': campaign / 'root',
                    '--binary': campaign / 'binaries' / binary.name,
-                   '--ledger': campaign / 'campaign-ledger.json'})
+                   '--ledger': campaign / 'campaign-ledger.json',
+                   **rewrite_tree})
         extra = ['--on-coordinator', '--guest-token',
                  '--fleet-state', str(campaign / 'fleet-state.json'),
                  '--fleet-config', str(campaign / 'config.json')]
@@ -891,6 +997,16 @@ def main():
     path = args.ledger or root / 'campaign-ledger.json'
     if Path(path).exists() and not args.resume:
         raise SystemExit(f'ledger exists; use --resume or a new --ledger: {path}')
+    if cluster and external is None:
+        if args.fleet_state is None:
+            raise SystemExit('preparing the tier externals needs --fleet-state for '
+                             'the owner addresses, or --external TIER=DIR')
+        external = stage3_specs.external_map(
+            prepare_externals(root=root, build=args.build, schema=args.schema,
+                              fleet_state=args.fleet_state, owners=owner_hosts,
+                              guest_root=args.guest_root),
+            database=args.external_database)
+        check_binary(args.binary, external)
     ledger = ledger_module.Ledger(path)
     if args.resume:
         ledger.load()
@@ -984,4 +1100,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

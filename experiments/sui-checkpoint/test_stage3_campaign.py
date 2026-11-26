@@ -8,6 +8,7 @@ import re
 import shlex
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,12 +18,32 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
+import campaign_upload
 import gcs_ledger
 import manual_sui
 import stage3_campaign
 import stage3_specs
 from gcp_api import ApiError, ObjectStore
 from test_stage3_specs import preparation
+
+
+FAILURES = []
+
+
+def record_failure(self, entry, artifacts, error, *, ledger=None):
+    """The shared failure contract of `campaign_upload.Evidence`.
+
+    SuiDriverFix owns the real method (`persist_failure`); this branch records
+    its calls and applies the same ledger transition so the driver can be
+    tested before the two branches merge.
+    """
+    ledger_module.Ledger().fail(entry, error)
+    FAILURES.append(dict(entry=dict(entry), error=str(error),
+                         artifacts=[dict(row) for row in artifacts],
+                         keys=[self.key(entry['stage'], entry['id'], row['name'],
+                                        entry['attempts'])
+                               for row in artifacts]))
+    return dict(cell_id=entry['id'], status='failed', uploaded=True)
 
 
 FAKE = textwrap.dedent("""\
@@ -215,6 +236,11 @@ class Driver(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.root = self.base / 'campaign'
+        FAILURES.clear()
+        patcher = mock.patch.object(campaign_upload.Evidence, 'persist_failure',
+                                    create=True, new=record_failure)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         spec_dir = self.root / 'stage3' / 'spec'
         spec_dir.mkdir(parents=True)
         self.binary = self.base / 'kv'
@@ -492,6 +518,15 @@ class Driver(unittest.TestCase):
         self.assertEqual(results[0]['status'], 'failed')
         saved = self.ledger().load()
         self.assertEqual(saved.status('stage3', self.cells[0]['id']), 'failed')
+        # The failed attempt still uploads what it wrote, under its own attempt.
+        self.assertEqual(len(FAILURES), 1)
+        self.assertEqual(FAILURES[0]['entry']['attempts'], 1)
+        self.assertEqual(FAILURES[0]['entry']['status'], 'failed')
+        self.assertIn('uploaded artifact differs', FAILURES[0]['error'])
+        names = {row['name'] for row in FAILURES[0]['artifacts']}
+        self.assertIn('run.json', names)
+        self.assertIn(f'campaign-hybrid-sui-2026-11-25/stage3/evidence/'
+                      f'{self.cells[0]["id"]}/attempt-1/run.json', FAILURES[0]['keys'])
 
     def test_resume_merges_the_campaign_ledger_from_the_bucket(self):
         store = FakeObjectStore()
@@ -651,6 +686,144 @@ class Phases(Driver):
         self.assertNotIn('projected_grid_cell_seconds', document)
 
 
+class CellTimeout(unittest.TestCase):
+    """F12: one hung cell must not outlive its own deadline by much."""
+
+    def cell(self, directory, deadline=600, shutdown=30):
+        path = Path(directory) / 'spec.json'
+        path.write_text(json.dumps({'case_id': 'c', 'limits': dict(
+            deadline_seconds=deadline, shutdown_grace_seconds=shutdown)}))
+        return dict(id='S3-A1-c2-native-cache0', path=str(path), arm='A',
+                    tier='native', stage='stage3', unit='x', config_hash='h')
+
+    def _run_cell(self, cell, output, *, timeout=None):
+        seen = {}
+
+        class Runner:
+            def run(self, cell, *, output, attempt, timeout, watchers=()):
+                seen['timeout'] = timeout
+                Path(output).mkdir(parents=True, exist_ok=True)
+                (Path(output) / 'summary.json').write_text('{}')
+                return dict(cell=cell['id'], exit_code=0)
+
+        stage3_campaign.run_cell(cell, Runner(), output=Path(output),
+                                 stale_root=Path(output).parent / 'stale',
+                                 attempt=1, timeout=timeout)
+        return seen['timeout']
+
+    def test_the_default_bound_is_the_spec_deadline_plus_the_grace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = self.cell(tmp)
+            self.assertEqual(self._run_cell(cell, Path(tmp) / 'out'), 750)
+            self.assertEqual(self._run_cell(self.cell(tmp, 900, 60),
+                                            Path(tmp) / 'out2'), 1080)
+            # An explicit --timeout is still honoured unchanged.
+            self.assertEqual(self._run_cell(cell, Path(tmp) / 'out3', timeout=42), 42)
+
+
+class TierPreparation(unittest.TestCase):
+    """F5: nothing else creates the two tier preparations the grid needs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.build = self.base / 'build'
+        source = (self.build / 'sources' / 'tidehunter-sharded-wal'
+                  / 'experiments' / 'sui-checkpoint')
+        source.mkdir(parents=True)
+        (source / 'prepare_external.py').write_text('#')
+        self.schema = self.base / 'schema'
+        self.schema.mkdir()
+        self.state = self.base / 'fleet.json'
+        self.state.write_text(json.dumps({'run_id': 'bench-' + 'a' * 16, 'fleet': [
+            dict(index=0, name='H0', internal_ip='10.0.0.2', rdma_ip='10.20.0.2'),
+            dict(index=1, name='H1', internal_ip='10.0.0.3', rdma_ip='10.20.0.3'),
+            dict(index=2, name='H2', internal_ip='10.0.0.4', rdma_ip='10.20.0.4')]}))
+        self.commands = []
+        self.real_run = subprocess.run
+
+    def fake_run(self, command, **kwargs):
+        if '--durability-tier' not in command:
+            # deployment.prepare shells out to openssl; only the tier
+            # preparation itself is simulated here.
+            return self.real_run(command, **kwargs)
+        self.commands.append(list(command))
+        output = Path(command[command.index('--output') + 1])
+        preparation(output, command[command.index('--durability-tier') + 1],
+                    guest=Path(command[command.index('--guest-root') + 1]))
+        return mock.Mock(returncode=0)
+
+    def prepare(self):
+        with mock.patch.object(stage3_campaign.subprocess, 'run', self.fake_run):
+            return stage3_campaign.prepare_externals(
+                root=self.base / 'root', build=self.build, schema=self.schema,
+                fleet_state=self.state, owners=['H1', 'H2'],
+                guest_root=Path('/mnt/tidehunter/sui-run-bench'))
+
+    def test_both_tiers_use_the_fleet_control_and_live_addresses(self):
+        items = self.prepare()
+        self.assertEqual([tier for tier, _ in items], ['native', 'synchronous'])
+        self.assertEqual(len(self.commands), 2)
+        for index, (tier, directory) in enumerate(items):
+            command = self.commands[index]
+            self.assertEqual(directory, self.base / 'root' / 'external' / tier)
+            self.assertEqual(command[command.index('--durability-tier') + 1], tier)
+            self.assertEqual(command[command.index('--hosts') + 1], '10.0.0.3,10.0.0.4')
+            self.assertEqual(command[command.index('--live-hosts') + 1],
+                             '10.20.0.3,10.20.0.4')
+            self.assertEqual(command[command.index('--transport') + 1], 'tcp')
+            self.assertEqual(command[command.index('--live-transport') + 1], 'rdma')
+            self.assertEqual(command[command.index('--coordinator-cache-mib') + 1], '0')
+            self.assertEqual(command[command.index('--port') + 1], '9400')
+            manifest = json.loads((directory / 'external-manifest.json').read_text())
+            self.assertEqual(manifest['durability_tier'], tier)
+            self.assertEqual(manifest['transport'], {'kind': 'tcp'})
+            self.assertEqual(manifest['live_transport'], 'rdma')
+
+    def test_a_retry_in_the_same_fleet_reuses_the_preparation(self):
+        self.prepare()
+        before = len(self.commands)
+        items = self.prepare()
+        self.assertEqual(len(self.commands), before)
+        self.assertEqual(len(items), 2)
+
+    def test_a_build_without_the_preparer_is_refused(self):
+        (self.build / 'sources' / 'tidehunter-sharded-wal' / 'experiments'
+         / 'sui-checkpoint' / 'prepare_external.py').unlink()
+        with self.assertRaisesRegex(SystemExit, 'prepare_external.py'):
+            self.prepare()
+
+    def test_a_state_with_only_instance_records_is_read(self):
+        self.state.write_text(json.dumps({'instances': [
+            dict(name='H' + str(index), fleet=dict(
+                index=index, name='H' + str(index),
+                internal_ip=f'10.0.0.{2 + index}', rdma_ip=f'10.20.0.{2 + index}'))
+            for index in range(3)]}))
+        self.assertEqual(stage3_campaign.fleet_addresses(self.state, ['H1', 'H2']),
+                         (['10.0.0.3', '10.0.0.4'], ['10.20.0.3', '10.20.0.4']))
+
+    def test_a_state_without_admitted_hosts_is_refused(self):
+        self.state.write_text(json.dumps({'instances': []}))
+        with self.assertRaisesRegex(SystemExit, 'no admitted hosts'):
+            stage3_campaign.fleet_addresses(self.state, ['H1', 'H2'])
+
+    def test_the_binary_must_be_the_one_the_preparation_was_built_from(self):
+        items = self.prepare()
+        external = stage3_specs.external_map(items)
+        binary = self.base / 'storage-node'
+        binary.write_bytes(b'binary')
+        with self.assertRaisesRegex(SystemExit, 'not the storage binary'):
+            stage3_campaign.check_binary(binary, external)
+        for tier, directory in items:
+            manifest_path = directory / 'external-manifest.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['storage_binary_sha256'] = ledger_module.sha256_file(binary)
+            manifest_path.write_text(json.dumps(manifest))
+            external[tier] = stage3_specs.load_external(directory, tier=tier)
+        stage3_campaign.check_binary(binary, external)
+
+
 class CommandLine(unittest.TestCase):
     def run_main(self, *arguments):
         old = sys.argv
@@ -665,9 +838,11 @@ class CommandLine(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 self.run_main('--root', tmp, '--binary', 'kv')
         message = str(raised.exception)
-        for flag in ('--external', '--guest-root', '--owners', '--zone',
-                     '--native-root', '--bucket-prefix'):
+        for flag in ('--guest-root', '--owners', '--native-root', '--bucket-prefix',
+                     '--build', '--schema'):
             self.assertIn(flag, message)
+        # The zone is only a hint for the SSH rehearsal, never a cluster binding.
+        self.assertNotIn('--zone', message)
 
     def test_rehearsal_mode_refuses_cluster_bindings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,6 +942,45 @@ class ClusterDispatch(unittest.TestCase):
             mock.call('bench-' + 'a' * 16 + '-0', synchronous,
                       Path('/mnt/tidehunter/bench-' + 'a' * 16
                            + '/campaign/external/synchronous'))])
+
+    def test_the_build_and_schema_are_staged_when_no_external_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / 'storage-node'
+            binary.write_bytes(b'binary')
+            build = root / 'build'
+            build.mkdir()
+            schema = root / 'schema'
+            schema.mkdir()
+            state = root / 'fleet.json'
+            state.write_text(json.dumps({'run_id': 'bench-' + 'b' * 16, 'host_count': 3,
+                                         'fleet': [{'index': 0}]}))
+            config = root / 'config.json'
+            config.write_text('{}')
+            remote = mock.Mock()
+            remote.send_file.return_value = (0, b'', b'')
+            remote.run_driver.return_value = (0, b'{}', b'')
+            argv = ['stage3_campaign.py', '--root', str(root / 'out'),
+                    '--binary', str(binary), '--build', str(build),
+                    '--schema', str(schema),
+                    '--native-root', '/mnt/tidehunter/native',
+                    '--guest-root', '/mnt/tidehunter/sui', '--owners', 'H1,H2',
+                    '--bucket-prefix', 'gs://mysten-research-bench-artifacts/campaign',
+                    '--fleet-state', str(state), '--fleet-config', str(config)]
+            with mock.patch.object(stage3_campaign.mailbox_exec, 'open_executor',
+                                   return_value=remote), \
+                    mock.patch.object(stage3_campaign.mailbox_exec, 'coordinator_of',
+                                      return_value='bench-' + 'b' * 16 + '-0'), \
+                    mock.patch.object(stage3_campaign.sys, 'argv', argv):
+                self.assertEqual(stage3_campaign.main(), 0)
+        campaign = Path('/mnt/tidehunter/bench-' + 'b' * 16 + '/campaign')
+        self.assertEqual(remote.stage_tree.call_args_list, [
+            mock.call('bench-' + 'b' * 16 + '-0', build, campaign / 'build'),
+            mock.call('bench-' + 'b' * 16 + '-0', schema, campaign / 'schema')])
+        argv_sent = remote.run_driver.call_args.args[2]
+        for flag, target in (('--build', campaign / 'build'),
+                            ('--schema', campaign / 'schema')):
+            self.assertEqual(argv_sent[argv_sent.index(flag) + 1], str(target))
 
 
 class BucketPrefix(unittest.TestCase):

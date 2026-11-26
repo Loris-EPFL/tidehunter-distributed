@@ -218,5 +218,42 @@ class Verification(unittest.TestCase):
                 mechanism.verify(cell, directory)
 
 
+class Stages(unittest.TestCase):
+    """F23: the S1 fault cells are stage-1 entries; M8 is a derived view."""
+
+    def test_every_s1_cell_is_recorded_under_stage_one(self):
+        s1 = [cell for cell in mechanism.cells() if cell['id'].startswith('S1-')]
+        self.assertEqual(len(s1), 18)
+        self.assertEqual({cell['stage'] for cell in s1}, {'stage1'})
+        self.assertEqual({cell['stage'] for cell in mechanism.cells()
+                          if cell['id'].startswith('M')},
+                         {'stage2'})
+
+    def test_the_m8_aliases_are_the_s1_5s_cells(self):
+        aliases = mechanism.aliases()
+        self.assertEqual(len(aliases), 8)
+        self.assertEqual(set(aliases.values()),
+                         {cell['id'] for cell in mechanism.cells()
+                          if cell['family'] == 'S1-5'})
+        for alias, cell_id in aliases.items():
+            self.assertEqual(mechanism.find(cell_id)['stage'], 'stage1')
+            self.assertTrue(alias.startswith('M8-'))
+        self.assertEqual(aliases['M8-stale-synchronous'], 'S1-5S-stale-synchronous')
+
+    def test_the_m8_view_carries_the_recorded_s1_5s_entry(self):
+        ledger = type('Ledger', (), dict(entries={}))()
+        cell_id = 'S1-5S-stale-native'
+        ledger.entries[('stage1', cell_id)] = dict(
+            id=cell_id, stage='stage1', unit=cell_id, status='passed',
+            attempts=1, config_hash='h', result_paths=[dict(path='/x')])
+        rows = mechanism.alias_entries(ledger)
+        row = next(row for row in rows if row['id'] == 'M8-stale-native')
+        self.assertEqual((row['stage'], row['alias_of']), ('stage2', cell_id))
+        self.assertEqual((row['status'], row['attempts']), ('passed', 1))
+        self.assertEqual(row['result_paths'], [dict(path='/x')])
+        # A cell that never ran is absent, never invented.
+        self.assertEqual([row['id'] for row in rows], ['M8-stale-native'])
+
+
 if __name__ == '__main__':
     unittest.main()

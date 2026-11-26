@@ -733,8 +733,10 @@ Stage 3 uses `experiments/sui-checkpoint/stage3_campaign.py` with the same
 campaign ledger and the same bucket prefix. It regenerates the 72 specs when
 they are absent, archives any previous database and output under
 `stage3/stale/`, and runs only planned cells. `--mode cluster` needs
-`--bucket-prefix`, the two tier preparations and the owner hosts; phase A (the
-arm-B synchronous probe) runs first, `--calibrate` runs the three phase-B cells
+`--bucket-prefix`, `--guest-root`, `--native-root` and the owner hosts; the two
+tier preparations are made on the coordinator host from `--build` and
+`--schema` unless `--external TIER=DIR` names them. Phase A (the arm-B
+synchronous probe) runs first, `--calibrate` runs the three phase-B cells
 once and freezes the counts, and `--skip-probe` skips phase A explicitly.
 `--mode rehearsal` runs the local fixture and needs `--allow-local-ledger`.
 `--allow-local-ledger` is the only local-rehearsal escape; it never uploads.
@@ -748,10 +750,10 @@ python3 experiments/sui-checkpoint/stage3_campaign.py \
 python3 experiments/sui-checkpoint/stage3_campaign.py \
   --mode cluster --root /absolute/stage3root \
   --binary /absolute/build/binaries/storage-node \
-  --external native=/absolute/external-native \
-  --external synchronous=/absolute/external-synchronous \
+  --build /absolute/build --schema /absolute/native-schema \
   --external-database live/checkpoints \
-  --guest-root /mnt/tidehunter/$CAMPAIGN --native-root /mnt/tidehunter/$CAMPAIGN \
+  --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --native-root /mnt/tidehunter-kv-comparison/$RUN \
   --owners H1,H2 --native-host H1 --zone us-central1-a \
   --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
   --ledger /absolute/campaign-ledger.json --calibrate --resume
@@ -759,8 +761,9 @@ python3 experiments/sui-checkpoint/stage3_campaign.py \
 
 `--from <cell-id>` shifts the plan, `--continue-on-failure` keeps measuring
 after a failed cell (the default stops), and every non-reference spec is
-`-cache0`; the two `-cache1000` read-only C=16 cells are the labelled cache-on
-reference pair. `backend.options.value_cache_size` carries the same count into
+`-cache0`; the two `-cache1000` read-only cells are the plan's cache-on pair
+(S3-C1 distributed at C=16, S3-C2 native at C=8).
+`backend.options.value_cache_size` carries the same count into
 the distributed and native keyspace configuration.
 
 The Sui campaign's three stages do not use `manual_campaign.py`. That module
@@ -990,15 +993,16 @@ python3 experiments/gcp-rdma/fault_cells.py \
 
 7. Run the stage-3 cells. Arm A (the storage probe and the `C=16` cells) runs
    on H0, arm B runs on `--native-host`; both are children of the request the
-   workstation submits to H0. The `--external` preparations and `--binary` are
-   staged through the bucket first.
+   workstation submits to H0. The `--binary`, `--build` and `--schema` inputs
+   are staged through the bucket first, and H0 prepares the two tier externals
+   from them before the probe.
 
 ```sh
 python3 experiments/sui-checkpoint/stage3_campaign.py \
   --mode cluster --root $CAMPAIGN_ROOT/stage3root \
   --binary $CAMPAIGN_ROOT/build/binaries/storage-node \
-  --external native=$CAMPAIGN_ROOT/external-native \
-  --external synchronous=$CAMPAIGN_ROOT/external-synchronous \
+  --build $CAMPAIGN_ROOT/build \
+  --schema $CAMPAIGN_ROOT/schema-run/experiment/native-schema \
   --external-database live/checkpoints \
   --guest-root /mnt/tidehunter/sui-run-$RUN \
   --native-root /mnt/tidehunter-kv-comparison/$RUN \
@@ -1109,8 +1113,8 @@ python3 experiments/gcp-rdma/fault_cells.py --cell M6-w4-c16 \
 # 7. stage 3
 python3 experiments/sui-checkpoint/stage3_campaign.py --mode cluster \
   --root $CAMPAIGN_ROOT/stage3root --binary $CAMPAIGN_ROOT/build/binaries/storage-node \
-  --external native=$CAMPAIGN_ROOT/external-native \
-  --external synchronous=$CAMPAIGN_ROOT/external-synchronous \
+  --build $CAMPAIGN_ROOT/build \
+  --schema $CAMPAIGN_ROOT/schema-run/experiment/native-schema \
   --external-database live/checkpoints --guest-root /mnt/tidehunter/sui-run-$RUN \
   --native-root /mnt/tidehunter-kv-comparison/$RUN --owners $RUN-1,$RUN-2 \
   --native-host $RUN-1 --fleet-state $STATE --fleet-config experiments/gcp-rdma/config.json \
