@@ -165,8 +165,11 @@ class Cluster:
     def context(self, namespace, receipts):
         config = json.loads((self.config_dir / 'config.json').read_text())
         remote = config['databases'][namespace]
+        # `external_owner_durability_receipts` is a list of path strings; the
+        # copied receipts' partition and parsed body stay in the evidence rows.
         return dict(transport=remote['tls']['transport'], remote=remote,
-                    receipts=list(receipts))
+                    receipts=[row['path'] if isinstance(row, dict) else str(row)
+                              for row in receipts])
 
     # ---- preparation ---------------------------------------------------
     def prepare(self):

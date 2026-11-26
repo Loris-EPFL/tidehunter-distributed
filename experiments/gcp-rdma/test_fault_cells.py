@@ -232,6 +232,29 @@ class Receipts(unittest.TestCase):
         self.assertEqual([row['partition'] for row in rows], [0, 1])
         self.assertEqual(rows[0]['receipt'], {'partition': 0})
 
+    def test_the_context_serializes_receipt_paths(self):
+        """`external_owner_durability_receipts` is a list of path strings."""
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory)
+            (config / 'nodes.json').write_text(json.dumps([
+                dict(namespace='ns', partition=0, host='h1', ready='/guest/node-0/ready'),
+                dict(namespace='ns', partition=1, host='h2', ready='/guest/node-1/ready')]))
+            (config / 'config.json').write_text(json.dumps(
+                {'databases': {'ns': {'read_cache_bytes': 0,
+                                      'tls': {'transport': {'kind': 'tcp'}}}}}))
+            remote = FakeRemote(files={
+                '/guest/node-0/ready.durability.json': b'{"partition": 0}',
+                '/guest/node-1/ready.durability.json': b'{"partition": 1}'})
+            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+            cluster.config_dir, cluster.remote = config, remote
+            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
+            rows = cluster.receipts('ns')
+            context = cluster.context('ns', rows)
+            expected = [str(config / 'receipts/node-0.json'),
+                        str(config / 'receipts/node-1.json')]
+        self.assertEqual(context['receipts'], expected)
+        self.assertTrue(all(isinstance(path, str) for path in context['receipts']))
+
     def test_missing_receipt_coverage_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory)
