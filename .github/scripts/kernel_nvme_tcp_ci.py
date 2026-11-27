@@ -332,6 +332,22 @@ def layout_spec(specs, document, root, index, *, reopen):
     return spec
 
 
+def negative_spec(specs, document, root, index, receipt):
+    """One single-owner run of the negative case.
+
+    The endpoint and receipt counts follow the selected database's own
+    partition list; the shared builder's campaign owner count would name two
+    endpoints that this deployment does not have.
+    """
+    spec = layout_spec(specs, document, root, index, reopen=False)
+    owners = len(document["storage"]["partitions"])
+    if owners != 1 or len(document.get("endpoints") or []) != owners:
+        raise RuntimeError(f"a negative owner needs one partition, found {owners}")
+    spec["backend"]["options"].update(
+        owners=owners, external_owner_durability_receipts=[str(receipt)])
+    return spec
+
+
 def run_coordinator(binary, spec, root, name, timeout=240):
     """Open one prepared database: provision, export, and close with its seal."""
     path = Path(root) / f"{name}.json"
@@ -535,10 +551,10 @@ def layout_negative(deployment, specs, binary, root):
             target = specs.receipt_path(root / ("negative-" + name), "native", 0)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(Path(published).read_bytes())
-        spec = layout_spec(specs, prepared["a"]["config"]["databases"][prepared["a"]["namespace"]],
-                           root / "negative-a", 0, reopen=False)
-        spec["backend"]["options"]["external_owner_durability_receipts"] = [
-            str(specs.receipt_path(root / "negative-a", "native", 0))]
+        spec = negative_spec(
+            specs, prepared["a"]["config"]["databases"][prepared["a"]["namespace"]],
+            root / "negative-a", 0,
+            specs.receipt_path(root / "negative-a", "native", 0))
         completed, _path, _output = run_coordinator(binary, spec, root / "negative-a", "a")
         error = coordinator_error(completed, "a")
         if error is not None:
@@ -550,10 +566,10 @@ def layout_negative(deployment, specs, binary, root):
             raise RuntimeError(f"the first owner exported no subsystem on port {base}")
         if not sorted(link.name for link in published.iterdir()):
             raise RuntimeError(f"the first owner exported no subsystem on port {base}")
-        spec = layout_spec(specs, prepared["b"]["config"]["databases"][prepared["b"]["namespace"]],
-                           root / "negative-b", 1, reopen=False)
-        spec["backend"]["options"].update(owners=1, external_owner_durability_receipts=[
-            str(specs.receipt_path(root / "negative-b", "native", 0))])
+        spec = negative_spec(
+            specs, prepared["b"]["config"]["databases"][prepared["b"]["namespace"]],
+            root / "negative-b", 1,
+            specs.receipt_path(root / "negative-b", "native", 0))
         completed, _path, _output = run_coordinator(binary, spec, root / "negative-b", "b")
         output = (completed.stdout or "") + (completed.stderr or "")
         if completed.returncode == 0:

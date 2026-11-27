@@ -81,6 +81,41 @@ class LayoutDefect(unittest.TestCase):
         self.assertEqual(len(found), 2)
 
 
+class NegativeSpecs(unittest.TestCase):
+    """Both negative runs must name their own single endpoint and receipt."""
+
+    def test_each_negative_owner_carries_its_own_count_and_receipt(self):
+        deployment, specs = kernel.campaign_modules()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            documents = {}
+            with patch.object(deployment, "certificates",
+                              lambda path, owners: path.mkdir()):
+                for name, namespace, port in (("a", kernel.LAYOUT_NAMESPACES[0],
+                                               kernel.LAYOUT_PORT),
+                                              ("b", kernel.LAYOUT_NAMESPACES[1],
+                                               kernel.LAYOUT_PORT + 10)):
+                    config, _nodes = deployment.prepare(
+                        root / name, {namespace: {}}, root / ("remote-" + name),
+                        shape_yamls={namespace: "key_spaces: []\n"},
+                        hosts=["127.0.0.1"], owners=1, port=port, transport="tcp",
+                        coordinator_cache=0, live_transport="tcp")
+                    documents[name] = config["databases"][namespace]
+            for index, name in ((0, "a"), (1, "b")):
+                receipt = specs.receipt_path(root / ("negative-" + name), "native", 0)
+                spec = kernel.negative_spec(specs, documents[name],
+                                            root / ("negative-" + name), index, receipt)
+                options = spec["backend"]["options"]
+                with self.subTest(name=name):
+                    self.assertEqual(options["owners"], 1)
+                    self.assertEqual(len(options["external_remote_config"]["endpoints"]), 1)
+                    self.assertEqual(options["external_owner_durability_receipts"],
+                                     [str(receipt)])
+                    self.assertEqual(spec["backend"]["options"]["path"],
+                                     str(root / ("negative-" + name) / "stage3" / "db"
+                                         / f"owner-layout-{index}" / "coordinator"))
+
+
 class CampaignModules(unittest.TestCase):
     def test_the_deployment_and_spec_builders_load(self):
         deployment, specs = kernel.campaign_modules()
