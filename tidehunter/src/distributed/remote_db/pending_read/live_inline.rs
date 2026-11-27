@@ -98,9 +98,13 @@ impl ReadService {
         drop(client);
     }
 
-    /// Arm the next grant this lane opens as a lost controller whose read
-    /// completes short.
-    pub(in crate::distributed::remote_db) fn bench_arm_short_read_after_open(&self, node: usize) {
+    /// Arm the next grant this lane opens so its read completes short, with
+    /// `lost` as the controller probe's verdict.
+    pub(in crate::distributed::remote_db) fn bench_arm_short_read_after_open(
+        &self,
+        node: usize,
+        lost: bool,
+    ) {
         let lanes = self.lanes.read();
         let lane = &lanes[0][node];
         let mut driver = lane.driver.lock();
@@ -108,7 +112,7 @@ impl ReadService {
             .live_cache
             .as_mut()
             .expect("the parked lane owns its cache")
-            .arm_short_read_after_open();
+            .arm_short_read_after_open(lost);
     }
 }
 

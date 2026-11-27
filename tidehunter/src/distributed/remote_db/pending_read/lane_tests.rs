@@ -806,7 +806,7 @@ fn a_short_read_on_a_lost_controller_does_not_poison_the_authority() {
     let parked = case.reads.bench_park_live_lane(0);
     case.reads
         .bench_register_permanent_local(0, position, &path);
-    case.reads.bench_arm_short_read_after_open(0);
+    case.reads.bench_arm_short_read_after_open(0, true);
     drop(parked);
     let before = case
         .fixture
@@ -836,5 +836,60 @@ fn a_short_read_on_a_lost_controller_does_not_poison_the_authority() {
             - before,
         1,
         "exactly one controller resume is counted"
+    );
+}
+
+/// The same short completion with a controller the probe reports live is a
+/// media or namespace verdict, not a resumable loss: the read fails, the
+/// authority is poisoned and later reads are refused. This pins the
+/// unverified-means-fatal contract at the poison site.
+#[test]
+fn an_unexplained_short_read_still_poisons_the_authority() {
+    let case = Case::new(1);
+    let position = case.positions[0];
+    case.reads.set_inline_reads_for_test(false);
+    let path =
+        crate::distributed::tcp::live_read::tests::owner_local_path(&case.fixture.node, position);
+    let parked = case.reads.bench_park_live_lane(0);
+    case.reads
+        .bench_register_permanent_local(0, position, &path);
+    case.reads.bench_arm_short_read_after_open(0, false);
+    drop(parked);
+    let before = case
+        .fixture
+        .metrics
+        .snapshot()
+        .counts
+        .read_controller_resumes;
+    let error = case
+        .reader
+        .read(KeySpace(0), &case.key, position)
+        .expect_err("a short read on a live controller is fatal");
+    assert!(
+        error.to_string().contains("short namespace read"),
+        "the fatal verdict names the short read: {error}"
+    );
+    assert!(
+        case.reads.failed(),
+        "an unexplained short read must poison the read authority"
+    );
+    assert_eq!(
+        case.fixture
+            .metrics
+            .snapshot()
+            .counts
+            .read_controller_resumes,
+        before,
+        "an unverified short read is never counted as a resume"
+    );
+    let refused = case
+        .reader
+        .read(KeySpace(0), &case.key, position)
+        .expect_err("a poisoned authority refuses later reads");
+    assert!(
+        refused
+            .to_string()
+            .contains("read authority is poisoned or closed"),
+        "the later read names the poison: {refused}"
     );
 }

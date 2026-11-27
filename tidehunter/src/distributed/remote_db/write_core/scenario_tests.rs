@@ -1512,7 +1512,7 @@ fn a_short_read_of_a_lost_controller_does_not_stop_the_write_core() {
     let parked = core.reads.bench_park_live_lane(0);
     core.reads
         .bench_register_permanent_local(0, position, &path);
-    core.reads.bench_arm_short_read_after_open(0);
+    core.reads.bench_arm_short_read_after_open(0, true);
     drop(parked);
     db.clear_read_cache();
     assert_eq!(

@@ -648,11 +648,11 @@ pub(crate) struct LiveReadCache {
     /// EIO exists.
     #[cfg(test)]
     fail_next_open: bool,
-    /// Report the next opened grant as a lost controller and complete its next
-    /// read short. Test-only: it models a controller the kernel deleted while
-    /// the lane re-opened it, whose only evidence is the short CQE.
+    /// Complete the next opened grant's read short, with the probe verdict
+    /// given. Test-only: it models the short CQE of a controller the kernel
+    /// deleted (`Some(true)`) or of a media fault on a live one (`Some(false)`).
     #[cfg(test)]
-    short_read_after_open: bool,
+    short_read_after_open: Option<bool>,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -696,7 +696,7 @@ impl LiveReadCache {
             #[cfg(test)]
             fail_next_open: false,
             #[cfg(test)]
-            short_read_after_open: false,
+            short_read_after_open: None,
         }
     }
 
@@ -706,11 +706,11 @@ impl LiveReadCache {
         self.fail_next_read_submission = true;
     }
 
-    /// Test only: report the next opened grant as a lost controller and its
-    /// next read as the short read that loss leaves on the completion queue.
+    /// Test only: complete the next opened grant's read short, with `lost` as
+    /// the controller probe's verdict.
     #[cfg(test)]
-    pub(crate) fn arm_short_read_after_open(&mut self) {
-        self.short_read_after_open = true;
+    pub(crate) fn arm_short_read_after_open(&mut self, lost: bool) {
+        self.short_read_after_open = Some(lost);
     }
 
     /// Test only: the next namespace open reports a controller the kernel
@@ -1100,12 +1100,12 @@ impl LiveReadCache {
                 match self.open_grant(client, epoch, state, position, connect_timeout)? {
                     Opened::Grant(index) => {
                         #[cfg(test)]
-                        if std::mem::take(&mut self.short_read_after_open) {
+                        if let Some(lost) = self.short_read_after_open.take() {
                             let grant = &mut self.grants[index];
-                            if let Some(lease) = grant.lease.clone() {
+                            grant.io.override_next_completion_result(0);
+                            if lost && let Some(lease) = grant.lease.clone() {
                                 lease.force_controller_lost(true);
                                 grant.controller_lost = Some(true);
-                                grant.io.override_next_completion_result(0);
                             }
                         }
                         if state.controller_losses > 0
