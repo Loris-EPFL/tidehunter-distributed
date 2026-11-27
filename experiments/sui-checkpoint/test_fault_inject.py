@@ -450,6 +450,89 @@ class InjectionRun(unittest.TestCase):
         self.assertIn('not alive', record['reason'])
         self.assertNotIn('controller', record['target'])
 
+    def test_a_record_persisted_before_the_rpc_names_the_target_and_no_delete(self):
+        """A fallback record must say what the injector had done so far.
+
+        Fleet A's `S1-4-mid-frame-native` left only
+        `{schema, kind, ok:false, reason, created_unix_ns}` because the record
+        was written once, at exit. The milestones now persist the selected
+        controller and whether the delete was attempted, so an RPC error before
+        the delete still answers "nothing was injected".
+        """
+        persisted = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            def latest(address):
+                raise ConnectionResetError(104, 'Connection reset by peer')
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                with self.assertRaises(OSError):
+                    fault_inject.run(self.args(), snapshot=inventory,
+                        delete=lambda *a: None, latest=latest,
+                        metrics=lambda url: metrics(10), clock=FakeClock().monotonic,
+                        sleep=lambda seconds: None,
+                        read_checkpoint=lambda address, sequence: {},
+                        write=persisted.append, **self.preflight())
+        self.assertGreaterEqual(len(persisted), 1,
+                                'the target milestone precedes the RPC')
+        record = persisted[-1]
+        self.assertEqual(record['target']['controller'], 'nvme1')
+        self.assertEqual(record['target']['nqn'], NQN)
+        self.assertEqual(record['preflight']['holders'], [dict(pid=42, descriptors=1)])
+        self.assertIs(record['deleted'], False)
+        self.assertNotIn('delete_attempted_unix_ns', record)
+
+    def test_a_record_persisted_after_the_delete_says_the_delete_happened(self):
+        persisted = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            state = dict(calls=0, deleted=False)
+            def snapshot():
+                return inventory('nvme2', 2) if state['deleted'] else inventory()
+            def latest(address):
+                state['calls'] += 1
+                if state['calls'] == 1:
+                    return 10
+                raise ConnectionResetError(104, 'Connection reset by peer')
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                with self.assertRaises(OSError):
+                    fault_inject.run(self.args(), snapshot=snapshot,
+                        delete=lambda *a: state.update(deleted=True), latest=latest,
+                        metrics=lambda url: metrics(10), clock=FakeClock().monotonic,
+                        sleep=lambda seconds: None,
+                        read_checkpoint=lambda address, sequence: {},
+                        write=persisted.append, **self.preflight())
+        deleted = [record for record in persisted if record['deleted']]
+        self.assertGreaterEqual(len(deleted), 1,
+                                'the delete milestone survives the later RPC error')
+        record = deleted[0]
+        self.assertEqual(record['target']['nqn'], NQN)
+        self.assertIn('deleted_unix_ns', record)
+        self.assertEqual(record['checkpoint_before'], 10)
+        self.assertNotIn('reconnected', record)
+        self.assertTrue(persisted[-1].get('reconnected'),
+                        'the reconnect milestone is the last one before the error')
+
+    def test_the_declined_delete_persists_deleted_false(self):
+        persisted = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(self.args(), snapshot=inventory,
+                    delete=lambda *a: (_ for _ in ()).throw(ValueError('refused')),
+                    latest=lambda address: 10, metrics=lambda url: metrics(10),
+                    clock=FakeClock().monotonic, sleep=lambda seconds: None,
+                    read_checkpoint=lambda address, sequence: {},
+                    write=persisted.append, **self.preflight())
+        self.assertFalse(record['ok'])
+        self.assertIs(record['deleted'], False)
+        self.assertTrue(persisted, 'the milestones precede the refused delete')
+        self.assertEqual({row['deleted'] for row in persisted}, {False})
+        self.assertTrue(any('delete_attempted_unix_ns' in row for row in persisted),
+                        'the attempted delete is recorded before the call')
+
 
 class Specification(unittest.TestCase):
     def base(self, **changes):
