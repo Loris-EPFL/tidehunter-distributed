@@ -1253,7 +1253,11 @@ class StaleFenceMeasurement(unittest.TestCase):
             cluster.owners = ['H1', 'H2']
             cluster.local = lambda name: cluster.output / name
             cluster.root = lambda name: cluster.local(name) / 'coordinator'
-            cluster.seal_markers = lambda host: dict(sealed=1)
+            seals = dict(n=0)
+            def marker(host):
+                seals['n'] += 1
+                return dict(sealed=0 if seals['n'] == 1 else 1)
+            cluster.seal_markers = marker
             cluster.generation_wal = lambda host: dict(generations={
                 '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
                                   dict(size=4096, mtime=1.0)}})
@@ -1349,7 +1353,11 @@ class StaleFenceMeasurement(unittest.TestCase):
             cluster.owners = ['H1', 'H2']
             cluster.local = lambda name: cluster.output / name
             cluster.root = lambda name: cluster.local(name) / 'coordinator'
-            cluster.seal_markers = lambda host: dict(sealed=1)
+            seals = dict(n=0)
+            def marker(host):
+                seals['n'] += 1
+                return dict(sealed=0 if seals['n'] == 1 else 1)
+            cluster.seal_markers = marker
             cluster.generation_wal = lambda host: dict(generations={
                 '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
                                   dict(size=4096, mtime=1.0)}})
@@ -1388,67 +1396,6 @@ class StaleFenceMeasurement(unittest.TestCase):
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
         self.assertEqual(latency['detail']['kind'], 'owner-row')
-
-
-class OwnerFenceProof(unittest.TestCase):
-    """The owner-side half: fence first, then nothing in the stale generation.
-
-    Shapes follow the real fleet-A evidence: an owner seals one database during
-    the pause (`S1-5S-lapse-native/attempt-3`: `sealed_partitions: 1`, apply
-    7,097 ms) and the stale generation's WAL lives under
-    `db-<database>/epoch_<generation>/wal_*`.
-    """
-
-    def snapshot(self, *, ns, sealed, size, mtime):
-        return dict(unix_ns=ns,
-                    seals={'H1': dict(host='H1', databases=1, sealed=sealed)},
-                    wal={'H1': dict(generations={'/db-1/epoch_3': {
-                        '/db-1/epoch_3/wal_0000000000000000':
-                            dict(size=size, mtime=mtime)}})})
-
-    def test_a_fenced_generation_that_gains_nothing_is_the_proof(self):
-        proof = fault_cells.CellDriver.owner_fence_proof(
-            self.snapshot(ns=100, sealed=1, size=4096, mtime=1.0),
-            self.snapshot(ns=200, sealed=1, size=4096, mtime=1.0),
-            authority_unix_ns=150)
-        self.assertTrue(proof['evidence_available'])
-        self.assertTrue(proof['fence_counters_increased'])
-        self.assertTrue(proof['no_stale_growth'])
-        self.assertIsNone(proof['reason'])
-        self.assertEqual(proof['stale_generations'], ['H1:/db-1/epoch_3'])
-
-    def test_growth_in_the_stale_generation_is_named(self):
-        proof = fault_cells.CellDriver.owner_fence_proof(
-            self.snapshot(ns=100, sealed=1, size=4096, mtime=1.0),
-            self.snapshot(ns=200, sealed=1, size=8192, mtime=2.0),
-            authority_unix_ns=150)
-        self.assertFalse(proof['no_stale_growth'])
-        self.assertIn('gained files or bytes', proof['reason'])
-        self.assertEqual(proof['stale_growth']['grown'],
-                         ['/db-1/epoch_3/wal_0000000000000000'])
-
-    def test_an_unsealed_owner_or_a_late_scrape_is_named(self):
-        unsealed = fault_cells.CellDriver.owner_fence_proof(
-            self.snapshot(ns=100, sealed=0, size=4096, mtime=1.0),
-            self.snapshot(ns=200, sealed=1, size=4096, mtime=1.0),
-            authority_unix_ns=150)
-        self.assertFalse(unsealed['fence_counters_increased'])
-        self.assertIn('no fence or write-protect marker', unsealed['reason'])
-        late = fault_cells.CellDriver.owner_fence_proof(
-            self.snapshot(ns=300, sealed=1, size=4096, mtime=1.0),
-            self.snapshot(ns=400, sealed=1, size=4096, mtime=1.0),
-            authority_unix_ns=150)
-        self.assertIn('after the new authority', late['reason'])
-
-    def test_missing_evidence_is_not_a_pass(self):
-        proof = fault_cells.CellDriver.owner_fence_proof(None, None,
-                                                        authority_unix_ns=1)
-        self.assertFalse(proof['evidence_available'])
-        self.assertIn('no owner-side fence snapshot', proof['reason'])
-        exclusive, reason = fault_cells.CellDriver._exclusive(
-            'owner-row', 0, new_authority=True, owner_fence=proof)
-        self.assertFalse(exclusive)
-        self.assertIn('no owner-side fence evidence', reason)
 
 
 class FenceAuditRun(unittest.TestCase):

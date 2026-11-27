@@ -975,51 +975,81 @@ class CellDriver:
                     wal={host: self.cluster.generation_wal(host) for host in hosts})
 
     @staticmethod
-    def owner_fence_proof(before, after, *, authority_unix_ns):
+    def owner_fence_proof(baseline, at_fence, after, *, authority_unix_ns):
         """The owner-side half of exclusivity, or the named reason it is absent.
 
-        `authority_unix_ns` is when the new authority's first accepted write
-        completed (or when the owner fenced, for a lapse cell). The seals must
-        have been published no later than that, and the generations listed at
-        the fence must show no new file and no growth afterwards.
+        Three snapshots are required: `baseline` before the stale writer is
+        stopped, `at_fence` while it is still stopped, and `after` the run.
+
+        - The fence marker must **strictly increase** from `baseline` to
+          `at_fence` (an equal positive count is a marker that predates this
+          fence, not one this fence published), and `at_fence` must be taken no
+          later than `authority_unix_ns`, the new authority's first accepted
+          write.
+        - Every generation listed in `at_fence` must still be present in `after`
+          with the same file set and identical size and mtime. A generation or
+          file that disappears is incomplete evidence, not absence of growth.
         """
         proof = dict(evidence_available=False, fence_counters_increased=None,
                      scraped_unix_ns=None, stale_generations=[], stale_growth=None,
                      no_stale_growth=None, reason=None)
-        if not before or not after:
-            proof['reason'] = 'no owner-side fence snapshot was taken'
+        if not baseline or not at_fence or not after:
+            proof['reason'] = ('no complete owner-side fence snapshot set (baseline, '
+                               'at the fence, after the run) was captured')
             return proof
-        proof['scraped_unix_ns'] = before.get('unix_ns')
-        proof['fence_counters_increased'] = all(
-            int((after.get('seals') or {}).get(host, {}).get('sealed') or 0)
-            >= int(seal.get('sealed') or 0) > 0
-            for host, seal in (before.get('seals') or {}).items()) if before.get('seals') else None
-        proof['stale_generations'] = sorted(
+        proof['scraped_unix_ns'] = at_fence.get('unix_ns')
+        before_seals = baseline.get('seals') or {}
+        at_seals = at_fence.get('seals') or {}
+        if not before_seals or not at_seals:
+            proof['reason'] = 'no owner seal marker was readable at either snapshot'
+            return proof
+        raised = []
+        for host, at in at_seals.items():
+            before = before_seals.get(host) or {}
+            if int(at.get('sealed') or 0) > int(before.get('sealed') or 0):
+                raised.append(host)
+        proof['fence_counters_increased'] = bool(raised)
+        proof['fence_hosts'] = raised
+
+        # The stale generations are those present while the writer is stopped;
+        # each must be byte-for-byte unchanged afterwards.
+        generations = sorted(
             f'{host}:{generation}'
-            for host, row in (before.get('wal') or {}).items()
+            for host, row in (at_fence.get('wal') or {}).items()
             for generation in (row.get('generations') or {}))
-        new_files, grown = [], []
-        for host, row in (before.get('wal') or {}).items():
+        proof['stale_generations'] = generations
+        missing, grown, new_files = [], [], []
+        for host, row in (at_fence.get('wal') or {}).items():
             later = ((after.get('wal') or {}).get(host) or {}).get('generations') or {}
             for generation, files in (row.get('generations') or {}).items():
+                if generation not in later:
+                    missing.append(generation)
+                    continue
                 current = later.get(generation) or {}
-                for path, entry in current.items():
-                    prior = files.get(path)
-                    if prior is None:
-                        new_files.append(path)
-                    elif (entry.get('size'), entry.get('mtime')) != (prior.get('size'),
-                                                                    prior.get('mtime')):
+                for path, entry in files.items():
+                    later_entry = current.get(path)
+                    if later_entry is None:
+                        missing.append(path)
+                    elif (later_entry.get('size'), later_entry.get('mtime')) != (
+                            entry.get('size'), entry.get('mtime')):
                         grown.append(path)
-        proof['stale_growth'] = dict(new_files=new_files, grown=grown)
-        proof['no_stale_growth'] = not new_files and not grown
+                for path in current:
+                    if path not in files:
+                        new_files.append(path)
+        proof['stale_growth'] = dict(missing=missing, new_files=new_files,
+                                     grown=grown)
+        proof['no_stale_growth'] = not (missing or new_files or grown)
         proof['evidence_available'] = True
         if not proof['fence_counters_increased']:
-            proof['reason'] = ('the owners published no fence or write-protect marker '
-                               'before the stale writer could run again')
+            proof['reason'] = ('the owners published no new fence or write-protect marker '
+                               'between the baseline and the fence')
         elif authority_unix_ns is not None and proof['scraped_unix_ns'] > authority_unix_ns:
             proof['reason'] = ('the owner-side fence snapshot was taken after the new '
                                'authority\'s first accepted write')
-        elif not proof['no_stale_growth']:
+        elif missing:
+            proof['reason'] = ('the stale generation\'s WAL listing is incomplete after '
+                               'the fence: ' + ', '.join(sorted(missing)[:3]))
+        elif new_files or grown:
             proof['reason'] = ('the stale generation\'s WAL gained files or bytes after '
                                'the fence')
         return proof
@@ -1406,11 +1436,12 @@ class CellDriver:
 
     def _lapse(self, child, host):
         result = dict(sealed_partitions=0)
+        baseline = self.fence_owner_snapshot()
         started = now_ns()
         child.signal(signal.SIGSTOP)
         result['paused_unix_ns'] = started
         result.update(self._seal_wait(host, started))
-        before = self.fence_owner_snapshot()
+        at_fence = self.fence_owner_snapshot()
         resumed = now_ns()
         child.signal(signal.SIGCONT)
         result['resumed_unix_ns'] = resumed
@@ -1449,7 +1480,7 @@ class CellDriver:
         # The row-level verdict; `fence_record` adds the audit and is the one
         # that publishes `exclusive`/`writers`.
         result['owner_fence'] = self.owner_fence_proof(
-            before, after, authority_unix_ns=result.get('fence_unix_ns'))
+            baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=bool(result.get('sealed_partitions')),
@@ -1537,13 +1568,16 @@ class CellDriver:
         run = self.cell['runs'][0]
         second = self.launch(run, 'fence-b', path=copy)
         result = dict(copied_root=str(copy))
+        # The owner-side baseline is taken before the new writer can be accepted.
+        baseline = self.fence_owner_snapshot()
         try:
             gate = self.gate_writes(second, FENCE_WRITES, timeout=300)
             result['second_gate'] = gate
             if not gate.get('reached'):
                 raise CellError(f"second coordinator wrote nothing: {gate.get('reason')}")
-            # Owner-side evidence, read while the stale writer is still stopped.
-            before = self.fence_owner_snapshot()
+            # At the fence, read while the stale writer is still stopped and
+            # before it may run again.
+            at_fence = self.fence_owner_snapshot()
             child.signal(signal.SIGCONT)
             result['resumed_unix_ns'] = now_ns()
             result['failure'] = self.stop_on_failure(child, count=1)
@@ -1593,7 +1627,7 @@ class CellDriver:
         # The row-level verdict; `fence_record` adds the audit and is the one
         # that publishes `exclusive`/`writers`.
         result['owner_fence'] = self.owner_fence_proof(
-            before, after, authority_unix_ns=result.get('fence_unix_ns'))
+            baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=result['second_measurement_rows'] > 0,
