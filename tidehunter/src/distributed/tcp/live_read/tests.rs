@@ -192,8 +192,9 @@ pub(crate) fn install_owner_local_leased(
 }
 
 /// Arm the next completion of the cached grant's inline queue as the short read
-/// of a controller the probe reports gone. The lane queue keeps its own
-/// completions, so a concurrent lane read is unaffected.
+/// of a controller the probe reports gone. A grant without its own inline queue
+/// shares the lane queue, so the caller must hold the lane (no lane submission
+/// in flight) until the inline attempt consumes the armed completion.
 pub(crate) fn arm_inline_short_read_loss(
     cache: &mut LiveReadCache,
     position: &VersionPosition,

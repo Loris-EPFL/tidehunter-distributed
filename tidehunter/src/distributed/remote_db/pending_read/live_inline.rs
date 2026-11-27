@@ -419,25 +419,12 @@ impl ReadService {
             resume.recv().unwrap();
         }
         let mut flights = self.state.flights.lock();
-        // Every new joiner must upgrade the registry's weak flight under
-        // this lock. No production weak upgrade occurs elsewhere, so one
-        // strong owner means only this producer can still hold the result.
-        // An out-of-lock upgrade/new consumer would break this invariant.
-        if Arc::strong_count(&flight) == 1 {
-            // Unregister in the same critical section as the decision.
-            // The not-ready signal prevents slot reuse until retirement.
-            flights.clear_slot(slot);
-        } else {
-            #[cfg(test)]
-            // Relaxed: test-only allocation-path diagnostics, not handoff.
-            self.state
-                .inline_result_copies
-                .fetch_add(1, Ordering::Relaxed);
-            *flight.completion.result.lock() = Some(match &result {
-                Ok(values) => Ok(values.clone()),
-                Err(error) => Err(copied_read_error(error)),
-            });
-        }
+        // Lane work never joins this flight (`FlightRegistry::find_lane`), and
+        // every upgrade of the registry's weak flight happens under this lock,
+        // so the producer is the flight's only consumer here. Unregister in the
+        // same critical section as the decision; the not-ready signal prevents
+        // slot reuse until retirement.
+        flights.clear_slot(slot);
         if let Some(trace) = trace {
             trace.event(if result.is_err() {
                 "flight_error"

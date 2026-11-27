@@ -687,8 +687,6 @@ struct State {
     #[cfg(test)]
     inline_mutex_fallbacks: AtomicUsize,
     #[cfg(test)]
-    inline_result_copies: AtomicUsize,
-    #[cfg(test)]
     inline_retirement_pause: ReactorPause,
     #[cfg(test)]
     inline_pause: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
@@ -1543,8 +1541,6 @@ impl ReadService {
             flight_metadata_bytes,
             #[cfg(test)]
             inline_mutex_fallbacks: AtomicUsize::new(0),
-            #[cfg(test)]
-            inline_result_copies: AtomicUsize::new(0),
             #[cfg(test)]
             inline_retirement_pause: Mutex::new(None),
             #[cfg(test)]
