@@ -116,9 +116,19 @@ impl Client {
             .min(limit)
             .min(self.page_limit)
             .min(256);
+        // The owner incarnation this reopen sees. The first page attempt may
+        // adopt a leftover controller only when its durable intent was created
+        // against this same owner process.
+        let owner_incarnation = Some(self.connected_status().incarnation);
         let mut attempts = 0;
         let result = loop {
             attempts += 1;
+            let adoption = if attempts == 1 {
+                ControllerAdoption::Recovery { owner_incarnation }
+            } else {
+                // The retry follows a verified loss: always connect fresh.
+                ControllerAdoption::Fresh { owner_incarnation }
+            };
             match self.replay_live_wal_page_attempt(
                 authority_epoch,
                 source_epoch,
@@ -129,6 +139,7 @@ impl Client {
                 cursor,
                 &config,
                 &pool,
+                adoption,
             ) {
                 Ok(page) => break Ok(page),
                 Err(RecoveryAttemptError {
@@ -170,6 +181,7 @@ impl Client {
         cursor: usize,
         config: &LiveClientConfig,
         pool: &LiveControllerPool,
+        adoption: ControllerAdoption,
     ) -> Result<RecoveryPage, RecoveryAttemptError> {
         if let Some(counters) = &self.live_counters {
             counters.record_metadata_request();
@@ -195,7 +207,8 @@ impl Client {
             .map_err(RecoveryAttemptError::fatal)?
         };
         let token = page.epoch_pin_token;
-        let read = self.read_live_recovery_records(&page, config, pool, per_batch, source_epoch);
+        let read =
+            self.read_live_recovery_records(&page, config, pool, per_batch, source_epoch, adoption);
         if let Some(counters) = &self.live_counters {
             counters.record_metadata_request();
         }
@@ -223,9 +236,9 @@ impl Client {
         }
     }
 
-    /// Read every binding of one validated page. Each binding opens through a
-    /// fresh-acquiring recovery connection and releases its lease before the
-    /// caller's page pin.
+    /// Read every binding of one validated page. Each binding opens through the
+    /// attempt's recovery connection and releases its lease before the caller's
+    /// page pin.
     fn read_live_recovery_records(
         &mut self,
         page: &LiveRecoveryPage,
@@ -233,6 +246,7 @@ impl Client {
         pool: &LiveControllerPool,
         per_batch: usize,
         source_epoch: u64,
+        adoption: ControllerAdoption,
     ) -> Result<Vec<(CompleteBatch, DurableBatch)>, RecoveryAttemptError> {
         let mut batches = Vec::with_capacity(page.entries.len());
         let mut index = 0;
@@ -274,9 +288,10 @@ impl Client {
                     &config.host_nqn,
                     config.host_id,
                     access,
-                    // A replay read must never bind the controller a killed
-                    // coordinator left on the replaced subsystem.
-                    ControllerAdoption::Fresh,
+                    // The first attempt adopts only a controller its intent
+                    // records against this owner incarnation; a retry always
+                    // retires and connects fresh.
+                    adoption,
                     deadline,
                     (
                         first.segment.partition,

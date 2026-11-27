@@ -99,7 +99,9 @@ fn write_protect_blocks_a_remote_write_and_keeps_the_export() {
             LiveNamespaceAccess::ReadWrite,
             // An admin-only proof owns no namespace I/O; never adopt another
             // process's controller.
-            ControllerAdoption::Fresh,
+            ControllerAdoption::Fresh {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .expect("connect a remote controller");

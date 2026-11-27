@@ -1551,7 +1551,8 @@ impl Client {
         )
     }
 
-    /// Authenticated status captured during connect; not a fresh health probe.
+    /// Latest authenticated status, from connect and every Status/Fence reply;
+    /// not a fresh health probe.
     #[allow(
         clippy::expect_used,
         reason = "connect stores the authenticated status before the client is returned"
@@ -1887,6 +1888,9 @@ impl Client {
         self.max_reads = status.max_reads;
         self.page_limit = status.recovery_page_batches;
         self.polling = status.polling;
+        // A status or fence reply is the latest authenticated owner state; the
+        // live connect records its incarnation in the durable intent.
+        self.connected_status = Some(status.clone());
         Ok(status)
     }
     pub fn status(&mut self) -> Result<NodeStatus, TcpError> {

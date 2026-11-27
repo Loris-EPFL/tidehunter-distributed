@@ -1476,12 +1476,16 @@ impl LiveReadCache {
                 .map_err(failed_io)?;
         }
         let setup = LiveReadTiming::start(&client.live_counters, LiveTimingStage::NamespaceSetup);
+        let adoption = ControllerAdoption::Adopt {
+            owner_incarnation: Some(client.connected_status().incarnation),
+        };
         let acquisition = if shared {
             pool.acquire_shared(
                 &target,
                 &config.host_nqn,
                 config.host_id,
                 access,
+                adoption,
                 connect_deadline,
             )
         } else if let GrantScope::File(location) = &scope {
@@ -1490,7 +1494,7 @@ impl LiveReadCache {
                 &config.host_nqn,
                 config.host_id,
                 access,
-                ControllerAdoption::Adopt,
+                adoption,
                 connect_deadline,
                 (
                     location.segment.partition,
@@ -1504,6 +1508,7 @@ impl LiveReadCache {
                 &config.host_nqn,
                 config.host_id,
                 access,
+                adoption,
                 connect_deadline,
             )
         };

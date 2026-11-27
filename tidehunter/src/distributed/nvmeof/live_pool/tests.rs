@@ -40,6 +40,9 @@ fn strict_and_shared_acquisitions_share_one_subsystem_controller() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .unwrap();
@@ -56,7 +59,9 @@ fn strict_and_shared_acquisitions_share_one_subsystem_controller() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadShared,
-            ControllerAdoption::Adopt,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
             (0, 1, 1),
         )
@@ -114,7 +119,9 @@ fn acquire_two_sealed_namespaces(
             host,
             [2; 16],
             LiveNamespaceAccess::ReadOnly,
-            ControllerAdoption::Adopt,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
             (0, 1, 0),
         )
@@ -125,7 +132,9 @@ fn acquire_two_sealed_namespaces(
             host,
             [2; 16],
             LiveNamespaceAccess::ReadOnly,
-            ControllerAdoption::Adopt,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
             (0, 1, 1),
         )
@@ -380,6 +389,9 @@ fn eviction_defers_a_busy_subsystem_controller_and_retires_it_idle() {
             "nqn.2026-01.test:host",
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .unwrap();
@@ -567,6 +579,9 @@ fn eviction_leaves_a_live_controller_cached() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .unwrap();
@@ -604,6 +619,9 @@ fn acquire_types_a_first_connect_loss_as_lost() {
         "nqn.2026-01.test:host",
         [2; 16],
         LiveNamespaceAccess::ReadWrite,
+        ControllerAdoption::Adopt {
+            owner_incarnation: None,
+        },
         deadline,
     ) {
         Ok(_) => panic!("the first connect reports the stopped controller"),
@@ -632,6 +650,9 @@ fn acquire_types_a_first_connect_loss_as_lost() {
             "nqn.2026-01.test:host",
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .expect("the next acquire connects");
@@ -678,6 +699,9 @@ fn a_lost_cached_lease_is_evicted_and_the_next_acquire_reconnects() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadWrite,
+        ControllerAdoption::Adopt {
+            owner_incarnation: None,
+        },
         deadline,
     ) {
         Ok(_) => panic!("the fixture first connect reports the stopped controller"),
@@ -697,6 +721,9 @@ fn a_lost_cached_lease_is_evicted_and_the_next_acquire_reconnects() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
         )
         .expect("the retry connects a fresh controller");
@@ -738,7 +765,9 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadOnly,
-        ControllerAdoption::Fresh,
+        ControllerAdoption::Fresh {
+            owner_incarnation: None,
+        },
         deadline,
         (0, 1, 0),
     ) {
@@ -770,7 +799,9 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadOnly,
-            ControllerAdoption::Fresh,
+            ControllerAdoption::Fresh {
+                owner_incarnation: None,
+            },
             deadline,
             (0, 1, 0),
         )
@@ -796,6 +827,9 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadWrite,
+        ControllerAdoption::Adopt {
+            owner_incarnation: None,
+        },
         deadline,
     ) {
         Ok(_) => panic!("the after-reserve loss must fail the first connect"),
@@ -810,6 +844,9 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadWrite,
+        ControllerAdoption::Adopt {
+            owner_incarnation: None,
+        },
         deadline,
     ) {
         Ok(_) => panic!("an Adopt retry must not clear a quarantined entry"),
@@ -846,7 +883,9 @@ fn a_fresh_acquisition_does_not_clear_a_worker_uncertain_quarantine() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadOnly,
-        ControllerAdoption::Fresh,
+        ControllerAdoption::Fresh {
+            owner_incarnation: None,
+        },
         deadline,
         (0, 1, 0),
     ) {
@@ -879,7 +918,9 @@ fn a_fresh_acquisition_does_not_clear_a_worker_uncertain_quarantine() {
         HOST,
         [2; 16],
         LiveNamespaceAccess::ReadOnly,
-        ControllerAdoption::Fresh,
+        ControllerAdoption::Fresh {
+            owner_incarnation: None,
+        },
         Instant::now() + PROGRESS_CAP,
         (0, 1, 0),
     ) {

@@ -1401,6 +1401,9 @@ impl super::Client {
             &config.host_nqn,
             config.host_id,
             LiveNamespaceAccess::ReadWrite,
+            crate::distributed::nvmeof::live_connect::ControllerAdoption::Adopt {
+                owner_incarnation: Some(self.connected_status().incarnation),
+            },
             deadline,
         );
         let (lease, acquisition, _) = match acquired {

@@ -48,19 +48,34 @@ pub struct LiveConnectTarget {
     pub geometry: LiveQueueGeometry,
 }
 
-/// Whether a connect may reuse the controller a durable intent records.
+/// How a connect treats a controller a durable intent records.
 ///
 /// The write path adopts: after an abrupt coordinator exit a healthy controller
-/// must not be torn down and recreated. A recovery read must never adopt. Its
-/// target may have been recreated under the same epoch-scoped export name by a
-/// new owner incarnation, and a leftover controller still pins the previous
-/// subsystem; the replay read would then bind a dead namespace.
+/// must not be torn down and recreated. A recovery read adopts only when the
+/// intent records the same owner incarnation it now sees. A different or
+/// unknown incarnation may name a target a new owner process replaced, so the
+/// recovery retires the leftover and connects fresh.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControllerAdoption {
-    /// Reuse a matching live controller when the registry keeps one.
-    Adopt,
+    /// Reuse a matching live controller (write and read path).
+    Adopt { owner_incarnation: Option<[u8; 16]> },
+    /// Reuse a matching live controller only when its intent records the same
+    /// `owner_incarnation`; otherwise retire the identity and connect fresh.
+    Recovery { owner_incarnation: Option<[u8; 16]> },
     /// Retire any matching intent and controller, then connect a new one.
-    Fresh,
+    Fresh { owner_incarnation: Option<[u8; 16]> },
+}
+
+impl ControllerAdoption {
+    /// The owner incarnation this connect is made against, recorded in the
+    /// durable intent. `None` means unknown (fixtures and admin-only users).
+    pub(crate) fn owner_incarnation(self) -> Option<[u8; 16]> {
+        match self {
+            Self::Adopt { owner_incarnation }
+            | Self::Recovery { owner_incarnation }
+            | Self::Fresh { owner_incarnation } => owner_incarnation,
+        }
+    }
 }
 
 /// The controller keep-alive timeout this engine requests, in seconds.
@@ -338,12 +353,13 @@ impl LiveController {
     /// Creates a distinct controller with explicit host identity. The kernel's
     /// control response, not a sysfs inventory difference, establishes ownership.
     ///
-    /// In `Adopt` mode a durable intent's live controller is reused instead of
-    /// deleted and recreated. A declined adoption is retired with its intent
-    /// before the fresh connect, so a live blocker is never left behind.
-    /// `Fresh` never adopts: it retires the identity's intent and controller
-    /// first, because a recovery read must not bind the previous incarnation's
-    /// subsystem.
+    /// A write connect (`Adopt`) reuses a durable intent's live controller
+    /// instead of deleting and recreating it; a declined adoption is retired
+    /// with its intent before the fresh connect, so a live blocker is never
+    /// left behind. A recovery connect (`Recovery`) adopts only when the
+    /// intent records the owner incarnation this reopen sees; a different or
+    /// unknown incarnation retires the identity and connects fresh. `Fresh`
+    /// never adopts: it retires the identity's intent and controller first.
     fn connect(
         registry: &LiveConnectionRegistry,
         target: &LiveConnectTarget,
@@ -356,34 +372,42 @@ impl LiveController {
         // Reject an invalid request before it can be compared against a durable
         // intent: a bad request must not retire a healthy controller.
         validate_connect_target(target, host_nqn, host_id)?;
-        match adoption {
-            ControllerAdoption::Adopt if registry.adopts() => {
-                match registry.try_adopt_controller(target, host_nqn, host_id, deadline) {
-                    Ok(Some(mut controller)) => {
-                        match controller.resolve_verified(access, deadline) {
-                            Ok(binding) => return Ok((controller, binding)),
-                            Err(error) => {
-                                let cleanup =
-                                    controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT);
-                                if cleanup.is_err() {
-                                    return Err(connect_error_after_cleanup(error, cleanup));
-                                }
-                            }
+        let adopt = match adoption {
+            ControllerAdoption::Adopt { .. } => registry.adopts(),
+            ControllerAdoption::Recovery { owner_incarnation } => {
+                registry.adopts()
+                    && registry.recovery_may_adopt(target, host_nqn, host_id, owner_incarnation)?
+            }
+            ControllerAdoption::Fresh { .. } => false,
+        };
+        if adopt {
+            match registry.try_adopt_controller(target, host_nqn, host_id, deadline) {
+                Ok(Some(mut controller)) => match controller.resolve_verified(access, deadline) {
+                    Ok(binding) => return Ok((controller, binding)),
+                    Err(error) => {
+                        let cleanup = controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT);
+                        if cleanup.is_err() {
+                            return Err(connect_error_after_cleanup(error, cleanup));
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => return Err(error),
-                }
+                },
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
-            ControllerAdoption::Adopt => {}
-            ControllerAdoption::Fresh => {
-                // A leftover intent would make `reserve` refuse this connect,
-                // and its controller may still pin the replaced subsystem.
-                registry.retire_identity(target, host_nqn, host_id, deadline)?;
-            }
+        } else if !matches!(adoption, ControllerAdoption::Adopt { .. }) {
+            // A recovery with a different or unknown owner, or a retry after a
+            // verified loss: retire the identity (counting what Adopt would
+            // have kept) before the fresh connect.
+            registry.retire_identity(target, host_nqn, host_id, deadline)?;
         }
-        let mut controller =
-            Self::connect_controller(registry, target, host_nqn, host_id, deadline)?;
+        let mut controller = Self::connect_controller(
+            registry,
+            target,
+            host_nqn,
+            host_id,
+            adoption.owner_incarnation(),
+            deadline,
+        )?;
         match controller.resolve_verified(access, deadline) {
             Ok(binding) => Ok((controller, binding)),
             Err(error) => Err(connect_error_after_cleanup(
@@ -401,9 +425,17 @@ impl LiveController {
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
+        owner_incarnation: Option<[u8; 16]>,
         deadline: Instant,
     ) -> io::Result<Self> {
-        match Self::connect_controller_once(registry, target, host_nqn, host_id, deadline) {
+        match Self::connect_controller_once(
+            registry,
+            target,
+            host_nqn,
+            host_id,
+            owner_incarnation,
+            deadline,
+        ) {
             Ok(controller) => Ok(controller),
             Err(error) if already_connected(&error) => {
                 // One bounded reconcile, then retry once only when the kernel
@@ -413,7 +445,14 @@ impl LiveController {
                 {
                     return Err(failure);
                 }
-                Self::connect_controller_once(registry, target, host_nqn, host_id, deadline)
+                Self::connect_controller_once(
+                    registry,
+                    target,
+                    host_nqn,
+                    host_id,
+                    owner_incarnation,
+                    deadline,
+                )
             }
             Err(error) => Err(error),
         }
@@ -423,6 +462,7 @@ impl LiveController {
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
+        owner_incarnation: Option<[u8; 16]>,
         deadline: Instant,
     ) -> io::Result<Self> {
         validate_connect_target(target, host_nqn, host_id)?;
@@ -431,6 +471,7 @@ impl LiveController {
             target: target.clone(),
             host_nqn: host_nqn.to_owned(),
             host_id,
+            owner_incarnation,
         };
         let intent_path = registry.reserve(&intent)?;
         #[cfg(test)]

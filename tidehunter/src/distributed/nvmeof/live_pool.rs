@@ -796,7 +796,9 @@ impl LiveControllerPool {
             host_nqn,
             host_id,
             access,
-            ControllerAdoption::Adopt,
+            ControllerAdoption::Adopt {
+                owner_incarnation: None,
+            },
             deadline,
             None,
         )
@@ -805,33 +807,26 @@ impl LiveControllerPool {
     /// `get_or_connect` that also reports the blocking connect and eviction
     /// durations. The pool lock is held only for map operations: a controller
     /// connect or delete never runs under it.
-    pub fn acquire(
+    pub(crate) fn acquire(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
     ) -> io::Result<(
         Arc<LiveControllerLease>,
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(
-            target,
-            host_nqn,
-            host_id,
-            access,
-            ControllerAdoption::Adopt,
-            deadline,
-            None,
-        )
+        self.acquire_inner(target, host_nqn, host_id, access, adoption, deadline, None)
     }
 
     /// File grant: tag the subsystem controller with the WAL subsystem it
     /// serves, so a retirement evicts the controller of its victims.
-    /// `adoption` is explicit at each call: a recovery read must never reuse a
-    /// controller the previous owner incarnation's process left behind.
+    /// `adoption` is explicit at each call: a recovery acquisition adopts only
+    /// a controller whose intent records the owner incarnation this reopen sees.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_file(
         &self,
@@ -858,27 +853,20 @@ impl LiveControllerPool {
         )
     }
 
-    pub fn acquire_shared(
+    pub(crate) fn acquire_shared(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
     ) -> io::Result<(
         Arc<LiveControllerLease>,
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(
-            target,
-            host_nqn,
-            host_id,
-            access,
-            ControllerAdoption::Adopt,
-            deadline,
-            None,
-        )
+        self.acquire_inner(target, host_nqn, host_id, access, adoption, deadline, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -965,7 +953,8 @@ impl LiveControllerPool {
                     // outcome. A worker that may still run, or an unreadable
                     // registry, can hold a controller whose intent must stay
                     // sealed until a process restart reconciles it.
-                    if adoption == ControllerAdoption::Adopt || *cause != QuarantineCause::Completed
+                    if matches!(adoption, ControllerAdoption::Adopt { .. })
+                        || *cause != QuarantineCause::Completed
                     {
                         return Err(invalid("connection outcome remains quarantined"));
                     }

@@ -269,6 +269,7 @@ fn registry_excludes_duplicate_intents_and_holds_lock() {
     let registry = LiveConnectionRegistry::open(&path, RegistryMode::Retire).unwrap();
     assert!(LiveConnectionRegistry::open(&path, RegistryMode::Retire).is_err());
     let intent = Intent {
+        owner_incarnation: None,
         target: LiveConnectTarget {
             nqn: "nqn.2026-01.test:wal".into(),
             uuid: [1; 16],
@@ -1208,6 +1209,7 @@ fn adoption_intent(target: &LiveConnectTarget) -> Intent {
         target: target.clone(),
         host_nqn: ADOPT_HOST.into(),
         host_id: ADOPT_HOST_ID,
+        owner_incarnation: None,
     }
 }
 
@@ -1516,6 +1518,117 @@ fn recovery_counts_only_adoptable_pre_existing_intents() {
     );
     assert_eq!(registry.retired_leftover_controllers(), 3);
     assert_eq!(registry.retired_adoptable_leftovers(), 1);
+}
+
+/// Recovery adopts only a controller whose durable intent records the owner
+/// incarnation this reopen sees. A different or unknown incarnation must take
+/// the fresh path, and the different-owner leftover still counts as adoptable
+/// because the unconditional write-path Adopt would have kept it.
+#[test]
+fn recovery_adopts_only_an_intent_from_the_same_owner_incarnation() {
+    let temp = tempdir::TempDir::new("adopt-incarnation").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let current = [7u8; 16];
+    let other = [8u8; 16];
+
+    // No intent at all: nothing a recovery may adopt.
+    assert!(
+        !registry
+            .recovery_may_adopt(&target, ADOPT_HOST, ADOPT_HOST_ID, Some(current))
+            .unwrap(),
+        "a registry without an intent has nothing to adopt"
+    );
+
+    // The write path's reserve records this owner incarnation, and the same
+    // incarnation is adoptable by a recovery.
+    let mut matching_intent = adoption_intent(&target);
+    matching_intent.owner_incarnation = Some(current);
+    let matching = registry.reserve(&matching_intent).unwrap();
+    assert!(
+        registry
+            .recovery_may_adopt(&target, ADOPT_HOST, ADOPT_HOST_ID, Some(current))
+            .unwrap(),
+        "the intent records this owner incarnation"
+    );
+    let controller_dir = fixture_controller(
+        &root,
+        30,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let mut adopted = registry
+        .try_adopt_controller(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("the matching intent's live controller is adopted")
+        .expect("a live verified controller is adoptable");
+    assert_eq!(
+        adopted.instance(),
+        30,
+        "recovery reuses the same controller"
+    );
+    let remover = remove_controller_when_deleted(controller_dir);
+    adopted.disconnect(deadline).unwrap();
+    remover.join().unwrap();
+    assert!(!matching.exists(), "disconnect removes the adopted intent");
+
+    // A pre-existing intent from another owner incarnation is unknown here.
+    let mut older = adoption_intent(&target);
+    older.owner_incarnation = Some(other);
+    let older_path = registry.seed_intent(&older).unwrap();
+    let older_controller = fixture_controller(
+        &root,
+        31,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    assert!(
+        !registry
+            .recovery_may_adopt(&target, ADOPT_HOST, ADOPT_HOST_ID, Some(current))
+            .unwrap(),
+        "a different owner incarnation is not adoptable"
+    );
+    let remover = remove_controller_when_deleted(older_controller.clone());
+    let counts = registry
+        .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("the different-owner leftover is retired");
+    remover.join().unwrap();
+    assert_eq!(
+        (counts.retired, counts.adoptable),
+        (1, 1),
+        "the fresh path retires the controller the old Adopt would have kept"
+    );
+    assert!(!older_controller.exists() && !older_path.exists());
+
+    // An intent without the field (older on-disk format) is unknown.
+    let legacy_path = registry.seed_intent(&adoption_intent(&target)).unwrap();
+    let legacy_controller = fixture_controller(
+        &root,
+        32,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    assert!(
+        !registry
+            .recovery_may_adopt(&target, ADOPT_HOST, ADOPT_HOST_ID, Some(current))
+            .unwrap(),
+        "an intent without an owner incarnation is unknown"
+    );
+    let remover = remove_controller_when_deleted(legacy_controller.clone());
+    registry
+        .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("the unknown-owner leftover is retired");
+    remover.join().unwrap();
+    assert!(!legacy_controller.exists() && !legacy_path.exists());
 }
 
 #[test]

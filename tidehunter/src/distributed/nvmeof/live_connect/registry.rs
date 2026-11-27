@@ -29,6 +29,11 @@ pub(super) struct Intent {
     pub(super) target: LiveConnectTarget,
     pub(super) host_nqn: String,
     pub(super) host_id: [u8; 16],
+    /// Owner incarnation the controller was created against. `None` means the
+    /// intent predates this field (or an admin/fixture connect); a recovery
+    /// treats it as unknown and never adopts.
+    #[serde(default)]
+    pub(super) owner_incarnation: Option<[u8; 16]>,
 }
 
 /// Test-only gate that holds a connect worker before it creates a controller,
@@ -361,10 +366,10 @@ impl LiveConnectionRegistry {
         Ok(())
     }
 
-    /// Retire the intent and every controller of one identity before a
-    /// non-adopting connect. A recovery read must never reuse a controller an
-    /// earlier process left behind, and the durable intent would otherwise
-    /// block `reserve`. Returns the controllers retired from intents that
+    /// Retire the intent and every controller of one identity before a fresh
+    /// connect. A recovery that may not adopt must not reuse a controller an
+    /// earlier owner incarnation left behind, and the durable intent would
+    /// otherwise block `reserve`. Returns the controllers retired from intents that
     /// predate this registry process; an intent this process published is
     /// recovery of its own failed connect and is not counted.
     pub(super) fn retire_identity(
@@ -404,6 +409,24 @@ impl LiveConnectionRegistry {
                 .fetch_add(outcome.adoptable as u64, Ordering::Relaxed);
         }
         Ok(outcome)
+    }
+
+    /// Whether a recovery may adopt this identity's controller: its durable
+    /// intent must record the owner incarnation the caller now sees. A
+    /// different or unknown incarnation returns false and takes the fresh path.
+    pub(super) fn recovery_may_adopt(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        current: Option<[u8; 16]>,
+    ) -> io::Result<bool> {
+        let recorded = self
+            .identity_intents(target, host_nqn, host_id)?
+            .into_iter()
+            .next()
+            .and_then(|(_, intent)| intent.owner_incarnation);
+        Ok(matches!((recorded, current), (Some(recorded), Some(current)) if recorded == current))
     }
 
     /// Whether this registry instance published `path`.
@@ -512,6 +535,8 @@ impl LiveConnectionRegistry {
             target: target.clone(),
             host_nqn: host_nqn.to_owned(),
             host_id,
+            // Identity matching only; this probe owns no intent.
+            owner_incarnation: None,
         };
         Ok(self
             .matching_controllers(&intent)?
@@ -888,8 +913,16 @@ impl LiveConnectionRegistry {
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
+        owner_incarnation: Option<[u8; 16]>,
         deadline: Instant,
     ) -> io::Result<LiveController> {
-        LiveController::connect_controller(self, target, host_nqn, host_id, deadline)
+        LiveController::connect_controller(
+            self,
+            target,
+            host_nqn,
+            host_id,
+            owner_incarnation,
+            deadline,
+        )
     }
 }

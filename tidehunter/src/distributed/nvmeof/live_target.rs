@@ -967,7 +967,7 @@ impl LiveTargetManager {
             .commissioning
             .as_mut()
             .ok_or_else(|| invalid("missing commissioning registry"))?
-            .connect_controller(target, host_nqn, random_id()?, deadline)?;
+            .connect_controller(target, host_nqn, random_id()?, None, deadline)?;
         Ok(CommissioningController::Live(controller))
     }
 
