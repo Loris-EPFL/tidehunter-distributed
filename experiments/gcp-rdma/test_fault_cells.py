@@ -254,20 +254,56 @@ class SnapshotGate(unittest.TestCase):
             with patch.object(fault_cells.time, 'sleep', sleep):
                 gate = self.driver().gate_snapshot(self.child(run), timeout=1)
         self.assertTrue(gate['reached'], gate)
-        self.assertEqual(gate['wal_allocated_baseline'], before)
-        self.assertGreater(gate['observations'][-1]['wal_allocated_bytes'], before)
-        self.assertGreater(gate['observations'][-1]['wal_allocated_delta'], 0)
+        self.assertEqual(gate['coordinator_wal_footprint_baseline'], before)
+        self.assertGreater(gate['observations'][-1]['coordinator_wal_footprint_bytes'],
+                           before)
+        self.assertGreater(gate['observations'][-1]['coordinator_wal_footprint_delta'], 0)
+        self.assertIn('not the engine index_value_bytes', gate['wal_measure'])
 
     def test_a_coordinator_without_a_wal_reports_no_volume(self):
         with tempfile.TemporaryDirectory() as tmp:
             run, region = self.tree(tmp)
             region.write_text('region v1')
             driver = self.driver()
-            self.assertIsNone(driver._coordinator_wal_bytes(self.child(run)))
+            self.assertIsNone(driver._coordinator_wal_footprint(self.child(run)))
             gate = driver.gate_snapshot(self.child(run), timeout=0.1)
-        self.assertIsNone(gate['wal_allocated_baseline'])
-        self.assertIsNone(gate['observations'][-1]['wal_allocated_bytes'])
-        self.assertIsNone(gate['observations'][-1]['wal_allocated_delta'])
+        self.assertIsNone(gate['coordinator_wal_footprint_baseline'])
+        self.assertIsNone(gate['observations'][-1]['coordinator_wal_footprint_bytes'])
+        self.assertIsNone(gate['observations'][-1]['coordinator_wal_footprint_delta'])
+
+    def test_a_missed_gate_is_written_before_the_cell_raises(self):
+        """The next missed cut must ship its probe series.
+
+        `crash()` raises before it appends a part, and the failure upload walks
+        files only, so S1-2S-snapshot's two fleet-A failures shipped no gate at
+        all. The record now lands at `<measure>/gate.json` first.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self.tree(tmp)
+            path = Path(run)
+
+            class Process:
+                returncode = None
+                pid = 7
+
+            child = types.SimpleNamespace(output=path, log=path / 'run.log',
+                                          process=Process(), started_unix_ns=1,
+                                          stop_record=None, stop=lambda: None)
+            driver = self.driver()
+            driver.cell = fault_cells.mechanism.find('S1-2S-snapshot-native')
+            driver.open = lambda run, name: child
+            driver.gate_writes = lambda child, count: dict(reached=True)
+            driver.gate_snapshot = lambda child, timeout=None: dict(
+                reached=False, reason='snapshot control-region store not observed',
+                observations=[dict(seconds=60.0,
+                                   coordinator_wal_footprint_bytes=9 << 30)])
+            driver.kill_coordinator = lambda child: {}
+            with self.assertRaisesRegex(fault_cells.CellError, 'gate missed'):
+                driver.crash()
+            written = json.loads((path.parent / 'gate.json').read_text())
+        self.assertFalse(written['reached'])
+        self.assertEqual(written['observations'][0]['coordinator_wal_footprint_bytes'],
+                         9 << 30)
 
 
 class OwnerWAL(unittest.TestCase):
