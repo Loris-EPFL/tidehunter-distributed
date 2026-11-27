@@ -59,6 +59,7 @@ import campaign_manifest
 import campaign_upload as upload_module
 import checkpoint_support as checkpoint
 import deployment
+import gcp_manual_compute
 import host_exec
 import mailbox_exec
 import proc_sampler
@@ -136,6 +137,22 @@ class NotReached(LaunchError):
     """A cell whose point the replay cannot produce; not a correctness failure."""
 
 
+def kernel_gate(fleet_state, live_transport):
+    """Refuse this cell when the fleet never admitted the initiator stack.
+
+    `gcp_manual_compute.py ready` publishes the record before any driver runs;
+    a missing or incomplete record means an owner would fail at its first
+    commissioning or write-protect, after the cell has started.
+    """
+    if fleet_state is None:
+        return
+    try:
+        gcp_manual_compute.require_fleet_initiator(
+            fleet_state, live_transport=live_transport)
+    except gcp_manual_compute.ComputeError as error:
+        raise SystemExit(str(error)) from None
+
+
 def controller_loss_admission(point, tier):
     """Refuse a point that this durability tier cannot produce at all."""
     if point is None:
@@ -156,11 +173,15 @@ def resume_deltas(delta):
 
 
 def live_window(owner_index):
-    """One owner host's live target service window (`deployment.prepare`)."""
+    """One owner host's live target service window (`deployment.prepare`).
+
+    Every database of that host takes one slot at the two-port stride inside
+    this partition window, so the window covers all of them.
+    """
     if type(owner_index) is not int or owner_index < 0:
         raise ValueError('owner index must be a nonnegative integer')
-    base = 4420 + 64 * owner_index
-    return base, base + 15
+    base = 4420 + deployment.LIVE_TARGET_WINDOW * owner_index
+    return base, base + deployment.LIVE_TARGET_SLOTS - 1
 
 
 def controller_loss_cell(stage, point, tier):
@@ -1329,6 +1350,7 @@ def main():
     if args.transport != expected_transport:
         raise SystemExit(f'--transport {args.transport} differs from the campaign '
                          f'topology {expected_transport}')
+    kernel_gate(args.fleet_state, args.live_transport)
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
     if args.controller_loss is not None:

@@ -930,6 +930,7 @@ def main():
     root = args.root.resolve()
     cluster = args.mode == 'cluster'
     if cluster:
+        manual_sui.kernel_gate(args.fleet_state, stage3_specs.LIVE_TRANSPORT)
         required = dict(guest_root=args.guest_root, owners=args.owners,
                         native_root=args.native_root, bucket_prefix=args.bucket_prefix)
         if not args.external:

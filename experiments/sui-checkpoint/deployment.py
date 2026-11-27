@@ -21,6 +21,16 @@ TRANSPORTS = ('tcp', *HARDWARE_TRANSPORTS, *SOFTWARE_TRANSPORTS)
 LIVE_TRANSPORTS = ('tcp', 'rdma')
 DEFAULT_QUEUE_GEOMETRY = dict(io_queues=4, queue_size=128, poll_queues=0)
 OWNER_MAX_PENDING_COMPLETIONS = 4096
+# One partition owns a 64-port window: 16 public slots, 16 commissioning slots
+# and 32 spare. Each database is its own owner process, so each database takes
+# one slot at a two-port stride of its partition window. The same stride is the
+# KV harness's colocated owner layout.
+LIVE_TARGET_WINDOW = 64
+LIVE_TARGET_SLOTS = 16
+LIVE_TARGET_STRIDE = 2
+MAX_DATABASES_PER_PARTITION = LIVE_TARGET_SLOTS // LIVE_TARGET_STRIDE
+POOL_FIELDS = ('public_port_base', 'public_service_base',
+               'commissioning_port_base', 'commissioning_service_base')
 LABEL_TRANSPORTS = {
     'tcp': {'kind': 'tcp'},
     'tcp-trusted': {'kind': 'tcp-trusted'},
@@ -143,6 +153,51 @@ def live_transport_for(transport, live_transport):
     return 'tcp'
 
 
+def live_target_pool(address, transport, partition, database):
+    """One database process's pool inside its partition's 64-port window.
+
+    The engine derives every target port and service from `slot`, and a
+    process root with `max_databases=1` uses slot 0, so two databases must not
+    share a base. The database index moves the base inside the partition
+    window; it never changes the partition's own offset.
+    """
+    base = LIVE_TARGET_WINDOW * partition + LIVE_TARGET_STRIDE * database
+    return dict(address=address, transport=transport,
+                public_port_base=1000 + base, public_service_base=4420 + base,
+                commissioning_port_base=1016 + base,
+                commissioning_service_base=4436 + base)
+
+
+def check_live_target_pools(pools):
+    """Fail closed when two databases of one (host, partition) share a pool.
+
+    `pools` is an iterable of `(host, partition, pool)`. Every one of the four
+    numbers must be distinct across the databases of one host and partition,
+    and each must stay inside its half of that partition's 64-port window: 16
+    public slots, then 16 commissioning slots.
+    """
+    groups = {}
+    for host, partition, pool in pools:
+        if set(pool) != {'address', 'transport', *POOL_FIELDS}:
+            raise ValueError('live target pool fields differ')
+        groups.setdefault((host, partition), []).append(pool)
+    for (host, partition), rows in groups.items():
+        numbers = [pool[field] for pool in rows for field in POOL_FIELDS]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError(f'{host} partition {partition}: live target pools '
+                             'overlap across databases')
+        for pool in rows:
+            for field, base in (('public_port_base', 1000),
+                                ('commissioning_port_base', 1016),
+                                ('public_service_base', 4420),
+                                ('commissioning_service_base', 4436)):
+                low = base + LIVE_TARGET_WINDOW * partition
+                if not low <= pool[field] < low + LIVE_TARGET_SLOTS:
+                    raise ValueError(
+                        f'{host} partition {partition}: {field} leaves its '
+                        '64-port window')
+
+
 def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, coordinator_cache,
             shard_cache=0, guest_root=None, write_profile_limit=0, resident_reads=None,
             owners=None, owner_transports=None, owner_tier=None, owner_wal='harness',
@@ -182,6 +237,10 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         raise ValueError(f'exactly {owners} distinct live target addresses are required')
     if set(shape_yamls) != set(schema):
         raise ValueError('canonical engine YAML must cover every selected namespace')
+    if len(schema) > MAX_DATABASES_PER_PARTITION:
+        raise ValueError(
+            f'the 64-port partition window holds at most '
+            f'{MAX_DATABASES_PER_PARTITION} databases at a two-port stride')
     resident = resident_read_config(resident_reads)
     if resident['destination_slots'] and not is_trusted(transport):
         raise ValueError('resident_reads requires an explicit trusted-native transport')
@@ -203,6 +262,15 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
         return dict(transport=selected, ca=str(base / 'ca.der'), cert=str(base / f'{name}.der'),
                     key=str(base / f'{name}.pk8'), server_name=name)
 
+    # Every database is its own owner process root, so its pool must be
+    # disjoint from every other database's pool on the same host. Check this
+    # before the first directory or launch file exists.
+    pools = [(host, partition,
+              live_target_pool(live_host, live_transport, partition, number))
+             for number in range(len(schema))
+             for partition, (host, live_host) in enumerate(zip(hosts, live_addresses))]
+    check_live_target_pools(pools)
+
     databases, nodes = {}, []
     for number, (namespace, shape) in enumerate(schema.items()):
         database = uuid.uuid4()
@@ -222,13 +290,10 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
             node_dir = directory / slug / f'node-{partition}'
             node_dir.mkdir(parents=True)
             runtime_node = runtime / slug / f'node-{partition}'
-            base = 64 * partition
             host_config = dict(
-                root=str(runtime_node / 'storage'), max_databases=16,
-                live_target_pool=dict(address=live_host, transport=live_transport,
-                    public_port_base=1000 + base, public_service_base=4420 + base,
-                    commissioning_port_base=1016 + base,
-                    commissioning_service_base=4436 + base),
+                root=str(runtime_node / 'storage'), max_databases=1,
+                live_target_pool=live_target_pool(
+                    live_host, live_transport, partition, number),
                 wal_member_read_policy='async', wal_prewrite=True,
                 max_device_reads_per_status=128,
                 durability=dict(max_unsynced_age_ms=None,

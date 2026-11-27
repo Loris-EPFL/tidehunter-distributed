@@ -54,16 +54,115 @@ MAX_FLEET_HOURS = 6
 KERNEL_RELEASE = '5.14.0-687.49.1+2.1.el9_8_ciq.x86_64'
 NVMET_SRCVERSION = '9F99AF855591751D53D463D'
 NVMET_BUILD_ID = '61aabd36adb3d8a51feb01cd289410d958c68c20'
+# The initiator stack every guest must load before a cell. The owners need it
+# for TCP commissioning and write-protect; the coordinator needs it for its
+# live controllers. nvme_tcp depends on nvme_fabrics and creates the device.
+INITIATOR_MODULES = ('nvme_fabrics', 'nvme_tcp')
+INITIATOR_RDMA_MODULES = ('rdma_cm', 'nvme_rdma')
+INITIATOR_DEVICE = '/dev/nvme-fabrics'
 
 
-def kernel_admission(remote, prepared):
-    """Read the running kernel and the loaded nvmet identity on every host.
+def initiator_modules(live_transport):
+    """The initiator modules one fleet's live data path needs."""
+    if live_transport not in ('tcp', 'rdma'):
+        raise ValueError('live NVMe-oF transport must be tcp or rdma')
+    return INITIATOR_MODULES + (INITIATOR_RDMA_MODULES if live_transport == 'rdma' else ())
+
+
+def initiator_script(live_transport):
+    """The root shell script that loads and proves the initiator stack."""
+    modules = initiator_modules(live_transport)
+    lines = ['set -eu', 'test "$(id -u)" = 0']
+    lines += [f'modprobe {module}' for module in modules]
+    lines.append(f'test -c {INITIATOR_DEVICE}')
+    for module in modules:
+        lines.append(f"printf '%s|%s|%s\\n' {module} "
+                     f"\"$(modinfo -F srcversion {module})\" "
+                     f"\"$(modinfo -F vermagic {module})\"")
+    return '\n'.join(lines)
+
+
+def admit_initiator(remote, host, *, live_transport, release):
+    """Load and prove the NVMe initiator stack on one host, as root.
+
+    The guest records what it loaded, not what the image should provide: a
+    host whose device or module identity differs stops the run before any
+    campaign driver starts.
+    """
+    modules = initiator_modules(live_transport)
+    code, out, err = remote.shell(host, initiator_script(live_transport), check=False)
+    if code != 0:
+        detail = (err or out).decode('utf-8', 'replace').strip()[-500:]
+        raise ComputeError(f'{host}: the NVMe initiator stack is unavailable: '
+                           + (detail or f'exit {code}'))
+    observed = {}
+    for line in out.decode('utf-8', 'replace').splitlines():
+        name, _, fields = line.partition('|')
+        srcversion, _, vermagic = fields.partition('|')
+        if name not in modules or name in observed:
+            raise ComputeError(f'{host}: unexpected initiator module report: {line!r}')
+        if not srcversion.strip() or not vermagic.strip():
+            raise ComputeError(f'{host}: {name} lacks srcversion or vermagic')
+        if vermagic.split()[0] != release:
+            raise ComputeError(f'{host}: {name} vermagic {vermagic.split()[0]} does not '
+                               f'match the running kernel {release}')
+        observed[name] = {'srcversion': srcversion.strip(), 'vermagic': vermagic.strip()}
+    missing = sorted(set(modules) - set(observed))
+    if missing:
+        raise ComputeError(f'{host}: the initiator report lacks ' + ', '.join(missing))
+    return {'live_transport': live_transport, 'device': INITIATOR_DEVICE,
+            'char_device': True, 'modules': observed}
+
+
+def require_initiator(admission, *, live_transport=None):
+    """Refuse a dispatch whose kernel admission lacks a complete initiator record.
+
+    `ready` is the only producer of the record, so its absence means the fleet
+    never proved the stack. A record from a TCP admission also serves an RDMA
+    cell only when it holds the RDMA modules.
+    """
+    hosts = (admission or {}).get('hosts')
+    fleet = (admission or {}).get('initiator')
+    if not isinstance(hosts, dict) or not hosts or not isinstance(fleet, dict):
+        raise ComputeError('kernel-admission.json has no initiator record; run ready')
+    transport = fleet.get('live_transport')
+    required = list(initiator_modules(transport))
+    if live_transport is not None and live_transport != transport:
+        required += [module for module in initiator_modules(live_transport)
+                     if module not in required]
+    if fleet.get('device') != INITIATOR_DEVICE:
+        raise ComputeError('kernel-admission.json names no initiator device')
+    for name in sorted(hosts):
+        record = hosts[name].get('initiator')
+        if not isinstance(record, dict) or record.get('device') != INITIATOR_DEVICE \
+                or record.get('char_device') is not True:
+            raise ComputeError(f'{name}: kernel-admission.json has no proven '
+                               f'{INITIATOR_DEVICE}')
+        modules = record.get('modules') or {}
+        for module in required:
+            fields = modules.get(module) or {}
+            if not fields.get('srcversion') or not fields.get('vermagic'):
+                raise ComputeError(f'{name}: kernel-admission.json has no '
+                                   f'{module} initiator record; run ready')
+    return admission
+
+
+def require_fleet_initiator(state_path, *, live_transport=None):
+    """The fleet-state gate the campaign drivers apply before a cell."""
+    state = json.loads(Path(state_path).read_text())
+    return require_initiator(state.get('kernel_admission'), live_transport=live_transport)
+
+
+def kernel_admission(remote, prepared, *, live_transport):
+    """Read the running kernel, the pinned nvmet and the initiator stack.
 
     The guest gate installs the pinned module and records the build ID it
-    loaded. The running release and the loaded srcversion are read from the
-    guest, so a host that booted another kernel, or that runs the stock module,
-    stops the run before any campaign driver starts.
+    loaded. The running release, the loaded srcversion and every initiator
+    module are read from the guest, so a host that booted another kernel, that
+    runs the stock module, or that never loaded `/dev/nvme-fabrics` stops the
+    run before any campaign driver starts.
     """
+    modules = initiator_modules(live_transport)
     observed = {}
     for name in sorted(prepared):
         receipt = prepared[name]
@@ -82,10 +181,22 @@ def kernel_admission(remote, prepared):
         if loaded != {'srcversion': NVMET_SRCVERSION, 'build_id': NVMET_BUILD_ID}:
             raise ComputeError(f'{name}: the worker did not record the pinned nvmet '
                                'build ID')
+        initiator = admit_initiator(remote, name, live_transport=live_transport,
+                                    release=release)
         observed[name] = {'kernel': release, 'nvmet_srcversion': srcversion,
-                          'nvmet_build_id': loaded['build_id']}
+                          'nvmet_build_id': loaded['build_id'],
+                          'initiator': initiator}
     return {'kernel_release': KERNEL_RELEASE, 'nvmet_srcversion': NVMET_SRCVERSION,
-            'nvmet_build_id': NVMET_BUILD_ID, 'hosts': observed}
+            'nvmet_build_id': NVMET_BUILD_ID,
+            'initiator': {'live_transport': live_transport, 'device': INITIATOR_DEVICE,
+                          'modules': list(modules)},
+            'hosts': observed}
+
+
+def live_transport_of(runtime):
+    """The live NVMe-oF transport the published runtime asks for."""
+    backends = ((runtime or {}).get('spec') or {}).get('backends') or []
+    return 'rdma' if any('nvme_rdma' in str(backend) for backend in backends) else 'tcp'
 
 
 def startup_script(config, state):
@@ -1315,11 +1426,16 @@ async def ready(config, args):
         args.state, gcp_api.campaign_client(config), bucket=config['bucket'],
         timeout_seconds=args.worker_seconds)
     prepared = remote.wait_workers(require=args.require_manifest_sha256)
-    admission = kernel_admission(remote, prepared)
+    # The published runtime is the immutable record of the fleet's live path;
+    # its backends decide which initiator modules the gate must prove.
+    store = gcp_api.campaign_client(config).objects(config['bucket'])
+    runtime = json.loads(store.get(f'runs/{state["run_id"]}/runtime.json',
+                                   max_bytes=4 * 1024 * 1024))
+    admission = kernel_admission(remote, prepared,
+                                 live_transport=live_transport_of(runtime))
     state['kernel_admission'] = admission
     save(args.state, state)
     # Campaign evidence: the same identity every host reported, under the run.
-    store = gcp_api.campaign_client(config).objects(config['bucket'])
     mailbox_exec.replace_object(
         store, f'runs/{state["run_id"]}/qualification/kernel-admission.json',
         (json.dumps(admission, sort_keys=True, indent=2) + '\n').encode())

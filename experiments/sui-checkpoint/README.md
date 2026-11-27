@@ -725,7 +725,8 @@ without new data-plane errors.
 It runs on the initiator, because the deleted object is the local controller:
 the coordinator host holds one controller per owner target. `--nqn` names one
 exact controller; `--service` with `--service-max` names the owner's contiguous
-live service window instead (`4420 + 64 * partition` up to fifteen ports) and
+live service window instead (`4420 + 64 * partition` up to fifteen ports, which
+covers every database that host serves at the two-port database stride) and
 keeps the lowest NQN, recording every candidate. The engine's live target NQNs
 carry a database scope and an epoch-derived suffix, so the window form is the
 one a campaign cell uses.

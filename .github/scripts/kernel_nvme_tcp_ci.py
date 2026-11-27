@@ -22,6 +22,16 @@ TRACING_ROOTS = (Path("/sys/kernel/tracing"), Path("/sys/kernel/debug/tracing"))
 NVMET_EVENTS = ("nvmet_req_init", "nvmet_req_complete")
 KPROBE = "p:nvmet_tcp_qr nvmet_tcp_queue_response req=%di"
 
+# The campaign's three databases and two owner partitions. `deployment.prepare`
+# gives every database process its own slot inside the partition's 64-port
+# window, so six owners on one host must not share a target.
+LAYOUT_OWNERS = 2
+LAYOUT_NAMESPACES = ("live/checkpoints", "live/store/epoch_0", "live/store/perpetual")
+LAYOUT_PORT = 24000
+LAYOUT_SECONDS = 180
+LAYOUT_SCOPE = "nqn.2026-01.local.tidehunter:db-"
+CONFIGFS = Path("/sys/kernel/config/nvmet")
+
 
 def write_text(path, value):
     path.write_text(value if value.endswith("\n") else value + "\n")
@@ -207,6 +217,351 @@ def inventory():
             "ports": sorted(p.name for p in (config / "ports").iterdir()),
             "controllers": controllers}
 
+
+def campaign_modules():
+    """The Sui deployment and stage-3 spec builders of this checkout."""
+    import importlib.util
+    for directory in (ROOT / "experiments", ROOT / "experiments/sui-checkpoint"):
+        if str(directory) not in sys.path:
+            sys.path.insert(0, str(directory))
+    loaded = {}
+    for name, relative in (("owner_layout_deployment",
+                            "experiments/sui-checkpoint/deployment.py"),
+                           ("owner_layout_specs",
+                            "experiments/sui-checkpoint/stage3_specs.py")):
+        spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        loaded[name] = module
+    return loaded["owner_layout_deployment"], loaded["owner_layout_specs"]
+
+
+def owner_launch(node):
+    import yaml
+    return yaml.safe_load(Path(node["launch"]).read_text())
+
+
+def start_owner(binary, node, log):
+    """Start one generated owner process; its ready file gates the next step."""
+    with open(log, "ab") as stream:
+        return subprocess.Popen(
+            [str(binary), "--experimental-storage-node", str(node["launch"])],
+            stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
+            start_new_session=True)
+
+
+def owner_name(node):
+    return str(node["namespace"]) + "/" + str(node["partition"])
+
+
+def wait_owners(nodes, processes, timeout=LAYOUT_SECONDS):
+    """Wait until every owner published its ready file, or report the failure."""
+    deadline = time.monotonic() + timeout
+    while True:
+        for node in nodes:
+            process = processes[owner_name(node)]
+            if process.poll() is not None:
+                raise RuntimeError(f"{owner_name(node)}: owner exited "
+                                   f"{process.returncode} before readiness")
+        missing = [owner_name(node) for node in nodes
+                   if not Path(node["ready"]).is_file()]
+        if not missing:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError("owner readiness expired: " + ", ".join(missing))
+        time.sleep(0.1)
+
+
+def stop_owner(process, node, timeout=LAYOUT_SECONDS):
+    """The engine's own stop: the stop file makes the owner drain its targets."""
+    Path(node["stop"]).write_text("stop\n")
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=30)
+    Path(node["stop"]).unlink(missing_ok=True)
+    return process.returncode
+
+
+def kill_owner(process, timeout=60):
+    process.kill()
+    process.wait(timeout=timeout)
+    return process.returncode
+
+
+def copy_receipts(nodes, specs, root, namespace):
+    """Put the selected database's owner receipts where its spec names them.
+
+    One receipt per partition names that partition's control address and
+    process, so the receipt of another database's owner on the same host does
+    not confirm this database.
+    """
+    for partition in range(LAYOUT_OWNERS):
+        selected = [node for node in nodes if node["partition"] == partition
+                    and node["namespace"] == namespace]
+        if len(selected) != 1:
+            raise RuntimeError(f"{namespace} partition {partition}: expected one owner")
+        published = Path(str(selected[0]["ready"]) + ".durability.json")
+        target = specs.receipt_path(Path(root), "native", partition)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(published.read_bytes())
+
+
+def layout_spec(specs, document, root, index, *, reopen):
+    """One kv-research run over one prepared database of the deployment."""
+    case = dict(case_id=f"owner-layout-{index}" + ("-reopen" if reopen else ""),
+                arm="A", mix="read" if reopen else "mixed", size=256,
+                distribution="uniform", tier="native", concurrency=2,
+                batch=None, cache=0, reference=False)
+    spec = specs.run_config(case, Path(root), external={"native": {"document": document}},
+                            measurement_operations=8)
+    spec["dataset"]["keys"] = 256
+    if reopen:
+        # The maintained second-open proof reuses the coordinator path: the
+        # reopened coordinator recovers the authority the owners hold.
+        spec["namespace"] = f"stage3-owner-layout-{index}"
+        spec["backend"]["options"]["path"] = str(
+            Path(root) / "stage3" / "db" / f"owner-layout-{index}" / "coordinator")
+        spec["phases"].update(preload=False, warmup_operations=0)
+    return spec
+
+
+def run_coordinator(binary, spec, root, name, timeout=240):
+    """Open one prepared database: provision, export, and close with its seal."""
+    path = Path(root) / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+    output = Path(root) / f"{name}-out"
+    if output.exists():
+        raise RuntimeError(f"{output}: coordinator output is not fresh")
+    completed = subprocess.run(
+        [str(binary), "--config", str(path), "--output", str(output)],
+        capture_output=True, text=True, timeout=timeout)
+    return completed, path, output
+
+
+def coordinator_error(completed, name):
+    if completed.returncode == 0:
+        return None
+    detail = (completed.stderr or completed.stdout).strip()[-3000:]
+    return f"{name}: coordinator exited {completed.returncode}: {detail}"
+
+
+def database_scope(nodes):
+    """The one database identity each generated owner root holds."""
+    scopes = {}
+    for node in nodes:
+        root = Path(owner_launch(node)["host"]["root"])
+        databases = sorted(path.name for path in root.glob("db-*"))
+        if len(databases) != 1:
+            raise RuntimeError(f"{root}: expected one database root, found {databases}")
+        scopes[owner_name(node)] = databases[0][3:]
+    return scopes
+
+
+def layout_defect(nodes, scopes):
+    """Every target port holds its own database scope and nothing else."""
+    expected = {}
+    for node in nodes:
+        pool = owner_launch(node)["host"]["live_target_pool"]
+        expected[pool["public_port_base"]] = (
+            f"{LAYOUT_SCOPE}{scopes[owner_name(node)]}-p{node['partition']}-")
+    ports = CONFIGFS / "ports"
+    observed = {}
+    for port in sorted(ports.iterdir(), key=lambda path: path.name):
+        links = sorted(link.name for link in (port / "subsystems").iterdir())
+        if not links:
+            continue
+        observed[int(port.name)] = links
+    missing = sorted(set(expected) - set(observed))
+    if missing:
+        return f"target ports published no subsystem: {missing}"
+    foreign = sorted(set(observed) - set(expected))
+    if foreign:
+        return f"unexpected published target ports: {foreign}"
+    for port_id, links in observed.items():
+        for link in links:
+            if not link.startswith(expected[port_id]):
+                return (f"port {port_id} holds another database's subsystem: {link} "
+                        f"(expected the {expected[port_id]} scope)")
+    return None
+
+
+def layout_teardown_defect(scopes):
+    """A stopped layout owns no scoped configfs object."""
+    residual = []
+    for scope in sorted(scopes):
+        prefix = f"{LAYOUT_SCOPE}{scope}-p"
+        for subsystem in (CONFIGFS / "subsystems").iterdir():
+            if subsystem.name.startswith(prefix):
+                residual.append(str(subsystem))
+        for host in (CONFIGFS / "hosts").iterdir():
+            if host.name.startswith(prefix):
+                residual.append(str(host))
+    for port in (CONFIGFS / "ports").iterdir():
+        for link in (port / "subsystems").iterdir():
+            if any(link.name.startswith(f"{LAYOUT_SCOPE}{scope}-p") for scope in scopes):
+                residual.append(str(link))
+    return residual
+
+
+def layout_positive(deployment, specs, binary, root):
+    """Three databases times two owners: export, seal, reopen and reconcile."""
+    root = Path(root)
+    root.mkdir(mode=0o700)
+    schema = {name: {"key_spaces": []} for name in LAYOUT_NAMESPACES}
+    config, nodes = deployment.prepare(
+        root / "deployment", schema, root / "remote",
+        shape_yamls={name: "key_spaces: []\n" for name in schema},
+        hosts=["127.0.0.1"] * LAYOUT_OWNERS, owners=LAYOUT_OWNERS,
+        port=LAYOUT_PORT, transport="tcp", coordinator_cache=0,
+        live_transport="tcp")
+    ports = [owner_launch(node)["host"]["live_target_pool"]["public_port_base"]
+             for node in nodes]
+    if len(set(ports)) != len(ports):
+        raise RuntimeError(f"prepared owners share a target port: {sorted(ports)}")
+    processes = {}
+    nodes_of = {owner_name(node): node for node in nodes}
+    try:
+        for node in nodes:
+            log = root / (owner_name(node).replace("/", "-") + ".log")
+            processes[owner_name(node)] = start_owner(binary, node, log)
+        wait_owners(nodes, processes)
+        for index, name in enumerate(LAYOUT_NAMESPACES):
+            copy_receipts(nodes, specs, root, name)
+            for reopen in (False, True):
+                label = f"owner-layout-{index}" + ("-reopen" if reopen else "")
+                completed, _path, _output = run_coordinator(
+                    binary, layout_spec(specs, config["databases"][name], root, index,
+                                        reopen=reopen), root, label)
+                error = coordinator_error(completed, label)
+                if error is not None:
+                    raise RuntimeError(error)
+        # A kill leaves every scoped object behind. Only a layout that gives
+        # each database its own port lets all six reopens reconcile it.
+        for node in nodes:
+            kill_owner(processes[owner_name(node)])
+        processes = {}
+        for node in nodes:
+            # The ready and receipt files of the killed incarnation must not
+            # satisfy the restart: the new process republishes both.
+            Path(node["ready"]).unlink(missing_ok=True)
+            Path(str(node["ready"]) + ".durability.json").unlink(missing_ok=True)
+            log = root / (owner_name(node).replace("/", "-") + ".log")
+            processes[owner_name(node)] = start_owner(binary, node, log)
+        wait_owners(nodes, processes)
+        scopes = database_scope(nodes)
+        defect = layout_defect(nodes, scopes)
+        if defect is not None:
+            raise RuntimeError(defect)
+        for node in nodes:
+            code = stop_owner(processes[owner_name(node)], node)
+            if code != 0:
+                raise RuntimeError(f"{owner_name(node)}: owner stop exited {code}")
+        processes = {}
+        residual = layout_teardown_defect(scopes.values())
+        if residual:
+            raise RuntimeError("stopped layout left configfs objects: " + ", ".join(residual))
+        return {"complete": True, "owners": len(nodes), "databases": len(LAYOUT_NAMESPACES),
+                "ports": {str(port): scope for port, scope
+                          in sorted(layout_observed(nodes, scopes).items())}}
+    finally:
+        for name, process in processes.items():
+            if process.poll() is not None:
+                continue
+            try:
+                stop_owner(process, nodes_of[name], timeout=20)
+            except BaseException:
+                process.kill()
+                process.wait(timeout=30)
+
+
+def layout_observed(nodes, scopes):
+    """The published port of every generated owner, for the receipt."""
+    observed = {}
+    for node in nodes:
+        pool = owner_launch(node)["host"]["live_target_pool"]
+        observed[pool["public_port_base"]] = (
+            f"{scopes[owner_name(node)]}-p{node['partition']}")
+    return observed
+
+
+def layout_negative(deployment, specs, binary, root):
+    """Two owners, one pool base, two databases: the second must refuse."""
+    root = Path(root)
+    root.mkdir(mode=0o700)
+    prepared = {}
+    for name, control in (("a", LAYOUT_PORT), ("b", LAYOUT_PORT + 10)):
+        namespace = LAYOUT_NAMESPACES[0] if name == "a" else LAYOUT_NAMESPACES[1]
+        config, nodes = deployment.prepare(
+            root / name, {namespace: {"key_spaces": []}}, root / ("remote-" + name),
+            shape_yamls={namespace: "key_spaces: []\n"},
+            hosts=["127.0.0.1"], owners=1, port=control, transport="tcp",
+            coordinator_cache=0, live_transport="tcp")
+        prepared[name] = dict(namespace=namespace, config=config, node=nodes[0])
+    # The negative case is the old layout: the second owner's launch names the
+    # first owner's pool base with its own root and control port.
+    first = owner_launch(prepared["a"]["node"])
+    launch = owner_launch(prepared["b"]["node"])
+    launch["host"]["live_target_pool"] = dict(first["host"]["live_target_pool"])
+    import yaml
+    Path(prepared["b"]["node"]["launch"]).write_text(yaml.safe_dump(launch, sort_keys=False))
+    processes = {}
+    try:
+        for name in ("a", "b"):
+            node = prepared[name]["node"]
+            log = root / f"negative-{name}.log"
+            processes[name] = start_owner(binary, node, log)
+            wait_owners([node], {owner_name(node): processes[name]})
+            published = str(node["ready"]) + ".durability.json"
+            target = specs.receipt_path(root / ("negative-" + name), "native", 0)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(Path(published).read_bytes())
+        spec = layout_spec(specs, prepared["a"]["config"]["databases"][prepared["a"]["namespace"]],
+                           root / "negative-a", 0, reopen=False)
+        spec["backend"]["options"]["external_owner_durability_receipts"] = [
+            str(specs.receipt_path(root / "negative-a", "native", 0))]
+        completed, _path, _output = run_coordinator(binary, spec, root / "negative-a", "a")
+        error = coordinator_error(completed, "a")
+        if error is not None:
+            raise RuntimeError("the first owner of the negative case failed: " + error)
+        ports = database_scope([prepared["a"]["node"]])
+        base = first["host"]["live_target_pool"]["public_port_base"]
+        published = CONFIGFS / "ports" / str(base) / "subsystems"
+        if not published.is_dir():
+            raise RuntimeError(f"the first owner exported no subsystem on port {base}")
+        if not sorted(link.name for link in published.iterdir()):
+            raise RuntimeError(f"the first owner exported no subsystem on port {base}")
+        spec = layout_spec(specs, prepared["b"]["config"]["databases"][prepared["b"]["namespace"]],
+                           root / "negative-b", 1, reopen=False)
+        spec["backend"]["options"].update(owners=1, external_owner_durability_receipts=[
+            str(specs.receipt_path(root / "negative-b", "native", 0))])
+        completed, _path, _output = run_coordinator(binary, spec, root / "negative-b", "b")
+        output = (completed.stdout or "") + (completed.stderr or "")
+        if completed.returncode == 0:
+            raise RuntimeError("the second owner shared a configfs port without a refusal")
+        if "refusing to share configfs object" not in output:
+            raise RuntimeError("the second owner failed for another reason: "
+                               + output.strip()[-3000:])
+        # The refused owner never created an object; the first owner's stop is
+        # the engine's own teardown of its scoped target.
+        code = stop_owner(processes.pop("a"), prepared["a"]["node"])
+        if code != 0:
+            raise RuntimeError(f"the negative first owner stop exited {code}")
+        kill_owner(processes.pop("b"))
+        residual = layout_teardown_defect(ports.values())
+        if residual:
+            raise RuntimeError("the negative layout left configfs objects: "
+                               + ", ".join(residual))
+        return {"complete": True, "refused": "refusing to share configfs object",
+                "port": base, "database": ports[owner_name(prepared["a"]["node"])]}
+    finally:
+        for process in processes.values():
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
 
 def read_proof(state, name):
     """Return (proof, None) or (None, reason) for one proof file."""
@@ -498,6 +853,35 @@ def qualify(args):
         trace.cleanup()
 
 
+def layout(args):
+    """Prove the Sui campaign owner layout on this host's real kernel target.
+
+    Three databases and two partitions generate six owner processes on one
+    address. Each database takes its own slot of the partition window, so
+    every process exports, seals and reopens its own target. The negative pass
+    gives two databases one pool base: the second process must refuse to share
+    the configfs port of the first.
+    """
+    deployment, specs = campaign_modules()
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    root = args.state / "owner-layout"
+    root.mkdir(mode=0o700)
+    binary = args.binary.resolve(strict=True)
+    evidence = {"scope": __doc__, "binary": str(binary), "complete": False}
+    try:
+        evidence["positive"] = layout_positive(deployment, specs, binary, root / "positive")
+        evidence["negative"] = layout_negative(deployment, specs, binary, root / "negative")
+        evidence["complete"] = True
+        print("owner_layout: " + json.dumps(evidence, sort_keys=True), flush=True)
+        return 0
+    except BaseException as error:
+        evidence["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        dump(root / "layout.json", evidence)
+
+
 def cleanup(args):
     """Confirm the proofs' teardown and the independently restored inventories.
 
@@ -525,7 +909,7 @@ def cleanup(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("qualify", "run", "cleanup"))
+    parser.add_argument("action", choices=("qualify", "run", "cleanup", "layout"))
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
@@ -539,7 +923,8 @@ def main():
             parser.error(f"untrusted root-owned state ancestor: {path}")
     if args.action != "cleanup" and args.binary is None:
         parser.error(f"{args.action} requires --binary")
-    return {"qualify": qualify, "run": run, "cleanup": cleanup}[args.action](args)
+    return {"qualify": qualify, "run": run, "cleanup": cleanup,
+            "layout": layout}[args.action](args)
 
 
 if __name__ == "__main__":

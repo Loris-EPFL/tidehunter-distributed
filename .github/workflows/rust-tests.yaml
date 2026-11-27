@@ -246,6 +246,20 @@ jobs:
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py run \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
             2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/run.log"
+      - name: Gate the three-database owner layout across two owners
+        id: owner_layout
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # Six generated owner processes on one address: three databases at
+          # their own slot of each partition's 64-port window, then an export,
+          # a seal, a reopen and a kill/restart reconcile per database. The
+          # negative pass gives two databases one pool base and requires the
+          # second to refuse with "refusing to share configfs object".
+          timeout --signal=TERM --kill-after=60s 420s \
+            sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py layout \
+              --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
+            2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/owner-layout.log"
       - name: Prove namespace write protection blocks remote writes
         timeout-minutes: 8
         run: |
@@ -307,6 +321,14 @@ jobs:
               echo "No single-owner summary; inspect setup and single-owner logs."
             fi
             echo "Four-owner admission and second-open proof."
+            echo "Three-database, two-owner campaign layout: distinct pools, export, seal, reopen, reconcile and the shared-pool refusal."
+            if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-layout/layout.json" ]; then
+              echo '```json'
+              cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-layout/layout.json"
+              echo '```'
+            else
+              echo "No owner-layout receipt; inspect the owner-layout log."
+            fi
             echo "No RDMA, independent SSD, HA or performance qualification."
             if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/proof/proof.json" ]; then
               echo '```json'

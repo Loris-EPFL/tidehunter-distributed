@@ -19,12 +19,30 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
 import campaign_upload
+import gcp_manual_compute
 import gcs_ledger
 import manual_sui
 import stage3_campaign
 import stage3_specs
 from gcp_api import ApiError, ObjectStore
 from test_stage3_specs import preparation
+
+
+def kernel_admission(live_transport='rdma'):
+    """The admission document `gcp_manual_compute.py ready` publishes."""
+    report = ''.join(
+        f'{module}|SRC|{gcp_manual_compute.KERNEL_RELEASE} SMP\n'
+        for module in gcp_manual_compute.initiator_modules(live_transport))
+    remote = mock.Mock()
+    remote.shell.side_effect = [
+        (0, gcp_manual_compute.KERNEL_RELEASE.encode(), b''),
+        (0, gcp_manual_compute.NVMET_SRCVERSION.encode(), b''),
+        (0, report.encode(), b'')]
+    return gcp_manual_compute.kernel_admission(
+        remote, {'owner-0': {'nvmet_fix': {'loaded': {'loaded_nvmet': {
+            'srcversion': gcp_manual_compute.NVMET_SRCVERSION,
+            'build_id': gcp_manual_compute.NVMET_BUILD_ID}}}}},
+        live_transport=live_transport)
 
 
 FAILURES = []
@@ -952,7 +970,8 @@ class ClusterDispatch(unittest.TestCase):
             self.preparation(synchronous, 'synchronous', ledger_module.sha256_file(binary))
             state = root / 'fleet.json'
             state.write_text(json.dumps({'run_id': 'bench-' + 'a' * 16, 'host_count': 3,
-                                         'fleet': [{'index': 0}]}))
+                                         'fleet': [{'index': 0}],
+                                         'kernel_admission': kernel_admission()}))
             config = root / 'config.json'
             config.write_text('{}')
             remote = mock.Mock()
@@ -1002,7 +1021,8 @@ class ClusterDispatch(unittest.TestCase):
             schema.mkdir()
             state = root / 'fleet.json'
             state.write_text(json.dumps({'run_id': 'bench-' + 'b' * 16, 'host_count': 3,
-                                         'fleet': [{'index': 0}]}))
+                                         'fleet': [{'index': 0}],
+                                         'kernel_admission': kernel_admission()}))
             config = root / 'config.json'
             config.write_text('{}')
             remote = mock.Mock()
@@ -1029,6 +1049,47 @@ class ClusterDispatch(unittest.TestCase):
         for flag, target in (('--build', campaign / 'build'),
                             ('--schema', campaign / 'schema')):
             self.assertEqual(argv_sent[argv_sent.index(flag) + 1], str(target))
+
+
+    def test_a_fleet_without_the_initiator_record_is_refused_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / 'storage-node'
+            binary.write_bytes(b'binary')
+            external = root / 'external-native'
+            synchronous = root / 'external-synchronous'
+            self.preparation(external, 'native', ledger_module.sha256_file(binary))
+            self.preparation(synchronous, 'synchronous', ledger_module.sha256_file(binary))
+            state = root / 'fleet.json'
+            state.write_text(json.dumps({'run_id': 'bench-' + 'c' * 16, 'host_count': 3,
+                                         'fleet': [{'index': 0}]}))
+            config = root / 'config.json'
+            config.write_text('{}')
+            remote = mock.Mock()
+            argv = ['stage3_campaign.py', '--root', str(root / 'out'),
+                    '--binary', str(binary), '--external', 'native=' + str(external),
+                    '--external', 'synchronous=' + str(synchronous),
+                    '--native-root', '/mnt/tidehunter/native',
+                    '--guest-root', '/mnt/tidehunter/sui', '--owners', 'H1,H2',
+                    '--bucket-prefix', 'gs://mysten-research-bench-artifacts/campaign',
+                    '--fleet-state', str(state), '--fleet-config', str(config)]
+            with mock.patch.object(stage3_campaign.mailbox_exec, 'open_executor',
+                                   return_value=remote), \
+                    mock.patch.object(stage3_campaign.sys, 'argv', argv):
+                with self.assertRaises(SystemExit) as raised:
+                    stage3_campaign.main()
+        self.assertIn('no initiator record', str(raised.exception))
+        remote.run_driver.assert_not_called()
+        remote.stage_tree.assert_not_called()
+
+    def test_a_tcp_admission_does_not_dispatch_an_rdma_cell(self):
+        document = kernel_admission('tcp')
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'fleet.json'
+            state.write_text(json.dumps({'kernel_admission': document}))
+            with self.assertRaises(SystemExit) as raised:
+                manual_sui.kernel_gate(state, stage3_specs.LIVE_TRANSPORT)
+        self.assertIn('rdma_cm initiator record', str(raised.exception))
 
 
 class BucketPrefix(unittest.TestCase):

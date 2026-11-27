@@ -141,11 +141,13 @@ class DeploymentContract(unittest.TestCase):
                     self.assertNotIn('database',db['storage'])
                     self.assertEqual(len(db['endpoints']),owners)
                     self.assertEqual([row['partition'] for row in db['endpoints']],list(range(owners)))
-                    for node in (row for row in nodes if row['namespace']
-                                 in config['databases']):
-                        pool=node['live_target_pool']
-                        self.assertEqual(pool['public_service_base'],
-                                         4420+64*node['partition'])
+                for database_number, namespace in enumerate(schema):
+                    for node in (row for row in nodes if row['namespace'] == namespace):
+                        pool = node['live_target_pool']
+                        self.assertEqual(
+                            pool['public_service_base'],
+                            4420 + deployment.LIVE_TARGET_WINDOW * node['partition']
+                            + deployment.LIVE_TARGET_STRIDE * database_number)
 
     def test_two_owner_host_inventory_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:

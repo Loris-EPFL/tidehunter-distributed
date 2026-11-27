@@ -21,12 +21,21 @@ from gcp_campaign import GUEST_SERVICE_ACCOUNT
 from gcp_manual_compute import Compute, ComputeError
 
 
+def initiator_report(live_transport, *, release=gcp_manual_compute.KERNEL_RELEASE):
+    """The initiator gate's own stdout: one module identity per line."""
+    return ''.join(
+        f'{module}|{module.upper()}SRC|{release} SMP preempt mod_unload modversions \n'
+        for module in gcp_manual_compute.initiator_modules(live_transport)).encode()
+
+
 def pinned_kernel(host, command, **_):
-    """The two identity reads `ready` makes on every host."""
+    """The identity reads and the initiator proof `ready` makes on every host."""
     if command == 'uname -r':
         return 0, gcp_manual_compute.KERNEL_RELEASE.encode(), b''
     if command == 'cat /sys/module/nvmet/srcversion':
         return 0, gcp_manual_compute.NVMET_SRCVERSION.encode(), b''
+    if command == gcp_manual_compute.initiator_script('rdma'):
+        return 0, initiator_report('rdma'), b''
     raise AssertionError('unexpected ready command: ' + str(command))
 
 
@@ -1118,6 +1127,9 @@ class OperatorFleetTests(unittest.TestCase):
                                               instance_id=record['fleet']['id'])
                 for record in state['instances']}
             from_state.return_value.shell.side_effect = pinned_kernel
+            # A released fleet has published its runtime before `ready` runs.
+            self.store.put(f'runs/{state["run_id"]}/runtime.json', json.dumps(
+                {'spec': {'backends': ['native', 'tidehunter_nvme_rdma']}}).encode())
             report = self.output(self.cli('ready', '--require-manifest-sha256', 'e' * 64))
         from_state.return_value.wait_workers.assert_called_once_with(require='e' * 64)
         self.assertEqual(report['hosts'], sorted(record['fleet']['name'] for record in state['instances']))
@@ -1128,24 +1140,81 @@ class OperatorFleetTests(unittest.TestCase):
         self.assertIn('runs/' + saved['run_id'] + '/qualification/kernel-admission.json',
                       self.store.objects)
 
-    def ready_with_kernel(self, *, release=None, srcversion=None, loaded=None):
+    def ready_with_kernel(self, *, release=None, srcversion=None, loaded=None,
+                          live_transport='rdma', initiator=None, initiator_ok=True):
         """Run the kernel gate over one prepared receipt with a chosen identity."""
         prepared = {'h': {
             'nvmet_fix': {'loaded': {'loaded_nvmet': loaded or {
                 'srcversion': gcp_manual_compute.NVMET_SRCVERSION,
                 'build_id': gcp_manual_compute.NVMET_BUILD_ID}}}}}
         remote = mock.Mock()
+        observed = release or gcp_manual_compute.KERNEL_RELEASE
+        report = initiator if initiator is not None else initiator_report(
+            live_transport, release=observed)
         remote.shell.side_effect = [
-            (0, (release or gcp_manual_compute.KERNEL_RELEASE).encode(), b''),
-            (0, (srcversion or gcp_manual_compute.NVMET_SRCVERSION).encode(), b'')]
-        return gcp_manual_compute.kernel_admission(remote, prepared)
+            (0, observed.encode(), b''),
+            (0, (srcversion or gcp_manual_compute.NVMET_SRCVERSION).encode(), b''),
+            (0 if initiator_ok else 1, report, b'')]
+        return gcp_manual_compute.kernel_admission(
+            remote, prepared, live_transport=live_transport)
 
     def test_the_kernel_gate_records_the_pinned_identity(self):
-        admission = self.ready_with_kernel()
-        self.assertEqual(admission['hosts']['h'], {
-            'kernel': gcp_manual_compute.KERNEL_RELEASE,
-            'nvmet_srcversion': gcp_manual_compute.NVMET_SRCVERSION,
-            'nvmet_build_id': gcp_manual_compute.NVMET_BUILD_ID})
+        admission = self.ready_with_kernel(live_transport='tcp')
+        self.assertEqual(admission['hosts']['h']['kernel'],
+                         gcp_manual_compute.KERNEL_RELEASE)
+        self.assertEqual(admission['hosts']['h']['nvmet_srcversion'],
+                         gcp_manual_compute.NVMET_SRCVERSION)
+        self.assertEqual(admission['hosts']['h']['nvmet_build_id'],
+                         gcp_manual_compute.NVMET_BUILD_ID)
+
+    def test_the_kernel_gate_records_the_tcp_initiator_stack(self):
+        admission = self.ready_with_kernel(live_transport='tcp')
+        record = admission['hosts']['h']['initiator']
+        self.assertEqual(admission['initiator']['live_transport'], 'tcp')
+        self.assertEqual(admission['initiator']['device'],
+                         gcp_manual_compute.INITIATOR_DEVICE)
+        self.assertEqual(list(record['modules']),
+                         list(gcp_manual_compute.INITIATOR_MODULES))
+        for fields in record['modules'].values():
+            self.assertEqual(fields['vermagic'].split()[0],
+                             gcp_manual_compute.KERNEL_RELEASE)
+            self.assertTrue(fields['srcversion'])
+
+    def test_the_initiator_gate_modprobes_every_module_with_rdma(self):
+        remote = mock.Mock()
+        remote.shell.return_value = (0, initiator_report(
+            'rdma', release=gcp_manual_compute.KERNEL_RELEASE), b'')
+        record = gcp_manual_compute.admit_initiator(
+            remote, 'h', live_transport='rdma', release=gcp_manual_compute.KERNEL_RELEASE)
+        script = remote.shell.call_args.args[1]
+        self.assertEqual(remote.shell.call_args.kwargs, {'check': False})
+        self.assertIn('test "$(id -u)" = 0', script)
+        self.assertIn(f'test -c {gcp_manual_compute.INITIATOR_DEVICE}', script)
+        for module in gcp_manual_compute.INITIATOR_MODULES + \
+                gcp_manual_compute.INITIATOR_RDMA_MODULES:
+            self.assertIn(f'modprobe {module}', script)
+            self.assertIn(f'modinfo -F srcversion {module}', script)
+        self.assertEqual(sorted(record['modules']),
+                         sorted(gcp_manual_compute.INITIATOR_MODULES
+                                + gcp_manual_compute.INITIATOR_RDMA_MODULES))
+
+    def test_the_initiator_gate_refuses_a_missing_fabrics_device(self):
+        remote = mock.Mock()
+        remote.shell.return_value = (
+            1, b'', b'test: /dev/nvme-fabrics: No such file or directory')
+        with self.assertRaisesRegex(ComputeError, 'initiator stack is unavailable'):
+            gcp_manual_compute.admit_initiator(
+                remote, 'h', live_transport='rdma',
+                release=gcp_manual_compute.KERNEL_RELEASE)
+
+    def test_the_initiator_gate_refuses_a_foreign_vermagic(self):
+        remote = mock.Mock()
+        remote.shell.return_value = (0, initiator_report(
+            'rdma', release='5.14.0-687.42.1+2.1.el9_8_ciq.x86_64'), b'')
+        with self.assertRaisesRegex(ComputeError, 'does not match the running kernel'):
+            gcp_manual_compute.admit_initiator(
+                remote, 'h', live_transport='rdma',
+                release=gcp_manual_compute.KERNEL_RELEASE)
 
     def test_the_kernel_gate_refuses_another_release(self):
         with self.assertRaisesRegex(ComputeError, 'running kernel 5.14.0-687.42.1'):
@@ -1157,6 +1226,28 @@ class OperatorFleetTests(unittest.TestCase):
         with self.assertRaisesRegex(ComputeError, 'did not record the pinned nvmet'):
             self.ready_with_kernel(loaded={'srcversion': 'EE2F4FC798D5ABF4AC018D3',
                                            'build_id': 'b' * 40})
+
+    def test_the_driver_gate_refuses_a_fleet_without_the_initiator_record(self):
+        admission = self.ready_with_kernel(live_transport='rdma')
+        path = Path(self.temp.name) / 'fleet.json'
+        path.write_text(json.dumps({'kernel_admission': admission}))
+        self.assertEqual(
+            gcp_manual_compute.require_fleet_initiator(path, live_transport='rdma'),
+            admission)
+        for broken in ({}, {'hosts': admission['hosts']},
+                       {'hosts': {'h': {'kernel': gcp_manual_compute.KERNEL_RELEASE}}},
+                       {'initiator': admission['initiator'], 'hosts': {}}):
+            path.write_text(json.dumps({'kernel_admission': broken}))
+            with self.subTest(broken=broken), self.assertRaisesRegex(
+                    ComputeError, 'initiator record'):
+                gcp_manual_compute.require_fleet_initiator(path, live_transport='rdma')
+
+    def test_a_tcp_admission_does_not_serve_an_rdma_cell(self):
+        admission = self.ready_with_kernel(live_transport='tcp')
+        with self.assertRaisesRegex(ComputeError, 'rdma_cm initiator record'):
+            gcp_manual_compute.require_initiator(admission, live_transport='rdma')
+        self.assertEqual(gcp_manual_compute.require_initiator(
+            admission, live_transport='tcp'), admission)
 
     def test_the_kernel_constants_match_the_module_review(self):
         import importlib.util

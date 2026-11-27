@@ -1208,6 +1208,10 @@ def main():
                         help='bound on the coordinator run; defaults to the fleet deadline')
     args = parser.parse_args()
 
+    if not args.dry_run:
+        # A dry run prints a plan and touches no host; every other run needs
+        # the fleet's proved initiator stack before its first owner starts.
+        manual_sui.kernel_gate(args.fleet_state, args.live_transport)
     cell = mechanism.find(args.cell)
     tier = args.durability_tier or cell['tier']
     if tier != cell['tier']:
