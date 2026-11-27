@@ -72,6 +72,8 @@ GROUPED_FLOOR = 5_000
 CEILING = 3_000_000
 WINDOW_SECONDS = 40
 CALIBRATION_OPERATIONS = 20_000
+# The binary's own wait at a measurement marker; below the engine's 300 s limit.
+GATE_SECONDS = 240
 PROBE_CASE = 'S3-P1-armB-c8-synchronous-probe'
 PROBE_OPERATIONS = 5_000
 # The engine's own cell deadline, the shutdown it allows itself and the driver's
@@ -347,6 +349,21 @@ def backend(case, root, *, native_root=None, external=None):
             for partition in range(OWNERS)]))
 
 
+def measurement_gates(case, root, *, native_root=None):
+    """The two marker pairs the binary and the driver handshake on.
+
+    The markers live on the host that runs the cell's binary: the coordinator
+    for arm A, the native store host for arm B. The driver creates the
+    directory, clears a previous attempt's markers and writes each release.
+    """
+    directory = store_root(case, root, native_root) / 'stage3' / 'gate' / case['case_id']
+    def gate(name):
+        return dict(ready_file=str(directory / f'{name}.ready'),
+                    release_file=str(directory / f'{name}.release'),
+                    timeout_seconds=GATE_SECONDS)
+    return gate('measurement'), gate('measurement-complete')
+
+
 def run_config(case, root, *, native_root=None, external=None,
                measurement_operations=MEASUREMENT_OPERATIONS):
     distribution = ('uniform' if case['distribution'] == 'uniform'
@@ -354,6 +371,8 @@ def run_config(case, root, *, native_root=None, external=None,
     workload = dict(kind='synthetic', distribution=distribution,
                     mix=MIXES[case['mix']], batch_size=case['batch'] or BATCH,
                     put_key_policy='overwrite')
+    begin_gate, completion_gate = measurement_gates(case, root,
+                                                    native_root=native_root)
     return dict(
         schema_version=1, case_id=case['case_id'],
         backend=backend(case, root, native_root=native_root, external=external),
@@ -368,6 +387,8 @@ def run_config(case, root, *, native_root=None, external=None,
                     measurement_operations=measurement_operations),
         diagnostics=dict(write_profile_limit=0, read_profile_limit=0),
         qualification_only=False, source_revision=None,
+        measurement_gate=begin_gate,
+        measurement_completion_gate=completion_gate,
         limits=dict(max_keys=KEYS, max_bytes=16 << 30,
                     max_operations=operation_limit(measurement_operations),
                     deadline_seconds=DEADLINE_SECONDS,

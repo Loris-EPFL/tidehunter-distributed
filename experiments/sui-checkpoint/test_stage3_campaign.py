@@ -81,15 +81,25 @@ FAKE = textwrap.dedent("""\
         raise SystemExit(2)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'summary.json').write_text(json.dumps({'case': case, 'complete': True}))
-    rows = ['phase,completed_ns,bytes', 'preload,0,8192']
-    rows += [f'measurement,{index * 1000000},8192' for index in range(5)]
+    (out / 'summary.json').write_text(json.dumps({
+        'case': case, 'complete': True,
+        'phase_counts': {'realized_mix': {'measurement.put': {'offered': 5,
+                                                             'fraction': 1.0}}}}))
+    (out / 'manifest.json').write_text(json.dumps({
+        'status': 'completed', 'errors_or_wrong_values': 0,
+        'completed_operations': 5}))
+    rows = ['phase,operation,outcome,api_ns,completed_ns,bytes',
+            'preload,put,success,0,0,8192']
+    rows += [f'measurement,put,success,{index * 1000},'
+             f'{index * 1000000},8192' for index in range(5)]
     (out / 'samples.csv').write_text('\\n'.join(rows) + '\\n')
     """)
 
 
-MEASUREMENT_CSV = ('phase,completed_ns,bytes\npreload,0,8192\n' + ''.join(
-    f'measurement,{index * 1000000},8192\n' for index in range(5))).encode()
+MEASUREMENT_CSV = ('phase,operation,outcome,api_ns,completed_ns,bytes\n'
+                   'preload,put,success,0,0,8192\n' + ''.join(
+                       f'measurement,put,success,{index * 1000},'
+                       f'{index * 1000000},8192\n' for index in range(5))).encode()
 
 
 class FakeObjectStore(ObjectStore):
@@ -144,6 +154,7 @@ class FakeRemote:
         self.by_host = {}
         self.calls = []
         self.owner_ready = {}
+        self.alive = set()
         self.fail_cases = set()
 
     def files(self, host):
@@ -169,11 +180,13 @@ class FakeRemote:
         self.calls.append((host, command))
         tokens = shlex.split(command)
         files = self.files(host)
+        if command.startswith("sh -c 'for f in"):
+            return 0, b'', b''
         if '@@' in command:
             return 0, self.sample_payload().encode(), b''
         if tokens[:1] == ['pgrep']:
             return 0, b'4242\n', b''
-        if tokens[:2] == ['rm', '-rf']:
+        if tokens[:2] in (['rm', '-rf'], ['rm', '-f']):
             for target in tokens[2:]:
                 if target == '&&':
                     break
@@ -189,7 +202,17 @@ class FakeRemote:
                 for key in [key for key in files if key.startswith(source + '/')]:
                     files[target + key[len(source):]] = files.pop(key)
             return 0, b'', b''
-        if tokens[:2] in (['mkdir', '-p'], ['chmod', '+x']) or tokens[:1] == ['kill']:
+        if tokens[:2] in (['mkdir', '-p'], ['chmod', '+x']) or tokens[:1] in (
+                ['kill'], ['touch']):
+            if tokens[:1] == ['kill']:
+                for pid in tokens[2:]:
+                    if pid.startswith('-'):
+                        pid = pid[1:]
+                    if pid.isdigit():
+                        self.alive.discard(int(pid))
+            elif tokens[:1] == ['touch']:
+                # The engine leaves `serve` when its typed stop marker appears.
+                self.alive.discard(4242)
             return 0, b'', b''
         if tokens[:3] == ['tar', '-xzf', '-']:
             return 0, b'', b''
@@ -203,7 +226,12 @@ class FakeRemote:
         output = tokens[tokens.index('--output') + 1]
         if case in self.fail_cases:
             return 2, b'', b'boom'
-        files[f'{output}/summary.json'] = json.dumps({'case': case}).encode()
+        files[f'{output}/summary.json'] = json.dumps({
+            'case': case, 'phase_counts': {'realized_mix': {
+                'measurement.put': {'offered': 5, 'fraction': 1.0}}}}).encode()
+        files[f'{output}/manifest.json'] = json.dumps({
+            'status': 'completed', 'errors_or_wrong_values': 0,
+            'completed_operations': 5}).encode()
         files[f'{output}/samples.csv'] = MEASUREMENT_CSV
         config = Path(tokens[tokens.index('--config') + 1])
         database = config.parent.parent / 'db' / config.stem
@@ -216,6 +244,7 @@ class FakeRemote:
             pidfile = re.search(r'echo \$\$ > (\S+);', command).group(1)
             files = self.files(host)
             files[pidfile] = b'4242\n'
+            self.alive.add(4242)
             files.update(self.owner_ready.get(host, {}))
             return 0, b'', b''
         code, out, err = self.run(host, command, stdin=stdin, check=False)
@@ -231,6 +260,9 @@ class FakeRemote:
 
     def exists(self, host, path):
         path = str(path)
+        match = re.fullmatch(r'/proc/([0-9]+)', path)
+        if match:
+            return int(match.group(1)) in self.alive
         files = self.files(host)
         return path in files or any(key.startswith(path + '/') for key in files)
 
@@ -371,8 +403,8 @@ class Driver(unittest.TestCase):
 
     def test_missing_summary_never_passes(self):
         self.binary.write_text(self.binary.read_text().replace(
-            "(out / 'summary.json').write_text(json.dumps({'case': case, 'complete': True}))",
-            'pass'))
+            "(out / 'summary.json').write_text(json.dumps({",
+            "(out / 'summary-absent.json').write_text(json.dumps({"))
         results, _ = self.run_campaign(cells=self.cells[:1])
         self.assertEqual(results[0]['status'], 'failed')
         saved = self.ledger().load()
@@ -486,7 +518,8 @@ class Driver(unittest.TestCase):
         owners.start('synchronous')
         self.assertEqual(json.loads(stage3_specs.receipt_path(
             self.root, 'synchronous', 0).read_text())['launch_nonce'], 'nonce-synchronous')
-        self.assertTrue(any(command.startswith('kill -TERM') for _, command in remote.calls))
+        self.assertTrue(any(command.startswith('touch')
+                            for _, command in remote.calls))
         self.assertEqual(owners.active, 'synchronous')
         self.assertEqual(owners.stop(), [])
         self.assertIsNone(owners.active)
@@ -526,7 +559,7 @@ class Driver(unittest.TestCase):
                          [self.cells[0]['id'], self.cells[2]['id']])
         reasons = [row['status'] for row in results if row['id'] != 'owner-processes']
         self.assertEqual(reasons, ['passed', 'passed'])
-        self.assertTrue(any(command.startswith('kill -TERM')
+        self.assertTrue(any(command.startswith('touch')
                             for _, command in remote.calls))
 
     # ---- upload before pass --------------------------------------------
@@ -591,6 +624,15 @@ class Driver(unittest.TestCase):
         self.assertGreaterEqual(len(writes), 2)
         self.assertEqual(writes[0][1], 0)
         self.assertEqual(writes[-1][1], len(writes) - 1)
+
+    def test_the_ledger_is_saved_locally_under_a_bucket(self):
+        """A coordinator-host loss must not take the resume state with it."""
+        store = FakeObjectStore()
+        self.run_campaign(cells=self.cells[:1], bucket=self.bucket(store))
+        path = self.root / 'stage3' / 'run-ledger.json'
+        self.assertTrue(path.is_file())
+        self.assertEqual(ledger_module.Ledger(path).load()
+                         .status('stage3', self.cells[0]['id']), 'passed')
 
 
 class Phases(Driver):
@@ -1090,6 +1132,205 @@ class ClusterDispatch(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 manual_sui.kernel_gate(state, stage3_specs.LIVE_TRANSPORT)
         self.assertIn('rdma_cm initiator record', str(raised.exception))
+
+
+class OwnerStops(unittest.TestCase):
+    """A forced owner kill is a failed stop; the record is cell evidence."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.root = self.base / 'campaign'
+
+    class Stubborn(FakeRemote):
+        def __init__(self):
+            super().__init__()
+            self.killed = False
+
+        def shell(self, host, command, *, stdin=None, check=True):
+            if command.startswith('kill -KILL'):
+                self.killed = True
+            return super().shell(host, command, stdin=stdin, check=check)
+
+        def exists(self, host, path):
+            if str(path) == '/proc/4242':
+                return not self.killed
+            return super().exists(host, path)
+
+    def owners(self, remote):
+        owners = stage3_campaign.Owners(remote, {}, root=self.root,
+                                        guest_root=self.base / 'guest')
+        owners.namespaces = {'H1': dict(partition=0, pid=4242, process_group=4242,
+                                        stopped=False)}
+        return owners
+
+    def test_a_forced_stop_is_recorded_and_never_clean(self):
+        remote = self.Stubborn()
+        owners = self.owners(remote)
+        with mock.patch.object(stage3_campaign, 'OWNER_STOP_SECONDS', 0.05), \
+                mock.patch.object(stage3_campaign, 'OWNER_KILL_SECONDS', 0.05), \
+                mock.patch.object(stage3_campaign.time, 'sleep', lambda _: None):
+            failures = owners.stop()
+        self.assertEqual(failures, [])
+        record = owners.stops[0]
+        self.assertTrue(record['forced'])
+        self.assertEqual(record['signal'], 'SIGTERM')
+        self.assertEqual(record['grace_seconds'], 0.05)
+        self.assertGreaterEqual(record['duration_seconds'], 0.0)
+        self.assertEqual(owners.forced(), ['H1'])
+
+    class Running(FakeRemote):
+        def __init__(self):
+            super().__init__()
+            self.running = True
+
+        def shell(self, host, command, *, stdin=None, check=True):
+            if command.startswith('kill -TERM'):
+                self.running = False
+            return super().shell(host, command, stdin=stdin, check=check)
+
+        def exists(self, host, path):
+            if str(path) == '/proc/4242':
+                return self.running
+            return super().exists(host, path)
+
+    def test_a_clean_stop_is_recorded(self):
+        remote = self.Running()
+        owners = self.owners(remote)
+        owners.stop()
+        self.assertFalse(owners.stops[0]['forced'])
+        self.assertFalse(owners.stops[0]['still_alive'])
+        self.assertEqual(owners.forced(), [])
+        self.assertTrue(any(command.startswith('kill -TERM -4242')
+                            for _, command in remote.calls))
+
+    def test_the_engine_stop_marker_is_tried_before_any_signal(self):
+        class Marker(FakeRemote):
+            def __init__(self):
+                super().__init__()
+                self.running = True
+
+            def shell(self, host, command, *, stdin=None, check=True):
+                if command.startswith('touch /mnt/guest/stop-0'):
+                    self.running = False
+                return super().shell(host, command, stdin=stdin, check=check)
+
+            def exists(self, host, path):
+                if str(path) == '/proc/4242':
+                    return self.running
+                return super().exists(host, path)
+
+        remote = Marker()
+        owners = self.owners(remote)
+        owners.namespaces['H1']['stop'] = '/mnt/guest/stop-0'
+        owners.stop()
+        record = owners.stops[0]
+        self.assertEqual(record['signal'], 'stop-file')
+        self.assertFalse(record['forced'])
+        self.assertFalse(any(command.startswith('kill -')
+                             for _, command in remote.calls))
+
+    def test_a_stop_record_travels_with_the_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'out'
+
+            class Runner:
+                def run(self, cell, *, output, attempt, timeout, watchers):
+                    Path(output).mkdir(parents=True)
+                    (Path(output) / 'summary.json').write_text('{}')
+                    return dict(cell=cell['id'])
+
+            stops = [dict(host='H1', partition=0, forced=False, signal='SIGTERM')]
+            rows = stage3_campaign.run_cell(
+                dict(id='S3-B1', path='b.json', arm='B', tier='native',
+                     config_hash='h'), Runner(), output=output,
+                stale_root=Path(tmp) / 'stale', attempt=1, timeout=5, stops=stops)
+            written = json.loads((output / 'owner-stops.json').read_text())
+        self.assertEqual(written, stops)
+        self.assertIn(str(output / 'owner-stops.json'), {row['path'] for row in rows})
+
+    def test_a_live_owner_under_the_guest_root_blocks_the_removal(self):
+        class Live(FakeRemote):
+            def shell(self, host, command, *, stdin=None, check=True):
+                if command.startswith("sh -c 'for f in"):
+                    self.calls.append((host, command))
+                    return 0, b'777 /mnt/guest/owner-0.pid\n', b''
+                return super().shell(host, command, stdin=stdin, check=check)
+
+            def exists(self, host, path):
+                if str(path) == '/proc/777':
+                    return True
+                return super().exists(host, path)
+
+            def read_bytes(self, host, path):
+                if str(path) == '/proc/777/cmdline':
+                    return b'/mnt/guest/storage-node\0--experimental-storage-node\0'
+                return super().read_bytes(host, path)
+
+        remote = Live()
+        owners = stage3_campaign.Owners(remote, {}, root=self.root,
+                                        guest_root=Path('/mnt/guest'))
+        prepared = {'manifest': {'hosts': [
+            dict(host='H1', archive=str(self.base / 'a.tar'), archive_sha256='0' * 64)]}}
+        (self.base / 'a.tar').write_text('x')
+        with mock.patch.object(stage3_campaign, 'OWNER_STOP_SECONDS', 0.05), \
+                mock.patch.object(stage3_campaign, 'OWNER_KILL_SECONDS', 0.05), \
+                mock.patch.object(stage3_campaign.time, 'sleep', lambda _: None), \
+                mock.patch.object(stage3_campaign.ledger_module, 'sha256_file',
+                                  return_value='0' * 64):
+            with self.assertRaisesRegex(ValueError, 'still alive'):
+                owners._install(prepared)
+        self.assertFalse(any(command.startswith('rm -rf')
+                             for _, command in remote.calls))
+        self.assertTrue(owners.stops[0]['forced'])
+
+
+class HandshakeAndPreflight(unittest.TestCase):
+    """The measurement window is gate-driven and the first cell preflights."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def test_a_cell_spec_declares_both_marker_pairs(self):
+        root = self.base / 'root'
+        case = stage3_specs.cells()[0]
+        document = stage3_specs.run_config(case, root)
+        gate = document['measurement_gate']
+        self.assertEqual(gate['ready_file'],
+                         str(root / 'stage3' / 'gate' / case['case_id']
+                             / 'measurement.ready'))
+        self.assertTrue(Path(gate['ready_file']).is_absolute())
+        self.assertEqual(document['measurement_completion_gate']['timeout_seconds'],
+                         stage3_specs.GATE_SECONDS)
+
+    def test_a_renamed_column_fails_with_its_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            (output / 'samples.csv').write_text(
+                'phase,operation,result,api_ns,completed_ns,bytes\n'
+                'measurement,put,success,1,1,4096\n')
+            (output / 'manifest.json').write_text(
+                json.dumps(dict(status='completed', errors_or_wrong_values=0,
+                                completed_operations=1)))
+            (output / 'summary.json').write_text(
+                json.dumps(dict(phase_counts=dict(realized_mix={}))))
+            with self.assertRaisesRegex(ValueError, 'lacks column\\(s\\): outcome'):
+                stage3_campaign.preflight(output, cell='S3-P1')
+
+    def test_a_renamed_manifest_key_fails_with_its_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            (output / 'samples.csv').write_text(
+                'phase,operation,outcome,api_ns,completed_ns,bytes\n'
+                'measurement,put,success,1,1,4096\n')
+            (output / 'manifest.json').write_text(json.dumps(dict(status='completed')))
+            (output / 'summary.json').write_text(
+                json.dumps(dict(phase_counts=dict(realized_mix={}))))
+            with self.assertRaisesRegex(ValueError, 'completed_operations'):
+                stage3_campaign.preflight(output, cell='S3-P1')
 
 
 class BucketPrefix(unittest.TestCase):
