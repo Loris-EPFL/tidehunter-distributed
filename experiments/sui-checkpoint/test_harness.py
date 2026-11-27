@@ -952,19 +952,27 @@ class ReopenWithFakes(unittest.TestCase):
             shift = producer_delta if address == 'producer' else ''
             return dict(sequenceNumber=sequence, digest=f'D{sequence}{shift}', epoch=0)
 
+        scraped = []
+
+        def urlopen(url, *args, **kwargs):
+            scraped.append(url)
+            return self.Response(b'last_executed_checkpoint 1775\n')
+
         with patch.object(run.checkpoint, 'wait_rpc', lambda child, address: 1775), \
                 patch.object(run.checkpoint, 'wait_for_rpc_indexes',
                              lambda child, address, tip, metrics: (
-                                 metrics, dict(status='all-ten-committed-at-frozen-tip'))), \
+                                 scraped.append(address) or metrics,
+                                 dict(status='all-ten-committed-at-frozen-tip'))), \
                 patch.object(run.checkpoint, 'rpc', rpc), \
-                patch.object(run.urllib.request, 'urlopen',
-                             lambda *args, **kwargs: self.Response(
-                                 b'last_executed_checkpoint 1775\n')):
+                patch.object(run.urllib.request, 'urlopen', urlopen):
             receipt, metrics = run.reopen(
                 owned, binary='sui-node-remote', root=Path(root), address='node',
+                metrics_address='node-metrics',
                 producer_address='producer', tip=1775, digest='D1775', bound=1776,
                 extra={'SUI_SHARDED_WAL_CONFIG': 'config.json'},
                 tail_checkpoints=tail)
+        # The node serves Prometheus on its metrics address, not on JSON-RPC.
+        self.assertEqual(scraped, ['http://node-metrics/metrics', 'node-metrics'])
         return owned, receipt, metrics
 
     def test_reopen_certifies_the_tip_and_reads_back_the_tail(self):

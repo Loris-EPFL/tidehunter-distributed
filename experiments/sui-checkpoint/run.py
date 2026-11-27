@@ -1159,8 +1159,8 @@ def audit_comparison(before, after):
     return dict(equal=True, namespaces=rows)
 
 
-def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound,
-           extra, tail_checkpoints):
+def reopen(owned, *, binary, root, address, metrics_address, producer_address, tip, digest,
+           bound, extra, tail_checkpoints):
     """Restart the measured node, certify the frozen tip, then stop it cleanly.
 
     The pinned Sui schedules from `highest_executed + 1`, so a node that already
@@ -1174,9 +1174,9 @@ def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound
     stop = None
     try:
         checkpoint.wait_rpc(child, address)
-        with urllib.request.urlopen(f'http://{address}/metrics', timeout=5) as response:
+        with urllib.request.urlopen(f'http://{metrics_address}/metrics', timeout=5) as response:
             metrics = response.read(32 << 20).decode()
-        metrics, catchup = checkpoint.wait_for_rpc_indexes(child, address, tip, metrics)
+        metrics, catchup = checkpoint.wait_for_rpc_indexes(child, metrics_address, tip, metrics)
         certified = checkpoint.rpc(address, 'sui_getCheckpoint', [str(tip)])
         first = max(0, tip - tail_checkpoints + 1)
         sample = []
@@ -1206,7 +1206,7 @@ def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound
 
 
 def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
-                     address, producer_address, tip, digest, bound, extra,
+                     address, metrics_address, producer_address, tip, digest, bound, extra,
                      schemas, native_root, config_path, env, tier, audit_before,
                      tail_checkpoints=64):
     """S1-1/S1-8: clean reopen, no new export, unchanged durable cut, same state."""
@@ -1219,7 +1219,8 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
     before_records = {name: durable_cut_record(path) for name, path in paths.items()}
     before_live = live_nvmeof_stats(parse_metrics((output / 'remote-final.prom').read_text()))
     receipt, metrics = reopen(owned, binary=bins / 'sui-node-remote', root=root,
-                             address=address, producer_address=producer_address, tip=tip,
+                             address=address, metrics_address=metrics_address,
+                             producer_address=producer_address, tip=tip,
                              digest=digest, bound=bound, extra=extra,
                              tail_checkpoints=tail_checkpoints)
     after_records = {name: durable_cut_record(path) for name, path in paths.items()}
@@ -1662,6 +1663,7 @@ def main():
             result['lifecycle'] = lifecycle_checks(
                 owned, bins=bins, root=root, output=output, remote_root=remote_root,
                 namespaces=set(schema), address=configs['remote']['json-rpc-address'],
+                metrics_address=configs['remote']['metrics-address'],
                 producer_address=configs['producer']['json-rpc-address'],
                 tip=tip, digest=replay_digest, bound=bound, extra=remote_extra,
                 schemas=schema, native_root=native_root, config_path=config_path,
