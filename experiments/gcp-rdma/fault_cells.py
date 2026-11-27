@@ -989,8 +989,13 @@ class CellDriver:
                 gate = self.gate_writes(child, GATE_WRITES)
             else:
                 writes = self.gate_writes(child, GATE_WRITES)
-                gate = self.gate_snapshot(child) if writes.get('reached') else writes
-                gate['writes'] = writes
+                if writes.get('reached'):
+                    gate = self.gate_snapshot(child)
+                    gate['writes'] = writes
+                else:
+                    # The write gate is the record itself here; a self-reference
+                    # would make the persisted record unserializable.
+                    gate = writes
             record['gate'] = gate
             if not gate.get('reached'):
                 # A missed gate aborts before any part is appended, and the

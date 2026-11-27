@@ -305,6 +305,37 @@ class SnapshotGate(unittest.TestCase):
         self.assertEqual(written['observations'][0]['coordinator_wal_footprint_bytes'],
                          9 << 30)
 
+    def test_a_missed_write_gate_persists_itself_without_referring_to_itself(self):
+        """The write gate is the record when it misses; it must not nest itself.
+
+        `gate = writes; gate['writes'] = writes` made the persisted record a
+        cycle (`ValueError: Circular reference detected`) and hid the CellError.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self.tree(tmp)
+            path = Path(run)
+
+            class Process:
+                returncode = None
+                pid = 7
+
+            child = types.SimpleNamespace(output=path, log=path / 'run.log',
+                                          process=Process(), started_unix_ns=1,
+                                          stop_record=None, stop=lambda: None)
+            driver = self.driver()
+            driver.cell = fault_cells.mechanism.find('S1-2S-snapshot-native')
+            driver.open = lambda run, name: child
+            driver.gate_writes = lambda child, count: dict(
+                reached=False, reason='200 acknowledged writes not observed',
+                observations=[dict(acknowledged=12)])
+            driver.kill_coordinator = lambda child: {}
+            with self.assertRaisesRegex(fault_cells.CellError, 'gate missed'):
+                driver.crash()
+            written = json.loads((path.parent / 'gate.json').read_text())
+        self.assertEqual(written['reason'], '200 acknowledged writes not observed')
+        self.assertEqual(written['observations'], [dict(acknowledged=12)])
+        self.assertNotIn('writes', written)
+
 
 class OwnerWAL(unittest.TestCase):
     def cluster(self, views):
