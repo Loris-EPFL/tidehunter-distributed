@@ -651,10 +651,10 @@ def reopen_defect(evidence, stderr):
     tail = recovery.get("tail_batches")
     if type(tail) is not int or tail <= 0:
         return f"the reopen replayed no WAL batch (tail_batches={tail!r})"
-    retired = recovery.get("retired_leftover_controllers")
-    if type(retired) is not int or retired < 1:
-        return ("the reopen retired no pre-restart controller "
-                f"(retired_leftover_controllers={retired!r})")
+    adoptable = recovery.get("retired_adoptable_leftovers")
+    if type(adoptable) is not int or adoptable < 1:
+        return ("the reopen retired no adoptable pre-restart controller "
+                f"(retired_adoptable_leftovers={adoptable!r})")
     for marker in RESTART_FORBIDDEN_STDERR:
         if marker in stderr:
             return f"the reopen stderr names {marker!r}"
@@ -775,6 +775,8 @@ def restart_positive(deployment, specs, binary, root):
         evidence["tail_batches"] = recovery["tail_batches"]
         evidence["retired_leftover_controllers"] = recovery[
             "retired_leftover_controllers"]
+        evidence["retired_adoptable_leftovers"] = recovery[
+            "retired_adoptable_leftovers"]
         remaining = controller_identities(inventory(), scope, node["partition"])
         if remaining:
             raise RuntimeError("the reopen left pre-restart controllers: "

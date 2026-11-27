@@ -656,9 +656,16 @@ impl LiveControllerPool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Controllers a fresh recovery acquisition retired in this process.
+    /// Controllers a fresh recovery acquisition retired from intents that
+    /// predate this registry process.
     pub(crate) fn retired_leftover_controllers(&self) -> u64 {
         self.registry.retired_leftover_controllers()
+    }
+
+    /// Of those retired pre-existing controllers, how many the Adopt path
+    /// would have adopted.
+    pub(crate) fn retired_adoptable_leftovers(&self) -> u64 {
+        self.registry.retired_adoptable_leftovers()
     }
 
     /// Whether the subsystem's cached controller is verifiably not live. Reads

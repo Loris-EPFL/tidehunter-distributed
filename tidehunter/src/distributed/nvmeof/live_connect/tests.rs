@@ -1304,7 +1304,8 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
         "live",
         target.geometry,
     );
-    let leftover_intent = registry.reserve(&adoption_intent(&target)).unwrap();
+    // The intent predates this registry, as a killed process leaves it.
+    let leftover_intent = registry.seed_intent(&adoption_intent(&target)).unwrap();
     registry.reconcile().unwrap();
     assert!(
         leftover.exists() && leftover_intent.exists(),
@@ -1312,18 +1313,27 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
     );
     let deadline = Instant::now() + PROGRESS_CAP;
     let remover = remove_controller_when_deleted(leftover.clone());
-    let retired = registry
+    let counts = registry
         .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
         .expect("a recovery read retires its own identity");
     remover.join().unwrap();
     assert_eq!(
-        retired, 1,
+        counts.retired, 1,
         "the recovery retire counts the controller it removed"
+    );
+    assert_eq!(
+        counts.adoptable, 1,
+        "a live, compatible, verified controller is one the Adopt path would keep"
     );
     assert_eq!(
         registry.retired_leftover_controllers(),
         1,
         "the open evidence carries the recovered retirement count"
+    );
+    assert_eq!(
+        registry.retired_adoptable_leftovers(),
+        1,
+        "the open evidence carries the adoptable pre-restart count"
     );
     assert!(
         !leftover.exists(),
@@ -1339,17 +1349,23 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
         .reserve(&adoption_intent(&target))
         .expect("the retired intent no longer conflicts with a fresh connect");
     registry.remove_intent(&fresh).unwrap();
+    let empty = registry
+        .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("a second retire of a clean identity succeeds");
     assert_eq!(
-        registry
-            .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
-            .expect("a second retire of a clean identity succeeds"),
-        0,
+        (empty.retired, empty.adoptable),
+        (0, 0),
         "no leftover controller means no retirement"
     );
     assert_eq!(
         registry.retired_leftover_controllers(),
         1,
         "an empty retire does not change the recovered count"
+    );
+    assert_eq!(
+        registry.retired_adoptable_leftovers(),
+        1,
+        "an empty retire does not change the adoptable count"
     );
     // The write path keeps adoption: the same live fixture is reused.
     let write_controller = fixture_controller(
@@ -1378,6 +1394,128 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
     let remover = remove_controller_when_deleted(write_controller);
     adopted.disconnect(deadline).unwrap();
     remover.join().unwrap();
+}
+
+/// Seed a pre-existing intent, plant the kernel controller it names, and run
+/// one recovery retire. Returns `(retired, adoptable)`.
+fn seed_and_retire(
+    registry: &LiveConnectionRegistry,
+    root: &Path,
+    caller: &LiveConnectTarget,
+    instance: u32,
+    state: &str,
+    intent: &Intent,
+) -> (usize, usize) {
+    let path = registry.seed_intent(intent).unwrap();
+    let controller = fixture_controller(
+        root,
+        instance,
+        &intent.target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        state,
+        intent.target.geometry,
+    );
+    let remover = remove_controller_when_deleted(controller.clone());
+    let counts = registry
+        .retire_identity(
+            caller,
+            ADOPT_HOST,
+            ADOPT_HOST_ID,
+            Instant::now() + PROGRESS_CAP,
+        )
+        .expect("the pre-existing intent is retired");
+    remover.join().unwrap();
+    assert!(
+        !controller.exists() && !path.exists(),
+        "the seeded controller and intent must be retired"
+    );
+    (counts.retired, counts.adoptable)
+}
+
+/// The recovery witness counts only controllers the pre-existing Adopt path
+/// would have adopted: a pre-existing, compatible intent whose controller was
+/// live and verified. An own failed connect, a non-live controller and an
+/// incompatible intent do not count.
+#[test]
+fn recovery_counts_only_adoptable_pre_existing_intents() {
+    let temp = tempdir::TempDir::new("adopt-retire-count").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let deadline = Instant::now() + PROGRESS_CAP;
+
+    // An intent this process published, with a controller it created and lost.
+    let own_intent = registry.reserve(&adoption_intent(&target)).unwrap();
+    let own_controller = fixture_controller(
+        &root,
+        20,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let remover = remove_controller_when_deleted(own_controller.clone());
+    let own = registry
+        .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("retiring our own failed intent succeeds");
+    remover.join().unwrap();
+    assert_eq!(
+        (own.retired, own.adoptable),
+        (0, 0),
+        "our own intent and controller are not a pre-restart leftover"
+    );
+    assert!(!own_controller.exists() && !own_intent.exists());
+    assert_eq!(registry.retired_leftover_controllers(), 0);
+    assert_eq!(registry.retired_adoptable_leftovers(), 0);
+
+    // A pre-existing live, compatible, verified controller counts as adoptable.
+    assert_eq!(
+        seed_and_retire(
+            &registry,
+            &root,
+            &target,
+            21,
+            "live",
+            &adoption_intent(&target)
+        ),
+        (1, 1),
+        "a live compatible pre-existing controller is what Adopt would keep"
+    );
+    assert_eq!(registry.retired_leftover_controllers(), 1);
+    assert_eq!(registry.retired_adoptable_leftovers(), 1);
+
+    // A non-live pre-existing controller is retired but was not adoptable.
+    assert_eq!(
+        seed_and_retire(
+            &registry,
+            &root,
+            &target,
+            22,
+            "resetting",
+            &adoption_intent(&target)
+        ),
+        (1, 0),
+        "a controller the kernel is not serving is not adoptable"
+    );
+    assert_eq!(registry.retired_leftover_controllers(), 2);
+    assert_eq!(registry.retired_adoptable_leftovers(), 1);
+
+    // A pre-existing intent whose target differs from the caller is retired
+    // but never adoptable: the Adopt path would have declined it.
+    let mut moved = adoption_intent(&target);
+    moved.target.geometry = LiveQueueGeometry {
+        io_queues: 2,
+        queue_size: 64,
+        poll_queues: 0,
+    };
+    assert_eq!(
+        seed_and_retire(&registry, &root, &target, 23, "live", &moved),
+        (1, 0),
+        "an incompatible intent target is not adoptable"
+    );
+    assert_eq!(registry.retired_leftover_controllers(), 3);
+    assert_eq!(registry.retired_adoptable_leftovers(), 1);
 }
 
 #[test]

@@ -200,10 +200,12 @@ class RestartReopen(unittest.TestCase):
         # The qualification values pass.
         kernel.admit_restart_geometry(self.storage())
 
-    def evidence(self, *, tail=3, kind="reopen", retired=1):
+    def evidence(self, *, tail=3, kind="reopen", retired=1, adoptable=1):
         recovery = {"tail_batches": tail}
         if retired is not None:
             recovery["retired_leftover_controllers"] = retired
+        if adoptable is not None:
+            recovery["retired_adoptable_leftovers"] = adoptable
         return {"start": {"coordinator_open": {"kind": kind, "recovery": recovery}}}
 
     def defect(self, evidence=None, stderr=""):
@@ -213,13 +215,13 @@ class RestartReopen(unittest.TestCase):
     def test_a_reopen_that_retired_the_leftover_controller_is_clean(self):
         self.assertIsNone(self.defect())
 
-    def test_a_reopen_that_retired_nothing_is_a_defect(self):
-        defect = self.defect(self.evidence(retired=0))
-        self.assertIn("retired no pre-restart controller", defect)
+    def test_a_reopen_that_retired_nothing_adoptable_is_a_defect(self):
+        defect = self.defect(self.evidence(retired=1, adoptable=0))
+        self.assertIn("retired no adoptable pre-restart controller", defect)
 
-    def test_a_missing_retirement_count_is_a_defect(self):
-        defect = self.defect(self.evidence(retired=None))
-        self.assertIn("retired_leftover_controllers=None", defect)
+    def test_a_missing_adoptable_count_is_a_defect(self):
+        defect = self.defect(self.evidence(adoptable=None))
+        self.assertIn("retired_adoptable_leftovers=None", defect)
 
     def test_an_empty_replay_is_a_defect(self):
         defect = self.defect(self.evidence(tail=0))
@@ -324,7 +326,8 @@ class RestartOrchestration(unittest.TestCase):
                     "coordinator_open": {
                         "kind": "reopen",
                         "recovery": {"tail_batches": 4,
-                                     "retired_leftover_controllers": 1}}}}
+                                     "retired_leftover_controllers": 1,
+                                     "retired_adoptable_leftovers": 1}}}}
                 (output / "measurement-read-evidence.json").write_text(
                     json.dumps(evidence))
                 return (subprocess.CompletedProcess([], 0, "", ""),
@@ -376,6 +379,7 @@ class RestartOrchestration(unittest.TestCase):
             self.assertTrue(evidence["complete"])
             self.assertEqual(evidence["tail_batches"], 4)
             self.assertEqual(evidence["retired_leftover_controllers"], 1)
+            self.assertEqual(evidence["retired_adoptable_leftovers"], 1)
             self.assertEqual(evidence["killed_returncode"], -9)
             # The engine admitted the killed spec with the qualification bounds.
             admitted = opened["admitted"]

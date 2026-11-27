@@ -13,6 +13,17 @@ pub(crate) enum RegistryMode {
     Adopt,
 }
 
+/// Retirement outcome of one fresh recovery identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RecoveryRetirements {
+    /// Controllers retired from intents that predate this registry process.
+    pub retired: usize,
+    /// Of those, controllers the pre-existing Adopt path would have adopted:
+    /// the intent's target is compatible with the caller's and the controller
+    /// was live, identity-verified and queue-geometry-verified.
+    pub adoptable: usize,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Intent {
     pub(super) target: LiveConnectTarget,
@@ -51,10 +62,18 @@ pub(super) struct RegistryInner {
     pub(super) _lock: File,
     pub(super) admission: Mutex<()>,
     pub(super) uncertain: AtomicBool,
-    /// Controllers a fresh recovery acquisition retired in this process. The
-    /// recovery evidence exposes it, so a reopen proves it removed the
-    /// controller the previous incarnation left, not merely that it survived.
+    /// Controllers retired whose durable intent predates this registry
+    /// process. The recovery evidence exposes it, so a reopen proves it
+    /// removed the controller the previous incarnation left; an intent this
+    /// process created and then failed does not count.
     pub(super) retired_leftover_controllers: std::sync::atomic::AtomicU64,
+    /// Of the retired pre-existing controllers, those the Adopt path would
+    /// have adopted. Only this count proves the reopen avoided the bug.
+    pub(super) retired_adoptable_leftovers: std::sync::atomic::AtomicU64,
+    /// Intent paths this registry instance published. `retire_identity` uses
+    /// it to keep its own failed connects out of the pre-restart count.
+    /// Lock order: `admission`, then this set.
+    own_intents: Mutex<std::collections::HashSet<PathBuf>>,
     /// Test only: the next connects fail after writing their durable intent,
     /// exactly as a `create` whose verify finds the new controller stopped
     /// does. The intent is left for reconciliation.
@@ -160,6 +179,8 @@ impl LiveConnectionRegistry {
                 admission: Mutex::new(()),
                 uncertain: AtomicBool::new(false),
                 retired_leftover_controllers: std::sync::atomic::AtomicU64::new(0),
+                retired_adoptable_leftovers: std::sync::atomic::AtomicU64::new(0),
+                own_intents: Mutex::new(std::collections::HashSet::new()),
                 #[cfg(test)]
                 after_reserve_lost: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(test)]
@@ -330,31 +351,110 @@ impl LiveConnectionRegistry {
     /// Retire the intent and every controller of one identity before a
     /// non-adopting connect. A recovery read must never reuse a controller an
     /// earlier process left behind, and the durable intent would otherwise
-    /// block `reserve`.
+    /// block `reserve`. Returns the controllers retired from intents that
+    /// predate this registry process; an intent this process published is
+    /// recovery of its own failed connect and is not counted.
     pub(super) fn retire_identity(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         deadline: Instant,
-    ) -> io::Result<usize> {
-        let mut retired = 0;
+    ) -> io::Result<RecoveryRetirements> {
+        let mut outcome = RecoveryRetirements::default();
         for (path, intent) in self.identity_intents(target, host_nqn, host_id)? {
             remaining(deadline)?;
-            retired += self.reconcile_retire_intent(&path, &intent, deadline)?;
+            // An intent this process published belongs to a connect attempt of
+            // this open. Retiring it is recovery of our own failure, not
+            // evidence that a previous incarnation left a controller behind.
+            let own = self.own_intent(&path);
+            let compatible = intent.target.nqn == target.nqn
+                && intent.target.address == target.address
+                && intent.target.service == target.service
+                && intent.target.transport == target.transport
+                && intent.target.geometry == target.geometry;
+            let adoptable = !own && compatible && self.adoptable_match(&intent, &path, deadline)?;
+            let retired = self.reconcile_retire_intent(&path, &intent, deadline)?;
+            if !own {
+                outcome.retired += retired;
+                if adoptable {
+                    outcome.adoptable += 1;
+                }
+            }
         }
-        if retired > 0 {
+        if outcome.retired > 0 {
             self.inner
                 .retired_leftover_controllers
-                .fetch_add(retired as u64, Ordering::Relaxed);
+                .fetch_add(outcome.retired as u64, Ordering::Relaxed);
         }
-        Ok(retired)
+        if outcome.adoptable > 0 {
+            self.inner
+                .retired_adoptable_leftovers
+                .fetch_add(outcome.adoptable as u64, Ordering::Relaxed);
+        }
+        Ok(outcome)
     }
 
-    /// Controllers a fresh recovery acquisition retired in this process.
+    /// Whether this intent has a controller the Adopt path would have kept:
+    /// live, identity-verified and queue-geometry-verified. The caller already
+    /// proved the intent's target compatible with the Fresh caller.
+    fn adoptable_match(
+        &self,
+        intent: &Intent,
+        intent_path: &Path,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        for candidate in self.matching_controllers(intent)? {
+            remaining(deadline)?;
+            if candidate.state != "live" {
+                continue;
+            }
+            let controller = self.controller_from_match(
+                intent.target.clone(),
+                &intent.host_nqn,
+                intent.host_id,
+                candidate,
+                intent_path.to_owned(),
+            );
+            if controller.verify().is_ok() && controller.verify_queue_geometry().is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether this registry instance published `path`.
+    fn own_intent(&self, path: &Path) -> bool {
+        self.inner
+            .own_intents
+            .lock()
+            .is_ok_and(|own| own.contains(path))
+    }
+
+    fn remember_own_intent(&self, path: &Path) {
+        if let Ok(mut own) = self.inner.own_intents.lock() {
+            own.insert(path.to_owned());
+        }
+    }
+
+    fn forget_own_intent(&self, path: &Path) {
+        if let Ok(mut own) = self.inner.own_intents.lock() {
+            own.remove(path);
+        }
+    }
+
+    /// Controllers a fresh recovery acquisition retired from intents that
+    /// predate this registry process.
     pub(crate) fn retired_leftover_controllers(&self) -> u64 {
         self.inner
             .retired_leftover_controllers
+            .load(Ordering::Relaxed)
+    }
+
+    /// Of those retired controllers, how many the Adopt path would have adopted.
+    pub(crate) fn retired_adoptable_leftovers(&self) -> u64 {
+        self.inner
+            .retired_adoptable_leftovers
             .load(Ordering::Relaxed)
     }
 
@@ -699,6 +799,7 @@ impl LiveConnectionRegistry {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        self.forget_own_intent(path);
         if let Err(error) = File::open(&self.inner.directory).and_then(|dir| dir.sync_all()) {
             self.inner.uncertain.store(true, Ordering::Release);
             return Err(error);
@@ -728,6 +829,14 @@ impl LiveConnectionRegistry {
                 ));
             }
         }
+        let path = self.write_intent(intent)?;
+        self.remember_own_intent(&path);
+        Ok(path)
+    }
+
+    /// Publish one complete intent atomically. Recovery ignores abandoned
+    /// temporary files.
+    fn write_intent(&self, intent: &Intent) -> io::Result<PathBuf> {
         let mut nonce = [0u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut nonce)?;
         let nonce = uuid_string(nonce);
@@ -740,12 +849,16 @@ impl LiveConnectionRegistry {
             .open(&temporary)?;
         serde_json::to_writer(&mut file, intent).map_err(io::Error::other)?;
         file.sync_all()?;
-        // Publish a complete record atomically without replacing an existing
-        // intent. Recovery ignores abandoned temporary files.
         std::fs::hard_link(&temporary, &path)?;
         std::fs::remove_file(&temporary)?;
         File::open(&self.inner.directory)?.sync_all()?;
         Ok(path)
+    }
+
+    /// Test only: publish an intent as if a previous process had left it.
+    #[cfg(test)]
+    pub(super) fn seed_intent(&self, intent: &Intent) -> io::Result<PathBuf> {
+        self.write_intent(intent)
     }
     pub(crate) fn has_intent(&self, nqn: &str, host_nqn: &str) -> io::Result<bool> {
         let _guard = self

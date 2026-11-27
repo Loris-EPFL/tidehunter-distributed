@@ -2101,45 +2101,44 @@ mod live_native;
 mod relocation_scan;
 mod wal_replay;
 
-/// The kernel owner-restart qualification (`kernel_nvme_tcp_ci.py restart`)
-/// uses 8 MiB WAL members in 4 MiB fragments with the research batch and group
-/// bounds. The campaign defaults (8 MiB batches, 12 MiB groups) cannot fit that
-/// fragment, so config admission must reject them before the write gate.
+/// A fragment must hold its group bound, a group must hold the encoded batch
+/// bound, and a member must be a whole number of fragments. The kernel CI's
+/// restart harness picks concrete values, but the admission rule is this
+/// relation; test it on small values instead of duplicating the harness.
 #[test]
-fn owner_restart_qualification_geometry_is_admit_checked() {
-    let mut qualification = config(vec![0], 0);
-    qualification.batch_limits = BatchLimits {
-        max_operations: 32,
-        max_encoded_bytes: 3 * 1024 * 1024,
+fn partition_geometry_requires_fragment_and_group_to_hold_their_members() {
+    let mut admitted = config(vec![0], 0);
+    admitted.batch_limits = BatchLimits {
+        max_operations: 8,
+        max_encoded_bytes: 64 * 1024,
     };
-    qualification.group_limits = GroupLimits {
-        max_batches: 32,
-        max_encoded_bytes: 4 * 1024 * 1024 - 8,
+    admitted.group_limits = GroupLimits {
+        max_batches: 8,
+        max_encoded_bytes: 128 * 1024,
     };
-    qualification.fragment_bytes = 4 * 1024 * 1024;
-    qualification.wal_file_bytes = 8 * 1024 * 1024;
-    qualification
+    admitted.fragment_bytes = 256 * 1024;
+    admitted.wal_file_bytes = 512 * 1024;
+    admitted
         .validate()
-        .expect("the CI owner-restart geometry must be admitted");
+        .expect("a fragment that holds its group and batch is admitted");
 
-    let mut campaign_group = qualification.clone();
-    campaign_group.group_limits = GroupLimits {
-        max_batches: 64,
-        max_encoded_bytes: 12 * 1024 * 1024,
+    let mut group_beyond_fragment = admitted.clone();
+    group_beyond_fragment.group_limits = GroupLimits {
+        max_batches: 8,
+        max_encoded_bytes: 512 * 1024,
     };
     assert!(
-        campaign_group.validate().is_err(),
-        "a 12 MiB group must not fit the qualification's 4 MiB fragment"
+        group_beyond_fragment.validate().is_err(),
+        "a group beyond its fragment must be refused"
     );
 
-    let mut oversized_batch = qualification.clone();
-    oversized_batch.batch_limits = BatchLimits {
-        max_operations: 32,
-        // Any batch above the 4 MiB group bound, like the campaign's 8 MiB.
-        max_encoded_bytes: 5 * 1024 * 1024,
+    let mut batch_beyond_group = admitted.clone();
+    batch_beyond_group.batch_limits = BatchLimits {
+        max_operations: 8,
+        max_encoded_bytes: 200 * 1024,
     };
     assert!(
-        oversized_batch.validate().is_err(),
-        "a batch above the group bound must be rejected, not truncated"
+        batch_beyond_group.validate().is_err(),
+        "a batch whose encoded member exceeds its group must be refused"
     );
 }
