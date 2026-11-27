@@ -282,6 +282,84 @@ class HistogramPopulations(unittest.TestCase):
         with self.assertRaises(ValueError):
             analyze.parse_metrics('rocksdb_x 1\nrocksdb_x 2\n')
 
+    def test_wrapper_tables_label_percentiles_as_intervals(self):
+        table = analyze.wrapper_latency_table(self.histogram())
+        row, = table['rows']
+        self.assertEqual(row['op'], 'get')
+        self.assertEqual(row['labels'], {'cf_name': 'objects'})
+        self.assertEqual(row['quantiles']['p50']['interval_us'], [0, 10])
+        self.assertEqual(row['quantiles']['p95']['interval_us'], [50, None])
+        self.assertTrue(row['quantiles']['p95']['upper_unbounded'])
+        comparison = analyze.wrapper_latency_comparison(
+            {'native': self.histogram(), 'remote': self.population_histogram(100)})
+        row, = comparison['rows']
+        self.assertEqual(row['op'], 'get')
+        self.assertEqual(row['native']['quantiles']['p50']['interval_us'], [0, 10])
+        self.assertEqual(row['remote']['quantiles']['p99']['interval_us'], [0, 10])
+
+
+class DbOpRecordingGate(unittest.TestCase):
+    def scrape(self, *, db_count=3, adapter_reads=5, adapter=''):
+        lines = [
+            'tidehunter_nvmeof_live_completed_read_ops_total 10',
+            f'db_op_count{{op="get",ks="store"}} {db_count}',
+            f'db_op_sum{{op="get",ks="store"}} {db_count * 10}',
+            f'db_op_bucket{{op="get",ks="store",le="+Inf"}} {db_count}',
+            'large_table_contention_count{ks="store"} 0',
+            'large_table_contention_sum{ks="store"} 0',
+        ]
+        if adapter_reads is not None:
+            lines.append('tidehunter_adapter{namespace="live/store",stat="read_calls"} '
+                         + str(adapter_reads))
+        if adapter:
+            lines.append(adapter)
+        return analyze.parse_metrics('\n'.join(lines) + '\n')
+
+    def test_zero_db_op_with_adapter_reads_is_a_typed_defect(self):
+        with self.assertRaises(analyze.DbOpNotRecorded) as raised:
+            analyze.metric_cut(self.scrape(db_count=0), {'live/store'}, remote=True)
+        self.assertEqual(raised.exception.fact['state'], 'zero')
+        self.assertEqual(raised.exception.fact['adapter_read_calls'], 5)
+        self.assertIn('db_op not recorded', str(raised.exception))
+
+    def test_absent_db_op_with_adapter_reads_is_a_typed_defect(self):
+        values = self.scrape(db_count=0)
+        values = {k: v for k, v in values.items() if not k.startswith('db_op_')}
+        with self.assertRaises(analyze.DbOpNotRecorded) as raised:
+            analyze.metric_cut(values, {'live/store'}, remote=True)
+        self.assertEqual(raised.exception.fact['state'], 'absent')
+
+    def test_recorded_db_op_passes_the_gate(self):
+        cut = analyze.metric_cut(self.scrape(), {'live/store'}, remote=True)
+        self.assertTrue(cut['coordinator']['db_op']['recorded'])
+        self.assertEqual(cut['coordinator']['db_op']['observations'], 3)
+
+    def test_idle_scrape_without_reads_is_not_a_defect(self):
+        cut = analyze.metric_cut(self.scrape(db_count=0, adapter_reads=None),
+                                 {'live/store'}, remote=True)
+        self.assertEqual(cut['coordinator']['db_op']['state'], 'zero')
+        self.assertFalse(cut['coordinator']['db_op']['recorded'])
+
+    def test_fraction_names_series_present_with_zero_observations(self):
+        values = self.scrape(db_count=0)
+        fraction = analyze.owner_fetch_fraction(
+            analyze.live_nvmeof_stats(values), analyze.coordinator_stats(values),
+            analyze.adapter_stats(values))
+        self.assertTrue(fraction['available'])
+        self.assertEqual(fraction['api_gets'], 5)
+        self.assertEqual(fraction['source'],
+                         'adapter read_calls; db_op series are registered with zero observations')
+
+    def test_fraction_names_absent_series(self):
+        values = self.scrape(db_count=0)
+        values = {k: v for k, v in values.items() if not k.startswith('db_op_')}
+        fraction = analyze.owner_fetch_fraction(
+            analyze.live_nvmeof_stats(values), analyze.coordinator_stats(values),
+            analyze.adapter_stats(values))
+        self.assertEqual(fraction['api_gets'], 5)
+        self.assertEqual(fraction['source'],
+                         'adapter read_calls; no db_op series was published')
+
 
 class CheckpointSequenceCacheEvidence(unittest.TestCase):
     def test_absent_is_unavailable_and_partial_or_ambiguous_counts_fail(self):

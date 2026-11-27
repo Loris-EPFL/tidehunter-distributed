@@ -101,9 +101,61 @@ class RealClusterScrape(unittest.TestCase):
         self.assertEqual(sorted(native), self.namespaces)
         self.assertEqual(sorted(analyze.adapter_stats(self.modes['remote'])),
                          self.namespaces)
-        analyze.metric_cut(self.modes['remote'],
-                           self.result['remote']['final_metrics_freshness']['required_namespaces'],
-                           remote=True)
+        # The native engine recorded db_op; the remote data path of this
+        # attempt did not, so the coordinator gate rejects that cut as a typed
+        # defect instead of an available zero-latency population.
+        namespaces = self.result['remote']['final_metrics_freshness']['required_namespaces']
+        analyze.metric_cut(self.modes['native'], namespaces, remote=False)
+        with self.assertRaisesRegex(analyze.DbOpNotRecorded, '^db_op not recorded'):
+            analyze.metric_cut(self.modes['remote'], namespaces, remote=True)
+
+    def test_wrapper_latency_tables_compare_native_and_remote(self):
+        table = {mode: analyze.wrapper_latency_table(values)
+                 for mode, values in self.modes.items()}
+        for mode, decoded in table.items():
+            self.assertTrue(decoded['rows'], mode)
+            self.assertEqual({row['op'] for row in decoded['rows']},
+                             {'get', 'iter', 'multiget', 'put', 'write_batch_commit'})
+            for row in decoded['rows']:
+                self.assertEqual(row['labels'].keys() <= {'cf_name', 'db_name'}, True)
+                for name in ('p50', 'p95', 'p99'):
+                    quantile = row['quantiles'][name]
+                    # A percentile is an interval or unavailable, never a point.
+                    self.assertIsInstance(quantile, dict)
+                    self.assertIn('interval_us', quantile)
+                    self.assertIn('lower_us', quantile)
+                    self.assertIn('upper_us', quantile)
+        comparison = analyze.wrapper_latency_comparison(self.modes)
+        self.assertEqual(comparison['modes'], ['native', 'remote'])
+        self.assertTrue(comparison['rows'])
+        shared = [row for row in comparison['rows']
+                  if 'native' in row and 'remote' in row]
+        self.assertTrue(shared)
+        for row in comparison['rows']:
+            self.assertTrue({'native', 'remote'} & set(row))
+            for mode in ('native', 'remote'):
+                if mode in row:
+                    self.assertEqual(row[mode]['available'], row[mode]['count'] > 0)
+
+    def test_owner_fetch_fraction_names_the_adapter_denominator(self):
+        fraction = analyze.owner_fetch_fraction(
+            analyze.live_nvmeof_stats(self.modes['remote']),
+            analyze.coordinator_stats(self.modes['remote']),
+            analyze.adapter_stats(self.modes['remote']))
+        self.assertTrue(fraction['available'])
+        self.assertEqual(fraction['source'],
+                         'adapter read_calls; db_op series are registered with zero observations')
+        self.assertEqual(fraction['api_gets'], 343)
+        self.assertEqual(fraction['db_op']['state'], 'zero')
+        self.assertEqual(fraction['db_op']['observations'], 0)
+        self.assertGreater(fraction['db_op']['series'], 0)
+        native = analyze.owner_fetch_fraction(
+            analyze.live_nvmeof_stats(self.modes['native']),
+            analyze.coordinator_stats(self.modes['native']),
+            analyze.adapter_stats(self.modes['native']))
+        self.assertFalse(native['available'])
+        self.assertEqual(native['reason'], 'owner read operation population missing')
+        self.assertTrue(native['db_op']['recorded'])
 
     def test_summarize_reads_the_real_scrapes(self):
         summary = analyze.summarize_verified(
@@ -115,6 +167,13 @@ class RealClusterScrape(unittest.TestCase):
         self.assertFalse(summary['modes']['native']['live_nvmeof']['available'])
         self.assertEqual(summary['cell_checks']['checks']['admission']
                          ['rdma_live_path']['state'], 'pass')
+        remote, native = summary['modes']['remote'], summary['modes']['native']
+        self.assertEqual(remote['coordinator']['db_op']['state'], 'zero')
+        self.assertEqual(remote['owner_fetch_fraction']['source'],
+                         'adapter read_calls; db_op series are registered with zero observations')
+        self.assertEqual(native['coordinator']['db_op']['state'], 'recorded')
+        self.assertTrue(remote['final_wrapper_latencies']['rows'])
+        self.assertTrue(summary['wrapper_latency_comparison']['rows'])
 
     def test_stale_adapter_names_are_neither_required_nor_emitted(self):
         for name in STALE_ADAPTER_STATS:
@@ -154,6 +213,26 @@ class PreCertificationFreshness(unittest.TestCase):
     def text(self, name):
         return (FIXTURES / name).read_text()
 
+    # The committed scrape predates engine db_op recording in the distributed
+    # data path. The current engine records the populations; this graft adds one
+    # real-shaped observed get population so the freshness machinery can be
+    # exercised. The unmodified scrape is rejected by
+    # test_the_real_scrape_reports_db_op_not_recorded.
+    RECORDED_GET = 'db_op_count{ks="active_jwks",op="get",db="epoch"}'
+    RECORDED = {
+        RECORDED_GET + ' 0': RECORDED_GET + ' 4',
+        'db_op_sum{ks="active_jwks",op="get",db="epoch"} 0':
+            'db_op_sum{ks="active_jwks",op="get",db="epoch"} 40',
+        'db_op_bucket{ks="active_jwks",op="get",db="epoch",le="5"} 0':
+            'db_op_bucket{ks="active_jwks",op="get",db="epoch",le="5"} 4',
+    }
+
+    def recorded(self, text):
+        for old, new in self.RECORDED.items():
+            self.assertIn(old, text)
+            text = text.replace(old, new, 1)
+        return text
+
     def wait(self, texts, *, baseline, budget=1, tip=None, observations=None):
         clock = [10.]
         def sleep(seconds):
@@ -179,11 +258,25 @@ class PreCertificationFreshness(unittest.TestCase):
             finally:
                 self.retained = destination.read_text() if destination.exists() else None
 
-    def test_the_real_replay_baseline_qualifies_the_quiescent_node(self):
+    def test_the_real_scrape_reports_db_op_not_recorded(self):
         baseline, final = self.text(self.FOREGROUND), self.text(self.FINAL)
+        with self.assertRaises(analyze.DbOpNotRecorded) as raised:
+            self.wait([final], baseline=baseline)
+        fact = raised.exception.fact
+        self.assertEqual(fact['state'], 'zero')
+        self.assertGreater(fact['series'], 0)
+        self.assertEqual(fact['observations'], 0)
+        self.assertGreater(fact['adapter_read_calls'], 0)
+        self.assertGreater(fact['adapter_write_commit_calls'], 0)
+        self.assertTrue(str(raised.exception).startswith('db_op not recorded:'))
+
+    def test_the_recorded_replay_baseline_qualifies_the_quiescent_node(self):
+        baseline = self.recorded(self.text(self.FOREGROUND))
+        final = self.recorded(self.text(self.FINAL))
         text, cut = self.wait([final], baseline=baseline)
         self.assertEqual(text, final)
         self.assertEqual(cut['baseline_scope'], analyze.PRE_CERTIFICATION_BASELINE)
+        self.assertEqual(cut['baseline']['coordinator']['db_op']['state'], 'recorded')
         self.assertTrue(analyze.metric_cut_progressed(cut['baseline'], cut['final'],
                                                       remote=True))
         self.assertGreater(cut['final']['live']['completed_read_ops'],
@@ -192,7 +285,7 @@ class PreCertificationFreshness(unittest.TestCase):
                                           cut, remote=True)
 
     def test_a_frozen_registry_never_qualifies(self):
-        frozen = self.text(self.FINAL)
+        frozen = self.recorded(self.text(self.FINAL))
         observations = []
         with self.assertRaisesRegex(TimeoutError, 'unavailable'):
             self.wait([frozen], baseline=frozen, budget=0.5, observations=observations)
@@ -201,8 +294,8 @@ class PreCertificationFreshness(unittest.TestCase):
         self.assertFalse(observations[0].get('unavailable'))
 
     def test_a_regressed_aggregate_counter_fails_the_cut(self):
-        baseline = self.text(self.FOREGROUND)
-        lines = self.text(self.FINAL).splitlines()
+        baseline = self.recorded(self.text(self.FOREGROUND))
+        lines = self.recorded(self.text(self.FINAL)).splitlines()
         counter = 'tidehunter_nvmeof_live_completed_write_ops_total{db="checkpoint"}'
         for index, line in enumerate(lines):
             if line.startswith(counter + ' '):
@@ -214,14 +307,15 @@ class PreCertificationFreshness(unittest.TestCase):
             self.wait(['\n'.join(lines) + '\n'], baseline=baseline)
 
     def test_lifecycle_and_hold_cells_keep_a_valid_cut(self):
-        _, cut = self.wait([self.text(self.FINAL)], baseline=self.text(self.FOREGROUND))
+        final = self.recorded(self.text(self.FINAL))
+        _, cut = self.wait([final], baseline=self.recorded(self.text(self.FOREGROUND)))
         lifecycle = dict(status='clean-reopen-verified', audit_reopen={'equal': True},
                          tail_replay={'state_unchanged': True}, durable_cut={'tracked': True},
                          no_new_export={'available': True}, tail_checkpoints=64)
         hold = dict(seconds=1800, requested_seconds=1800,
                     disk_samples=[{'namespace': 'a'}, {'namespace': 'a'}],
                     final={'databases': ['a']}, final_metrics_available=True)
-        values = {'remote': analyze.parse_metrics(self.text(self.FINAL))}
+        values = {'remote': analyze.parse_metrics(final)}
         for cell_id, result in (
                 ('S1-1-native', dict(cell_id='S1-1-native', lifecycle=lifecycle)),
                 ('S1-8-synchronous', dict(cell_id='S1-8-synchronous', lifecycle=lifecycle)),
@@ -238,7 +332,7 @@ class PreCertificationFreshness(unittest.TestCase):
                                              checkpoint_count=self.TIP + 1)
                 self.assertEqual(checks['failures'], [])
                 analyze.validate_final_metric_cut(
-                    analyze.parse_metrics(self.text(self.FINAL)), self.NAMESPACES,
+                    analyze.parse_metrics(final), self.NAMESPACES,
                     result['final_metrics_freshness'], remote=True)
 
 
