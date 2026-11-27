@@ -239,6 +239,26 @@ class ReviewedCells(unittest.TestCase):
         self.assertEqual(ledger.run_arguments(ledger.cell('M1-c4-native')),
                          ['--driver-concurrency', '4'])
 
+    def test_every_controller_loss_cell_paces_its_replay_for_the_mid_replay_point(self):
+        """S1-4/M7 must outlast the injection gate.
+
+        The measured node answers its endpoints ~4.4 s after it starts and the
+        unpaced replay of the 1,776-checkpoint fixture ends 8-9 s in, so the
+        fleet-A injections all landed on the start-up ramp (fleet A's
+        `S1-4-mid-frame-native` and `-synchronous` evidence). 34 ms per
+        checkpoint is 60.4 s of replay, half of it 30.2 s: past the gate and
+        with 30 s of replay left for the injector's preflight and verification.
+        """
+        paced = [row for row in ledger.MANUAL_SUI_CELLS
+                 if row['id'].startswith(('S1-4-', 'M7-'))]
+        self.assertEqual(len(paced), 10, 'five points minus the unreachable native flush')
+        for row in paced:
+            with self.subTest(cell=row['id']):
+                self.assertEqual(ledger.run_arguments(row), ['--pacing-ms', '34'])
+                # Half of 1,776 x 34 ms is 30.2 s: 4.4 s of start-up plus the
+                # injector's 7 s preflight leave 18.8 s of margin.
+                self.assertGreater(1776 * 34 / 2000, 4.4 + 7.0)
+
     def test_a_reviewed_stage_is_the_only_filter(self):
         self.assertEqual({row['stage'] for row in ledger.cells('stage1')}, {'stage1'})
         self.assertEqual({row['stage'] for row in ledger.cells('stage2')}, {'stage2'})

@@ -554,16 +554,88 @@ class ControllerLossCells(unittest.TestCase):
                     service=4420, service_max=4435, transport='rdma',
                     metrics_url='http://127.0.0.1:9000/metrics',
                     rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+                    at_checkpoints=2,
                     now=lambda: clock[0], latest=lambda address: state['watermark'],
                     metrics=metrics)
                 clock[0] = 0.0
                 self.assertFalse(gate.poll(None))
                 clock[0] = 1.0
                 self.assertFalse(gate.poll(None))
+                state['watermark'] += 1
                 state[knob] += 1
                 clock[0] = 2.0
                 fired, reason = gate.fires(gate.samples[-2], gate.sample())
                 self.assertTrue(fired, reason)
+
+    def test_the_gate_cannot_fire_on_the_real_startup_ramp(self):
+        """The fleet-A mid-frame series: the counter edge alone is not a point.
+
+        `fixtures/s1-4-mid-frame-attempt2-gate.json` is the 27-sample gate
+        series of `S1-4-mid-frame-native/attempt-2`. The old gate fired on its
+        last pair (7 -> 3,611 write ops over 26.1 s of node start-up); with the
+        mid-replay aim of 888 checkpoints of 1,776 the same pair is refused.
+        """
+        series = json.loads((HERE / 'fixtures' / 's1-4-mid-frame-attempt2-gate.json').read_text())
+        gate = manual_sui.ControllerLoss(
+            point=series['point'], host='h0', address='10.0.0.2',
+            service=4420, service_max=4435, transport='rdma', metrics_url='',
+            rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+            at_checkpoints=series['bound'] // 2)
+        self.assertEqual(gate.aim, 888)
+        verdicts = [gate.fires(previous, current) for previous, current
+                    in zip(series['samples'], series['samples'][1:])]
+        self.assertFalse(any(fired for fired, _ in verdicts))
+        # The old gate's own pair: the previous probe never completed a checkpoint.
+        self.assertIn('no completed checkpoint before this sample', verdicts[-1][1])
+        # The same edge, with a previous checkpoint, is refused for its position.
+        current = dict(series['samples'][-1])
+        previous = dict(series['samples'][-2], watermark=147)
+        self.assertIn('148 checkpoints done, the point is 888', gate.fires(previous, current)[1])
+        self.assertFalse(gate.fires(previous, current)[0])
+        # The same pair past the aim is the point.
+        gate.aim, gate.bound = 148, series['bound']
+        self.assertTrue(gate.fires(previous, current)[0])
+
+    def test_the_gate_reads_the_run_bound_and_needs_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            gate = manual_sui.ControllerLoss(
+                point='mid-frame', host='h0', address='10.0.0.2', service=4420,
+                service_max=4435, transport='rdma', metrics_url='',
+                rpc_address='127.0.0.1:9000', output=output)
+            self.assertIsNone(gate.aim_from_run())
+            # The frozen Sui form run.py writes before it starts the node.
+            (output / 'remote.yaml').write_text(
+                'json-rpc-address: 127.0.0.1:34765\nrun-with-range:\n  Checkpoint: 1776\n')
+            self.assertEqual(manual_sui.replay_bound(output), 1776)
+            self.assertEqual(gate.aim_from_run(), 888)
+            # A truncated or non-integer bound is not a stated bound.
+            (output / 'remote.yaml').write_text('run-with-range:\n  Checkpoint: 1776\n'
+                                                'next: [\n')
+            self.assertIsNone(manual_sui.replay_bound(output))
+            (output / 'remote.yaml').write_text('run-with-range:\n  Epoch: 2\n')
+            self.assertIsNone(manual_sui.replay_bound(output))
+            gate = manual_sui.ControllerLoss(
+                point='mid-frame', host='h0', address='10.0.0.2', service=4420,
+                service_max=4435, transport='rdma', metrics_url='',
+                rpc_address='127.0.0.1:9000', output=output, at_checkpoints=10)
+            stalled = dict(watermark=20, counters={'completed_write_ops_total': 1.0})
+            later = dict(watermark=20, counters={'completed_write_ops_total': 9.0})
+            self.assertIn('did not advance', gate.fires(stalled, later)[1])
+            earlier = dict(watermark=19, counters={'completed_write_ops_total': 9.0})
+            self.assertIn('did not advance', gate.fires(stalled, earlier)[1])
+            advancing = dict(watermark=21, counters={'completed_write_ops_total': 9.0})
+            self.assertTrue(gate.fires(stalled, advancing)[0])
+            first = dict(watermark=None, counters={'completed_write_ops_total': 9.0})
+            self.assertIn('no completed checkpoint before this sample',
+                          gate.fires(first, advancing)[1])
+            boundless = manual_sui.ControllerLoss(
+                point='mid-frame', host='h0', address='10.0.0.2', service=4420,
+                service_max=4435, transport='rdma', metrics_url='',
+                rpc_address='127.0.0.1:9000', output=output / 'absent')
+            self.assertIn('the replay bound is not yet stated',
+                          boundless.fires(stalled, advancing)[1])
+            self.assertIn('one sample', gate.fires(None, advancing)[1])
 
     def test_the_gate_fails_closed_without_a_completed_checkpoint(self):
         gate = manual_sui.ControllerLoss(
@@ -577,11 +649,13 @@ class ControllerLossCells(unittest.TestCase):
         self.assertIn('no completed checkpoint', reason)
 
     def test_a_missing_counter_fails_closed(self):
+        watermarks = iter([5, 6])
         gate = manual_sui.ControllerLoss(
             point='during-flush', host='h0', address='10.0.0.2', service=4420,
             service_max=4435, transport='rdma', metrics_url='http://x/metrics',
             rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
-            now=lambda: 0.0, latest=lambda address: 5,
+            at_checkpoints=1, now=lambda: 0.0,
+            latest=lambda address: next(watermarks),
             metrics=lambda url: 'tidehunter_nvmeof_live_errors_total 0\n')
         previous = gate.sample()
         current = gate.sample()
@@ -601,6 +675,7 @@ class ControllerLossCells(unittest.TestCase):
     def test_the_gate_pools_the_per_database_live_family(self):
         clock = [0.0]
         writes = {'checkpoint': 10, 'epoch': 3}
+        watermarks = iter([1, 2])
         def metrics(url):
             return ''.join(f'tidehunter_nvmeof_live_completed_write_ops_total{{db="{db}"}} '
                            f'{value}\n' for db, value in writes.items())
@@ -608,7 +683,8 @@ class ControllerLossCells(unittest.TestCase):
             point='mid-frame', host='h0', address='10.0.0.2', service=4420,
             service_max=4435, transport='rdma', metrics_url='http://x/metrics',
             rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
-            now=lambda: clock[0], latest=lambda address: 2, metrics=metrics)
+            at_checkpoints=1, now=lambda: clock[0],
+            latest=lambda address: next(watermarks), metrics=metrics)
         clock[0] = 0.0
         first = gate.sample()
         self.assertEqual(first['counters'], {'completed_write_ops_total': 13.0})
@@ -663,7 +739,8 @@ class ControllerLossInjection(unittest.TestCase):
             metrics_url='http://127.0.0.1:9000/metrics',
             rpc_address='127.0.0.1:9000',
             output=Path(output or self.root / 'run'), gate_timeout=30.0,
-            probe_seconds=0.2, now=time.monotonic, latest=latest, metrics=metrics)
+            probe_seconds=0.2, at_checkpoints=1,
+            now=time.monotonic, latest=latest, metrics=metrics)
         values.update(overrides)
         return manual_sui.ControllerLoss(**values)
 
@@ -706,6 +783,10 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertEqual(evidence['kernel_log']['host'], 'coordinator')
         self.assertEqual(evidence['intents'], str(intents))
         self.assertGreaterEqual(len(evidence['samples']), 2)
+        progress = evidence['progress']
+        self.assertEqual((progress['at'], progress['fraction'], progress['bound']),
+                         (1, 0.5, None))
+        self.assertGreaterEqual(progress['watermark_from_gate'], 1)
         self.assertEqual(evidence['injector']['ok'], True)
         self.assertTrue((self.root / 'run/controller-loss/mid-frame.json').is_file())
         names = {row['name'] for row in self.launcher(remote, gate).artifacts()}
@@ -724,10 +805,15 @@ class ControllerLossInjection(unittest.TestCase):
                     b'2026-11-26T10:00:01,000000+00:00 host systemd-udevd[9]: '
                     b'blkid: Buffer I/O error on dev nvme1n1\n'), b''
 
-        window = gate.kernel_log(Remote(), '2026-11-26T09:59:59Z', '2026-11-26T10:00:02Z')
+        remote = Remote()
+        window = gate.kernel_log(remote, '2026-11-26T09:59:59Z', '2026-11-26T10:00:02Z')
         self.assertTrue(window['available'])
         self.assertEqual((window['since'], window['until']),
                          ('2026-11-26T09:59:59Z', '2026-11-26T10:00:02Z'))
+        self.assertEqual(window['since_dmesg'], '2026-11-26 09:59:59')
+        self.assertEqual(window['until_dmesg'], '2026-11-26 10:00:02')
+        self.assertIn("--since '2026-11-26 09:59:59'", remote.command)
+        self.assertIn("--until '2026-11-26 10:00:02'", remote.command)
         self.assertEqual(len(window['lines']), 2)
         self.assertEqual(len(window['other']), 1)
         self.assertEqual(len(window['udev_probe']), 1)
@@ -1254,7 +1340,7 @@ class NotReachedIsTerminal(unittest.TestCase):
                 service=4420, service_max=4435, transport='rdma',
                 metrics_url='http://127.0.0.1:9000/metrics',
                 rpc_address='127.0.0.1:9000', output=output, gate_timeout=0.2,
-                probe_seconds=0.2, now=time.monotonic, latest=latest,
+                probe_seconds=0.2, at_checkpoints=1, now=time.monotonic, latest=latest,
                 metrics=lambda url: 'tidehunter_nvmeof_live_leased_flushes_total 0\n',
                 not_reached=True)
         def launcher(directory, remote):

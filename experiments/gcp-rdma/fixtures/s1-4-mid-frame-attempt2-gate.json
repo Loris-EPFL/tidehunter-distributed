@@ -1,0 +1,188 @@
+{
+ "schema": 1,
+ "source": "gs://mysten-research-bench-artifacts/campaign-hybrid-sui-2026-11-25/stage1/evidence/S1-4-mid-frame-native/attempt-2/controller-loss/evidence.json",
+ "point": "mid-frame",
+ "bound": 1776,
+ "note": "The gate series of the fleet-A mid-frame cell: 22 samples refused while the node booted, then the metrics endpoint answered at 4.0 write ops, then the first checkpoint sample at 26.1 s reported 148 completed checkpoints and 3,611 write ops. The old gate fired there; the replay ended at checkpoint 1,776.",
+ "fired_at": {
+  "seconds": 26.095105762000003,
+  "watermark": 148,
+  "counters": {
+   "completed_write_ops_total": 3611.0
+  }
+ },
+ "samples": [
+  {
+   "seconds": 0.0,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 1.011,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 2.012,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 3.012,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 4.013,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 5.013,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 6.014,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 7.014,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 8.015,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 9.016,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 10.016,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 11.017,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 12.017,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 13.018,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 14.025,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 15.025,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 16.026,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 17.026,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 18.027,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 19.028,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 20.029,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 21.029,
+   "watermark": null,
+   "counters": {},
+   "reason": "live metrics sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 22.03,
+   "watermark": null,
+   "counters": {
+    "completed_write_ops_total": null
+   },
+   "reason": "checkpoint RPC sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 23.04,
+   "watermark": null,
+   "counters": {
+    "completed_write_ops_total": 0.0
+   },
+   "reason": "checkpoint RPC sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 24.049,
+   "watermark": null,
+   "counters": {
+    "completed_write_ops_total": 4.0
+   },
+   "reason": "checkpoint RPC sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 25.071,
+   "watermark": null,
+   "counters": {
+    "completed_write_ops_total": 7.0
+   },
+   "reason": "checkpoint RPC sample failed: <urlopen error [Errno 111] Connection refused>"
+  },
+  {
+   "seconds": 26.095,
+   "watermark": 148,
+   "counters": {
+    "completed_write_ops_total": 3611.0
+   },
+   "reason": null
+  }
+ ]
+}

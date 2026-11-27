@@ -41,7 +41,9 @@ deleted (`campaign_upload.Evidence.persist_failure`).
 """
 import argparse
 import json
+import math
 import os
+from datetime import datetime
 from pathlib import Path
 import re
 import shlex
@@ -49,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -231,6 +234,48 @@ def controller_loss_addresses(fixture):
     return values[0], values[1]
 
 
+def replay_bound(output):
+    """The measured node's replay bound from its own run config, or None.
+
+    `run.py` writes `<output>/remote.yaml` before it starts the node, with
+    `run-with-range.Checkpoint` holding the exclusive bound (the frozen Sui
+    externally tagged form). A partially written or absent file answers None so
+    the gate re-reads it on the next probe instead of certifying a point from a
+    truncated config.
+    """
+    try:
+        config = checkpoint.configuration(Path(output), 'remote')
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    # `configuration` normalises the frozen tagged form to a `CheckpointBound`
+    # int; the dict branch keeps a raw read of the same file usable.
+    bound = config.get('run-with-range')
+    value = bound.get('Checkpoint') if isinstance(bound, dict) else bound
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 < value < 1 << 64 else None
+
+
+def dmesg_time(stamp):
+    """`YYYY-MM-DD HH:MM:SS` from the campaign's `date -u +...T...Z` stamp.
+
+    util-linux `dmesg --since/--until` refuses the ISO `T`/`Z` form with
+    `invalid time value "2026-11-27T21:46:14Z"`, which is why every fleet-A
+    S1-4 cell retained an empty kernel window.
+    """
+    if not isinstance(stamp, str):
+        return None
+    text = stamp.strip()
+    if text.endswith('Z'):
+        text = text[:-1]
+    text = text.replace('T', ' ')
+    try:
+        datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
+    return text
+
+
 def _live_decoder():
     """Load the Sui-checkpoint analyzer under a unique module name.
 
@@ -281,13 +326,30 @@ class ControllerLoss:
     a point that never fires fails the cell with the observation series instead
     of injecting at an unproven time. A synchronous `during-flush` point has no
     guaranteed flush, so an unobserved point records the cell as not reached.
+
+    The point must also land mid-replay. The measured node answers its
+    checkpoint and metrics endpoints a few seconds after it starts, and its
+    unpaced replay of the 1,776-checkpoint fixture lasts 8-9 s, so a gate that
+    accepted the first counter edge fired on the node's start-up ramp: all three
+    S1-4 injections of fleet A landed at 25-26 s with 88-451 of 1,776
+    checkpoints done, and the synchronous cell's injector reached its first RPC
+    after the node had already exited. The gate therefore also requires the
+    completed checkpoint to advance between samples and to pass
+    `progress_fraction` of the replay bound `run.py` writes to
+    `<output>/remote.yaml` (`run-with-range.Checkpoint`); the cell rows pace the
+    replay so half of it falls well after the endpoints answer.
     """
     def __init__(self, *, point, host, address, service, service_max, transport,
                  metrics_url, rpc_address, output, nqn=None, intents=None, timeout=30.0,
                  gate_timeout=1200.0, probe_seconds=1.0, not_reached=False,
+                 progress_fraction=0.5, at_checkpoints=None,
                  now=time.monotonic, latest=None, metrics=None):
         if point not in CONTROLLER_LOSS_POINTS:
             raise ValueError('unknown controller-loss point')
+        if not 0.0 < progress_fraction < 1.0:
+            raise ValueError('the progress fraction lies strictly inside the replay')
+        if at_checkpoints is not None and at_checkpoints < 1:
+            raise ValueError('the progress checkpoint is positive')
         self.point = point
         self.host = host
         self.address = address
@@ -298,6 +360,9 @@ class ControllerLoss:
         self.output = Path(output)
         self.nqn = nqn
         self.intents = Path(intents) if intents is not None else None
+        self.progress_fraction = progress_fraction
+        self.bound = None
+        self.aim = at_checkpoints
         self.timeout = timeout
         self.gate_timeout = gate_timeout
         self.probe_seconds = probe_seconds
@@ -325,12 +390,36 @@ class ControllerLoss:
             row['reason'] = f'live metrics sample failed: {error}'
         return row
 
+    def aim_from_run(self):
+        """The mid-replay checkpoint `run.py` states for this run, or None.
+
+        `run.py` writes `<output>/remote.yaml` before it starts the measured
+        node, with the replay bound in `run-with-range.Checkpoint`. Half of that
+        bound is the mid-replay point. Until the file is a complete u64, the
+        gate cannot certify a mid-replay moment and stays closed.
+        """
+        bound = replay_bound(self.output)
+        if bound is None:
+            return None
+        self.bound = bound
+        return max(1, math.ceil(bound * self.progress_fraction))
+
     def fires(self, previous, current):
-        """Whether this sample is the point's observed edge."""
+        """Whether this sample is the point's observed edge, mid-replay."""
         if current['watermark'] is None or current['watermark'] < 1:
             return False, 'no completed checkpoint'
+        if self.aim is None:
+            return False, 'the replay bound is not yet stated'
         if previous is None:
             return False, 'one sample'
+        if previous['watermark'] is None:
+            return False, 'no completed checkpoint before this sample'
+        if current['watermark'] <= previous['watermark']:
+            return False, 'the completed checkpoint did not advance'
+        if current['watermark'] < self.aim:
+            stated = f' of {self.bound}' if self.bound is not None else ''
+            return False, (f'{current["watermark"]} checkpoints done, the point is '
+                           f'{self.aim}{stated}')
         for name in CONTROLLER_LOSS_COUNTERS[self.point]:
             before = previous['counters'].get(name)
             after = current['counters'].get(name)
@@ -344,6 +433,8 @@ class ControllerLoss:
         """Probe once and inject when the point fires; True means injected."""
         if self.done:
             return True
+        if self.aim is None:
+            self.aim = self.aim_from_run()
         now = self.now()
         if self.started is None:
             self.started = now
@@ -400,16 +491,22 @@ class ControllerLoss:
 
         The injector deletes a controller outside the engine's teardown guards,
         so a udev partition probe can log an expected error. Those lines are
-        kept and labelled; the cell never gates on this window.
+        kept and labelled; the cell never gates on this window. The window
+        bounds are converted to the util-linux `--since/--until` form: the ISO
+        stamp the host `date` prints is refused by dmesg.
         """
         window = dict(host=self.host, since=since, until=until, available=False,
                       reason=None, lines=[], udev_probe=[], other=[])
-        if since is None:
+        since_time, until_time = dmesg_time(since), dmesg_time(until)
+        window['since_dmesg'] = since_time
+        window['until_dmesg'] = until_time
+        if since_time is None:
             window['reason'] = 'the host clock was unreadable'
             return window
-        code, out, err = remote.run(
-            self.host, 'dmesg --time-format=iso --since ' + shlex.quote(since),
-            check=False)
+        command = 'dmesg --time-format=iso --since ' + shlex.quote(since_time)
+        if until_time is not None:
+            command += ' --until ' + shlex.quote(until_time)
+        code, out, err = remote.run(self.host, command, check=False)
         if code != 0:
             window['reason'] = (err.decode('utf-8', 'replace').strip()[-500:]
                                 or f'dmesg exited {code}')
@@ -442,6 +539,9 @@ class ControllerLoss:
             transport=self.transport, nqn=self.nqn,
             intents=None if self.intents is None else str(self.intents),
             injected=True,
+            progress=dict(bound=self.bound, at=self.aim,
+                          fraction=self.progress_fraction,
+                          watermark_from_gate=gate.get('watermark')),
             exit_code=code, stdout=out.decode('utf-8', 'replace')[-4000:],
             stderr=err.decode('utf-8', 'replace')[-4000:],
             resume=resume_deltas((record or {}).get('live_delta')),
@@ -1455,6 +1555,11 @@ def main():
                         help='deadline for observing the point; default: 2 * deadline + 600 s')
     parser.add_argument('--controller-loss-probe-seconds', type=float, default=1.0,
                         help='live sample interval while waiting for the point')
+    parser.add_argument('--controller-loss-progress-fraction', type=float, default=0.5,
+                        help='fraction of the replay bound the completed checkpoint must '
+                             'pass before the point may fire (strictly inside 0..1)')
+    parser.add_argument('--controller-loss-at-checkpoints', type=int,
+                        help='exact completed-checkpoint threshold; overrides the fraction')
     parser.add_argument('run_args', nargs=argparse.REMAINDER,
                         help='extra run.py arguments after --')
     args = parser.parse_args()
@@ -1560,6 +1665,8 @@ def main():
                           if args.controller_loss_gate_timeout is not None
                           else 2 * args.deadline + 600.0),
             probe_seconds=args.controller_loss_probe_seconds,
+            progress_fraction=args.controller_loss_progress_fraction,
+            at_checkpoints=args.controller_loss_at_checkpoints,
             not_reached=(args.controller_loss == 'during-flush'
                          and args.durability_tier == 'synchronous'))
     launcher = SuiLauncher(
