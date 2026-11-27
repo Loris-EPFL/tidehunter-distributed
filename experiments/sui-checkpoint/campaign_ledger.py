@@ -141,12 +141,25 @@ def _manual_sui_cells():
     ]
     # S1-4 and M7 are one launcher flag (--controller-loss) and a derived cell
     # id. A Native `during-flush` point is unreachable and is not a cell.
+    #
+    # The injection must land mid-replay, and the measured node only answers its
+    # checkpoint and metrics endpoints a few seconds after it starts: fleet A's
+    # unpaced replay of the 1,776-checkpoint fixture finished in 8.0-9.0 s, so
+    # every gate fired on the start-up ramp and the synchronous injector's first
+    # RPC arrived after the node had exited. `--pacing-ms 34` makes the replay
+    # 1776 x 34 ms = 60.4 s; half of it is 30.2 s, which is 25.8 s after the
+    # endpoints first answered (4.4 s) and leaves 30.2 s of replay behind the
+    # point for the injector's 2-7 s preflight and its verification.
     for point in ('mid-frame', 'after-adoption'):
         for tier in ('native', 'synchronous'):
-            rows.append(_cell(f'S1-4-{point}-{tier}', 'stage1', tier))
-            rows.append(_cell(f'M7-{point}-{tier}', 'stage2', tier))
-    rows.append(_cell('S1-4-during-flush-synchronous', 'stage1', 'synchronous'))
-    rows.append(_cell('M7-during-flush-synchronous', 'stage2', 'synchronous'))
+            rows.append(_cell(f'S1-4-{point}-{tier}', 'stage1', tier,
+                              run=(('--pacing-ms', '34'),)))
+            rows.append(_cell(f'M7-{point}-{tier}', 'stage2', tier,
+                              run=(('--pacing-ms', '34'),)))
+    rows.append(_cell('S1-4-during-flush-synchronous', 'stage1', 'synchronous',
+                      run=(('--pacing-ms', '34'),)))
+    rows.append(_cell('M7-during-flush-synchronous', 'stage2', 'synchronous',
+                      run=(('--pacing-ms', '34'),)))
     return tuple(rows)
 
 
