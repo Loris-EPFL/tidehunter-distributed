@@ -115,24 +115,65 @@ def live_metric_namespaces(schema, epoch):
     return live
 
 
-def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, destination):
-    """Certify one post-certified scrape with observed aggregate progress.
+# Bound the per-scrape observation record retained on success and failure.
+FINAL_METRIC_OBSERVATION_LIMIT = 128
+
+
+def freshness_summary(observed, unavailable, observations):
+    """A bounded failure line: was the cut unavailable or merely not advanced."""
+    tail = list(observations)[-3:]
+    return (f'{observed} observation(s), {unavailable} unavailable, '
+            f'last {tail}')
+
+
+def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, destination,
+                           baseline=None, tip=None, observations=None):
+    """Certify one post-certified scrape against the last replay scrape.
 
     The engine no longer publishes per-owner generation counters. A scalar
-    coordinator registry covers every audited live namespace, and a remote cut
-    additionally requires an aggregate `tidehunter_nvmeof_live_*` counter to
-    advance after certification.
+    coordinator registry covers every audited live namespace. A remote cut
+    compares the post-certification scrape with the pre-certification replay
+    scrape, because a full replay finishes before certification: an idle node
+    publishes no later work to advance. The post-certification scrape must
+    show the certified tip, the same aggregate population, no regression, and
+    at least one advanced aggregate `tidehunter_nvmeof_live_*` counter. The
+    native path keeps its first-post-certification fixed point.
+
+    `observations` may be a caller-owned list: it receives the same bounded
+    per-scrape record, so a failure can state whether a scrape lacked the cut
+    population or was available without an advance.
     """
-    from analyze import (metric_cut, metric_cut_progressed, parse_metrics,
+    from analyze import (PRE_CERTIFICATION_BASELINE, metric_cut,
+                         metric_cut_progressed, parse_metrics,
                          validate_final_metric_cut, MetricCutUnavailable)
-    baseline = None
+    if remote:
+        if baseline is None:
+            raise ValueError('a remote final metric cut needs a pre-certification baseline')
+        if tip is None:
+            raise ValueError('a remote final metric cut needs the certified tip')
+        try:
+            prior = metric_cut(parse_metrics(baseline), namespaces, remote=True)
+        except MetricCutUnavailable as unavailable:
+            raise RuntimeError('the pre-certification replay baseline lacks the final cut '
+                               'population: ' + str(unavailable)) from None
+    else:
+        prior = None
+    reference = None
     unavailable_observations = 0
-    observations = []
+    observed = 0
+    observations = observations if observations is not None else []
+    def record(row):
+        nonlocal observed
+        observed += 1
+        observations.append(row)
+        if len(observations) > FINAL_METRIC_OBSERVATION_LIMIT:
+            del observations[0]
     start = time.monotonic()
     while True:
         remaining = end - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError('final metrics freshness exceeded original replay deadline')
+            raise TimeoutError('final metrics freshness exceeded original replay deadline: '
+                               + freshness_summary(observed, unavailable_observations, observations))
         for process in (child, *shards):
             state = sample(process)
             if state.get('exited') or state.get('core_dumping'):
@@ -143,30 +184,52 @@ def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, d
         # Retain the last real response even on schema/deadline/freshness failure.
         destination.write_text(text)
         if time.monotonic() >= end:
-            raise TimeoutError('final metrics scrape exceeded original replay deadline')
+            raise TimeoutError('final metrics scrape exceeded original replay deadline: '
+                               + freshness_summary(observed, unavailable_observations, observations))
+        if remote:
+            completed = checkpoint.completed_checkpoint(text)
+            if completed < tip:
+                record(dict(seconds=time.monotonic() - start,
+                            completed_checkpoint=completed,
+                            reason='below the certified tip'))
+                time.sleep(min(.1, max(0, end - time.monotonic())))
+                continue
+            if completed > tip:
+                raise RuntimeError('final metrics scrape passed the certified tip: '
+                                   + freshness_summary(observed, unavailable_observations, observations))
         try:
             current = metric_cut(parse_metrics(text), namespaces, remote=remote)
         except MetricCutUnavailable as unavailable:
             unavailable_observations += 1
-            observations.append(dict(seconds=time.monotonic() - start, unavailable=True,
-                                     reason=str(unavailable)))
+            record(dict(seconds=time.monotonic() - start, unavailable=True,
+                        reason=str(unavailable)))
             time.sleep(min(.1, max(0, end - time.monotonic())))
             continue
-        observations.append(dict(seconds=time.monotonic() - start,
+        record(dict(seconds=time.monotonic() - start,
             live_available=current['live']['available'],
             keyspaces=current['coordinator']['keyspaces']))
-        if baseline is None:
-            baseline = current
-        elif metric_cut_progressed(baseline, current, remote=remote):
+        if remote:
+            reference = prior
+            progressed = metric_cut_progressed(prior, current, remote=True)
+        else:
+            if reference is None:
+                reference = current
+                progressed = False
+            else:
+                progressed = metric_cut_progressed(reference, current, remote=False)
+        if progressed:
             cut = dict(status='post-certified-scrape',
-                required_namespaces=sorted(namespaces), baseline=baseline, final=current,
-                observations=observations, seconds=time.monotonic() - start,
+                required_namespaces=sorted(namespaces), baseline=reference, final=current,
+                observations=list(observations), seconds=time.monotonic() - start,
                 unavailable_observations=unavailable_observations,
                 scope='after certified RPC and index catchup; excluded from foreground elapsed; '
                       'aggregate live counters and coordinator histograms, not quiescent physical IO')
+            if remote:
+                cut['baseline_scope'] = PRE_CERTIFICATION_BASELINE
             validate_final_metric_cut(parse_metrics(text), namespaces, cut, remote=remote)
             if time.monotonic() >= end:
-                raise TimeoutError('final metrics qualification exceeded original replay deadline')
+                raise TimeoutError('final metrics qualification exceeded original replay deadline: '
+                                   + freshness_summary(observed, unavailable_observations, observations))
             return text, cut
         time.sleep(min(.1, max(0, end - time.monotonic())))
 
@@ -257,6 +320,7 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
     progress, samples, disk_samples, final_count = [], [], [], 0
     next_disk = time.monotonic() if disk_sample else float('inf')
     metrics = ''
+    pre_certified = None
     def take_disk_sample():
         if not disk_sample:
             return
@@ -294,6 +358,8 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                 progress.append(dict(seconds=time.monotonic()-start, completed_checkpoint=completed))
                 if completed > tip:
                     raise RuntimeError('replay passed frozen tip')
+                if completed < tip:
+                    pre_certified = metrics
                 final_count = final_count+1 if completed == tip else 0
                 if final_count == 2 and not short_run:
                     break
@@ -325,8 +391,19 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
         if certified['digest'] != digest or int(certified['sequenceNumber']) != tip:
             raise RuntimeError('completed certified checkpoint digest mismatch')
         namespaces = live_metric_namespaces(schema, int(certified['epoch']))
-        metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
-            remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom')
+        baseline = pre_certified if pre_certified is not None else metrics
+        freshness_observations = []
+        try:
+            metrics, freshness = wait_for_final_metrics(child, shards, config['metrics-address'], namespaces,
+                remote=mode == 'remote', end=start + deadline, destination=owned.root / f'{mode}-final.prom',
+                baseline=baseline, tip=tip, observations=freshness_observations)
+        except BaseException as error:
+            # A failed freshness gate must still state whether its scrapes were
+            # available without an advance or lacked the cut population.
+            build.save(owned.root / f'{mode}-freshness.json', dict(
+                status='failed', mode=mode, tip=tip, failure=str(error),
+                observations=freshness_observations))
+            raise
     # SIGTERM only after committed indexer frontiers; audit subsequently reopens all stores.
     held = None
     if hold_seconds:

@@ -15,8 +15,11 @@ read. The final and foreground scrapes were byte-identical in that attempt, so
 the one scrape per mode serves both.
 """
 from pathlib import Path
+import io
 import json
+import tempfile
 import unittest
+from unittest import mock
 
 import analyze
 import run
@@ -132,6 +135,111 @@ class RealClusterScrape(unittest.TestCase):
             read_limit=self.result['read_profile_limit'],
             write_limit=self.result['write_profile_limit'],
             native_write_limit=self.result['native_write_profile_limit'])
+
+
+class PreCertificationFreshness(unittest.TestCase):
+    """The final cut compares with the last replay scrape, not with itself.
+
+    `attempt4-*` are the real S1-0-native attempt 4 scrapes: the foreground
+    scrape taken at the end of the full 1776-checkpoint replay, before the RPC
+    index catchup, and the post-certification scrape the failed gate kept while
+    it waited for an advance that a quiescent node never published.
+    """
+
+    TIP = 1775
+    NAMESPACES = {'live/checkpoints', 'live/store/epoch_0', 'live/store/perpetual'}
+    FOREGROUND = 'attempt4-remote-foreground.prom'
+    FINAL = 'attempt4-remote-final.prom'
+
+    def text(self, name):
+        return (FIXTURES / name).read_text()
+
+    def wait(self, texts, *, baseline, budget=1, tip=None, observations=None):
+        clock = [10.]
+        def sleep(seconds):
+            clock[0] += seconds
+        responses = iter(texts)
+        last = texts[-1]
+        def scrape(*args, **kwargs):
+            nonlocal last
+            last = next(responses, last)
+            return io.BytesIO(last.encode())
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(run.time, 'sleep', side_effect=sleep), \
+                mock.patch.object(run, 'sample',
+                                  return_value={'pid': 123, 'exited': False}), \
+                mock.patch.object(run.urllib.request, 'urlopen', side_effect=scrape):
+            destination = Path(directory) / 'final.prom'
+            try:
+                return run.wait_for_final_metrics(
+                    object(), [], 'unused', self.NAMESPACES, remote=True,
+                    end=10 + budget, destination=destination, baseline=baseline,
+                    tip=self.TIP if tip is None else tip, observations=observations)
+            finally:
+                self.retained = destination.read_text() if destination.exists() else None
+
+    def test_the_real_replay_baseline_qualifies_the_quiescent_node(self):
+        baseline, final = self.text(self.FOREGROUND), self.text(self.FINAL)
+        text, cut = self.wait([final], baseline=baseline)
+        self.assertEqual(text, final)
+        self.assertEqual(cut['baseline_scope'], analyze.PRE_CERTIFICATION_BASELINE)
+        self.assertTrue(analyze.metric_cut_progressed(cut['baseline'], cut['final'],
+                                                      remote=True))
+        self.assertGreater(cut['final']['live']['completed_read_ops'],
+                           cut['baseline']['live']['completed_read_ops'])
+        analyze.validate_final_metric_cut(analyze.parse_metrics(final), self.NAMESPACES,
+                                          cut, remote=True)
+
+    def test_a_frozen_registry_never_qualifies(self):
+        frozen = self.text(self.FINAL)
+        observations = []
+        with self.assertRaisesRegex(TimeoutError, 'unavailable'):
+            self.wait([frozen], baseline=frozen, budget=0.5, observations=observations)
+        self.assertEqual(self.retained, frozen)
+        self.assertTrue(observations[0]['live_available'])
+        self.assertFalse(observations[0].get('unavailable'))
+
+    def test_a_regressed_aggregate_counter_fails_the_cut(self):
+        baseline = self.text(self.FOREGROUND)
+        lines = self.text(self.FINAL).splitlines()
+        counter = 'tidehunter_nvmeof_live_completed_write_ops_total{db="checkpoint"}'
+        for index, line in enumerate(lines):
+            if line.startswith(counter + ' '):
+                lines[index] = counter + ' 1'
+                break
+        else:
+            self.fail('the fixture lacks the aggregate write counter')
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.wait(['\n'.join(lines) + '\n'], baseline=baseline)
+
+    def test_lifecycle_and_hold_cells_keep_a_valid_cut(self):
+        _, cut = self.wait([self.text(self.FINAL)], baseline=self.text(self.FOREGROUND))
+        lifecycle = dict(status='clean-reopen-verified', audit_reopen={'equal': True},
+                         tail_replay={'state_unchanged': True}, durable_cut={'tracked': True},
+                         no_new_export={'available': True}, tail_checkpoints=64)
+        hold = dict(seconds=1800, requested_seconds=1800,
+                    disk_samples=[{'namespace': 'a'}, {'namespace': 'a'}],
+                    final={'databases': ['a']}, final_metrics_available=True)
+        values = {'remote': analyze.parse_metrics(self.text(self.FINAL))}
+        for cell_id, result in (
+                ('S1-1-native', dict(cell_id='S1-1-native', lifecycle=lifecycle)),
+                ('S1-8-synchronous', dict(cell_id='S1-8-synchronous', lifecycle=lifecycle)),
+                ('M5-hold', dict(cell_id='M5-hold', hold=hold))):
+            with self.subTest(cell=cell_id):
+                result |= dict(live_transport='rdma', cache={'coordinator_bytes': 0},
+                               checkpoint_limit=self.TIP)
+                result['final_metrics_freshness'] = cut
+                self.assertEqual(analyze.lifecycle_check(result)['state'],
+                                 'pass' if 'lifecycle' in result else 'missing_counter')
+                self.assertEqual(analyze.hold_check(result)['state'],
+                                 'pass' if 'hold' in result else 'missing_counter')
+                checks = analyze.cell_checks(result, values, sorted(self.NAMESPACES),
+                                             checkpoint_count=self.TIP + 1)
+                self.assertEqual(checks['failures'], [])
+                analyze.validate_final_metric_cut(
+                    analyze.parse_metrics(self.text(self.FINAL)), self.NAMESPACES,
+                    result['final_metrics_freshness'], remote=True)
 
 
 if __name__ == '__main__':

@@ -204,9 +204,14 @@ per-owner availability flag, and no value-cache hit counter exists. M2 therefore
 uses `owner_fetch_fraction`: aggregate owner read operations divided by
 coordinator `get` calls. It is a request ratio, not a hit rate or byte ratio.
 The harness **does not expect, emit or fabricate** per-partition samples. The final cut needs one post-certified aggregate
-publication advance in remote mode and coordinator coverage of every audited
-live namespace. A missing family is transiently retried and then fails the
-run; it is never reported as zero. Application-cache hits, resident/page-cache
+publication advance over the last replay scrape in remote mode and coordinator
+coverage of every audited live namespace. A full replay finishes before
+certification, so the baseline is the last replay scrape below the certified
+tip, never the first post-certification scrape: a quiescent node publishes no
+later work to advance. A missing family is transiently retried and then fails
+the run; it is never reported as zero. A failed gate retains its bounded
+per-scrape record (`<mode>-freshness.json`), so a timeout states whether the
+cut population was unavailable or merely not advanced. Application-cache hits, resident/page-cache
 service, async submissions and positive process physical-I/O brackets remain
 distinct. Advisory eviction and async submission alone never prove physical
 NVMe reads, and process-I/O brackets never establish one device read per key.

@@ -1140,9 +1140,11 @@ class AggregateMetricCut(unittest.TestCase):
     generation counter or a five-partition population.
     """
 
-    def scrape(self, *, reads=10, connects=1, keyspace='store', db='store', extra=''):
+    def scrape(self, *, reads=10, connects=1, keyspace='store', db='store', extra='',
+               watermark=7):
         db_label = f',db="{db}"' if db else ''
         return '\n'.join([
+            f'last_executed_checkpoint {watermark}',
             f'tidehunter_nvmeof_live_completed_read_ops_total {reads}',
             'tidehunter_nvmeof_live_completed_read_bytes_total 4096',
             'tidehunter_nvmeof_live_read_io_samples_total 4',
@@ -1161,7 +1163,8 @@ class AggregateMetricCut(unittest.TestCase):
             'index_blob_cache_fills 1',
         ]) + '\n' + extra
 
-    def wait(self, texts, *, remote=True, namespaces={'live/store'}, budget=1):
+    def wait(self, texts, *, remote=True, namespaces={'live/store'}, budget=1,
+             baseline=None, tip=7, observations=None):
         clock = [10.]
         def sleep(seconds):
             clock[0] += seconds
@@ -1179,7 +1182,8 @@ class AggregateMetricCut(unittest.TestCase):
             destination = Path(directory) / 'final.prom'
             try:
                 return run.wait_for_final_metrics(object(), [], 'unused', set(namespaces),
-                    remote=remote, end=10 + budget, destination=destination)
+                    remote=remote, end=10 + budget, destination=destination,
+                    baseline=baseline, tip=tip, observations=observations)
             finally:
                 self.last_retained = destination.read_text() if destination.exists() else None
 
@@ -1224,8 +1228,9 @@ class AggregateMetricCut(unittest.TestCase):
                                {'live/store'}, remote=True)
 
     def test_legacy_generation_counters_are_not_required_or_accepted(self):
-        text, cut = self.wait([self.scrape(), self.scrape(reads=11)])
+        text, cut = self.wait([self.scrape(reads=11)], baseline=self.scrape())
         self.assertEqual(cut['status'], 'post-certified-scrape')
+        self.assertEqual(cut['baseline_scope'], analyze.PRE_CERTIFICATION_BASELINE)
         self.assertEqual(cut['baseline']['live']['completed_read_ops'], 10)
         self.assertEqual(cut['final']['live']['completed_read_ops'], 11)
         self.assertEqual(self.last_retained, text)
@@ -1238,23 +1243,61 @@ class AggregateMetricCut(unittest.TestCase):
         baseline = analyze.metric_cut(analyze.parse_metrics(self.scrape()), {'live/store'}, remote=True)
         final = analyze.metric_cut(analyze.parse_metrics(self.scrape(reads=11)), {'live/store'}, remote=True)
         cut = dict(status='post-certified-scrape', required_namespaces=['live/store'],
-                   baseline=baseline, final=final)
+                   baseline=baseline, final=final,
+                   baseline_scope=analyze.PRE_CERTIFICATION_BASELINE)
         values = analyze.parse_metrics(self.scrape(reads=11))
         analyze.validate_final_metric_cut(values, {'live/store'}, cut, remote=True)
         for change in (dict(required_namespaces=[]), dict(status='old'),
-                       dict(baseline=dict(live=baseline['live']))):
+                       dict(baseline=dict(live=baseline['live'])),
+                       dict(baseline_scope='first post-certification scrape')):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 analyze.validate_final_metric_cut(values, {'live/store'}, cut | change, remote=True)
 
+    def test_remote_cut_requires_a_pre_certification_baseline(self):
+        with self.assertRaisesRegex(ValueError, 'pre-certification baseline'):
+            self.wait([self.scrape(reads=11)])
+
     def test_wait_retains_the_last_real_response_on_no_progress(self):
         with self.assertRaises(TimeoutError):
-            self.wait([self.scrape(), self.scrape()], budget=0.5)
+            self.wait([self.scrape(), self.scrape()], baseline=self.scrape(), budget=0.5)
         self.assertEqual(self.last_retained, self.scrape())
+
+    def test_final_scrape_below_the_certified_tip_is_not_accepted(self):
+        with self.assertRaises(TimeoutError):
+            self.wait([self.scrape(watermark=6, reads=11)], baseline=self.scrape(), budget=0.5)
+        with self.assertRaisesRegex(RuntimeError, 'passed the certified tip'):
+            self.wait([self.scrape(watermark=8, reads=11)], baseline=self.scrape(), budget=0.5)
+
+    def test_final_scrape_regression_fails_the_cut(self):
+        with self.assertRaisesRegex(ValueError, 'regressed'):
+            self.wait([self.scrape(reads=9)], baseline=self.scrape())
+
+    def test_timeout_record_states_available_without_an_advance(self):
+        observations = []
+        with self.assertRaisesRegex(TimeoutError, 'observation\\(s\\), 0 unavailable'):
+            self.wait([self.scrape()], baseline=self.scrape(), budget=0.5,
+                      observations=observations)
+        self.assertTrue(observations[0]['live_available'])
+
+    def test_timeout_record_states_an_unavailable_cut(self):
+        observations = []
+        unavailable = self.scrape(keyspace='other', db='other')
+        with self.assertRaisesRegex(TimeoutError, 'observation\\(s\\), [1-9]\\d* unavailable'):
+            self.wait([unavailable], baseline=self.scrape(), budget=0.5,
+                      observations=observations)
+        self.assertTrue(observations[0]['unavailable'])
+
+    def test_observation_record_is_bounded(self):
+        text, cut = self.wait([self.scrape()] * 200 + [self.scrape(reads=11)],
+                              baseline=self.scrape(), budget=30)
+        self.assertEqual(len(cut['observations']), run.FINAL_METRIC_OBSERVATION_LIMIT)
+        self.assertEqual(cut['final']['live']['completed_read_ops'], 11)
 
     def test_missing_coordinator_namespace_is_retried_not_accepted(self):
         with self.assertRaises(TimeoutError):
-            self.wait([self.scrape(keyspace='other', db='other'), self.scrape(keyspace='other', db='other')],
-                      namespaces={'live/store'}, budget=0.5)
+            self.wait([self.scrape(keyspace='other', db='other'),
+                       self.scrape(keyspace='other', db='other')],
+                      baseline=self.scrape(), namespaces={'live/store'}, budget=0.5)
         self.assertEqual(self.last_retained, self.scrape(keyspace='other', db='other'))
 
     def test_native_cut_needs_no_live_family(self):
@@ -1272,6 +1315,80 @@ class AggregateMetricCut(unittest.TestCase):
             {'live/checkpoints', 'live/store/perpetual', 'live/store/epoch_1'})
         with self.assertRaises(ValueError):
             run.live_metric_namespaces(schema, 2)
+
+
+class FreshnessFailureRecord(unittest.TestCase):
+    def test_a_failed_gate_saves_its_bounded_observations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text = 'last_executed_checkpoint 1\n'
+            owned = SimpleNamespace(root=root, start=lambda *args, **kwargs: object())
+            def refuse(*args, **kwargs):
+                kwargs['observations'].append(dict(
+                    seconds=0.5, live_available=True, keyspaces=['store']))
+                raise TimeoutError(
+                    'final metrics freshness exceeded original replay deadline: '
+                    '1 observation(s), 0 unavailable, last []')
+            with patch.object(run, 'sample', return_value={'pid': 1, 'exited': False}), \
+                    patch.object(run, 'host_sample', return_value={}), \
+                    patch.object(run.checkpoint, 'configuration',
+                                 return_value={'metrics-address': 'unused',
+                                               'json-rpc-address': 'unused'}), \
+                    patch.object(run.checkpoint, 'wait_for_rpc_indexes',
+                                 return_value=(text, {})), \
+                    patch.object(run.checkpoint, 'rpc',
+                                 return_value={'digest': 'digest',
+                                               'sequenceNumber': 1, 'epoch': 0}), \
+                    patch.object(run.deployment, 'schemas',
+                                 return_value={'live/store': {},
+                                               'live/store/epoch_0': {}}), \
+                    patch.object(run.urllib.request, 'urlopen',
+                                 side_effect=lambda *a, **k: io.BytesIO(text.encode())), \
+                    patch.object(run, 'wait_for_final_metrics', side_effect=refuse):
+                with self.assertRaisesRegex(TimeoutError, '1 observation'):
+                    run.replay(owned, 'unused', root, 'remote', 1, 'digest',
+                               {'SUI_SHARDED_WAL_SCHEMA_OUTPUT': str(root / 'schema')},
+                               [], 30)
+            record = json.loads((root / 'remote-freshness.json').read_text())
+            self.assertEqual(record['status'], 'failed')
+            self.assertEqual(record['tip'], 1)
+            self.assertIn('1 observation', record['failure'])
+            self.assertTrue(record['observations'][0]['live_available'])
+
+    def test_replay_passes_the_last_replay_scrape_below_the_certified_tip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scrapes = ['last_executed_checkpoint 0\n', 'last_executed_checkpoint 1\n',
+                       'last_executed_checkpoint 2\n', 'last_executed_checkpoint 2\n']
+            seen = {}
+            def refuse(*args, **kwargs):
+                seen.update(baseline=kwargs['baseline'], tip=kwargs['tip'])
+                raise TimeoutError(
+                    'final metrics freshness exceeded original replay deadline: '
+                    '0 observation(s), 0 unavailable, last []')
+            owned = SimpleNamespace(root=root, start=lambda *args, **kwargs: object())
+            with patch.object(run, 'sample', return_value={'pid': 1, 'exited': False}), \
+                    patch.object(run, 'host_sample', return_value={}), \
+                    patch.object(run.checkpoint, 'configuration',
+                                 return_value={'metrics-address': 'unused',
+                                               'json-rpc-address': 'unused'}), \
+                    patch.object(run.checkpoint, 'wait_for_rpc_indexes',
+                                 return_value=(scrapes[-1], {})), \
+                    patch.object(run.checkpoint, 'rpc',
+                                 return_value={'digest': 'digest',
+                                               'sequenceNumber': 2, 'epoch': 0}), \
+                    patch.object(run.deployment, 'schemas',
+                                 return_value={'live/store': {},
+                                               'live/store/epoch_0': {}}), \
+                    patch.object(run.urllib.request, 'urlopen',
+                                 side_effect=[io.BytesIO(text.encode()) for text in scrapes]), \
+                    patch.object(run, 'wait_for_final_metrics', side_effect=refuse):
+                with self.assertRaisesRegex(TimeoutError, '0 observation'):
+                    run.replay(owned, 'unused', root, 'remote', 2, 'digest',
+                               {'SUI_SHARDED_WAL_SCHEMA_OUTPUT': str(root / 'schema')},
+                               [], 30)
+            self.assertEqual(seen['tip'], 2)
+            self.assertEqual(seen['baseline'], scrapes[1])
 
 
 class EvidenceBoundaries(unittest.TestCase):
@@ -1476,9 +1593,12 @@ class EvidenceBoundaries(unittest.TestCase):
                 current = analyze.metric_cut(analyze.parse_metrics(text), {'live/db'}, remote=remote)
                 baseline = analyze.metric_cut(analyze.parse_metrics(scrape(9) if remote else text),
                                               {'live/db'}, remote=remote) if remote else current
-                return dict(status='post-certified-scrape', required_namespaces=['live/db'],
-                            baseline=baseline, final=current, observations=[], seconds=0.,
-                            unavailable_observations=0)
+                cut = dict(status='post-certified-scrape', required_namespaces=['live/db'],
+                           baseline=baseline, final=current, observations=[], seconds=0.,
+                           unavailable_observations=0)
+                if remote:
+                    cut['baseline_scope'] = analyze.PRE_CERTIFICATION_BASELINE
+                return cut
             native_text = 'last_executed_checkpoint 1\n'
             def replay_for(cut):
                 return dict(completed_checkpoint_digest='tip', elapsed_seconds_including_startup=2,

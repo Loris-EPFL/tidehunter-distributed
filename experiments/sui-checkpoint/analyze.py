@@ -361,6 +361,12 @@ class MetricCutUnavailable(ValueError):
     """A transiently incomplete scrape; the final-cut wait retries this only."""
 
 
+# A remote final cut is compared with the last replay scrape, never with the
+# first post-certification scrape: a full replay finishes before certification,
+# so an idle node has no later counter to advance.
+PRE_CERTIFICATION_BASELINE = 'pre-certification replay scrape'
+
+
 def metric_cut(values, namespaces, *, remote):
     """Decode one scrape into the aggregate live and coordinator populations."""
     live = live_nvmeof_stats(values)
@@ -404,6 +410,8 @@ def validate_final_metric_cut(values, namespaces, cut, *, remote):
             cut.get('required_namespaces') != sorted(namespaces) or
             cut.get('final') != current):
         raise ValueError('final metric cut population/status differs')
+    if remote and cut.get('baseline_scope') != PRE_CERTIFICATION_BASELINE:
+        raise ValueError('remote final metric cut baseline is not the pre-certification replay scrape')
     baseline = cut.get('baseline')
     if not isinstance(baseline, dict) or set(baseline) != {'live', 'coordinator'}:
         raise ValueError('final metric cut baseline is missing')
