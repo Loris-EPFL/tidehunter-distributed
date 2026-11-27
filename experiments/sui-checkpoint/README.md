@@ -1030,33 +1030,26 @@ exported before the exact-owned fleet termination attempt.
   waiting, not storage persistence. Append, file/namespace synchronization,
   checkpoint work and durable-but-unpublished waiting use separate counters.
   These nested/concurrent sums must not be added into a wall-time decomposition.
-* `read_profile_selected/completed/errors/returned` bind completed read groups and
-  actor-only returns. `read_profile_inline_completed/inline_ns` separate caller-owned
-  scalar progress; `read_profile_actor_completed` is the actor population.
-  Do not divide actor queue/service timing by combined inline/actor completions.
-  Successful-group count is completed minus errors; actor return uses returned
-  count. Server coverage uses `server_response_recheck_samples`. Dropped replies
-  need not have return samples. Server/codec spans nest within exchange/service.
-  All sums can overlap concurrent requests; do not add them to elapsed replay.
-  `read_rpcs` counts submitted groups; negotiated limits can split one group into
-  several wire requests. `read_profile_wire_requests` counts those wire requests
-  in successful sampled profiles, not in unsampled traffic.
-* `write_durable_batches` distinguishes storage progress from acknowledged
-  `write_concurrent_completed`. Admission, pending/queued/byte peaks and
-  `write_peak_inflight_nodes` expose whether application writes actually overlap.
+* `read_profile_selected/completed/errors` bind the sampled completed read
+  groups; `read_profile_inline_completed/inline_ns` separate caller-owned scalar
+  progress, and `read_profile_nvme_flight_ns/flight_count` the owner flight
+  time. All sums can overlap concurrent requests; do not add them to elapsed
+  replay. `read_rpcs` counts submitted groups; negotiated limits can split one
+  group into several owner requests, and no separate wire-request counter exists.
+* `write_append_requests` and `write_commit_calls` distinguish admission from
+  acknowledged durable commits. `write_concurrent_admitted`, pending/queued/byte
+  peaks expose whether application writes actually overlap; there is no separate
+  completed-concurrency or peak-inflight-node counter.
   These peaks are cumulative, and separately scraped counters are not atomic
   snapshots. The local implementation and remaining locks are documented in
   [the concurrency cutover](../../docs/distributed/CONCURRENT_AUTHORITY_AND_TRANSPORT_2026-10-13.md).
-* `read_profile_transport_*` covers connection progress sweeps with sampled
-  requests queued/active. It can include interleaved unprofiled work. Queue,
-  submit and retire spans have separate sample counts because frames can cross
-  the sample boundary. CQ clocks/counts describe local progress calls, not
-  per-RPC network RTT. Sampling turns these clocks off when sampled work ends.
-  The local monitor adds no diagnostic RPC or scrape-time owner/connection lock.
-  Availability flags distinguish absent server/progress data and TCP's absent
-  fabric CQ data; the analyzer masks unavailable timings instead of reporting
-  zero latency. Qualification requires successful profile/server/transport
-  coverage when enabled and actual timed CQ calls for fabric transports.
+* `read_profile_transport_*`/`read_profile_server_*` availability flags are
+  exported as capability zeros; the engine no longer exports read transport
+  stage clocks, so the analyzer masks them instead of reporting zero latency.
+  Qualification requires successful sampled completions when read profiling is
+  enabled. Write-profile servers/client/transport clocks stay conditional on a
+  selected write profile, and their availability flags distinguish absent data
+  from a measured zero.
 
 `experiment/results.json`, every raw log/metric/sample/schema/audit,
 `evidence.tar.gz` and its receipt are retained. Bulk DBs/WALs and private TLS

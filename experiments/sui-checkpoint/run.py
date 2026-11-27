@@ -7,7 +7,6 @@ owners is the campaign shape; the coordinator has no per-partition counter.
 import argparse
 import ctypes
 import fcntl
-import math
 import json
 import os
 from pathlib import Path
@@ -519,19 +518,12 @@ def validate_profiles(counters, databases, read_limit, write_limit):
             if stats['read_rpcs'] == 0:
                 if any(stats[key] != 0 for key in (
                         'read_profile_selected', 'read_profile_completed',
-                        'read_profile_errors', 'read_profile_wire_requests')):
+                        'read_profile_errors')):
                     raise ValueError('zero read-RPC population contains profile observations')
             elif (not 0 < stats['read_profile_selected'] <= read_limit
                     or not 0 < stats['read_profile_completed'] <= read_limit
-                    or stats['read_profile_wire_requests'] <= 0
-                    or stats['read_profile_errors'] != 0
-                    or stats.get('read_profile_server_available') != 1
-                    or stats.get('read_profile_transport_progress_available') != 1):
-                raise ValueError('bounded read profile lacks successful RPC/server/transport observations')
-            if (is_fabric_transport(databases[name]['tls']['transport']) and stats['read_rpcs'] > 0
-                    and (stats.get('read_profile_transport_cq_available') != 1
-                         or (stats.get('read_profile_transport_cq_timed_calls') or 0) <= 0)):
-                raise ValueError('fabric completion-queue profiling is unavailable')
+                    or stats['read_profile_errors'] != 0):
+                raise ValueError('bounded read profile lacks successful sampled observations')
         expected = len(databases[name]['endpoints'])
         if stats['write_profile_expected_connections'] != expected:
             raise ValueError('write profiling does not cover the configured append owners')
@@ -570,34 +562,68 @@ def validate_native_profiles(counters, limit):
             raise ValueError('native persistence profile is incomplete or contains failed barriers')
 
 
-def validate_checkpoint_diagnostics(counters, write_limit):
-    from analyze import CHECKPOINT_DIAGNOSTIC_PHASES, CHECKPOINT_HISTORY_COUNTERS
-    enabled = int(write_limit > 0)
-    def count(value):
-        return (not isinstance(value, bool) and isinstance(value, (int, float))
-                and math.isfinite(value) and value >= 0 and value == int(value))
-    for stats in counters.values():
-        if stats.get('write_checkpoint_diagnostics_available') != enabled:
-            raise ValueError('checkpoint diagnostic availability differs from selected population')
-        records = stats.get('write_checkpoint_diagnostic_records')
-        dropped = stats.get('write_checkpoint_diagnostic_dropped_records')
-        if not count(records) or not count(dropped) or dropped > records or (not enabled and records):
-            raise ValueError('checkpoint diagnostic record/drop cardinality is invalid')
-        for phase in CHECKPOINT_DIAGNOSTIC_PHASES:
-            prefix = 'write_checkpoint_diagnostic_' + phase
-            samples, total = stats.get(prefix + '_count'), stats.get(prefix + '_ns')
-            if (not count(samples) or samples > records or (not enabled and samples)
-                    or (enabled and (not count(total) or (samples == 0 and total != 0)))
-                    or (not enabled and total not in (None, 0))):
-                raise ValueError('checkpoint diagnostic phase population/span is invalid: ' + phase)
-        history_count = stats.get('write_checkpoint_diagnostic_history_io_checkpoint_count')
-        if (not count(history_count) or history_count > records or (not enabled and history_count)):
-            raise ValueError('checkpoint history IO population is invalid')
-        for counter in CHECKPOINT_HISTORY_COUNTERS:
-            total = stats.get('write_checkpoint_diagnostic_' + counter)
-            if ((enabled and (not count(total) or (history_count == 0 and total != 0)))
-                    or (not enabled and total not in (None, 0))):
-                raise ValueError('checkpoint history IO counter unavailable or malformed: ' + counter)
+# Adapter counters every selected database must publish on the measured node.
+# Each name has a current engine producer; the read submit/detached/finish
+# split, the durable-batch and completed-concurrency counts, the foreground
+# checkpoint split and the read-profile wire count were removed from the
+# engine and are not required here.
+REQUIRED_ADAPTER_STATS = frozenset((
+    'read_calls', 'read_keys', 'read_rpcs', 'cache_hits', 'cache_misses',
+    'remote_timing_available', 'write_gate_wait_calls', 'scalar_read_calls',
+    'bulk_read_calls', 'write_commit_calls',
+    'scalar_read_ns_available', 'read_index_ns_available',
+    'write_append_requests', 'write_concurrent_admitted',
+    'write_concurrent_pending_peak',
+    'read_profile_limit', 'read_profile_selected', 'read_profile_completed',
+    'read_profile_errors', 'read_profile_inline_completed', 'read_profile_inline_ns',
+    'read_profile_actor_completed', 'cache_inserts',
+    'write_checkpoint_ns', 'write_checkpoint_count',
+    'write_durable_receipt_publication_blocked_ns',
+    'write_durable_receipt_publication_blocked_batches',
+    'write_durable_receipt_publication_waiting_batches',
+    'write_durable_receipt_publication_waiting_peak',
+    'write_profile_limit', 'write_profile_available',
+    'write_profile_expected_connections', 'write_profile_captured_connections',
+    'write_profile_sampled_requests'))
+
+
+def validate_final_metrics(remote_values, native_values, foreground_values, *,
+                           schema, databases, read_limit, write_limit,
+                           native_write_limit):
+    """Validate both final scrapes and the foreground checkpoint counters.
+
+    `remote_values` and `native_values` are the parsed final scrapes of each
+    measured node; `foreground_values` maps `native` and `remote` to the
+    parsed foreground scrape. The remote scrape is the measured node, so a
+    selected database that publishes no adapter counters there fails the cell.
+    """
+    from analyze import adapter_stats, checkpoint_sequence_cache_stats
+    counters = adapter_stats(remote_values)
+    if counters and (set(counters) != set(schema)
+            or any(not REQUIRED_ADAPTER_STATS.issubset(stats)
+                   for stats in counters.values())
+            or any(stats['remote_timing_available'] != 1
+                   or stats['read_profile_limit'] != read_limit
+                   or stats['write_profile_limit'] != write_limit
+                   for stats in counters.values())):
+        raise ValueError('API/key/RPC/cache/stage instrumentation lacks selected DB coverage')
+    if counters and any(stats['scalar_read_ns_available'] != int(read_limit > 0)
+           or stats['read_index_ns_available'] != int(read_limit > 0)
+           for stats in counters.values()):
+        raise ValueError('scalar/index diagnostic timing availability differs from selected population')
+    if counters:
+        validate_profiles(counters, databases, read_limit, write_limit)
+    native_counters = adapter_stats(native_values)
+    if native_counters and (set(native_counters) != set(schema) or any(
+            stats.get('remote_timing_available') != 0 or 'write_gate_wait_calls' not in stats
+            for stats in native_counters.values())):
+        raise ValueError('native write-gate timing instrumentation is unavailable')
+    if native_counters:
+        validate_native_profiles(native_counters, native_write_limit)
+    for mode in ('native', 'remote'):
+        if not checkpoint_sequence_cache_stats(foreground_values[mode]):
+            raise ValueError('checkpoint sequence-cache counters are unavailable')
+    return counters, native_counters
 
 
 def external_index_rows_error(database):
@@ -1507,45 +1533,13 @@ def main():
                        result['remote']['final_metrics_freshness']['required_namespaces'], remote=True)
         counters = adapter_stats(metrics(output/'remote-final.prom'))
         result['adapter_metrics_available'] = bool(counters)
-        required = {'read_calls','read_keys','read_rpcs','cache_hits','cache_misses',
-                    'remote_timing_available','write_gate_wait_calls','scalar_read_calls','bulk_read_calls','write_commit_calls',
-                    'scalar_read_ns_available','read_index_ns_available',
-                    'read_submit_calls','read_detached_wait_calls','read_finish_calls',
-                    'write_append_requests','write_peak_inflight_nodes','write_durable_batches',
-                    'write_concurrent_admitted','write_concurrent_completed','write_concurrent_pending_peak',
-                    'read_profile_limit','read_profile_selected','read_profile_completed','read_profile_errors',
-                    'read_profile_inline_completed','read_profile_inline_ns','read_profile_actor_completed',
-                    'read_profile_wire_requests','cache_inserts',
-                    'write_checkpoint_ns','write_checkpoint_count',
-                    'write_foreground_checkpoint_ns','write_foreground_checkpoint_count',
-                    'write_durable_receipt_publication_blocked_ns','write_durable_receipt_publication_blocked_batches',
-                    'write_durable_receipt_publication_waiting_batches','write_durable_receipt_publication_waiting_peak',
-                    'write_profile_limit','write_profile_available','write_profile_expected_connections',
-                    'write_profile_captured_connections','write_profile_sampled_requests'}
-        if counters and (set(counters) != set(schema)
-                or any(not required.issubset(stats) for stats in counters.values())
-                or any(stats['remote_timing_available'] != 1
-                       or stats['read_profile_limit'] != args.read_profile_limit
-                       or stats['write_profile_limit'] != args.write_profile_limit
-                       for stats in counters.values())):
-            raise ValueError('API/key/RPC/cache/stage instrumentation lacks selected DB coverage')
-        if counters and any(stats['scalar_read_ns_available'] != int(args.read_profile_limit > 0)
-               or stats['read_index_ns_available'] != int(args.read_profile_limit > 0)
-               for stats in counters.values()):
-            raise ValueError('scalar/index diagnostic timing availability differs from selected population')
-        if counters:
-            validate_profiles(counters, config['databases'], args.read_profile_limit, args.write_profile_limit)
-            validate_checkpoint_diagnostics(counters, args.write_profile_limit)
-        native_counters = adapter_stats(metrics(output/'native-final.prom'))
-        if native_counters and (set(native_counters) != set(schema) or any(
-                stats.get('remote_timing_available') != 0 or 'write_gate_wait_calls' not in stats
-                for stats in native_counters.values())):
-            raise ValueError('native write-gate timing instrumentation is unavailable')
-        if native_counters:
-            validate_native_profiles(native_counters, args.native_write_profile_limit)
-        for mode in ('native', 'remote'):
-            if not checkpoint_sequence_cache_stats(metrics(output / f'{mode}-foreground.prom')):
-                raise ValueError('checkpoint sequence-cache counters are unavailable')
+        validate_final_metrics(
+            metrics(output/'remote-final.prom'), metrics(output/'native-final.prom'),
+            {mode: metrics(output / f'{mode}-foreground.prom')
+             for mode in ('native', 'remote')},
+            schema=schema, databases=config['databases'],
+            read_limit=args.read_profile_limit, write_limit=args.write_profile_limit,
+            native_write_limit=args.native_write_profile_limit)
         result['audit']=audit(root,output,bins,schema,native_root,remote_root,config_path,env)
         result['audit_scope'] = ('re-open of both stopped stores after a short bound; shards stayed live'
                                  if short_run else 're-open of both stopped stores; shards stayed live')

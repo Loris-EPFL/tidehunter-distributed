@@ -24,15 +24,6 @@ sys.dont_write_bytecode = True
 import tarfile
 import build
 
-CHECKPOINT_DIAGNOSTIC_PHASES = (
-    'pressure_wait', 'drain', 'existing_capture_wait', 'new_capture_wait',
-    'staging_manifest', 'receipt_history', 'receipt_history_sync', 'node_prefix_wait',
-    'index_prepare', 'index_persist', 'metadata_install', 'owner_adoption', 'obsolete_cleanup')
-CHECKPOINT_HISTORY_COUNTERS = (
-    'history_stream_opens', 'history_previous_slot_reads', 'history_receipt_write_ops',
-    'history_receipt_write_bytes', 'history_buffer_flushes', 'history_node_write_ops',
-    'history_node_write_bytes', 'history_sync_operations')
-
 
 def metrics(path):
     return parse_metrics(path.read_text())
@@ -84,6 +75,8 @@ LIVE_NVMEOF_PREFIX = 'tidehunter_nvmeof_live_'
 # Gauges in the aggregate live family; every other aggregate is monotone.
 LIVE_NVMEOF_GAUGES = frozenset(('target_observed_partitions', 'target_fixture_partitions',
     'target_owned_namespaces', 'lane_inflight_requests_max', 'lane_inflight_operations_max'))
+# Per-database gauges that report a pool high-water mark, not a count.
+LIVE_NVMEOF_MAXIMA = frozenset(('lane_inflight_requests_max', 'lane_inflight_operations_max'))
 
 
 def _labels(metric):
@@ -94,21 +87,34 @@ def _labels(metric):
 def live_nvmeof_stats(values):
     """Decode the pull-only aggregate NVMe-oF live family.
 
-    `tidehunter/src/distributed/nvmeof/live_prometheus.rs` exports one unlabeled
-    family per host: namespace identities stay evidence, never metric labels.
-    There is no per-partition or per-sample-availability counter, so this
-    decoder never invents one.
+    `tidehunter/src/distributed/nvmeof/live_prometheus.rs` exports the family
+    unlabeled, but Sui registers one metrics registry per database with the
+    constant `db` label (Sui `crates/typed-store/src/tidehunter_util.rs`,
+    `new_db_registry`), so one scrape carries the family once per database.
+    Namespace and partition identities stay evidence, never metric labels.
+    The counters are summed across `db`, which is the host total both the
+    admission cell and the owner-fetch fraction measure. There is no
+    per-sample-availability counter, so this decoder never invents one.
     """
     counters = {}
+    seen = set()
     for metric, value in values.items():
         if not metric.startswith(LIVE_NVMEOF_PREFIX):
             continue
-        name = metric[len(LIVE_NVMEOF_PREFIX):]
-        if not re.fullmatch(r'[a-z0-9_]+', name) or name in counters:
+        head, brace, encoded = metric.partition('{')
+        name = head[len(LIVE_NVMEOF_PREFIX):]
+        labels = _labels(encoded) if brace else {}
+        database = labels.pop('db', None) if labels else None
+        if (not re.fullmatch(r'[a-z0-9_]+', name) or labels
+                or (name, database) in seen):
             raise ValueError('invalid or duplicate aggregate live NVMe-oF metric')
         if not math.isfinite(value) or value < 0:
             raise ValueError('invalid aggregate live NVMe-oF value')
-        counters[name] = value
+        seen.add((name, database))
+        pooled = counters.get(name, 0) + value
+        if name in LIVE_NVMEOF_MAXIMA and name in counters:
+            pooled = max(counters[name], value)
+        counters[name] = pooled
     return dict(available=bool(counters), counters=counters,
         read_io_samples=counters.get('read_io_samples_total'),
         read_seconds=counters.get('read_io_seconds_total'),
@@ -121,7 +127,8 @@ def live_nvmeof_stats(values):
         namespace_connects=counters.get('namespace_connects_total'),
         errors=counters.get('errors_total'),
         observed_partitions=counters.get('target_observed_partitions'),
-        scope='aggregate per-host live counters, no namespace or partition labels; '
+        scope='aggregate per-host live counters, summed over the per-database `db` '
+              'label and carrying no namespace or partition label; '
               'read_io_seconds includes queue, fabric, target and storage; not a per-value service time')
 
 
@@ -447,12 +454,6 @@ def adapter_stats(values):
                         unavailable |= not stats.get(prefix + 'cq_timed_calls')
                 if unavailable:
                     stats[name] = None
-            if (name.startswith('write_checkpoint_diagnostic_') and name.endswith('_ns')
-                    and stats.get('write_checkpoint_diagnostics_available') != 1):
-                stats[name] = None
-            if (name in {'write_checkpoint_diagnostic_' + counter for counter in CHECKPOINT_HISTORY_COUNTERS}
-                    and stats.get('write_checkpoint_diagnostics_available') != 1):
-                stats[name] = None
             if name.startswith('native_profile_') and name.endswith('_ns') and stats.get('native_profile_available') != 1:
                 stats[name] = None
     return result
@@ -675,16 +676,15 @@ def multiplexed_profile_mean(stats, field, denominator, flags=(), prefix=''):
 
 
 def adapter_means(stats):
-    """Use observed inline/actor populations, never guess historical splits.
+    """Use observed populations of the counters the engine exports.
 
-    Actor queue/service sums omit failed profiles, but errors are not split by
-    path. Their means are unavailable on any sampled error. Inline elapsed
-    includes failed calls. Wire/server sums describe successful profiles only,
-    not all read_rpcs or all returned keys.
+    The read profile exports the completed sampled population, an inline
+    population and an NVMe flight population. It exports no actor queue,
+    service or return, codec, exchange, server or transport stage clocks, so
+    no mean is invented for those removed stages.
     """
     result = {}
-    stages = {'write_gate_wait', 'scalar_read', 'bulk_read', 'write_commit',
-              'read_submit', 'read_admission_wait', 'read_detached_wait', 'read_finish'}
+    stages = {'write_gate_wait', 'scalar_read', 'bulk_read', 'write_commit'}
     stages.update(name[:-3] for name in stats if name.endswith('_ns') and name[:-3] + '_calls' in stats)
     for stage in sorted(stages):
         flags = (('write_profile_available',) if stage.startswith('write_profile_') else
@@ -693,43 +693,16 @@ def adapter_means(stats):
         if stage in ('scalar_read', 'read_index'):
             flags += (stage + '_ns_available',)
         result[stage] = mean_span(stats, stage + '_ns', stage + '_calls', flags)
-    profile_denominators = dict(
-        inline='inline_completed', actor_queue='actor_completed',
-        actor_service='actor_completed', actor_return='returned',
-        request_encode='wire_requests', exchange='wire_requests',
-        request_send='wire_requests', response_header='wire_requests',
-        response_body='wire_requests',
-        response_decode='wire_requests', record_verify='wire_requests',
-        server_handler='wire_requests', server_inventory_wait='wire_requests',
-        server_authority_lookup='wire_requests', server_record_read='wire_requests',
-        server_response_recheck_wait='server_response_recheck_samples',
-        server_response_recheck='server_response_recheck_samples',
-        transport_output_queue='transport_output_queue_samples',
-        transport_output_submit='transport_output_submit_samples',
-        transport_output_retire='transport_output_retire_samples',
-        transport_cq_call='transport_cq_timed_calls')
-    for stage, denominator in profile_denominators.items():
-        flags = ['read_profile_enabled']
-        if stage.startswith('server_'):
-            flags.append('read_profile_server_available')
-        if stage.startswith('transport_'):
-            flags.append('read_profile_transport_progress_available')
-        if stage.startswith('transport_cq_'):
-            flags.append('read_profile_transport_cq_available')
-        row = multiplexed_profile_mean(
-            stats, stage + '_ns', denominator, flags, prefix='read_profile_')
-        if stage in ('actor_queue', 'actor_service') and stats.get('read_profile_errors') != 0:
-            row.update(unavailable('sampled errors absent or nonzero; successful actor population cannot be isolated'))
-        result['read_profile_' + stage] = row
+    for stage, denominator in (('inline', 'inline_completed'),
+                               ('nvme_flight', 'nvme_flight_count')):
+        result['read_profile_' + stage] = mean_span(
+            stats, 'read_profile_' + stage + '_ns', 'read_profile_' + denominator,
+            ('read_profile_enabled',))
     for stage, denominator in (
             ('write_checkpoint', 'write_checkpoint_count'),
-            ('write_foreground_checkpoint', 'write_foreground_checkpoint_count'),
+            ('write_background_checkpoint', 'write_background_checkpoint_suffix_batches'),
             ('write_durable_receipt_publication_blocked', 'write_durable_receipt_publication_blocked_batches')):
         result[stage] = mean_span(stats, stage + '_ns', denominator, ('remote_timing_available',))
-    for phase in CHECKPOINT_DIAGNOSTIC_PHASES:
-        stage = 'write_checkpoint_diagnostic_' + phase
-        result[stage] = mean_span(stats, stage + '_ns', stage + '_count',
-                                  ('write_checkpoint_diagnostics_available',))
     write_denominators = {
         **{f'connection_append_{name}': 'sampled_requests' for name in
            ('inventory_wait', 'inventory_residence', 'decode', 'group_build', 'wal', 'persist')},

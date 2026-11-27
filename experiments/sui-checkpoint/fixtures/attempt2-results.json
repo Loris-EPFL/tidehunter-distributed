@@ -1,0 +1,823 @@
+{
+ "build_manifest_sha256": "32b6b01719efee6c8c9cf6dfd0752f736c8578e7623f21e11ae4fcfa3bcf396f",
+ "cache": {
+  "coordinator_bytes": 0,
+  "shard_bytes": 0
+ },
+ "cell_id": "S1-0-native",
+ "checkpoint_digest": "H99wnyq8EhEWniD97rkYdVodnMs88dtpkpGEdhaJjt9N",
+ "checkpoint_limit": 3,
+ "deployment": {
+  "databases": {
+   "live/checkpoints": {
+    "endpoints": [
+     {
+      "address": "10.128.0.15:9400",
+      "partition": 0,
+      "server_name": "node-0"
+     },
+     {
+      "address": "10.128.0.20:9401",
+      "partition": 1,
+      "server_name": "node-1"
+     }
+    ],
+    "tls": {
+     "transport": {
+      "kind": "tcp"
+     }
+    }
+   },
+   "live/store/epoch_0": {
+    "endpoints": [
+     {
+      "address": "10.128.0.15:9402",
+      "partition": 0,
+      "server_name": "node-0"
+     },
+     {
+      "address": "10.128.0.20:9403",
+      "partition": 1,
+      "server_name": "node-1"
+     }
+    ],
+    "tls": {
+     "transport": {
+      "kind": "tcp"
+     }
+    }
+   },
+   "live/store/perpetual": {
+    "endpoints": [
+     {
+      "address": "10.128.0.15:9404",
+      "partition": 0,
+      "server_name": "node-0"
+     },
+     {
+      "address": "10.128.0.20:9405",
+      "partition": 1,
+      "server_name": "node-1"
+     }
+    ],
+    "tls": {
+     "transport": {
+      "kind": "tcp"
+     }
+    }
+   }
+  }
+ },
+ "disk": {
+  "final": {
+   "budget": {
+    "allocated_bytes": 3221295104,
+    "apparent_bytes": 9663723094,
+    "fraction": 0.16801992532142665,
+    "free_bytes": 57515339776,
+    "limit": 0.7,
+    "note": "projected peak is the larger of apparent and allocated bytes; stop when it exceeds the configured share of free space",
+    "projected_peak_bytes": 9663723094,
+    "within_limit": true
+   },
+   "databases": {
+    "live/checkpoints": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 16384,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 9592,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073758208,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221235064,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    },
+    "live/store/epoch_0": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 28672,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 19887,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073770496,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221245359,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    },
+    "live/store/perpetual": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 24576,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 17199,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073766400,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221242671,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    }
+   },
+   "fragment_bytes": 1073741824,
+   "free": {
+    "fragment_size": 4096,
+    "free_bytes": 57515339776,
+    "total_bytes": 85620473856
+   },
+   "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+   "sampled_unix_ns": 1795761916923213272,
+   "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+  },
+  "geometry": {
+   "fragment_bytes": 1073741824,
+   "matches_production": true,
+   "production_fragment_bytes": 1073741824
+  },
+  "samples": [
+   {
+    "unavailable": "database directory is absent: live/checkpoints"
+   },
+   {
+    "databases": {
+     "live/checkpoints": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 12288,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 8502,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073754112,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221233974,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     },
+     "live/store/epoch_0": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 20480,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 15667,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073762304,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221241139,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     },
+     "live/store/perpetual": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 16384,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 11480,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073758208,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221236952,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     }
+    },
+    "fragment_bytes": 1073741824,
+    "free": {
+     "fragment_size": 4096,
+     "free_bytes": 57522958336,
+     "total_bytes": 85620473856
+    },
+    "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+    "sampled_unix_ns": 1795761908321693112,
+    "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+   },
+   {
+    "databases": {
+     "live/checkpoints": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 16384,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 9592,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073758208,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221235064,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     },
+     "live/store/epoch_0": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 28672,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 19887,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073770496,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221245359,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     },
+     "live/store/perpetual": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 24576,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 17199,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073766400,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221242671,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     }
+    },
+    "fragment_bytes": 1073741824,
+    "free": {
+     "fragment_size": 4096,
+     "free_bytes": 57515339776,
+     "total_bytes": 85620473856
+    },
+    "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+    "sampled_unix_ns": 1795761916923213272,
+    "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+   }
+  ]
+ },
+ "durability": "native appended-frontier acknowledgement (RAM ack, Sui production tier)",
+ "live_transport": "rdma",
+ "native": {
+  "bound": 3,
+  "completed_window": {
+   "completed_checkpoint_delta": 3,
+   "note": "250 ms observation resolution; not individual checkpoint latency",
+   "sampled_checkpoints_per_second": 6.246525071117136,
+   "seconds": 0.4802670229999535,
+   "status": "short window; not steady state"
+  },
+  "disk_final": null,
+  "disk_samples": null,
+  "elapsed_seconds_including_startup": 7.251713278000011,
+  "exit_code": 0,
+  "final_metrics_freshness": {
+   "available": false,
+   "reason": "short replay: node exited at the inclusive bound; final metrics are the last live scrape and the state audit reopens the stopped stores",
+   "required_namespaces": [
+    "live/checkpoints",
+    "live/store/epoch_0",
+    "live/store/perpetual"
+   ],
+   "source": "last_live_scrape"
+  },
+  "final_metrics_source": "last_live_scrape",
+  "hold": null,
+  "host_after": {
+   "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 22000 20746 6857113 2054817 0 14593 2068338 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 21999 20746 6857112 2054814 192 14785 2067895 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+   "meminfo": "MemTotal:       125178604 kB\nMemFree:        98985640 kB\nMemAvailable:   120115304 kB\nBuffers:           38356 kB\nCached:         22162068 kB\nSwapCached:            0 kB\nActive:         20693996 kB\nInactive:        2882576 kB\nActive(anon):    1393264 kB\nInactive(anon):        0 kB\nActive(file):   19300732 kB\nInactive(file):  2882576 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:           5648108 kB\nWriteback:         81820 kB\nAnonPages:       1368596 kB\nMapped:           900276 kB\nShmem:             17112 kB\nKReclaimable:     173264 kB\nSlab:             287160 kB\nSReclaimable:     173264 kB\nSUnreclaim:       113896 kB\nKernelStack:        9808 kB\nPageTables:         8232 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1919284 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       28932 kB\nVmallocChunk:          0 kB\nPercpu:             6592 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:   1024000 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+   "swap_pages": {
+    "pswpin": 0,
+    "pswpout": 0
+   }
+  },
+  "host_before": {
+   "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 15920 19513 4115313 1127289 0 9659 1140809 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 15919 19513 4115312 1127285 0 9794 1140367 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+   "meminfo": "MemTotal:       125178604 kB\nMemFree:        118413384 kB\nMemAvailable:   120640824 kB\nBuffers:           38356 kB\nCached:          3281244 kB\nSwapCached:            0 kB\nActive:          1799204 kB\nInactive:        2876116 kB\nActive(anon):    1372840 kB\nInactive(anon):        0 kB\nActive(file):     426364 kB\nInactive(file):  2876116 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:            764800 kB\nWriteback:             0 kB\nAnonPages:       1349892 kB\nMapped:           899460 kB\nShmem:             17112 kB\nKReclaimable:     130472 kB\nSlab:             242180 kB\nSReclaimable:     130472 kB\nSUnreclaim:       111708 kB\nKernelStack:        9600 kB\nPageTables:         7664 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1919700 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       29348 kB\nVmallocChunk:          0 kB\nPercpu:             6592 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:   1030144 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+   "swap_pages": {
+    "pswpin": 0,
+    "pswpout": 0
+   }
+  },
+  "peak_sampled_rss_bytes": 20149579776,
+  "phase_timing": {
+   "after_first_execution_to_exit_upper_seconds": 1.8119652780000113,
+   "caveat": "execution START spacing, not checkpoint completion/service latency; includes scheduling/waiting",
+   "first_checkpoint": 0,
+   "first_log_to_first_execution_seconds": 5.439748,
+   "first_to_last_execution_start_seconds": 0.452221,
+   "last_checkpoint": 3,
+   "logged_execution_starts": 4,
+   "phase_note": "upper bound includes final execution, shutdown and exit polling; not completion latency or steady state",
+   "start_spacing_ms": {
+    "max": 449.815,
+    "p50": 1.6949999999999998,
+    "p95": 449.815,
+    "p99": 449.815
+   }
+  },
+  "process_io_final": {
+   "host": {
+    "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 22000 20746 6857113 2054817 0 14593 2068338 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 21999 20746 6857112 2054814 192 14785 2067895 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+    "meminfo": "MemTotal:       125178604 kB\nMemFree:        98985640 kB\nMemAvailable:   120115304 kB\nBuffers:           38356 kB\nCached:         22162068 kB\nSwapCached:            0 kB\nActive:         20693996 kB\nInactive:        2882576 kB\nActive(anon):    1393264 kB\nInactive(anon):        0 kB\nActive(file):   19300732 kB\nInactive(file):  2882576 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:           5648108 kB\nWriteback:         81820 kB\nAnonPages:       1368596 kB\nMapped:           900276 kB\nShmem:             17112 kB\nKReclaimable:     173264 kB\nSlab:             287160 kB\nSReclaimable:     173264 kB\nSUnreclaim:       113896 kB\nKernelStack:        9808 kB\nPageTables:         8232 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1919284 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       28932 kB\nVmallocChunk:          0 kB\nPercpu:             6592 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:   1024000 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+    "swap_pages": {
+     "pswpin": 0,
+     "pswpout": 0
+    }
+   },
+   "node": {
+    "exit_code": 0,
+    "exited": true,
+    "pid": 4600,
+    "unavailable": {
+     "process": "exited"
+    }
+   },
+   "seconds": 7.247500564000006,
+   "shards": []
+  }
+ },
+ "native_write_profile_limit": 0,
+ "read_profile_limit": 0,
+ "remote": {
+  "bound": 3,
+  "completed_window": {
+   "completed_checkpoint_delta": 3,
+   "note": "250 ms observation resolution; not individual checkpoint latency",
+   "sampled_checkpoints_per_second": 5.526679596247521,
+   "seconds": 0.5428214080000089,
+   "status": "short window; not steady state"
+  },
+  "disk_final": {
+   "budget": {
+    "allocated_bytes": 3221295104,
+    "apparent_bytes": 9663723094,
+    "fraction": 0.16801992532142665,
+    "free_bytes": 57515339776,
+    "limit": 0.7,
+    "note": "projected peak is the larger of apparent and allocated bytes; stop when it exceeds the configured share of free space",
+    "projected_peak_bytes": 9663723094,
+    "within_limit": true
+   },
+   "databases": {
+    "live/checkpoints": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 16384,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 9592,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073758208,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221235064,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    },
+    "live/store/epoch_0": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 28672,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 19887,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073770496,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221245359,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    },
+    "live/store/perpetual": {
+     "classes": {
+      "index_wal": {
+       "allocated_bytes": 1073741824,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221225472,
+       "apparent_fragment_slots": 3,
+       "files": 1
+      },
+      "other": {
+       "allocated_bytes": 24576,
+       "allocated_fragment_slots": 0,
+       "apparent_bytes": 17199,
+       "apparent_fragment_slots": 3,
+       "files": 4
+      }
+     },
+     "index_wal_files": 1,
+     "total": {
+      "allocated_bytes": 1073766400,
+      "allocated_fragment_slots": 1,
+      "apparent_bytes": 3221242671,
+      "apparent_fragment_slots": 6,
+      "files": 5
+     }
+    }
+   },
+   "fragment_bytes": 1073741824,
+   "free": {
+    "fragment_size": 4096,
+    "free_bytes": 57515339776,
+    "total_bytes": 85620473856
+   },
+   "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+   "sampled_unix_ns": 1795761916923213272,
+   "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+  },
+  "disk_samples": [
+   {
+    "unavailable": "database directory is absent: live/checkpoints"
+   },
+   {
+    "databases": {
+     "live/checkpoints": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 12288,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 8502,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073754112,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221233974,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     },
+     "live/store/epoch_0": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 20480,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 15667,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073762304,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221241139,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     },
+     "live/store/perpetual": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 16384,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 11480,
+        "apparent_fragment_slots": 2,
+        "files": 3
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073758208,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221236952,
+       "apparent_fragment_slots": 5,
+       "files": 4
+      }
+     }
+    },
+    "fragment_bytes": 1073741824,
+    "free": {
+     "fragment_size": 4096,
+     "free_bytes": 57522958336,
+     "total_bytes": 85620473856
+    },
+    "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+    "sampled_unix_ns": 1795761908321693112,
+    "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+   },
+   {
+    "databases": {
+     "live/checkpoints": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 16384,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 9592,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073758208,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221235064,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     },
+     "live/store/epoch_0": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 28672,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 19887,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073770496,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221245359,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     },
+     "live/store/perpetual": {
+      "classes": {
+       "index_wal": {
+        "allocated_bytes": 1073741824,
+        "allocated_fragment_slots": 1,
+        "apparent_bytes": 3221225472,
+        "apparent_fragment_slots": 3,
+        "files": 1
+       },
+       "other": {
+        "allocated_bytes": 24576,
+        "allocated_fragment_slots": 0,
+        "apparent_bytes": 17199,
+        "apparent_fragment_slots": 3,
+        "files": 4
+       }
+      },
+      "index_wal_files": 1,
+      "total": {
+       "allocated_bytes": 1073766400,
+       "allocated_fragment_slots": 1,
+       "apparent_bytes": 3221242671,
+       "apparent_fragment_slots": 6,
+       "files": 5
+      }
+     }
+    },
+    "fragment_bytes": 1073741824,
+    "free": {
+     "fragment_size": 4096,
+     "free_bytes": 57515339776,
+     "total_bytes": 85620473856
+    },
+    "root": "/mnt/tidehunter/bench-68bbf96a569f1513/campaign/out/S1-0-native-attempt-2/remote/full_node_db/94970e38de08",
+    "sampled_unix_ns": 1795761916923213272,
+    "scope": "coordinator database directories only; st_blocks*512 is filesystem allocation, fragment slots are derived bounds, not engine preallocation records"
+   }
+  ],
+  "elapsed_seconds_including_startup": 18.642807780999988,
+  "exit_code": 0,
+  "final_metrics_freshness": {
+   "available": false,
+   "reason": "short replay: node exited at the inclusive bound; final metrics are the last live scrape and the state audit reopens the stopped stores",
+   "required_namespaces": [
+    "live/checkpoints",
+    "live/store/epoch_0",
+    "live/store/perpetual"
+   ],
+   "source": "last_live_scrape"
+  },
+  "final_metrics_source": "last_live_scrape",
+  "hold": null,
+  "host_after": {
+   "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 42533 20759 17237121 5806322 0 33948 5819843 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 42532 20759 17237120 5806319 192 34273 5819401 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+   "meminfo": "MemTotal:       125178604 kB\nMemFree:        89270228 kB\nMemAvailable:   119860344 kB\nBuffers:           38356 kB\nCached:         31611380 kB\nSwapCached:            0 kB\nActive:         30138168 kB\nInactive:        2894700 kB\nActive(anon):    1400252 kB\nInactive(anon):        0 kB\nActive(file):   28737916 kB\nInactive(file):  2894700 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:           3632888 kB\nWriteback:         65540 kB\nAnonPages:       1367544 kB\nMapped:           900628 kB\nShmem:             17112 kB\nKReclaimable:     195548 kB\nSlab:             311420 kB\nSReclaimable:     195548 kB\nSUnreclaim:       115872 kB\nKernelStack:        9776 kB\nPageTables:         8668 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1884068 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       28868 kB\nVmallocChunk:          0 kB\nPercpu:             6784 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:    995328 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+   "swap_pages": {
+    "pswpin": 0,
+    "pswpout": 0
+   }
+  },
+  "host_before": {
+   "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 22893 20746 7311841 2221292 0 15442 2234812 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 22892 20746 7311840 2221288 192 15637 2234370 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+   "meminfo": "MemTotal:       125178604 kB\nMemFree:        99001996 kB\nMemAvailable:   120136764 kB\nBuffers:           38356 kB\nCached:         22167168 kB\nSwapCached:            0 kB\nActive:         20688072 kB\nInactive:        2887680 kB\nActive(anon):    1387340 kB\nInactive(anon):        0 kB\nActive(file):   19300732 kB\nInactive(file):  2887680 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:           5427520 kB\nWriteback:         65540 kB\nAnonPages:       1360496 kB\nMapped:           899844 kB\nShmem:             17112 kB\nKReclaimable:     173264 kB\nSlab:             287104 kB\nSReclaimable:     173264 kB\nSUnreclaim:       113840 kB\nKernelStack:        9168 kB\nPageTables:         7684 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1919700 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       28932 kB\nVmallocChunk:          0 kB\nPercpu:             6592 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:   1021952 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+   "swap_pages": {
+    "pswpin": 0,
+    "pswpout": 0
+   }
+  },
+  "peak_sampled_rss_bytes": 10505445376,
+  "phase_timing": {
+   "after_first_execution_to_exit_upper_seconds": 7.254766780999988,
+   "caveat": "execution START spacing, not checkpoint completion/service latency; includes scheduling/waiting",
+   "first_checkpoint": 0,
+   "first_log_to_first_execution_seconds": 11.388041,
+   "first_to_last_execution_start_seconds": 0.476249,
+   "last_checkpoint": 3,
+   "logged_execution_starts": 4,
+   "phase_note": "upper bound includes final execution, shutdown and exit polling; not completion latency or steady state",
+   "start_spacing_ms": {
+    "max": 472.086,
+    "p50": 2.599,
+    "p95": 472.086,
+    "p99": 472.086
+   }
+  },
+  "process_io_final": {
+   "host": {
+    "diskstats": " 259       0 nvme1n1 7051 189 1084113 13520 42533 20759 17237121 5806322 0 33948 5819843 0 0 0 0 0 0\n 259       1 nvme1n1p1 291 183 17384 146 1 0 1 3 0 105 150 0 0 0 0 0 0\n 259       2 nvme1n1p2 6533 6 1057753 13081 42532 20759 17237120 5806319 192 34273 5819401 0 0 0 0 0 0\n 259       3 nvme0n1 9230 0 109112 3072 134402 41091 5761880 103706 0 72588 176689 7001 0 29360128008 69910 0 0\n",
+    "meminfo": "MemTotal:       125178604 kB\nMemFree:        89270228 kB\nMemAvailable:   119860344 kB\nBuffers:           38356 kB\nCached:         31611380 kB\nSwapCached:            0 kB\nActive:         30138168 kB\nInactive:        2894700 kB\nActive(anon):    1400252 kB\nInactive(anon):        0 kB\nActive(file):   28737916 kB\nInactive(file):  2894700 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:           3632888 kB\nWriteback:         65540 kB\nAnonPages:       1367544 kB\nMapped:           900628 kB\nShmem:             17112 kB\nKReclaimable:     195548 kB\nSlab:             311420 kB\nSReclaimable:     195548 kB\nSUnreclaim:       115872 kB\nKernelStack:        9776 kB\nPageTables:         8668 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    62589300 kB\nCommitted_AS:    1884068 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:       28868 kB\nVmallocChunk:          0 kB\nPercpu:             6784 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:    995328 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:      228112 kB\nDirectMap2M:     8157184 kB\nDirectMap1G:    121634816 kB\n",
+    "swap_pages": {
+     "pswpin": 0,
+     "pswpout": 0
+    }
+   },
+   "node": {
+    "exit_code": 0,
+    "exited": true,
+    "pid": 4789,
+    "unavailable": {
+     "process": "exited"
+    }
+   },
+   "seconds": 18.63885044,
+   "shards": []
+  }
+ },
+ "source_archive_sha256": "42fa19fc18bbce2bb4c19fa003c199ef47db8649292f0ebf3787ed23938cdaee",
+ "source_range": {
+  "checkpoint_count": 1776,
+  "full_contents_retention_guard": "tip below pinned producer 5000-checkpoint retention",
+  "range_sha256": "896408bc8581e07473e11db805a69295286df17e05cfb90ed0952c45a9286f9f",
+  "summary_range_verified": true
+ },
+ "topology": "2 physical owners per database; external hosts",
+ "write_profile_limit": 0
+}

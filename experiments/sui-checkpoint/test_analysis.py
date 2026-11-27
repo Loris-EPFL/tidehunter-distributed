@@ -11,42 +11,32 @@ class TimingPopulations(unittest.TestCase):
                     read_profile_transport_progress_available=1,
                     read_profile_transport_cq_available=0,
                     read_profile_completed=10, read_profile_inline_completed=6,
-                    read_profile_actor_completed=4, read_profile_returned=3,
-                    read_profile_wire_requests=20, read_profile_inline_ns=6000,
-                    read_profile_actor_queue_ns=8000, read_profile_actor_service_ns=12000,
-                    read_profile_actor_return_ns=9000, read_profile_exchange_ns=40000,
-                    read_profile_server_authority_lookup_ns=60000,
-                    read_profile_server_record_read_ns=80000,
-                    read_profile_server_response_recheck_ns=10000,
-                    read_profile_server_response_recheck_samples=5,
-                    read_profile_transport_output_submit_ns=18000,
-                    read_profile_transport_output_submit_samples=6,
-                    read_profile_transport_cq_call_ns=0,
-                    read_profile_transport_cq_timed_calls=0)
+                    read_profile_actor_completed=4,
+                    read_profile_nvme_completed=4, read_profile_nvme_flight_count=4,
+                    read_profile_inline_ns=6000, read_profile_nvme_flight_ns=8000,
+                    write_profile_available=1, write_profile_client_requests=20)
 
-    def test_inline_actor_return_wire_and_output_populations_are_distinct(self):
+    def test_inline_and_flight_populations_are_distinct(self):
         means = analyze.adapter_means(self.profile())
-        for name, expected in [('inline', 1), ('actor_queue', 2), ('actor_service', 3),
-                               ('actor_return', 3), ('exchange', 2),
-                               ('server_authority_lookup', 3), ('server_record_read', 4),
-                               ('server_response_recheck', 2), ('transport_output_submit', 3)]:
+        for name, expected in [('inline', 1), ('nvme_flight', 2)]:
             self.assertEqual(means['read_profile_' + name]['mean_us'], expected)
-        self.assertIsNone(means['read_profile_transport_cq_call']['mean_us'])
-        self.assertEqual(means['read_profile_actor_return']['denominator'], 'read_profile_returned')
+        self.assertEqual(means['read_profile_inline']['denominator'],
+                         'read_profile_inline_completed')
+        self.assertEqual(means['read_profile_nvme_flight']['denominator'],
+                         'read_profile_nvme_flight_count')
 
     def test_missing_actor_split_is_unavailable_not_all_completions(self):
         stats = self.profile()
-        del stats['read_profile_actor_completed']
-        self.assertIsNone(analyze.adapter_means(stats)['read_profile_actor_queue']['mean_us'])
-        del stats['read_profile_wire_requests']
-        self.assertIsNone(analyze.adapter_means(stats)['read_profile_exchange']['mean_us'])
+        del stats['read_profile_inline_completed']
+        self.assertIsNone(analyze.adapter_means(stats)['read_profile_inline']['mean_us'])
+        del stats['read_profile_nvme_flight_count']
+        self.assertIsNone(analyze.adapter_means(stats)['read_profile_nvme_flight']['mean_us'])
 
-    def test_errors_cannot_dilute_successful_actor_spans(self):
+    def test_sampled_errors_do_not_suppress_the_caller_inline_span(self):
         stats = self.profile() | {'read_profile_errors': 1}
         means = analyze.adapter_means(stats)
-        self.assertFalse(means['read_profile_actor_service']['available'])
         self.assertEqual(means['read_profile_inline']['mean_us'], 1)
-        self.assertEqual(means['read_profile_exchange']['mean_us'], 2)
+        self.assertEqual(means['read_profile_nvme_flight']['mean_us'], 2)
 
     def test_empty_missing_and_nonfinite_spans_are_not_zero(self):
         self.assertIsNone(analyze.mean_span({'n': 0, 't': 0}, 't', 'n')['mean_us'])
@@ -57,23 +47,22 @@ class TimingPopulations(unittest.TestCase):
 
     def test_protocol_compatibility_means_are_unavailable_without_mutating_counters(self):
         fields = ('request_send', 'response_header', 'response_body', 'server_inventory_wait')
-        stats = self.profile() | dict(write_profile_available=1, write_profile_client_requests=20)
-        for prefix in ('read_profile_', 'write_profile_client_'):
-            stats.update({prefix + field + '_ns': 0 for field in fields})
+        stats = self.profile()
+        stats.update({'write_profile_client_' + field + '_ns': 0 for field in fields})
+        stats.update({'write_profile_client_exchange_ns': 40000})
         original = stats.copy()
         means = analyze.adapter_means(stats)
-        for prefix in ('read_profile_', 'write_profile_client_'):
-            for field in fields:
-                with self.subTest(prefix=prefix, field=field):
-                    row = means[prefix + field]
-                    self.assertFalse(row['available'])
-                    self.assertIsNone(row['mean_us'])
-                    self.assertTrue(row['reason'])
-                    self.assertEqual(row['total_ns'], 0)
-                    self.assertEqual(row['count'], 20)
-                    self.assertEqual(row['numerator'], prefix + field + '_ns')
+        for field in fields:
+            with self.subTest(field=field):
+                row = means['write_profile_client_' + field]
+                self.assertFalse(row['available'])
+                self.assertIsNone(row['mean_us'])
+                self.assertTrue(row['reason'])
+                self.assertEqual(row['total_ns'], 0)
+                self.assertEqual(row['count'], 20)
+                self.assertEqual(row['numerator'], 'write_profile_client_' + field + '_ns')
         self.assertEqual(stats, original)
-        self.assertEqual(means['read_profile_exchange']['mean_us'], 2)
+        self.assertEqual(means['write_profile_client_exchange']['mean_us'], 2)
 
     def test_ram_profile_uses_same_compatibility_classification(self):
         stats = dict(requests=5, request_send_ns=0, response_header_ns=0,
@@ -92,13 +81,12 @@ class TimingPopulations(unittest.TestCase):
             stats, 'exchange_ns', 'requests')['mean_us'], 5)
 
     def test_structural_zeros_are_not_compatibility_clocks(self):
-        stats = self.profile() | dict(read_profile_transport_output_retire_ns=0,
-                                     read_profile_transport_output_retire_samples=4,
-                                     write_profile_available=1,
-                                     write_profile_client_socket_read_ns=0,
-                                     write_profile_client_socket_read_calls=0)
+        stats = self.profile() | dict(write_profile_client_transport_output_retire_ns=0,
+                                      write_profile_client_transport_output_retire_samples=4,
+                                      write_profile_client_socket_read_ns=0,
+                                      write_profile_client_socket_read_calls=0)
         means = analyze.adapter_means(stats)
-        retirement = means['read_profile_transport_output_retire']
+        retirement = means['write_profile_client_transport_output_retire']
         self.assertTrue(retirement['available'])
         self.assertEqual((retirement['mean_us'], retirement['count']), (0, 4))
         tls = means['write_profile_client_socket_read']
@@ -432,6 +420,23 @@ class AggregateReplacement(unittest.TestCase):
 
     def test_native_diagnostics_are_not_zero_latency(self):
         self.assertFalse(analyze.adapter_means({'remote_timing_available': 0})['write_commit']['available'])
+
+    def test_per_database_live_family_is_pooled_to_the_host_total(self):
+        values = analyze.parse_metrics('\n'.join([
+            'tidehunter_nvmeof_live_completed_read_ops_total{db="checkpoint"} 7',
+            'tidehunter_nvmeof_live_completed_read_ops_total{db="epoch"} 3',
+            'tidehunter_nvmeof_live_target_observed_partitions{db="checkpoint"} 2',
+            'tidehunter_nvmeof_live_target_observed_partitions{db="epoch"} 2',
+            'tidehunter_nvmeof_live_lane_inflight_requests_max{db="checkpoint"} 4',
+            'tidehunter_nvmeof_live_lane_inflight_requests_max{db="epoch"} 9',
+        ]) + '\n')
+        stats = analyze.live_nvmeof_stats(values)
+        self.assertEqual(stats['counters']['completed_read_ops_total'], 10)
+        self.assertEqual(stats['counters']['target_observed_partitions'], 4)
+        self.assertEqual(stats['counters']['lane_inflight_requests_max'], 9)
+        with self.assertRaisesRegex(ValueError, 'duplicate aggregate'):
+            analyze.live_nvmeof_stats(values | {
+                'tidehunter_nvmeof_live_completed_read_ops_total{partition="0"}': 4})
 
 
 NAMESPACE = 'live/db'

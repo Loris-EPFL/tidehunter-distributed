@@ -56,59 +56,6 @@ class NativeProfileContract(unittest.TestCase):
                 run.validate_native_profiles({'live/checkpoints': sampled | changed}, 8)
 
 
-class CheckpointDiagnosticContract(unittest.TestCase):
-    def test_empty_diagnostics_are_available_but_not_zero_latency_samples(self):
-        stats = dict(write_checkpoint_diagnostics_available=1,
-                     write_checkpoint_diagnostic_records=0,
-                     write_checkpoint_diagnostic_dropped_records=0,
-                     write_checkpoint_diagnostic_history_io_checkpoint_count=0)
-        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
-            stats['write_checkpoint_diagnostic_' + phase + '_ns'] = 0
-            stats['write_checkpoint_diagnostic_' + phase + '_count'] = 0
-        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
-            stats['write_checkpoint_diagnostic_' + counter] = 0
-        run.validate_checkpoint_diagnostics({'db': stats}, 128)
-        mean = analyze.adapter_means(stats)['write_checkpoint_diagnostic_pressure_wait']
-        self.assertFalse(mean['available'])
-        self.assertIsNone(mean['mean_us'])
-        measured = stats | dict(write_checkpoint_diagnostic_records=3,
-            write_checkpoint_diagnostic_pressure_wait_ns=20000,
-            write_checkpoint_diagnostic_pressure_wait_count=2,
-            write_checkpoint_diagnostic_owner_adoption_ns=5000,
-            write_checkpoint_diagnostic_owner_adoption_count=1)
-        run.validate_checkpoint_diagnostics({'db': measured}, 128)
-        means = analyze.adapter_means(measured)
-        self.assertEqual(means['write_checkpoint_diagnostic_pressure_wait']['mean_us'], 10)
-        self.assertEqual(means['write_checkpoint_diagnostic_owner_adoption']['mean_us'], 5)
-        with self.assertRaises(ValueError):
-            run.validate_checkpoint_diagnostics({'db': measured}, 0)
-        with self.assertRaises(ValueError):
-            run.validate_checkpoint_diagnostics({'db': measured | dict(
-                write_checkpoint_diagnostic_pressure_wait_count=4)}, 128)
-        with self.assertRaises(ValueError):
-            run.validate_checkpoint_diagnostics({'db': stats | dict(
-                write_checkpoint_diagnostic_pressure_wait_ns=1)}, 128)
-
-    def test_disabled_checkpoint_diagnostics_do_not_preserve_stale_spans(self):
-        values = dict(write_checkpoint_diagnostics_available=0,
-                      write_checkpoint_diagnostic_records=0,
-                      write_checkpoint_diagnostic_dropped_records=0,
-                      write_checkpoint_diagnostic_history_io_checkpoint_count=0)
-        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
-            values['write_checkpoint_diagnostic_' + phase + '_ns'] = 12345
-            values['write_checkpoint_diagnostic_' + phase + '_count'] = 0
-        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
-            values['write_checkpoint_diagnostic_' + counter] = 12345
-        metrics = {f'tidehunter_adapter{{namespace="db",stat="{key}"}}': value
-                   for key, value in values.items()}
-        stats = analyze.adapter_stats(metrics)['db']
-        run.validate_checkpoint_diagnostics({'db': stats}, 0)
-        for phase in analyze.CHECKPOINT_DIAGNOSTIC_PHASES:
-            self.assertIsNone(stats['write_checkpoint_diagnostic_' + phase + '_ns'])
-        for counter in analyze.CHECKPOINT_HISTORY_COUNTERS:
-            self.assertIsNone(stats['write_checkpoint_diagnostic_' + counter])
-
-
 class DurabilityTierContract(unittest.TestCase):
     def test_external_config_must_state_the_selected_tier(self):
         config = {'databases': {'db': {'live_nvme': {'leased_durability': 'native'}}}}
@@ -281,18 +228,19 @@ class DeploymentContract(unittest.TestCase):
     def test_cache_only_reads_do_not_require_invented_rpc_samples(self):
         databases = {'db': dict(tls={'transport': 'tcp'}, endpoints=[{}])}
         stats = dict(read_rpcs=0, read_profile_selected=0, read_profile_completed=0,
-                     read_profile_errors=0, read_profile_wire_requests=0,
+                     read_profile_errors=0,
                      write_profile_expected_connections=1, write_profile_captured_connections=0,
                      write_profile_sampled_requests=0, write_profile_available=0)
         run.validate_profiles({'db': stats}, databases, 4096, 0)
         with self.assertRaisesRegex(ValueError, 'zero read-RPC population'):
             run.validate_profiles({'db': stats | {'read_profile_selected': 1}}, databases, 4096, 0)
         databases['db']['tls']['transport'] = 'fabric-tcp'
-        rpc_stats = stats | dict(read_rpcs=1, read_profile_selected=1, read_profile_completed=1,
-                                read_profile_wire_requests=1, read_profile_server_available=1,
-                                read_profile_transport_progress_available=1)
-        with self.assertRaisesRegex(ValueError, 'completion-queue'):
-            run.validate_profiles({'db': rpc_stats}, databases, 4096, 0)
+        rpc_stats = stats | dict(read_rpcs=1, read_profile_selected=1,
+                                 read_profile_completed=1)
+        run.validate_profiles({'db': rpc_stats}, databases, 4096, 0)
+        with self.assertRaisesRegex(ValueError, 'bounded read profile'):
+            run.validate_profiles({'db': rpc_stats | {'read_profile_completed': 0}},
+                                  databases, 4096, 0)
 
     def test_write_profiles_reject_partial_errors_and_clean_population_contamination(self):
         databases = {'db': dict(tls={'transport': 'tcp'}, endpoints=[{}] * 5)}
