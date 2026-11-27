@@ -1183,3 +1183,8 @@ class OwnerCellStop(unittest.TestCase):
         self.assertFalse(any(call[1].startswith('kill -')
                              for call in remote.calls))
         self.assertEqual(cluster.stops, records)
+        # A failed cell raises before its verdict; the stop record is already
+        # on disk next to the cleanup, so its failure upload carries both.
+        persisted = json.loads((cluster.output / 'owner-stops.json').read_text())
+        self.assertEqual(persisted, records)
+        self.assertTrue((cluster.output / 'owner-cleanup.json').is_file())

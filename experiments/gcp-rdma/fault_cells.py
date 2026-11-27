@@ -496,9 +496,12 @@ class Cluster:
         return records
 
     def write_lifecycle_evidence(self):
-        path = self.local('owner-cleanup.json')
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.cleanups, indent=2, sort_keys=True) + '\n')
+        """Owner stops and cleanups travel with the cell, passed or failed."""
+        for name, rows in (('owner-stops.json', self.stops),
+                           ('owner-cleanup.json', self.cleanups)):
+            path = self.local(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
 
     # ---- host evidence -------------------------------------------------
     def owner_root(self, host):
@@ -1354,6 +1357,7 @@ def cell_artifacts(output, parts):
             rows.append(campaign_upload.artifact(path, name))
 
     add(output / 'receipt.json', 'receipt.json')
+    add(output / 'owner-stops.json', 'owner-stops.json')
     add(output / 'owner-cleanup.json', 'owner-cleanup.json')
     for part in parts:
         base = Path(part['output'])
