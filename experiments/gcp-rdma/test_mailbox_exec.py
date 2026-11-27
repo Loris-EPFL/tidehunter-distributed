@@ -360,8 +360,8 @@ class Campaign(unittest.TestCase):
         self.assertEqual((code, err), (0, b''))
         self.assertEqual(json.loads(out), {'argv': ['--owners', 'H1,H2', '--cell-id', 'S1 0']})
         request = self.request()
-        self.assertIn(shlex.quote(sys.executable) + ' ' + shlex.quote(str(script)),
-                      request['argv'][2])
+        self.assertIn('env PYTHONDONTWRITEBYTECODE=1 ' + shlex.quote(sys.executable) + ' '
+                      + shlex.quote(str(script)), request['argv'][2])
         self.assertEqual(request['stdout_object'],
                          f'runs/{RUN}/transfer/{FLEET[2]["id"]}/'
                          f'{request["operation_id"]}/stdout')
