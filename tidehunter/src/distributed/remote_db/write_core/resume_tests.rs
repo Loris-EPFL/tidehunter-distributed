@@ -41,6 +41,23 @@ fn write_survives_one_owner_connection_break() {
             // The production worker client enables the write resume; the local
             // fixture has no DMA reaper, so its detached queue drains inline.
             let mut client = fixture.writer();
+            // A resume episode is bounded by two I/O deadlines, and the leased
+            // fixture sets one second, so a loaded machine can spend the whole
+            // budget on the episode's session setups. This test measures the
+            // resume, not its latency, so the I/O deadline is the suite's hang
+            // guard; every assertion below still holds.
+            let mut live = client
+                .leased_test_live_config()
+                .expect("the writer is live")
+                .clone();
+            live.io_timeout_ms = PROGRESS_CAP.as_millis() as u64;
+            live.connect_timeout_ms = PROGRESS_CAP.as_millis() as u64;
+            client
+                .configure_live_nvme(
+                    &live,
+                    crate::distributed::remote_db::RemoteDatabaseConfig::MAX_OWNER_APPEND_OCCUPANCY,
+                )
+                .expect("the writer accepts the resume budget");
             client.leased_test_resume(true);
             workers.push(worker(fixture, client));
         }

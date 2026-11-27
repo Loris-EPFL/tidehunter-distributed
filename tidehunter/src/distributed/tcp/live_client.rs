@@ -2729,6 +2729,11 @@ impl super::Client {
 }
 #[cfg(test)]
 impl super::Client {
+    /// The live configuration this client runs, so a test that must retune a
+    /// deadline clones it instead of reaching the private field.
+    pub(crate) fn leased_test_live_config(&self) -> Option<&LiveClientConfig> {
+        self.live_config.as_ref()
+    }
     pub(crate) fn leased_test_frontier(&self) -> (u64, bool, bool) {
         (
             self.live_leased
