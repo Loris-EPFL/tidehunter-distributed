@@ -41,6 +41,11 @@ NVME_CONTROLLERS = Path("/sys/class/nvme")
 # WAL members in 4 MiB fragments, so the replay crosses both boundaries.
 RESTART_WAL_FILE_BYTES = 8 * 1024**2
 RESTART_FRAGMENT_BYTES = 4 * 1024**2
+# The matching research qualification bounds: an 8 MiB batch and a 12 MiB
+# group (the campaign defaults) do not fit a 4 MiB fragment.
+RESTART_BATCH_OPERATIONS = 32
+RESTART_BATCH_BYTES = 3 * 1024**2
+RESTART_GROUP_BATCHES = 32
 RESTART_FORBIDDEN_STDERR = ("pinned controller is not live", "short namespace read")
 
 
@@ -533,13 +538,47 @@ def layout_observed(nodes, scopes):
     return observed
 
 
+def admit_restart_geometry(storage):
+    """Check the restart owner geometry against the engine's admission rules.
+
+    `PartitionConfig::validate` requires the group bound to hold the encoded
+    batch bound, the fragment to hold the group bound plus its frame header,
+    and the member size to be a whole number of fragments. `options.rs`
+    repeats the fragment/group check on the external document before the first
+    connect. The campaign defaults (8 MiB batches, 12 MiB groups) do not fit
+    this qualification's 4 MiB fragment.
+    """
+    batch = storage["batch_limits"]["max_encoded_bytes"]
+    group = storage["group_limits"]["max_encoded_bytes"]
+    fragment = storage["fragment_bytes"]
+    wal = storage["wal_file_bytes"]
+    if group < batch + 8:
+        raise RuntimeError(
+            "restart WAL geometry: group bound does not hold the batch bound")
+    if fragment < group + 8:
+        raise RuntimeError(
+            "restart WAL geometry: fragment does not hold the group bound")
+    if fragment > 0xFFFF_FFFF or fragment % 8:
+        raise RuntimeError("restart WAL geometry: invalid fragment size")
+    if wal == 0 or wal % fragment:
+        raise RuntimeError(
+            "restart WAL geometry: member size is not a fragment multiple")
+
+
 def restart_geometry(document):
-    """The CI WAL geometry of the owner-restart proof: 8 MiB in 4 MiB fragments."""
+    """The qualification WAL geometry of the owner-restart proof.
+
+    8 MiB members in 4 MiB fragments with the matching research batch and
+    group bounds, admitted before any coordinator starts.
+    """
     storage = document["storage"]
+    storage["batch_limits"] = {"max_operations": RESTART_BATCH_OPERATIONS,
+                               "max_encoded_bytes": RESTART_BATCH_BYTES}
+    storage["group_limits"] = {"max_batches": RESTART_GROUP_BATCHES,
+                               "max_encoded_bytes": RESTART_FRAGMENT_BYTES - 8}
     storage["fragment_bytes"] = RESTART_FRAGMENT_BYTES
     storage["wal_file_bytes"] = RESTART_WAL_FILE_BYTES
-    if storage["wal_file_bytes"] % storage["fragment_bytes"]:
-        raise RuntimeError("restart WAL member size is not a fragment multiple")
+    admit_restart_geometry(storage)
     return document
 
 
@@ -595,24 +634,12 @@ def controller_identities(document, scope, partition):
     return identities
 
 
-def controller_key(entity):
-    """The (device, inode) pair of a controller identity, or None."""
-    device = entity.get("sysfs_device")
-    inode = entity.get("sysfs_inode")
-    if type(device) is int and type(inode) is int:
-        return (device, inode)
-    return None
-
-
-def reopen_defect(evidence, scope, partition, previous_controllers,
-                  present_before_reopen, stderr):
+def reopen_defect(evidence, stderr):
     """The reason a restart reopen is unproven, or None when it is proven.
 
     `evidence` is the reopened coordinator's `measurement-read-evidence.json`.
-    `previous_controllers` are the scoped sysfs identities captured before the
-    coordinator was killed; `present_before_reopen` are those that still
-    existed when the reopen started, which is what makes the check exercise
-    the old adoption path rather than a controller the kernel already dropped.
+    The engine counts the controllers its fresh recovery acquisition retired, so
+    the verdict does not depend on a recycled nvmeN ordinal or on sysfs timing.
     """
     start = evidence.get("start") if isinstance(evidence, dict) else None
     if not isinstance(start, dict):
@@ -624,29 +651,24 @@ def reopen_defect(evidence, scope, partition, previous_controllers,
     tail = recovery.get("tail_batches")
     if type(tail) is not int or tail <= 0:
         return f"the reopen replayed no WAL batch (tail_batches={tail!r})"
-    previous = {key for key in map(controller_key, previous_controllers) if key}
-    present = {key for key in map(controller_key, present_before_reopen) if key}
-    if not previous & present:
-        return ("no pre-restart controller remained when the reopen started; "
-                "the check cannot prove recovery retired it")
-    prefix = f"{LAYOUT_SCOPE}{scope}-p{partition:08x}-"
-    reopened = []
-    for route in (start.get("live_nvmeof") or {}).get("routes") or []:
-        identity = route.get("namespace_identity") or {}
-        if not str(identity.get("nqn", "")).startswith(prefix):
-            continue
-        key = controller_key(identity.get("controller") or {})
-        if key is not None:
-            reopened.append(key)
-    if not reopened:
-        return "the reopen recorded no live controller identity for its database"
-    stale = sorted(set(reopened) & previous)
-    if stale:
-        return f"the reopen reused the pre-restart controller {stale}"
+    retired = recovery.get("retired_leftover_controllers")
+    if type(retired) is not int or retired < 1:
+        return ("the reopen retired no pre-restart controller "
+                f"(retired_leftover_controllers={retired!r})")
     for marker in RESTART_FORBIDDEN_STDERR:
         if marker in stderr:
             return f"the reopen stderr names {marker!r}"
     return None
+
+
+def validate_coordinator(binary, spec, root, name, timeout=120):
+    """Admit one coordinator spec with the engine before starting anything."""
+    path = Path(root) / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+    return subprocess.run(
+        [str(binary), "--config", str(path), "--validate-config"],
+        capture_output=True, text=True, timeout=timeout)
 
 
 def start_coordinator(binary, spec_path, output, stdout_path, stderr_path):
@@ -697,6 +719,11 @@ def restart_positive(deployment, specs, binary, root):
         copy_receipts(nodes, specs, root, namespace, owners=1)
         # Run the coordinator until its write gate. The preloaded batches are
         # in the owner's WAL with no checkpoint and no seal.
+        admitted = validate_coordinator(binary, killed, root, "owner-restart-admit")
+        if admitted.returncode != 0:
+            raise RuntimeError(
+                "restart spec admission failed: "
+                + (admitted.stderr or admitted.stdout or "").strip()[-3000:])
         spec_path = root / "owner-restart.json"
         spec_path.write_text(json.dumps(killed, indent=2, sort_keys=True) + "\n")
         first_out = root / "owner-restart-out"
@@ -714,10 +741,6 @@ def restart_positive(deployment, specs, binary, root):
                 raise RuntimeError("the coordinator write gate expired")
             time.sleep(0.1)
         scope = database_scope([node])[owner_name(node)]
-        previous = controller_identities(inventory(), scope, node["partition"])
-        if not previous:
-            raise RuntimeError(f"the killed coordinator holds no controller for {scope}")
-        evidence["previous_controllers"] = previous
         # No pool shutdown, no checkpoint, no seal: a real abrupt coordinator exit.
         os.killpg(first.pid, signal.SIGKILL)
         first.wait(timeout=60)
@@ -731,9 +754,6 @@ def restart_positive(deployment, specs, binary, root):
         processes[owner_name(node)] = start_owner(binary, node, log)
         wait_owners([node], processes)
         copy_receipts(nodes, specs, root, namespace, owners=1)
-        # The replay must find the pre-restart controller still present; if the
-        # kernel already dropped it, the check cannot prove it was retired.
-        present = controller_identities(inventory(), scope, node["partition"])
         # Reopen the same coordinator root: recovery must replay, not adopt.
         completed, _path, output = run_coordinator(
             binary, reopened, root, "owner-restart-reopen")
@@ -748,12 +768,13 @@ def restart_positive(deployment, specs, binary, root):
             read_evidence = json.loads(evidence_path.read_text())
         except (OSError, ValueError) as error:
             raise RuntimeError(f"the reopen wrote no read evidence: {error}") from error
-        defect = reopen_defect(read_evidence, scope, node["partition"], previous,
-                               present, stderr)
+        defect = reopen_defect(read_evidence, stderr)
         if defect is not None:
             raise RuntimeError(defect)
-        evidence["tail_batches"] = (
-            read_evidence["start"]["coordinator_open"]["recovery"]["tail_batches"])
+        recovery = read_evidence["start"]["coordinator_open"]["recovery"]
+        evidence["tail_batches"] = recovery["tail_batches"]
+        evidence["retired_leftover_controllers"] = recovery[
+            "retired_leftover_controllers"]
         remaining = controller_identities(inventory(), scope, node["partition"])
         if remaining:
             raise RuntimeError("the reopen left pre-restart controllers: "
@@ -1163,8 +1184,9 @@ def restart(args):
     deployment, specs = campaign_modules()
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    # The proof owns creation of this root and fails on a stale one; the
+    # finally below only creates it for a failure that happens before that.
     root = args.state / "owner-restart"
-    root.mkdir(mode=0o700)
     binary = args.binary.resolve(strict=True)
     evidence = {"scope": __doc__, "binary": str(binary), "complete": False}
     try:
@@ -1176,6 +1198,7 @@ def restart(args):
         evidence["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
+        root.mkdir(parents=True, exist_ok=True)
         dump(root / "restart.json", evidence)
 
 

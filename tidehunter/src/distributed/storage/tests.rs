@@ -2100,3 +2100,46 @@ mod live_extent;
 mod live_native;
 mod relocation_scan;
 mod wal_replay;
+
+/// The kernel owner-restart qualification (`kernel_nvme_tcp_ci.py restart`)
+/// uses 8 MiB WAL members in 4 MiB fragments with the research batch and group
+/// bounds. The campaign defaults (8 MiB batches, 12 MiB groups) cannot fit that
+/// fragment, so config admission must reject them before the write gate.
+#[test]
+fn owner_restart_qualification_geometry_is_admit_checked() {
+    let mut qualification = config(vec![0], 0);
+    qualification.batch_limits = BatchLimits {
+        max_operations: 32,
+        max_encoded_bytes: 3 * 1024 * 1024,
+    };
+    qualification.group_limits = GroupLimits {
+        max_batches: 32,
+        max_encoded_bytes: 4 * 1024 * 1024 - 8,
+    };
+    qualification.fragment_bytes = 4 * 1024 * 1024;
+    qualification.wal_file_bytes = 8 * 1024 * 1024;
+    qualification
+        .validate()
+        .expect("the CI owner-restart geometry must be admitted");
+
+    let mut campaign_group = qualification.clone();
+    campaign_group.group_limits = GroupLimits {
+        max_batches: 64,
+        max_encoded_bytes: 12 * 1024 * 1024,
+    };
+    assert!(
+        campaign_group.validate().is_err(),
+        "a 12 MiB group must not fit the qualification's 4 MiB fragment"
+    );
+
+    let mut oversized_batch = qualification.clone();
+    oversized_batch.batch_limits = BatchLimits {
+        max_operations: 32,
+        // Any batch above the 4 MiB group bound, like the campaign's 8 MiB.
+        max_encoded_bytes: 5 * 1024 * 1024,
+    };
+    assert!(
+        oversized_batch.validate().is_err(),
+        "a batch above the group bound must be rejected, not truncated"
+    );
+}

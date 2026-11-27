@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -140,8 +141,15 @@ class RestartReopen(unittest.TestCase):
             root = Path(tmp)
             document, node = self.database(root)
             kernel.restart_geometry(document)
-            self.assertEqual(document["storage"]["wal_file_bytes"], 8 * 1024**2)
-            self.assertEqual(document["storage"]["fragment_bytes"], 4 * 1024**2)
+            storage = document["storage"]
+            self.assertEqual(storage["wal_file_bytes"], 8 * 1024**2)
+            self.assertEqual(storage["fragment_bytes"], 4 * 1024**2)
+            # The qualification bounds must fit the fragment, not the campaign
+            # defaults (8 MiB batches, 12 MiB groups) that prepare() writes.
+            self.assertEqual(storage["batch_limits"],
+                             {"max_operations": 32, "max_encoded_bytes": 3 * 1024**2})
+            self.assertEqual(storage["group_limits"],
+                             {"max_batches": 32, "max_encoded_bytes": 4 * 1024**2 - 8})
             coordinator = root / "db" / "coordinator"
             killed = kernel.restart_spec(
                 self.specs, document, root, case_id="owner-restart",
@@ -174,50 +182,44 @@ class RestartReopen(unittest.TestCase):
                          reopened["backend"]["options"]["external_remote_config"])
         self.assertEqual(node["namespace"], kernel.LAYOUT_NAMESPACES[0])
 
-    PREVIOUS = [{"controller": "nvme7", "sysfs_device": 1, "sysfs_inode": 101}]
+    def storage(self, *, fragment=4 * 1024**2, wal=8 * 1024**2,
+                batch=3 * 1024**2, group=None):
+        return {"batch_limits": {"max_operations": 32, "max_encoded_bytes": batch},
+                "group_limits": {"max_batches": 32,
+                                 "max_encoded_bytes": (fragment - 8) if group is None else group},
+                "fragment_bytes": fragment, "wal_file_bytes": wal}
 
-    def present(self):
-        return [dict(row) for row in self.PREVIOUS]
+    def test_restart_geometry_admission_rejects_the_campaign_bounds(self):
+        # The campaign's 12 MiB group cannot fit a 4 MiB fragment: this is the
+        # spec that failed before the write gate.
+        with self.assertRaisesRegex(RuntimeError, "fragment does not hold the group"):
+            kernel.admit_restart_geometry(self.storage(group=12 * 1024**2, batch=8 * 1024**2))
+        # A batch above its group is refused as well.
+        with self.assertRaisesRegex(RuntimeError, "group bound does not hold the batch"):
+            kernel.admit_restart_geometry(self.storage(batch=6 * 1024**2))
+        # The qualification values pass.
+        kernel.admit_restart_geometry(self.storage())
 
-    def evidence(self, *, tail=3, kind="reopen", device=1, inode=202,
-                 instance=7, nqn=None, routes=True, controller=True):
-        scope = "aa" * 16
-        nqn = nqn or kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"
-        identity = {"nqn": nqn, "controller_instance": instance}
-        if controller:
-            identity["controller"] = {"sysfs_device": device, "sysfs_inode": inode}
-        live = {"routes": [{"namespace_identity": identity}]} if routes else {}
-        return {"start": {
-            "coordinator_open": {"kind": kind, "recovery": {"tail_batches": tail}},
-            "live_nvmeof": live}}
+    def evidence(self, *, tail=3, kind="reopen", retired=1):
+        recovery = {"tail_batches": tail}
+        if retired is not None:
+            recovery["retired_leftover_controllers"] = retired
+        return {"start": {"coordinator_open": {"kind": kind, "recovery": recovery}}}
 
-    def defect(self, evidence=None, *, previous=None, present=None, stderr=""):
+    def defect(self, evidence=None, stderr=""):
         return kernel.reopen_defect(
-            self.evidence() if evidence is None else evidence,
-            "aa" * 16, 0,
-            self.PREVIOUS if previous is None else previous,
-            self.present() if present is None else present,
-            stderr)
+            self.evidence() if evidence is None else evidence, stderr)
 
-    def test_a_recycled_ordinal_with_a_new_controller_is_clean(self):
-        # The kernel frees the nvmeN ordinal with the old controller, so the
-        # replacement normally reuses the same ordinal; identity is the inode.
-        defect = self.defect(self.evidence(instance=7, device=1, inode=202))
-        self.assertIsNone(defect)
+    def test_a_reopen_that_retired_the_leftover_controller_is_clean(self):
+        self.assertIsNone(self.defect())
 
-    def test_the_same_controller_inode_is_a_defect(self):
-        defect = self.defect(self.evidence(instance=9, device=1, inode=101))
-        self.assertIn("reused the pre-restart controller", defect)
+    def test_a_reopen_that_retired_nothing_is_a_defect(self):
+        defect = self.defect(self.evidence(retired=0))
+        self.assertIn("retired no pre-restart controller", defect)
 
-    def test_a_pre_restart_controller_must_exist_when_the_reopen_starts(self):
-        # The kernel had already dropped the leftover: the check would pass on
-        # the old adoption path, so the proof must fail instead.
-        defect = self.defect(present=[])
-        self.assertIn("no pre-restart controller remained", defect)
-
-    def test_a_route_without_controller_identity_is_a_defect(self):
-        defect = self.defect(self.evidence(controller=False))
-        self.assertIn("no live controller identity", defect)
+    def test_a_missing_retirement_count_is_a_defect(self):
+        defect = self.defect(self.evidence(retired=None))
+        self.assertIn("retired_leftover_controllers=None", defect)
 
     def test_an_empty_replay_is_a_defect(self):
         defect = self.defect(self.evidence(tail=0))
@@ -229,15 +231,15 @@ class RestartReopen(unittest.TestCase):
                 defect = self.defect(stderr="error: " + marker)
                 self.assertIn(marker, defect)
 
-    def test_the_open_must_be_a_reopen_with_a_live_route(self):
+    def test_the_open_must_be_a_reopen(self):
         defect = self.defect(self.evidence(kind="create"))
         self.assertIn("not 'reopen'", defect)
-        defect = self.defect(self.evidence(routes=False))
-        self.assertIn("no live controller identity", defect)
         defect = self.defect({})
         self.assertIn("no measurement start boundary", defect)
 
     def test_controller_identities_use_the_sysfs_inode_not_the_ordinal(self):
+        # Secondary evidence for the post-close leftover scan: a recycled
+        # ordinal must not be mistaken for the same controller object.
         scope = "aa" * 16
         document = {"controllers": {
             "nvme3": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"},
@@ -283,14 +285,10 @@ class RestartOrchestration(unittest.TestCase):
     def test_kill_at_the_write_gate_restarts_the_owner_and_reopens_once(self):
         deployment, specs = kernel.campaign_modules()
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "restart"
-            class_root = Path(tmp) / "nvme-class"
-            (class_root / "nvme7").mkdir(parents=True)
-            (class_root / "nvme8").mkdir()
-            previous = (class_root / "nvme7").stat()
-            replacement = (class_root / "nvme8").stat()
+            state = Path(tmp) / "state"
+            state.mkdir()
+            root = state / "owner-restart"
             events = []
-            scope = "aa" * 16
             gate_path = {}
             coordinator_process = {}
 
@@ -313,30 +311,24 @@ class RestartOrchestration(unittest.TestCase):
 
             opened = {}
 
+            def admission(binary, spec, run_root, name, timeout=120):
+                opened["admitted"] = spec
+                return subprocess.CompletedProcess([], 0, "", "")
+
             def reopen(binary, spec, run_root, name):
                 events.append(("coordinator", "reopen"))
                 opened["spec"] = spec
-                # The retired controller is gone; the new one reused its ordinal.
-                (class_root / "nvme7").rmdir()
                 output = Path(run_root) / f"{name}-out"
                 output.mkdir(parents=True)
                 evidence = {"start": {
-                    "coordinator_open": {"kind": "reopen",
-                                         "recovery": {"tail_batches": 4}},
-                    "live_nvmeof": {"routes": [{"namespace_identity": {
-                        "nqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1",
-                        "controller_instance": 7,
-                        "controller": {"sysfs_device": replacement.st_dev,
-                                       "sysfs_inode": replacement.st_ino}}}]}}}
+                    "coordinator_open": {
+                        "kind": "reopen",
+                        "recovery": {"tail_batches": 4,
+                                     "retired_leftover_controllers": 1}}}}
                 (output / "measurement-read-evidence.json").write_text(
                     json.dumps(evidence))
                 return (subprocess.CompletedProcess([], 0, "", ""),
                         Path(run_root) / f"{name}.json", output)
-
-            def controllers(names):
-                return {"controllers": {
-                    name: {"subsysnqn": kernel.LAYOUT_SCOPE + scope
-                           + "-p00000000-sub-1"} for name in names}}
 
             def killpg(pid, sig):
                 events.append(("killpg", pid))
@@ -344,26 +336,34 @@ class RestartOrchestration(unittest.TestCase):
                 # The kernel ends the process group; the fake reports its exit.
                 coordinator_process["p"].returncode = -9
 
+            args = SimpleNamespace(state=state, binary=Path("/bin/true"))
             with patch.object(deployment, "certificates",
                               lambda path, owners: path.mkdir()), \
-                    patch.object(kernel, "NVME_CONTROLLERS", class_root), \
+                    patch.object(kernel, "campaign_modules",
+                                 return_value=(deployment, specs)), \
                     patch.object(kernel, "start_owner", side_effect=owner), \
+                    patch.object(kernel, "validate_coordinator", side_effect=admission), \
                     patch.object(kernel, "start_coordinator", side_effect=coordinator), \
                     patch.object(kernel, "run_coordinator", side_effect=reopen), \
                     patch.object(kernel, "kill_owner",
                                  side_effect=lambda process: process.kill()
                                  or process.wait()), \
                     patch.object(kernel, "inventory",
-                                 side_effect=[controllers(["nvme7"]),
-                                              controllers(["nvme7"]),
-                                              controllers([])]), \
+                                 side_effect=[{"controllers": {}}]), \
                     patch.object(kernel, "database_scope",
                                  side_effect=lambda nodes: {
-                                     kernel.owner_name(node): scope for node in nodes}), \
+                                     kernel.owner_name(node): "aa" * 16
+                                     for node in nodes}), \
                     patch.object(kernel, "layout_teardown_defect", return_value=[]), \
                     patch.object(kernel.os, "killpg", side_effect=killpg):
-                evidence = kernel.restart_positive(deployment, specs, Path("/bin/true"), root)
+                exit_code = kernel.restart(args)
 
+            # The action owns no second creation of its proof root: reaching
+            # restart_positive would raise FileExistsError on a duplicate.
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((root / "restart.json").is_file())
+            receipt = json.loads((root / "restart.json").read_text())
+            self.assertTrue(receipt["complete"])
             self.assertIn(("killpg", 4242), events)
             # The owner starts, the coordinator is killed at its gate, the owner
             # starts again, and the reopen runs once on the same coordinator.
@@ -372,12 +372,18 @@ class RestartOrchestration(unittest.TestCase):
             self.assertEqual([event for event in events if event[0] == "coordinator"],
                              [("coordinator", "gate"), ("coordinator", "reopen")])
             self.assertIn(("kill", "owner"), events)
+            evidence = receipt["restart"]
             self.assertTrue(evidence["complete"])
             self.assertEqual(evidence["tail_batches"], 4)
-            self.assertEqual(evidence["previous_controllers"], [{
-                "controller": "nvme7", "sysfs_device": previous.st_dev,
-                "sysfs_inode": previous.st_ino}])
+            self.assertEqual(evidence["retired_leftover_controllers"], 1)
             self.assertEqual(evidence["killed_returncode"], -9)
+            # The engine admitted the killed spec with the qualification bounds.
+            admitted = opened["admitted"]
+            storage = admitted["backend"]["options"]["external_remote_config"]["storage"]
+            self.assertEqual(storage["fragment_bytes"], 4 * 1024**2)
+            self.assertEqual(storage["group_limits"]["max_encoded_bytes"],
+                             4 * 1024**2 - 8)
+            self.assertEqual(admitted["backend"]["options"]["owners"], 1)
             # The killed run stops at a gate; the reopen is one-owner and ungated.
             killed = json.loads((root / "owner-restart.json").read_text())
             for spec in (killed, opened["spec"]):
@@ -411,15 +417,43 @@ class RestartOrchestration(unittest.TestCase):
                 coordinator_process["p"] = self.Process("coordinator", 4242, events)
                 return coordinator_process["p"]
 
+            def admission(binary, spec, run_root, name, timeout=120):
+                return subprocess.CompletedProcess([], 0, "", "")
+
             with patch.object(deployment, "certificates",
                               lambda path, owners: path.mkdir()), \
                     patch.object(kernel, "start_owner", side_effect=owner), \
+                    patch.object(kernel, "validate_coordinator", side_effect=admission), \
                     patch.object(kernel, "start_coordinator", side_effect=coordinator), \
                     patch.object(kernel, "LAYOUT_SECONDS", 0):
                 with self.assertRaisesRegex(RuntimeError, "write gate expired"):
                     kernel.restart_positive(deployment, specs, Path("/bin/true"), root)
             self.assertIn(("kill", "coordinator"), events)
             self.assertIsNotNone(coordinator_process["p"].returncode)
+
+    def test_an_inadmissible_spec_fails_before_the_coordinator_starts(self):
+        deployment, specs = kernel.campaign_modules()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "restart"
+            events = []
+
+            def owner(binary, node, log):
+                Path(node["ready"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(node["ready"]).write_text("ready\n")
+                Path(str(node["ready"]) + ".durability.json").write_text("{}\n")
+                return self.Process("owner", 1001, events)
+
+            def admission(binary, spec, run_root, name, timeout=120):
+                return subprocess.CompletedProcess(
+                    [], 1, "", "invalid external remote owner configuration")
+
+            with patch.object(deployment, "certificates",
+                              lambda path, owners: path.mkdir()), \
+                    patch.object(kernel, "start_owner", side_effect=owner), \
+                    patch.object(kernel, "validate_coordinator", side_effect=admission):
+                with self.assertRaisesRegex(RuntimeError, "restart spec admission failed"):
+                    kernel.restart_positive(deployment, specs, Path("/bin/true"), root)
+            self.assertNotIn(("coordinator", "gate"), events)
 
 
 class CampaignModules(unittest.TestCase):
