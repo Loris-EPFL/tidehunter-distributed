@@ -62,9 +62,12 @@ import deployment
 import gcp_manual_compute
 import host_exec
 import mailbox_exec
+import owner_lifecycle
 import proc_sampler
 
 OWNER_READY_SECONDS = 120
+OWNER_STOP_SECONDS = owner_lifecycle.OWNER_STOP_SECONDS
+OWNER_KILL_SECONDS = owner_lifecycle.OWNER_KILL_SECONDS
 # The owner control plane listens here on every partition; `deployment.prepare`
 # adds the partition index to this base. The coordinator is a client and does
 # not listen, so it has no port of its own.
@@ -564,7 +567,7 @@ class SuiLauncher:
                  ledger=None, cell_id='sui-replay', stage='stage1', resume=False,
                  store=None, bucket=None, prefix=None, write_profile_limit=0,
                  resident_reads=None, allow_local_ledger=False, controller_loss=None,
-                 hold_seconds=0):
+                 hold_seconds=0, cleanup_root=None):
         self.remote = remote
         self.build_root = Path(build_root).resolve()
         self.fixture = Path(fixture).resolve()
@@ -610,6 +613,9 @@ class SuiLauncher:
         self.allow_local_ledger = allow_local_ledger
         self.controller_loss = controller_loss
         self.hold_seconds = hold_seconds
+        self.cleanup_root = Path(cleanup_root) if cleanup_root else None
+        self.stops = []
+        self.cleanups = []
         self.failure_skipped = []
 
     # ---- admission -----------------------------------------------------
@@ -697,7 +703,37 @@ class SuiLauncher:
             self.remote.shell(host, f'chmod +x {shlex.quote(str(self.guest_root / "storage-node"))}')
 
     # ---- owner lifecycle ----------------------------------------------
+    def cleanup_owners(self, *, required=True):
+        """Run the exact-owned configfs gate on every owner host.
+
+        A previous incarnation may have died before its typed stop marker, and
+        its port links would make the next owner's reconcile refuse to share a
+        configfs object. Only this engine's NQN prefix is removed.
+        """
+        hosts = [record['host'] for record in self.external['hosts']]
+        records = owner_lifecycle.cleanup_hosts(
+            self.remote, hosts, root=self.cleanup_root)
+        self.cleanups.extend(records)
+        self.write_lifecycle_evidence()
+        failed = [row['host'] for row in records if not row['complete']]
+        if failed and required:
+            raise LaunchError('owner configfs cleanup failed on '
+                              + ', '.join(sorted(failed)))
+        return failed
+
+    def write_lifecycle_evidence(self):
+        for name, rows in (('owner-stops.json', self.stops),
+                           ('owner-cleanup.json', self.cleanups)):
+            if not rows:
+                continue
+            path = self.output / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + '.tmp')
+            temporary.write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
+            os.replace(temporary, path)
+
     def start(self):
+        self.cleanup_owners()
         for record in self.external['hosts']:
             host = record['host']
             namespaces = []
@@ -716,7 +752,9 @@ class SuiLauncher:
                     time.sleep(0.1)
                 pid = int(self.remote.read_bytes(host, pidfile).strip())
                 namespaces.append(dict(index=index, command=command, pid=pid,
-                                       process_group=pid, log=str(log)))
+                                       process_group=pid, log=str(log),
+                                       partition=record['partition'],
+                                       stop=record['stop_files'][index]))
             self.namespaces[host] = namespaces
         for record in self.external['hosts']:
             for ready in record['ready_files']:
@@ -758,33 +796,60 @@ class SuiLauncher:
                 row['unix_ns'] = rows[-1]['unix_ns'] + 1
             rows.append(row)
 
-    def stop(self):
+    def stop(self, *, fail_on_forced=True):
+        """Close every owned group, then remove this engine's configfs objects.
+
+        The typed stop marker is tried first, so the owner runs its own
+        teardown and writes its shutdown proof. SIGTERM has no handler in the
+        owner, so using it first killed the process before teardown and left
+        its port links. A forced kill or a failed cleanup fails the cell; the
+        next cell's `start` also refuses to run if leftovers remain.
+        """
+        alive = any(not namespace.get('stopped')
+                    for namespaces in self.namespaces.values()
+                    for namespace in namespaces)
+        if not self.started and not alive:
+            return []
         self.sample_stop.set()
         if self.sample_thread is not None:
             self.sample_thread.join(timeout=10)
             self.sample_thread = None
+        forced = []
         for host, namespaces in self.namespaces.items():
             for namespace in namespaces:
-                if not namespace.get('stopped'):
-                    self.remote.shell(host, f'kill -TERM -{namespace["process_group"]}',
-                                      check=False)
-            deadline = time.monotonic() + 30
-            while any(self.remote.exists(host, f'/proc/{n["pid"]}') for n in namespaces):
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.2)
-            for namespace in namespaces:
-                if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                    self.remote.shell(host, f'kill -KILL -{namespace["process_group"]}',
-                                      check=False)
-                deadline = time.monotonic() + 10
-                while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                    if time.monotonic() > deadline:
-                        break
-                    time.sleep(0.1)
-                namespace['stopped'] = not self.remote.exists(
-                    host, f'/proc/{namespace["pid"]}')
+                if namespace.get('stopped'):
+                    continue
+                record = owner_lifecycle.stop_owner(
+                    self.remote, host=host, pid=namespace['pid'],
+                    process_group=namespace['process_group'],
+                    stop_path=namespace.get('stop'),
+                    partition=namespace.get('partition'),
+                    grace=OWNER_STOP_SECONDS, kill_grace=OWNER_KILL_SECONDS)
+                namespace['stopped'] = not record['still_alive']
+                self.stops.append(record)
+                if record['forced'] or record['still_alive']:
+                    forced.append(host)
         self.started = False
+        survivors = sorted({host for host, namespaces in self.namespaces.items()
+                            for namespace in namespaces
+                            if not namespace.get('stopped')})
+        failed = list(survivors)
+        if survivors:
+            for host in survivors:
+                self.cleanups.append(dict(
+                    host=host, root=str(self.cleanup_root) if self.cleanup_root
+                    else owner_lifecycle.CONFIGFS,
+                    prefix=owner_lifecycle.NQN_PREFIX, before=[], removed=[],
+                    remains=[], unavailable=False, complete=False, exit_code=None,
+                    error='owner still alive; cleanup refused'))
+        else:
+            failed.extend(self.cleanup_owners(required=False))
+        self.write_lifecycle_evidence()
+        if fail_on_forced and (forced or failed):
+            detail = sorted(set(forced) | set(failed))
+            raise LaunchError('owner stop or configfs cleanup failed on '
+                              + ', '.join(detail))
+        return forced
 
     # ---- host evidence -------------------------------------------------
     def write_resources(self, binding):
@@ -868,6 +933,12 @@ class SuiLauncher:
         # a per-sample stream: they stay under evidence/ with the summary.
         for path in sorted((self.output / 'controller-loss').glob('*.json')):
             rows.append(upload_module.artifact(path, self.evidence_name(path)))
+        # The owner close and the between-cell cleanup are their own records:
+        # a shutdown proof is useful only next to the signal that was used.
+        for path in (self.output / 'owner-stops.json',
+                     self.output / 'owner-cleanup.json'):
+            if path.is_file():
+                rows.append(upload_module.artifact(path, self.evidence_name(path)))
         return rows
 
     def persist(self, entry, artifacts):
@@ -1159,7 +1230,7 @@ class SuiLauncher:
             code = child.wait()
         finally:
             if self.started:
-                self.stop()
+                self.stop(fail_on_forced=False)
             if child.poll() is None:
                 code = child.wait()
         if self.controller_loss is not None:

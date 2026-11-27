@@ -53,6 +53,7 @@ import disk_collector
 import host_exec
 import mailbox_exec
 import manual_sui
+import owner_lifecycle
 import stage2_mechanism as mechanism
 import stage3_specs
 
@@ -65,7 +66,7 @@ COORDINATOR_STOP_GRACE_SECONDS = stage3_specs.SHUTDOWN_GRACE_SECONDS
 # An owner is not the measured process and its close path tears down every live
 # NVMe-oF target, then writes and syncs a shutdown proof per database; the old
 # proven controller allowed 90 s for exactly that (`cleanup_timeout`).
-OWNER_STOP_GRACE_SECONDS = 90
+OWNER_STOP_GRACE_SECONDS = owner_lifecycle.OWNER_STOP_SECONDS
 # A failed attempt uploads what it still holds before the fleet is deleted. The
 # local coordinator database, TLS material and any bulk storage tree never
 # travel, and one oversized file must not consume the whole failure budget.
@@ -121,7 +122,7 @@ class Cluster:
                  owners, tier, transport='tcp', live_transport='rdma',
                  schema=None, port=manual_sui.OWNER_CONTROL_PORT,
                  coordinator_cache_mib=0,
-                 shard_cache_mib=0):
+                 shard_cache_mib=0, cleanup_root=None):
         self.remote, self.owners = remote, list(owners)
         self.build_root = Path(build_root).resolve()
         self.output = Path(output).resolve()
@@ -139,6 +140,8 @@ class Cluster:
         self.external = None
         self.namespaces = {}
         self.stops = []
+        self.cleanup_root = Path(cleanup_root) if cleanup_root else None
+        self.cleanups = []
 
     # ---- admission -----------------------------------------------------
     def admit(self):
@@ -461,54 +464,40 @@ class Cluster:
         records = []
         for host, namespaces in self.namespaces.items():
             for namespace in namespaces:
-                alive = self.remote.exists(host, f'/proc/{namespace["pid"]}')
-                started = time.monotonic()
-                record = dict(host=host, partition=namespace['partition'],
-                              pid=namespace['pid'], signal=None,
-                              grace_seconds=OWNER_STOP_GRACE_SECONDS,
-                              duration_seconds=0.0, forced=False,
-                              still_alive=False, source='cell', exit_code=None)
-                if alive:
-                    stop_file = namespace.get('stop')
-                    if stop_file:
-                        record['signal'] = 'stop-file'
-                        self.remote.shell(host, f'touch {quote(stop_file)}',
-                                          check=False)
-                        deadline = time.monotonic() + OWNER_STOP_GRACE_SECONDS
-                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                            if time.monotonic() > deadline:
-                                break
-                            time.sleep(0.2)
-                    if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                        record['signal'] = ((record['signal'] + '+SIGTERM')
-                                            if record['signal'] else 'SIGTERM')
-                        self.remote.shell(
-                            host, f'kill -TERM -{namespace["process_group"]}',
-                            check=False)
-                        deadline = time.monotonic() + 10
-                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                            if time.monotonic() > deadline:
-                                break
-                            time.sleep(0.1)
-                    record['forced'] = self.remote.exists(
-                        host, f'/proc/{namespace["pid"]}')
-                    if record['forced']:
-                        self.remote.shell(
-                            host, f'kill -KILL -{namespace["process_group"]}',
-                            check=False)
-                        deadline = time.monotonic() + 10
-                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                            if time.monotonic() > deadline:
-                                break
-                            time.sleep(0.1)
-                record['still_alive'] = self.remote.exists(
-                    host, f'/proc/{namespace["pid"]}')
-                record['duration_seconds'] = round(time.monotonic() - started, 3)
+                if namespace.get('stopped'):
+                    continue
+                record = owner_lifecycle.stop_owner(
+                    self.remote, host=host, pid=namespace['pid'],
+                    process_group=namespace['process_group'],
+                    stop_path=namespace.get('stop'),
+                    partition=namespace.get('partition'), source='cell',
+                    grace=OWNER_STOP_GRACE_SECONDS,
+                    kill_grace=owner_lifecycle.OWNER_KILL_SECONDS)
                 namespace['stopped'] = not record['still_alive']
                 records.append(record)
         self.namespaces = {}
         self.stops.extend(records)
+        self.cleanups = getattr(self, 'cleanups', [])
+        survivors = sorted({row['host'] for row in records if row['still_alive']})
+        if survivors:
+            for host in survivors:
+                self.cleanups.append(dict(
+                    host=host, root=str(self.cleanup_root) if self.cleanup_root
+                    else owner_lifecycle.CONFIGFS,
+                    prefix=owner_lifecycle.NQN_PREFIX, before=[], removed=[],
+                    remains=[], unavailable=False, complete=False, exit_code=None,
+                    error='owner still alive; cleanup refused'))
+        else:
+            self.cleanups.extend(owner_lifecycle.cleanup_hosts(
+                self.remote, self.owners,
+                root=getattr(self, 'cleanup_root', None)))
+        self.write_lifecycle_evidence()
         return records
+
+    def write_lifecycle_evidence(self):
+        path = self.local('owner-cleanup.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.cleanups, indent=2, sort_keys=True) + '\n')
 
     # ---- host evidence -------------------------------------------------
     def owner_root(self, host):
@@ -1191,6 +1180,8 @@ def stop_records(driver, parts):
             records.append(dict(record, part=part.get('name'),
                                 process='coordinator', output=part.get('output')))
     records.extend(dict(row, part='owners') for row in driver.cluster.stops)
+    records.extend(dict(row, part='cleanup', process='configfs')
+                   for row in getattr(driver.cluster, 'cleanups', []))
     return records
 
 
@@ -1203,6 +1194,10 @@ def stop_verdict(cell, records):
                  f"{row.get('part')} owner {row.get('partition')}")
         if 'host' in row:
             label += f" on {row['host']}"
+        if row.get('process') == 'configfs':
+            checks.append(mechanism._check(label + ' removed every owned object',
+                                           row.get('complete') is True, row))
+            continue
         checks.append(mechanism._check(label + ' stopped without a forced kill',
                                        not row.get('forced'), row))
         checks.append(mechanism._check(label + ' left no live process',
@@ -1358,6 +1353,7 @@ def cell_artifacts(output, parts):
             rows.append(campaign_upload.artifact(path, name))
 
     add(output / 'receipt.json', 'receipt.json')
+    add(output / 'owner-cleanup.json', 'owner-cleanup.json')
     for part in parts:
         base = Path(part['output'])
         name = part['name']

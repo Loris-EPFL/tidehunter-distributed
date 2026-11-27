@@ -83,6 +83,7 @@ import gcp_manual_storage
 import host_exec
 import mailbox_exec
 import manual_sui
+import owner_lifecycle
 import proc_sampler
 import stage2_mechanism as mechanism
 import stage3_specs
@@ -93,8 +94,8 @@ OWNER_READY_SECONDS = 120
 # NVMe-oF target, then writes and syncs a shutdown proof per database. The old
 # proven controller allowed 90 s for that (`cleanup_timeout`); the 30 s cell
 # bound is the coordinator's own `shutdown_grace_seconds`, not the owner's.
-OWNER_STOP_SECONDS = 90
-OWNER_KILL_SECONDS = 10
+OWNER_STOP_SECONDS = owner_lifecycle.OWNER_STOP_SECONDS
+OWNER_KILL_SECONDS = owner_lifecycle.OWNER_KILL_SECONDS
 TIER_ORDER = {'native': 0, 'synchronous': 1}
 
 
@@ -437,16 +438,19 @@ class Bucket:
 class Owners:
     """The stage-3 owner process groups of one tier's external preparation."""
 
-    def __init__(self, remote, preparations, *, root, guest_root):
+    def __init__(self, remote, preparations, *, root, guest_root,
+                 cleanup_root=None):
         self.remote = remote
         self.preparations = preparations
         self.root = Path(root)
         self.guest_root = Path(guest_root)
+        self.cleanup_root = Path(cleanup_root) if cleanup_root else None
         self.active = None
         self.installed = None
         self.namespaces = {}
         self.receipts = []
         self.stops = []
+        self.cleanups = []
 
     def _previous_owners(self, host):
         """`(pid, pidfile)` of owners of an earlier installation still alive."""
@@ -475,28 +479,13 @@ class Owners:
         """Never delete a guest root under a live owner of an earlier install."""
         records = []
         for pid, pidfile in self._previous_owners(host):
-            started = time.monotonic()
-            self.remote.shell(host, f'kill -TERM -{pid}', check=False)
-            deadline = time.monotonic() + OWNER_STOP_SECONDS
-            while self.remote.exists(host, f'/proc/{pid}'):
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.2)
-            forced = self.remote.exists(host, f'/proc/{pid}')
-            if forced:
-                self.remote.shell(host, f'kill -KILL -{pid}', check=False)
-                deadline = time.monotonic() + OWNER_KILL_SECONDS
-                while self.remote.exists(host, f'/proc/{pid}'):
-                    if time.monotonic() > deadline:
-                        break
-                    time.sleep(0.1)
-            alive = self.remote.exists(host, f'/proc/{pid}')
-            records.append(dict(host=host, partition=None, pid=pid, pidfile=pidfile,
-                                signal='SIGTERM', grace_seconds=OWNER_STOP_SECONDS,
-                                duration_seconds=round(time.monotonic() - started, 3),
-                                forced=forced, still_alive=alive, exit_code=None,
-                                source='previous install'))
-            if alive:
+            record = owner_lifecycle.stop_owner(
+                self.remote, host=host, pid=pid, process_group=pid,
+                source='previous install', grace=OWNER_STOP_SECONDS,
+                kill_grace=OWNER_KILL_SECONDS)
+            record['pidfile'] = pidfile
+            records.append(record)
+            if record['still_alive']:
                 self.stops.extend(records)
                 raise ValueError(f'{host}: previous owner {pid} is still alive; '
                                  'refusing to remove its guest root')
@@ -543,7 +532,11 @@ class Owners:
         """Put one tier's owner archive on its hosts without starting a process."""
         if self.installed == tier:
             return self.preparations[tier]
-        self.stop()
+        failures = self.stop()
+        if failures:
+            raise ValueError('owner stop or configfs cleanup failed on '
+                             + ', '.join(sorted(set(failures)))
+                             + '; refusing to install the next tier')
         prepared = self.preparations[tier]
         self._verify(prepared)
         self._install(prepared)
@@ -556,10 +549,27 @@ class Owners:
                 for host, entry in self.namespaces.items()
                 if not entry.get('stopped')]
 
+    def cleanup(self, *, required=True):
+        """Remove every tidehunter-prefixed configfs object on each owner host."""
+        hosts = sorted({record['host']
+                        for prepared in self.preparations.values()
+                        for record in prepared['manifest']['hosts']})
+        records = owner_lifecycle.cleanup_hosts(
+            self.remote, hosts, root=self.cleanup_root)
+        self.cleanups.extend(records)
+        failed = [row['host'] for row in records if not row['complete']]
+        if failed and required:
+            raise ValueError('owner configfs cleanup failed on '
+                             + ', '.join(sorted(failed)))
+        return failed
+
     def start(self, tier):
         if self.active == tier:
             return self.receipts
         prepared = self.install(tier)
+        # The previous cell may have died before its owner teardown. This gate
+        # runs after its owners are stopped and before this cell's owners start.
+        self.cleanup()
         index = prepared['index']
         # Published per host as it starts, so a partial start is still stopped.
         self.namespaces = {}
@@ -633,46 +643,26 @@ class Owners:
         for host, entry in self.namespaces.items():
             if entry.get('stopped'):
                 continue
-            started = time.monotonic()
-            record = dict(host=host, partition=entry['partition'], pid=entry['pid'],
-                          signal=None, grace_seconds=OWNER_STOP_SECONDS,
-                          duration_seconds=0.0, forced=False, still_alive=False,
-                          exit_code=None)
-            alive = self.remote.exists(host, f'/proc/{entry["pid"]}')
-            if alive:
-                if entry.get('stop'):
-                    record['signal'] = 'stop-file'
-                    self.remote.shell(host, f'touch {quote(entry["stop"])}', check=False)
-                    deadline = time.monotonic() + OWNER_STOP_SECONDS
-                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                        if time.monotonic() > deadline:
-                            break
-                        time.sleep(0.2)
-                if self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                    record['signal'] = ((record['signal'] + '+SIGTERM')
-                                        if record['signal'] else 'SIGTERM')
-                    self.remote.shell(host, f'kill -TERM -{entry["process_group"]}',
-                                      check=False)
-                    deadline = time.monotonic() + OWNER_KILL_SECONDS
-                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                        if time.monotonic() > deadline:
-                            break
-                        time.sleep(0.1)
-                record['forced'] = self.remote.exists(host, f'/proc/{entry["pid"]}')
-                if record['forced']:
-                    self.remote.shell(host, f'kill -KILL -{entry["process_group"]}',
-                                      check=False)
-                    deadline = time.monotonic() + OWNER_KILL_SECONDS
-                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                        if time.monotonic() > deadline:
-                            break
-                        time.sleep(0.1)
-            record['still_alive'] = self.remote.exists(host, f'/proc/{entry["pid"]}')
-            record['duration_seconds'] = round(time.monotonic() - started, 3)
+            record = owner_lifecycle.stop_owner(
+                self.remote, host=host, pid=entry['pid'],
+                process_group=entry['process_group'], stop_path=entry.get('stop'),
+                partition=entry['partition'], grace=OWNER_STOP_SECONDS,
+                kill_grace=OWNER_KILL_SECONDS)
             entry['stopped'] = not record['still_alive']
             self.stops.append(record)
             if not entry['stopped']:
                 failures.append(host)
+        survivors = sorted(set(failures))
+        if survivors:
+            for host in survivors:
+                self.cleanups.append(dict(
+                    host=host, root=str(self.cleanup_root) if self.cleanup_root
+                    else owner_lifecycle.CONFIGFS,
+                    prefix=owner_lifecycle.NQN_PREFIX, before=[], removed=[],
+                    remains=[], unavailable=False, complete=False, exit_code=None,
+                    error='owner still alive; cleanup refused'))
+        else:
+            failures.extend(self.cleanup(required=False))
         self.active = None if not failures else self.active
         return failures
 
@@ -854,7 +844,7 @@ def schedule(cells):
 
 
 def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watchers=(),
-             stops=()):
+             stops=(), cleanups=()):
     """Run one cell from a fresh database and output; return its artifacts."""
     if timeout is None:
         timeout = stage3_specs.cell_timeout(cell['path'])
@@ -864,13 +854,19 @@ def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watcher
                             watchers=watchers)
     except CellFailure as error:
         write_record(output, dict(error.record, failure=str(error)))
-        if stops:
-            write_stops(Path(output) / 'owner-stops.json', stops)
+        write_lifecycle(Path(output), stops=stops, cleanups=cleanups)
         raise
     write_record(output, record)
+    write_lifecycle(Path(output), stops=stops, cleanups=cleanups)
+    return artifacts(output)
+
+
+def write_lifecycle(output, *, stops=(), cleanups=()):
+    """Owner closes and between-cell cleanups travel with the cell they gate."""
     if stops:
         write_stops(Path(output) / 'owner-stops.json', stops)
-    return artifacts(output)
+    if cleanups:
+        write_stops(Path(output) / 'owner-cleanup.json', cleanups)
 
 
 def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket=None,
@@ -897,10 +893,11 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
             if runner is None and local.mode == 'rehearsal':
                 runner = local
             output = root / 'stage3' / 'out' / cell['id']
+            before = len(owners.stops) if owners is not None else 0
+            cleanups_before = len(owners.cleanups) if owners is not None else 0
             try:
                 if runner is None:
                     raise ValueError(f'arm {cell["arm"]} cell {cell["id"]} has no runner')
-                before = len(owners.stops) if owners is not None else 0
                 if cell['arm'] == 'B' and owners is not None:
                     owners.stop()
                 if cell['arm'] == 'A' and owners is not None:
@@ -913,7 +910,9 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                     cell, runner, output=output, stale_root=stale_root,
                     attempt=entry['attempts'], timeout=timeout,
                     watchers=owners.watchers() if (owners and cell['arm'] == 'A') else (),
-                    stops=owners.stops[before:] if owners is not None else ())
+                    stops=owners.stops[before:] if owners is not None else (),
+                    cleanups=(owners.cleanups[cleanups_before:]
+                              if owners is not None else ()))
                 if bucket is not None:
                     bucket.publish(cell['id'], produced, output, attempt=entry['attempts'])
                     ledger.mark_passed(entry, produced, store=bucket.ledger_store)
@@ -923,7 +922,13 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                 results.append(dict(id=cell['id'], status='passed', mode=runner.mode))
             except Exception as error:
                 # The failure upload keeps the attempt's receipt, run.json and
-                # samples: a fleet DELETE must not destroy the only copy.
+                # samples: a fleet DELETE must not destroy the only copy. A
+                # failed pre-cell gate still writes its close and cleanup rows.
+                write_lifecycle(
+                    output,
+                    stops=owners.stops[before:] if owners is not None else (),
+                    cleanups=(owners.cleanups[cleanups_before:]
+                              if owners is not None else ()))
                 ledger.fail(entry, error)
                 if bucket is not None:
                     bucket.evidence.persist_failure(
@@ -942,6 +947,8 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                                 status='failed' if failed or forced else 'stopped',
                                 detail=sorted(failed), forced=sorted(forced)))
             write_stops(root / 'stage3' / 'owner-stops.json', owners.stops)
+            if owners.cleanups:
+                write_stops(root / 'stage3' / 'owner-cleanup.json', owners.cleanups)
     return results, planned
 
 

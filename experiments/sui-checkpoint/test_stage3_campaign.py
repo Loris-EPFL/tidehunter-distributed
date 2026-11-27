@@ -180,6 +180,8 @@ class FakeRemote:
         self.calls.append((host, command))
         tokens = shlex.split(command)
         files = self.files(host)
+        if command.startswith('# tidehunter-owner-cleanup'):
+            return 0, b'', b''
         if command.startswith("sh -c 'for f in"):
             return 0, b'', b''
         if '@@' in command:

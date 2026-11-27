@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -86,8 +87,9 @@ class FakeBuild:
             import pathlib, sys, time, yaml
             launch = pathlib.Path(sys.argv[2])
             buffer = bytearray(1 << 20)
+            stop = launch.parent / 'stop'
             (launch.parent / 'ready').write_text('ready')
-            while True:
+            while not stop.exists():
                 time.sleep(0.05)
             """))
         owner.chmod(0o755)
@@ -319,7 +321,8 @@ class LauncherHandshake(unittest.TestCase):
             output=base / 'run', guest_root=self.root / 'guest',
             stage_dir=base / 'stages', config_dir=base / 'external-config',
             resources=base / 'resources.json', tier='native', owners=2,
-            deadline=900, transport='efa', live_transport='rdma', schema=self.schema)
+            deadline=900, transport='efa', live_transport='rdma', schema=self.schema,
+            cleanup_root=self.root / 'nvmet')
         values.update(overrides)
         return manual_sui.SuiLauncher(**values)
 
@@ -672,7 +675,7 @@ class ControllerLossInjection(unittest.TestCase):
             stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
             resources=self.root / 'resources.json', tier='native', owners=2,
             deadline=900, transport='efa', live_transport='rdma', schema=self.schema,
-            controller_loss=gate)
+            controller_loss=gate, cleanup_root=self.root / 'nvmet')
         values.update(overrides)
         return manual_sui.SuiLauncher(**values)
 
@@ -1164,6 +1167,7 @@ class FailureEvidence(unittest.TestCase):
             stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
             resources=self.root / 'resources.json', tier='native', owners=2,
             deadline=900, transport='efa', live_transport='rdma', schema=schema,
+            cleanup_root=self.root / 'nvmet',
             ledger=ledger, cell_id='S1-1-native', store=store,
             bucket='mysten-research-bench-artifacts', prefix=prefix,
             allow_local_ledger=False)
@@ -1198,7 +1202,8 @@ class FailureEvidence(unittest.TestCase):
             fixture=fixture, output=self.root / 'run', guest_root=self.root / 'guest',
             stage_dir=self.root / 'stages', config_dir=self.root / 'external-config',
             resources=self.root / 'resources.json', tier='native', owners=2,
-            deadline=900, transport='efa', live_transport='rdma', schema=schema)
+            deadline=900, transport='efa', live_transport='rdma', schema=schema,
+            cleanup_root=self.root / 'nvmet')
         launcher.config_dir.mkdir(parents=True)
         (launcher.config_dir / 'host-0.tar.gz').write_bytes(b'archive')
         names = {row['name'] for row in launcher.failure_artifacts()}
@@ -1243,6 +1248,7 @@ class NotReachedIsTerminal(unittest.TestCase):
                 resources=root / (directory + '-resources.json'),
                 tier='synchronous', owners=2, deadline=900, transport='efa',
                 live_transport='rdma', schema=schema,
+                cleanup_root=root / 'nvmet',
                 controller_loss=gate(remote, root / directory), ledger=ledger,
                 cell_id='S1-4-during-flush-synchronous',
                 allow_local_ledger=True)
@@ -1261,6 +1267,72 @@ class NotReachedIsTerminal(unittest.TestCase):
         self.assertTrue(third['skipped'])
         self.assertEqual(third['status'], 'invalid')
         self.assertFalse(remote.requests)
+
+
+class OwnerCloseGate(unittest.TestCase):
+    """manual_sui uses the marker first and refuses a cell after a failed gate."""
+
+    class Remote:
+        def __init__(self, *, leave_on_marker=False):
+            self.alive = {42}
+            self.calls = []
+            self.leave_on_marker = leave_on_marker
+
+        def shell(self, host, command, *, stdin=None, check=True):
+            self.calls.append(command)
+            if command.startswith('# tidehunter-owner-cleanup'):
+                return 0, b'', b''
+            if command.startswith('touch /guest/stop') and not self.leave_on_marker:
+                self.alive.clear()
+            if command.startswith('kill -TERM'):
+                self.alive.clear()
+            if command.startswith('kill -KILL'):
+                self.alive.clear()
+            return 0, b'', b''
+
+        def exists(self, host, path):
+            return str(path) == '/proc/42' and 42 in self.alive
+
+    def launcher(self, remote, root):
+        launcher = manual_sui.SuiLauncher.__new__(manual_sui.SuiLauncher)
+        launcher.remote = remote
+        launcher.output = Path(root) / 'run'
+        launcher.cleanup_root = Path(root) / 'nvmet'
+        launcher.external = {'hosts': [
+            dict(host='H1', partition=0, commands=[['owner']],
+                 ready_files=['/guest/ready'], stop_files=['/guest/stop'])]}
+        launcher.namespaces = {'H1': [dict(partition=0, pid=42, process_group=42,
+                                           stopped=False, stop='/guest/stop')]}
+        launcher.stops = []
+        launcher.cleanups = []
+        launcher.started = True
+        launcher.sample_stop = threading.Event()
+        launcher.sample_thread = None
+        return launcher
+
+    def test_stop_touches_the_marker_before_any_signal_and_records_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = self.Remote()
+            launcher = self.launcher(remote, tmp)
+            launcher.stop()
+            self.assertEqual(launcher.stops[0]['signal'], 'stop-file')
+            self.assertFalse(launcher.stops[0]['forced'])
+            self.assertFalse(any(command.startswith('kill -')
+                                 for command in remote.calls))
+            self.assertIn('touch /guest/stop', remote.calls)
+            self.assertTrue((launcher.output / 'owner-stops.json').is_file())
+            self.assertTrue((launcher.output / 'owner-cleanup.json').is_file())
+
+    def test_a_failed_cleanup_blocks_the_next_owner_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = self.Remote()
+            launcher = self.launcher(remote, tmp)
+            failed = dict(host='H1', complete=False, error='failed')
+            with mock.patch.object(manual_sui.owner_lifecycle, 'cleanup_hosts',
+                                   return_value=[failed]):
+                with self.assertRaisesRegex(manual_sui.LaunchError, 'cleanup failed'):
+                    launcher.start()
+            self.assertFalse(any('setsid' in command for command in remote.calls))
 
 
 if __name__ == '__main__':

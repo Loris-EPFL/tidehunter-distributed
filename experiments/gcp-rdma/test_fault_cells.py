@@ -1171,6 +1171,8 @@ class OwnerCellStop(unittest.TestCase):
         remote = self.Remote()
         cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
         cluster.remote, cluster.owners, cluster.stops = remote, ['h1'], []
+        cluster.cleanup_root, cluster.cleanups = None, []
+        cluster.output = Path(tempfile.mkdtemp()) / 'out'
         cluster.namespaces = {'h1': [dict(partition=0, pid=11, process_group=11,
                                           stopped=False, stop='/guest/stop')]}
         records = cluster.stop()
