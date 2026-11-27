@@ -85,21 +85,153 @@ class OwnedProcess:
         return self.returncode
 
 
-def stop_group(child, grace=5):
-    """Signal descendants before reaping the leader; never signal recycled IDs."""
+STACK_FILE_LIMIT = 16 << 10
+STACK_COMMAND_LIMIT = 64 << 10
+STACK_COMMAND_TIMEOUT = 3.0
+
+
+def _proc_stat(proc_root, pid):
+    """The parsed `/proc/<pid>/stat` tail, or None when it is unavailable."""
+    try:
+        text = (Path(proc_root) / str(pid) / 'stat').read_text()
+    except (OSError, UnicodeError):
+        return None
+    try:
+        return text[text.rindex(')') + 2:].split()
+    except ValueError:
+        return None
+
+
+def _process_group(proc_root, leader):
+    """The leader and every live process whose process group names it."""
+    members = {leader}
+    try:
+        entries = list(Path(proc_root).iterdir())
+    except OSError:
+        return sorted(members)
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fields = _proc_stat(proc_root, entry.name)
+        if fields is None or len(fields) < 3:
+            continue
+        try:
+            group = int(fields[2])
+        except ValueError:
+            continue
+        if group == leader:
+            members.add(int(entry.name))
+    return sorted(members)
+
+
+def _bounded_proc_file(path, limit=STACK_FILE_LIMIT):
+    try:
+        with Path(path).open('rb') as stream:
+            data = stream.read(limit)
+        return data.decode('utf-8', 'replace').rstrip('\n')
+    except (OSError, UnicodeError) as error:
+        return f'<unavailable: {type(error).__name__}>'
+
+
+def capture_shutdown_stacks(pid, destination, *, label=None, grace=None,
+                            proc_root=Path('/proc'), which=shutil.which,
+                            runner=None, limit=STACK_FILE_LIMIT,
+                            command_limit=STACK_COMMAND_LIMIT,
+                            command_timeout=STACK_COMMAND_TIMEOUT):
+    """Copy the process group's task state before a forced kill; never raises.
+
+    `/proc/<pid>/task/*/{comm,stat,wchan,syscall,stack}` needs no package. An
+    external thread dump is added only when `command -v` finds eu-stack or gdb,
+    with a bounded timeout and output.
+    """
+    destination = Path(destination)
+    runner = subprocess.run if runner is None else runner
+    lines = [f'# shutdown stacks: label={label or "process"} pid={pid} '
+             f'grace={grace} unix={time.time():.3f}']
+    try:
+        members = _process_group(proc_root, pid)
+        lines.append('group: ' + ' '.join(str(member) for member in members))
+        for member in members:
+            task_root = Path(proc_root) / str(member) / 'task'
+            try:
+                tasks = sorted(task_root.iterdir())
+            except OSError as error:
+                lines.append(f'## process {member}: task directory unavailable '
+                             f'({type(error).__name__})')
+                continue
+            for task in tasks:
+                if not task.name.isdigit():
+                    continue
+                lines.append(f'## process {member} task {task.name}')
+                for name in ('comm', 'stat', 'wchan', 'syscall', 'stack'):
+                    lines.append(f'# {name}')
+                    lines.append(_bounded_proc_file(task / name, limit))
+        if which('eu-stack'):
+            command = ['eu-stack', '-p', str(pid)]
+        elif which('gdb'):
+            command = ['gdb', '-batch', '-p', str(pid), '-ex', 'thread apply all bt']
+        else:
+            command = None
+        if command is None:
+            lines.append('## external thread dump: eu-stack/gdb not found')
+        else:
+            lines.append('## ' + ' '.join(command))
+            try:
+                done = runner(command, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=command_timeout)
+                text = (done.stdout or b'').decode('utf-8', 'replace')
+                lines.append(text[:command_limit])
+                if len(text) > command_limit:
+                    lines.append(f'[truncated at {command_limit} bytes]')
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                lines.append(f'<failed: {type(error).__name__}: {error}>')
+    except BaseException as error:  # evidence capture must never mask a stop
+        lines.append(f'# capture failed: {type(error).__name__}: {error}')
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text('\n'.join(lines) + '\n')
+    except OSError:
+        return None
+    return destination
+
+
+def stop_group(child, grace=5, *, stacks=None, label=None,
+               proc_root=Path('/proc'), which=shutil.which, runner=None):
+    """Signal descendants before reaping the leader; never signal recycled IDs.
+
+    Returns the stop record: the signal sent, the reaped code (or
+    `killed after grace`), the seconds from SIGTERM to exit and whether the
+    grace expired. On expiry the group's task state is copied to `stacks`
+    before SIGKILL.
+    """
     if not isinstance(child, OwnedProcess):
         raise TypeError('group cleanup requires an owned, unreaped session leader')
     if child.reaped:
-        return
+        return dict(signal=None, returncode=child.returncode,
+                    reaped_returncode=child.returncode, seconds=0.0,
+                    sigkill=False, stacks=None)
+    record = dict(signal='SIGTERM', returncode=None, reaped_returncode=None,
+                  seconds=None, sigkill=False, stacks=None)
+    started = time.monotonic()
     try:
         child.signal_group(signal.SIGTERM)
         try:
             child.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            pass
+            record['sigkill'] = True
+            if stacks is not None:
+                path = capture_shutdown_stacks(
+                    child.pid, stacks, label=label, grace=grace,
+                    proc_root=proc_root, which=which, runner=runner)
+                record['stacks'] = None if path is None else str(path)
     finally:
         child.signal_group(signal.SIGKILL)
         child.reap(timeout=5)
+        record['seconds'] = round(time.monotonic() - started, 3)
+        record['reaped_returncode'] = child.returncode
+        record['returncode'] = ('killed after grace' if record['sigkill']
+                                else child.returncode)
+    return record
 
 
 def bounded(command, *, timeout, **kwargs):

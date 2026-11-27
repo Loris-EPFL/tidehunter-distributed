@@ -19,6 +19,7 @@ import deployment
 import analyze
 import build
 import run
+import stage3_specs
 
 
 class SoftwareFabricGeometry(unittest.TestCase):
@@ -926,6 +927,9 @@ class ReopenWithFakes(unittest.TestCase):
 
         def stop(self, child):
             self.stopped.append(child)
+            return dict(signal='SIGTERM', returncode=-signal.SIGTERM,
+                        reaped_returncode=-signal.SIGTERM, seconds=0.1,
+                        sigkill=False, stacks=None)
 
     class Response:
         def __init__(self, data):
@@ -1315,6 +1319,208 @@ class AggregateMetricCut(unittest.TestCase):
             {'live/checkpoints', 'live/store/perpetual', 'live/store/epoch_1'})
         with self.assertRaises(ValueError):
             run.live_metric_namespaces(schema, 2)
+
+
+def owned_leader(pid):
+    """An OwnedProcess stand-in whose signals, wait and reap are local."""
+    child = object.__new__(build.OwnedProcess)
+    child.pid, child.args, child.returncode, child.reaped = pid, ['leader'], None, False
+    return child
+
+
+class ShutdownGrace(unittest.TestCase):
+    def test_every_owned_stop_uses_the_declared_grace(self):
+        self.assertEqual(run.SHUTDOWN_GRACE_SECONDS, 30)
+        self.assertEqual(run.SHUTDOWN_GRACE_SECONDS,
+                         stage3_specs.SHUTDOWN_GRACE_SECONDS)
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = run.Owned(Path(tmp), {})
+            child = object.__new__(build.OwnedProcess)
+            child.name = 'remote'
+            owner.children.append(child)
+            with patch.object(build, 'stop_group', return_value={}) as stop:
+                owner.stop(child)
+            self.assertEqual(stop.call_args.kwargs['grace'],
+                             run.SHUTDOWN_GRACE_SECONDS)
+            self.assertEqual(stop.call_args.kwargs['label'], 'remote')
+            self.assertEqual(stop.call_args.kwargs['stacks'],
+                             Path(tmp) / 'remote-shutdown-stacks.txt')
+        self.assertEqual(run.Owned(Path('/unused'), {}, shutdown_grace=7).shutdown_grace, 7)
+
+    def test_a_clean_sigterm_exit_is_not_a_forced_kill(self):
+        child = owned_leader(4242)
+        sent = []
+        child.signal_group = sent.append
+        def wait(timeout):
+            child.returncode = -signal.SIGTERM
+            return child.returncode
+        def reap(timeout):
+            child.reaped = True
+            return child.returncode
+        child.wait, child.reap = wait, reap
+        record = build.stop_group(child)
+        self.assertEqual(record['signal'], 'SIGTERM')
+        self.assertEqual(record['returncode'], -signal.SIGTERM)
+        self.assertEqual(record['reaped_returncode'], -signal.SIGTERM)
+        self.assertFalse(record['sigkill'])
+        self.assertGreaterEqual(record['seconds'], 0)
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+
+    def test_a_leader_that_exits_with_a_code_keeps_that_code(self):
+        child = owned_leader(4243)
+        child.signal_group = lambda number: None
+        def wait(timeout):
+            child.returncode = 7
+            return 7
+        def reap(timeout):
+            child.reaped = True
+            return 7
+        child.wait, child.reap = wait, reap
+        record = build.stop_group(child, grace=30)
+        self.assertEqual(record['returncode'], 7)
+        self.assertEqual(record['reaped_returncode'], 7)
+        self.assertFalse(record['sigkill'])
+        self.assertIsNone(record['stacks'])
+
+    def test_a_process_ignoring_sigterm_is_killed_after_the_grace_with_stacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proc = root / 'proc'
+            leader = proc / '4244' / 'task' / '4244'
+            member = proc / '4245' / 'task' / '4251'
+            for task, comm, stack in ((leader, 'sui-node', 'stack-leader'),
+                                      (member, 'storage-node', 'stack-member')):
+                task.mkdir(parents=True)
+                (task.parent.parent / 'stat').write_text(
+                    f'{task.parent.parent.name} ({comm}) S 1 4244 4244 0 -1\n')
+                (task / 'comm').write_text(comm + '\n')
+                (task / 'stat').write_text(
+                    f'{task.name} ({comm}) S 1 4244 4244 0 -1 4194560\n')
+                (task / 'wchan').write_text('wait_woken\n')
+                (task / 'syscall').write_text('0 0x0 0x0\n')
+                (task / 'stack').write_text(stack + '\n')
+            destination = root / 'remote-shutdown-stacks.txt'
+            child = owned_leader(4244)
+            sent, seen = [], {}
+            def signal_group(number):
+                sent.append(number)
+                if number == signal.SIGKILL:
+                    seen['stacks_before_sigkill'] = destination.exists()
+            child.signal_group = signal_group
+            def wait(timeout):
+                raise subprocess.TimeoutExpired(child.args, timeout)
+            def reap(timeout):
+                seen['stacks_at_reap'] = destination.exists()
+                child.reaped = True
+                child.returncode = -signal.SIGKILL
+                return child.returncode
+            child.wait, child.reap = wait, reap
+            def never(command, **kwargs):
+                raise AssertionError('no thread dumper is installed')
+            record = build.stop_group(child, grace=30, stacks=destination,
+                                      label='remote', proc_root=proc,
+                                      which=lambda name: None, runner=never)
+            self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+            self.assertTrue(record['sigkill'])
+            self.assertEqual(record['returncode'], 'killed after grace')
+            self.assertEqual(record['reaped_returncode'], -signal.SIGKILL)
+            self.assertEqual(record['stacks'], str(destination))
+            self.assertTrue(seen['stacks_before_sigkill'])
+            self.assertTrue(seen['stacks_at_reap'])
+            text = destination.read_text()
+            for expected in ('label=remote', 'group: 4244 4245', 'sui-node',
+                             'storage-node', 'stack-leader', 'stack-member'):
+                self.assertIn(expected, text)
+
+    def test_the_external_thread_dump_runs_only_when_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = root / 'proc' / '4246' / 'task' / '4246'
+            task.mkdir(parents=True)
+            (task / 'comm').write_text('sui-node\n')
+            destination = root / 'remote-shutdown-stacks.txt'
+            calls = []
+            def runner(command, **kwargs):
+                calls.append(command)
+                return SimpleNamespace(stdout=b'Thread 1 (LWP 4246)\n')
+            build.capture_shutdown_stacks(
+                4246, destination, proc_root=root / 'proc',
+                which=lambda name: '/usr/bin/gdb' if name == 'gdb' else None,
+                runner=runner)
+            self.assertEqual(calls, [['gdb', '-batch', '-p', '4246',
+                                      '-ex', 'thread apply all bt']])
+            self.assertIn('Thread 1 (LWP 4246)', destination.read_text())
+            calls.clear()
+            build.capture_shutdown_stacks(
+                4246, destination, proc_root=root / 'proc',
+                which=lambda name: None, runner=runner)
+            self.assertEqual(calls, [])
+            self.assertIn('not found', destination.read_text())
+
+    def _replay(self, root, stop_record):
+        sink = {}
+        owned = SimpleNamespace(root=root, start=lambda *args, **kwargs: object(),
+                                stop=lambda child: stop_record)
+        text = 'last_executed_checkpoint 1\n'
+        now = [0.0]
+        def monotonic():
+            now[0] += 0.1
+            return now[0]
+        clock = SimpleNamespace(monotonic=monotonic, sleep=lambda seconds: None)
+        with patch.object(run, 'time', clock), \
+                patch.object(run, 'sample',
+                             return_value={'pid': 1, 'exited': False}), \
+                patch.object(run, 'host_sample', return_value={}), \
+                patch.object(run.checkpoint, 'configuration',
+                             return_value={'metrics-address': 'unused',
+                                           'json-rpc-address': 'unused'}), \
+                patch.object(run.checkpoint, 'wait_for_rpc_indexes',
+                             return_value=(text, {})), \
+                patch.object(run.checkpoint, 'rpc',
+                             return_value={'digest': 'digest',
+                                           'sequenceNumber': 1, 'epoch': 0}), \
+                patch.object(run.checkpoint, 'replay_phases', return_value={}), \
+                patch.object(run.deployment, 'schemas',
+                             return_value={'live/store': {},
+                                           'live/store/epoch_0': {}}), \
+                patch.object(run.urllib.request, 'urlopen',
+                             side_effect=lambda *a, **k: io.BytesIO(text.encode())), \
+                patch.object(run, 'wait_for_final_metrics',
+                             return_value=(text, {'available': True})):
+            try:
+                result = run.replay(
+                    owned, 'unused', root, 'remote', 1, 'digest',
+                    {'SUI_SHARDED_WAL_SCHEMA_OUTPUT': str(root / 'schema')},
+                    [], 30, record=sink)
+            except RuntimeError as error:
+                return sink, error
+        return sink, result
+
+    def test_the_mode_result_carries_the_stop_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'remote.log').write_text('')
+            record = dict(signal='SIGTERM', returncode=-signal.SIGTERM,
+                          reaped_returncode=-signal.SIGTERM, seconds=0.25,
+                          sigkill=False, stacks=None)
+            sink, result = self._replay(root, record)
+            self.assertIs(result, sink)
+            self.assertEqual(result['shutdown'], record)
+            self.assertEqual(result['exit_code'], -signal.SIGTERM)
+
+    def test_a_nonzero_exit_is_reported_with_its_code_before_the_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'remote.log').write_text('')
+            record = dict(signal='SIGTERM', returncode=7, reaped_returncode=7,
+                          seconds=0.25, sigkill=False, stacks=None)
+            sink, error = self._replay(root, record)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn('return code 7', str(error))
+            self.assertIn('0.250 s after SIGTERM', str(error))
+            self.assertNotIn('killed after grace', str(error))
+            self.assertEqual(sink['shutdown'], record)
+            self.assertEqual(sink['exit_code'], 7)
 
 
 class FreshnessFailureRecord(unittest.TestCase):

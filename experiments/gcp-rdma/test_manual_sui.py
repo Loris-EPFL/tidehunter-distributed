@@ -1171,6 +1171,8 @@ class FailureEvidence(unittest.TestCase):
             (launcher.output / 'experiment').mkdir(parents=True)
             (launcher.output / 'experiment/results.json').write_text(
                 '{"failure": "audit differs"}')
+            (launcher.output / 'experiment/remote-shutdown-stacks.txt').write_text(
+                '# forced kill\n')
             raise manual_sui.LaunchError('audit differs')
         with mock.patch.object(launcher, 'execute', execute):
             with self.assertRaisesRegex(manual_sui.LaunchError, 'audit differs'):
@@ -1178,6 +1180,8 @@ class FailureEvidence(unittest.TestCase):
         self.assertEqual(ledger.status('stage1', 'S1-1-native'), 'failed')
         uploaded = [key for key in store.objects if '/attempt-1/' in key]
         self.assertTrue(any(key.endswith('experiment/results.json')
+                            for key in uploaded))
+        self.assertTrue(any(key.endswith('experiment/remote-shutdown-stacks.txt')
                             for key in uploaded))
         stored, _ = gcs_ledger.ObjectStoreLedger(store).get(
             f'{prefix}/campaign-ledger.json')

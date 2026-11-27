@@ -48,6 +48,10 @@ INVALID = 'invalid'
 # value declares it in its table row (M3 and M4 are the 64 MiB rows).
 DEFAULT_FRAGMENT_MIB = 1024
 DEFAULT_COORDINATOR_CACHE_MIB = 0
+# The declared SIGTERM-to-SIGKILL allowance for one owned node stop. It matches
+# the engine's own smallest close bound (`config.timeout`, 30 s), and the
+# stage-3 cell timeout publishes the same value as `shutdown_grace_seconds`.
+SHUTDOWN_GRACE_SECONDS = 30
 REVIEWED_STAGES = ('stage1', 'stage2')
 
 

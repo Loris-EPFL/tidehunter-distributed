@@ -49,6 +49,8 @@ import json
 from pathlib import Path
 import re
 
+import campaign_ledger
+
 KEYS = 65536
 SEED = 1775
 BATCH = 26
@@ -75,7 +77,7 @@ PROBE_OPERATIONS = 5_000
 # The engine's own cell deadline, the shutdown it allows itself and the driver's
 # allowance for the copy-back, upload and owner stop after it.
 DEADLINE_SECONDS = 600
-SHUTDOWN_GRACE_SECONDS = 30
+SHUTDOWN_GRACE_SECONDS = campaign_ledger.SHUTDOWN_GRACE_SECONDS
 CELL_TIMEOUT_GRACE_SECONDS = 120
 DEFAULT_CELL_TIMEOUT = (DEADLINE_SECONDS + SHUTDOWN_GRACE_SECONDS
                         + CELL_TIMEOUT_GRACE_SECONDS)

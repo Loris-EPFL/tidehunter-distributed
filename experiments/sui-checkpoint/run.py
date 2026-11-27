@@ -25,6 +25,9 @@ import deployment
 import disk_collector as disk
 import checkpoint_support as checkpoint
 
+# The campaign's declared shutdown allowance; one value for every owned stop.
+SHUTDOWN_GRACE_SECONDS = campaign_ledger.SHUTDOWN_GRACE_SECONDS
+
 
 def read_json(path):
     return json.loads(path.read_text())
@@ -74,29 +77,35 @@ def host_sample():
 
 
 class Owned:
-    def __init__(self, root, env):
+    def __init__(self, root, env, shutdown_grace=SHUTDOWN_GRACE_SECONDS):
         self.root, self.env, self.children = root, env, []
+        self.shutdown_grace = shutdown_grace
         self.libc = ctypes.CDLL(None, use_errno=True)
 
     def start(self, name, command, extra=None):
         with (self.root / f'{name}.log').open('xb') as log:
-            return self.spawn(command, log, subprocess.STDOUT, extra)
+            return self.spawn(command, log, subprocess.STDOUT, extra, name=name)
 
-    def spawn(self, command, stdout, stderr, extra=None):
+    def spawn(self, command, stdout, stderr, extra=None, name=None):
         parent = os.getpid()
         def parent_death():
             if self.libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != parent:
                 os._exit(125)
         child = build.OwnedProcess(list(map(str, command)), env=self.env | (extra or {}),
                                    stdout=stdout, stderr=stderr, preexec_fn=parent_death)
+        child.name = name or 'process'
         self.children.append(child)
         return child
 
     def stop(self, child):
         if child not in self.children:
             raise ValueError('process is not owned by this runner')
-        build.stop_group(child, grace=10)
+        name = getattr(child, 'name', 'process')
+        record = build.stop_group(
+            child, grace=self.shutdown_grace,
+            stacks=self.root / f'{name}-shutdown-stacks.txt', label=name)
         self.children.remove(child)
+        return record
 
     def close(self):
         for child in reversed(self.children.copy()):
@@ -306,9 +315,10 @@ def hold_node(owned, child, shards, *, address, seconds, disk_sample,
 
 def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
            disk_sample=None, disk_interval_seconds=10, bound=None,
-           short_run=False, certified_epoch=None, hold_seconds=0):
+           short_run=False, certified_epoch=None, hold_seconds=0, record=None):
     if bound is None:
         bound = tip
+    summary = {} if record is None else record
     if short_run and certified_epoch is None:
         raise ValueError('a short replay needs the producer-certified epoch')
     config = checkpoint.configuration(root, mode)
@@ -414,9 +424,19 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                          seconds=hold_seconds, disk_sample=disk_sample,
                          interval_seconds=disk_interval_seconds,
                          destination=owned.root / f'{mode}-hold.prom')
-    owned.stop(child)
-    if child.returncode not in (0, -signal.SIGTERM):
-        raise RuntimeError(f'{mode}: shutdown required forced kill or failed')
+    # The record is in the mode's result before the gate, so a failed stop is
+    # still described in results.json.
+    summary['shutdown'] = owned.stop(child)
+    stop = summary['shutdown']
+    summary['exit_code'] = stop['reaped_returncode']
+    if stop['sigkill'] or stop['reaped_returncode'] not in (0, -signal.SIGTERM):
+        detail = (f"forced kill, return code {stop['reaped_returncode']}, "
+                  f"{stop['seconds']:.3f} s after SIGTERM" if stop['sigkill'] else
+                  f"return code {stop['reaped_returncode']}, "
+                  f"{stop['seconds']:.3f} s after SIGTERM")
+        raise RuntimeError(
+            f'{mode}: shutdown failed: {detail}'
+            + (f"; stacks written to {stop['stacks']}" if stop['stacks'] else ''))
     final_disk = None
     if disk_sample:
         take_disk_sample()
@@ -426,25 +446,27 @@ def replay(owned, binary, root, mode, tip, digest, extra, shards, deadline,
                 final_disk = dict(final_disk, budget=disk.budget(final_disk))
             except ValueError as error:
                 final_disk = dict(final_disk, budget=dict(available=False, reason=str(error)))
-    return dict(elapsed_seconds_including_startup=elapsed, completed_checkpoint_digest=digest,
+    summary.update(dict(elapsed_seconds_including_startup=elapsed, completed_checkpoint_digest=digest,
         completed_checkpoint_epoch=int(certified['epoch']),
         checkpoint_limit=tip, completed_window=checkpoint.completion_window(progress), progress=progress,
         phase_timing=checkpoint.replay_phases((owned.root / f'{mode}.log').read_text(), elapsed),
-        rpc_index_catchup=catchup, final_metrics_freshness=freshness, exit_code=child.returncode,
+        rpc_index_catchup=catchup, final_metrics_freshness=freshness,
+        exit_code=stop['reaped_returncode'],
         bound=bound, short_run=short_run, final_metrics_source=(
             'last_live_scrape' if short_run else 'post-certified live scrape'),
         certified_source=('producer' if short_run else 'measured node'),
         peak_sampled_rss_bytes=max(sum(p.get('VmRSS', 0) for p in [r['node'], *r['shards']]) for r in samples),
         process_io_final=samples[-1], host_before=samples[0]['host'], host_after=samples[-1]['host'],
         disk_samples=disk_samples if disk_sample else None, disk_final=final_disk,
-        hold=held)
+        hold=held))
+    return summary
 
 
 def command_json(command, destination, env, deadline=600):
     owned = Owned(destination.parent, env)
     try:
         with destination.open('xb') as stdout, destination.with_suffix('.stderr').open('xb') as stderr:
-            child = owned.spawn(command, stdout, stderr)
+            child = owned.spawn(command, stdout, stderr, name=destination.stem)
             code = child.wait(timeout=deadline)
             if code:
                 raise subprocess.CalledProcessError(code, command)
@@ -1149,6 +1171,7 @@ def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound
     start = time.monotonic()
     child = owned.start('reopen', [binary, '--config-path', root / 'remote.yaml',
                                   '--run-with-range-checkpoint', replay_bound(bound)], extra)
+    stop = None
     try:
         checkpoint.wait_rpc(child, address)
         with urllib.request.urlopen(f'http://{address}/metrics', timeout=5) as response:
@@ -1164,11 +1187,16 @@ def reopen(owned, *, binary, root, address, producer_address, tip, digest, bound
                 raise RuntimeError(f'tail checkpoint {sequence} differs after the reopen')
             sample.append(dict(sequenceNumber=sequence, digest=node['digest']))
     finally:
-        owned.stop(child)
-    if child.returncode not in (0, -signal.SIGTERM):
-        raise RuntimeError('the reopen required a forced kill or failed')
+        stop = owned.stop(child)
+    if stop['sigkill'] or stop['reaped_returncode'] not in (0, -signal.SIGTERM):
+        detail = (f"forced kill, return code {stop['reaped_returncode']}, "
+                  f"{stop['seconds']:.3f} s after SIGTERM" if stop['sigkill'] else
+                  f"return code {stop['reaped_returncode']}, "
+                  f"{stop['seconds']:.3f} s after SIGTERM")
+        raise RuntimeError(f'the reopen failed: {detail}')
     (owned.root / 'reopen-final.prom').write_text(metrics)
-    return dict(seconds=time.monotonic() - start, exit_code=child.returncode,
+    return dict(seconds=time.monotonic() - start,
+                exit_code=stop['reaped_returncode'], shutdown=stop,
                 certified=dict(sequenceNumber=int(certified['sequenceNumber']),
                                digest=certified['digest'], epoch=int(certified['epoch'])),
                 rpc_index_catchup=catchup,
@@ -1281,6 +1309,11 @@ def main():
                         help='last K checkpoints read back through the reopened node')
     parser.add_argument('--disk-sample-seconds', type=int, default=10,
                         help='coordinator disk inventory interval in seconds, 0 disables collection')
+    parser.add_argument('--shutdown-grace-seconds', type=int,
+                        default=SHUTDOWN_GRACE_SECONDS,
+                        help='SIGTERM-to-SIGKILL allowance for every owned node stop; '
+                             f'the campaign declares {SHUTDOWN_GRACE_SECONDS} s and the '
+                             "engine's own smallest close bound is 30 s")
     parser.add_argument('--hold-seconds', type=int, default=0,
                         help='M5: keep the certified measured node resident this long, '
                              'sampling its disk, then take a final metrics scrape; needs '
@@ -1335,6 +1368,8 @@ def main():
         raise ValueError('max index maps must be 3..32; the WAL mapper panics below 3')
     if not 0 <= args.hold_seconds <= 86400:
         raise ValueError('hold seconds must be 0..86400')
+    if not 1 <= args.shutdown_grace_seconds <= 600:
+        raise ValueError('shutdown grace must be 1..600 seconds')
     if args.hold_seconds and not args.disk_sample_seconds:
         raise ValueError('a hold needs disk sampling; give --disk-sample-seconds above 0')
     if not 0 <= args.snapshot_written_bytes <= 1 << 40:
@@ -1441,7 +1476,7 @@ def main():
         native_write_profile_limit=args.native_write_profile_limit,
         mutex_count=mutex_count)
     env = deployment.process_environment(env, transport='tcp' if args.external_config else args.local_transport)
-    owned=Owned(output,env)
+    owned=Owned(output,env,shutdown_grace=args.shutdown_grace_seconds)
     producer_env = checkpoint.source_environment(prior)
     result=dict(schema=1,metrics_schema=3,protocol=9,backend='tidehunter-sharded-wal',cell_id=args.cell_id,
         durability=('synchronous durable whole-batch publication' if args.durability_tier == 'synchronous'
@@ -1514,8 +1549,10 @@ def main():
         result['short_run'] = short_run
         result['bound'] = bound
         native_extra=dict(SUI_SHARDED_WAL_ROOT=str(native_root), SUI_SHARDED_WAL_SCHEMA_OUTPUT=str(output/'native-schema'))
-        result['native']=replay(owned,bins/'sui-node-native',root,'native',tip,replay_digest,native_extra,[],args.deadline,
-            bound=bound, short_run=short_run, certified_epoch=prefix_epoch)
+        result['native']={}
+        replay(owned,bins/'sui-node-native',root,'native',tip,replay_digest,native_extra,[],args.deadline,
+            bound=bound, short_run=short_run, certified_epoch=prefix_epoch,
+            record=result['native'])
         schema=deployment.schemas(output/'native-schema', 'native')
         shards=[]
         if args.external_config:
@@ -1588,10 +1625,11 @@ def main():
         result['disk_geometry'] = dict(fragment_bytes=args.fragment_mib*deployment.MIB,
             production_fragment_bytes=1024*deployment.MIB,
             matches_production=args.fragment_mib == 1024)
-        result['remote']=replay(owned,bins/'sui-node-remote',root,'remote',tip,replay_digest,remote_extra,shards,args.deadline,
+        result['remote']={}
+        replay(owned,bins/'sui-node-remote',root,'remote',tip,replay_digest,remote_extra,shards,args.deadline,
             bound=bound, short_run=short_run, certified_epoch=prefix_epoch,
             disk_sample=disk_sample, disk_interval_seconds=args.disk_sample_seconds,
-            hold_seconds=args.hold_seconds)
+            hold_seconds=args.hold_seconds, record=result['remote'])
         result['hold'] = result['remote']['hold']
         result['live_transport'] = (
             (result.get('external_manifest') or {}).get('live_transport') or 'tcp')
