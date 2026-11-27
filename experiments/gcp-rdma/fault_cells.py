@@ -935,6 +935,27 @@ class CellDriver:
                     refusal=found[0].get('error_kind') if found else None)
 
     # ---- run records --------------------------------------------------
+    def keep_rows(self, child, name):
+        """Copy a bounded sample excerpt of one run into the cell output.
+
+        `failure_artifacts` walks the output tree, so an excerpt written here
+        ships with the cell; a raw `samples.csv.tmp` above the upload bound is
+        retained but unread by any verdict.
+        """
+        output = getattr(child, 'output', None)
+        if output is None:
+            return None
+        for member in ('samples.csv', 'samples.csv.tmp'):
+            source = Path(output) / member
+            if not source.is_file():
+                continue
+            target = Path(output).parent.parent / name / 'samples-excerpt.csv'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            excerpt = sample_excerpt(source)
+            shutil.copyfile(excerpt, target)
+            return target
+        return None
+
     def write_gate(self, child, gate):
         """Persist one gate record beside the run, before any verdict.
 
@@ -1173,6 +1194,63 @@ class CellDriver:
                                            or last_success < first)))
 
     @staticmethod
+    def _row_wall_ns(child, row):
+        """Wall clock of one completed sample: process start + completed_ns."""
+        return CellDriver._refusal_wall_ns(child, row)
+
+    @staticmethod
+    def _measurement_rows(rows_):
+        return [row for row in rows_ if row.get('phase') == 'measurement']
+
+    @classmethod
+    def _stale_after_fence(cls, child, rows_, fence_ns):
+        """How many stale-writer writes completed after the fence.
+
+        Returns `None` when the comparison cannot be made — no fence instant or
+        rows without a completion time — so a missing proof is never read as
+        zero. A success strictly after the fence is a write the stale
+        coordinator completed under the new authority.
+        """
+        if fence_ns is None:
+            return None
+        measurement = cls._measurement_rows(rows_)
+        if not measurement:
+            return None
+        walls = [cls._row_wall_ns(child, row) for row in measurement]
+        if any(wall is None for wall in walls):
+            return None
+        return sum(1 for wall, row in zip(walls, measurement)
+                   if row.get('outcome') == 'success' and wall > fence_ns)
+
+    @classmethod
+    def _first_success_ns(cls, child, rows_):
+        """Wall clock of the first successful measurement write, or None."""
+        for row in cls._measurement_rows(rows_):
+            if row.get('outcome') != 'success':
+                continue
+            wall = cls._row_wall_ns(child, row)
+            if wall is not None:
+                return wall
+        return None
+
+    @classmethod
+    def _last_success_ns(cls, child, rows_):
+        walls = [cls._row_wall_ns(child, row) for row in cls._measurement_rows(rows_)
+                 if row.get('outcome') == 'success']
+        walls = [wall for wall in walls if wall is not None]
+        return max(walls) if walls else None
+
+    @staticmethod
+    def _run_end_ns(child):
+        """Wall clock of the process's run end from its own summary, or None."""
+        summary = Path(child.output) / 'summary.json'
+        try:
+            finished = json.loads(summary.read_text()).get('finished_unix_seconds')
+        except (OSError, ValueError):
+            return None
+        return None if finished is None else int(round(float(finished) * 1e9))
+
+    @staticmethod
     def _refusal_wall_ns(child, row):
         """Wall time of a completed sample: process start plus completed_ns."""
         started = getattr(child, 'started_unix_ns', None)
@@ -1224,12 +1302,85 @@ class CellDriver:
         result['typed_refusal'] = typed
         result['stale_write_refused'] = refusal['refused']
         result['no_success_after_refusal'] = refusal['no_success_after']
-        wall = (self._refusal_wall_ns(child, rows_[refusal['first']])
-                if refusal['refused'] else None)
-        if wall is not None:
-            result['fence_reject_ms'] = (wall - resumed) / 1e6
-        result['writers'] = 1 if refusal['no_success_after'] else 2
+        # The fence of a lapse cell is the owner's write-protect, applied while
+        # the coordinator was paused: after it, the sealed generation may not be
+        # written by that coordinator again.
+        result['fence_unix_ns'] = (started + int(result['write_protect_apply_ms'] * 1e6)
+                                   if result.get('write_protect_apply_ms') is not None
+                                   else None)
+        result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
+        result['stale_success_after_fence'] = self._stale_after_fence(
+            child, rows_, result['fence_unix_ns'])
+        refusal_kind, wall = self._refusal_kind(
+            child, rows_, refusal, result.get('refusal_source'))
+        result['refusal_kind'] = refusal_kind
+        result['refusal_unix_ns'] = wall
+        result['fence_reject_ms'], result['fence_reject_window_ms'] = self._fence_window(
+            result['fence_unix_ns'], wall, self._last_success_ns(child, rows_),
+            self._run_end_ns(child))
+        # The row-level verdict; `fence_record` adds the audit and is the one
+        # that publishes `exclusive`/`writers`.
+        result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
+            refusal_kind, result['stale_success_after_fence'],
+            new_authority=bool(result.get('sealed_partitions')), audit_ok=True)
         return result
+
+    @classmethod
+    def _refusal_kind(cls, child, rows_, refusal, source):
+        """The stale writer's typed refusal, and its wall clock when known.
+
+        Either an owner-side refusal row (`owner-row`) or the coordinator's own
+        typed lease-lapse self-fence (`coordinator-self-fence`). A self-fence is
+        emitted before the frame is encoded, so it has no sample row and no
+        timestamp of its own.
+        """
+        if refusal['refused']:
+            return 'owner-row', cls._refusal_wall_ns(child, rows_[refusal['first']])
+        if refusal['typed'] or source == 'coordinator log':
+            return 'coordinator-self-fence', None
+        return None, None
+
+    @staticmethod
+    def _fence_window(fence_ns, refusal_ns, last_success_ns, run_end_ns):
+        """Fence-reject latency, or the window that bounds it.
+
+        Exact when the refusal is a sample row; otherwise the refusal happened
+        after the stale writer's last success and before its run ended.
+        """
+        if fence_ns is None:
+            return None, None
+        if refusal_ns is not None:
+            return (refusal_ns - fence_ns) / 1e6, None
+        lower = (None if last_success_ns is None
+                 else max(0.0, (last_success_ns - fence_ns) / 1e6))
+        upper = None if run_end_ns is None else max(0.0, (run_end_ns - fence_ns) / 1e6)
+        if lower is None and upper is None:
+            return None, None
+        return None, dict(lower_ms=lower, upper_ms=upper)
+
+    @staticmethod
+    def _exclusive(refusal_kind, stale_after, *, new_authority, audit_ok=None):
+        """Whether exclusive writes are proven, and the first missing proof.
+
+        `audit_ok` is the audit/verify part's answer to "no stale-writer write
+        after the fence": True, False, or None when the cell ran no audit. None
+        is a missing proof, never a pass.
+        """
+        if refusal_kind is None:
+            return False, 'the stale writer recorded no typed refusal (row or self-fence)'
+        if not new_authority:
+            return False, 'the new authority recorded no progress (no new writer, no seal)'
+        if stale_after is None:
+            return False, ('the stale writer\'s rows or the fence instant are missing, '
+                           'so no write after the fence can be ruled out')
+        if stale_after:
+            return False, f'{stale_after} stale-writer write(s) completed after the fence'
+        if audit_ok is None:
+            return False, ('no audit/verify part reports whether the stale writer left a '
+                           'write after the fence')
+        if not audit_ok:
+            return False, 'the audit/verify part reports a stale-writer write after the fence'
+        return True, None
 
     def _contend(self, child, case):
         """Freeze A, copy its root, start B on the copy, then resume A.
@@ -1258,6 +1409,9 @@ class CellDriver:
             result['failure'] = self.stop_on_failure(child, count=1)
         finally:
             second.stop()
+            # The new writer's own rows are the fence's evidence; the failure
+            # upload keeps 30 MiB of samples.csv.tmp that no verdict reads.
+            self.keep_rows(second, 'fence-b')
         first_rows = child.rows()
         refusal = self._refusal(first_rows)
         text, typed = refusal['text'], refusal['typed']
@@ -1272,14 +1426,33 @@ class CellDriver:
         result['no_success_after_refusal'] = refusal['no_success_after']
         result['refusal_text'] = text
         result['typed_refusal'] = typed
-        # The stale case's fence latency: from A's resume to the completion of
-        # its first refused call, taken from the sample's own completed_ns.
-        if case == 'stale' and refusal['refused']:
-            wall = self._refusal_wall_ns(child, first_rows[refusal['first']])
-            if wall is not None:
-                result['fence_reject_ms'] = ((wall - result['resumed_unix_ns'])
-                                             / 1e6)
-        result['writers'] = 1 if refusal['no_success_after'] else 2
+        second_rows = second.rows()
+        result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
+        result['second_started_unix_ns'] = getattr(second, 'started_unix_ns', None)
+        result['second_measurement_rows'] = len(self._measurement_rows(second_rows))
+        # The fence is the new coordinator's first completed write, converted to
+        # the same wall clock as the stale writer's rows. Without both start
+        # clocks the comparison is impossible and the verdict says so.
+        if (result['first_started_unix_ns'] is not None
+                and result['second_started_unix_ns'] is not None):
+            result['fence_unix_ns'] = self._first_success_ns(second, second_rows)
+            result['second_last_success_unix_ns'] = self._last_success_ns(second, second_rows)
+        else:
+            result['fence_unix_ns'] = None
+        result['stale_success_after_fence'] = self._stale_after_fence(
+            child, first_rows, result['fence_unix_ns'])
+        refusal_kind, wall = self._refusal_kind(
+            child, first_rows, refusal, result.get('refusal_source'))
+        result['refusal_kind'] = refusal_kind
+        result['refusal_unix_ns'] = wall
+        result['fence_reject_ms'], result['fence_reject_window_ms'] = self._fence_window(
+            result['fence_unix_ns'], wall, self._last_success_ns(child, first_rows),
+            self._run_end_ns(child))
+        # The row-level verdict; `fence_record` adds the audit and is the one
+        # that publishes `exclusive`/`writers`.
+        result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
+            refusal_kind, result['stale_success_after_fence'],
+            new_authority=result['second_measurement_rows'] > 0, audit_ok=True)
         return result
 
     def _sealed(self, child, host):
@@ -1409,23 +1582,76 @@ def crash_checks(cell, observations):
     return checks
 
 
+def fault_cells_exclusive(fence):
+    """The fence record's final exclusivity, including the audit when present."""
+    audit_ok = None
+    if fence.get('audit_available') is True:
+        audit_ok = fence.get('audit_stale_writes_after_fence') == 0
+    return CellDriver._exclusive(
+        fence.get('refusal_kind'), fence.get('stale_success_after_fence'),
+        new_authority=((fence.get('second_measurement_rows') or 0) > 0
+                       if fence.get('case') in ('contend', 'stale')
+                       else (fence.get('sealed_partitions') or 0) >= 1),
+        audit_ok=audit_ok)
+
+
 def fence_record(driver):
-    """The M8/S1-5 verdict: one writer, a typed refusal and the fence latencies."""
+    """The M8/S1-5 verdict: the stale writer cannot write under the new authority.
+
+    The plan's property is "a stale coordinator cannot write after the new
+    coordinator's fence". A refusal is accepted as an owner-side typed refusal
+    row or as the coordinator's own typed lease-lapse self-fence
+    (`coordinator_lease.rs` emits it before frame encoding), and it only counts
+    together with exclusivity: the stale writer recorded no completed success
+    after the fence, the new authority proceeded, and the audit is clean when an
+    audit part exists. A missing proof is a named failure, never a pass.
+    """
     fence = driver.fence
     case = fence['case']
-    checks = [mechanism._check('exactly one writer', fence.get('writers') == 1,
-                               fence.get('writers')),
-              mechanism._check('stale writer refused with a typed error',
-                               bool(fence.get('typed_refusal')),
-                               fence.get('refusal_text')),
-              mechanism._check('no successful write after the first refusal',
-                               fence.get('no_success_after_refusal') is True,
-                               dict(first_refusal_row=fence.get('first_refusal_row'),
-                                    last_success_row=fence.get('last_success_row')))]
-    if case in ('lapse', 'sealed'):
-        checks.append(mechanism._check('write-protect applied on an owner',
-                                       fence.get('sealed_partitions', 0) >= 1,
-                                       fence.get('sealed_partitions')))
+    audit_parts = [part for part in getattr(driver, 'parts', [])
+                   if part.get('role') == 'verify']
+    fence.setdefault('audit_available', bool(audit_parts))
+    if not audit_parts:
+        fence.setdefault('audit_note',
+                         'this cell runs no audit/verify part, so exclusivity is not '
+                         'proven: the fence cells need a verify run over the stale '
+                         'writer\'s root')
+        fence.setdefault('audit_stale_writes_after_fence', None)
+    fence['exclusive'], fence['exclusivity_reason'] = fault_cells_exclusive(fence)
+    fence['writers'] = 1 if fence['exclusive'] else 2
+    checks = [
+        mechanism._check('the stale writer was refused (owner row or coordinator self-fence)',
+                         fence.get('refusal_kind') is not None,
+                         dict(kind=fence.get('refusal_kind'),
+                              text=fence.get('refusal_text'),
+                              first_refusal_row=fence.get('first_refusal_row'))),
+        mechanism._check('the new authority proceeded',
+                         (fence.get('second_measurement_rows') or 0) > 0
+                         if case in ('contend', 'stale')
+                         else (fence.get('sealed_partitions') or 0) >= 1,
+                         dict(second_measurement_rows=fence.get('second_measurement_rows'),
+                              sealed_partitions=fence.get('sealed_partitions'))),
+        mechanism._check('no stale-writer write completed after the fence',
+                         fence.get('stale_success_after_fence') == 0,
+                         dict(stale_success_after_fence=fence.get('stale_success_after_fence'),
+                              fence_unix_ns=fence.get('fence_unix_ns'),
+                              first_started_unix_ns=fence.get('first_started_unix_ns'),
+                              second_started_unix_ns=fence.get('second_started_unix_ns'),
+                              reason=fence.get('exclusivity_reason'))),
+        mechanism._check('exclusive writes are proven', fence.get('exclusive') is True,
+                         dict(reason=fence.get('exclusivity_reason'),
+                              refusal_kind=fence.get('refusal_kind'),
+                              stale_success_after_fence=fence.get('stale_success_after_fence'),
+                              second_measurement_rows=fence.get('second_measurement_rows'),
+                              sealed_partitions=fence.get('sealed_partitions'))),
+    ]
+    checks.append(mechanism._check(
+        'the audit/verify reports no stale-writer write after the fence',
+        fence.get('audit_available') is True
+        and fence.get('audit_stale_writes_after_fence') == 0,
+        dict(available=fence.get('audit_available'),
+             stale_writes_after_fence=fence.get('audit_stale_writes_after_fence'),
+             note=fence.get('audit_note'))))
     if case == 'sealed':
         checks.append(mechanism._check('sealed generation is readable',
                                        fence.get('sealed_read_ok') is True,
@@ -1433,10 +1659,14 @@ def fence_record(driver):
         checks.append(mechanism._check('sealed generation is not writable',
                                        fence.get('sealed_write_refused') is True,
                                        fence.get('sealed_write_text')))
-    if case in ('lapse', 'stale'):
-        checks.append(mechanism._check('fence latency measured',
-                                       fence.get('fence_reject_ms') is not None,
-                                       fence.get('fence_reject_ms')))
+    if case in ('contend', 'lapse', 'stale', 'sealed'):
+        checks.append(mechanism._check(
+            'fence latency measured or bounded',
+            fence.get('fence_reject_ms') is not None
+            or fence.get('fence_reject_window_ms') is not None,
+            dict(kind=fence.get('refusal_kind'),
+                 exact_ms=fence.get('fence_reject_ms'),
+                 window=fence.get('fence_reject_window_ms'))))
     if case in ('lapse', 'sealed'):
         checks.append(mechanism._check('write-protect apply latency measured',
                                        fence.get('write_protect_apply_ms') is not None,

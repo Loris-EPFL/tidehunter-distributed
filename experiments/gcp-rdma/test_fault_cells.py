@@ -337,6 +337,127 @@ class SnapshotGate(unittest.TestCase):
         self.assertNotIn('writes', written)
 
 
+class FenceExclusivity(unittest.TestCase):
+    """S1-5S: the stale writer cannot write after the new authority's fence.
+
+    `fixtures/s1-5s-contend-attempt3.json` is the real fleet-A contend receipt
+    record (no start clocks, no fence instant) and
+    `fixtures/s1-5s-contend-a-excerpt.csv` is the real stale writer's row
+    excerpt. `fixtures/s1-5s-contend-attempt3.json:new_writer` holds the real new
+    writer's counts and its first success at 1.624 s after its own start.
+    """
+
+    def fixture(self, name):
+        return json.loads((ROOT / 'experiments/gcp-rdma/fixtures' / name).read_text())
+
+    def driver(self, fence, parts=()):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        driver.cell = dict(id='S1-5S-contend-native')
+        driver.fence = fence
+        driver.parts = list(parts)
+        return driver
+
+    def test_the_old_contend_record_names_the_missing_proof(self):
+        """No start clocks means no fence instant, which must fail named."""
+        real = self.fixture('s1-5s-contend-attempt3.json')
+        fence = dict(real['fence'], writers=2,
+                     refusal_kind='coordinator-self-fence',
+                     stale_success_after_fence=None,
+                     second_measurement_rows=real['new_writer']['measurement_rows'],
+                     exclusivity_reason=('the stale writer\'s rows or the fence instant '
+                                         'are missing, so no write after the fence can '
+                                         'be ruled out'))
+        record = fault_cells.fence_record(self.driver(fence))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['no stale-writer write completed after the fence']['ok'])
+        self.assertFalse(named['exclusive writes are proven']['ok'])
+        self.assertIn('missing',
+                      named['exclusive writes are proven']['detail']['reason'])
+        self.assertFalse(record['fence']['audit_available'])
+        self.assertIn('no audit/verify part', record['fence']['audit_note'])
+        self.assertFalse(record['fence']['exclusive'])
+        audit = [check for check in record['checks']
+                 if check['check'].startswith('the audit/verify reports')][0]
+        self.assertFalse(audit['ok'])
+
+    def test_the_real_stale_rows_are_judged_against_the_new_writers_fence(self):
+        rows_ = fault_cells.rows(ROOT / 'experiments/gcp-rdma/fixtures' / 's1-5s-contend-a-excerpt.csv')
+        real = self.fixture('s1-5s-contend-attempt3.json')['new_writer']
+        child = types.SimpleNamespace(started_unix_ns=1_000_000_000,
+                                      output=Path('/nonexistent'))
+        # The real excerpt keeps every early non-success row and drops the
+        # successes (the receipt's last_success_row is 89,156 of the full file),
+        # so it can never prove the property on its own: the verdict must read
+        # the live rows and both start clocks.
+        measurement = [row for row in rows_ if row['phase'] == 'measurement']
+        self.assertTrue(measurement)
+        self.assertEqual({row['outcome'] for row in measurement} - {'success'},
+                         {row['outcome'] for row in measurement})
+        self.assertIsNone(fault_cells.CellDriver._last_success_ns(child, rows_))
+        self.assertEqual(fault_cells.CellDriver._stale_after_fence(child, rows_, 1), 0)
+        self.assertIsNone(fault_cells.CellDriver._stale_after_fence(child, rows_, None),
+                          'no fence instant is never read as zero')
+        # The counting itself: two successes at +1 s and +3 s, a fence between
+        # them finds the later one.
+        late = [dict(phase='measurement', outcome='success', completed_ns='1000000000'),
+                dict(phase='measurement', outcome='success', completed_ns='3000000000')]
+        self.assertEqual(fault_cells.CellDriver._stale_after_fence(
+            child, late, 1_000_000_000 + 3_500_000_000), 0)
+        self.assertEqual(fault_cells.CellDriver._stale_after_fence(
+            child, late, 1_000_000_000 + 2_000_000_000), 1)
+        self.assertIsNone(fault_cells.CellDriver._stale_after_fence(
+            child, [dict(phase='measurement', outcome='success')], 1))
+        second = types.SimpleNamespace(started_unix_ns=5_000_000_000,
+                                       output=Path('/nonexistent'))
+        self.assertEqual(real['first_success_completed_ns'], 1_624_106_620)
+        self.assertGreater(real['measurement_successes'], 0)
+
+    def test_recorded_clocks_and_no_stale_success_is_a_pass(self):
+        real = self.fixture('s1-5s-contend-attempt3.json')
+        fence = dict(real['fence'], refusal_kind='owner-row', exclusive=True,
+                     writers=1, stale_success_after_fence=0,
+                     audit_available=True, audit_stale_writes_after_fence=0,
+                     second_measurement_rows=real['new_writer']['measurement_rows'],
+                     fence_unix_ns=1_000_000_000_000,
+                     first_started_unix_ns=999_000_000_000,
+                     second_started_unix_ns=999_500_000_000,
+                     fence_reject_ms=12.5, exclusivity_reason=None)
+        record = fault_cells.fence_record(self.driver(fence))
+        self.assertTrue(record['ok'], record)
+
+    def test_a_stale_success_after_the_fence_fails_named(self):
+        real = self.fixture('s1-5s-contend-attempt3.json')
+        fence = dict(real['fence'], refusal_kind='owner-row', exclusive=False,
+                     writers=2, stale_success_after_fence=3,
+                     second_measurement_rows=1,
+                     fence_unix_ns=1, first_started_unix_ns=0,
+                     second_started_unix_ns=0, fence_reject_ms=1.0,
+                     exclusivity_reason='3 stale-writer write(s) completed after the fence')
+        record = fault_cells.fence_record(self.driver(fence))
+        self.assertFalse(record['ok'])
+        detail = [c for c in record['checks']
+                  if c['check'] == 'no stale-writer write completed after the fence'][0]
+        self.assertEqual(detail['detail']['stale_success_after_fence'], 3)
+
+    def test_a_self_fence_is_accepted_with_a_bounded_latency(self):
+        fence = dict(case='lapse', refusal_kind='coordinator-self-fence',
+                     refusal_text='coordinator lease lapsed on owner partition 1',
+                     first_refusal_row=None, exclusive=True, writers=1,
+                     stale_success_after_fence=0, sealed_partitions=1,
+                     audit_available=True, audit_stale_writes_after_fence=0,
+                     write_protect_apply_ms=7097.3, fence_reject_ms=None,
+                     fence_reject_window_ms=dict(lower_ms=0.0, upper_ms=420.0),
+                     fence_unix_ns=1, first_started_unix_ns=0)
+        record = fault_cells.fence_record(self.driver(fence))
+        self.assertTrue(record['ok'], record)
+        latency = [c for c in record['checks']
+                   if c['check'] == 'fence latency measured or bounded'][0]
+        self.assertTrue(latency['ok'])
+        self.assertEqual(latency['detail']['kind'], 'coordinator-self-fence')
+        self.assertEqual(latency['detail']['window'], dict(lower_ms=0.0, upper_ms=420.0))
+
+
 class OwnerWAL(unittest.TestCase):
     def cluster(self, views):
         cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
@@ -592,9 +713,17 @@ class FenceVerdict(unittest.TestCase):
     def test_one_writer_with_a_typed_refusal_passes(self):
         record = self.records(dict(case='stale', tier='native', writers=1,
                                    typed_refusal=True,
+                                   refusal_kind='owner-row',
                                    refusal_text='coordinator lease lapsed',
                                    no_success_after_refusal=True,
                                    first_error_row=40, last_success_row=39,
+                                   first_refusal_row=40,
+                                   stale_success_after_fence=0, exclusive=True,
+                                   second_measurement_rows=200,
+                                   audit_available=True,
+                                   audit_stale_writes_after_fence=0,
+                                   first_started_unix_ns=1, second_started_unix_ns=2,
+                                   fence_unix_ns=3,
                                    fence_reject_ms=12.5))
         self.assertTrue(record['ok'], record)
 
@@ -1084,11 +1213,14 @@ class StaleFenceMeasurement(unittest.TestCase):
                          completed_ns='50000000')]
 
     class Second:
-        def __init__(self):
+        def __init__(self, started_unix_ns=1_000_000_000):
             self.stopped = False
+            self.started_unix_ns = started_unix_ns
+            self.output = Path('/nonexistent')
 
         def rows(self):
-            return [dict(phase='measurement', outcome='success', error_kind='')]
+            return [dict(phase='measurement', outcome='success', error_kind='',
+                         completed_ns='10000000')]
 
         def stop(self):
             self.stopped = True
@@ -1114,15 +1246,26 @@ class StaleFenceMeasurement(unittest.TestCase):
                                  return_value=dict(gate=gate, exit_code=1)):
                 result = driver._contend(child, 'stale')
         self.assertEqual(result['resumed_unix_ns'], 1_000_000_000)
-        self.assertEqual(result['fence_reject_ms'], 50.0)
+        # The fence is the new writer's first completed write at +10 ms on its
+        # own clock; the stale writer's refusal completed at +50 ms.
+        self.assertEqual(result['fence_unix_ns'], 1_010_000_000)
+        self.assertEqual(result['fence_reject_ms'], 40.0)
+        self.assertEqual(result['refusal_kind'], 'owner-row')
+        self.assertEqual(result['stale_success_after_fence'], 0)
+        self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
         self.assertTrue(result['stale_write_refused'])
         self.assertTrue(result['typed_refusal'])
-        self.assertEqual(result['writers'], 1)
         self.assertTrue(second.stopped)
+        result['audit_stale_writes_after_fence'] = 0
         record = fault_cells.fence_record(
             types.SimpleNamespace(cell=driver.cell,
+                                  parts=[dict(role='verify')],
                                   fence=dict(result, case='stale', tier='native')))
         self.assertTrue(record['ok'], record)
+        latency = [check for check in record['checks']
+                   if check['check'] == 'fence latency measured or bounded'][0]
+        self.assertEqual(latency['detail']['kind'], 'owner-row')
+        self.assertEqual(latency['detail']['exact_ms'], 40.0)
 
     def test_a_refusal_is_the_first_non_success_measurement_row(self):
         driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
@@ -1163,7 +1306,7 @@ class StaleFenceMeasurement(unittest.TestCase):
         refusal = driver._refusal(rows_)
         self.assertFalse(refusal['no_success_after'])
 
-    def test_a_contend_cell_is_not_a_stale_latency_claim(self):
+    def test_a_contend_cell_reports_the_fence_latency_with_its_kind(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'fence-a'
             (root / 'coordinator').mkdir(parents=True)
@@ -1182,7 +1325,20 @@ class StaleFenceMeasurement(unittest.TestCase):
                                  return_value=dict(gate=dict(reached=True, errors=1),
                                                    exit_code=1)):
                 result = driver._contend(child, 'contend')
-        self.assertNotIn('fence_reject_ms', result)
+        # A contend cell reports the same quantity as a stale cell, and says
+        # which kind of refusal it measured.
+        self.assertEqual(result['fence_unix_ns'], 1_010_000_000)
+        self.assertEqual(result['fence_reject_ms'], 40.0)
+        self.assertEqual(result['refusal_kind'], 'owner-row')
+        self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
+        result['audit_stale_writes_after_fence'] = 0
+        record = fault_cells.fence_record(
+            types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
+                                  fence=dict(result, case='contend', tier='native')))
+        self.assertTrue(record['ok'], record)
+        latency = [check for check in record['checks']
+                   if check['check'] == 'fence latency measured or bounded'][0]
+        self.assertEqual(latency['detail']['kind'], 'owner-row')
 
 
 class AttemptPaths(unittest.TestCase):
