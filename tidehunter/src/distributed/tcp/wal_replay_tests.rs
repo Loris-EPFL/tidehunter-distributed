@@ -636,9 +636,20 @@ fn replay_page_stops_after_two_lost_controllers() {
         None,
         "a spent retry budget marks the client broken: {error}"
     );
-    assert!(
-        !source.pool.connect_loss_pending(),
-        "both page attempts reached the connect: the budget is two reads"
+    assert_eq!(
+        source.pool.connect_losses_remaining(),
+        0,
+        "both armed losses were spent by a connect"
+    );
+    assert_eq!(
+        source.pool.lost_connect_injections(),
+        2,
+        "the second page attempt must also see a lost connect"
+    );
+    assert_eq!(
+        source.pool.connect_attempts(),
+        2,
+        "RECOVERY_PAGE_ATTEMPTS is two: one connect per page attempt"
     );
 }
 
@@ -696,9 +707,20 @@ fn replay_page_reconnects_after_one_lost_controller() {
         3,
         "the page keeps every batch the retry read"
     );
-    assert!(
-        !source.pool.connect_loss_pending(),
+    assert_eq!(
+        source.pool.connect_losses_remaining(),
+        0,
         "the first attempt reached the connect and consumed the armed loss"
+    );
+    assert_eq!(
+        source.pool.lost_connect_injections(),
+        1,
+        "only the first attempt saw the armed loss"
+    );
+    assert_eq!(
+        source.pool.connect_attempts(),
+        2,
+        "the loss cost one connect and the retry cost one"
     );
     assert_eq!(
         client.session_present(),

@@ -717,3 +717,112 @@ fn a_lost_cached_lease_is_evicted_and_the_next_acquire_reconnects() {
     drop(fresh);
     pool.shutdown(deadline).unwrap();
 }
+
+/// A verified loss raised while creating a fresh controller leaves its
+/// durable intent behind, so the failed acquisition quarantines the entry.
+/// A `Fresh` retry clears that entry and connects; an `Adopt` retry keeps the
+/// old fail-stop.
+#[test]
+fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    let dir = tempdir::TempDir::new("live-pool-quarantine").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Adopt).unwrap();
+    let pool = LiveControllerPool::new(registry.clone(), 2, 1).unwrap();
+    let target = fixture_target("nqn.2026-01.test:quarantine-fresh", 1, [1; 16], 4096);
+    let deadline = Instant::now() + PROGRESS_CAP;
+    // The hook fires after `reserve`, exactly as a `create` verify loss does:
+    // the intent stays and the pool cannot prove the controller absent.
+    registry.fail_next_after_reserve_loss();
+    let error = match pool.acquire_file(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadOnly,
+        ControllerAdoption::Fresh,
+        deadline,
+        (0, 1, 0),
+    ) {
+        Ok(_) => panic!("the after-reserve loss must fail the first connect"),
+        Err(error) => error,
+    };
+    assert!(
+        crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "the first-connect loss keeps its typed cause: {error}"
+    );
+    assert!(
+        matches!(
+            pool.state.lock().unwrap().entries.get(&target.nqn),
+            Some(Entry::Quarantined)
+        ),
+        "a lost connect with a remaining intent quarantines the entry"
+    );
+    pool.evict_lost(&target.nqn, deadline)
+        .expect("a quarantined entry cannot be proven lost; eviction is a no-op");
+    // The kernel path's Fresh connect retires that leftover intent; the local
+    // fixture replaces only the controller, so the retry must clear the entry.
+    let path = dir.path().join("wal");
+    std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+    pool.register_local_target(&target, LiveNamespaceAccess::ReadOnly, path)
+        .unwrap();
+    let (lease, how, _) = pool
+        .acquire_file(
+            &target,
+            HOST,
+            [2; 16],
+            LiveNamespaceAccess::ReadOnly,
+            ControllerAdoption::Fresh,
+            deadline,
+            (0, 1, 0),
+        )
+        .expect("a fresh retry clears the quarantine and reconnects");
+    assert_eq!(
+        how,
+        LivePoolAcquisition::Connected,
+        "the retry must connect, not reuse a quarantined entry"
+    );
+    assert!(!lease.controller_lost(), "the reconnected fixture is live");
+    drop(lease);
+    pool.shutdown(deadline).unwrap();
+
+    // The write path keeps its fail-stop: an Adopt retry still refuses.
+    let dir = tempdir::TempDir::new("live-pool-quarantine-adopt").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Adopt).unwrap();
+    let pool = LiveControllerPool::new(registry.clone(), 2, 1).unwrap();
+    let target = fixture_target("nqn.2026-01.test:quarantine-adopt", 1, [1; 16], 4096);
+    registry.fail_next_after_reserve_loss();
+    let error = match pool.acquire_shared(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadWrite,
+        deadline,
+    ) {
+        Ok(_) => panic!("the after-reserve loss must fail the first connect"),
+        Err(error) => error,
+    };
+    assert!(
+        crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "the Adopt first connect keeps the lost cause: {error}"
+    );
+    let error = match pool.acquire_shared(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadWrite,
+        deadline,
+    ) {
+        Ok(_) => panic!("an Adopt retry must not clear a quarantined entry"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::InvalidData,
+        "the Adopt quarantine stays a typed fail-stop: {error}"
+    );
+    assert!(
+        error.to_string().contains("quarantined"),
+        "the fail-stop names the quarantine: {error}"
+    );
+}

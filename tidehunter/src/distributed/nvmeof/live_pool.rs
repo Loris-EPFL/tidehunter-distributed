@@ -293,6 +293,15 @@ pub struct LiveControllerPool {
     /// observable: the pool must consume exactly one per lost connect.
     #[cfg(test)]
     fail_next_connect_lost: std::sync::atomic::AtomicU32,
+    /// Test only: every connect attempt, lost or not. A retry-budget test
+    /// reads it to prove the number of page attempts, independent of how many
+    /// fixture losses were armed.
+    #[cfg(test)]
+    connect_attempts: std::sync::atomic::AtomicU32,
+    /// Test only: connects the fixture answered with a lost controller. A
+    /// budget test reads it to prove every expected attempt saw its loss.
+    #[cfg(test)]
+    lost_connect_injections: std::sync::atomic::AtomicU32,
 }
 impl LiveControllerPool {
     /// Local-file pool fixture. It does not create or qualify a kernel controller.
@@ -410,6 +419,10 @@ impl LiveControllerPool {
             local_targets: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_next_connect_lost: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            connect_attempts: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            lost_connect_injections: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -606,13 +619,26 @@ impl LiveControllerPool {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Test only: whether an armed lost-connect remains unconsumed. A retry
-    /// budget test reads it to prove every attempt reached the connect.
+    /// Test only: how many armed lost-connects remain unconsumed. A retry
+    /// budget test reads it to prove every attempt reached its connect.
     #[cfg(test)]
-    pub(crate) fn connect_loss_pending(&self) -> bool {
+    pub(crate) fn connect_losses_remaining(&self) -> u32 {
         self.fail_next_connect_lost
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+    }
+
+    /// Test only: how many connects this pool attempted.
+    #[cfg(test)]
+    pub(crate) fn connect_attempts(&self) -> u32 {
+        self.connect_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test only: how many connects the fixture answered as a lost controller.
+    #[cfg(test)]
+    pub(crate) fn lost_connect_injections(&self) -> u32 {
+        self.lost_connect_injections
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the subsystem's cached controller is verifiably not live. Reads
@@ -682,11 +708,22 @@ impl LiveControllerPool {
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
         #[cfg(test)]
+        self.connect_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Exactly one armed loss per connect: a retry budget must be able to
+        // spend several without swallowing the rest.
+        #[cfg(test)]
         if self
             .fail_next_connect_lost
-            .swap(0, std::sync::atomic::Ordering::Relaxed)
-            > 0
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |armed| armed.checked_sub(1),
+            )
+            .is_ok()
         {
+            self.lost_connect_injections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(crate::distributed::nvmeof::live_namespace::controller_lost_error());
         }
         #[cfg(any(test, feature = "test-utils"))]
@@ -897,7 +934,15 @@ impl LiveControllerPool {
                     }
                 }
                 Some(Entry::Quarantined) => {
-                    return Err(invalid("connection outcome remains quarantined"));
+                    if adoption == ControllerAdoption::Adopt {
+                        return Err(invalid("connection outcome remains quarantined"));
+                    }
+                    // A fresh recovery connect retires the identity's leftover
+                    // intent and controller before `reserve`, so an uncertain
+                    // earlier connect of the same identity cannot block it.
+                    state.entries.remove(&key);
+                    // The freed slot and pending count changed: decide again.
+                    continue;
                 }
                 None => {
                     if state

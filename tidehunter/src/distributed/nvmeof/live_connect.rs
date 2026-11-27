@@ -395,6 +395,12 @@ impl LiveController {
             host_id,
         };
         let intent_path = registry.reserve(&intent)?;
+        #[cfg(test)]
+        if registry.take_after_reserve_loss() {
+            // The controller this reserve created is gone. The intent stays
+            // for reconciliation, exactly as a `create` verify loss leaves it.
+            return Err(controller_lost_error());
+        }
         // Kept after the worker takes its own copy: an `-EALREADY` means no
         // controller was created and the durable intent must not block the
         // bounded retry.

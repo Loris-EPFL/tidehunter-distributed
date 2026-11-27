@@ -43,6 +43,11 @@ pub(super) struct RegistryInner {
     pub(super) _lock: File,
     pub(super) admission: Mutex<()>,
     pub(super) uncertain: AtomicBool,
+    /// Test only: the next connects fail after writing their durable intent,
+    /// exactly as a `create` whose verify finds the new controller stopped
+    /// does. The intent is left for reconciliation.
+    #[cfg(test)]
+    pub(super) after_reserve_lost: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Clone)]
@@ -139,6 +144,8 @@ impl LiveConnectionRegistry {
                 _lock: lock,
                 admission: Mutex::new(()),
                 uncertain: AtomicBool::new(false),
+                #[cfg(test)]
+                after_reserve_lost: std::sync::atomic::AtomicU32::new(0),
             }),
         };
         registry.reconcile()?;
@@ -315,6 +322,26 @@ impl LiveConnectionRegistry {
             self.reconcile_retire_intent(&path, &intent, deadline)?;
         }
         Ok(())
+    }
+
+    /// Test only: the next connect fails after its durable intent is written,
+    /// leaving the intent behind like a `create` verify loss.
+    #[cfg(test)]
+    pub(crate) fn fail_next_after_reserve_loss(&self) {
+        self.inner
+            .after_reserve_lost
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test only: one armed after-reserve loss, if any.
+    #[cfg(test)]
+    pub(super) fn take_after_reserve_loss(&self) -> bool {
+        self.inner
+            .after_reserve_lost
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |armed| {
+                armed.checked_sub(1)
+            })
+            .is_ok()
     }
 
     /// Whether a controller with this subsystem and host identity remains in
