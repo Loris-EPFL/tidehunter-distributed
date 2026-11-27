@@ -837,6 +837,7 @@ fn a_short_read_inline_declines_without_quarantining() {
         .io
         .override_next_completion_result(0);
     let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    let errors_before = lane.metrics.snapshot().counts.errors;
     let error = lane
         .cache
         .read_inline_cached(
@@ -860,6 +861,11 @@ fn a_short_read_inline_declines_without_quarantining() {
         1,
         "the declined inline read is counted as a resume"
     );
+    assert_eq!(
+        lane.metrics.snapshot().counts.errors,
+        errors_before,
+        "a decline to the lane is not a terminal data-plane error"
+    );
     let grant = lane
         .cache
         .grants
@@ -880,6 +886,11 @@ fn a_short_read_inline_declines_without_quarantining() {
             .expect("the lane reconnects the lost controller"),
         &vec![frame],
         "the lane returns the identical member bytes"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.errors,
+        errors_before,
+        "the healed read records no data-plane error"
     );
     lane.cache.close(&mut lane.client, 1).unwrap();
     lane.client.live_pool = None;

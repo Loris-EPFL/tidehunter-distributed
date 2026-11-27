@@ -129,7 +129,8 @@ impl LiveReadCache {
     /// was verifiably deleted, it evicts the dead lease, marks the grant broken
     /// without poisoning its subsystem, and returns a `ConnectionAborted`
     /// class. The caller declines the inline route, and the lane retries the
-    /// idempotent read and reconnects inside its own budget.
+    /// idempotent read and reconnects inside its own budget. The decline is
+    /// counted as a resume, never as a data-plane error: the read is not lost.
     pub(crate) fn read_inline_cached(
         &mut self,
         client: &Client,
@@ -137,20 +138,21 @@ impl LiveReadCache {
         deadline: Instant,
         trace: Option<&ReadTraceChild>,
     ) -> Result<Vec<Bytes>, TcpError> {
-        let result = match self.read_inline_cached_inner(client, position, deadline, trace) {
+        match self.read_inline_cached_inner(client, position, deadline, trace) {
             Ok(bytes) => Ok(bytes),
-            Err(InlineFailure::Transient(error)) => Err(error),
+            Err(InlineFailure::Transient(error)) => {
+                if let Some(counters) = &client.live_counters {
+                    counters.record_error();
+                }
+                Err(error)
+            }
+            // An intentional decline to the lane, which retries the idempotent
+            // read: not a terminal error, and the caller never sees it as one.
             Err(InlineFailure::LostController(error)) => Err(TcpError::with_kind(
                 std::io::ErrorKind::ConnectionAborted,
                 error.to_string(),
             )),
-        };
-        if result.is_err()
-            && let Some(counters) = &client.live_counters
-        {
-            counters.record_error();
         }
-        result
     }
 
     fn read_inline_cached_inner(
