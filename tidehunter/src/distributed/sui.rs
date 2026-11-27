@@ -16,9 +16,10 @@ use super::codec::Mutation;
 use super::remote_db::{ConcurrentRemoteDatabase, RemoteDatabase, RemoteDatabaseConfig};
 use super::write_timeline::{WriteTimelineExport, WriteTimelineSample, WriteTimelineStage};
 use crate::config::Config;
+use crate::context::DbOpKind;
 use crate::db::{Db as NativeDb, DbError};
 use crate::key_shape::{KeyShape, KeySpace};
-use crate::metrics::Metrics;
+use crate::metrics::{MetricHistogram, MetricIntCounter, Metrics, TimerExt};
 use crate::minibytes::Bytes;
 use parking_lot::RwLock;
 use std::path::Path;
@@ -491,6 +492,9 @@ pub struct Db {
     backend: Backend,
     shape: KeyShape,
     capture_id: u64,
+    /// Engine `db_op` and `write_batch_times` handles of the remote backend;
+    /// `None` on native, whose `Db` records them itself.
+    engine_ops: Option<EngineOpMetrics>,
     writes: RwLock<()>,
     write_gate_wait: Stage,
     durable_native: AtomicBool,
@@ -530,6 +534,127 @@ impl Remote {
         Arc::try_unwrap(self.db)
             .map_err(|_| error("remote database still shared after the relocation worker joined"))
     }
+}
+
+/// Engine `Db` operation metrics of the remote backend, resolved once per
+/// keyspace at open: a Sui call never looks up a label pair or allocates.
+///
+/// The adapter records at the Sui API boundary, where native `Db` records for
+/// its backend, so each call is observed exactly once and internal work
+/// (relocation, snapshots, retries, audits) is not counted. The label values
+/// are native's: `get` per key of a `multi_get`, `exists` per key of a
+/// `multi_exists`, and `write_batch` with the native untagged `ks=""`.
+struct EngineOpMetrics {
+    get: Vec<MetricHistogram>,
+    exists: Vec<MetricHistogram>,
+    write_batch: MetricHistogram,
+    write_batch_times: MetricIntCounter,
+}
+
+impl EngineOpMetrics {
+    fn new(metrics: &Metrics, shape: &KeyShape) -> Self {
+        Self {
+            get: shape
+                .iter_ks()
+                .map(|ks| {
+                    metrics
+                        .db_op_mcs
+                        .with_label_values(&[DbOpKind::Get.as_ref(), ks.name()])
+                })
+                .collect(),
+            exists: shape
+                .iter_ks()
+                .map(|ks| {
+                    metrics
+                        .db_op_mcs
+                        .with_label_values(&[DbOpKind::Exists.as_ref(), ks.name()])
+                })
+                .collect(),
+            // Native's batch op carries the batch tag in the `ks` label; the
+            // Sui adapter has no tags, so it uses native's default empty tag.
+            write_batch: metrics.db_op_mcs.with_label_values(&["write_batch", ""]),
+            write_batch_times: metrics.write_batch_times.with_label_values(&["", "write"]),
+        }
+    }
+
+    fn get_timer(&self, ks: KeySpace) -> impl Drop {
+        self.get[ks.as_usize()].clone().mcs_timer()
+    }
+
+    fn exists_timer(&self, ks: KeySpace) -> impl Drop {
+        self.exists[ks.as_usize()].clone().mcs_timer()
+    }
+
+    fn write_batch_timer(&self) -> impl Drop {
+        self.write_batch.clone().mcs_timer()
+    }
+
+    fn write_batch_times_timer(&self) -> impl Drop {
+        self.write_batch_times.clone().mcs_timer()
+    }
+
+    /// One `get` observation per key, as native's per-key `Db::get` loop does.
+    /// The batch is one owner round trip, so each key gets an equal share of
+    /// the measured call instead of an individually measured span.
+    fn observe_gets(&self, ks: KeySpace, keys: usize, elapsed_mcs: u128) {
+        self.observe_per_key(&self.get[ks.as_usize()], keys, elapsed_mcs);
+    }
+
+    /// One `exists` observation per key, as native's per-key `Db::exists` loop.
+    fn observe_exists(&self, ks: KeySpace, keys: usize, elapsed_mcs: u128) {
+        self.observe_per_key(&self.exists[ks.as_usize()], keys, elapsed_mcs);
+    }
+
+    fn observe_per_key(&self, histogram: &MetricHistogram, keys: usize, elapsed_mcs: u128) {
+        if keys == 0 {
+            return;
+        }
+        let per_key_mcs = elapsed_mcs as f64 / keys as f64;
+        for _ in 0..keys {
+            histogram.observe(per_key_mcs);
+        }
+    }
+}
+
+/// The remote batch read of the Sui adapter: one trace, one batched owner
+/// fetch. Shared by `multi_get` and `multi_exists`, so only the Sui entry
+/// point records the engine op metric and the internal use is not counted
+/// twice.
+fn remote_multi_get<K: AsRef<[u8]>>(
+    remote: &Remote,
+    ks: KeySpace,
+    keys: &[K],
+    caller_id: Option<u64>,
+) -> Vec<Result<Option<Bytes>>> {
+    let trace = caller_id.and_then(|id| remote.db.begin_read_trace(id, keys.len()));
+    if keys.is_empty() {
+        if let Some(trace) = trace {
+            trace.event("api_finished");
+            trace.finish(true);
+        }
+        return Vec::new();
+    }
+    // One call for any key count: the table pages internally at the value
+    // reader's bounded window, so no separate large-read path exists.
+    let values = remote.bulk_read.run(|| {
+        if let Some(trace) = trace.as_ref() {
+            remote.db.traced_get_many(ks, keys, Some(trace))
+        } else {
+            remote.db.get_many(ks, keys)
+        }
+    });
+    let output: Vec<_> = match values {
+        Ok(values) => values
+            .into_iter()
+            .map(|value| value.map_err(error))
+            .collect(),
+        Err(e) => keys.iter().map(|_| Err(error(&e))).collect(),
+    };
+    if let Some(trace) = trace {
+        trace.event("api_finished");
+        trace.finish(output.iter().all(Result::is_ok));
+    }
+    output
 }
 impl Db {
     /// Live payload counters and verified namespace evidence, not configuration
@@ -745,10 +870,18 @@ impl Db {
         ))
     }
     fn new(backend: Backend, shape: KeyShape, capture_id: u64) -> Arc<Self> {
+        let engine_ops = match &backend {
+            Backend::Native(_) => None,
+            Backend::Remote(remote) => Some(EngineOpMetrics::new(
+                remote.db.hybrid_table().metrics(),
+                &shape,
+            )),
+        };
         Arc::new(Self {
             backend,
             shape,
             capture_id,
+            engine_ops,
             writes: RwLock::new(()),
             write_gate_wait: Stage::default(),
             durable_native: AtomicBool::new(false),
@@ -1366,11 +1499,13 @@ impl Db {
         self.read_keys.fetch_add(1, Ordering::Relaxed);
         match &self.backend {
             Backend::Native(db) => db.get(ks, key),
-            Backend::Remote(remote) => remote
-                .scalar_read
-                .run_if(remote.db.read_profile_enabled(), || {
-                    remote.db.get(ks, key).map_err(error)
-                }),
+            Backend::Remote(remote) => {
+                let _timer = self
+                    .engine_ops
+                    .as_ref()
+                    .map(|metrics| metrics.get_timer(ks));
+                self.remote_get(remote, ks, key)
+            }
         }
     }
     pub fn traced_get(&self, ks: KeySpace, key: &[u8], caller_id: u64) -> Result<Option<Bytes>> {
@@ -1384,12 +1519,28 @@ impl Db {
         self.read_keys.fetch_add(1, Ordering::Relaxed);
         match &self.backend {
             Backend::Native(db) => db.get(ks, key),
-            Backend::Remote(remote) => remote
-                .scalar_read
-                .run_if(remote.db.read_profile_enabled(), || {
-                    remote.db.traced_get(ks, key, caller_id).map_err(error)
-                }),
+            Backend::Remote(remote) => {
+                let _timer = self
+                    .engine_ops
+                    .as_ref()
+                    .map(|metrics| metrics.get_timer(ks));
+                remote
+                    .scalar_read
+                    .run_if(remote.db.read_profile_enabled(), || {
+                        remote.db.traced_get(ks, key, caller_id).map_err(error)
+                    })
+            }
         }
+    }
+    /// The remote scalar read, without the engine op metric: `exists` of a
+    /// keyspace whose index key is a reduction calls it and records `exists`
+    /// once instead of also recording the internal `get`.
+    fn remote_get(&self, remote: &Remote, ks: KeySpace, key: &[u8]) -> Result<Option<Bytes>> {
+        remote
+            .scalar_read
+            .run_if(remote.db.read_profile_enabled(), || {
+                remote.db.get(ks, key).map_err(error)
+            })
     }
     pub fn exists(&self, ks: KeySpace, key: &[u8]) -> Result<bool> {
         if let Some(call) = kv_capture::Call::begin(self.capture_id, ks, kv_capture::EXISTS, 1) {
@@ -1405,11 +1556,24 @@ impl Db {
                 db.exists(ks, key)
             }
             Backend::Remote(remote) if !self.shape.ks(ks).need_check_index_key() => {
+                let _timer = self
+                    .engine_ops
+                    .as_ref()
+                    .map(|metrics| metrics.exists_timer(ks));
                 self.read_calls.fetch_add(1, Ordering::Relaxed);
                 self.read_keys.fetch_add(1, Ordering::Relaxed);
                 remote.db.contains(ks, key).map_err(error)
             }
-            Backend::Remote(_) => self.get(ks, key).map(|v| v.is_some()),
+            Backend::Remote(remote) => {
+                let _timer = self
+                    .engine_ops
+                    .as_ref()
+                    .map(|metrics| metrics.exists_timer(ks));
+                self.read_calls.fetch_add(1, Ordering::Relaxed);
+                self.read_keys.fetch_add(1, Ordering::Relaxed);
+                self.remote_get(remote, ks, key)
+                    .map(|value| value.is_some())
+            }
         }
     }
     pub fn multi_get<K: AsRef<[u8]>>(
@@ -1454,33 +1618,10 @@ impl Db {
             }
             Backend::Remote(remote) => remote,
         };
-        let trace = caller_id.and_then(|id| remote.db.begin_read_trace(id, keys.len()));
-        if keys.is_empty() {
-            if let Some(trace) = trace {
-                trace.event("api_finished");
-                trace.finish(true);
-            }
-            return Vec::new();
-        }
-        // One call for any key count: the table pages internally at the value
-        // reader's bounded window, so no separate large-read path exists.
-        let values = remote.bulk_read.run(|| {
-            if let Some(trace) = trace.as_ref() {
-                remote.db.traced_get_many(ks, keys, Some(trace))
-            } else {
-                remote.db.get_many(ks, keys)
-            }
-        });
-        let output: Vec<_> = match values {
-            Ok(values) => values
-                .into_iter()
-                .map(|value| value.map_err(error))
-                .collect(),
-            Err(e) => keys.iter().map(|_| Err(error(&e))).collect(),
-        };
-        if let Some(trace) = trace {
-            trace.event("api_finished");
-            trace.finish(output.iter().all(Result::is_ok));
+        let began = Instant::now();
+        let output = remote_multi_get(remote, ks, keys, caller_id);
+        if let Some(metrics) = &self.engine_ops {
+            metrics.observe_gets(ks, keys.len(), began.elapsed().as_micros());
         }
         output
     }
@@ -1495,9 +1636,18 @@ impl Db {
             call.finish(result.iter().all(Result::is_ok));
             return result;
         }
-        if self.native().is_none() && self.shape.ks(ks).need_check_index_key() {
-            return self
-                .multi_get(ks, keys)
+        if self.shape.ks(ks).need_check_index_key()
+            && let Backend::Remote(remote) = &self.backend
+        {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            self.read_keys
+                .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            let began = Instant::now();
+            let values = remote_multi_get(remote, ks, keys, None);
+            if let Some(metrics) = &self.engine_ops {
+                metrics.observe_exists(ks, keys.len(), began.elapsed().as_micros());
+            }
+            return values
                 .into_iter()
                 .map(|value| value.map(|v| v.is_some()))
                 .collect();
@@ -1512,7 +1662,13 @@ impl Db {
             Backend::Native(db) => keys.iter().map(|key| db.exists(ks, key)).collect(),
             Backend::Remote(remote) => keys
                 .iter()
-                .map(|key| remote.db.contains(ks, key).map_err(error))
+                .map(|key| {
+                    let _timer = self
+                        .engine_ops
+                        .as_ref()
+                        .map(|metrics| metrics.exists_timer(ks));
+                    remote.db.contains(ks, key).map_err(error)
+                })
                 .collect(),
         }
     }
@@ -1591,6 +1747,14 @@ impl Db {
         if mutations.is_empty() {
             return self.validate_cached_read();
         }
+        let _batch_timer = self
+            .engine_ops
+            .as_ref()
+            .map(EngineOpMetrics::write_batch_timer);
+        let _batch_times_timer = self
+            .engine_ops
+            .as_ref()
+            .map(EngineOpMetrics::write_batch_times_timer);
         let sequence = self.operations.fetch_add(1, Ordering::Relaxed);
         let mut operation = [0u8; 16];
         operation[..8].copy_from_slice(&remote.epoch.to_le_bytes());
