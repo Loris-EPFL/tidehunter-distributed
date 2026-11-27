@@ -233,8 +233,7 @@ class ReviewedCells(unittest.TestCase):
 
     def test_run_arguments_round_trip(self):
         for cell_id in ('S1-0-native', 'S1-0-synchronous'):
-            self.assertEqual(ledger.run_arguments(ledger.cell(cell_id)),
-                             ['--checkpoints', '4'])
+            self.assertEqual(ledger.run_arguments(ledger.cell(cell_id)), [])
         self.assertEqual(ledger.run_arguments(ledger.cell('S1-1-native')),
                          ['--lifecycle-checks', '--tail-checkpoints', '64'])
         self.assertEqual(ledger.run_arguments(ledger.cell('M1-c4-native')),

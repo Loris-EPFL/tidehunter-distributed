@@ -707,7 +707,7 @@ python3 experiments/gcp-rdma/manual_sui.py \
   --transport tcp --live-transport rdma --durability-tier native \
   --cell-id S1-0-native --stage stage1 \
   --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
-  --ledger /absolute/campaign-ledger.json -- --checkpoints 4
+  --ledger /absolute/campaign-ledger.json
 ```
 
 `manual_sui.py --list [stage1|stage2]` prints the reviewed rows; a campaign run
@@ -1147,8 +1147,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0-native 
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-0-native --guest-root /mnt/tidehunter/sui-run-$RUN \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
-  --bucket-prefix $BUCKET --ledger $LEDGER \
-  -- --checkpoints 4
+  --bucket-prefix $BUCKET --ledger $LEDGER
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --cell-id S1-0-synchronous --durability-tier synchronous \
@@ -1158,8 +1157,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --output $CAMPAIGN_ROOT/stage1/S1-0-synchronous \
   --guest-root /mnt/tidehunter/sui-run-$RUN \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
-  --bucket-prefix $BUCKET --ledger $LEDGER \
-  -- --checkpoints 4
+  --bucket-prefix $BUCKET --ledger $LEDGER
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --cell-id S1-1-native --durability-tier native \

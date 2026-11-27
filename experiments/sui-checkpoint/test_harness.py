@@ -1678,8 +1678,8 @@ class ReviewedCellAdmission(unittest.TestCase):
 
     def test_each_reviewed_row_admits_its_own_knobs(self):
         rows = {
-            'S1-0-native': dict(checkpoints=4),
-            'S1-0-synchronous': dict(checkpoints=4),
+            'S1-0-native': dict(),
+            'S1-0-synchronous': dict(),
             'S1-1-native': dict(lifecycle_checks=True),
             'S1-7-cache0-native': dict(value_cache_size=0),
             'S1-7-blob1024-native': dict(index_blob_cache_mib=1024,
@@ -1709,7 +1709,6 @@ class ReviewedCellAdmission(unittest.TestCase):
             ('M3-native', dict(fragment_mib=64, max_maps=3, max_index_maps=3,
                                max_dirty_keys=1024), 'max-dirty-keys'),
             ('M5-hold', dict(hold_seconds=0), 'hold-seconds'),
-            ('S1-0-native', dict(checkpoints=None), 'checkpoints'),
             ('M2-cache0-native', dict(value_cache_size=None), 'value-cache-size'),
         )
         for cell_id, knobs, needle in cases:

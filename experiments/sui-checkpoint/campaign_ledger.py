@@ -73,11 +73,11 @@ def _manual_sui_cells():
     rows = [
         # ---- stage 1: correctness -------------------------------------------
         # The admission cell runs on both tiers: the synchronous one is the
-        # first FUA write on this image.
-        _cell('S1-0-native', 'stage1', 'native', requires=('admission',),
-              run=(('--checkpoints', '4'),)),
-        _cell('S1-0-synchronous', 'stage1', 'synchronous', requires=('admission',),
-              run=(('--checkpoints', '4'),)),
+        # first FUA write on this image. It replays the full fixture: a short
+        # run exits at its bound before the last scrape can observe it, and
+        # its final metrics would predate the replayed checkpoints.
+        _cell('S1-0-native', 'stage1', 'native', requires=('admission',)),
+        _cell('S1-0-synchronous', 'stage1', 'synchronous', requires=('admission',)),
         _cell('S1-1-native', 'stage1', 'native', requires=('lifecycle',),
               run=(('--lifecycle-checks',), ('--tail-checkpoints', '64'))),
         _cell('S1-1-synchronous', 'stage1', 'synchronous', requires=('lifecycle',),
