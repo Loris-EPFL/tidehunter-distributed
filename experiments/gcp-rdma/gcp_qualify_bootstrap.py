@@ -500,7 +500,7 @@ def _fleet_phase(deadline, seconds, operation):
 def _fleet_cleanup(run_id):
     import shutil
     gcp_runtime._run(run_id)
-    root = Path('/mnt/tidehunter-kv-comparison') / run_id
+    root = Path(gcp_runtime.RUN_DATA_ROOT) / run_id
     if root.is_symlink():
         raise ValueError('qualification data root is a symlink')
     for target in ('live-tcp', 'live-rdma', 'live-rdma-spdk'):

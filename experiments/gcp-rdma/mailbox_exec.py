@@ -81,6 +81,99 @@ class MailboxUnknownHost(MailboxError):
     """The host is not one of this fleet's admitted guests."""
 
 
+# Runs on every guest before a cell starts. The run data root must be the mount
+# that gcp_worker.prepare_storage made from the guest's local NVMe SSD, not the
+# boot persistent disk, and every declared campaign or guest path must resolve
+# inside it. A boot disk fills after about seven Sui cells, so a cell that ran
+# there did not measure local-NVMe behaviour.
+DATA_ROOT_GATE = r'''set -eu
+root={root}
+if ! findmnt -rn -M "$root" -o SOURCE >/dev/null 2>&1; then
+  echo "data root $root is not a mount point" >&2
+  exit 1
+fi
+device=$(readlink -f "$(findmnt -rn -M "$root" -o SOURCE)")
+case "$(basename "$device")" in
+  nvme[0-9]*n[0-9]*) ;;
+  *) echo "data root $root is on $device, not a local NVMe device" >&2; exit 1 ;;
+esac
+model=$(cat "/sys/block/$(basename "$device")/device/model" 2>/dev/null || true)
+case "$model" in
+  nvme_card|nvme_card[0-9]*|*Local*SSD*|*local*ssd*|*Titanium*|*titanium*) ;;
+  *) echo "data root $root is on $device ($model), not an admitted local SSD" >&2; exit 1 ;;
+esac
+boot=$(readlink -f "$(findmnt -rn -o SOURCE /)")
+if [ "$device" = "$boot" ]; then
+  echo "data root $root is the boot disk $device" >&2
+  exit 1
+fi
+for parent in $(lsblk -sno PATH "$boot" 2>/dev/null || true); do
+  if [ "$device" = "$parent" ]; then
+    echo "data root $root is the boot disk $device" >&2
+    exit 1
+  fi
+done
+set -- {paths}
+for candidate in "$@"; do
+  resolved=$(realpath -m -- "$candidate")
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *) echo "$candidate resolves to $resolved, outside $root" >&2; exit 1 ;;
+  esac
+done
+printf 'data_root=%s device=%s model=%s\n' "$root" "$device" "$model"
+'''
+
+
+def cloud_run(args):
+    """True for a paid campaign, false for the free local rehearsal."""
+    return (not getattr(args, 'gcloud_ssh', False)
+            and gcp_api.rehearsal_endpoint() is None)
+
+
+def data_root(args):
+    """The campaign data root this invocation owns, named by its fleet state."""
+    run_id = gcp_runtime.fleet_run_id(getattr(args, 'fleet_state', None))
+    if run_id is None:
+        raise SystemExit('a campaign run needs --fleet-state to name its data root')
+    return gcp_runtime.run_data_root(run_id)
+
+
+def admit_data_roots(args, roots):
+    """Refuse a cloud run whose declared on-host data roots are elsewhere.
+
+    A rehearsal keeps the same declaration but cannot prove the kernel mount, so
+    only a paid campaign refuses here; the guest gate still checks the real
+    hosts before a cell starts.
+    """
+    if not cloud_run(args):
+        return
+    run_id = gcp_runtime.fleet_run_id(args.fleet_state)
+    if run_id is None:
+        # The executor refuses a campaign without a fleet state before any
+        # request; there is no data root to prove yet.
+        return
+    for label, path in roots:
+        try:
+            gcp_runtime.admit_data_root_path(path, run_id, label)
+        except gcp_runtime.RuntimeSafetyError as exc:
+            raise SystemExit(str(exc)) from None
+
+
+def require_data_root(remote, run_id, paths):
+    """Prove on every guest, through the mailbox, that the SSD holds the run."""
+    root = gcp_runtime.run_data_root(run_id)
+    script = DATA_ROOT_GATE.format(
+        root=shlex.quote(str(root)),
+        paths=' '.join(shlex.quote(str(path)) for path in paths))
+    for host in getattr(remote, 'fleet', ()):
+        code, _out, err = remote.run(host['name'], script, check=False)
+        if code != 0:
+            raise SystemExit(
+                f'{host["name"]}: data root gate refused: '
+                + err.decode('utf-8', 'replace').strip())
+
+
 def upload_identical(store, key, path, sha256):
     """Upload one file and accept an existing object that holds the same bytes.
 
@@ -622,19 +715,25 @@ def coordinator_of(state_path):
     return fleet[0]['name']
 
 
-def dispatch(args, *, coordinator, script_relative, trees=(), files=(), values=None):
+def dispatch(args, *, coordinator, script_relative, trees=(), files=(), values=None,
+             data_paths=()):
     """Stage this driver's inputs and run it on the coordinator host.
 
     `trees` and `files` are `(guest name, local path)` pairs staged under
     `runs/<run>` inside the guest root; `values` maps a flag to the guest name
-    its value becomes. The coordinator runs the admitted package copy of this
+    its value becomes; `data_paths` are the driver's declared on-host roots
+    beside the campaign tree. Everything is staged under the run's local-SSD
+    data root, and a cloud run proves that placement on every guest before the
+    first byte is staged. The coordinator runs the admitted package copy of this
     script, with the guest metadata identity, so it writes the owner requests
     itself.
     """
     remote = open_executor(args)
     state_path = Path(args.fleet_state)
     state = json.loads(state_path.read_text())
-    campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
+    campaign = gcp_runtime.run_data_root(state['run_id']) / 'campaign'
+    if cloud_run(args):
+        require_data_root(remote, state['run_id'], [campaign, *data_paths])
     for name, local in trees:
         remote.stage_tree(coordinator, local, campaign / name)
     for name, local in files:
@@ -657,15 +756,21 @@ def dispatch(args, *, coordinator, script_relative, trees=(), files=(), values=N
 def rewrite(argv, values):
     """Replace the values of named flags in an existing argument vector.
 
-    A flag absent from `argv` keeps its own default on the guest, so a caller
-    maps only the paths that exist on the workstation.
+    Both `--flag value` and `--flag=value` forms are replaced, because argparse
+    accepts either and an equal-form path would otherwise reach the coordinator
+    unchanged. A flag absent from `argv` keeps its own default on the guest, so
+    a caller maps only the paths that exist on the workstation.
     """
     result = [str(item) for item in argv]
-    for index, item in enumerate(result[:-1]):
+    for index, item in enumerate(result):
         if item == '--':
             break
-        if item in values:
-            result[index + 1] = str(values[item])
+        for flag, value in values.items():
+            if item == flag:
+                if index + 1 < len(result):
+                    result[index + 1] = str(value)
+            elif item.startswith(flag + '='):
+                result[index] = flag + '=' + str(value)
     return result
 
 
@@ -710,4 +815,5 @@ def open_executor(args):
 __all__ = ['MailboxError', 'MailboxTimeout', 'MailboxRefused', 'MailboxUnknownHost',
            'MailboxExec', 'sui_spec', 'publish', 'release', 'gate_script', 'load_config',
            'open_executor', 'rewrite', 'with_flags', 'coordinator_of', 'dispatch',
+           'cloud_run', 'data_root', 'admit_data_roots', 'require_data_root',
            'tree_digest', 'admit_nvmet_fix', 'admit_package_nvmet_fix']

@@ -13,6 +13,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'nvmeof'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kv-comparison'))
 from cloud_layout import OWNER_HOST_COUNTS
+import gcp_runtime
 import manage
 import rdma_diagnostics
 
@@ -267,7 +268,7 @@ def main():
     parser.add_argument('--device')
     parser.add_argument('--owners', type=int, help='owner host count (create/cleanup)')
     args = parser.parse_args()
-    root = Path('/mnt/tidehunter-kv-comparison') / args.run_id / 'headroom-probe'
+    root = gcp_runtime.run_data_root(args.run_id) / 'headroom-probe'
     configfs = Path('/sys/kernel/config/nvmet')
     if args.action in ('create', 'cleanup'):
         if args.owners is None:

@@ -60,6 +60,7 @@ import campaign_upload as upload_module
 import checkpoint_support as checkpoint
 import deployment
 import gcp_manual_compute
+import gcp_runtime
 import host_exec
 import mailbox_exec
 import owner_lifecycle
@@ -887,6 +888,7 @@ class SuiLauncher:
                       schema=schema_files),
             knobs=dict(transport=self.transport, live_transport=self.live_transport,
                        tier=self.tier, owners=self.owners,
+                       data_device=gcp_runtime.DATA_DEVICE,
                        fragment_mib=self.fragment_mib, run_args=self.extra_run,
                        coordinator_cache_mib=self.coordinator_cache_mib,
                        shard_cache_mib=self.shard_cache_mib,
@@ -1359,8 +1361,9 @@ def main():
     parser.add_argument('--schema', type=Path, required=True,
                         help='native-schema from a source-identical local run')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--guest-root', type=Path, required=True,
-                        help='absolute owner storage root, identical on both owners')
+    parser.add_argument('--guest-root', type=Path,
+                        help='absolute owner storage root, identical on both owners; '
+                             'default: <data root>/guest on the run local SSD')
     parser.add_argument('--coordinator', required=True)
     parser.add_argument('--owners', required=True, help='owner1,owner2')
     parser.add_argument('--zone',
@@ -1455,6 +1458,16 @@ def main():
         raise SystemExit(f'--transport {args.transport} differs from the campaign '
                          f'topology {expected_transport}')
     kernel_gate(args.fleet_state, args.live_transport)
+    # Every campaign directory lives on the guest local SSD that
+    # gcp_worker.prepare_storage formatted and mounted for this run.
+    if args.guest_root is None:
+        args.guest_root = mailbox_exec.data_root(args) / 'guest'
+    mailbox_exec.admit_data_roots(args, [
+        ('--guest-root', args.guest_root),
+        *[(flag, value) for flag, value in (
+            ('--stage-dir', args.stage_dir),
+            ('--external-config-dir', args.external_config_dir),
+            ('--resources', args.resources)) if value is not None]])
     hosts = plan(args.coordinator, args.owners.split(','))
     output = args.output.resolve()
     if args.controller_loss is not None:
@@ -1485,6 +1498,7 @@ def main():
             script_relative='experiments/gcp-rdma/manual_sui.py',
             trees=[('build', args.build), ('fixture', args.fixture), ('schema', args.schema)],
             files=files,
+            data_paths=[args.guest_root],
             values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
                     '--output': Path('out') / args.output.name,
                     '--ledger': 'campaign-ledger.json',
@@ -1511,6 +1525,15 @@ def main():
         # A retry derives its own attempt-scoped tree; the base name still names
         # the cell, and the ledger path stays stable (F20).
         output = attempt_output(output, attempt)
+    # These are the directories this run writes on its own host. A cloud run
+    # proves each one on the run's SSD; a rehearsal has no such mount to prove.
+    mailbox_exec.admit_data_roots(args, [
+        ('--output', output),
+        ('--stage-dir', args.stage_dir or output.with_name(output.name + '-stages')),
+        ('--external-config-dir', args.external_config_dir
+         or output.with_name(output.name + '-external-config')),
+        ('--resources', args.resources
+         or output.with_name(output.name + '-resources.json'))])
     remote = mailbox_exec.open_executor(args)
     controller_loss = None
     if args.controller_loss is not None:

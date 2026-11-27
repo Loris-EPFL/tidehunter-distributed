@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -607,10 +608,13 @@ class CoordinatorTests(unittest.TestCase):
                 mailbox_exec.coordinator_of(path)
 
     def test_rewrite_replaces_only_named_flag_values(self):
-        argv = ['--build', '/local/build', '--cell', '--build-like', '--', '--build', '/run.py-x']
-        self.assertEqual(mailbox_exec.rewrite(argv, {'--build': '/guest/build'}),
-                         ['--build', '/guest/build', '--cell', '--build-like', '--',
-                          '--build', '/run.py-x'])
+        argv = ['--build', '/local/build', '--output=/local/cell', '--cell',
+                '--build-like', '--', '--build', '/run.py-x']
+        self.assertEqual(
+            mailbox_exec.rewrite(argv, {'--build': '/guest/build',
+                                        '--output': '/guest/out'}),
+            ['--build', '/guest/build', '--output=/guest/out', '--cell',
+             '--build-like', '--', '--build', '/run.py-x'])
 
     def test_dispatch_stages_the_inputs_and_runs_the_package_copy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -622,6 +626,8 @@ class CoordinatorTests(unittest.TestCase):
             argv = ['manual_sui.py', '--build', '/local/build', '--fixture', '/local/fixture',
                     '--output', '/local/cell', '--on-coordinator', '--', '--checkpoints', '4']
             with mock.patch.object(mailbox_exec, 'open_executor', return_value=remote), \
+                    mock.patch.object(mailbox_exec.gcp_api, 'rehearsal_endpoint',
+                                      return_value='http://store'), \
                     mock.patch.object(mailbox_exec.sys, 'argv', argv):
                 code = mailbox_exec.dispatch(
                     args, coordinator=FLEET[0]['name'],
@@ -630,7 +636,7 @@ class CoordinatorTests(unittest.TestCase):
                     values={'--build': 'build', '--fixture': 'fixture',
                             '--output': Path('out/cell')})
         self.assertEqual(code, 0)
-        campaign = Path(f'/mnt/tidehunter/{RUN}/campaign')
+        campaign = gcp_runtime.run_data_root(RUN) / 'campaign'
         self.assertEqual(remote.stage_tree.call_args_list,
                          [mock.call(FLEET[0]['name'], '/local/build', campaign / 'build'),
                           mock.call(FLEET[0]['name'], '/local/fixture', campaign / 'fixture')])
@@ -651,6 +657,120 @@ class CoordinatorTests(unittest.TestCase):
                     '--fleet-config', str(campaign / 'config.json'),
                     '--', '--checkpoints', '4']
         self.assertEqual(guest_argv, expected)
+
+
+class DataRootPlacement(unittest.TestCase):
+    """The campaign writes only to the mounted local SSD of its run."""
+
+    def state(self, directory):
+        state = {'run_id': RUN, 'source_sha256': SOURCE, 'deadline': deadline(),
+                 'host_count': 3, 'bucket': 'bucket',
+                 'instances': [{'name': f'{RUN}-{index}', 'fleet': host}
+                               for index, host in enumerate(FLEET)]}
+        path = Path(directory) / 'state.json'
+        path.write_text(json.dumps(state))
+        return path
+
+    def test_a_guest_root_on_the_boot_disk_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = type('Args', (), {'fleet_state': self.state(directory),
+                                     'gcloud_ssh': False})()
+            with mock.patch.object(mailbox_exec.gcp_api, 'rehearsal_endpoint',
+                                   return_value=None), \
+                    self.assertRaisesRegex(SystemExit, 'outside the run data root'):
+                mailbox_exec.admit_data_roots(
+                    args, [('--guest-root', '/mnt/tidehunter/sui-run')])
+
+    def test_dispatch_rewrites_the_equals_form_of_a_mapped_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.state(directory)
+            config = Path(directory) / 'config.json'
+            config.write_text('{}')
+            remote = mock.Mock(spec=mailbox_exec.MailboxExec)
+            remote.run_driver.return_value = (0, b'{}', b'')
+            args = type('Args', (), {'fleet_state': path, 'fleet_config': config,
+                                     'coordinator_seconds': 60})()
+            argv = ['manual_sui.py', '--output=/tmp/cell']
+            with mock.patch.object(mailbox_exec, 'open_executor', return_value=remote), \
+                    mock.patch.object(mailbox_exec.gcp_api, 'rehearsal_endpoint',
+                                      return_value='http://store'), \
+                    mock.patch.object(mailbox_exec.sys, 'argv', argv):
+                mailbox_exec.dispatch(
+                    args, coordinator=FLEET[0]['name'],
+                    script_relative='experiments/gcp-rdma/manual_sui.py',
+                    values={'--output': Path('out/cell')})
+        campaign = gcp_runtime.run_data_root(RUN) / 'campaign'
+        sent = remote.run_driver.call_args.args[2]
+        self.assertIn('--output=' + str(campaign / 'out/cell'), sent)
+
+    def test_dispatch_proves_the_ssd_mount_on_every_guest_before_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.state(directory)
+            config = Path(directory) / 'config.json'
+            config.write_text('{}')
+            remote = mock.Mock(spec=mailbox_exec.MailboxExec)
+            remote.fleet = FLEET
+            remote.run.return_value = (0, b'data_root=' + str(
+                gcp_runtime.run_data_root(RUN)).encode() + b' device=/dev/nvme7n1', b'')
+            remote.run_driver.return_value = (0, b'{}', b'')
+            args = type('Args', (), {'fleet_state': path, 'fleet_config': config,
+                                     'coordinator_seconds': 60})()
+            guest = gcp_runtime.run_data_root(RUN) / 'guest'
+            with mock.patch.object(mailbox_exec, 'open_executor', return_value=remote), \
+                    mock.patch.object(mailbox_exec.gcp_api, 'rehearsal_endpoint',
+                                      return_value=None), \
+                    mock.patch.object(mailbox_exec.sys, 'argv', ['manual_sui.py']):
+                mailbox_exec.dispatch(
+                    args, coordinator=FLEET[0]['name'],
+                    script_relative='experiments/gcp-rdma/manual_sui.py',
+                    data_paths=[guest])
+        self.assertEqual([call.args[0] for call in remote.run.call_args_list],
+                         [host['name'] for host in FLEET])
+        gate = remote.run.call_args_list[0].args[1]
+        self.assertIn(f'root={gcp_runtime.run_data_root(RUN)}', gate)
+        self.assertIn(f'findmnt -rn -M "$root"', gate)
+        self.assertIn(str(guest), gate)
+        campaign = gcp_runtime.run_data_root(RUN) / 'campaign'
+        self.assertEqual(remote.send_file.call_args_list[0],
+                         mock.call(FLEET[0]['name'], campaign / 'fleet-state.json', path))
+
+
+class DataRootGateScript(unittest.TestCase):
+    """The guest script refuses a root that is not a local-NVMe mount."""
+
+    def run_gate(self, root, findmnt, extra=None):
+        with tempfile.TemporaryDirectory() as directory:
+            binaries = Path(directory) / 'bin'
+            binaries.mkdir()
+            for name, body in dict({'findmnt': findmnt}, **(extra or {})).items():
+                path = binaries / name
+                path.write_text('#!/bin/sh\n' + body + '\n')
+                path.chmod(0o755)
+            gate = mailbox_exec.DATA_ROOT_GATE.format(
+                root=shlex.quote(str(root)), paths='')
+            return subprocess.run(['/bin/sh', '-c', gate], capture_output=True,
+                                  text=True, timeout=30,
+                                  env=dict(os.environ,
+                                           PATH=str(binaries) + ':/usr/bin:/bin'))
+
+    def test_a_directory_that_is_not_a_mount_point_is_refused(self):
+        completed = self.run_gate('/tmp/not-a-mount', 'exit 1')
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn('is not a mount point', completed.stderr)
+
+    def test_a_source_that_is_not_nvme_is_refused(self):
+        completed = self.run_gate('/tmp/not-nvme', 'echo /dev/sda1')
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn('not a local NVMe device', completed.stderr)
+
+    def test_the_boot_nvme_disk_is_refused(self):
+        findmnt = ('case "$*" in *"-M "*) echo /dev/nvme0n1 ;; '
+                   '*) echo /dev/nvme0n1p1 ;; esac')
+        completed = self.run_gate(
+            '/tmp/boot', findmnt,
+            {'cat': 'echo nvme_card0', 'lsblk': 'echo /dev/nvme0n1p1; echo /dev/nvme0n1'})
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn('is the boot disk', completed.stderr)
 
 
 class GuestIdentityTests(unittest.TestCase):

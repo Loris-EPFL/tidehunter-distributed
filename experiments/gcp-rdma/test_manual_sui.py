@@ -1018,6 +1018,24 @@ class ControlTransport(unittest.TestCase):
             self.assertEqual(manual_sui.main(), 0)
         self.assertEqual(dispatch.call_args.args[0].transport, 'tcp')
 
+    def test_a_coordinator_output_outside_the_ssd_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'fleet.json'
+            state.write_text(json.dumps({'run_id': 'bench-' + 'a' * 16}))
+            data = manual_sui.gcp_runtime.run_data_root('bench-' + 'a' * 16)
+            argv = ['manual_sui.py', '--build', '/b', '--fixture', '/f',
+                    '--schema', '/s', '--output', '/tmp/boot-cell',
+                    '--guest-root', str(data / 'guest'),
+                    '--coordinator', 'h0', '--owners', 'h1,h2',
+                    '--on-coordinator', '--allow-local-ledger',
+                    '--fleet-state', str(state)]
+            with mock.patch.object(manual_sui, 'kernel_gate'), \
+                    mock.patch.object(manual_sui.mailbox_exec.gcp_api,
+                                      'rehearsal_endpoint', return_value=None), \
+                    mock.patch.object(sys, 'argv', argv), \
+                    self.assertRaisesRegex(SystemExit, 'outside the run data root'):
+                manual_sui.main()
+
     def test_a_control_transport_outside_the_topology_is_refused(self):
         with mock.patch.object(sys, 'argv', self.argv('efa')), \
              mock.patch.object(manual_sui.mailbox_exec, 'dispatch') as dispatch, \

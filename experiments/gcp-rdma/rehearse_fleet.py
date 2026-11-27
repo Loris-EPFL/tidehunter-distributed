@@ -63,6 +63,7 @@ import campaign_ledger
 import campaign_manifest
 import gcp_api
 import gcp_manual_compute
+import gcp_runtime
 import mailbox_exec
 import rehearse_guest
 import stage2_mechanism
@@ -76,7 +77,6 @@ BASE_IMAGE = 'tidehunter-gcp-build:latest'
 IMAGE = 'tidehunter-rehearsal:latest'
 CONTROL_SUBNET = '10.90.0.0/24'
 DATA_SUBNET = '10.91.0.0/24'
-GUEST_ROOT = Path('/mnt/tidehunter/sui')
 # An owner that reaches kernel NVMe-oF provisioning names one of these in its
 # log before it exits. The rehearsal stops at that exact wall.
 WALL_MARKERS = ('nvmet', 'configfs', 'rdma_cm', 'nldev', 'libibverbs',
@@ -174,6 +174,10 @@ class Rehearsal:
         self.gateway = None
         self.deadline = None
         self.run_id = 'bench-rehearsal-' + self.tag
+        # The containers mount this path at the same place the guests do, so a
+        # rehearsal exercises the campaign's own local-SSD data layout.
+        self.data_root = gcp_runtime.run_data_root(self.run_id)
+        self.guest_root = self.data_root / 'guest'
         self.store = None
         self.config = None
         self.package = Path(args.package)
@@ -282,6 +286,7 @@ class Rehearsal:
         for host in fleet:
             directory = self.work / 'guests' / host['name']
             (directory / 'mnt').mkdir(parents=True, exist_ok=True)
+            (directory / 'data').mkdir(parents=True, exist_ok=True)
             identity = dict(host, project_id=PROJECT, project_number=PROJECT_NUMBER,
                             bucket=BUCKET, run_id=self.run_id,
                             source_sha256=self.source_sha256,
@@ -294,6 +299,7 @@ class Rehearsal:
                    '-v', str(ENGINE) + ':/rehearsal/src:ro',
                    '-v', str(directory) + ':/rehearsal/work',
                    '-v', str(directory / 'mnt') + ':/mnt/tidehunter',
+                   '-v', str(directory / 'data') + ':' + gcp_runtime.RUN_DATA_ROOT,
                    # The guest image installs libfabric 1.50 into the default
                    # loader path; the rehearsal mounts the sealed prefix there,
                    # because the worker replaces LD_LIBRARY_PATH with the
@@ -343,7 +349,7 @@ class Rehearsal:
         # bind every gate to an identity no guest can match.
         runtime, reference = mailbox_exec.publish(
             store, config, state, self.package, self.args.revision,
-            self.spec, self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
+            self.spec, self.fleet_hosts, guest_roots=[str(self.guest_root)])
         script = mailbox_exec.gate_script(BUCKET, state)
         for host in self.fleet_hosts:
             mailbox_exec.release(store, state, host, script)
@@ -351,7 +357,7 @@ class Rehearsal:
         mailbox_exec.release(store, state, self.fleet_hosts[0], script)
         again, same = mailbox_exec.publish(store, config, state, self.package,
                                            self.args.revision, self.spec,
-                                           self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
+                                           self.fleet_hosts, guest_roots=[str(self.guest_root)])
         if again != runtime or same['generation'] != reference['generation']:
             raise Failure('a repeated publish changed the runtime identity')
         self.step('publish and release', True,
@@ -375,7 +381,7 @@ class Rehearsal:
         try:
             mailbox_exec.publish(self.store, self.config, state, second,
                                  self.args.revision, self.spec, self.fleet_hosts,
-                                 guest_roots=[str(GUEST_ROOT)])
+                                 guest_roots=[str(self.guest_root)])
         except mailbox_exec.MailboxError as error:
             refused = str(error)
         if refused is None or 'immutable blob already holds other bytes' not in refused:
@@ -389,7 +395,7 @@ class Rehearsal:
                           + ', '.join(sorted(expected - set(removed))))
         _runtime, reference = mailbox_exec.publish(
             self.store, self.config, state, second, self.args.revision, self.spec,
-            self.fleet_hosts, guest_roots=[str(GUEST_ROOT)])
+            self.fleet_hosts, guest_roots=[str(self.guest_root)])
         package_object = json.loads(self.store.get('runs/' + self.run_id + '/package.json'))
         receipt = json.loads((second / 'package-receipt.json').read_text())
         if package_object.get('sha256') != receipt['sha256']:
@@ -437,8 +443,8 @@ class Rehearsal:
         """
         self.current_cell = output_name
         for host in self.fleet_hosts[1:]:
-            docker('exec', host['name'], 'rm', '-rf', str(GUEST_ROOT))
-        campaign = f'/mnt/tidehunter/{self.run_id}/campaign'
+            docker('exec', host['name'], 'rm', '-rf', str(self.guest_root))
+        campaign = f'{gcp_runtime.RUN_DATA_ROOT}/{self.run_id}/campaign'
         targets = [campaign + '/out/' + output_name,
                    campaign + '/out/' + output_name + '-external-config',
                    campaign + '/out/' + output_name + '-stages',
@@ -460,15 +466,19 @@ class Rehearsal:
         """One guest's `/mnt/tidehunter` as seen from the laptop."""
         return self.work / 'guests' / host['name'] / 'mnt'
 
+    def data_mount(self, host):
+        """One guest's local-SSD data root as seen from the laptop."""
+        return self.work / 'guests' / host['name'] / 'data'
+
     def campaign_mount(self):
         """H0's staged campaign directory as seen from the laptop."""
-        return self.guest_mount(self.fleet_hosts[0]) / self.run_id / 'campaign'
+        return self.data_mount(self.fleet_hosts[0]) / self.run_id / 'campaign'
 
     def owner_logs(self):
         lines = []
-        root_relative = GUEST_ROOT.relative_to('/mnt/tidehunter')
+        root_relative = self.guest_root.relative_to(gcp_runtime.RUN_DATA_ROOT)
         for host in self.fleet_hosts[1:]:
-            root = self.guest_mount(host) / root_relative
+            root = self.data_mount(host) / root_relative
             for log in sorted(root.glob('*.log')):
                 text = log.read_text(errors='replace')
                 lines.append((host['name'], log.name, text))
@@ -521,7 +531,7 @@ class Rehearsal:
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
-                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--guest-root', self.guest_root, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--transport', 'tcp', '--live-transport', 'rdma',
                 '--cell-id', 'S1-0-native', '--stage', 'stage1',
@@ -540,7 +550,7 @@ class Rehearsal:
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
-                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--guest-root', self.guest_root, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--transport', 'tcp', '--live-transport', 'rdma',
                 '--durability-tier', 'synchronous',
@@ -567,7 +577,7 @@ class Rehearsal:
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
-                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--guest-root', self.guest_root, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--transport', 'tcp', '--live-transport', 'rdma',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,
@@ -592,7 +602,7 @@ class Rehearsal:
         argv = [sys.executable, HERE / 'manual_sui.py',
                 '--build', self.build, '--fixture', self.args.fixture,
                 '--schema', self.args.schema, '--output', output,
-                '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                '--guest-root', self.guest_root, '--coordinator', self.fleet_hosts[0]['name'],
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--transport', 'tcp', '--live-transport', 'rdma',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,
@@ -680,7 +690,7 @@ class Rehearsal:
                     '--cell', cell_id,
                     '--build', self.build, '--fixture', self.args.fixture,
                     '--schema', self.args.schema, '--output', output,
-                    '--guest-root', GUEST_ROOT, '--coordinator', self.fleet_hosts[0]['name'],
+                    '--guest-root', self.guest_root, '--coordinator', self.fleet_hosts[0]['name'],
                     '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                     '--transport', 'tcp', '--live-transport', 'rdma',
                     '--fleet-state', self.state_path, '--fleet-config', self.config_path,
@@ -725,8 +735,8 @@ class Rehearsal:
         argv = [sys.executable, ENGINE / 'experiments/sui-checkpoint/stage3_campaign.py',
                 '--root', output, '--binary', Path(self.build) / 'binaries/storage-node',
                 '--build', self.build, '--schema', self.args.schema,
-                '--native-root', str(GUEST_ROOT / 'native'),
-                '--guest-root', GUEST_ROOT,
+                '--native-root', str(self.guest_root.parent / 'native'),
+                '--guest-root', self.guest_root,
                 '--owners', ','.join(host['name'] for host in self.fleet_hosts[1:]),
                 '--bucket-prefix', 'gs://' + BUCKET + '/rehearsal',
                 '--fleet-state', self.state_path, '--fleet-config', self.config_path,

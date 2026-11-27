@@ -80,6 +80,7 @@ sys.path.insert(0, str(HERE.parent / 'gcp-rdma'))
 import campaign_ledger as ledger_module
 import campaign_upload
 import gcp_manual_storage
+import gcp_runtime
 import host_exec
 import mailbox_exec
 import manual_sui
@@ -135,7 +136,8 @@ def cells_for(root, *, engine_rev, sui_rev, binary_ids, spec_dir=None):
         cells.append(dict(id=case['case_id'], stage=STAGE,
                           unit=case['case_id'], arm=case['arm'], tier=case['tier'],
                           config_hash=ledger_module.config_hash(
-                              spec=spec_hash(path), knobs=dict(case=case),
+                              spec=spec_hash(path),
+                              knobs=dict(case=case, data_device=gcp_runtime.DATA_DEVICE),
                               engine_rev=engine_rev, sui_rev=sui_rev,
                               binary_ids=binary_ids),
                           path=str(path)))
@@ -696,7 +698,10 @@ def write_calibration_specs(root, *, external):
 
 
 def entry_identity(path, *, knobs, engine_rev, sui_rev, binary_ids):
-    return ledger_module.config_hash(spec=spec_hash(path), knobs=knobs,
+    # The placement is part of the identity: a cell that passed with its data
+    # on the boot disk is not the same measurement as one on the local SSD.
+    return ledger_module.config_hash(spec=spec_hash(path),
+                                     knobs=dict(knobs, data_device=gcp_runtime.DATA_DEVICE),
                                      engine_rev=engine_rev, sui_rev=sui_rev,
                                      binary_ids=binary_ids)
 
@@ -1131,6 +1136,13 @@ def main():
     cluster = args.mode == 'cluster'
     if cluster:
         manual_sui.kernel_gate(args.fleet_state, stage3_specs.LIVE_TRANSPORT)
+        run_id = gcp_runtime.fleet_run_id(args.fleet_state)
+        if run_id is not None:
+            # Both roots default under the run's local-SSD data root, the
+            # directory gcp_worker.prepare_storage mounted for this run.
+            data = gcp_runtime.run_data_root(run_id)
+            args.guest_root = args.guest_root or data / 'stage3-guest'
+            args.native_root = args.native_root or data / 'native'
         required = dict(guest_root=args.guest_root, owners=args.owners,
                         native_root=args.native_root, bucket_prefix=args.bucket_prefix)
         if not args.external:
@@ -1144,6 +1156,8 @@ def main():
                 + '; pass --mode rehearsal for the labelled single-host fixture')
         if not args.guest_root.is_absolute() or not args.native_root.is_absolute():
             raise SystemExit('--guest-root and --native-root must be absolute')
+        mailbox_exec.admit_data_roots(args, [('--guest-root', args.guest_root),
+                                             ('--native-root', args.native_root)])
         if args.bucket_prefix and not args.bucket_prefix.startswith('gs://'):
             raise SystemExit('--bucket-prefix must be gs://<bucket>/<campaign prefix>')
     elif args.external or args.guest_root or args.owners or args.native_root:
@@ -1165,7 +1179,11 @@ def main():
         remote = mailbox_exec.open_executor(args)
         coordinator = mailbox_exec.coordinator_of(args.fleet_state)
         state = json.loads(Path(args.fleet_state).read_text())
-        campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
+        campaign = gcp_runtime.run_data_root(state['run_id']) / 'campaign'
+        if mailbox_exec.cloud_run(args):
+            mailbox_exec.require_data_root(
+                remote, state['run_id'],
+                [campaign, args.guest_root, args.native_root])
         binary = Path(args.binary)
         remote.send_file(coordinator, campaign / 'binaries' / binary.name, binary,
                          mode=0o755)
@@ -1206,6 +1224,13 @@ def main():
         sys.stdout.write(out.decode('utf-8', 'replace'))
         sys.stderr.write(err.decode('utf-8', 'replace'))
         return code
+    if cluster:
+        # On the coordinator, every tree this run writes is under --root. The
+        # guest and native roots are checked again here, after the dispatch
+        # rewrite, so the paths that actually run are the paths that passed.
+        mailbox_exec.admit_data_roots(args, [('--root', root),
+                                             ('--guest-root', args.guest_root),
+                                             ('--native-root', args.native_root)])
     path = args.ledger or root / 'campaign-ledger.json'
     if cluster and external is None:
         if args.fleet_state is None:

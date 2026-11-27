@@ -50,6 +50,7 @@ import campaign_ledger as ledger_module
 import campaign_manifest
 import campaign_upload
 import disk_collector
+import gcp_runtime
 import host_exec
 import mailbox_exec
 import manual_sui
@@ -1397,7 +1398,9 @@ def main():
     parser.add_argument('--schema', type=Path)
     parser.add_argument('--fixture', type=Path)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--guest-root', type=Path, required=True)
+    parser.add_argument('--guest-root', type=Path,
+                        help='absolute owner storage root, identical on both owners; '
+                             'default: <data root>/guest on the run local SSD')
     parser.add_argument('--coordinator', required=True)
     parser.add_argument('--owners', required=True, help='owner1,owner2')
     parser.add_argument('--zone', help='zone of the three hosts, for the SSH callback')
@@ -1441,6 +1444,10 @@ def main():
         # A dry run prints a plan and touches no host; every other run needs
         # the fleet's proved initiator stack before its first owner starts.
         manual_sui.kernel_gate(args.fleet_state, args.live_transport)
+    if args.guest_root is None and args.fleet_state is not None:
+        args.guest_root = mailbox_exec.data_root(args) / 'guest'
+    if not args.dry_run:
+        mailbox_exec.admit_data_roots(args, [('--guest-root', args.guest_root)])
     cell = mechanism.find(args.cell)
     tier = args.durability_tier or cell['tier']
     if tier != cell['tier']:
@@ -1477,9 +1484,14 @@ def main():
             args, coordinator=args.coordinator,
             script_relative='experiments/gcp-rdma/fault_cells.py',
             trees=[('build', args.build), ('fixture', args.fixture), ('schema', args.schema)],
+            data_paths=[args.guest_root],
             values={'--build': 'build', '--fixture': 'fixture', '--schema': 'schema',
                     '--output': Path('out') / args.output.name,
                     '--config-dir': 'external', '--ledger': 'campaign-ledger.json'})
+    # The output and config trees this cell writes on its own host must sit on
+    # the run's SSD; a retry adds only a suffix under the same parents.
+    mailbox_exec.admit_data_roots(args, [('--output', output),
+                                         ('--config-dir', config_dir)])
     ledger_path = args.ledger or output.with_name(output.name + '-ledger.json')
     ledger, entry = ledger_module.Ledger(ledger_path), None
     evidence = (campaign_upload.Evidence(store, prefix) if store is not None else None)
@@ -1496,7 +1508,8 @@ def main():
                   schema={str(path.relative_to(args.schema)): digest(path)
                           for path in sorted(Path(args.schema).rglob('*')) if path.is_file()}),
         knobs=dict(tier=tier, cell=cell, transport=args.transport,
-                   live_transport=args.live_transport, owners=hosts['owners']),
+                   live_transport=args.live_transport, owners=hosts['owners'],
+                   data_device=gcp_runtime.DATA_DEVICE),
         engine_rev=manifest.get('source_archive_sha256'),
         sui_rev=manifest.get('source_archive_sha256'),
         binary_ids=manifest['binaries'])

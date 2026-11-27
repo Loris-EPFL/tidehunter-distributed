@@ -36,6 +36,54 @@ REPLAY_CLIENT_TARGET_MIB = 32 * 1024
 IDLE_STOP_SECONDS = 1800
 IDLE_MIN_SECONDS = 60
 IDLE_MAX_SECONDS = 3600
+# The one campaign data root per run. `gcp_worker.prepare_storage` formats the
+# guest's local NVMe SSD and mounts it at `/mnt/tidehunter-kv-comparison/<run>`
+# before the worker serves the first request; that file is frozen image code, so
+# the same literal lives there too. Campaign trees, owner WAL backing files and
+# cell databases live under this root; anything left on the boot disk fills the
+# 80 GB persistent disk.
+RUN_DATA_ROOT = '/mnt/tidehunter-kv-comparison'
+# The package and the mailbox gate live on the boot disk; campaign data roots
+# belong to the mounted SSD.
+GUEST_ROOT_PREFIXES = ('/mnt/tidehunter/', RUN_DATA_ROOT + '/')
+# Placement label hashed into every campaign cell identity. A cell that passed
+# while its data sat on the boot disk has another identity, so it reruns.
+DATA_DEVICE = 'local-ssd'
+RUN_ID_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
+
+
+def run_data_root(run_id):
+    """The one directory this run owns on every guest's local NVMe SSD."""
+    if (not isinstance(run_id, str) or not RUN_ID_PATTERN.match(run_id)
+            or '..' in run_id):
+        raise RuntimeSafetyError('invalid campaign run id')
+    return Path(RUN_DATA_ROOT) / run_id
+
+
+def fleet_run_id(fleet_state):
+    """The run id a `gcp_manual_compute.py` fleet state names, or None."""
+    if fleet_state is None:
+        return None
+    try:
+        state = json.loads(Path(fleet_state).read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeSafetyError('fleet state is not readable') from exc
+    if not isinstance(state, dict):
+        raise RuntimeSafetyError('fleet state is not an object')
+    return state.get('run_id')
+
+
+def admit_data_root_path(path, run_id, label):
+    """Resolve one declared data path and prove it is inside the run's SSD root."""
+    root = run_data_root(run_id)
+    try:
+        resolved = Path(os.path.abspath(str(path)))
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise RuntimeSafetyError(
+            f'{label} {path} is outside the run data root {root}: the campaign '
+            'stores everything on the guest local NVMe SSD') from None
+    return resolved
 
 
 def replay_client_memory_mib(machine_type, requested=None):
@@ -282,12 +330,13 @@ def validate_runtime(config):
     package_root = config['package_root']
     if (not isinstance(roots, list) or len(roots) > 8 or len(set(roots)) != len(roots)
             or any(not isinstance(value, str)
-                   or not value.startswith(('/mnt/tidehunter/', '/mnt/tidehunter-kv-comparison/'))
+                   or not value.startswith(GUEST_ROOT_PREFIXES)
                    or '..' in PurePosixPath(value).parts or value.endswith('/')
                    or value == package_root or value.startswith(package_root + '/')
                    for value in roots)):
         raise RuntimeSafetyError(
-            'guest roots must be distinct directories under /mnt/tidehunter or /mnt/tidehunter-kv-comparison')
+            'guest roots must be distinct directories under /mnt/tidehunter or '
+            + RUN_DATA_ROOT)
     return config
 
 
@@ -893,7 +942,7 @@ def _controller_config(runtime):
     region = raw_hosts[0]['zone'].rsplit('-', 1)[0]
     cpus = int(runtime['machine_type'].rsplit('-', 1)[-1])
     fleet = {'schema_version': 1, 'run_id': runtime['run_id'], 'provider': 'gcp', 'replication_factor': 1,
-             'qualification_only': False, 'data_root': '/mnt/tidehunter-kv-comparison/' + runtime['run_id'],
+             'qualification_only': False, 'data_root': RUN_DATA_ROOT + '/' + runtime['run_id'],
              'region': region, 'instance_type': runtime['machine_type'], 'coordinator': host(raw_hosts[0]), 'nodes': nodes,
              'server_cpus': cpus, 'client_cpus': cpus, 'server_memory_mib': 16384, 'client_memory_mib': 16384}
     if 'valkey_rdma' in runtime['spec']['backends']:

@@ -695,13 +695,24 @@ the guest RDMA/kernel admission below. The run output, external config
 directory and stage directory must be fresh; the launcher refuses an existing
 stage marker and finishes with `launcher-receipt.json`.
 
+The run data root is `/mnt/tidehunter-kv-comparison/<run-id>`.
+`gcp_worker.prepare_storage` formats the guest local NVMe SSD and mounts it
+there at `ready`. The drivers default every on-host data path under it: the
+campaign tree at `campaign`, the owner guest root at `guest`, the stage-3 guest
+root at `stage3-guest`, and the native store at `native`. A paid run refuses a
+declared root outside this directory. Before the first cell, the mailbox
+executor runs a gate on every guest: `findmnt` must prove that the root is a
+mount point whose source is an admitted local NVMe device and not the boot
+disk, and every declared path must resolve inside it. A cell whose identity
+carries another data device reruns instead of being skipped.
+
 ```sh
 python3 experiments/gcp-rdma/manual_sui.py \
   --build /absolute/owned/checkpoint-build \
   --fixture /absolute/checkpoint-fixtures/sui-genesis-1775/fixture \
   --schema /absolute/local-run/experiment/native-schema \
   --output /absolute/cloud-run \
-  --guest-root /mnt/tidehunter/sui-run-<run-id> \
+  --guest-root /mnt/tidehunter-kv-comparison/<run-id>/guest \
   --fleet-state /absolute/fleet-stage1.json \
   --fleet-config experiments/gcp-rdma/config.json \
   --transport tcp --live-transport rdma --durability-tier native \
@@ -774,7 +785,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $CAMPAIGN_ROOT/build --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M7-mid-frame-native \
-  --guest-root /mnt/tidehunter/sui-run-$RUN --coordinator $RUN-0 \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest --coordinator $RUN-0 \
   --owners $RUN-1,$RUN-2 --durability-tier native \
   --bucket-prefix gs://mysten-research-bench-artifacts/$CAMPAIGN \
   --ledger $CAMPAIGN_ROOT/campaign-ledger.json
@@ -806,8 +817,9 @@ Stage 3 uses `experiments/sui-checkpoint/stage3_campaign.py` with the same
 campaign ledger and the same bucket prefix. It regenerates the 72 specs when
 they are absent, archives any previous database and output under
 `stage3/stale/`, and runs only planned cells. `--mode cluster` needs
-`--bucket-prefix`, `--guest-root`, `--native-root` and the owner hosts; the two
-tier preparations are made on the coordinator host from `--build` and
+`--bucket-prefix`, the owner hosts and the run fleet state; `--guest-root` and
+`--native-root` default to `<data root>/stage3-guest` and `<data root>/native`.
+The two tier preparations are made on the coordinator host from `--build` and
 `--schema`. The campaign never passes `--external`, because the driver prepares
 both tiers itself from the fleet state. Phase A (the arm-B
 synchronous probe) runs first, `--calibrate` runs the three phase-B cells
@@ -826,8 +838,8 @@ python3 experiments/sui-checkpoint/stage3_campaign.py \
   --binary /absolute/build/binaries/storage-node \
   --build /absolute/build --schema /absolute/native-schema \
   --external-database live/checkpoints \
-  --guest-root /mnt/tidehunter/sui-run-$RUN \
-  --native-root /mnt/tidehunter-kv-comparison/$RUN \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/stage3-guest \
+  --native-root /mnt/tidehunter-kv-comparison/$RUN/native \
   --owners H1,H2 --native-host H1 \
   --fleet-state /absolute/fleet-stage3.json \
   --fleet-config experiments/gcp-rdma/config.json \
@@ -1059,6 +1071,8 @@ LEDGER=$CAMPAIGN_ROOT/campaign-ledger.json
 STATE1=$CAMPAIGN_ROOT/fleet-stage1.json
 STATE2=$CAMPAIGN_ROOT/fleet-stage2.json
 STATE3=$CAMPAIGN_ROOT/fleet-stage3.json
+# The guest local SSD mounted for this run; every campaign and cell path is here.
+DATA_ROOT=/mnt/tidehunter-kv-comparison/$RUN
 # The revision the package was sealed at, never the current checkout's HEAD:
 # `create` refuses a --revision that differs from package-receipt.json and a
 # checkout that differs from the sealed closure.
@@ -1096,8 +1110,7 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py create \
   --campaign $CAMPAIGN --state $STATE1 --hosts 3 --hours 5 --stage stage1 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
   --revision "$REVISION" \
-  --guest-root /mnt/tidehunter-kv-comparison/$RUN \
-  --guest-root /mnt/tidehunter/sui-run-$RUN
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE1
 python3 experiments/gcp-rdma/gcp_manual_compute.py ready --state $STATE1
 ```
@@ -1145,7 +1158,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 --cell-id S1-0-native 
   --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage1/S1-0-native --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage1/S1-0-native --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 
@@ -1155,7 +1168,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-0-synchronous \
-  --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 
@@ -1164,7 +1177,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --transport tcp \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage1/S1-1-native --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage1/S1-1-native --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER \
   -- --lifecycle-checks --tail-checkpoints 64
@@ -1176,7 +1189,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage1 \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-4-mid-frame-native \
-  --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 
@@ -1185,7 +1198,7 @@ python3 experiments/gcp-rdma/fault_cells.py --cell S1-2S-publication-native \
   --fleet-state $STATE1 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage1/S1-2S-publication-native \
-  --guest-root /mnt/tidehunter/sui-run-$RUN --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 ```
 
@@ -1228,8 +1241,7 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py create \
   --campaign $CAMPAIGN --state $STATE2 --hosts 3 --hours 6 --stage stage2 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
   --revision "$REVISION" \
-  --guest-root /mnt/tidehunter-kv-comparison/$RUN \
-  --guest-root /mnt/tidehunter/sui-run-$RUN
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE2
 python3 experiments/gcp-rdma/gcp_manual_compute.py ready --state $STATE2
 ```
@@ -1251,7 +1263,7 @@ python3 experiments/gcp-rdma/fault_cells.py --cell M6-w1-c16 \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
   --output $CAMPAIGN_ROOT/stage2/M6-w1-c16 \
-  --guest-root /mnt/tidehunter/sui-run-$RUN --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 
 python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M3-native \
@@ -1259,7 +1271,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M3-native \
   --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage2/M3-native --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage2/M3-native --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER \
   -- --max-dirty-keys 16 --max-maps 3 --max-index-maps 3
@@ -1269,7 +1281,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M4-native \
   --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage2/M4-native --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage2/M4-native --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER \
   -- --index-blob-cache-mib 1024 --index-blob-cache-min-bytes 0
@@ -1279,7 +1291,7 @@ python3 experiments/gcp-rdma/manual_sui.py --stage stage2 --cell-id M5-hold \
   --transport tcp \
   --fleet-state $STATE2 --fleet-config experiments/gcp-rdma/config.json \
   --build $BUILD --fixture $FIXTURE --schema $SCHEMA \
-  --output $CAMPAIGN_ROOT/stage2/M5-hold --guest-root /mnt/tidehunter/sui-run-$RUN \
+  --output $CAMPAIGN_ROOT/stage2/M5-hold --guest-root /mnt/tidehunter-kv-comparison/$RUN/guest \
   --coordinator $RUN-0 --owners $RUN-1,$RUN-2 \
   --bucket-prefix $BUCKET --ledger $LEDGER
 ```
@@ -1306,8 +1318,7 @@ python3 experiments/gcp-rdma/gcp_manual_compute.py create \
   --campaign $CAMPAIGN --state $STATE3 --hosts 3 --hours 2 --stage stage3 \
   --package $PACKAGE --spec $CAMPAIGN_ROOT/runtime-spec.json \
   --revision "$REVISION" \
-  --guest-root /mnt/tidehunter-kv-comparison/$RUN \
-  --guest-root /mnt/tidehunter/sui-run-$RUN
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN
 python3 experiments/gcp-rdma/gcp_manual_compute.py verify --state $STATE3
 python3 experiments/gcp-rdma/gcp_manual_compute.py ready --state $STATE3
 ```
@@ -1321,8 +1332,8 @@ python3 experiments/sui-checkpoint/stage3_campaign.py \
   --binary $BUILD/binaries/storage-node \
   --build $BUILD --schema $SCHEMA \
   --external-database live/checkpoints \
-  --guest-root /mnt/tidehunter/sui-run-$RUN \
-  --native-root /mnt/tidehunter-kv-comparison/$RUN \
+  --guest-root /mnt/tidehunter-kv-comparison/$RUN/stage3-guest \
+  --native-root /mnt/tidehunter-kv-comparison/$RUN/native \
   --owners $RUN-1,$RUN-2 --native-host $RUN-1 \
   --fleet-state $STATE3 --fleet-config experiments/gcp-rdma/config.json \
   --bucket-prefix $BUCKET --ledger $LEDGER --calibrate

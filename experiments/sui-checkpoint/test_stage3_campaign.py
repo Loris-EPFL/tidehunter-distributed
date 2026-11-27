@@ -956,6 +956,33 @@ class CommandLine(unittest.TestCase):
         self.assertIn('rehearsal mode', str(raised.exception))
 
 
+class PlacementIdentity(unittest.TestCase):
+    """A cell that passed on the boot disk is not the same measurement."""
+
+    def test_the_data_device_changes_the_cell_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / 'spec.json'
+            spec.write_text('{}')
+
+            def identity():
+                return stage3_campaign.entry_identity(
+                    spec, knobs=dict(case='native'), engine_rev='e', sui_rev='s',
+                    binary_ids={'kv-research': 'b'})
+            local_ssd = identity()
+            stage3_specs.write(Path(tmp) / 'campaign')
+            cells = stage3_campaign.cells_for(Path(tmp) / 'campaign', engine_rev='e',
+                                              sui_rev='s', binary_ids={'kv-research': 'b'})
+            grid_ssd = cells[0]['config_hash']
+            with mock.patch.object(stage3_campaign.gcp_runtime, 'DATA_DEVICE',
+                                   'boot-disk'):
+                boot_disk = identity()
+                grid_boot = stage3_campaign.cells_for(
+                    Path(tmp) / 'campaign', engine_rev='e', sui_rev='s',
+                    binary_ids={'kv-research': 'b'})[0]['config_hash']
+        self.assertNotEqual(local_ssd, boot_disk)
+        self.assertNotEqual(grid_ssd, grid_boot)
+
+
 class ClusterDispatch(unittest.TestCase):
     """The laptop stages each tier's local preparation, then runs on H0."""
 
@@ -1018,14 +1045,17 @@ class ClusterDispatch(unittest.TestCase):
                                          'kernel_admission': kernel_admission()}))
             config = root / 'config.json'
             config.write_text('{}')
+            data = stage3_campaign.gcp_runtime.run_data_root('bench-' + 'a' * 16)
             remote = mock.Mock()
+            remote.fleet = [{'name': 'bench-' + 'a' * 16 + '-0'}]
+            remote.run.return_value = (0, b'data_root', b'')
             remote.send_file.return_value = (0, b'', b'')
             remote.run_driver.return_value = (0, b'{}', b'')
             argv = ['stage3_campaign.py', '--root', str(root / 'out'),
                     '--binary', str(binary), '--external', 'native=' + str(external),
                     '--external', 'synchronous=' + str(synchronous),
-                    '--native-root', '/mnt/tidehunter/native',
-                    '--guest-root', '/mnt/tidehunter/sui', '--owners', 'H1,H2',
+                    '--native-root', str(data / 'native'),
+                    '--guest-root', str(data / 'stage3-guest'), '--owners', 'H1,H2',
                     '--zone', 'us-central1-a',
                     '--bucket-prefix', 'gs://mysten-research-bench-artifacts/campaign',
                     '--fleet-state', str(state), '--fleet-config', str(config)]
@@ -1041,16 +1071,14 @@ class ClusterDispatch(unittest.TestCase):
             if item == '--external':
                 self.assertIn('=', argv_sent[index + 1])
                 self.assertNotIn('--external', argv_sent[index + 1])
+        campaign = stage3_campaign.gcp_runtime.run_data_root(
+            'bench-' + 'a' * 16) / 'campaign'
         self.assertEqual(remote.stage_tree.call_args_list, [
-            mock.call('bench-' + 'a' * 16 + '-0', external,
-                      Path('/mnt/tidehunter/bench-' + 'a' * 16 + '/campaign/external/native')),
+            mock.call('bench-' + 'a' * 16 + '-0', external, campaign / 'external/native'),
             mock.call('bench-' + 'a' * 16 + '-0', synchronous,
-                      Path('/mnt/tidehunter/bench-' + 'a' * 16
-                           + '/campaign/external/synchronous'))])
+                      campaign / 'external/synchronous')])
         self.assertIn(
-            mock.call('bench-' + 'a' * 16 + '-0',
-                      Path('/mnt/tidehunter/bench-' + 'a' * 16
-                           + '/campaign/binaries/storage-node'),
+            mock.call('bench-' + 'a' * 16 + '-0', campaign / 'binaries/storage-node',
                       binary, mode=0o755),
             remote.send_file.call_args_list)
 
@@ -1069,14 +1097,17 @@ class ClusterDispatch(unittest.TestCase):
                                          'kernel_admission': kernel_admission()}))
             config = root / 'config.json'
             config.write_text('{}')
+            data = stage3_campaign.gcp_runtime.run_data_root('bench-' + 'b' * 16)
             remote = mock.Mock()
+            remote.fleet = [{'name': 'bench-' + 'b' * 16 + '-0'}]
+            remote.run.return_value = (0, b'data_root', b'')
             remote.send_file.return_value = (0, b'', b'')
             remote.run_driver.return_value = (0, b'{}', b'')
-            argv = ['stage3_campaign.py', '--root', str(root / 'out'),
+            argv = ['stage3_campaign.py', '--root=' + str(root / 'out'),
                     '--binary', str(binary), '--build', str(build),
                     '--schema', str(schema),
-                    '--native-root', '/mnt/tidehunter/native',
-                    '--guest-root', '/mnt/tidehunter/sui', '--owners', 'H1,H2',
+                    '--native-root', str(data / 'native'),
+                    '--guest-root', str(data / 'stage3-guest'), '--owners', 'H1,H2',
                     '--bucket-prefix', 'gs://mysten-research-bench-artifacts/campaign',
                     '--fleet-state', str(state), '--fleet-config', str(config)]
             with mock.patch.object(stage3_campaign.mailbox_exec, 'open_executor',
@@ -1085,7 +1116,8 @@ class ClusterDispatch(unittest.TestCase):
                                       return_value='bench-' + 'b' * 16 + '-0'), \
                     mock.patch.object(stage3_campaign.sys, 'argv', argv):
                 self.assertEqual(stage3_campaign.main(), 0)
-        campaign = Path('/mnt/tidehunter/bench-' + 'b' * 16 + '/campaign')
+        campaign = stage3_campaign.gcp_runtime.run_data_root(
+            'bench-' + 'b' * 16) / 'campaign'
         self.assertEqual(remote.stage_tree.call_args_list, [
             mock.call('bench-' + 'b' * 16 + '-0', build, campaign / 'build'),
             mock.call('bench-' + 'b' * 16 + '-0', schema, campaign / 'schema')])
@@ -1093,6 +1125,8 @@ class ClusterDispatch(unittest.TestCase):
         for flag, target in (('--build', campaign / 'build'),
                             ('--schema', campaign / 'schema')):
             self.assertEqual(argv_sent[argv_sent.index(flag) + 1], str(target))
+        # The equal form of an argparse flag is rewritten as well.
+        self.assertIn('--root=' + str(campaign / 'root'), argv_sent)
 
 
     def test_a_fleet_without_the_initiator_record_is_refused_before_dispatch(self):

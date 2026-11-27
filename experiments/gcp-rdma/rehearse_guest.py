@@ -35,6 +35,8 @@ for relative in ('', 'experiments/gcp-rdma', 'experiments/kv-comparison',
     sys.path.insert(0, str(SRC / relative) if relative else str(SRC))
 sys.dont_write_bytecode = True
 
+import gcp_runtime
+
 MAX_PACKAGE = 512 * 1024 * 1024
 MAX_SOURCE = 256 * 1024 * 1024
 
@@ -71,7 +73,7 @@ def verify_fleet(config, clients, **kwargs):
 
 def prepare_storage(config, host, api):
     """The container filesystem stands in for the admitted local SSD."""
-    target = Path('/mnt/tidehunter-kv-comparison') / config['run_id']
+    target = Path(gcp_runtime.RUN_DATA_ROOT) / config['run_id']
     target.mkdir(parents=True, exist_ok=True)
     return {'device': '(rehearsal container filesystem)', 'mkfs_duration_seconds': None,
             'lazy_initialization_disabled': None,
