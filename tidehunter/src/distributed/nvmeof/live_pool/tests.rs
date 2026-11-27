@@ -246,11 +246,10 @@ fn pending_and_capacity_are_bounded_without_connecting() {
         matches!(pool.get_or_connect(&other, "nqn.2026-01.test:host", [2;16], LiveNamespaceAccess::ReadWrite, deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     );
     assert!(matches!(pool.shutdown(deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
-    pool.state
-        .lock()
-        .unwrap()
-        .entries
-        .insert(target.nqn.clone(), Entry::Quarantined);
+    pool.state.lock().unwrap().entries.insert(
+        target.nqn.clone(),
+        Entry::Quarantined(QuarantineCause::Completed),
+    );
     assert!(
         matches!(pool.get_or_connect(&other, "nqn.2026-01.test:host", [2;16], LiveNamespaceAccess::ReadWrite, deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
     );
@@ -271,7 +270,7 @@ fn pending_and_capacity_are_bounded_without_connecting() {
     );
     assert!(matches!(
         pool.state.lock().unwrap().entries.get(&target.nqn),
-        Some(Entry::Quarantined)
+        Some(Entry::Quarantined(_))
     ));
     assert!(matches!(pool.shutdown(deadline), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
     std::fs::remove_file(journal).unwrap();
@@ -753,9 +752,9 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
     assert!(
         matches!(
             pool.state.lock().unwrap().entries.get(&target.nqn),
-            Some(Entry::Quarantined)
+            Some(Entry::Quarantined(QuarantineCause::Completed))
         ),
-        "a lost connect with a remaining intent quarantines the entry"
+        "a completed lost connect with a remaining intent quarantines the entry"
     );
     pool.evict_lost(&target.nqn, deadline)
         .expect("a quarantined entry cannot be proven lost; eviction is a no-op");
@@ -825,4 +824,82 @@ fn a_fresh_acquisition_clears_a_quarantined_entry_but_adopt_fails_stop() {
         error.to_string().contains("quarantined"),
         "the fail-stop names the quarantine: {error}"
     );
+}
+
+/// A worker held past the caller's deadline may still create a controller.
+/// A Fresh acquisition must not clear that quarantine: only a completed
+/// connect with a leftover intent is retryable.
+#[test]
+fn a_fresh_acquisition_does_not_clear_a_worker_uncertain_quarantine() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    let dir = tempdir::TempDir::new("live-pool-worker-uncertain").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Adopt).unwrap();
+    let pool = LiveControllerPool::new(registry.clone(), 2, 1).unwrap();
+    let target = fixture_target("nqn.2026-01.test:worker-uncertain", 1, [1; 16], 4096);
+    let (entered, release) = registry.block_next_connect_worker();
+    // Stimulus, not a measurement: the call must end by timing out while the
+    // worker is held. PROGRESS_CAP is only the hang guard.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let error = match pool.acquire_file(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadOnly,
+        ControllerAdoption::Fresh,
+        deadline,
+        (0, 1, 0),
+    ) {
+        Ok(_) => panic!("a worker held past the deadline must time out"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::TimedOut,
+        "the caller reports its own deadline: {error}"
+    );
+    entered
+        .recv_timeout(PROGRESS_CAP)
+        .expect("the connect worker started before the caller timed out");
+    assert!(
+        matches!(
+            pool.state.lock().unwrap().entries.get(&target.nqn),
+            Some(Entry::Quarantined(QuarantineCause::WorkerUncertain))
+        ),
+        "a live worker quarantines the entry as uncertain, not completed"
+    );
+    // A buggy retry would connect; its worker is released up front so it can
+    // never open a fabrics device. A sealed retry starts no worker at all.
+    let (entered_again, release_again) = registry.block_next_connect_worker();
+    release_again
+        .try_send(())
+        .expect("the second pause is buffered for release");
+    let error = match pool.acquire_file(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadOnly,
+        ControllerAdoption::Fresh,
+        Instant::now() + PROGRESS_CAP,
+        (0, 1, 0),
+    ) {
+        Ok(_) => panic!("a worker-uncertain quarantine must fail-stop a Fresh retry"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::InvalidData,
+        "the sealed quarantine is a typed fail-stop: {error}"
+    );
+    assert!(
+        error.to_string().contains("quarantined"),
+        "the fail-stop names the quarantine: {error}"
+    );
+    assert!(
+        entered_again.try_recv().is_err(),
+        "the sealed entry must not start a second connect worker"
+    );
+    release
+        .try_send(())
+        .expect("release the timed-out worker so it cannot outlive the test");
 }

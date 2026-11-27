@@ -1312,10 +1312,19 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
     );
     let deadline = Instant::now() + PROGRESS_CAP;
     let remover = remove_controller_when_deleted(leftover.clone());
-    registry
+    let retired = registry
         .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
         .expect("a recovery read retires its own identity");
     remover.join().unwrap();
+    assert_eq!(
+        retired, 1,
+        "the recovery retire counts the controller it removed"
+    );
+    assert_eq!(
+        registry.retired_leftover_controllers(),
+        1,
+        "the open evidence carries the recovered retirement count"
+    );
     assert!(
         !leftover.exists(),
         "a recovery read must not bind the pre-restart controller: {}",
@@ -1330,6 +1339,18 @@ fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
         .reserve(&adoption_intent(&target))
         .expect("the retired intent no longer conflicts with a fresh connect");
     registry.remove_intent(&fresh).unwrap();
+    assert_eq!(
+        registry
+            .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+            .expect("a second retire of a clean identity succeeds"),
+        0,
+        "no leftover controller means no retirement"
+    );
+    assert_eq!(
+        registry.retired_leftover_controllers(),
+        1,
+        "an empty retire does not change the recovered count"
+    );
     // The write path keeps adoption: the same live fixture is reused.
     let write_controller = fixture_controller(
         &root,

@@ -20,6 +20,14 @@ pub(super) struct Intent {
     pub(super) host_id: [u8; 16],
 }
 
+/// Test-only gate that holds a connect worker before it creates a controller,
+/// so a caller can time out while the worker is still alive.
+#[cfg(test)]
+pub(super) struct WorkerPause {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 /// One controller whose sysfs identity matches an intent, read through a
 /// pinned directory so a reused `nvmeN` number cannot be adopted.
 struct ControllerMatch {
@@ -43,11 +51,18 @@ pub(super) struct RegistryInner {
     pub(super) _lock: File,
     pub(super) admission: Mutex<()>,
     pub(super) uncertain: AtomicBool,
+    /// Controllers a fresh recovery acquisition retired in this process. The
+    /// recovery evidence exposes it, so a reopen proves it removed the
+    /// controller the previous incarnation left, not merely that it survived.
+    pub(super) retired_leftover_controllers: std::sync::atomic::AtomicU64,
     /// Test only: the next connects fail after writing their durable intent,
     /// exactly as a `create` whose verify finds the new controller stopped
     /// does. The intent is left for reconciliation.
     #[cfg(test)]
     pub(super) after_reserve_lost: std::sync::atomic::AtomicU32,
+    /// Test only: connect workers to hold before they create a controller.
+    #[cfg(test)]
+    pub(super) worker_pauses: Mutex<std::collections::VecDeque<WorkerPause>>,
 }
 
 #[derive(Clone)]
@@ -144,8 +159,11 @@ impl LiveConnectionRegistry {
                 _lock: lock,
                 admission: Mutex::new(()),
                 uncertain: AtomicBool::new(false),
+                retired_leftover_controllers: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
                 after_reserve_lost: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(test)]
+                worker_pauses: Mutex::new(std::collections::VecDeque::new()),
             }),
         };
         registry.reconcile()?;
@@ -188,7 +206,8 @@ impl LiveConnectionRegistry {
         intent_path: &Path,
         intent: &Intent,
         deadline: Instant,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
+        let mut retired = 0;
         for controller in self.matching_controllers(intent)? {
             remaining(deadline)?;
             let mut owned = self.controller_from_match(
@@ -204,8 +223,10 @@ impl LiveConnectionRegistry {
                 owned.deletion = DeletionState::Initiated;
             }
             owned.retire(deadline)?;
+            retired += 1;
         }
-        self.remove_intent(intent_path)
+        self.remove_intent(intent_path)?;
+        Ok(retired)
     }
 
     fn reconcile_retire(&self) -> io::Result<()> {
@@ -316,12 +337,25 @@ impl LiveConnectionRegistry {
         host_nqn: &str,
         host_id: [u8; 16],
         deadline: Instant,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
+        let mut retired = 0;
         for (path, intent) in self.identity_intents(target, host_nqn, host_id)? {
             remaining(deadline)?;
-            self.reconcile_retire_intent(&path, &intent, deadline)?;
+            retired += self.reconcile_retire_intent(&path, &intent, deadline)?;
         }
-        Ok(())
+        if retired > 0 {
+            self.inner
+                .retired_leftover_controllers
+                .fetch_add(retired as u64, Ordering::Relaxed);
+        }
+        Ok(retired)
+    }
+
+    /// Controllers a fresh recovery acquisition retired in this process.
+    pub(crate) fn retired_leftover_controllers(&self) -> u64 {
+        self.inner
+            .retired_leftover_controllers
+            .load(Ordering::Relaxed)
     }
 
     /// Test only: the next connect fails after its durable intent is written,
@@ -331,6 +365,44 @@ impl LiveConnectionRegistry {
         self.inner
             .after_reserve_lost
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test only: hold the next connect worker before it creates a
+    /// controller. Returns the entry signal and the release sender; the
+    /// released worker reports a typed worker-uncertain error and never opens
+    /// a fabrics device.
+    #[cfg(test)]
+    pub(crate) fn block_next_connect_worker(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release) = std::sync::mpsc::sync_channel(1);
+        self.inner
+            .worker_pauses
+            .lock()
+            .expect("worker pause lock")
+            .push_back(WorkerPause { entered, release });
+        (entered_rx, release_tx)
+    }
+
+    /// Test only: hold a connect worker if a pause is armed.
+    #[cfg(test)]
+    pub(super) fn pause_worker(&self) -> io::Result<()> {
+        let pause = self
+            .inner
+            .worker_pauses
+            .lock()
+            .map_err(|_| invalid("worker pause poisoned"))?
+            .pop_front();
+        let Some(pause) = pause else {
+            return Ok(());
+        };
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+        Err(worker_uncertain_error(io::ErrorKind::TimedOut))
     }
 
     /// Test only: one armed after-reserve loss, if any.

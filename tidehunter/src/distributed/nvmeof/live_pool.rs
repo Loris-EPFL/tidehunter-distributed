@@ -251,11 +251,26 @@ fn cache_local_member(
         );
     Ok(())
 }
+/// Why a connect outcome remains quarantined. Only a completed connect can be
+/// cleared by a fresh recovery acquisition; an outcome whose worker may still
+/// run, or whose durable intent could not be read, stays sealed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuarantineCause {
+    /// The connect finished with an error and left its durable intent.
+    Completed,
+    /// The caller stopped waiting for a worker that may still create a
+    /// controller; clearing the intent could orphan that controller.
+    WorkerUncertain,
+    /// The durable intent could not be read, so neither absence nor safety is
+    /// proven.
+    RegistryUnknown,
+}
+
 // Keep bounded controller state inline; boxing would add an allocation at setup.
 #[allow(clippy::large_enum_variant)]
 enum Entry {
     Pending(Identity),
-    Quarantined,
+    Quarantined(QuarantineCause),
     /// An idle controller whose deletion runs outside the pool lock. The entry
     /// still counts against capacity; waiters block until it is removed or, on
     /// a failed delete, restored as an unusable `Ready` entry.
@@ -519,7 +534,7 @@ impl LiveControllerPool {
                 Entry::Ready {
                     identity, lease, ..
                 } => matches(identity) && !idle(lease),
-                Entry::Quarantined => false,
+                Entry::Quarantined(_) => false,
             }) {
                 return Ok(RetirementResult::Busy);
             }
@@ -558,7 +573,7 @@ impl LiveControllerPool {
                 None => return Ok(()),
                 // A pending connect owns its entry, a closing one is already
                 // being retired, and a quarantined outcome has no controller.
-                Some(Entry::Pending(_) | Entry::Closing { .. } | Entry::Quarantined) => {
+                Some(Entry::Pending(_) | Entry::Closing { .. } | Entry::Quarantined(_)) => {
                     return Ok(());
                 }
                 Some(Entry::Ready { lease, .. }) => lease.clone(),
@@ -639,6 +654,11 @@ impl LiveControllerPool {
     pub(crate) fn lost_connect_injections(&self) -> u32 {
         self.lost_connect_injections
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Controllers a fresh recovery acquisition retired in this process.
+    pub(crate) fn retired_leftover_controllers(&self) -> u64 {
+        self.registry.retired_leftover_controllers()
     }
 
     /// Whether the subsystem's cached controller is verifiably not live. Reads
@@ -933,13 +953,15 @@ impl LiveControllerPool {
                         return Err(timeout());
                     }
                 }
-                Some(Entry::Quarantined) => {
-                    if adoption == ControllerAdoption::Adopt {
+                Some(Entry::Quarantined(cause)) => {
+                    // A fresh recovery connect may clear only a completed
+                    // outcome. A worker that may still run, or an unreadable
+                    // registry, can hold a controller whose intent must stay
+                    // sealed until a process restart reconciles it.
+                    if adoption == ControllerAdoption::Adopt || *cause != QuarantineCause::Completed
+                    {
                         return Err(invalid("connection outcome remains quarantined"));
                     }
-                    // A fresh recovery connect retires the identity's leftover
-                    // intent and controller before `reserve`, so an uncertain
-                    // earlier connect of the same identity cannot block it.
                     state.entries.remove(&key);
                     // The freed slot and pending count changed: decide again.
                     continue;
@@ -948,7 +970,7 @@ impl LiveControllerPool {
                     if state
                         .entries
                         .values()
-                        .filter(|e| matches!(e, Entry::Pending(_) | Entry::Quarantined))
+                        .filter(|e| matches!(e, Entry::Pending(_) | Entry::Quarantined(_)))
                         .count()
                         >= self.max_pending
                     {
@@ -1023,20 +1045,29 @@ impl LiveControllerPool {
                 // Every failure after intent publication can leave a controller
                 // or a late worker, not just timeouts. An unreadable registry
                 // is also unknown; release capacity only on confirmed absence.
-                if !matches!(self.registry.has_intent(&target.nqn, host_nqn), Ok(false)) {
-                    state.entries.insert(key, Entry::Quarantined);
+                let cause = if super::live_connect::connect_worker_uncertain(&error) {
+                    // A late worker can still create a controller even when
+                    // the intent currently reads absent.
+                    QuarantineCause::WorkerUncertain
                 } else {
-                    drop(state);
-                    // No kernel intent exists: the failed connect left no
-                    // controller.
-                    self.state
-                        .lock()
-                        .map_err(|_| invalid("controller pool poisoned"))?
-                        .entries
-                        .remove(&key);
-                    self.changed.notify_all();
-                    return Err(error);
-                }
+                    match self.registry.has_intent(&target.nqn, host_nqn) {
+                        Ok(false) => {
+                            drop(state);
+                            // No kernel intent exists: the failed connect left
+                            // no controller.
+                            self.state
+                                .lock()
+                                .map_err(|_| invalid("controller pool poisoned"))?
+                                .entries
+                                .remove(&key);
+                            self.changed.notify_all();
+                            return Err(error);
+                        }
+                        Ok(true) => QuarantineCause::Completed,
+                        Err(_) => QuarantineCause::RegistryUnknown,
+                    }
+                };
+                state.entries.insert(key, Entry::Quarantined(cause));
                 self.changed.notify_all();
                 Err(error)
             }
@@ -1137,7 +1168,7 @@ impl LiveControllerPool {
             .map_err(|_| invalid("controller pool poisoned"))?;
         for entry in state.entries.values() {
             match entry {
-                Entry::Pending(_) | Entry::Quarantined | Entry::Closing { .. } => {
+                Entry::Pending(_) | Entry::Quarantined(_) | Entry::Closing { .. } => {
                     return Err(full());
                 }
                 Entry::Ready { lease, .. } if !idle(lease) => {
@@ -1177,7 +1208,7 @@ impl Drop for LiveControllerPool {
         if state.entries.values().any(|entry| match entry {
             Entry::Pending(_) => true,
             // Nothing can open I/O on a controller whose delete was started.
-            Entry::Quarantined | Entry::Closing { .. } => false,
+            Entry::Quarantined(_) | Entry::Closing { .. } => false,
             Entry::Ready { lease, .. } => !idle(lease),
         }) {
             std::process::abort();

@@ -151,6 +151,44 @@ fn with_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     )
 }
 
+/// A connect whose worker may still create a controller after the caller
+/// stopped waiting. Its durable intent must not be cleared or reused until a
+/// process restart reconciles it: a late worker could otherwise create a
+/// controller no reopen can retire.
+#[derive(Debug)]
+pub(crate) struct ConnectWorkerUncertain;
+
+impl std::fmt::Display for ConnectWorkerUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NVMe connect worker outcome is uncertain")
+    }
+}
+
+impl std::error::Error for ConnectWorkerUncertain {}
+
+fn worker_uncertain_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, ConnectWorkerUncertain)
+}
+
+/// Whether `error` reports a connect whose worker may still create a
+/// controller. Walks the source chain, so a context wrapper still classifies;
+/// never matches a message.
+pub(crate) fn connect_worker_uncertain(error: &io::Error) -> bool {
+    let Some(cause) = error.get_ref() else {
+        return false;
+    };
+    let mut current: &(dyn std::error::Error + 'static) = cause;
+    loop {
+        if current.downcast_ref::<ConnectWorkerUncertain>().is_some() {
+            return true;
+        }
+        match current.source() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
 /// A connect failure with its cleanup verdict. The primary error stays the
 /// source, so a typed lost cause survives the cleanup note and the acquire
 /// callers can still classify it.
@@ -412,6 +450,14 @@ impl LiveController {
         std::thread::Builder::new()
             .name("live-nvme-connect".into())
             .spawn(move || {
+                #[cfg(test)]
+                let result = match worker_registry.pause_worker() {
+                    Ok(()) => {
+                        Self::create(target_copy, host_nqn, host_id, worker_registry, intent_path)
+                    }
+                    Err(error) => Err(error),
+                };
+                #[cfg(not(test))]
                 let result =
                     Self::create(target_copy, host_nqn, host_id, worker_registry, intent_path);
                 if let Err(mpsc::SendError(Ok(mut controller))) = tx.send(result)
@@ -421,7 +467,10 @@ impl LiveController {
                     eprintln!("late NVMe controller cleanup failed; intent quarantined: {error}");
                 }
             })?;
-        let mut controller = match rx.recv_timeout(remaining(deadline)?) {
+        // The worker exists from here on: an expired wait is a worker whose
+        // outcome is unknown, not a connect that completed without effect.
+        let wait = remaining(deadline).map_err(|error| worker_uncertain_error(error.kind()))?;
+        let mut controller = match rx.recv_timeout(wait) {
             Ok(Ok(controller)) => controller,
             Ok(Err(error)) => {
                 if already_connected(&error) {
@@ -429,9 +478,13 @@ impl LiveController {
                 }
                 return Err(error);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(timeout()),
+            // The worker may still create a controller: its intent must stay
+            // sealed for reconciliation, not be cleared by a recovery retry.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(worker_uncertain_error(io::ErrorKind::TimedOut));
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(invalid("connection worker failed"));
+                return Err(worker_uncertain_error(io::ErrorKind::InvalidData));
             }
         };
         match controller.verify_queue_geometry() {

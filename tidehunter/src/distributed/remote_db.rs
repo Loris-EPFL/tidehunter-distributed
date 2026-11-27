@@ -671,6 +671,10 @@ pub struct RecoveryStats {
     pub fencing_ns: u64,
     pub tail_batches: u64,
     pub tail_bytes: u64,
+    /// Controllers the recovery replay's fresh acquisitions retired. A reopen
+    /// that found the previous incarnation's controller reports at least one;
+    /// zero means there was nothing left to retire.
+    pub retired_leftover_controllers: u64,
     /// Batches below the loaded region's cut that replay read again and did not
     /// apply, because the stored blobs already hold them. Sources: the
     /// per-stream fragment floor, a retained generation with no stored row
@@ -1377,6 +1381,9 @@ impl RemoteDatabase {
         };
         recovery_stats.tail_batches = report.tail_batches;
         recovery_stats.tail_bytes = report.tail_bytes;
+        recovery_stats.retired_leftover_controllers = live_pool
+            .as_ref()
+            .map_or(0, |pool| pool.retired_leftover_controllers());
         recovery_stats.below_cut_skipped = report.below_cut_skipped;
         #[cfg(test)]
         if matches!(interruption, Some(OpenInterruption::DuringReplay)) {
