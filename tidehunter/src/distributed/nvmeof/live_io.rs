@@ -180,9 +180,6 @@ pub struct LiveIo {
     next_completion_result: Option<i32>,
     #[cfg(test)]
     next_submit_result: Option<i32>,
-    /// Fails the next read submission with `errno`, before any SQE.
-    #[cfg(test)]
-    next_read_submit_result: Option<i32>,
     /// Fails the next `submit_pending_write` like the kernel submit syscall.
     #[cfg(test)]
     next_pending_submit_result: Option<i32>,
@@ -256,8 +253,6 @@ impl LiveIo {
             next_completion_result: None,
             #[cfg(test)]
             next_submit_result: None,
-            #[cfg(test)]
-            next_read_submit_result: None,
             #[cfg(test)]
             next_pending_submit_result: None,
             #[cfg(test)]
@@ -367,15 +362,10 @@ impl LiveIo {
     pub(crate) fn last_write_errno(&self) -> Option<i32> {
         self.last_write_errno
     }
-    /// Test only: fail the next write buffer request with `errno`, before any SQE.
+    /// Test only: fail the next submission with `errno`, before any SQE.
     #[cfg(test)]
     pub(crate) fn override_submit_result(&mut self, errno: i32) {
         self.next_submit_result = Some(errno);
-    }
-    /// Test only: fail the next read submission with `errno`, before any SQE.
-    #[cfg(test)]
-    pub(crate) fn override_read_submit_result(&mut self, errno: i32) {
-        self.next_read_submit_result = Some(errno);
     }
     /// Test only: fail the next `submit_pending_write` with `errno`, as the
     /// kernel submit syscall does for a queue whose controller was deleted.
@@ -731,13 +721,6 @@ impl LiveIo {
     ) -> Result<LiveSubmitOutcome, LiveIoError> {
         if self.closed || self.fatal_at.is_some() {
             return Err(LiveIoError::Invalid("queue closed"));
-        }
-        #[cfg(test)]
-        if data.is_none()
-            && let Some(errno) = self.next_read_submit_result.take()
-        {
-            self.stats.errors += 1;
-            return Err(LiveIoError::Io(io::Error::from_raw_os_error(errno)));
         }
         if ranges.is_empty() || self.requests.contains_key(&id) {
             return Err(LiveIoError::Invalid("empty or duplicate request"));

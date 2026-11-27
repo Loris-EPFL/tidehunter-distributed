@@ -125,7 +125,8 @@ counter_fields!(
     read_lane_pin_failures,
     /// Reads that survived a verified controller loss: the lane requeued the
     /// members, evicted the dead lease and re-issued the same bytes on a new
-    /// controller (completion requeue, submission verdict, or inline decline).
+    /// controller (completion requeue, reconnect after a lost namespace open,
+    /// or an inline decline handed to the lane).
     read_controller_resumes,
     leased_bytes,
     leased_skip_markers,

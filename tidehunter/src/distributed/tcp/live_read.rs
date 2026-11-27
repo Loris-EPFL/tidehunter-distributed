@@ -1782,45 +1782,12 @@ impl LiveReadCache {
                 .io
                 .submit_reads_traced(flight, &ranges, deadline, state.trace.as_ref()),
         };
-        let submitted = match submitted {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // Classify before `live_error` flattens the errno through
-                // `TcpError::component`: a submit-time lost controller has no
-                // later verdict. A failed submission left no SQE on the ring,
-                // so the members can be re-issued on a new controller.
-                if let LiveIoError::Io(io_error) = &error
-                    && read_controller_lost(io_error, state.deadline, || {
-                        grant_controller_lost(grant)
-                    })
-                {
-                    let nqn = grant
-                        .lease
-                        .as_ref()
-                        .map(|lease| lease.binding().nqn.clone());
-                    grant.broken = true;
-                    grant.lost = true;
-                    if let (Some(pool), Some(nqn)) = (client.live_pool.as_ref(), nqn) {
-                        let teardown = super::controller_teardown_deadline(
-                            client
-                                .live_config
-                                .as_ref()
-                                .map_or(0, |config| config.connect_timeout_ms),
-                        );
-                        let _ = pool.evict_lost(&nqn, teardown);
-                    }
-                    if let Some(trace) = &state.trace {
-                        trace.event("live_member_requeued_lost_controller");
-                    }
-                    return Err(TcpError::with_kind(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "live read submission lost its controller",
-                    ));
-                }
-                return Err(live_error(error));
-            }
-        };
-        match submitted {
+        // `submit_reads_*` reports only a request that never reached the ring
+        // (closed queue, spent deadline, no credit) or a full ring. A submit
+        // syscall failure is discarded there; `mark_submission_error` records it
+        // on the request without a raw errno, so no path can classify it as a
+        // controller loss. Such a failure stays fatal.
+        match submitted.map_err(live_error)? {
             LiveSubmitOutcome::Submitted => {}
             LiveSubmitOutcome::Full => return Ok(Group::Blocked),
         }
