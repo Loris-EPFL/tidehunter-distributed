@@ -25,6 +25,7 @@ Exit status is nonzero when any verification fails; the JSON record is written
 in both outcomes so the campaign retains the failed case.
 """
 import argparse
+import copy
 import hashlib
 import importlib.util
 import ipaddress
@@ -351,18 +352,31 @@ def process_state(pids):
 def run(args, *, snapshot=None, delete=None,
         latest=latest_checkpoint, metrics=scrape_metrics, clock=time.monotonic,
         sleep=time.sleep, read_checkpoint=read_checkpoint,
-        namespaces=None, holders=None, sectors=None):
-    """Inject one controller loss and return the retained record."""
+        namespaces=None, holders=None, sectors=None, write=None):
+    """Inject one controller loss and return the retained record.
+
+    `write` persists the record at each milestone (target selected, preflight
+    passed, delete attempted, delete returned, reconnect seen). A run that dies
+    on an RPC after the delete therefore still leaves the evidence that the
+    delete happened; without it a fallback record cannot say whether anything
+    was injected (`main`).
+    """
     snapshot = snapshot or manage.controller_snapshot
     delete = delete or manage.delete_controller
     namespaces = namespaces or controller_namespaces
     holders = holders or namespace_holders
     sectors = sectors or wait_sectors_advance
+    def persist():
+        # A copy per milestone: the caller keeps what was true at that point, not
+        # a live dict the next milestone mutates.
+        write(copy.deepcopy(record))
+
+    write = write or (lambda record: None)
     validate_spec(args)
     address = str(ipaddress.ip_address(args.address))
     record = dict(schema=1, kind='w1_controller_loss', injection='sysfs delete_controller',
         created_unix_ns=time.time_ns(), target=dict(nqn=args.nqn, transport=args.transport,
-            address=address, service=args.service), ok=False, reason=None)
+            address=address, service=args.service), ok=False, reason=None, deleted=False)
     record['processes_before'] = process_state(args.owner_pid)
     if any(not row['alive'] for row in record['processes_before']):
         record['reason'] = 'an owned process was not alive before injection'
@@ -384,6 +398,7 @@ def run(args, *, snapshot=None, delete=None,
     record['target'].update(controller=controller, inode=identity['inode'],
         hostnqn=deleted_hostnqn, nqn=deleted_nqn, transport=args.transport,
         address=address, service=args.service, service_max=args.service_max)
+    persist()
     # The deleted controller must be the one serving the coordinator's writes:
     # it is live, a process holds its namespace open, and the namespace's write
     # sectors advance. A stale read-only epoch fails these before any delete.
@@ -416,6 +431,7 @@ def run(args, *, snapshot=None, delete=None,
                             f'in {args.preflight_timeout} s')
         record['finished_unix_ns'] = time.time_ns()
         return record
+    persist()
     before_sequence = latest(args.sui_rpc)
     if before_sequence < 0:
         raise ValueError('negative checkpoint sequence')
@@ -430,13 +446,18 @@ def run(args, *, snapshot=None, delete=None,
     if before_metrics is not None:
         record['live_before'] = before_metrics
     started = clock()
+    record['delete_attempted_unix_ns'] = time.time_ns()
+    persist()
     try:
         delete(controller, identity, {'hostnqn': deleted_hostnqn})
     except (OSError, ValueError) as error:
         record['reason'] = 'controller delete was refused or failed: ' + str(error)
-        record['ok'] = False
+        record['deleted'] = False
         record['finished_unix_ns'] = time.time_ns()
         return record
+    record['deleted'] = True
+    record['deleted_unix_ns'] = time.time_ns()
+    persist()
     record['outage_started_seconds'] = started
     try:
         reconnect, reconnect_observations = wait_for_reconnect(nqn=deleted_nqn,
@@ -445,6 +466,9 @@ def run(args, *, snapshot=None, delete=None,
             snapshot=snapshot, clock=clock, sleep=sleep)
         record['reconnect_seconds'] = reconnect
         record['reconnect_observations'] = reconnect_observations
+        record['reconnected'] = True
+        record['reconnected_unix_ns'] = time.time_ns()
+        persist()
         after_sequence, progress, progress_observations = wait_for_progress(
             args.sui_rpc, before_sequence, timeout=args.timeout, clock=clock,
             sleep=sleep, rpc=lambda address: latest(address))
@@ -535,12 +559,29 @@ def main():
                         help='bound on observing the selected namespace write advance')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+
+    def persist(record):
+        """Replace the record atomically, so a killed run leaves a whole file."""
+        temporary = args.output.with_name(args.output.name + '.tmp')
+        temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+        os.replace(temporary, args.output)
+
     try:
-        record = run(args)
+        record = run(args, write=persist)
     except (OSError, ValueError) as error:
-        record = dict(schema=1, kind='w1_controller_loss', ok=False, reason=str(error),
-                      created_unix_ns=time.time_ns())
-    args.output.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+        # `run` persists each milestone, so the last one survives an exception
+        # on any later RPC: a fallback record still says whether the controller
+        # was selected and deleted. Only a run that died before its first
+        # milestone leaves nothing, and then the record says exactly that.
+        try:
+            record = json.loads(args.output.read_text())
+            if not isinstance(record, dict):
+                raise ValueError('the persisted record is not an object')
+        except (OSError, ValueError):
+            record = dict(schema=1, kind='w1_controller_loss', deleted=False,
+                          created_unix_ns=time.time_ns())
+        record.update(ok=False, reason=str(error))
+    persist(record)
     print(json.dumps(dict(ok=record.get('ok'), reason=record.get('reason'),
                           output=str(args.output)), sort_keys=True))
     if not record.get('ok'):
