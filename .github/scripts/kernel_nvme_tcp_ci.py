@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Supervise the maintained single- and four-owner kernel TCP proofs.
+"""Supervise the maintained kernel NVMe/TCP proofs.
 
-The proof owns setup, admission, second-open recovery and teardown. This wrapper
-adds signal-to-finally delivery and inventory receipts, not another NVMe lifecycle.
+The proofs own setup, admission, second-open recovery, owner layout and the
+owner-restart reopen. This wrapper adds signal-to-finally delivery, evidence
+and inventory receipts, not another NVMe lifecycle.
 """
 import argparse
 import json
@@ -31,6 +32,12 @@ LAYOUT_PORT = 24000
 LAYOUT_SECONDS = 180
 LAYOUT_SCOPE = "nqn.2026-01.local.tidehunter:db-"
 CONFIGFS = Path("/sys/kernel/config/nvmet")
+
+# The owner-restart proof reuses the single-owner qualification geometry: 8 MiB
+# WAL members in 4 MiB fragments, so the replay crosses both boundaries.
+RESTART_WAL_FILE_BYTES = 8 * 1024**2
+RESTART_FRAGMENT_BYTES = 4 * 1024**2
+RESTART_FORBIDDEN_STDERR = ("pinned controller is not live", "short namespace read")
 
 
 def write_text(path, value):
@@ -291,14 +298,15 @@ def kill_owner(process, timeout=60):
     return process.returncode
 
 
-def copy_receipts(nodes, specs, root, namespace):
+def copy_receipts(nodes, specs, root, namespace, owners=LAYOUT_OWNERS):
     """Put the selected database's owner receipts where its spec names them.
 
     One receipt per partition names that partition's control address and
     process, so the receipt of another database's owner on the same host does
-    not confirm this database.
+    not confirm this database. `owners` follows the prepared database, so a
+    one-owner proof never looks for a second receipt.
     """
-    for partition in range(LAYOUT_OWNERS):
+    for partition in range(owners):
         selected = [node for node in nodes if node["partition"] == partition
                     and node["namespace"] == namespace]
         if len(selected) != 1:
@@ -519,6 +527,212 @@ def layout_observed(nodes, scopes):
         observed[pool["public_port_base"]] = (
             f"{scopes[owner_name(node)]}-p{node['partition']:08x}")
     return observed
+
+
+def restart_geometry(document):
+    """The CI WAL geometry of the owner-restart proof: 8 MiB in 4 MiB fragments."""
+    storage = document["storage"]
+    storage["fragment_bytes"] = RESTART_FRAGMENT_BYTES
+    storage["wal_file_bytes"] = RESTART_WAL_FILE_BYTES
+    if storage["wal_file_bytes"] % storage["fragment_bytes"]:
+        raise RuntimeError("restart WAL member size is not a fragment multiple")
+    return document
+
+
+def restart_spec(specs, document, root, *, case_id, coordinator, gated, reopen):
+    """One write-only coordinator over the restart proof's database.
+
+    The killed run stops at its measurement gate with the preloaded batches
+    still unsealed in the owner WAL. The reopen uses the same coordinator root,
+    writes nothing before its replay, and takes no gate because no driver
+    releases one in CI.
+    """
+    case = dict(case_id=case_id, arm="A", mix="write", size=256,
+                distribution="uniform", tier="native", concurrency=1,
+                batch=None, cache=0, reference=False)
+    spec = specs.run_config(case, Path(root), external={"native": {"document": document}},
+                            measurement_operations=8, gated=gated)
+    spec["dataset"]["keys"] = 256
+    options = spec["backend"]["options"]
+    # The prepared database has one partition; the shared builder defaults to
+    # the campaign's two owners and would name a receipt that does not exist.
+    options["owners"] = 1
+    options["external_owner_durability_receipts"] = [
+        str(specs.receipt_path(Path(root), "native", 0))]
+    options["path"] = str(coordinator)
+    spec["namespace"] = f"stage3-{case_id}"
+    if reopen:
+        spec["phases"].update(preload=False, warmup_operations=0)
+        spec["phases"]["measurement_operations"] = 16
+    return spec
+
+
+def scoped_controllers(document, scope, partition):
+    """The kernel controllers of one database's subsystem on this host."""
+    prefix = f"{LAYOUT_SCOPE}{scope}-p{partition:08x}-"
+    controllers = document.get("controllers") or {}
+    return sorted(name for name, facts in controllers.items()
+                  if str((facts or {}).get("subsysnqn", "")).startswith(prefix))
+
+
+def reopen_defect(evidence, scope, partition, previous_controllers, stderr):
+    """The reason a restart reopen is unproven, or None when it is proven.
+
+    `evidence` is the reopened coordinator's `measurement-read-evidence.json`
+    and `previous_controllers` are the kernel controller names captured before
+    the coordinator was killed.
+    """
+    start = evidence.get("start") if isinstance(evidence, dict) else None
+    if not isinstance(start, dict):
+        return "the reopened coordinator wrote no measurement start boundary"
+    opened = start.get("coordinator_open") or {}
+    if opened.get("kind") != "reopen":
+        return f"the coordinator open kind is {opened.get('kind')!r}, not 'reopen'"
+    recovery = opened.get("recovery") or {}
+    tail = recovery.get("tail_batches")
+    if type(tail) is not int or tail <= 0:
+        return f"the reopen replayed no WAL batch (tail_batches={tail!r})"
+    prefix = f"{LAYOUT_SCOPE}{scope}-p{partition:08x}-"
+    instances = set()
+    for route in (start.get("live_nvmeof") or {}).get("routes") or []:
+        identity = route.get("namespace_identity") or {}
+        instance = identity.get("controller_instance")
+        if str(identity.get("nqn", "")).startswith(prefix) and type(instance) is int:
+            instances.add(instance)
+    if not instances:
+        return "the reopen recorded no live route for its database"
+    previous = {int(name[4:]) for name in previous_controllers
+                if re.fullmatch(r"nvme[0-9]+", str(name))}
+    stale = sorted(instances & previous)
+    if stale:
+        return f"the reopen reused the pre-restart controller instance {stale}"
+    for marker in RESTART_FORBIDDEN_STDERR:
+        if marker in stderr:
+            return f"the reopen stderr names {marker!r}"
+    return None
+
+
+def start_coordinator(binary, spec_path, output, stdout_path, stderr_path):
+    """Start one coordinator whose write gate the caller waits for."""
+    with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+        return subprocess.Popen(
+            [str(binary), "--config", str(spec_path), "--output", str(output)],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+
+
+def restart_positive(deployment, specs, binary, root):
+    """Kill a coordinator at its write gate, restart its owner, reopen the root.
+
+    The killed coordinator leaves its kernel controller and durable intent on
+    the coordinator host. The restarted owner replaces the epoch-scoped target,
+    so a recovery read that adopts the leftover controller binds a dead
+    subsystem. The reopen must instead retire it, connect a new controller and
+    read a non-empty replay page.
+    """
+    root = Path(root)
+    root.mkdir(mode=0o700)
+    namespace = LAYOUT_NAMESPACES[0]
+    config, nodes = deployment.prepare(
+        root / "deployment", {namespace: {"key_spaces": []}}, root / "remote",
+        shape_yamls={namespace: "key_spaces: []\n"},
+        hosts=["127.0.0.1"], owners=1, port=LAYOUT_PORT, transport="tcp",
+        coordinator_cache=0, live_transport="tcp")
+    if len(nodes) != 1:
+        raise RuntimeError(f"the restart proof needs one owner, found {len(nodes)}")
+    node = nodes[0]
+    document = restart_geometry(config["databases"][namespace])
+    coordinator = root / "stage3" / "db" / "owner-restart" / "coordinator"
+    killed = restart_spec(specs, document, root, case_id="owner-restart",
+                          coordinator=coordinator, gated=True, reopen=False)
+    reopened = restart_spec(specs, document, root, case_id="owner-restart-reopen",
+                            coordinator=coordinator, gated=False, reopen=True)
+    gate = Path(killed["measurement_gate"]["ready_file"])
+    # The binary refuses a measurement gate whose parent directory is absent.
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    processes = {}
+    evidence = {"schema": 1, "kind": "owner_restart_reopen", "complete": False,
+                "wal_file_bytes": RESTART_WAL_FILE_BYTES}
+    try:
+        log = root / "owner.log"
+        processes[owner_name(node)] = start_owner(binary, node, log)
+        wait_owners([node], processes)
+        copy_receipts(nodes, specs, root, namespace, owners=1)
+        # Run the coordinator until its write gate. The preloaded batches are
+        # in the owner's WAL with no checkpoint and no seal.
+        spec_path = root / "owner-restart.json"
+        spec_path.write_text(json.dumps(killed, indent=2, sort_keys=True) + "\n")
+        first_out = root / "owner-restart-out"
+        if first_out.exists():
+            raise RuntimeError(f"{first_out}: coordinator output is not fresh")
+        first = start_coordinator(binary, spec_path, first_out,
+                                  root / "owner-restart.stdout",
+                                  root / "owner-restart.stderr")
+        deadline = time.monotonic() + LAYOUT_SECONDS
+        while not gate.is_file():
+            if first.poll() is not None:
+                raise RuntimeError(f"the coordinator exited {first.returncode} "
+                                   "before its write gate")
+            if time.monotonic() > deadline:
+                raise RuntimeError("the coordinator write gate expired")
+            time.sleep(0.1)
+        scope = database_scope([node])[owner_name(node)]
+        previous = scoped_controllers(inventory(), scope, node["partition"])
+        if not previous:
+            raise RuntimeError(f"the killed coordinator holds no controller for {scope}")
+        evidence["previous_controllers"] = previous
+        # No pool shutdown, no checkpoint, no seal: a real abrupt coordinator exit.
+        os.killpg(first.pid, signal.SIGKILL)
+        first.wait(timeout=60)
+        evidence["killed_returncode"] = first.returncode
+        # The restart is a new owner incarnation: the old target and its
+        # controllers no longer serve, and the ready/receipt files are stale.
+        kill_owner(processes.pop(owner_name(node)))
+        Path(node["ready"]).unlink(missing_ok=True)
+        Path(str(node["ready"]) + ".durability.json").unlink(missing_ok=True)
+        processes[owner_name(node)] = start_owner(binary, node, log)
+        wait_owners([node], processes)
+        copy_receipts(nodes, specs, root, namespace, owners=1)
+        # Reopen the same coordinator root: recovery must replay, not adopt.
+        completed, _path, output = run_coordinator(
+            binary, reopened, root, "owner-restart-reopen")
+        stderr = (completed.stderr or "")
+        (root / "owner-restart-reopen.stderr").write_text(stderr)
+        evidence["reopen_returncode"] = completed.returncode
+        raise_for = coordinator_error(completed, "owner-restart-reopen")
+        if raise_for is not None:
+            raise RuntimeError(raise_for)
+        evidence_path = output / "measurement-read-evidence.json"
+        try:
+            read_evidence = json.loads(evidence_path.read_text())
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"the reopen wrote no read evidence: {error}") from error
+        defect = reopen_defect(read_evidence, scope, node["partition"], previous, stderr)
+        if defect is not None:
+            raise RuntimeError(defect)
+        evidence["tail_batches"] = (
+            read_evidence["start"]["coordinator_open"]["recovery"]["tail_batches"])
+        remaining = scoped_controllers(inventory(), scope, node["partition"])
+        if remaining:
+            raise RuntimeError("the reopen left pre-restart controllers: "
+                               + ", ".join(remaining))
+        code = stop_owner(processes.pop(owner_name(node)), node)
+        if code != 0:
+            raise RuntimeError(f"the restarted owner stop exited {code}")
+        residual = layout_teardown_defect([scope])
+        if residual:
+            raise RuntimeError("the restart proof left configfs objects: "
+                               + ", ".join(residual))
+        evidence["complete"] = True
+        return evidence
+    finally:
+        for process in processes.values():
+            if process.poll() is not None:
+                continue
+            try:
+                stop_owner(process, node, timeout=20)
+            except BaseException:
+                process.kill()
+                process.wait(timeout=30)
 
 
 def layout_negative(deployment, specs, binary, root):
@@ -886,6 +1100,34 @@ def qualify(args):
         trace.cleanup()
 
 
+def restart(args):
+    """Prove the coordinator reopen after a SIGKILL and an owner restart.
+
+    One database, one owner. The coordinator is killed at its write gate so no
+    clean close disconnects its controller or seals its WAL. The owner is
+    killed and restarted as a new incarnation, then the same coordinator root
+    is reopened. The reopen must read a non-empty replay page through a fresh
+    controller and never report a lost controller or a short namespace read.
+    """
+    deployment, specs = campaign_modules()
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    root = args.state / "owner-restart"
+    root.mkdir(mode=0o700)
+    binary = args.binary.resolve(strict=True)
+    evidence = {"scope": __doc__, "binary": str(binary), "complete": False}
+    try:
+        evidence["restart"] = restart_positive(deployment, specs, binary, root)
+        evidence["complete"] = True
+        print("owner_restart: " + json.dumps(evidence, sort_keys=True), flush=True)
+        return 0
+    except BaseException as error:
+        evidence["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        dump(root / "restart.json", evidence)
+
+
 def layout(args):
     """Prove the Sui campaign owner layout on this host's real kernel target.
 
@@ -942,7 +1184,8 @@ def cleanup(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("qualify", "run", "cleanup", "layout"))
+    parser.add_argument("action",
+                        choices=("qualify", "run", "cleanup", "layout", "restart"))
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
@@ -957,7 +1200,7 @@ def main():
     if args.action != "cleanup" and args.binary is None:
         parser.error(f"{args.action} requires --binary")
     return {"qualify": qualify, "run": run, "cleanup": cleanup,
-            "layout": layout}[args.action](args)
+            "layout": layout, "restart": restart}[args.action](args)
 
 
 if __name__ == "__main__":

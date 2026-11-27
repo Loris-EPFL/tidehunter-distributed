@@ -263,6 +263,21 @@ jobs:
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py layout \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
             2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/owner-layout.log"
+      - name: Gate coordinator reopen over a killed coordinator and owner restart
+        id: owner_restart
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # One database and one owner. The coordinator is SIGKILLed at its
+          # write gate, so no clean close disconnects its controller or seals
+          # its WAL. The owner is killed and restarted as a new incarnation,
+          # then the same coordinator root is reopened. Recovery must retire the
+          # leftover controller, read a non-empty replay page through a fresh
+          # controller, and never report a lost controller or a short read.
+          timeout --signal=TERM --kill-after=60s 420s \
+            sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py restart \
+              --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
+            2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/owner-restart.log"
       - name: Prove namespace write protection blocks remote writes
         timeout-minutes: 8
         run: |
@@ -325,6 +340,14 @@ jobs:
             fi
             echo "Four-owner admission and second-open proof."
             echo "Three-database, two-owner campaign layout: distinct pools, export, seal, reopen, reconcile and the shared-pool refusal."
+            echo "Coordinator reopen over an abrupt coordinator kill and an owner restart: non-empty replay through a fresh controller."
+            if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-restart/restart.json" ]; then
+              echo '```json'
+              cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-restart/restart.json"
+              echo '```'
+            else
+              echo "No owner-restart receipt; inspect the owner-restart log."
+            fi
             if [ -f "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-layout/layout.json" ]; then
               echo '```json'
               cat "$RUNNER_TEMP/kernel-nvme-tcp$KERNEL_TCP_STATE/owner-layout/layout.json"

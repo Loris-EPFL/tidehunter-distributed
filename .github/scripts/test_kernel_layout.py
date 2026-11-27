@@ -1,6 +1,7 @@
-"""The owner-layout proof's pure parts: scope checks, teardown and spec shape."""
+"""The layout and owner-restart proofs' pure parts: scope, teardown, spec and verdict."""
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -114,6 +115,235 @@ class NegativeSpecs(unittest.TestCase):
                     self.assertEqual(spec["backend"]["options"]["path"],
                                      str(root / ("negative-" + name) / "stage3" / "db"
                                          / f"owner-layout-{index}" / "coordinator"))
+
+
+class RestartReopen(unittest.TestCase):
+    """The owner-restart proof: geometry, spec shape and the reopen verdict."""
+
+    def setUp(self):
+        self.deployment, self.specs = kernel.campaign_modules()
+
+    def database(self, root):
+        name = kernel.LAYOUT_NAMESPACES[0]
+        with patch.object(self.deployment, "certificates",
+                          lambda path, owners: path.mkdir()):
+            config, nodes = self.deployment.prepare(
+                root / "deployment", {name: {"key_spaces": []}}, root / "remote",
+                shape_yamls={name: "key_spaces: []\n"},
+                hosts=["127.0.0.1"], owners=1, port=kernel.LAYOUT_PORT,
+                transport="tcp", coordinator_cache=0, live_transport="tcp")
+        self.assertEqual(len(nodes), 1)
+        return config["databases"][name], nodes[0]
+
+    def test_the_killed_run_gates_and_the_reopen_reuses_its_coordinator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            document, node = self.database(root)
+            kernel.restart_geometry(document)
+            self.assertEqual(document["storage"]["wal_file_bytes"], 8 * 1024**2)
+            self.assertEqual(document["storage"]["fragment_bytes"], 4 * 1024**2)
+            coordinator = root / "db" / "coordinator"
+            killed = kernel.restart_spec(
+                self.specs, document, root, case_id="owner-restart",
+                coordinator=coordinator, gated=True, reopen=False)
+            reopened = kernel.restart_spec(
+                self.specs, document, root, case_id="owner-restart-reopen",
+                coordinator=coordinator, gated=False, reopen=True)
+        # The killed run must stop at a write gate with preloaded writes.
+        self.assertIn("measurement_gate", killed)
+        self.assertTrue(killed["phases"]["preload"])
+        self.assertEqual(killed["workload"]["mix"]["put"], 100)
+        self.assertEqual(killed["backend"]["options"]["path"], str(coordinator))
+        # The prepared database has one partition, so both specs name one owner
+        # and one receipt; the shared builder defaults to the campaign's two.
+        for spec in (killed, reopened):
+            options = spec["backend"]["options"]
+            self.assertEqual(options["owners"], 1)
+            self.assertEqual(options["external_owner_durability_receipts"],
+                             [str(self.specs.receipt_path(root, "native", 0))])
+        # The reopen must not wait at any gate and must not preload: its first
+        # live use is the replay under test.
+        self.assertNotIn("measurement_gate", reopened)
+        self.assertNotIn("measurement_completion_gate", reopened)
+        self.assertFalse(reopened["phases"]["preload"])
+        self.assertEqual(reopened["phases"]["warmup_operations"], 0)
+        self.assertEqual(reopened["backend"]["options"]["path"], str(coordinator))
+        # A stale ready marker would make the binary refuse its own gate.
+        self.assertFalse(Path(killed["measurement_gate"]["ready_file"]).exists())
+        self.assertEqual(killed["backend"]["options"]["external_remote_config"],
+                         reopened["backend"]["options"]["external_remote_config"])
+        self.assertEqual(node["namespace"], kernel.LAYOUT_NAMESPACES[0])
+
+    def evidence(self, *, tail=3, kind="reopen", instance=12, nqn=None, routes=True):
+        scope = "aa" * 16
+        nqn = nqn or kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"
+        live = {"routes": [
+            {"namespace_identity": {"nqn": nqn, "controller_instance": instance}}]} \
+            if routes else {}
+        return {"start": {
+            "coordinator_open": {"kind": kind, "recovery": {"tail_batches": tail}},
+            "live_nvmeof": live}}
+
+    def test_a_non_empty_replay_through_a_fresh_controller_is_clean(self):
+        defect = kernel.reopen_defect(self.evidence(), "aa" * 16, 0, ["nvme7"], "")
+        self.assertIsNone(defect)
+
+    def test_an_empty_replay_is_a_defect(self):
+        defect = kernel.reopen_defect(self.evidence(tail=0), "aa" * 16, 0, ["nvme7"], "")
+        self.assertIn("replayed no WAL batch", defect)
+
+    def test_a_reused_pre_restart_controller_is_a_defect(self):
+        defect = kernel.reopen_defect(self.evidence(instance=7), "aa" * 16, 0,
+                                      ["nvme7"], "")
+        self.assertIn("reused the pre-restart controller", defect)
+
+    def test_the_lost_controller_and_short_read_markers_fail_the_reopen(self):
+        for marker in kernel.RESTART_FORBIDDEN_STDERR:
+            with self.subTest(marker=marker):
+                defect = kernel.reopen_defect(self.evidence(), "aa" * 16, 0,
+                                              ["nvme7"], "error: " + marker)
+                self.assertIn(marker, defect)
+
+    def test_the_open_must_be_a_reopen_with_a_live_route(self):
+        defect = kernel.reopen_defect(self.evidence(kind="create"), "aa" * 16, 0,
+                                      ["nvme7"], "")
+        self.assertIn("not 'reopen'", defect)
+        defect = kernel.reopen_defect(self.evidence(routes=False), "aa" * 16, 0,
+                                      ["nvme7"], "")
+        self.assertIn("no live route", defect)
+        defect = kernel.reopen_defect({}, "aa" * 16, 0, ["nvme7"], "")
+        self.assertIn("no measurement start boundary", defect)
+
+    def test_scoped_controllers_name_only_their_database_partition(self):
+        scope = "aa" * 16
+        document = {"controllers": {
+            "nvme3": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"},
+            "nvme4": {"subsysnqn": kernel.LAYOUT_SCOPE + "bb" * 16 + "-p00000000-sub-1"},
+            "nvme5": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000001-sub-1"}}}
+        self.assertEqual(kernel.scoped_controllers(document, scope, 0), ["nvme3"])
+
+
+class RestartOrchestration(unittest.TestCase):
+    """The restart sequence with mocked processes: one owner, one kill, one reopen."""
+
+    class Process:
+        def __init__(self, name, pid, events):
+            self.name = name
+            self.pid = pid
+            self.events = events
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.events.append(("kill", self.name))
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.events.append(("wait", self.name))
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    def test_kill_at_the_write_gate_restarts_the_owner_and_reopens_once(self):
+        deployment, specs = kernel.campaign_modules()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "restart"
+            events = []
+            scope = "aa" * 16
+            gate_path = {}
+            coordinator_process = {}
+
+            def owner(binary, node, log):
+                Path(node["ready"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(node["ready"]).write_text("ready\n")
+                Path(str(node["ready"]) + ".durability.json").write_text("{}\n")
+                events.append(("owner", "start"))
+                return self.Process("owner", 1000 + len(events), events)
+
+            def coordinator(binary, spec_path, output, stdout_path, stderr_path):
+                spec = json.loads(Path(spec_path).read_text())
+                gate = Path(spec["measurement_gate"]["ready_file"])
+                gate_path["path"] = gate
+                gate.parent.mkdir(parents=True, exist_ok=True)
+                gate.write_text("ready\n")
+                events.append(("coordinator", "gate"))
+                coordinator_process["p"] = self.Process("coordinator", 4242, events)
+                return coordinator_process["p"]
+
+            opened = {}
+
+            def reopen(binary, spec, run_root, name):
+                events.append(("coordinator", "reopen"))
+                opened["spec"] = spec
+                output = Path(run_root) / f"{name}-out"
+                output.mkdir(parents=True)
+                evidence = {"start": {
+                    "coordinator_open": {"kind": "reopen",
+                                         "recovery": {"tail_batches": 4}},
+                    "live_nvmeof": {"routes": [{"namespace_identity": {
+                        "nqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1",
+                        "controller_instance": 12}}]}}}
+                (output / "measurement-read-evidence.json").write_text(
+                    json.dumps(evidence))
+                return (subprocess.CompletedProcess([], 0, "", ""),
+                        Path(run_root) / f"{name}.json", output)
+
+            def controllers(names):
+                return {"controllers": {
+                    name: {"subsysnqn": kernel.LAYOUT_SCOPE + scope
+                           + "-p00000000-sub-1"} for name in names}}
+
+            def killpg(pid, sig):
+                events.append(("killpg", pid))
+                self.assertEqual(sig, kernel.signal.SIGKILL)
+                # The kernel ends the process group; the fake reports its exit.
+                coordinator_process["p"].returncode = -9
+
+            with patch.object(deployment, "certificates",
+                              lambda path, owners: path.mkdir()), \
+                    patch.object(kernel, "start_owner", side_effect=owner), \
+                    patch.object(kernel, "start_coordinator", side_effect=coordinator), \
+                    patch.object(kernel, "run_coordinator", side_effect=reopen), \
+                    patch.object(kernel, "kill_owner",
+                                 side_effect=lambda process: process.kill()
+                                 or process.wait()), \
+                    patch.object(kernel, "inventory",
+                                 side_effect=[controllers(["nvme7"]), controllers([])]), \
+                    patch.object(kernel, "database_scope",
+                                 side_effect=lambda nodes: {
+                                     kernel.owner_name(node): scope for node in nodes}), \
+                    patch.object(kernel, "layout_teardown_defect", return_value=[]), \
+                    patch.object(kernel.os, "killpg", side_effect=killpg):
+                evidence = kernel.restart_positive(deployment, specs, Path("/bin/true"), root)
+
+            self.assertIn(("killpg", 4242), events)
+            # The owner starts, the coordinator is killed at its gate, the owner
+            # starts again, and the reopen runs once on the same coordinator.
+            owners = [event for event in events if event[0] == "owner"]
+            self.assertEqual(owners, [("owner", "start"), ("owner", "start")])
+            self.assertEqual([event for event in events if event[0] == "coordinator"],
+                             [("coordinator", "gate"), ("coordinator", "reopen")])
+            self.assertIn(("kill", "owner"), events)
+            self.assertTrue(evidence["complete"])
+            self.assertEqual(evidence["tail_batches"], 4)
+            self.assertEqual(evidence["previous_controllers"], ["nvme7"])
+            self.assertEqual(evidence["killed_returncode"], -9)
+            # The killed run stops at a gate; the reopen is one-owner and ungated.
+            killed = json.loads((root / "owner-restart.json").read_text())
+            for spec in (killed, opened["spec"]):
+                options = spec["backend"]["options"]
+                self.assertEqual(options["owners"], 1)
+                self.assertEqual(options["external_owner_durability_receipts"],
+                                 [str(specs.receipt_path(root, "native", 0))])
+            self.assertIn("measurement_gate", killed)
+            self.assertNotIn("measurement_gate", opened["spec"])
+            self.assertEqual(opened["spec"]["backend"]["options"]["path"],
+                             str(root / "stage3" / "db" / "owner-restart" / "coordinator"))
+            self.assertTrue(gate_path["path"].is_file())
+            self.assertTrue(specs.receipt_path(root, "native", 0).is_file())
+            self.assertFalse(specs.receipt_path(root, "native", 1).exists())
 
 
 class CampaignModules(unittest.TestCase):
