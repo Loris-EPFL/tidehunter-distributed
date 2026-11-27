@@ -1209,7 +1209,7 @@ class SuiLauncher:
         self.start_sampling()
         command = [sys.executable, str(self.source / 'run.py'), *self.run_command()]
         self.local_commands.append(command)
-        child = subprocess.Popen(command)
+        child = build.OwnedProcess(command)
         marker = self.stage_dir / 'resources-required.json'
         resources_written = False
         try:
@@ -1236,12 +1236,14 @@ class SuiLauncher:
                 if time.monotonic() > deadline:
                     raise TimeoutError('run.py did not request resource evidence')
                 time.sleep(0.2)
-            code = child.wait()
+            code = child.wait(timeout=max(1.0, deadline - time.monotonic()))
         finally:
             if self.started:
                 self.stop(fail_on_forced=False)
-            if child.poll() is None:
-                code = child.wait()
+            # A replay that outlives its cap is stopped with its Sui children;
+            # an exited one is only reaped.
+            self.coordinator_stop = build.stop_group(
+                child, grace=ledger_module.SHUTDOWN_GRACE_SECONDS)
         if self.controller_loss is not None:
             self.controller_loss.write_evidence()
         if code != 0:
