@@ -278,3 +278,68 @@ fn read_controller_loss_targets_the_current_read_route() {
         "dropped route evidence cannot name the current read controller"
     );
 }
+
+#[test]
+fn a_resumed_read_route_is_proved_from_its_own_new_route() {
+    let read = |nqn: &str, nsid: u64, inode: u64| {
+        serde_json::json!({
+            "transport": "tcp", "address": "10.0.0.2", "service": 4420,
+            "writer": null,
+            "namespace_identity": {"nqn": nqn, "nsid": nsid,
+                "controller_instance": 7, "controller": {"sysfs_inode": inode}}
+        })
+    };
+    let write = |nqn: &str, inode: u64| {
+        serde_json::json!({
+            "transport": "tcp", "address": "10.0.0.2", "service": 4420,
+            "writer": {"epoch": 1, "file_index": 0},
+            "namespace_identity": {"nqn": nqn, "nsid": 1,
+                "controller_instance": 8, "controller": {"sysfs_inode": inode}}
+        })
+    };
+    // Routes present before the loss, then the writer's post-loss resume on the
+    // same NQN and the read path's reconnect after it.
+    let mut sample = serde_json::json!({
+        "route_evidence_dropped": 0,
+        "routes": [read("nqn.2026-01.test:sub", 1, 11),
+                   write("nqn.2026-01.test:sub", 12)]
+    });
+    let prior = sample["routes"]
+        .as_array()
+        .expect("the fixture holds routes")
+        .len();
+    sample["routes"]
+        .as_array_mut()
+        .expect("the fixture holds routes")
+        .extend([
+            write("nqn.2026-01.test:sub", 21),
+            read("nqn.2026-01.test:sub", 1, 22),
+        ]);
+    let resumed =
+        resumed_read_route(&sample, prior).expect("the post-loss read route proves the resume");
+    assert_eq!(
+        resumed["namespace_identity"]["controller"]["sysfs_inode"], 22,
+        "the inode comes from the read route, not from the writer route on the same NQN"
+    );
+    // A writer route alone never proves that the read path resumed.
+    sample["routes"] = serde_json::json!([
+        read("nqn.2026-01.test:sub", 1, 11),
+        write("nqn.2026-01.test:sub", 31)
+    ]);
+    assert!(
+        resumed_read_route(&sample, 1).is_err(),
+        "a writer route cannot prove the read path resumed"
+    );
+    // No route at or after the loss is no resume either.
+    assert!(
+        resumed_read_route(&sample, 2).is_err(),
+        "a snapshot that lost routes before the loss cannot prove a resume"
+    );
+    // Dropped evidence breaks the append order, so the selection is refused.
+    sample["routes"] = serde_json::json!([read("nqn.2026-01.test:sub", 1, 41)]);
+    sample["route_evidence_dropped"] = serde_json::json!(1);
+    assert!(
+        resumed_read_route(&sample, 0).is_err(),
+        "dropped route evidence cannot prove the read path resumed"
+    );
+}

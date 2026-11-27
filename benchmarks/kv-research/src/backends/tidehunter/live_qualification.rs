@@ -1240,6 +1240,34 @@ fn current_read_route(sample: &serde_json::Value) -> BackendResult<serde_json::V
         .ok_or_else(|| "controller loss requires an active read route".into())
 }
 
+/// The newest read route appended after `prior` routes of an earlier snapshot.
+///
+/// A resumed read must be proved from its own route: a writer route recorded
+/// for the same NQN describes another grant and can carry a new inode while the
+/// read route is still stale. Route evidence is append-ordered and never
+/// dropped (`route_evidence_dropped == 0`), so routes at or after `prior` are
+/// exactly the ones the loss produced.
+fn resumed_read_route(
+    sample: &serde_json::Value,
+    prior: usize,
+) -> BackendResult<serde_json::Value> {
+    check(
+        count(sample, "route_evidence_dropped")? == 0,
+        "the live namespace route evidence was dropped",
+    )?;
+    let routes = sample["routes"]
+        .as_array()
+        .ok_or("live namespace routes unavailable")?;
+    routes
+        .get(prior..)
+        .ok_or("the read-loss snapshot lost routes it had before the loss")?
+        .iter()
+        .filter(|route| route["writer"].is_null())
+        .next_back()
+        .cloned()
+        .ok_or_else(|| "the read path appended no read route after the loss".into())
+}
+
 /// Delete the controller that serves the read route and require the read path
 /// to resume on a new one.
 ///
@@ -1247,7 +1275,8 @@ fn current_read_route(sample: &serde_json::Value) -> BackendResult<serde_json::V
 /// post-loss reads are the first reads of those keys. Every value must match,
 /// the engine must count a read controller resume, no data-plane error may
 /// appear, the read route must come back on the same NQN with a different
-/// sysfs inode, and a following put and get must still work.
+/// sysfs inode in a route appended after the loss, and a following put and get
+/// must still work.
 fn qualify_read_controller_loss(
     input: &Input,
     db: &std::sync::Arc<sui::Db>,
@@ -1274,6 +1303,7 @@ fn qualify_read_controller_loss(
         .map_err(native_error)?;
     read_expected(db, ks, &sentinel, Some(&sentinel_value))?;
     let before = stats(db)?;
+    let prior_routes = before["routes"].as_array().map_or(0, Vec::len);
     let route = current_read_route(&before)?;
     let controller = ActiveWriteController::from_route(&route)?;
     check(
@@ -1343,19 +1373,25 @@ fn qualify_read_controller_loss(
         delta(&before, &after, "errors")? == 0,
         "the read-loss resume recorded a data-plane error",
     )?;
-    let identities = controller_identities(&after)?;
-    let (instance, inode) = identities
-        .get(&controller.nqn)
-        .copied()
-        .ok_or("the resumed read path recorded no controller for the lost NQN")?;
+    // The inode and the NQN must come from the same route the read path
+    // appended after the loss: a writer route for the same NQN is another grant.
+    let resumed = resumed_read_route(&after, prior_routes)?;
+    let identity = resumed["namespace_identity"]
+        .as_object()
+        .ok_or("the resumed read route names no namespace identity")?;
+    check(
+        identity["nqn"].as_str() == Some(controller.nqn.as_str()),
+        "the resumed read route names another NQN",
+    )?;
+    let instance = identity["controller_instance"]
+        .as_u64()
+        .ok_or("the resumed read route records no controller instance")?;
+    let inode = identity["controller"]["sysfs_inode"]
+        .as_u64()
+        .ok_or("the resumed read route records no controller inode")?;
     check(
         inode != controller.sysfs_inode,
-        "the resumed read path reused the deleted controller's sysfs inode",
-    )?;
-    let resumed = current_read_route(&after)?;
-    check(
-        resumed["namespace_identity"]["nqn"].as_str() == Some(controller.nqn.as_str()),
-        "the resumed read route names another NQN",
+        "the resumed read route reused the deleted controller's sysfs inode",
     )?;
     verify_routes(&after, &input.expected_route)?;
     // The authority must still acknowledge a write after the healed read.
