@@ -893,3 +893,136 @@ fn an_unexplained_short_read_still_poisons_the_authority() {
         "the later read names the poison: {refused}"
     );
 }
+
+/// Wait until the joining reader has reached the lane path and been refused the
+/// lane, because the inline producer holds its reservation.
+///
+/// A reader that coalesced onto the inline flight never reaches that decision,
+/// so this stays zero until lane work skips inline flights. It is observed
+/// progress with the module's one patience bound, never a latency premise.
+fn wait_for_lane_refusal(case: &Case) {
+    let deadline = Instant::now() + WAIT;
+    let diagnostics = &case.reads.state.diagnostics;
+    while diagnostics.admission_retry_lane.load(Ordering::Relaxed) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a reader joining an inline read never reached the lane: it coalesced onto the \
+             inline flight"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// One parked inline producer, one joining reader, and the controller loss the
+/// producer's inline attempt meets. Both callers must end with their member.
+fn coalesced_inline_loss_case<J: Send>(
+    case: &Case,
+    position: VersionPosition,
+    join: impl FnOnce() -> Result<J, LocalDbError> + Send,
+) -> (Option<Bytes>, Result<J, LocalDbError>) {
+    let parked = case.reads.bench_park_live_lane(0);
+    assert!(
+        case.reads
+            .bench_install_owner_local_leased(&case.fixture.node, position),
+        "the fixture installs the owner's WAL with a pooled controller lease"
+    );
+    assert!(
+        case.reads.bench_arm_inline_short_read_loss(0, &position),
+        "the cached grant holds a controller lease to report lost"
+    );
+    let (inline_entered, wait_entered) = mpsc::sync_channel(1);
+    let (resume_inline, wait_resume) = mpsc::sync_channel(1);
+    *case.reads.state.inline_pause.lock() = Some((inline_entered, wait_resume));
+    let (a, joined) = std::thread::scope(|scope| {
+        // Both release handles move into the callback, so a failing wait drops
+        // them (worker first, then the producer's pause) before the scope
+        // joins the spawned readers.
+        let resume_inline = resume_inline;
+        let parked = parked;
+        let a = scope.spawn(|| case.reader.read(KeySpace(0), &case.key, position));
+        wait_entered
+            .recv_timeout(WAIT)
+            .expect("the inline producer registered its flight before its I/O");
+        let joined = scope.spawn(join);
+        wait_for_lane_refusal(case);
+        resume_inline
+            .send(())
+            .expect("the inline producer is waiting to submit");
+        // The producer's inline attempt still owns the lane; the worker serves
+        // the lane request once that attempt has returned or declined.
+        drop(parked);
+        (
+            a.join().expect("the inline producer did not panic"),
+            joined.join().expect("the joining reader did not panic"),
+        )
+    });
+    assert_eq!(case.inline_reads(), 1, "the producer took the inline route");
+    assert!(
+        case.reads
+            .state
+            .diagnostics
+            .live_inline_fallback_grant
+            .load(Ordering::Relaxed)
+            >= 1,
+        "the producer's inline attempt declined its lost controller to the lane"
+    );
+    assert!(
+        !case.reads.failed(),
+        "a handled inline controller loss must not poison the read authority"
+    );
+    (a.expect("the inline producer returns the member"), joined)
+}
+
+/// A scalar reader that joins while an inline read is in flight must not
+/// receive that read's intentional controller-loss decline as its own failure.
+#[test]
+fn a_coalesced_reader_does_not_join_an_inline_controller_decline() {
+    let case = Case::new(1);
+    let position = case.positions[0];
+    let (a, b) = coalesced_inline_loss_case(&case, position, || {
+        case.reader.read(KeySpace(0), &case.key, position)
+    });
+    assert!(
+        case.reads
+            .state
+            .diagnostics
+            .live_inline_fallback_coalesced
+            .load(Ordering::Relaxed)
+            >= 1,
+        "the joining reader saw the inline flight and declined at its joiner"
+    );
+    assert_eq!(
+        a,
+        Some(case.values[0].clone()),
+        "the producer's read returns the member after the lane reconnect"
+    );
+    assert_eq!(
+        b.expect("the joining reader returns the member"),
+        Some(case.values[0].clone()),
+        "the joining reader reads the member through the lane"
+    );
+}
+
+/// The batch route must not coalesce a page onto an inline flight either: a
+/// page whose rows all name the in-flight member (a caller may ask twice) is
+/// then the pure-coalesced shape, and it must return the value twice, not the
+/// producer's decline.
+#[test]
+fn a_coalesced_page_does_not_join_an_inline_controller_decline() {
+    let case = Case::new(1);
+    let position = case.positions[0];
+    let rows = vec![(case.key.clone(), position), (case.key.clone(), position)];
+    let (a, page) = coalesced_inline_loss_case(&case, position, || {
+        case.reader.read_many(KeySpace(0), &rows)
+    });
+    assert_eq!(
+        a,
+        Some(case.values[0].clone()),
+        "the producer's read returns the member after the lane reconnect"
+    );
+    assert_eq!(
+        page.expect("the joining page returns its values"),
+        vec![Some(case.values[0].clone()), Some(case.values[0].clone())],
+        "the page reads the member twice through the lane"
+    );
+}

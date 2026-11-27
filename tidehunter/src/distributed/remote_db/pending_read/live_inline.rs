@@ -98,6 +98,44 @@ impl ReadService {
         drop(client);
     }
 
+    /// Install the owner's local WAL grant for `position` with a pooled
+    /// controller lease and register its fixture namespace. The lane must be
+    /// parked so its cache is in the driver.
+    pub(in crate::distributed::remote_db) fn bench_install_owner_local_leased(
+        &self,
+        node: &crate::distributed::tcp::StorageNode,
+        position: VersionPosition,
+    ) -> bool {
+        let lanes = self.lanes.read();
+        let lane = &lanes[0][0];
+        let mut driver = lane.driver.lock();
+        let client = lane.client.lock();
+        let cache = driver
+            .live_cache
+            .as_mut()
+            .expect("the parked lane owns its cache");
+        crate::distributed::tcp::live_read::tests::install_owner_local_leased(
+            cache, &client, node, position,
+        )
+    }
+
+    /// Arm the next completion of the cached grant's inline queue as a short
+    /// read of a controller the probe reports gone. The lane must be parked.
+    pub(in crate::distributed::remote_db) fn bench_arm_inline_short_read_loss(
+        &self,
+        node: usize,
+        position: &VersionPosition,
+    ) -> bool {
+        let lanes = self.lanes.read();
+        let lane = &lanes[0][node];
+        let mut driver = lane.driver.lock();
+        let cache = driver
+            .live_cache
+            .as_mut()
+            .expect("the parked lane owns its cache");
+        crate::distributed::tcp::live_read::tests::arm_inline_short_read_loss(cache, position)
+    }
+
     /// Arm the next grant this lane opens so its read completes short, with
     /// `lost` as the controller probe's verdict.
     pub(in crate::distributed::remote_db) fn bench_arm_short_read_after_open(
@@ -284,6 +322,7 @@ impl ReadService {
             node,
             positions: vec![*position],
             slot,
+            inline: true,
             completion: FlightCompletion::new(),
             // Set at submission below: admission locks and pauses do not count.
             io_deadline: Mutex::new(None),

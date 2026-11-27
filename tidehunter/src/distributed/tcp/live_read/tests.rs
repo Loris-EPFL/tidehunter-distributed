@@ -101,23 +101,13 @@ pub(crate) fn owner_local_path(
     owner_member_lease(node, position).segment.path.clone()
 }
 
-/// Register the fixture namespace of the permanent per-owner export that
-/// serves `position`, so the lane's `open_permanent` connects the owner's WAL
-/// file instead of a kernel controller. Recovery registers the same target for
-/// the pages it reads.
-pub(crate) fn register_permanent_local(
-    client: &Client,
-    position: &VersionPosition,
-    path: &std::path::Path,
-) {
+/// The permanent per-owner export target that serves `position`, as the lane
+/// derives it from the client's export list.
+fn permanent_local_target(client: &Client, position: &VersionPosition) -> LiveConnectTarget {
     let config = client
         .live_config
         .as_ref()
         .expect("the lane client is configured");
-    let pool = client
-        .live_pool
-        .as_ref()
-        .expect("the lane client has a controller pool");
     let (epoch, info, _) = client
         .live_exports
         .as_ref()
@@ -129,7 +119,7 @@ pub(crate) fn register_permanent_local(
         *epoch,
         position.address.offset / client.expected.wal_file_bytes,
     );
-    let target = LiveConnectTarget {
+    LiveConnectTarget {
         nqn: name.nqn,
         uuid: name.uuid,
         nsid: name.nsid,
@@ -139,13 +129,87 @@ pub(crate) fn register_permanent_local(
         service: info.service,
         transport: info.transport,
         geometry: config.queue_geometry,
-    };
+    }
+}
+
+/// Register the fixture namespace of the permanent per-owner export that
+/// serves `position`, so the lane's `open_permanent` connects the owner's WAL
+/// file instead of a kernel controller. Recovery registers the same target for
+/// the pages it reads.
+pub(crate) fn register_permanent_local(
+    client: &Client,
+    position: &VersionPosition,
+    path: &std::path::Path,
+) {
+    let pool = client
+        .live_pool
+        .as_ref()
+        .expect("the lane client has a controller pool");
+    let target = permanent_local_target(client, position);
     pool.register_local_target(
         &target,
         crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadShared,
         path.to_owned(),
     )
     .unwrap();
+}
+
+/// Install the owner's local WAL grant for `position` with a pooled controller
+/// lease, and register that controller's fixture namespace so the lane retry
+/// reconnects it. Drives the inline route and its controller verdict without a
+/// kernel controller and without depending on a warm lane read.
+pub(crate) fn install_owner_local_leased(
+    cache: &mut LiveReadCache,
+    client: &Client,
+    node: &super::super::StorageNode,
+    position: VersionPosition,
+) -> bool {
+    let path = install_owner_local(cache, node, position);
+    register_permanent_local(client, &position, &path);
+    let config = client
+        .live_config
+        .as_ref()
+        .expect("the lane client is configured");
+    let pool = client
+        .live_pool
+        .as_ref()
+        .expect("the lane client has a controller pool");
+    let target = permanent_local_target(client, &position);
+    if pool
+        .cache_local_shared_namespace(&target, &config.host_nqn, config.host_id, &path)
+        .is_err()
+    {
+        return false;
+    }
+    let Some(lease) = pool.cached_lease(&target.nqn) else {
+        return false;
+    };
+    let Some(grant) = cache.grants.last_mut() else {
+        return false;
+    };
+    grant.lease = Some(lease);
+    true
+}
+
+/// Arm the next completion of the cached grant's inline queue as the short read
+/// of a controller the probe reports gone. The lane queue keeps its own
+/// completions, so a concurrent lane read is unaffected.
+pub(crate) fn arm_inline_short_read_loss(
+    cache: &mut LiveReadCache,
+    position: &VersionPosition,
+) -> bool {
+    let Some(index) = cache.find_grant(position) else {
+        return false;
+    };
+    let grant = &mut cache.grants[index];
+    let Some(lease) = grant.lease.clone() else {
+        return false;
+    };
+    grant.controller_lost = Some(true);
+    // A local-file lease has no kernel controller: report the deletion.
+    lease.force_controller_lost(true);
+    grant.inline_io_mut().override_next_completion_result(0);
+    true
 }
 
 /// Pin the owner's real WAL inode and open it as a local namespace. Only

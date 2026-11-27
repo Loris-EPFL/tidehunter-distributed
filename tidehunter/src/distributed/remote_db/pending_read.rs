@@ -115,6 +115,41 @@ impl FlightRegistry {
         None
     }
 
+    /// Like [`Self::find`], but never a flight an inline caller owns.
+    ///
+    /// A lane request that coalesced onto an inline flight would receive that
+    /// flight's intentional controller-loss decline as its own read failure: a
+    /// lane flight is the only kind a transport retry can answer. The upgrade
+    /// happens under the caller's registry lock and drops here before the call
+    /// returns, so the inline producer's one-strong-owner check still sees only
+    /// real consumers. The search continues past a skipped inline flight,
+    /// because a lane flight for the same member can be registered too.
+    #[allow(
+        clippy::expect_used,
+        reason = "the bucket chain only holds allocated entries, so every index resolves"
+    )]
+    fn find_lane(
+        &self,
+        node: usize,
+        position: &VersionPosition,
+    ) -> Option<(Arc<ReadFlight>, usize)> {
+        let mut index = self.buckets[self.bucket(node, position)];
+        while index != NO_INDEX {
+            let entry = self.entries[index]
+                .as_ref()
+                .expect("allocated flight entry");
+            if entry.node == node
+                && entry.position == *position
+                && let Some(flight) = self.slots[entry.slot].upgrade()
+                && !flight.inline
+            {
+                return Some((flight, entry.member));
+            }
+            index = entry.bucket_next;
+        }
+        None
+    }
+
     #[allow(
         clippy::expect_used,
         reason = "the bucket chain only holds allocated entries, so every index resolves"
@@ -849,6 +884,11 @@ struct ReadFlight {
     node: usize,
     positions: Vec<VersionPosition>,
     slot: usize,
+    /// Set for a flight the caller runs on its own borrowed lane. Lane work
+    /// must never coalesce onto one: the inline route answers a verified
+    /// controller loss by declining to the lane, an answer only its producer
+    /// can act on.
+    inline: bool,
     completion: FlightCompletion,
     /// Deadline of the outstanding transport I/O, set by the transport at
     /// submission; `None` before submission. Waiting callers time out only
@@ -1988,7 +2028,7 @@ impl ReadService {
             SmallVec::with_capacity(positions.len());
         let mut missing_index = (positions.len() > 1).then(HashMap::new);
         for position in positions {
-            let existing = flights.find(node, position);
+            let existing = flights.find_lane(node, position);
             if let Some((flight, slot)) = existing {
                 if let Some(trace) = &trace {
                     trace.event_io("coalesced_flight_slot", 0, flight.slot as u64);
@@ -2108,6 +2148,7 @@ impl ReadService {
                 node,
                 positions: missing.clone(),
                 slot,
+                inline: false,
                 completion: FlightCompletion::new(),
                 io_deadline: Mutex::new(None),
                 _credit: credit.clone(),
