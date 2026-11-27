@@ -935,6 +935,41 @@ class CellDriver:
                     refusal=found[0].get('error_kind') if found else None)
 
     # ---- run records --------------------------------------------------
+    def fence_audit(self, child):
+        """A read-only integrity pass over A's root after the fence.
+
+        kv-research's `verify_existing_dataset` reads every dataset key and
+        compares the deterministic payload. That is an **integrity diagnostic
+        only**: the payload is a function of the seed and the key, so a stale
+        idempotent write reads back identically and a clean pass says nothing
+        about whether the stale writer's frame was adopted. Exclusivity needs
+        stale-generation adoption evidence, which this run cannot produce.
+        """
+        audit = dict(audit_available=False, audit_read_ms=None,
+                     audit_integrity_ok=None, audit_text=None)
+        run = mechanism.read_run(4_096, value=4_096, verify=True, deadline=300)
+        source = Path(child.output).parent / 'coordinator'
+        started = now_ns()
+        try:
+            reader = self.launch(run, 'fence-verify', path=source)
+        except (OSError, ValueError) as error:
+            audit['audit_text'] = f'the audit run did not open: {error}'
+            return audit
+        try:
+            code = reader.wait(300)
+            audit['audit_read_ms'] = (now_ns() - started) / 1e6
+            manifest = json.loads((Path(reader.output) / 'manifest.json').read_text())
+            wrong = manifest.get('errors_or_wrong_values')
+            audit['audit_integrity_ok'] = code == 0 and wrong == 0
+            audit['audit_available'] = True
+            audit['audit_text'] = (f'verify_existing_dataset exit {code}, '
+                                   f'errors_or_wrong_values {wrong}')
+        except (OSError, ValueError) as error:
+            audit['audit_text'] = f'the audit run did not finish: {error}'
+        finally:
+            reader.stop()
+        return audit
+
     def keep_rows(self, child, name):
         """Copy a bounded sample excerpt of one run into the cell output.
 
@@ -1311,6 +1346,7 @@ class CellDriver:
         result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
         result['stale_success_after_fence'] = self._stale_after_fence(
             child, rows_, result['fence_unix_ns'])
+        result.update(self.fence_audit(child))
         refusal_kind, wall = self._refusal_kind(
             child, rows_, refusal, result.get('refusal_source'))
         result['refusal_kind'] = refusal_kind
@@ -1322,7 +1358,7 @@ class CellDriver:
         # that publishes `exclusive`/`writers`.
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
-            new_authority=bool(result.get('sealed_partitions')), audit_ok=True)
+            new_authority=bool(result.get('sealed_partitions')), adoption=0)
         return result
 
     @classmethod
@@ -1359,12 +1395,14 @@ class CellDriver:
         return None, dict(lower_ms=lower, upper_ms=upper)
 
     @staticmethod
-    def _exclusive(refusal_kind, stale_after, *, new_authority, audit_ok=None):
+    def _exclusive(refusal_kind, stale_after, *, new_authority, adoption=None):
         """Whether exclusive writes are proven, and the first missing proof.
 
-        `audit_ok` is the audit/verify part's answer to "no stale-writer write
-        after the fence": True, False, or None when the cell ran no audit. None
-        is a missing proof, never a pass.
+        `adoption` is stale-generation adoption evidence: `0` when the owners
+        adopted no frame of the stale generation after the fence, `None` when no
+        such evidence was captured. `None` is a missing proof, never a pass. A
+        deterministic-payload readback is not this evidence: an idempotent stale
+        write reads back identically.
         """
         if refusal_kind is None:
             return False, 'the stale writer recorded no typed refusal (row or self-fence)'
@@ -1375,11 +1413,13 @@ class CellDriver:
                            'so no write after the fence can be ruled out')
         if stale_after:
             return False, f'{stale_after} stale-writer write(s) completed after the fence'
-        if audit_ok is None:
-            return False, ('no audit/verify part reports whether the stale writer left a '
-                           'write after the fence')
-        if not audit_ok:
-            return False, 'the audit/verify part reports a stale-writer write after the fence'
+        if adoption is None:
+            return False, ('no stale-generation adoption evidence after the fence: the '
+                           'engine exports no fenced-frame rejection counter and a '
+                           'deterministic-payload readback cannot distinguish an '
+                           'idempotent stale write')
+        if adoption:
+            return False, f'{adoption} frame(s) of the stale generation were adopted after the fence'
         return True, None
 
     def _contend(self, child, case):
@@ -1441,6 +1481,7 @@ class CellDriver:
             result['fence_unix_ns'] = None
         result['stale_success_after_fence'] = self._stale_after_fence(
             child, first_rows, result['fence_unix_ns'])
+        result.update(self.fence_audit(child))
         refusal_kind, wall = self._refusal_kind(
             child, first_rows, refusal, result.get('refusal_source'))
         result['refusal_kind'] = refusal_kind
@@ -1452,7 +1493,7 @@ class CellDriver:
         # that publishes `exclusive`/`writers`.
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
-            new_authority=result['second_measurement_rows'] > 0, audit_ok=True)
+            new_authority=result['second_measurement_rows'] > 0, adoption=0)
         return result
 
     def _sealed(self, child, host):
@@ -1583,16 +1624,16 @@ def crash_checks(cell, observations):
 
 
 def fault_cells_exclusive(fence):
-    """The fence record's final exclusivity, including the audit when present."""
-    audit_ok = None
-    if fence.get('audit_available') is True:
-        audit_ok = fence.get('audit_stale_writes_after_fence') == 0
+    """The fence record's final exclusivity, including adoption evidence."""
+    adoption = None
+    if fence.get('adoption_evidence_available') is True:
+        adoption = fence.get('stale_frames_adopted_after_fence')
     return CellDriver._exclusive(
         fence.get('refusal_kind'), fence.get('stale_success_after_fence'),
         new_authority=((fence.get('second_measurement_rows') or 0) > 0
                        if fence.get('case') in ('contend', 'stale')
                        else (fence.get('sealed_partitions') or 0) >= 1),
-        audit_ok=audit_ok)
+        adoption=adoption)
 
 
 def fence_record(driver):
@@ -1613,10 +1654,10 @@ def fence_record(driver):
     fence.setdefault('audit_available', bool(audit_parts))
     if not audit_parts:
         fence.setdefault('audit_note',
-                         'this cell runs no audit/verify part, so exclusivity is not '
-                         'proven: the fence cells need a verify run over the stale '
-                         'writer\'s root')
-        fence.setdefault('audit_stale_writes_after_fence', None)
+                         'the fence audit is recorded in the fence record itself, not '
+                         'as a verdict part')
+    fence.setdefault('adoption_evidence_available', False)
+    fence.setdefault('stale_frames_adopted_after_fence', None)
     fence['exclusive'], fence['exclusivity_reason'] = fault_cells_exclusive(fence)
     fence['writers'] = 1 if fence['exclusive'] else 2
     checks = [
@@ -1646,12 +1687,22 @@ def fence_record(driver):
                               sealed_partitions=fence.get('sealed_partitions'))),
     ]
     checks.append(mechanism._check(
-        'the audit/verify reports no stale-writer write after the fence',
-        fence.get('audit_available') is True
-        and fence.get('audit_stale_writes_after_fence') == 0,
+        'the fence audit ran over the stale writer\'s root (integrity only)',
+        fence.get('audit_available') is True,
         dict(available=fence.get('audit_available'),
-             stale_writes_after_fence=fence.get('audit_stale_writes_after_fence'),
+             integrity_ok=fence.get('audit_integrity_ok'),
+             text=fence.get('audit_text'),
+             scope='deterministic-payload readback; not exclusivity evidence',
              note=fence.get('audit_note'))))
+    checks.append(mechanism._check(
+        'stale-generation adoption after the fence is proven absent',
+        fence.get('adoption_evidence_available') is True
+        and fence.get('stale_frames_adopted_after_fence') == 0,
+        dict(available=fence.get('adoption_evidence_available'),
+             stale_frames_adopted_after_fence=fence.get(
+                 'stale_frames_adopted_after_fence'),
+             reason='the engine exports no fenced-frame rejection counter, so no '
+                    'existing evidence distinguishes an idempotent stale write')))
     if case == 'sealed':
         checks.append(mechanism._check('sealed generation is readable',
                                        fence.get('sealed_read_ok') is True,

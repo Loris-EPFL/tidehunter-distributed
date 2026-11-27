@@ -375,11 +375,14 @@ class FenceExclusivity(unittest.TestCase):
         self.assertIn('missing',
                       named['exclusive writes are proven']['detail']['reason'])
         self.assertFalse(record['fence']['audit_available'])
-        self.assertIn('no audit/verify part', record['fence']['audit_note'])
+        self.assertIn('recorded in the fence record', record['fence']['audit_note'])
         self.assertFalse(record['fence']['exclusive'])
-        audit = [check for check in record['checks']
-                 if check['check'].startswith('the audit/verify reports')][0]
-        self.assertFalse(audit['ok'])
+        named_checks = {check['check']: check for check in record['checks']}
+        self.assertFalse(named_checks[
+            'stale-generation adoption after the fence is proven absent']['ok'])
+        self.assertIn('no fenced-frame rejection counter',
+                      named_checks['stale-generation adoption after the fence is '
+                                   'proven absent']['detail']['reason'])
 
     def test_the_real_stale_rows_are_judged_against_the_new_writers_fence(self):
         rows_ = fault_cells.rows(ROOT / 'experiments/gcp-rdma/fixtures' / 's1-5s-contend-a-excerpt.csv')
@@ -417,7 +420,9 @@ class FenceExclusivity(unittest.TestCase):
         real = self.fixture('s1-5s-contend-attempt3.json')
         fence = dict(real['fence'], refusal_kind='owner-row', exclusive=True,
                      writers=1, stale_success_after_fence=0,
-                     audit_available=True, audit_stale_writes_after_fence=0,
+                     audit_available=True, audit_integrity_ok=True,
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0,
                      second_measurement_rows=real['new_writer']['measurement_rows'],
                      fence_unix_ns=1_000_000_000_000,
                      first_started_unix_ns=999_000_000_000,
@@ -445,7 +450,9 @@ class FenceExclusivity(unittest.TestCase):
                      refusal_text='coordinator lease lapsed on owner partition 1',
                      first_refusal_row=None, exclusive=True, writers=1,
                      stale_success_after_fence=0, sealed_partitions=1,
-                     audit_available=True, audit_stale_writes_after_fence=0,
+                     audit_available=True, audit_integrity_ok=True,
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0,
                      write_protect_apply_ms=7097.3, fence_reject_ms=None,
                      fence_reject_window_ms=dict(lower_ms=0.0, upper_ms=420.0),
                      fence_unix_ns=1, first_started_unix_ns=0)
@@ -720,8 +727,9 @@ class FenceVerdict(unittest.TestCase):
                                    first_refusal_row=40,
                                    stale_success_after_fence=0, exclusive=True,
                                    second_measurement_rows=200,
-                                   audit_available=True,
-                                   audit_stale_writes_after_fence=0,
+                                   audit_available=True, audit_integrity_ok=True,
+                                   adoption_evidence_available=True,
+                                   stale_frames_adopted_after_fence=0,
                                    first_started_unix_ns=1, second_started_unix_ns=2,
                                    fence_unix_ns=3,
                                    fence_reject_ms=12.5))
@@ -1244,7 +1252,12 @@ class StaleFenceMeasurement(unittest.TestCase):
                     patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
                     patch.object(driver, 'stop_on_failure',
                                  return_value=dict(gate=gate, exit_code=1)):
-                result = driver._contend(child, 'stale')
+                with patch.object(driver, 'fence_audit', return_value=dict(
+                        audit_available=True, audit_integrity_ok=True,
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0,
+                        audit_read_ms=1.0, audit_text='verify ok')):
+                    result = driver._contend(child, 'stale')
         self.assertEqual(result['resumed_unix_ns'], 1_000_000_000)
         # The fence is the new writer's first completed write at +10 ms on its
         # own clock; the stale writer's refusal completed at +50 ms.
@@ -1256,11 +1269,12 @@ class StaleFenceMeasurement(unittest.TestCase):
         self.assertTrue(result['stale_write_refused'])
         self.assertTrue(result['typed_refusal'])
         self.assertTrue(second.stopped)
-        result['audit_stale_writes_after_fence'] = 0
+        fence = dict(result, case='stale', tier='native',
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0)
         record = fault_cells.fence_record(
-            types.SimpleNamespace(cell=driver.cell,
-                                  parts=[dict(role='verify')],
-                                  fence=dict(result, case='stale', tier='native')))
+            types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
+                                  fence=fence))
         self.assertTrue(record['ok'], record)
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
@@ -1324,21 +1338,88 @@ class StaleFenceMeasurement(unittest.TestCase):
                     patch.object(driver, 'stop_on_failure',
                                  return_value=dict(gate=dict(reached=True, errors=1),
                                                    exit_code=1)):
-                result = driver._contend(child, 'contend')
+                with patch.object(driver, 'fence_audit', return_value=dict(
+                        audit_available=True, audit_integrity_ok=True,
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0,
+                        audit_read_ms=1.0, audit_text='verify ok')):
+                    result = driver._contend(child, 'contend')
         # A contend cell reports the same quantity as a stale cell, and says
         # which kind of refusal it measured.
         self.assertEqual(result['fence_unix_ns'], 1_010_000_000)
         self.assertEqual(result['fence_reject_ms'], 40.0)
         self.assertEqual(result['refusal_kind'], 'owner-row')
         self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
-        result['audit_stale_writes_after_fence'] = 0
+        fence = dict(result, case='contend', tier='native',
+                     adoption_evidence_available=True,
+                     stale_frames_adopted_after_fence=0)
         record = fault_cells.fence_record(
             types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
-                                  fence=dict(result, case='contend', tier='native')))
+                                  fence=fence))
         self.assertTrue(record['ok'], record)
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
         self.assertEqual(latency['detail']['kind'], 'owner-row')
+
+
+class FenceAuditRun(unittest.TestCase):
+    """The audit the fence verdict requires is a kv-research verify run.
+
+    `fixtures/s1-5s-contend-attempt3.json` carries the real cell's numbers so the
+    audit is asserted beside the evidence it must accompany.
+    """
+
+    def driver(self, tmp, *, exit_code=0, wrong=0, fail=None):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        driver.cell = fault_cells.mechanism.find('S1-5S-contend-native')
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.output = Path(tmp)
+        cluster.local = lambda name: cluster.output / name
+        cluster.root = lambda name: cluster.local(name) / 'coordinator'
+        driver.cluster = cluster
+
+        class Reader:
+            output = Path(tmp) / 'fence-verify' / 'run'
+
+            def wait(self, timeout):
+                return exit_code
+
+            def stop(self):
+                pass
+
+        Reader.output.mkdir(parents=True, exist_ok=True)
+        (Reader.output / 'manifest.json').write_text(
+            json.dumps(dict(errors_or_wrong_values=wrong)))
+        driver.launch = (lambda run, name, path=None: (_ for _ in ()).throw(ValueError(fail))
+                         if fail else Reader())
+        return driver
+
+    def test_a_clean_verify_run_is_the_audit_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = self.driver(tmp).fence_audit(
+                types.SimpleNamespace(output=Path(tmp) / 'fence-a' / 'run'))
+        self.assertTrue(audit['audit_available'])
+        self.assertTrue(audit['audit_integrity_ok'])
+        self.assertNotIn('audit_stale_writes_after_fence', audit,
+                         'a deterministic readback is not adoption evidence')
+        self.assertIn('verify_existing_dataset exit 0', audit['audit_text'])
+        self.assertIsNotNone(audit['audit_read_ms'])
+
+    def test_a_wrong_value_or_a_failed_read_is_a_dirty_audit(self):
+        for kwargs in (dict(wrong=2), dict(exit_code=1)):
+            with self.subTest(**kwargs), tempfile.TemporaryDirectory() as tmp:
+                audit = self.driver(tmp, **kwargs).fence_audit(
+                    types.SimpleNamespace(output=Path(tmp) / 'fence-a' / 'run'))
+            self.assertTrue(audit['audit_available'])
+            self.assertFalse(audit['audit_integrity_ok'])
+
+    def test_an_unopenable_audit_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = self.driver(tmp, fail='no dataset at that root').fence_audit(
+                types.SimpleNamespace(output=Path(tmp) / 'fence-a' / 'run'))
+        self.assertFalse(audit['audit_available'])
+        self.assertIsNone(audit['audit_integrity_ok'])
+        self.assertIn('did not open', audit['audit_text'])
 
 
 class AttemptPaths(unittest.TestCase):
