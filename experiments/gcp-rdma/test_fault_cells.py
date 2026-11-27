@@ -287,6 +287,22 @@ class OwnerWAL(unittest.TestCase):
         self.assertTrue(gate['reached'])
         self.assertIn('after the unlink', gate['note'])
 
+    def test_dir_sync_baselines_the_root_after_the_first_store(self):
+        no_root = dict(host='h1', files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
+                       roots={})
+        first = dict(host='h1', files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
+                     roots={'/g/partition-wal-root-v1': dict(size=1, mtime=1.0)})
+        gone = dict(host='h1', files={},
+                    roots={'/g/partition-wal-root-v1': dict(size=1, mtime=1.0)})
+        synced = dict(host='h1', files={},
+                      roots={'/g/partition-wal-root-v1': dict(size=2, mtime=2.0)})
+        with patch.object(fault_cells.time, 'sleep', lambda _: None):
+            driver = fault_cells.CellDriver(
+                self.cluster([no_root, first, gone, synced]),
+                fault_cells.mechanism.find('S1-6S-dir-sync-native'))
+            gate = driver.gate_retirement('h1', 'dir-sync', timeout=1)
+        self.assertTrue(gate['reached'], gate)
+
     def test_dir_sync_cut_needs_the_root_rewrite(self):
         before = dict(host='h1', files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
                       roots={'/g/partition-wal-root-v1': dict(size=1, mtime=1.0)})

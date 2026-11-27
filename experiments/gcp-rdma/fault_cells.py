@@ -819,7 +819,18 @@ class CellDriver:
         return values
 
     def gate_retirement(self, host, cut, *, timeout=GATE_TIMEOUT_SECONDS):
+        base_started = time.monotonic()
         before = self.cluster.wal(host)
+        if cut == 'dir-sync':
+            # A root exists only after the owner's first store. The rewrite
+            # being cut on is a change of an existing root, so baseline once
+            # one exists instead of treating its first creation as a rewrite.
+            while not before['roots']:
+                if time.monotonic() - base_started >= timeout:
+                    return dict(reached=False, cut=cut,
+                                reason='no durable root to baseline')
+                time.sleep(0.2)
+                before = self.cluster.wal(host)
         baseline = dict(before['files'])
         roots = dict(before['roots'])
         started = time.monotonic()
