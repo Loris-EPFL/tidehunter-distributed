@@ -785,3 +785,56 @@ fn a_submission_time_timeout_is_retried_within_the_call_deadline() {
         "the retried read is not a caller-visible timeout"
     );
 }
+
+/// A lane read that completes short is not a read-authority verdict when the
+/// controller it used was verifiably deleted: the lane requeues the member,
+/// evicts the dead controller, reconnects and the value path returns the
+/// value. `reads.failed()` stays false, so the write core keeps accepting
+/// writes after the healed read.
+#[test]
+fn a_short_read_on_a_lost_controller_does_not_poison_the_authority() {
+    let case = Case::new(1);
+    let position = case.positions[0];
+    // The lane route owns the quarantine and the retry budget; the inline
+    // route's decline is covered by `tcp::live_read`.
+    case.reads.set_inline_reads_for_test(false);
+    let path =
+        crate::distributed::tcp::live_read::tests::owner_local_path(&case.fixture.node, position);
+    // The ordinary-file fixture has no kernel target: register the owner's
+    // export as a local namespace, then make the grant the lane opens report
+    // the deletion the kernel would report and complete its read short.
+    let parked = case.reads.bench_park_live_lane(0);
+    case.reads
+        .bench_register_permanent_local(0, position, &path);
+    case.reads.bench_arm_short_read_after_open(0);
+    drop(parked);
+    let before = case
+        .fixture
+        .metrics
+        .snapshot()
+        .counts
+        .read_controller_resumes;
+    let value = case
+        .reader
+        .read(KeySpace(0), &case.key, position)
+        .expect("a resumed short read serves the value")
+        .expect("a put member returns its value");
+    assert_eq!(
+        value, case.values[0],
+        "the retried read returns the identical member bytes"
+    );
+    assert!(
+        !case.reads.failed(),
+        "a short read of a verifiably lost controller must not poison the read authority"
+    );
+    assert_eq!(
+        case.fixture
+            .metrics
+            .snapshot()
+            .counts
+            .read_controller_resumes
+            - before,
+        1,
+        "exactly one controller resume is counted"
+    );
+}

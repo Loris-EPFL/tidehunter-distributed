@@ -9,7 +9,7 @@ use crate::distributed::nvmeof::live_connect::{ControllerAdoption, LiveConnectTa
 use crate::distributed::nvmeof::live_io::{LiveIo, LiveIoError, LiveIoResult, LiveSubmitOutcome};
 use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
 use crate::distributed::nvmeof::live_metrics::{LiveNamespaceIdentity, LiveRouteEvidence};
-use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
+use crate::distributed::nvmeof::live_namespace::{LiveNamespaceAccess, retryable_lost_read};
 use crate::distributed::nvmeof::live_pool::{
     LiveControllerLease, LiveControllerPool, LivePoolAcquisition,
 };
@@ -57,7 +57,7 @@ impl RecoveryAttemptError {
     fn io(error: io::Error, pool: &LiveControllerPool, nqn: &str) -> Self {
         let lost = crate::distributed::nvmeof::live_namespace::controller_lost(&error)
             || pool.entry_lost(nqn);
-        let retry = retryable_recovery_failure(&error, lost);
+        let retry = retryable_lost_read(&error, lost);
         Self {
             error: TcpError::component(error),
             retryable: retry,
@@ -73,18 +73,6 @@ impl RecoveryAttemptError {
             other => Self::fatal(TcpError::component(other)),
         }
     }
-}
-
-/// Whether a recovery page may be read again after this failure.
-///
-/// The failure class alone is never enough. A short read or an `EIO`/`EBADF`
-/// on a live controller is a media or namespace verdict and must stay fatal;
-/// a retry needs the error-path sysfs verdict that the controller is gone.
-/// Owner verdicts (`InvalidData` and other classes) never retry.
-fn retryable_recovery_failure(error: &io::Error, lost: bool) -> bool {
-    lost && (crate::distributed::nvmeof::live_namespace::controller_lost(error)
-        || matches!(error.raw_os_error(), Some(libc::EIO | libc::EBADF))
-        || error.kind() == io::ErrorKind::UnexpectedEof)
 }
 
 impl Client {

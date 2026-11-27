@@ -21,25 +21,23 @@ impl From<TcpError> for InlineFailure {
 
 /// Whether this failed inline read lost its controller.
 ///
-/// True only for `EIO`/`EBADF` from a grant whose pinned controller is
-/// verifiably not live. The grant is marked broken but **not** poisoning, and
-/// its dead lease is evicted, so the retry opens a new controller. A failed
-/// eviction reports false: the reconnect is impossible, so the fatal class
-/// stands.
+/// True only for a short namespace read, `EIO`/`EBADF` or the typed cause from
+/// a grant whose pinned controller is verifiably not live. A live controller
+/// keeps every one of those fatal. The grant is marked broken but **not**
+/// poisoning, and its dead lease is evicted, so the lane retry opens a new
+/// controller. A failed eviction keeps this verdict: the reconnect is still
+/// possible, so a verifiably lost controller never becomes a media verdict.
 fn inline_controller_lost(
     grant: &mut Grant,
     client: &Client,
     error: &LiveIoError,
     deadline: Instant,
+    trace: Option<&ReadTraceChild>,
 ) -> bool {
-    let errno = match error {
-        LiveIoError::Io(error) => error.raw_os_error(),
-        _ => None,
-    };
-    if !errno.is_some_and(crate::distributed::tcp::is_lost_io_errno) {
+    let LiveIoError::Io(error) = error else {
         return false;
-    }
-    if !grant_controller_lost(grant) {
+    };
+    if !read_controller_lost(error, deadline, || grant_controller_lost(grant)) {
         return false;
     }
     let Some(lease) = grant.lease.as_ref() else {
@@ -57,6 +55,12 @@ fn inline_controller_lost(
             crate::distributed::tcp::controller_teardown_deadline(config.connect_timeout_ms)
         });
         let _ = pool.evict_lost(&nqn, teardown);
+    }
+    if let Some(counters) = &client.live_counters {
+        counters.record_read_controller_resume();
+    }
+    if let Some(trace) = trace {
+        trace.event("live_member_requeued_lost_controller");
     }
     true
 }
@@ -214,7 +218,7 @@ impl LiveReadCache {
             let waited = grant.inline_io_mut().wait(timeout);
             if let Err(error) = waited {
                 drain_failed_io(grant);
-                let lost = inline_controller_lost(grant, client, &error, deadline);
+                let lost = inline_controller_lost(grant, client, &error, deadline, trace);
                 if !lost {
                     grant.broken = true;
                     if let GrantScope::Subsystem {
@@ -237,7 +241,7 @@ impl LiveReadCache {
                 Ok(completions) => completions,
                 Err(error) => {
                     drain_failed_io(grant);
-                    let lost = inline_controller_lost(grant, client, &error, deadline);
+                    let lost = inline_controller_lost(grant, client, &error, deadline, trace);
                     if !lost {
                         grant.broken = true;
                         if let GrantScope::Subsystem {
@@ -279,8 +283,8 @@ impl LiveReadCache {
                             error,
                             crate::distributed::nvmeof::live_io::LiveIoError::Io(_)
                         );
-                        let lost =
-                            io_error && inline_controller_lost(grant, client, &error, deadline);
+                        let lost = io_error
+                            && inline_controller_lost(grant, client, &error, deadline, trace);
                         if io_error
                             && !lost
                             && let GrantScope::Subsystem {

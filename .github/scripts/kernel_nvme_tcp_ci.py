@@ -939,15 +939,17 @@ def interrupted(signum, _frame):
 
 
 class ControllerLossSupervisor(threading.Thread):
-    """Delete the active write controller each tier's proof asks for.
+    """Delete each controller a tier's proof asks for, write or read.
 
-    The qualification proof writes `controller-loss-ready.json` naming its own
-    process, the controller, that controller's sysfs inode and its namespace.
-    This thread answers every request once: it re-proves the inode and the
-    coordinator's namespace descriptor, writes `delete_controller`, waits for
-    the sysfs entry to disappear, and records the injection next to the
-    request. A request that does not describe a live controller, or a
-    controller that does not disappear, is an error, never a pass.
+    The qualification proof writes `controller-loss-ready.json` for the write
+    route and `read-controller-loss-ready.json` for the read route. Each names
+    its own process, the controller, that controller's sysfs inode, its
+    namespace and its role. This thread answers every request once: it
+    re-proves the inode, the role and the coordinator's namespace descriptor,
+    writes `delete_controller`, waits for the sysfs entry to disappear, and
+    records the injection next to the request. A request that does not describe
+    a live controller, or a controller that does not disappear, is an error,
+    never a pass.
     """
 
     def __init__(self, root, deadline, *, poll=0.1):
@@ -966,7 +968,7 @@ class ControllerLossSupervisor(threading.Thread):
         seen = set()
         try:
             while not self.stop_event.wait(self.poll):
-                for request in sorted(self.root.rglob("controller-loss-ready.json")):
+                for request in sorted(self.root.rglob("*controller-loss-ready.json")):
                     if request in seen:
                         continue
                     seen.add(request)
@@ -994,6 +996,9 @@ def inject_controller_loss(request_path, *, controller_root=Path("/sys/class/nvm
     nqn = target.get("nqn")
     if request.get("kind") != "w1_controller_loss_request":
         raise RuntimeError(f"unexpected controller-loss request kind: {request.get('kind')!r}")
+    role = request.get("role")
+    if role not in ("write", "read"):
+        raise RuntimeError(f"unexpected controller-loss role: {role!r}")
     if not (isinstance(controller, str) and re.fullmatch(r"nvme[0-9]+", controller)):
         raise RuntimeError(f"invalid controller name: {controller!r}")
     if target.get("state") != "live":
@@ -1022,7 +1027,7 @@ def inject_controller_loss(request_path, *, controller_root=Path("/sys/class/nvm
     if not held:
         raise RuntimeError("the coordinator holds no descriptor on the requested namespace")
     evidence = {"schema": 1, "kind": "w1_controller_loss_injection",
-                "requested": True, "injected": False,
+                "requested": True, "injected": False, "role": role,
                 "controller": controller, "sysfs_inode": inode, "nqn": nqn,
                 "namespace_path": namespace, "coordinator_pid": pid,
                 "coordinator_descriptors": sorted(held),
@@ -1039,7 +1044,11 @@ def inject_controller_loss(request_path, *, controller_root=Path("/sys/class/nvm
     evidence["removed"] = not path.exists()
     evidence["removed_seconds"] = time.monotonic() - started
     evidence["injected"] = evidence["removed"]
-    Path(request_path).with_name("controller-loss-injection.json").write_text(
+    suffix = "-ready.json"
+    evidence_name = (str(request_path.name)[: -len(suffix)] + "-injection.json"
+                     if str(request_path.name).endswith(suffix)
+                     else "controller-loss-injection.json")
+    Path(request_path).with_name(evidence_name).write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     if not evidence["removed"]:
         raise RuntimeError(f"controller {controller} did not disappear after delete_controller")
@@ -1154,6 +1163,29 @@ def qualify(args):
             if (tier_proof.get("checks", {}).get("w1_controller_loss") is not True
                     or loss.get("resumed", {}).get("sysfs_inode") in (None, loss.get("deleted", {}).get("sysfs_inode"))):
                 raise RuntimeError(f"controller-loss resume unproven in {proof_path}")
+            read = loss.get("read") or {}
+            read_deleted = read.get("deleted") or {}
+            read_resumed = read.get("resumed") or {}
+            if (read.get("kind") != "read_controller_loss"
+                    or read.get("role") != "read"
+                    or not isinstance(read.get("reads"), int) or read["reads"] < 1
+                    or not isinstance(read.get("pages"), int) or read["pages"] < 1
+                    or not isinstance(read.get("digest"), str) or not read["digest"]
+                    or read_resumed.get("read_controller_resumes", 0) < 1
+                    or read_resumed.get("sysfs_inode") in (None, read_deleted.get("sysfs_inode"))):
+                raise RuntimeError(f"read controller-loss resume unproven in {proof_path}")
+        roles = {record.get("role") for record in supervisor.records}
+        if (not {"write", "read"} <= roles
+                or len(supervisor.records) < 2 * len(qualifications)):
+            raise RuntimeError(
+                "controller-loss injection was not confirmed for both the write and read routes")
+        # A resumed read must never leave the authority poisoned; the evidence
+        # a failing cell records is the only place those verdicts can appear.
+        for evidence_path in sorted(output.rglob("*.json")):
+            text = evidence_path.read_text()
+            for message in ("read authority is poisoned", "write core requires recovery"):
+                if message in text:
+                    raise RuntimeError(f"{message!r} recorded in {evidence_path}")
         proofs_complete = len(qualifications) == 2
         after = inventory()
         dump(output / "after.json", after)

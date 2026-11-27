@@ -233,3 +233,48 @@ fn controller_loss_targets_the_current_writer_route() {
         "dropped route evidence cannot name the current writer"
     );
 }
+
+#[test]
+fn read_controller_loss_targets_the_current_read_route() {
+    let read = |nqn: &str, nsid: u64| {
+        serde_json::json!({
+            "transport": "tcp", "address": "10.0.0.2", "service": 4420,
+            "writer": null,
+            "namespace_identity": {"nqn": nqn, "nsid": nsid}
+        })
+    };
+    let mut sample = serde_json::json!({
+        "route_evidence_dropped": 0,
+        "routes": [
+            {"transport": "tcp", "address": "10.0.0.2", "service": 4420,
+             "writer": {"epoch": 1, "file_index": 0},
+             "namespace_identity": {"nqn": "nqn.2026-01.test:sub", "nsid": 1}},
+            read("nqn.2026-01.test:read-a", 1),
+            read("nqn.2026-01.test:read-b", 2)
+        ]
+    });
+    // A reconnect appends a route: the newest read route is the live one.
+    let route = current_read_route(&sample).expect("the newest read route is current");
+    assert_eq!(
+        route["namespace_identity"]["nqn"], "nqn.2026-01.test:read-b",
+        "the read loss targets the controller the read path opened last"
+    );
+    assert_eq!(
+        route["namespace_identity"]["nsid"], 2,
+        "the current route names the member the read path opened last"
+    );
+    // A writer route is never a read-loss target.
+    let writer_only = sample["routes"][0].clone();
+    sample["routes"] = serde_json::json!([writer_only]);
+    assert!(
+        current_read_route(&sample).is_err(),
+        "a writer-only snapshot names no read controller"
+    );
+    // Dropped evidence breaks the append order, so the selection is refused.
+    sample["routes"] = serde_json::json!([read("nqn.2026-01.test:read-a", 1)]);
+    sample["route_evidence_dropped"] = serde_json::json!(1);
+    assert!(
+        current_read_route(&sample).is_err(),
+        "dropped route evidence cannot name the current read controller"
+    );
+}

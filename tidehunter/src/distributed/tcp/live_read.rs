@@ -579,6 +579,35 @@ fn grant_controller_lost(grant: &Grant) -> bool {
         .is_some_and(|lease| lease.controller_lost())
 }
 
+/// Verdict for one failed live read, with the bounded second probe a short
+/// read needs.
+///
+/// A short read races the kernel's controller teardown: the CQE can retire
+/// before sysfs reflects the deletion, so the first probe can still see a live
+/// controller and the loss would poison the authority. For the short-read
+/// class only, one second probe runs after [`POOL_RETRY`] when the request
+/// deadline still allows it. The lane worker may block for that single
+/// millisecond on this error path; the probe never loops.
+fn read_controller_lost(
+    error: &std::io::Error,
+    deadline: Instant,
+    probe: impl Fn() -> bool,
+) -> bool {
+    use crate::distributed::nvmeof::live_namespace::retryable_lost_read;
+    if retryable_lost_read(error, probe()) {
+        return true;
+    }
+    if error.kind() != std::io::ErrorKind::UnexpectedEof {
+        return false;
+    }
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    std::thread::sleep(POOL_RETRY.min(deadline - now));
+    retryable_lost_read(error, probe())
+}
+
 /// Lane state: file grants, requests in flight and unreleased owner pins.
 ///
 /// Owner: the lane's driver lock, borrowed by its worker or an idle caller.
@@ -619,6 +648,11 @@ pub(crate) struct LiveReadCache {
     /// EIO exists.
     #[cfg(test)]
     fail_next_open: bool,
+    /// Report the next opened grant as a lost controller and complete its next
+    /// read short. Test-only: it models a controller the kernel deleted while
+    /// the lane re-opened it, whose only evidence is the short CQE.
+    #[cfg(test)]
+    short_read_after_open: bool,
 }
 impl Default for LiveReadCache {
     fn default() -> Self {
@@ -661,6 +695,8 @@ impl LiveReadCache {
             fail_next_read_submission: false,
             #[cfg(test)]
             fail_next_open: false,
+            #[cfg(test)]
+            short_read_after_open: false,
         }
     }
 
@@ -668,6 +704,13 @@ impl LiveReadCache {
     #[cfg(test)]
     pub(crate) fn fail_next_read_submission(&mut self) {
         self.fail_next_read_submission = true;
+    }
+
+    /// Test only: report the next opened grant as a lost controller and its
+    /// next read as the short read that loss leaves on the completion queue.
+    #[cfg(test)]
+    pub(crate) fn arm_short_read_after_open(&mut self) {
+        self.short_read_after_open = true;
     }
 
     /// Test only: the next namespace open reports a controller the kernel
@@ -993,6 +1036,12 @@ impl LiveReadCache {
                 && Instant::now() < state.deadline;
             if lost_retry {
                 state.controller_losses += 1;
+                if let Some(counters) = &client.live_counters {
+                    counters.record_read_controller_resume();
+                }
+                if let Some(trace) = &state.trace {
+                    trace.event("live_member_requeued_lost_controller");
+                }
                 continue;
             }
             let retry_safe = error.kind() == std::io::ErrorKind::TimedOut
@@ -1049,7 +1098,23 @@ impl LiveReadCache {
                 index
             } else {
                 match self.open_grant(client, epoch, state, position, connect_timeout)? {
-                    Opened::Grant(index) => index,
+                    Opened::Grant(index) => {
+                        #[cfg(test)]
+                        if std::mem::take(&mut self.short_read_after_open) {
+                            let grant = &mut self.grants[index];
+                            if let Some(lease) = grant.lease.clone() {
+                                lease.force_controller_lost(true);
+                                grant.controller_lost = Some(true);
+                                grant.io.override_next_completion_result(0);
+                            }
+                        }
+                        if state.controller_losses > 0
+                            && let Some(trace) = &state.trace
+                        {
+                            trace.event("live_member_reconnected");
+                        }
+                        index
+                    }
                     Opened::NoCapacity => {
                         no_new_grant = true;
                         continue;
@@ -1717,7 +1782,45 @@ impl LiveReadCache {
                 .io
                 .submit_reads_traced(flight, &ranges, deadline, state.trace.as_ref()),
         };
-        match submitted.map_err(live_error)? {
+        let submitted = match submitted {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Classify before `live_error` flattens the errno through
+                // `TcpError::component`: a submit-time lost controller has no
+                // later verdict. A failed submission left no SQE on the ring,
+                // so the members can be re-issued on a new controller.
+                if let LiveIoError::Io(io_error) = &error
+                    && read_controller_lost(io_error, state.deadline, || {
+                        grant_controller_lost(grant)
+                    })
+                {
+                    let nqn = grant
+                        .lease
+                        .as_ref()
+                        .map(|lease| lease.binding().nqn.clone());
+                    grant.broken = true;
+                    grant.lost = true;
+                    if let (Some(pool), Some(nqn)) = (client.live_pool.as_ref(), nqn) {
+                        let teardown = super::controller_teardown_deadline(
+                            client
+                                .live_config
+                                .as_ref()
+                                .map_or(0, |config| config.connect_timeout_ms),
+                        );
+                        let _ = pool.evict_lost(&nqn, teardown);
+                    }
+                    if let Some(trace) = &state.trace {
+                        trace.event("live_member_requeued_lost_controller");
+                    }
+                    return Err(TcpError::with_kind(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "live read submission lost its controller",
+                    ));
+                }
+                return Err(live_error(error));
+            }
+        };
+        match submitted {
             LiveSubmitOutcome::Submitted => {}
             LiveSubmitOutcome::Full => return Ok(Group::Blocked),
         }
@@ -1858,30 +1961,38 @@ impl LiveReadCache {
 
     /// Requeue a read whose grant's controller was verifiably deleted.
     ///
-    /// Returns `true` when the failure was handled here: the failed members are
-    /// pending again, the dead lease was evicted and the broken grant will not
-    /// poison `failed_subsystems`, so the next admission connects a new
-    /// controller. Returns `false` for every other class, which keeps today's
-    /// fatal verdict. A request that already spent its one reconnect, or whose
-    /// absolute deadline passed, fails with a transient kind so the caller can
-    /// retry the idempotent read instead of losing the authority.
+    /// The resumable classes are the short namespace read, `EIO`/`EBADF` and
+    /// the typed `ControllerLost`, and only with the error-path probe's verdict
+    /// that the pinned controller is gone: the same predicate the recovery page
+    /// read uses. Returns `true` when the failure was handled here: the failed
+    /// members are pending again, the dead lease was evicted and the broken
+    /// grant will not poison `failed_subsystems`, so the next admission connects
+    /// a new controller. Returns `false` for every other class (a media verdict
+    /// on a live controller, an owner verdict, a broken ring), which keeps
+    /// today's fatal verdict. A request that already spent its one reconnect,
+    /// or whose absolute deadline passed, fails with a transient kind so the
+    /// caller can retry the idempotent read instead of losing the authority.
     fn requeue_lost_controller_read(
         &mut self,
         client: &mut Client,
         flight: &Flight,
         error: &LiveIoError,
     ) -> Result<bool, TcpError> {
-        let errno = match error {
-            LiveIoError::Io(error) => error.raw_os_error(),
-            _ => None,
-        };
-        if !errno.is_some_and(super::is_lost_io_errno) {
+        let LiveIoError::Io(error) = error else {
             return Ok(false);
-        }
+        };
+        let Some(state) = self.requests.get(&flight.token) else {
+            return Ok(false);
+        };
+        let deadline = state.deadline;
         let Some(grant) = self.grants.iter().find(|grant| grant.id == flight.grant) else {
             return Ok(false);
         };
-        if !grant_controller_lost(grant) {
+        // The resumable loss classes: a short namespace read, `EIO`/`EBADF`,
+        // or the typed cause, each only with the error-path probe's verdict
+        // that the pinned controller is gone. A live controller keeps every
+        // one of them fatal; an owner verdict never matches.
+        if !read_controller_lost(error, deadline, || grant_controller_lost(grant)) {
             return Ok(false);
         }
         let Some(lease) = grant.lease.as_ref() else {
@@ -1938,6 +2049,12 @@ impl LiveReadCache {
         };
         if !already_lost {
             state.controller_losses += 1;
+            if let Some(counters) = &client.live_counters {
+                counters.record_read_controller_resume();
+            }
+        }
+        if let Some(trace) = &state.trace {
+            trace.event("live_member_requeued_lost_controller");
         }
         for &position in &flight.positions {
             state.slots[position] = Slot::Pending;

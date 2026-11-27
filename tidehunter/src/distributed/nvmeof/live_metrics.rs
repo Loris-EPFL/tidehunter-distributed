@@ -123,6 +123,10 @@ counter_fields!(
     leased_flush_samples,
     leased_flush_covered_frames,
     read_lane_pin_failures,
+    /// Reads that survived a verified controller loss: the lane requeued the
+    /// members, evicted the dead lease and re-issued the same bytes on a new
+    /// controller (completion requeue, submission verdict, or inline decline).
+    read_controller_resumes,
     leased_bytes,
     leased_skip_markers,
     extents_leased,
@@ -519,6 +523,12 @@ impl LiveNvmeCounters {
     }
     pub fn record_grant_eviction(&self) {
         self.grant_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One read that a verified controller loss could not fail: it is re-issued
+    /// on a reconnected controller. Not `read_retries`, which is the
+    /// submission-time `TimedOut` retry.
+    pub fn record_read_controller_resume(&self) {
+        self.read_controller_resumes.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_copy_bytes_avoided(&self, bytes: u64) {
         self.copy_bytes_avoided.fetch_add(bytes, Ordering::Relaxed);

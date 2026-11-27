@@ -1483,3 +1483,55 @@ fn random_fan_in_fan_out_windows_publish_every_batch() {
     db.flush_index().unwrap();
     db.shutdown().unwrap();
 }
+
+/// A lane read that completes short on a controller the probe proves deleted
+/// is resumed, not a read-authority verdict: the write core keeps accepting
+/// writes after the healed read. This is the Sui checkpoint executor's cell:
+/// read, then acknowledge more writes on the same authority.
+#[test]
+fn a_short_read_of_a_lost_controller_does_not_stop_the_write_core() {
+    use crate::distributed::remote_db::pipeline_tests::newest_cut;
+    let fixture = Fixture::new();
+    let mut db = fixture.open();
+    let core = Arc::clone(&db.core);
+    core.write(fixture.operation(0, 1), vec![put(1, 1)], None)
+        .unwrap();
+    core.wait_settled().unwrap();
+    let position = core
+        .table
+        .get(KeySpace(0), &1u32.to_be_bytes(), newest_cut())
+        .unwrap()
+        .expect("the written key is indexed");
+    // The lane route owns the quarantine and the retry budget.
+    core.reads.set_inline_reads_for_test(false);
+    // The ordinary-file fixture has no kernel target: register the owner's
+    // export as a local namespace, then make the grant the lane opens report
+    // the deletion the kernel would report and complete its read short.
+    let path =
+        crate::distributed::tcp::live_read::tests::owner_local_path(&fixture.nodes[0], position);
+    let parked = core.reads.bench_park_live_lane(0);
+    core.reads
+        .bench_register_permanent_local(0, position, &path);
+    core.reads.bench_arm_short_read_after_open(0);
+    drop(parked);
+    db.clear_read_cache();
+    assert_eq!(
+        value(&mut db, 1),
+        Some(vec![1; 32]),
+        "the resumed short read returns the value"
+    );
+    assert!(
+        !core.reads.failed(),
+        "a short read of a verifiably lost controller must not poison the read authority"
+    );
+    core.write(fixture.operation(0, 2), vec![put(2, 2)], None)
+        .expect("the write after the healed read must be accepted");
+    core.wait_settled().unwrap();
+    db.clear_read_cache();
+    assert_eq!(
+        value(&mut db, 2),
+        Some(vec![2; 32]),
+        "the write after the healed read is applied"
+    );
+    db.shutdown().unwrap();
+}

@@ -73,6 +73,43 @@ impl ReadService {
             position,
         );
     }
+
+    /// Register the fixture namespace of the permanent per-owner export that
+    /// serves `position`, so the lane's `open_permanent` connects the owner's
+    /// WAL file instead of a kernel controller. The lane must be parked so its
+    /// cache is in the driver.
+    pub(in crate::distributed::remote_db) fn bench_register_permanent_local(
+        &self,
+        node: usize,
+        position: VersionPosition,
+        path: &std::path::Path,
+    ) {
+        let lanes = self.lanes.read();
+        let lane = &lanes[0][node];
+        let driver = lane.driver.lock();
+        assert!(
+            driver.live_cache.is_some(),
+            "the parked lane owns its cache"
+        );
+        let client = lane.client.lock();
+        crate::distributed::tcp::live_read::tests::register_permanent_local(
+            &client, &position, path,
+        );
+        drop(client);
+    }
+
+    /// Arm the next grant this lane opens as a lost controller whose read
+    /// completes short.
+    pub(in crate::distributed::remote_db) fn bench_arm_short_read_after_open(&self, node: usize) {
+        let lanes = self.lanes.read();
+        let lane = &lanes[0][node];
+        let mut driver = lane.driver.lock();
+        driver
+            .live_cache
+            .as_mut()
+            .expect("the parked lane owns its cache")
+            .arm_short_read_after_open();
+    }
 }
 
 impl ReadService {

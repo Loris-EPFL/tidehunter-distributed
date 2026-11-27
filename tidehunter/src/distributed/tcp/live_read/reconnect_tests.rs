@@ -589,3 +589,371 @@ fn a_lost_acquire_requeues_the_read() {
     pool.shutdown(Instant::now() + Duration::from_secs(1))
         .unwrap();
 }
+
+/// A read CQE that completes short is the same resumable class as `EIO` when
+/// the error-path probe proves the pinned controller is gone: the kernel
+/// reports a vanished controller as a short read, not only as `EIO`. The lane
+/// requeues the members, evicts the dead lease, reconnects and returns the
+/// identical member bytes; the subsystem is not quarantined and the resume is
+/// counted.
+#[test]
+fn a_short_read_on_a_lost_controller_reconnects_and_returns_the_same_member() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    assert_eq!(
+        lane.collect(1)[0]
+            .result
+            .as_ref()
+            .expect("the first read serves from the pool"),
+        &vec![frame.clone()],
+        "the pooled controller serves the member"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let nqn = lane.cache.grants[index]
+        .lease
+        .as_ref()
+        .expect("the pooled grant holds its lease")
+        .binding()
+        .nqn
+        .clone();
+    let cached = pool
+        .cached_lease(&nqn)
+        .expect("the read cached its controller");
+    // A local-file lease has no kernel controller to probe: the test reports
+    // the deletion the kernel would report.
+    cached.force_controller_lost(true);
+    lane.cache.grants[index].controller_lost = Some(true);
+    // A positive count below the buffer length is the short namespace read a
+    // vanished controller leaves on the completion queue.
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(0);
+    let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the short read of a lost controller is resumed"),
+        &vec![frame],
+        "the retry returns the identical member bytes"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a lost controller must not quarantine the subsystem"
+    );
+    let reopened = pool
+        .cached_lease(&nqn)
+        .expect("the retry connected a new controller");
+    assert!(
+        !Arc::ptr_eq(&cached, &reopened),
+        "the retry evicted the dead controller before it reopened"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.read_controller_resumes - before,
+        1,
+        "one resumed read is counted once"
+    );
+    // The shutdown contract requires every externally held lease released.
+    drop(cached);
+    drop(reopened);
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The same short completion on a controller the probe reports live is a media
+/// or namespace verdict: it stays fatal, quarantines the subsystem and is never
+/// counted as a resume. This is the poison contract a read with no verdict
+/// keeps.
+#[test]
+fn a_short_read_on_a_live_controller_stays_fatal() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the pooled controller serves the first member"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    lane.cache.grants[index].controller_lost = Some(false);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(0);
+    let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    let error = done[0]
+        .result
+        .as_ref()
+        .expect_err("an unexplained short read is fatal");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::Other,
+        "the short read keeps its fatal class: {error}"
+    );
+    assert!(
+        error.to_string().contains("short namespace read"),
+        "the fatal verdict names the short read: {error}"
+    );
+    assert!(
+        lane.cache.failed_subsystems.contains(&(1, 0)),
+        "an unexplained short read still quarantines the subsystem"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.read_controller_resumes,
+        before,
+        "an unverified short read is never counted as a resume"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// One request spends at most one reconnect. A short read that resumes and a
+/// reconnect that then fails leave the read a transient error, with exactly
+/// one counted resume and no second connect.
+#[test]
+fn a_second_loss_in_one_request_is_not_retried() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the pooled controller serves the first member"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let cached = pool
+        .cached_lease(
+            &lane.cache.grants[index]
+                .lease
+                .as_ref()
+                .expect("the pooled grant holds its lease")
+                .binding()
+                .nqn,
+        )
+        .expect("the read cached its controller");
+    cached.force_controller_lost(true);
+    lane.cache.grants[index].controller_lost = Some(true);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(0);
+    // The one reconnect the request is allowed fails on its own connect.
+    pool.fail_next_connect_lost();
+    let attempts = pool.connect_attempts();
+    let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    let error = done[0]
+        .result
+        .as_ref()
+        .expect_err("a second loss inside one request is not retried");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::ConnectionAborted,
+        "the spent budget is a transient class, not a media verdict: {error}"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.read_controller_resumes - before,
+        1,
+        "exactly one resume is counted"
+    );
+    assert_eq!(
+        pool.connect_attempts() - attempts,
+        1,
+        "the request made exactly one reconnect attempt"
+    );
+    assert_eq!(
+        pool.connect_losses_remaining(),
+        0,
+        "the armed connect loss was consumed by the one reconnect"
+    );
+    drop(cached);
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// The inline route never sets up a controller. A short read on a verifiably
+/// lost controller declines the member with a transient class, so the caller
+/// submits it through the lane, which reconnects and serves it.
+#[test]
+fn a_short_read_inline_declines_without_quarantining() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the first read caches the grant"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let nqn = lane.cache.grants[index]
+        .lease
+        .as_ref()
+        .expect("the pooled grant holds its lease")
+        .binding()
+        .nqn
+        .clone();
+    if let Some(cached) = pool.cached_lease(&nqn) {
+        cached.force_controller_lost(true);
+    }
+    lane.cache.grants[index].controller_lost = Some(true);
+    lane.cache.grants[index]
+        .io
+        .override_next_completion_result(0);
+    let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    let error = lane
+        .cache
+        .read_inline_cached(
+            &lane.client,
+            &a,
+            Instant::now() + Duration::from_secs(10),
+            None,
+        )
+        .expect_err("the inline route cannot set up a controller");
+    assert_eq!(
+        error.kind(),
+        ErrorKind::ConnectionAborted,
+        "the caller recognizes the decline: {error}"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "the lane must stay free to reconnect"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.read_controller_resumes - before,
+        1,
+        "the declined inline read is counted as a resume"
+    );
+    let grant = lane
+        .cache
+        .grants
+        .iter()
+        .find(|grant| grant.lease.is_some())
+        .expect("the pooled grant remains for retirement");
+    assert!(
+        grant.broken && grant.lost,
+        "the dead grant is broken and marked lost"
+    );
+    // The lane now reconnects and serves the member.
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the lane reconnects the lost controller"),
+        &vec![frame],
+        "the lane returns the identical member bytes"
+    );
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}
+
+/// A read submission that fails with `EIO` on a verifiably lost controller is
+/// classified before `TcpError::component` flattens the errno: the lane marks
+/// the grant lost, evicts it and requeues within its one-reconnect budget.
+#[test]
+fn a_lost_controller_read_submission_requeues_the_read() {
+    let mut lane = subsystem_lane();
+    lane.cache.grants.clear();
+    let (pool, info) = cached_permanent_pool(&lane);
+    lane.client.live_exports = Some((1, info, 2));
+    lane.client.live_pool = Some(pool.clone());
+    let a = lane.a;
+    let frame = member_frame(&lane.first, &a);
+    lane.submit(vec![a]);
+    assert!(
+        lane.collect(1)[0].result.is_ok(),
+        "the first read caches the grant"
+    );
+    let index = lane
+        .cache
+        .find_grant(&a)
+        .expect("the first read cached its grant");
+    let nqn = lane.cache.grants[index]
+        .lease
+        .as_ref()
+        .expect("the pooled grant holds its lease")
+        .binding()
+        .nqn
+        .clone();
+    let cached = pool
+        .cached_lease(&nqn)
+        .expect("the read cached its controller");
+    cached.force_controller_lost(true);
+    lane.cache.grants[index].controller_lost = Some(true);
+    lane.cache.grants[index]
+        .io
+        .override_read_submit_result(libc::EIO);
+    let before = lane.metrics.snapshot().counts.read_controller_resumes;
+    lane.submit(vec![a]);
+    let done = lane.collect(1);
+    assert_eq!(
+        done[0]
+            .result
+            .as_ref()
+            .expect("the submit-time loss is requeued and reconnected"),
+        &vec![frame],
+        "the retry returns the identical member bytes"
+    );
+    assert!(
+        lane.cache.failed_subsystems.is_empty(),
+        "a submit-time controller loss must not quarantine the subsystem"
+    );
+    assert_eq!(
+        lane.metrics.snapshot().counts.read_controller_resumes - before,
+        1,
+        "one resumed read is counted once"
+    );
+    let reopened = pool
+        .cached_lease(&nqn)
+        .expect("the retry connected a new controller");
+    assert!(
+        !Arc::ptr_eq(&cached, &reopened),
+        "the retry evicted the dead controller before it reopened"
+    );
+    drop(cached);
+    drop(reopened);
+    lane.cache.close(&mut lane.client, 1).unwrap();
+    lane.client.live_pool = None;
+    pool.shutdown(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+}

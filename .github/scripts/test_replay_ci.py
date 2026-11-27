@@ -24,8 +24,27 @@ def write_cleanup_state(state, proof, prewrite=None, before=None):
         kernel.dump(state / name / "proof.json", value)
 
 
-def write_tier_proofs(output, *, resumed_inode=2):
+def read_loss(read_resumed_inode=12, resumes=1):
+    """The read phase of one tier's controller-loss evidence."""
+    return {
+        "kind": "read_controller_loss",
+        "role": "read",
+        "deleted": {"controller": "nvme3", "sysfs_inode": 11},
+        "resumed": {
+            "controller_instance": 4,
+            "sysfs_inode": read_resumed_inode,
+            "read_controller_resumes": resumes,
+        },
+        "reads": 256,
+        "pages": 8,
+        "digest": "00",
+    }
+
+
+def write_tier_proofs(output, *, resumed_inode=2, read=None):
     """Write one qualification receipt per tier, as the worker does."""
+    if read is None:
+        read = read_loss()
     for tier in ("native", "synchronous"):
         native = output / f"kernel-live-test-{tier}" / tier / "native"
         native.mkdir(parents=True)
@@ -33,6 +52,7 @@ def write_tier_proofs(output, *, resumed_inode=2):
             "controller_loss": {
                 "deleted": {"controller": "nvme1", "sysfs_inode": 1},
                 "resumed": {"controller_instance": 2, "sysfs_inode": resumed_inode},
+                "read": read,
             },
             "checks": {"w1_controller_loss": True},
         })
@@ -51,7 +71,9 @@ class InjectedSupervisor:
         pass
 
     def join(self, timeout=None):
-        self.records = [{"injected": True}, {"injected": True}]
+        # Each tier asks for its write controller and its read controller.
+        self.records = [{"injected": True, "role": role}
+                        for _tier in range(2) for role in ("write", "read")]
 
     error = None
 
@@ -169,7 +191,7 @@ class ReplayCITests(unittest.TestCase):
                 self.assertEqual(list(summary), expected)
                 self.assertEqual(summary["wal_replay"]["inventory_restored"], restored)
                 self.assertEqual(summary["wal_replay"]["controller_loss"],
-                                 {"injections": 2, "tiers": 2})
+                                 {"injections": 4, "tiers": 2})
 
     def test_a_controller_loss_without_a_proven_resume_gates_the_qualification(self):
         import argparse
@@ -225,10 +247,10 @@ class ReplayCITests(unittest.TestCase):
             fd.mkdir(parents=True)
             (fd / "3").symlink_to(namespace)
 
-            def request(name, *, inode=live_inode, pid=4242):
+            def request(name, *, inode=live_inode, pid=4242, role="write"):
                 path = root / name
                 path.write_text(json.dumps({
-                    "kind": "w1_controller_loss_request", "pid": pid,
+                    "kind": "w1_controller_loss_request", "pid": pid, "role": role,
                     "target": {"controller": "nvme7", "sysfs_inode": inode,
                                "nqn": "nqn.2026-01.test:owner",
                                "namespace_path": str(namespace), "state": "live"}}))
@@ -243,7 +265,8 @@ class ReplayCITests(unittest.TestCase):
             # before any delete is issued.
             for name, values, message in (
                     ("stale.json", dict(inode=live_inode + 1), "inode differs"),
-                    ("no-descriptor.json", dict(pid=4243), "no descriptor")):
+                    ("no-descriptor.json", dict(pid=4243), "no descriptor"),
+                    ("bad-role.json", dict(role="sideways"), "unexpected controller-loss role")):
                 with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
                     kernel.inject_controller_loss(request(name, **values), **roots)
             self.assertEqual(deleted, [])
@@ -255,6 +278,22 @@ class ReplayCITests(unittest.TestCase):
             self.assertTrue(kept.is_dir(), "an unrelated controller is never touched")
             evidence = json.loads((root / "controller-loss-injection.json").read_text())
             self.assertEqual(evidence, record)
+            self.assertEqual(record["role"], "write")
+            # The read route asks for its own controller, and its evidence never
+            # overwrites the write route's.
+            controller.mkdir()
+            (controller / "state").write_text("live\n")
+            live_inode = controller.stat().st_ino
+            read_request = request("read-controller-loss-ready.json",
+                                   inode=live_inode, role="read")
+            read_record = kernel.inject_controller_loss(read_request, **roots)
+            self.assertTrue(read_record["injected"])
+            self.assertEqual(read_record["role"], "read")
+            self.assertEqual(
+                json.loads((root / "controller-loss-injection.json").read_text()), record)
+            self.assertEqual(
+                json.loads((root / "read-controller-loss-injection.json").read_text()),
+                read_record)
 
 
     def test_prewrite_pass_gates_the_run(self):
@@ -564,6 +603,101 @@ class ReplayCITests(unittest.TestCase):
                 self.assertEqual(prewrite["defect"], "proof proof complete is not true")
                 self.assertFalse(json.loads((state / "result.json").read_text())["passed"])
 
+
+    def test_a_read_controller_loss_without_a_proven_resume_gates_the_qualification(self):
+        import argparse
+        import local_dry_run_targets
+        for read in (read_loss(read_resumed_inode=11), read_loss(resumes=0),
+                     {"kind": "read_controller_loss", "role": "read"}):
+            with self.subTest(read=read), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                args = argparse.Namespace(state=state, binary=state / "binary")
+
+                def worker(output, *_args, **_kwargs):
+                    write_tier_proofs(output, read=read)
+                    return ({"complete": True, "fixture_removed": True}, output / "evidence")
+
+                with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                        patch.object(kernel, "ControllerLossSupervisor", InjectedSupervisor), \
+                        patch.object(kernel.signal, "signal"), \
+                        patch.object(kernel, "inventory", return_value={}):
+                    with self.assertRaisesRegex(RuntimeError,
+                                                "read controller-loss resume unproven"):
+                        kernel.qualify(args)
+
+    def test_a_controller_loss_must_answer_both_roles(self):
+        import argparse
+        import local_dry_run_targets
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            args = argparse.Namespace(state=state, binary=state / "binary")
+
+            def worker(output, *_args, **_kwargs):
+                write_tier_proofs(output)
+                return ({"complete": True, "fixture_removed": True}, output / "evidence")
+
+            class WriteOnlySupervisor(InjectedSupervisor):
+                def join(self, timeout=None):
+                    self.records = [{"injected": True, "role": "write"} for _ in range(4)]
+
+            with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                    patch.object(kernel, "ControllerLossSupervisor", WriteOnlySupervisor), \
+                    patch.object(kernel.signal, "signal"), \
+                    patch.object(kernel, "inventory", return_value={}):
+                with self.assertRaisesRegex(RuntimeError, "both the write and read routes"):
+                    kernel.qualify(args)
+
+    def test_a_poisoned_authority_verdict_gates_the_qualification(self):
+        import argparse
+        import local_dry_run_targets
+        for poisoned in ("read authority is poisoned", "write core requires recovery"):
+            with self.subTest(poisoned=poisoned), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                args = argparse.Namespace(state=state, binary=state / "binary")
+
+                def worker(output, *_args, **_kwargs):
+                    write_tier_proofs(output)
+                    (output / "kernel-live-test-native" / "progress.json").write_text(
+                        json.dumps({"detail": poisoned}))
+                    return ({"complete": True, "fixture_removed": True}, output / "evidence")
+
+                with patch.object(local_dry_run_targets, "_kernel_live_worker", side_effect=worker), \
+                        patch.object(kernel, "ControllerLossSupervisor", InjectedSupervisor), \
+                        patch.object(kernel.signal, "signal"), \
+                        patch.object(kernel, "inventory", return_value={}):
+                    with self.assertRaisesRegex(RuntimeError, "recorded in"):
+                        kernel.qualify(args)
+
+    def test_controller_loss_supervisor_answers_write_and_read_requests(self):
+        import time
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tier" / "native").mkdir(parents=True)
+            write = root / "tier" / "native" / "controller-loss-ready.json"
+            read = root / "tier" / "native" / "read-controller-loss-ready.json"
+            write.write_text(json.dumps({"role": "write"}))
+            read.write_text(json.dumps({"role": "read"}))
+            seen = []
+
+            def fake_inject(path):
+                role = json.loads(Path(path).read_text())["role"]
+                seen.append(role)
+                return {"injected": True, "role": role}
+
+            supervisor = kernel.ControllerLossSupervisor(root, time.monotonic() + 5, poll=0.01)
+            with patch.object(kernel, "inject_controller_loss", side_effect=fake_inject):
+                supervisor.start()
+                try:
+                    deadline = time.monotonic() + 5
+                    while len(seen) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                finally:
+                    supervisor.stop()
+                    supervisor.join(timeout=5)
+            self.assertIsNone(supervisor.error)
+            self.assertEqual(seen, ["write", "read"])
+            self.assertEqual([record["role"] for record in supervisor.records],
+                             ["write", "read"])
 
 class NvmetTraceTests(unittest.TestCase):
     def test_counts_double_completion_and_repeated_enqueue(self):

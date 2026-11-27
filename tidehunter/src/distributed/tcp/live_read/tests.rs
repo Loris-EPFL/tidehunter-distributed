@@ -78,6 +78,76 @@ pub(crate) fn configure_local_client(client: &mut Client) {
     });
 }
 
+/// The owner's live lease of the member `position` names. No descriptor or
+/// read plan exists for a bare position, so the lease names the frame itself.
+fn owner_member_lease(
+    node: &super::super::StorageNode,
+    position: VersionPosition,
+) -> crate::distributed::nvmeof::live_storage::LiveRecordLease {
+    let member = position.address;
+    let inventory = node.inventory.lock();
+    inventory
+        .active(member.segment_generation)
+        .unwrap()
+        .resolve_live_member(member)
+        .unwrap()
+}
+
+/// The owner WAL file path that holds `position`'s member bytes.
+pub(crate) fn owner_local_path(
+    node: &super::super::StorageNode,
+    position: VersionPosition,
+) -> std::path::PathBuf {
+    owner_member_lease(node, position).segment.path.clone()
+}
+
+/// Register the fixture namespace of the permanent per-owner export that
+/// serves `position`, so the lane's `open_permanent` connects the owner's WAL
+/// file instead of a kernel controller. Recovery registers the same target for
+/// the pages it reads.
+pub(crate) fn register_permanent_local(
+    client: &Client,
+    position: &VersionPosition,
+    path: &std::path::Path,
+) {
+    let config = client
+        .live_config
+        .as_ref()
+        .expect("the lane client is configured");
+    let pool = client
+        .live_pool
+        .as_ref()
+        .expect("the lane client has a controller pool");
+    let (epoch, info, _) = client
+        .live_exports
+        .as_ref()
+        .expect("the lane opened its live exports");
+    let name = wal_export_name(
+        FILES_PER_SUBSYSTEM,
+        client.expected.inventory.database,
+        client.expected.partition,
+        *epoch,
+        position.address.offset / client.expected.wal_file_bytes,
+    );
+    let target = LiveConnectTarget {
+        nqn: name.nqn,
+        uuid: name.uuid,
+        nsid: name.nsid,
+        bytes: client.expected.wal_file_bytes,
+        block_size: info.block_size,
+        address: info.address.clone(),
+        service: info.service,
+        transport: info.transport,
+        geometry: config.queue_geometry,
+    };
+    pool.register_local_target(
+        &target,
+        crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess::ReadShared,
+        path.to_owned(),
+    )
+    .unwrap();
+}
+
 /// Pin the owner's real WAL inode and open it as a local namespace. Only
 /// target/controller setup is replaced; validation and pin release are real.
 pub(crate) fn install_owner_local(
@@ -89,12 +159,7 @@ pub(crate) fn install_owner_local(
     // The position names the member frame itself: no descriptor to derive it from.
     let member = position.address;
     let generation = member.segment_generation;
-    let mut inventory = node.inventory.lock();
-    let lease = inventory
-        .active(generation)
-        .unwrap()
-        .resolve_live_member(member)
-        .unwrap();
+    let lease = owner_member_lease(node, position);
     let segment = lease.segment.clone();
     let path = segment.path.clone();
     let location = LiveRecordLocation {
@@ -116,6 +181,7 @@ pub(crate) fn install_owner_local(
         segment,
     };
     let token = [42; 16];
+    let mut inventory = node.inventory.lock();
     assert!(
         inventory
             .live_pins

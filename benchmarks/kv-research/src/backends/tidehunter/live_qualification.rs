@@ -1197,6 +1197,191 @@ fn current_write_route(sample: &serde_json::Value) -> BackendResult<serde_json::
         .ok_or_else(|| "controller loss requires an active write route".into())
 }
 
+/// Keys the read-loss phase writes before the loss and reads after it, and the
+/// members of one `multi_get` page. The keys are never read before the loss, so
+/// every post-loss read is the first one and cannot be answered by the
+/// coordinator's value cache.
+const READ_LOSS_KEYS: u64 = 256;
+const READ_LOSS_PAGE: usize = 32;
+
+/// Per-key digest of a warm value, as evidence that the post-loss reads
+/// returned the identical bytes.
+fn read_digest(value: &[u8]) -> String {
+    use blake2::{Blake2b512, Digest};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Blake2b512::new();
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0xf)]));
+    }
+    text
+}
+
+/// The read route the engine opened last, from one evidence snapshot.
+///
+/// A read grant records no writer, so the newest such route names the
+/// controller the read path used last. `verify_routes` and this selection
+/// refuse a snapshot whose route evidence was dropped, so "last" is exact.
+fn current_read_route(sample: &serde_json::Value) -> BackendResult<serde_json::Value> {
+    check(
+        count(sample, "route_evidence_dropped")? == 0,
+        "the live namespace route evidence was dropped",
+    )?;
+    sample["routes"]
+        .as_array()
+        .ok_or("live namespace routes unavailable")?
+        .iter()
+        .filter(|route| route["writer"].is_null())
+        .next_back()
+        .cloned()
+        .ok_or_else(|| "controller loss requires an active read route".into())
+}
+
+/// Delete the controller that serves the read route and require the read path
+/// to resume on a new one.
+///
+/// The warm set is written before the loss and its values are known, so the
+/// post-loss reads are the first reads of those keys. Every value must match,
+/// the engine must count a read controller resume, no data-plane error may
+/// appear, the read route must come back on the same NQN with a different
+/// sysfs inode, and a following put and get must still work.
+fn qualify_read_controller_loss(
+    input: &Input,
+    db: &std::sync::Arc<sui::Db>,
+    ks: tidehunter::key_shape::KeySpace,
+    output: &Path,
+    progress: &mut QualificationProgress,
+) -> BackendResult<serde_json::Value> {
+    let mut keys = Vec::with_capacity(usize::try_from(READ_LOSS_KEYS).unwrap_or(0));
+    let mut values = Vec::with_capacity(keys.capacity());
+    let mut digests = Vec::with_capacity(keys.capacity());
+    for id in 0..READ_LOSS_KEYS {
+        let key = key_bytes(&input.namespace, 47, id);
+        let value = value_bytes(&input.namespace, 53, id, 1024, 1.0);
+        db.insert(ks, key.clone(), value.clone())
+            .map_err(native_error)?;
+        digests.push(read_digest(&value));
+        keys.push(key);
+        values.push(value);
+    }
+    // One read of a sentinel creates the read route the supervisor deletes.
+    let sentinel = key_bytes(&input.namespace, 59, 1);
+    let sentinel_value = value_bytes(&input.namespace, 61, 1, 1024, 1.0);
+    db.insert(ks, sentinel.clone(), sentinel_value.clone())
+        .map_err(native_error)?;
+    read_expected(db, ks, &sentinel, Some(&sentinel_value))?;
+    let before = stats(db)?;
+    let route = current_read_route(&before)?;
+    let controller = ActiveWriteController::from_route(&route)?;
+    check(
+        controller.state().as_deref() == Some("live"),
+        "the read controller is not live before the loss",
+    )?;
+    check(
+        controller.sysfs_matches(),
+        "the read controller inode differs from the route evidence",
+    )?;
+    check(
+        controller.namespace_descriptors > 0,
+        "the coordinator holds no descriptor on the read namespace",
+    )?;
+    let request = serde_json::json!({
+        "schema": 1, "kind": "w1_controller_loss_request",
+        "phase": "controller_loss", "role": "read",
+        "pid": std::process::id(),
+        "host_nqn": route["host_nqn"],
+        "address": route["address"],
+        "service": route["service"],
+        "target": controller.evidence(),
+    });
+    let request_path = output.join("read-controller-loss-ready.json");
+    fs::write(&request_path, serde_json::to_vec_pretty(&request)?)?;
+    fs::File::open(output)?.sync_all()?;
+    progress.mark("read_controller_loss_requested", Some(db));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = controller.state();
+        if !controller.sysfs_matches() || state.as_deref().is_some_and(|state| state != "live") {
+            break;
+        }
+        check(
+            Instant::now() < deadline,
+            "the read controller was not deleted before the deadline",
+        )?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    progress.mark("read_controller_loss_observed", Some(db));
+    // The warm set, read for the first time inside one local deadline.
+    for (key, value) in keys.iter().zip(&values) {
+        read_expected(db, ks, key, Some(value))?;
+    }
+    let mut pages = 0u64;
+    for (index, page) in keys.chunks(READ_LOSS_PAGE).enumerate() {
+        let observed = db.multi_get(ks, page);
+        check(
+            observed.len() == page.len(),
+            "read-loss multi_get length mismatch",
+        )?;
+        let expected = &values[index * READ_LOSS_PAGE..index * READ_LOSS_PAGE + page.len()];
+        for (actual, expected) in observed.into_iter().zip(expected) {
+            check(
+                actual.map_err(native_error)?.as_ref() == Some(expected),
+                "read-loss multi_get value mismatch",
+            )?;
+        }
+        pages += 1;
+    }
+    let after = stats(db)?;
+    check(
+        delta(&before, &after, "read_controller_resumes")? >= 1,
+        "the read loss did not resume a read controller",
+    )?;
+    check(
+        delta(&before, &after, "errors")? == 0,
+        "the read-loss resume recorded a data-plane error",
+    )?;
+    let identities = controller_identities(&after)?;
+    let (instance, inode) = identities
+        .get(&controller.nqn)
+        .copied()
+        .ok_or("the resumed read path recorded no controller for the lost NQN")?;
+    check(
+        inode != controller.sysfs_inode,
+        "the resumed read path reused the deleted controller's sysfs inode",
+    )?;
+    let resumed = current_read_route(&after)?;
+    check(
+        resumed["namespace_identity"]["nqn"].as_str() == Some(controller.nqn.as_str()),
+        "the resumed read route names another NQN",
+    )?;
+    verify_routes(&after, &input.expected_route)?;
+    // The authority must still acknowledge a write after the healed read.
+    let after_key = key_bytes(&input.namespace, 67, 1);
+    let after_value = value_bytes(&input.namespace, 71, 1, 4096, 1.0);
+    db.insert(ks, after_key.clone(), after_value.clone())
+        .map_err(native_error)?;
+    read_expected(db, ks, &after_key, Some(&after_value))?;
+    Ok(serde_json::json!({
+        "kind": "read_controller_loss",
+        "role": "read",
+        "deleted": controller.evidence(),
+        "resumed": {
+            "controller_instance": instance,
+            "sysfs_inode": inode,
+            "read_controller_resumes": delta(&before, &after, "read_controller_resumes")?,
+            "namespace_connects": delta(&before, &after, "namespace_connects")?,
+            "resume_attempts": delta(&before, &after, "resume_attempts")?,
+        },
+        "reads": keys.len(),
+        "pages": pages,
+        "digest": read_digest(digests.join("\n").as_bytes()),
+        "after": after,
+    }))
+}
+
 /// Delete the active write controller from outside and require a W1 resume.
 ///
 /// The request file names the controller, its sysfs inode, its namespace and
@@ -1230,7 +1415,7 @@ fn qualify_controller_loss(
     )?;
     let request = serde_json::json!({
         "schema": 1, "kind": "w1_controller_loss_request",
-        "phase": "controller_loss",
+        "phase": "controller_loss", "role": "write",
         "pid": std::process::id(),
         "host_nqn": route["host_nqn"],
         "address": route["address"],
@@ -1284,6 +1469,9 @@ fn qualify_controller_loss(
         "the resumed write path reused the deleted controller's sysfs inode",
     )?;
     verify_routes(&after, &input.expected_route)?;
+    // The read path has its own controller loss: a short read of a deleted
+    // controller must resume, not poison the authority the writer needs.
+    let read = qualify_read_controller_loss(input, db, ks, output, progress)?;
     Ok(serde_json::json!({
         "kind": "w1_controller_loss",
         "deleted": controller.evidence(),
@@ -1295,6 +1483,7 @@ fn qualify_controller_loss(
             "resume_frames": delta(clean, &after, "resume_frames")?,
             "namespace_connects": delta(clean, &after, "namespace_connects")?,
         },
+        "read": read,
         "after": after,
     }))
 }

@@ -122,6 +122,23 @@ pub(crate) fn controller_lost(error: &io::Error) -> bool {
         }
     }
 }
+
+/// Whether a failed live read or recovery page may be re-issued on a new
+/// controller.
+///
+/// The failure class alone is never enough. A short read or an `EIO`/`EBADF`
+/// on a live controller is a media or namespace verdict, and a retry would
+/// hide it; a retry needs the error-path probe's verdict that the pinned
+/// controller is gone. `UnexpectedEof` is the short namespace read a vanished
+/// controller produces, `EIO`/`EBADF` are the errnos the kernel reports for it
+/// (`NVME_SC_HOST_ABORTED_CMD` and `GD_DEAD` both map to `BLK_STS_IOERR`), and
+/// the typed [`VerifyError::ControllerLost`] names the same loss without an
+/// errno. Owner verdicts (`InvalidData` and every other class) never retry.
+pub(crate) fn retryable_lost_read(error: &io::Error, lost: bool) -> bool {
+    lost && (controller_lost(error)
+        || matches!(error.raw_os_error(), Some(libc::EIO | libc::EBADF))
+        || error.kind() == io::ErrorKind::UnexpectedEof)
+}
 fn verify_transport(sysfs: &Path, nqn: &str, transport: NvmeofTransport) -> io::Result<()> {
     verify_transport_at(
         sysfs,

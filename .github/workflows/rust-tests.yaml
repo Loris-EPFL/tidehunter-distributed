@@ -223,18 +223,25 @@ jobs:
       - name: Build shared kernel TCP proof binary
         timeout-minutes: 10
         run: cargo +1.90 build --locked --offline -p kv-research --bin kv-research
-      - name: Gate single-owner abrupt-crash recovery in both durability tiers
+      - name: Gate single-owner recovery and write+read controller-loss resume in both durability tiers
         # CI uses 8 MiB WAL members with 4 MiB fragments, crossing both boundaries.
-        # Cloud qualification keeps its 1 GiB members.
+        # Cloud qualification keeps its 1 GiB members. Each tier loses its write
+        # controller and then its read controller; the read cells must resume on
+        # a new controller and must never poison the authority the writer shares.
         timeout-minutes: 7
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/kernel-nvme-tcp"
+          log="$RUNNER_TEMP/kernel-nvme-tcp/single-owner.log"
           df -B1 /var/lib /mnt "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/kernel-nvme-tcp/disk-before.txt"
           timeout --signal=TERM --kill-after=25s 390s \
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py qualify \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \
-            2>&1 | tee "$RUNNER_TEMP/kernel-nvme-tcp/single-owner.log"
+            2>&1 | tee "$log"
+          if grep -E "read authority is poisoned|write core requires recovery" "$log"; then
+            echo "a controller-loss cell poisoned the authority" >&2
+            exit 1
+          fi
       - name: Run kernel TCP four-owner admission and second-open proof
         id: four_owner
         timeout-minutes: 13
