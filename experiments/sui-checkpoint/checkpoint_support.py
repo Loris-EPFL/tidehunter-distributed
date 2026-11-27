@@ -74,8 +74,10 @@ def rpc_committer_attempts(metrics):
     """Batches each committer attempted in this process; absent means none were attempted.
 
     The committer counts an attempt before it writes, and it is the only writer
-    of a pipeline's watermark, so a pipeline absent from this family
-    re-executed and re-committed nothing at all.
+    of a pipeline's watermark, so a zero total is this process committing
+    nothing at all. This counter is the observable for "did the reopened node
+    commit", because the frontier family's presence carries no such meaning (see
+    `reopened_index_state`).
     """
     return pipeline_series(metrics, "rpc_store_indexer_total_committer_batches_attempted")
 
@@ -137,27 +139,42 @@ def reopened_index_state(metrics, log, checkpoint):
     """How a reopened node's ten indexers stand against the frozen tip.
 
     A clean reopen resumes every pipeline from its persisted watermark, so the
-    framework schedules from `checkpoint + 1` and ingests nothing. The committer
-    publishes `rpc_store_indexer_watermark_checkpoint_in_db` only when a batch
-    lands, so that family is absent after a resume; a node that re-executed the
-    checkpoints instead publishes all ten at the tip. Returns None while the
-    node has not yet stated its resume frontier.
+    framework schedules from `checkpoint + 1` and ingests nothing. Whether this
+    process committed is read from `rpc_store_indexer_total_committer_batches_attempted`:
+    the committer increments it before every batch write and it is the only
+    writer of a pipeline's committed watermark.
+
+    The committed-frontier gauge cannot stand in for the counter. Each committer
+    binds one `rpc_store_indexer_watermark_checkpoint_in_db{pipeline=...}` child
+    at construction, through `CheckpointLagMetricReporter::new_for_pipeline`
+    (`pipeline/{concurrent/commit_watermark,sequential/committer}.rs`), and
+    Prometheus publishes every bound child at its zero value. A reopened node
+    therefore publishes the whole family at 0 without committing anything; only
+    a non-zero value is a commit this process made. Returns None while the node
+    has not yet stated its resume frontier.
     """
     frontiers = rpc_index_frontiers(metrics, checkpoint)
     attempts = rpc_committer_attempts(metrics)
-    if frontiers:
+    if sum(attempts.values()):
         missing = sorted(RPC_INDEX_PIPELINES - set(frontiers))
-        behind = sorted(name for name, value in frontiers.items() if value != checkpoint)
+        behind = sorted(f"{name}@{value}" for name, value in frontiers.items()
+                        if value != checkpoint)
         if missing or behind:
-            raise RuntimeError("the reopened node committed only part of the RPC pipelines: "
-                               + ", ".join(missing + behind))
+            raise RuntimeError(
+                f"the reopened node attempted batches without committing all ten "
+                f"pipelines at the frozen tip {checkpoint}: "
+                + ", ".join(missing + behind))
         return {"status": "all-ten-committed-at-frozen-tip", "checkpoint": checkpoint,
                 "frontiers": frontiers, "committer_batches": attempts,
                 "scope": "the reopened node re-executed checkpoints"}
-    if any(attempts.values()):
-        raise RuntimeError("the reopened node attempted indexer commits without publishing "
-                           "a committed frontier: "
-                           + ", ".join(sorted(name for name, value in attempts.items() if value)))
+    # This process attempted no batch, so any bound child still reads zero. A
+    # non-zero frontier under a zero attempt total is a watermark this process
+    # cannot have written; treat it as an inconsistency rather than a commit.
+    published = {name: value for name, value in frontiers.items() if value}
+    if published:
+        raise RuntimeError(
+            "the reopened node published a committed frontier without attempting a batch: "
+            + ", ".join(sorted(f"{name}@{value}" for name, value in published.items())))
     resume = rpc_index_resume(log, checkpoint)
     if resume is None:
         return None
@@ -171,17 +188,19 @@ def reopened_index_state(metrics, log, checkpoint):
         raise RuntimeError("the reopened rpc-store restored to checkpoint "
                            f"{bootstrap['highest_committed']}, not the frozen tip {checkpoint}")
     return {"status": "persisted-watermark-at-frozen-tip", "checkpoint": checkpoint,
-            "frontiers": {}, "committer_batches": {}, "resume": resume, "bootstrap": bootstrap,
+            "frontiers": frontiers, "committer_batches": attempts, "resume": resume,
+            "bootstrap": bootstrap,
             "scope": "the persisted watermark each pipeline resumes from; the committer "
-                     "published nothing because the frozen tip schedules no checkpoint"}
+                     "attempted no batch and left every bound frontier child at zero"}
 
 
 def wait_for_reopened_indexes(child, address, log, checkpoint, metrics):
     """Wait until the reopened node states where its indexers resume.
 
     Unlike the replay wait, a clean reopen commits nothing: the committed-frontier
-    gauge only appears when a batch lands, so the observable is the framework's
-    resume frontier read back from the persisted watermarks.
+    gauge is bound at zero by each committer and the attempt counter stays at
+    zero, so the observable is the framework's resume frontier read back from
+    the persisted watermarks.
     """
     start = time.monotonic()
     observations = []
