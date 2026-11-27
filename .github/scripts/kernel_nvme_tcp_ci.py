@@ -312,15 +312,19 @@ def copy_receipts(nodes, specs, root, namespace):
 def layout_spec(specs, document, root, index, *, reopen):
     """One kv-research run over one prepared database of the deployment."""
     case = dict(case_id=f"owner-layout-{index}" + ("-reopen" if reopen else ""),
-                arm="A", mix="read" if reopen else "mixed", size=256,
+                arm="A", mix="write" if reopen else "mixed", size=256,
                 distribution="uniform", tier="native", concurrency=2,
                 batch=None, cache=0, reference=False)
+    # One complete write batch after the restart, so both owners of the
+    # database publish their namespace.
     spec = specs.run_config(case, Path(root), external={"native": {"document": document}},
-                            measurement_operations=8)
+                            measurement_operations=26 if reopen else 8)
     spec["dataset"]["keys"] = 256
     if reopen:
         # The maintained second-open proof reuses the coordinator path: the
-        # reopened coordinator recovers the authority the owners hold.
+        # reopened coordinator recovers the authority the owners hold. Its live
+        # writes publish the namespace again after the owner restart, because
+        # setup creates only ports and hosts.
         spec["namespace"] = f"stage3-owner-layout-{index}"
         spec["backend"]["options"]["path"] = str(
             Path(root) / "stage3" / "db" / f"owner-layout-{index}" / "coordinator")
@@ -429,16 +433,16 @@ def layout_positive(deployment, specs, binary, root):
             log = root / (owner_name(node).replace("/", "-") + ".log")
             processes[owner_name(node)] = start_owner(binary, node, log)
         wait_owners(nodes, processes)
+        # Provision every database: export on its own port, then seal.
         for index, name in enumerate(LAYOUT_NAMESPACES):
             copy_receipts(nodes, specs, root, name)
-            for reopen in (False, True):
-                label = f"owner-layout-{index}" + ("-reopen" if reopen else "")
-                completed, _path, _output = run_coordinator(
-                    binary, layout_spec(specs, config["databases"][name], root, index,
-                                        reopen=reopen), root, label)
-                error = coordinator_error(completed, label)
-                if error is not None:
-                    raise RuntimeError(error)
+            label = f"owner-layout-{index}"
+            completed, _path, _output = run_coordinator(
+                binary, layout_spec(specs, config["databases"][name], root, index,
+                                    reopen=False), root, label)
+            error = coordinator_error(completed, label)
+            if error is not None:
+                raise RuntimeError(error)
         # A kill leaves every scoped object behind. Only a layout that gives
         # each database its own port lets all six reopens reconcile it.
         for node in nodes:
@@ -452,6 +456,18 @@ def layout_positive(deployment, specs, binary, root):
             log = root / (owner_name(node).replace("/", "-") + ".log")
             processes[owner_name(node)] = start_owner(binary, node, log)
         wait_owners(nodes, processes)
+        # Startup reconcile removes the scoped objects and setup creates only
+        # ports and hosts. The second coordinator's live writes publish each
+        # namespace again on its own port; only then are the links inspected.
+        for index, name in enumerate(LAYOUT_NAMESPACES):
+            copy_receipts(nodes, specs, root, name)
+            label = f"owner-layout-{index}-reopen"
+            completed, _path, _output = run_coordinator(
+                binary, layout_spec(specs, config["databases"][name], root, index,
+                                    reopen=True), root, label)
+            error = coordinator_error(completed, label)
+            if error is not None:
+                raise RuntimeError(error)
         scopes = database_scope(nodes)
         defect = layout_defect(nodes, scopes)
         if defect is not None:

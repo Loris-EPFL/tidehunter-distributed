@@ -252,10 +252,13 @@ jobs:
         run: |
           set -euo pipefail
           # Six generated owner processes on one address: three databases at
-          # their own slot of each partition's 64-port window, then an export,
-          # a seal, a reopen and a kill/restart reconcile per database. The
-          # negative pass gives two databases one pool base and requires the
-          # second to refuse with "refusing to share configfs object".
+          # their own slot of each partition's 64-port window. Each database
+          # exports and seals; all six are killed and restarted so startup
+          # reconcile must remove only its own objects; a second coordinator
+          # then writes live so the namespaces are published again before the
+          # per-port scope check. The negative pass gives two databases one
+          # pool base and requires the second to refuse with
+          # "refusing to share configfs object".
           timeout --signal=TERM --kill-after=60s 420s \
             sudo -n /usr/bin/python3 -B .github/scripts/kernel_nvme_tcp_ci.py layout \
               --state "$KERNEL_TCP_STATE" --binary target/debug/kv-research \

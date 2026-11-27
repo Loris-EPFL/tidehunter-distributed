@@ -110,7 +110,12 @@ class CampaignModules(unittest.TestCase):
                          [str(specs.receipt_path(root, "native", partition))
                           for partition in range(kernel.LAYOUT_OWNERS)])
         self.assertFalse(spec["phases"]["preload"])
-        self.assertEqual(spec["workload"]["mix"]["read"], 100)
+        # The reopen performs live writes, so the restarted owners publish
+        # their namespaces again before the port check.
+        self.assertEqual(spec["workload"]["mix"]["put"], 100)
+        self.assertEqual(spec["phases"]["measurement_operations"], 26)
+        self.assertEqual(spec["backend"]["options"]["path"],
+                         str(root / "stage3" / "db" / "owner-layout-0" / "coordinator"))
 
 
 if __name__ == "__main__":
