@@ -23,6 +23,13 @@ NQN_PREFIX = 'nqn.2026-01.local.tidehunter:'
 CONFIGFS = '/sys/kernel/config/nvmet'
 OWNER_STOP_SECONDS = 90
 OWNER_KILL_SECONDS = 10
+# `pid pidfile` for each pidfile under "$1" whose process is still alive. The
+# test sits in an `if`, so a last pidfile that names a stopped owner does not
+# become the script's exit status: a nonzero status means the check failed.
+PREVIOUS_OWNERS_SCRIPT = ('for f in "$1"/owner-*.pid; do [ -f "$f" ] || continue; '
+                          'read -r pid < "$f"; '
+                          'if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then echo "$pid $f"; fi; '
+                          'done')
 
 CLEANUP_SCRIPT = """\
 # tidehunter-owner-cleanup

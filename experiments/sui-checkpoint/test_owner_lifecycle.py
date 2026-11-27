@@ -93,6 +93,30 @@ class CleanupTree(unittest.TestCase):
         self.assertTrue(record['remains'])
 
 
+class PreviousOwners(unittest.TestCase):
+    """The shared check reports live owners and exits 0 on stopped ones."""
+
+    def test_a_stopped_last_owner_is_not_a_failed_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = subprocess.Popen(['sleep', '60'])
+            try:
+                dead = subprocess.Popen(['true'])
+                dead.wait()
+                (root / 'owner-0-0.pid').write_text(f'{live.pid}\n')
+                # The glob sorts this file last: its stopped owner was the
+                # script's exit status before the test moved into an `if`.
+                (root / 'owner-1-0.pid').write_text(f'{dead.pid}\n')
+                result = subprocess.run(
+                    ['sh', '-c', owner_lifecycle.PREVIOUS_OWNERS_SCRIPT, '--', str(root)],
+                    capture_output=True, text=True, check=False)
+            finally:
+                live.kill()
+                live.wait()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), [str(live.pid), str(root / 'owner-0-0.pid')])
+
+
 class StopOrder(unittest.TestCase):
     class Remote:
         def __init__(self, *, leave_on_marker=False, leave_on_term=False):

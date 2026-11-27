@@ -234,9 +234,7 @@ class Cluster:
         workspace, so it is the first check. A recycled pid is not an owner:
         its command line must name the guest binary or this guest root.
         """
-        script = ('for f in "$1"/owner-*.pid; do [ -f "$f" ] || continue; '
-                  'read -r pid < "$f"; [ -n "$pid" ] && [ -d "/proc/$pid" ] && '
-                  'echo "$pid $f"; done')
+        script = owner_lifecycle.PREVIOUS_OWNERS_SCRIPT
         code, out, err = self.remote.shell(
             host, f'sh -c {quote(script)} -- {quote(self.guest_root)}', check=False)
         if code != 0:
