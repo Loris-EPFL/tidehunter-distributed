@@ -60,6 +60,11 @@ FENCE_CASES = ('contend', 'lapse', 'stale', 'sealed')
 # config admission limit of 300 s and above the slowest owner-ready wait here,
 # so a driver that never releases fails the run with the engine's own error.
 MEASUREMENT_GATE_SECONDS = 240
+# The snapshot cut must outlive the snapshot thread's 60 s first poll and pass
+# the production 8 GiB value-byte root cadence. 3,500,000 x 4,096 B = 14.3 GiB
+# of value bytes; at the measured 41k put/s the run lasts about 85 s, so the
+# first poll stores a control region before the run ends.
+SNAPSHOT_MEASUREMENT = 3_500_000
 # The columns every verdict parser reads: `phase` and `outcome` select rows,
 # `operation` selects a metric, `api_ns` carries the exact sample and
 # `completed_ns`/`bytes` carry the stage-3 call window and payload.

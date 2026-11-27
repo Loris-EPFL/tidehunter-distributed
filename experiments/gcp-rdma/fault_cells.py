@@ -29,6 +29,7 @@ Every cell here is a synthetic mechanism cell over the campaign topology, not a
 Sui-adapter result. `--dry-run` prints the plan without touching a host.
 """
 import argparse
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,7 @@ OWNER_STOP_GRACE_SECONDS = owner_lifecycle.OWNER_STOP_SECONDS
 # travel, and one oversized file must not consume the whole failure budget.
 FAILURE_ARTIFACT_LIMIT = 128 << 20
 FAILURE_ARTIFACT_SKIP = ('host-*.tar.gz',)
+SAMPLE_EXCERPT_ROWS = 200
 FAILURE_SKIP_PARTS = ('coordinator', 'tls', 'storage')
 GATE_WRITES = 200
 FENCE_WRITES = 20
@@ -554,9 +556,11 @@ class Cluster:
         script ends with `exit 0` and the parser keeps only complete lines. A
         transport failure still exits non-zero from the executor.
         """
+        # `find -printf %T@` carries fractional seconds; `stat -c %Y` would
+        # miss a root rewrite inside the same second.
         script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
-                  'find "$d" -maxdepth 1 -name "wal_*" -printf "%p %s %T@\\n" 2>/dev/null; '
-                  'stat -c "%n %s %Y" "$d/partition-wal-root-v1" 2>/dev/null; done')
+                  'find "$d" -maxdepth 1 \\( -name "wal_*" -o -name "partition-wal-root-v1" \\) '
+                  '-printf "%p %s %T@\\n" 2>/dev/null; done; exit 0')
         code, out, err = self.remote.shell(
             host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
@@ -1084,6 +1088,35 @@ class CellDriver:
                                       and (last_success is None
                                            or last_success < first)))
 
+    @staticmethod
+    def _refusal_wall_ns(child, row):
+        """Wall time of a completed sample: process start plus completed_ns."""
+        started = getattr(child, 'started_unix_ns', None)
+        try:
+            completed = int(row.get('completed_ns', ''))
+        except (TypeError, ValueError):
+            return None
+        return None if started is None else started + completed
+
+    def _log_refusal(self, child):
+        """A typed refusal from the coordinator's own final line, if any.
+
+        A sample row carries the backend error the refused call returned; the
+        coordinator's summary line names the first causal failure. The log is
+        the fallback when the row text does not carry the typed class.
+        """
+        log = getattr(child, 'log', None)
+        if log is None:
+            return None
+        try:
+            text = Path(log).read_text(errors='replace')
+        except OSError:
+            return None
+        for line in text.splitlines():
+            if 'causal failure' in line and self.typed(line):
+                return line.strip()
+        return None
+
     def _lapse(self, child, host):
         result = dict(sealed_partitions=0)
         started = now_ns()
@@ -1096,21 +1129,22 @@ class CellDriver:
         result['failure'] = self.stop_on_failure(child, count=1, timeout=180)
         result['a_exit'] = result['failure'].get('exit_code')
         rows_ = child.rows()
-        outcomes = [row.get('outcome') for row in rows_]
-        first_error = next((index for index, value in enumerate(outcomes)
-                            if value == 'error'), None)
-        last_success = max((index for index, value in enumerate(outcomes)
-                            if value == 'success'), default=None)
-        text = rows_[first_error].get('error_kind') if first_error is not None else None
+        refusal = self._refusal(rows_)
+        text, typed = refusal['text'], refusal['typed']
+        if not typed and (logged := self._log_refusal(child)):
+            text, typed = logged, True
+            result['refusal_source'] = 'coordinator log'
+        result['first_refusal_row'] = refusal['first']
+        result['last_success_row'] = refusal['last_success']
         result['refusal_text'] = text
-        result['typed_refusal'] = bool(text) and self.typed(text)
-        if text:
-            result['fence_reject_ms'] = (now_ns() - resumed) / 1e6
-        result['stale_write_refused'] = first_error is not None
-        result['no_success_after_refusal'] = (first_error is not None and
-                                              (last_success is None or
-                                               last_success < first_error))
-        result['writers'] = 1 if result['no_success_after_refusal'] else 2
+        result['typed_refusal'] = typed
+        result['stale_write_refused'] = refusal['refused']
+        result['no_success_after_refusal'] = refusal['no_success_after']
+        wall = (self._refusal_wall_ns(child, rows_[refusal['first']])
+                if refusal['refused'] else None)
+        if wall is not None:
+            result['fence_reject_ms'] = (wall - resumed) / 1e6
+        result['writers'] = 1 if refusal['no_success_after'] else 2
         return result
 
     def _contend(self, child, case):
@@ -1142,6 +1176,10 @@ class CellDriver:
             second.stop()
         first_rows = child.rows()
         refusal = self._refusal(first_rows)
+        text, typed = refusal['text'], refusal['typed']
+        if not typed and (logged := self._log_refusal(child)):
+            text, typed = logged, True
+            result['refusal_source'] = 'coordinator log'
         result['first_refusal_row'] = refusal['first']
         result['last_success_row'] = refusal['last_success']
         result['first_acknowledged'] = acknowledged(first_rows)
@@ -1149,20 +1187,15 @@ class CellDriver:
         result['stale_write_refused'] = refusal['refused']
         result['no_success_after_refusal'] = refusal['no_success_after']
         result['refusal_text'] = text
-        result['typed_refusal'] = bool(text) and self.typed(text)
-        # The stale case's fence latency: from A's resume to the observed first
-        # typed refusal. The coordinator's sample writer flushes once a second,
-        # so this is the observation latency, never a claim of the engine's own
-        # syscall-to-refusal time.
-        failure = result.get('failure') or {}
-        gate = failure.get('gate') or {}
-        if case == 'stale' and gate.get('reached') and gate.get('unix_ns') is not None:
-            result['fence_reject_ms'] = ((gate['unix_ns'] - result['resumed_unix_ns'])
-                                         / 1e6)
-        writers = (1 if result['second_acknowledged'] else 0) + \
-                  (1 if (last_success is not None and first_error is not None and
-                         last_success > first_error) else 0)
-        result['writers'] = writers
+        result['typed_refusal'] = typed
+        # The stale case's fence latency: from A's resume to the completion of
+        # its first refused call, taken from the sample's own completed_ns.
+        if case == 'stale' and refusal['refused']:
+            wall = self._refusal_wall_ns(child, first_rows[refusal['first']])
+            if wall is not None:
+                result['fence_reject_ms'] = ((wall - result['resumed_unix_ns'])
+                                             / 1e6)
+        result['writers'] = 1 if refusal['no_success_after'] else 2
         return result
 
     def _sealed(self, child, host):
@@ -1287,7 +1320,8 @@ def crash_checks(cell, observations):
         found = failure.get('gate') or {}
         checks.append(mechanism._check('coordinator recorded a typed write failure',
                                        found.get('reached') is True,
-                                       found.get('errors')))
+                                       dict(refusals=found.get('refusals'),
+                                            text=found.get('text'))))
     return checks
 
 
@@ -1302,7 +1336,7 @@ def fence_record(driver):
                                fence.get('refusal_text')),
               mechanism._check('no successful write after the first refusal',
                                fence.get('no_success_after_refusal') is True,
-                               dict(first_error_row=fence.get('first_error_row'),
+                               dict(first_refusal_row=fence.get('first_refusal_row'),
                                     last_success_row=fence.get('last_success_row')))]
     if case in ('lapse', 'sealed'):
         checks.append(mechanism._check('write-protect applied on an owner',
@@ -1360,6 +1394,32 @@ def list_cells(stage='all'):
     rows = cell_table(stage)
     print(json.dumps(dict(cells=rows, count=len(rows)), indent=1))
     return 0
+
+
+def sample_excerpt(path, *, limit=SAMPLE_EXCERPT_ROWS):
+    """Bounded rows of an oversized samples.csv: head, refusals and tail.
+
+    A fence run records one non-success row per refused mutation, so its
+    samples.csv passes the failure upload bound. The verdict's evidence is the
+    first refusal and the success rows around it, so an excerpt carries the
+    header, the first successes, the first refusals and the last rows.
+    """
+    path = Path(path)
+    excerpt = path.with_name(path.stem + '.excerpt.csv')
+    head, refusals, tail = [], [], deque(maxlen=limit)
+    with path.open(errors='replace') as stream:
+        header = stream.readline()
+        for line in stream:
+            fields = line.split(',')
+            outcome = fields[2] if len(fields) > 2 else ''
+            if outcome != 'success':
+                if len(refusals) < limit:
+                    refusals.append(line)
+            elif len(head) < limit:
+                head.append(line)
+            tail.append(line)
+    excerpt.write_text(header + ''.join(head) + ''.join(refusals) + ''.join(tail))
+    return excerpt
 
 
 def failure_artifacts(output, config_dir):

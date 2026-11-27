@@ -90,6 +90,19 @@ class SampleParsing(unittest.TestCase):
             self.assertEqual(fault_cells.failures(parsed)[0]['error_kind'],
                              'coordinator lease lapsed')
 
+    def test_a_refused_mutation_is_an_unknown_outcome_not_an_error(self):
+        """The engine records `unknown_mutation` for a refused put; it is not `error`."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'samples.csv.tmp'
+            path.write_text(sample_rows(3) +
+                            sample_rows(2, outcome='unknown_mutation').split('\n', 1)[1])
+            parsed = fault_cells.rows(path)
+            self.assertEqual(fault_cells.acknowledged(parsed), 3)
+            self.assertEqual(fault_cells.failures(parsed), [])
+            self.assertEqual(len(fault_cells.refused(parsed)), 2)
+            self.assertTrue(fault_cells.CellDriver.typed(
+                fault_cells.refused(parsed)[0]['error_kind']))
+
     def test_missing_file_is_empty_not_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(fault_cells.rows(Path(directory) / 'absent.csv'), [])
@@ -107,6 +120,7 @@ class TypedErrors(unittest.TestCase):
                      'coordinator lease held by another incarnation',
                      'stale coordinator lease authority',
                      'sealed by write protect',
+                     'stale or sealed request authority',
                      'Permission denied (os error 13)'):
             with self.subTest(text=text):
                 self.assertTrue(fault_cells.CellDriver.typed(text))
@@ -160,6 +174,61 @@ class Gates(unittest.TestCase):
         self.assertIn('exited before', gate['reason'])
 
 
+class SnapshotGate(unittest.TestCase):
+    def driver(self):
+        return fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+
+    def tree(self, root):
+        run = Path(root) / 'measure' / 'run'
+        run.mkdir(parents=True)
+        (run / 'samples.csv.tmp').write_text(sample_rows(fault_cells.GATE_WRITES))
+        region = Path(root) / 'measure' / 'coordinator' / 'cr'
+        region.parent.mkdir(parents=True)
+        return run, region
+
+    def child(self, run):
+        return types.SimpleNamespace(
+            output=run, alive=lambda: True,
+            rows=lambda: fault_cells.rows(run / 'samples.csv.tmp'))
+
+    def test_the_gate_reaches_on_a_stored_control_region(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            region.write_text('region v1')
+            calls = []
+
+            def sleep(_):
+                calls.append(1)
+                if len(calls) == 1:
+                    region.write_text('region v2 with the stored root')
+            with patch.object(fault_cells.time, 'sleep', sleep):
+                gate = self.driver().gate_snapshot(self.child(run), timeout=1)
+        self.assertTrue(gate['reached'], gate)
+        self.assertIn('cr', gate['observations'][-1]['changed'])
+
+    def test_creating_the_region_at_open_is_not_a_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            calls = []
+
+            def sleep(_):
+                calls.append(1)
+                if len(calls) == 1:
+                    region.write_text('created at open')
+            with patch.object(fault_cells.time, 'sleep', sleep):
+                gate = self.driver().gate_snapshot(self.child(run), timeout=0.3)
+        self.assertFalse(gate['reached'], gate)
+
+    def test_a_dead_coordinator_ends_the_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self.tree(tmp)
+            child = types.SimpleNamespace(output=run, alive=lambda: False,
+                                          rows=lambda: [])
+            gate = self.driver().gate_snapshot(child, timeout=1)
+        self.assertFalse(gate['reached'])
+        self.assertIn('exited before', gate['reason'])
+
+
 class OwnerWAL(unittest.TestCase):
     def cluster(self, views):
         cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
@@ -169,6 +238,27 @@ class OwnerWAL(unittest.TestCase):
         iterator = iter(views)
         cluster.wal = lambda host: next(iterator)
         return cluster
+
+    def test_the_listing_exits_zero_while_a_root_is_mid_rename(self):
+        """The durable root is replaced by rename; a missing root is not a failure."""
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.remote = FakeRemote()
+        cluster.owner_root = lambda host: Path('/guest')
+        self.assertEqual(cluster.wal('h1')['files'], {})
+        command = cluster.remote.calls[-1][1]
+        self.assertIn('done; exit 0', command)
+
+    def test_a_transport_failure_still_reports_its_cause(self):
+        class Failing(FakeRemote):
+            def run(self, host, command, *, stdin=None, check=True):
+                return 1, b'', b'connection reset by peer'
+
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.remote = Failing()
+        cluster.owner_root = lambda host: Path('/guest')
+        with self.assertRaisesRegex(fault_cells.CellError,
+                                    'connection reset by peer'):
+            cluster.wal('h1')
 
     def test_unlink_cut_needs_only_a_disappearance(self):
         before = dict(host='h1', files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
@@ -598,6 +688,23 @@ class FailureUpload(unittest.TestCase):
             self.assertEqual(skipped, [dict(path=str(big),
                                             reason='above the failure upload bound')])
 
+    def test_an_oversized_sample_file_still_ships_a_bounded_excerpt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'out'
+            run = output / 'measure' / 'run'
+            run.mkdir(parents=True)
+            samples = run / 'samples.csv'
+            samples.write_text(sample_rows(4) +
+                               sample_rows(3, outcome='unknown_mutation').split('\n', 1)[1])
+            with patch.object(fault_cells, 'FAILURE_ARTIFACT_LIMIT', 64):
+                rows, skipped = fault_cells.failure_artifacts(output, Path(tmp) / 'cfg')
+            names = {row['name'] for row in rows}
+            self.assertIn('measure/run/samples.excerpt.csv', names)
+            excerpt = (run / 'samples.excerpt.csv').read_text()
+            self.assertIn('unknown_mutation', excerpt)
+            self.assertIn(dict(path=str(samples),
+                               reason='above the failure upload bound'), skipped)
+
     def test_a_failed_attempt_uploads_evidence_and_a_failed_ledger(self):
         from test_gcs_ledger import FakeObjectStore
         with tempfile.TemporaryDirectory() as tmp:
@@ -820,6 +927,7 @@ class StaleFenceMeasurement(unittest.TestCase):
         def __init__(self, output):
             self.output = Path(output)
             self.signals = []
+            self.started_unix_ns = 1_000_000_000
 
         def signal(self, value):
             self.signals.append(value)
@@ -828,10 +936,13 @@ class StaleFenceMeasurement(unittest.TestCase):
             pass
 
         def rows(self):
-            return [dict(phase='measurement', outcome='success', error_kind=''),
-                    dict(phase='measurement', outcome='success', error_kind=''),
-                    dict(phase='measurement', outcome='error',
-                         error_kind='coordinator lease lapsed')]
+            return [dict(phase='measurement', outcome='success', error_kind='',
+                         completed_ns='0'),
+                    dict(phase='measurement', outcome='success', error_kind='',
+                         completed_ns='1'),
+                    dict(phase='measurement', outcome='unknown_mutation',
+                         error_kind='coordinator lease lapsed',
+                         completed_ns='50000000')]
 
     class Second:
         def __init__(self):
@@ -873,6 +984,45 @@ class StaleFenceMeasurement(unittest.TestCase):
             types.SimpleNamespace(cell=driver.cell,
                                   fence=dict(result, case='stale', tier='native')))
         self.assertTrue(record['ok'], record)
+
+    def test_a_refusal_is_the_first_non_success_measurement_row(self):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        rows_ = [dict(phase='preload', outcome='success', error_kind=''),
+                 dict(phase='measurement', outcome='success', error_kind=''),
+                 dict(phase='measurement', outcome='unknown_mutation',
+                      error_kind='backend_transport_failure; mutation outcome '
+                                 'unknown: coordinator lease lapsed'),
+                 dict(phase='measurement', outcome='unknown_mutation',
+                      error_kind='coordinator lease lapsed')]
+        refusal = driver._refusal(rows_)
+        self.assertEqual(refusal['first'], 2)
+        self.assertEqual(refusal['last_success'], 1)
+        self.assertTrue(refusal['typed'])
+        self.assertTrue(refusal['no_success_after'])
+
+    def test_an_untyped_row_takes_the_causal_line_from_the_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'run.log'
+            log.write_text('kv-research: measurement end boundary failed: write core '
+                           'requires recovery; first causal failure: owner=Some(0) '
+                           'stage=live_group: coordinator lease lapsed on owner '
+                           'partition 0\n')
+            driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+            child = types.SimpleNamespace(log=log)
+            rows_ = [dict(phase='measurement', outcome='unknown_mutation',
+                          error_kind='Connection refused', completed_ns='5')]
+            refusal = driver._refusal(rows_)
+            self.assertFalse(refusal['typed'])
+            logged = driver._log_refusal(child)
+        self.assertIn('coordinator lease lapsed', logged)
+
+    def test_a_success_after_a_refusal_is_a_second_writer(self):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        rows_ = [dict(phase='measurement', outcome='unknown_mutation',
+                      error_kind='coordinator lease lapsed'),
+                 dict(phase='measurement', outcome='success', error_kind='')]
+        refusal = driver._refusal(rows_)
+        self.assertFalse(refusal['no_success_after'])
 
     def test_a_contend_cell_is_not_a_stale_latency_claim(self):
         with tempfile.TemporaryDirectory() as tmp:

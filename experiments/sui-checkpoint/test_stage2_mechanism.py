@@ -88,9 +88,35 @@ class CellTable(unittest.TestCase):
                 self.assertEqual(run['mix']['put_batch'], 0)
                 self.assertEqual(run['mix']['delete'], 0)
 
+    def test_the_snapshot_cut_outlives_the_snapshot_poll_and_byte_cadence(self):
+        for tier in mechanism.TIERS:
+            cell = mechanism.find(f'S1-2S-snapshot-{tier}')
+            run = cell['runs'][0]
+            self.assertEqual(run['measurement'], mechanism.SNAPSHOT_MEASUREMENT)
+            # The first snapshot check is 60 s after open and the root trigger
+            # is 8 GiB of value bytes; the run must pass both.
+            self.assertGreater(run['measurement'] * run['value'], 8 << 30)
+            self.assertLessEqual(run['measurement'] * run['value'], 16 << 30)
+            self.assertGreaterEqual(run['deadline'], 900)
+            publication = mechanism.find(f'S1-2S-publication-{tier}')
+            self.assertEqual(publication['runs'][0]['measurement'], 1_000_000)
+
     def test_unknown_cell_fails(self):
         with self.assertRaisesRegex(ValueError, 'unknown mechanism cell'):
             mechanism.find('M99')
+
+
+class RowSelection(unittest.TestCase):
+    def test_a_refused_mutation_is_not_an_error_row(self):
+        rows = [dict(phase='measurement', outcome='success', error_kind=''),
+                dict(phase='measurement', outcome='unknown_mutation',
+                     error_kind='coordinator lease lapsed'),
+                dict(phase='measurement', outcome='error', error_kind='boom')]
+        self.assertEqual([row['outcome'] for row in mechanism.refused(rows)],
+                         ['unknown_mutation', 'error'])
+        self.assertEqual([row['outcome'] for row in mechanism.failures(rows)],
+                         ['error'])
+        self.assertEqual(mechanism.acknowledged(rows), 1)
 
 
 class Specs(unittest.TestCase):
