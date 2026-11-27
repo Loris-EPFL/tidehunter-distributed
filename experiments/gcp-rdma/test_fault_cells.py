@@ -379,10 +379,10 @@ class FenceExclusivity(unittest.TestCase):
         self.assertFalse(record['fence']['exclusive'])
         named_checks = {check['check']: check for check in record['checks']}
         self.assertFalse(named_checks[
-            'stale-generation adoption after the fence is proven absent']['ok'])
-        self.assertIn('no fenced-frame rejection counter',
-                      named_checks['stale-generation adoption after the fence is '
-                                   'proven absent']['detail']['reason'])
+            'the owners fenced before the new authority\'s first accepted write']['ok'])
+        self.assertIn('no owner-side fence snapshot',
+                      named_checks['the owners fenced before the new authority\'s '
+                                   'first accepted write']['detail']['reason'])
 
     def test_the_real_stale_rows_are_judged_against_the_new_writers_fence(self):
         rows_ = fault_cells.rows(ROOT / 'experiments/gcp-rdma/fixtures' / 's1-5s-contend-a-excerpt.csv')
@@ -421,9 +421,13 @@ class FenceExclusivity(unittest.TestCase):
         fence = dict(real['fence'], refusal_kind='owner-row', exclusive=True,
                      writers=1, stale_success_after_fence=0,
                      audit_available=True, audit_integrity_ok=True,
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0,
                      second_measurement_rows=real['new_writer']['measurement_rows'],
+                     owner_fence=dict(evidence_available=True,
+                                      fence_counters_increased=True,
+                                      no_stale_growth=True,
+                                      stale_generations=['h0:/db-1/epoch_3'],
+                                      stale_growth=dict(new_files=[], grown=[]),
+                                      scraped_unix_ns=5, reason=None),
                      fence_unix_ns=1_000_000_000_000,
                      first_started_unix_ns=999_000_000_000,
                      second_started_unix_ns=999_500_000_000,
@@ -451,8 +455,12 @@ class FenceExclusivity(unittest.TestCase):
                      first_refusal_row=None, exclusive=True, writers=1,
                      stale_success_after_fence=0, sealed_partitions=1,
                      audit_available=True, audit_integrity_ok=True,
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0,
+                     owner_fence=dict(evidence_available=True,
+                                      fence_counters_increased=True,
+                                      no_stale_growth=True,
+                                      stale_generations=['h0:/db-1/epoch_3'],
+                                      stale_growth=dict(new_files=[], grown=[]),
+                                      scraped_unix_ns=5, reason=None),
                      write_protect_apply_ms=7097.3, fence_reject_ms=None,
                      fence_reject_window_ms=dict(lower_ms=0.0, upper_ms=420.0),
                      fence_unix_ns=1, first_started_unix_ns=0)
@@ -728,8 +736,10 @@ class FenceVerdict(unittest.TestCase):
                                    stale_success_after_fence=0, exclusive=True,
                                    second_measurement_rows=200,
                                    audit_available=True, audit_integrity_ok=True,
-                                   adoption_evidence_available=True,
-                                   stale_frames_adopted_after_fence=0,
+owner_fence=dict(evidence_available=True, fence_counters_increased=True,
+                                       no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
+                                       stale_growth=dict(new_files=[], grown=[]),
+                                       scraped_unix_ns=5, reason=None),
                                    first_started_unix_ns=1, second_started_unix_ns=2,
                                    fence_unix_ns=3,
                                    fence_reject_ms=12.5))
@@ -1243,6 +1253,10 @@ class StaleFenceMeasurement(unittest.TestCase):
             cluster.owners = ['H1', 'H2']
             cluster.local = lambda name: cluster.output / name
             cluster.root = lambda name: cluster.local(name) / 'coordinator'
+            cluster.seal_markers = lambda host: dict(sealed=1)
+            cluster.generation_wal = lambda host: dict(generations={
+                '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
+                                  dict(size=4096, mtime=1.0)}})
             driver = fault_cells.CellDriver(
                 cluster, fault_cells.mechanism.find('S1-5S-stale-native'))
             second = self.Second()
@@ -1254,8 +1268,12 @@ class StaleFenceMeasurement(unittest.TestCase):
                                  return_value=dict(gate=gate, exit_code=1)):
                 with patch.object(driver, 'fence_audit', return_value=dict(
                         audit_available=True, audit_integrity_ok=True,
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0,
+                     owner_fence=dict(evidence_available=True,
+                                      fence_counters_increased=True,
+                                      no_stale_growth=True,
+                                      stale_generations=['h0:/db-1/epoch_3'],
+                                      stale_growth=dict(new_files=[], grown=[]),
+                                      scraped_unix_ns=5, reason=None),
                         audit_read_ms=1.0, audit_text='verify ok')):
                     result = driver._contend(child, 'stale')
         self.assertEqual(result['resumed_unix_ns'], 1_000_000_000)
@@ -1269,9 +1287,10 @@ class StaleFenceMeasurement(unittest.TestCase):
         self.assertTrue(result['stale_write_refused'])
         self.assertTrue(result['typed_refusal'])
         self.assertTrue(second.stopped)
-        fence = dict(result, case='stale', tier='native',
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0)
+        fence = dict(result, case='stale', tier='native', owner_fence=dict(
+            evidence_available=True, fence_counters_increased=True,
+            no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
+            stale_growth=dict(new_files=[], grown=[]), scraped_unix_ns=5, reason=None))
         record = fault_cells.fence_record(
             types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
                                   fence=fence))
@@ -1330,6 +1349,10 @@ class StaleFenceMeasurement(unittest.TestCase):
             cluster.owners = ['H1', 'H2']
             cluster.local = lambda name: cluster.output / name
             cluster.root = lambda name: cluster.local(name) / 'coordinator'
+            cluster.seal_markers = lambda host: dict(sealed=1)
+            cluster.generation_wal = lambda host: dict(generations={
+                '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
+                                  dict(size=4096, mtime=1.0)}})
             driver = fault_cells.CellDriver(
                 cluster, fault_cells.mechanism.find('S1-5S-contend-native'))
             with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
@@ -1340,8 +1363,12 @@ class StaleFenceMeasurement(unittest.TestCase):
                                                    exit_code=1)):
                 with patch.object(driver, 'fence_audit', return_value=dict(
                         audit_available=True, audit_integrity_ok=True,
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0,
+                     owner_fence=dict(evidence_available=True,
+                                      fence_counters_increased=True,
+                                      no_stale_growth=True,
+                                      stale_generations=['h0:/db-1/epoch_3'],
+                                      stale_growth=dict(new_files=[], grown=[]),
+                                      scraped_unix_ns=5, reason=None),
                         audit_read_ms=1.0, audit_text='verify ok')):
                     result = driver._contend(child, 'contend')
         # A contend cell reports the same quantity as a stale cell, and says
@@ -1350,9 +1377,10 @@ class StaleFenceMeasurement(unittest.TestCase):
         self.assertEqual(result['fence_reject_ms'], 40.0)
         self.assertEqual(result['refusal_kind'], 'owner-row')
         self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
-        fence = dict(result, case='contend', tier='native',
-                     adoption_evidence_available=True,
-                     stale_frames_adopted_after_fence=0)
+        fence = dict(result, case='contend', tier='native', owner_fence=dict(
+            evidence_available=True, fence_counters_increased=True,
+            no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
+            stale_growth=dict(new_files=[], grown=[]), scraped_unix_ns=5, reason=None))
         record = fault_cells.fence_record(
             types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
                                   fence=fence))
@@ -1360,6 +1388,67 @@ class StaleFenceMeasurement(unittest.TestCase):
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
         self.assertEqual(latency['detail']['kind'], 'owner-row')
+
+
+class OwnerFenceProof(unittest.TestCase):
+    """The owner-side half: fence first, then nothing in the stale generation.
+
+    Shapes follow the real fleet-A evidence: an owner seals one database during
+    the pause (`S1-5S-lapse-native/attempt-3`: `sealed_partitions: 1`, apply
+    7,097 ms) and the stale generation's WAL lives under
+    `db-<database>/epoch_<generation>/wal_*`.
+    """
+
+    def snapshot(self, *, ns, sealed, size, mtime):
+        return dict(unix_ns=ns,
+                    seals={'H1': dict(host='H1', databases=1, sealed=sealed)},
+                    wal={'H1': dict(generations={'/db-1/epoch_3': {
+                        '/db-1/epoch_3/wal_0000000000000000':
+                            dict(size=size, mtime=mtime)}})})
+
+    def test_a_fenced_generation_that_gains_nothing_is_the_proof(self):
+        proof = fault_cells.CellDriver.owner_fence_proof(
+            self.snapshot(ns=100, sealed=1, size=4096, mtime=1.0),
+            self.snapshot(ns=200, sealed=1, size=4096, mtime=1.0),
+            authority_unix_ns=150)
+        self.assertTrue(proof['evidence_available'])
+        self.assertTrue(proof['fence_counters_increased'])
+        self.assertTrue(proof['no_stale_growth'])
+        self.assertIsNone(proof['reason'])
+        self.assertEqual(proof['stale_generations'], ['H1:/db-1/epoch_3'])
+
+    def test_growth_in_the_stale_generation_is_named(self):
+        proof = fault_cells.CellDriver.owner_fence_proof(
+            self.snapshot(ns=100, sealed=1, size=4096, mtime=1.0),
+            self.snapshot(ns=200, sealed=1, size=8192, mtime=2.0),
+            authority_unix_ns=150)
+        self.assertFalse(proof['no_stale_growth'])
+        self.assertIn('gained files or bytes', proof['reason'])
+        self.assertEqual(proof['stale_growth']['grown'],
+                         ['/db-1/epoch_3/wal_0000000000000000'])
+
+    def test_an_unsealed_owner_or_a_late_scrape_is_named(self):
+        unsealed = fault_cells.CellDriver.owner_fence_proof(
+            self.snapshot(ns=100, sealed=0, size=4096, mtime=1.0),
+            self.snapshot(ns=200, sealed=1, size=4096, mtime=1.0),
+            authority_unix_ns=150)
+        self.assertFalse(unsealed['fence_counters_increased'])
+        self.assertIn('no fence or write-protect marker', unsealed['reason'])
+        late = fault_cells.CellDriver.owner_fence_proof(
+            self.snapshot(ns=300, sealed=1, size=4096, mtime=1.0),
+            self.snapshot(ns=400, sealed=1, size=4096, mtime=1.0),
+            authority_unix_ns=150)
+        self.assertIn('after the new authority', late['reason'])
+
+    def test_missing_evidence_is_not_a_pass(self):
+        proof = fault_cells.CellDriver.owner_fence_proof(None, None,
+                                                        authority_unix_ns=1)
+        self.assertFalse(proof['evidence_available'])
+        self.assertIn('no owner-side fence snapshot', proof['reason'])
+        exclusive, reason = fault_cells.CellDriver._exclusive(
+            'owner-row', 0, new_authority=True, owner_fence=proof)
+        self.assertFalse(exclusive)
+        self.assertIn('no owner-side fence evidence', reason)
 
 
 class FenceAuditRun(unittest.TestCase):
