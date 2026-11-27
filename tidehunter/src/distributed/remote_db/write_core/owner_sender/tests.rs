@@ -1,4 +1,5 @@
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::thread;
 
 #[test]
@@ -12,7 +13,7 @@ fn full_control_wait_releases_order_and_recaptures_its_fence() {
     let (reply, pending) = mpsc::sync_channel(1);
     let sending = Arc::clone(&sender);
     let send = thread::spawn(move || sending.send(Command::Stats(reply)));
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     // Full admission has no effect and must not retain owner.order.
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
     let (earlier, _) = queue.reserve(|| 1);
@@ -68,7 +69,7 @@ fn expired_full_control_has_no_effect_and_receiver_drop_wakes_waiters() {
     *sender.waiting.lock() = Some(waiting);
     let sending = Arc::clone(&sender);
     let send = thread::spawn(move || sending.send(Command::QueueReady));
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     drop(receiver);
     assert!(send.join().unwrap().is_err());
 }
@@ -84,7 +85,7 @@ fn explicit_close_wakes_full_sender_and_retains_only_admitted_commands() {
     let sending = Arc::clone(&sender);
     let (reply, pending) = mpsc::sync_channel(1);
     let send = thread::spawn(move || sending.send(Command::Stats(reply)));
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(PROGRESS_CAP).unwrap();
     sender.close();
     sender.close();
     assert!(send.join().unwrap().is_err());

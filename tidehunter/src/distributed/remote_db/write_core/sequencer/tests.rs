@@ -1,7 +1,7 @@
 use super::*;
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use std::sync::Barrier;
 use std::thread;
-use std::time::Duration;
 
 struct Credits {
     available: Mutex<usize>,
@@ -18,7 +18,7 @@ impl Credits {
 
     fn reserve(&self) -> Reservation<'_> {
         let mut available = self.available.lock();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PROGRESS_CAP;
         while *available == 0 {
             assert!(
                 !self
@@ -160,7 +160,7 @@ fn concurrent_prefix_completion_from(start: u64) {
                 credits.release(sequencer.complete_release(sequence));
             }
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PROGRESS_CAP;
         // Relaxed is deliberately not a metadata handoff. AcqRel allocation
         // must relay retirement to a caller holding an old admission grant.
         for attempt in 0..10_000_000 {
@@ -206,7 +206,7 @@ fn concurrent_slot_reuse_from(start: u64) {
                     credits.release(sequencer.complete_resolve(sequence));
                     assert_eq!(
                         sequencer
-                            .wait(version(sequence), Instant::now() + Duration::from_secs(5))
+                            .wait(version(sequence), Instant::now() + PROGRESS_CAP)
                             .unwrap(),
                         version(sequence)
                     );

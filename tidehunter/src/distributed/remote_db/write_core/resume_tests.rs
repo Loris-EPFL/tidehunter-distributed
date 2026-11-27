@@ -5,13 +5,13 @@
 //! flag) under a bounded cap; nothing here is a sleep or a latency premise.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use super::super::leased_tests::worker;
 use crate::distributed::codec::CompleteBatch;
 use crate::distributed::durability::DurabilityTier;
 use crate::distributed::storage::DurableBatch;
 use crate::distributed::tcp::leased_tests::{Fixture, owner_read};
+use crate::distributed::test_bounds::PROGRESS_CAP;
 
 /// Read the record `receipt` acknowledged for `batch` back through the owner.
 fn assert_reads_back(fixture: &Fixture, batch: &CompleteBatch, receipt: &DurableBatch) {
@@ -62,7 +62,7 @@ fn write_survives_one_owner_connection_break() {
                 .enqueue(1, vec![batch.clone()])
                 .expect("the worker admits the batch");
             let receipts = reply
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(PROGRESS_CAP)
                 .expect("the caller reply arrives")
                 .expect("the batch is durable");
             assert_eq!(receipts.len(), 1, "one batch, one receipt");
