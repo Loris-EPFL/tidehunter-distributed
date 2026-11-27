@@ -442,6 +442,30 @@ class ReopenPath(unittest.TestCase):
                              str(Path(tmp) / 'measure' / 'coordinator'))
             self.assertEqual(part['output'], str(Path(tmp) / 'verify' / 'run'))
 
+    def test_open_serializes_receipt_paths_not_rows(self):
+        """The spec carries path strings; a raw row is a map and fails the open."""
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = self.driver(tmp)
+            driver.cluster.receipts = lambda namespace: [
+                dict(partition=0, path='/g/receipts/node-0.json', receipt={}),
+                dict(partition=1, path='/g/receipts/node-1.json', receipt={})]
+            driver.cluster.context = lambda namespace, receipts: dict(
+                transport={'kind': 'tcp'}, remote={'read_cache_bytes': 0},
+                receipts=[row['path'] if isinstance(row, dict) else str(row)
+                          for row in receipts])
+
+            class Child:
+                def __init__(self, *, binary, spec, directory, name='run'):
+                    self.output = Path(directory) / name
+                    self.output.mkdir(parents=True, exist_ok=True)
+
+            with patch.object(fault_cells, 'Coordinator', Child):
+                driver.open(driver.cell['runs'][0], 'measure')
+            spec = json.loads((Path(tmp) / 'measure' / 'spec.json').read_text())
+        self.assertEqual(
+            spec['backend']['options']['external_owner_durability_receipts'],
+            ['/g/receipts/node-0.json', '/g/receipts/node-1.json'])
+
     def test_the_verify_verdict_sees_the_kill_of_the_measured_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             driver = self.driver(tmp)

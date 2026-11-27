@@ -536,7 +536,10 @@ class CellDriver:
         self.namespace = namespace
         self.context = self.cluster.context(namespace, chosen)
         self.receipt_paths = [row['path'] for row in recorded]
-        return chosen
+        # `spec()` overrides its context receipts with this value, and the
+        # backend admits `external_owner_durability_receipts` as paths, so the
+        # raw rows would serialize maps into the spec and fail the open.
+        return self.context['receipts']
 
     def open(self, run, name, *, receipts=None):
         chosen = self.bind_context(receipts=receipts)
