@@ -1269,27 +1269,37 @@ def admission_checks(values, *, live_transport):
     return details
 
 
+# Upstream Sui commits three batches per checkpoint to the perpetual store
+# (plan 8.1); the other namespaces carry their own per-checkpoint writes. The
+# node also commits at most this many batches before the first checkpoint.
+PERPETUAL_SUFFIX = '/store/perpetual'
+STARTUP_PERPETUAL_BATCHES = 2
+
+
 def write_batch_check(values, namespaces, checkpoint_count):
-    """Write batches per completed checkpoint, from the adapter commit counter."""
+    """Perpetual-store write batches per completed checkpoint, from the adapter."""
     if not isinstance(checkpoint_count, int) or checkpoint_count < 1:
         raise ValueError('a checkpoint population is required')
-    stats = adapter_stats(values)
-    absent = [f'{name}:write_commit_calls' for name in sorted(namespaces)
-              if name not in stats or stats[name].get('write_commit_calls') is None]
-    if absent:
+    perpetual = sorted(name for name in namespaces if name.endswith(PERPETUAL_SUFFIX))
+    if len(perpetual) != 1:
+        return _state('missing_counter', 'exactly one perpetual-store namespace is required',
+                      namespaces=sorted(namespaces))
+    name = perpetual[0]
+    calls = adapter_stats(values).get(name, {}).get('write_commit_calls')
+    if calls is None:
         return _state('missing_counter', 'the write-commit counter is absent',
-                      missing=absent)
-    batches = int(sum(stats[name]['write_commit_calls'] for name in stats
-                      if name in set(namespaces)))
-    ratio = batches / checkpoint_count
-    payload = dict(batches=batches, checkpoints=checkpoint_count,
-                   write_batches_per_checkpoint=ratio,
-                   source='sum of write_commit_calls across the audited namespaces '
-                          'divided by replayed checkpoints; upstream writes three '
-                          'batches per checkpoint')
-    if ratio != 3:
-        return _state('fail', f'write batches per checkpoint reads {ratio}, not 3',
-                      **payload)
+                      missing=[f'{name}:write_commit_calls'])
+    batches = int(calls)
+    extra = batches - 3 * checkpoint_count
+    payload = dict(namespace=name, batches=batches, checkpoints=checkpoint_count,
+                   write_batches_per_checkpoint=batches / checkpoint_count,
+                   startup_batches=extra,
+                   source='write_commit_calls of the perpetual store divided by replayed '
+                          'checkpoints; upstream writes three batches per checkpoint, '
+                          f'plus at most {STARTUP_PERPETUAL_BATCHES} before the first')
+    if not 0 <= extra <= STARTUP_PERPETUAL_BATCHES:
+        return _state('fail', f'perpetual write batches per checkpoint read '
+                              f'{batches / checkpoint_count}, not 3', **payload)
     return _state('pass', None, **payload)
 
 
