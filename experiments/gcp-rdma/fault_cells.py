@@ -789,21 +789,22 @@ class CellDriver:
         is taken over data. This gate reads only files: the sample file is too
         large to parse on every poll.
 
-        Each observation also carries the coordinator WAL's allocated bytes, so
-        the evidence says how many value bytes the engine had published at the
-        cut: the cadence is `index_value_bytes()`, not the WAL position, and
-        `S1-2S-snapshot-native` missed the 8 GiB default with a 101 s run.
+        Each observation also carries the coordinator WAL's allocated filesystem
+        footprint, which bounds what the engine had written at the cut. It is a
+        footprint (`st_blocks`), not the engine's logical `index_value_bytes()`
+        counter and not a value-byte count; `S1-2S-snapshot-native` missed the
+        8 GiB default with a 101 s run and retained no written volume at all.
         """
-        baseline = self._coordinator_wal_bytes(child)
+        baseline = self._coordinator_wal_footprint(child)
         state = dict(previous=self._snapshot_files(child))
 
         def predicate():
             current = self._snapshot_files(child)
             previous = state['previous']
-            wal = self._coordinator_wal_bytes(child)
-            row = dict(wal_allocated_bytes=wal,
-                       wal_allocated_delta=(None if baseline is None or wal is None
-                                            else wal - baseline))
+            wal = self._coordinator_wal_footprint(child)
+            row = dict(coordinator_wal_footprint_bytes=wal,
+                       coordinator_wal_footprint_delta=(
+                           None if baseline is None or wal is None else wal - baseline))
             if not previous:
                 state['previous'] = current
                 return dict(row, reached=False, note='waiting for the control region')
@@ -814,15 +815,19 @@ class CellDriver:
             return dict(row, reached=bool(changed), changed=changed, files=len(current))
         gate = self.wait_for(child, predicate, timeout=timeout, poll=0.1,
                              label='snapshot control-region store')
-        gate['wal_allocated_baseline'] = baseline
+        gate['coordinator_wal_footprint_baseline'] = baseline
+        gate['wal_measure'] = ('allocated filesystem footprint (st_blocks x 512) of '
+                               'the coordinator WAL files; not the engine index_value_bytes '
+                               'and not a value-byte count')
         return gate
 
-    def _coordinator_wal_bytes(self, child):
-        """Allocated bytes of the coordinator's WAL files, or None.
+    def _coordinator_wal_footprint(self, child):
+        """Allocated filesystem footprint of the coordinator's WAL files, or None.
 
         `set_len` gives each new index WAL file its apparent size without
-        allocating blocks, so the allocated count is the written volume. A file
-        that cannot be stat'ed is skipped, and no WAL at all answers None.
+        allocating blocks, so the block footprint bounds the bytes actually
+        written. A file that cannot be stat'ed is skipped, and no WAL at all
+        answers None.
         """
         root = Path(child.output).parent / 'coordinator'
         total, seen = 0, False
@@ -930,6 +935,20 @@ class CellDriver:
                     refusal=found[0].get('error_kind') if found else None)
 
     # ---- run records --------------------------------------------------
+    def write_gate(self, child, gate):
+        """Persist one gate record beside the run, before any verdict.
+
+        `failure_artifacts` walks every file under the attempt's output tree, so
+        a gate written here reaches the bucket even when the cell never records
+        a part.
+        """
+        path = Path(child.output).parent / 'gate.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(gate, indent=1, sort_keys=True) + '\n')
+        os.replace(temporary, path)
+        return path
+
     def part(self, name, run, child, observations, *, verdict=True):
         return dict(name=name, role=run['role'], run=run, verdict=verdict,
                     output=str(child.output), log=str(child.log),
@@ -974,6 +993,10 @@ class CellDriver:
                 gate['writes'] = writes
             record['gate'] = gate
             if not gate.get('reached'):
+                # A missed gate aborts before any part is appended, and the
+                # failure upload walks files: without this the probe series of
+                # the very run that missed the cut is lost again.
+                self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             record['kill'] = self.kill_coordinator(child)
         finally:
@@ -1019,6 +1042,10 @@ class CellDriver:
             gate = self.gate_writes(child, GATE_WRITES)
             record['gate'] = gate
             if not gate.get('reached'):
+                # A missed gate aborts before any part is appended, and the
+                # failure upload walks files: without this the probe series of
+                # the very run that missed the cut is lost again.
+                self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             record['kill'] = self.kill_owner(host, 'owner crash after the write gate')
             record['failure'] = self.stop_on_failure(child)
@@ -1049,6 +1076,10 @@ class CellDriver:
             gate = self.gate_retirement(host, cut)
             record['gate'] = gate
             if not gate.get('reached'):
+                # A missed gate aborts before any part is appended, and the
+                # failure upload walks files: without this the probe series of
+                # the very run that missed the cut is lost again.
+                self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             record['kill'] = self.kill_owner(host, f'retirement {cut}')
             record['failure'] = self.stop_on_failure(child)
@@ -1081,6 +1112,10 @@ class CellDriver:
             gate = self.gate_writes(child, GATE_WRITES)
             record['gate'] = gate
             if not gate.get('reached'):
+                # A missed gate aborts before any part is appended, and the
+                # failure upload walks files: without this the probe series of
+                # the very run that missed the cut is lost again.
+                self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             if case == 'lapse':
                 record.update(self._lapse(child, host))
