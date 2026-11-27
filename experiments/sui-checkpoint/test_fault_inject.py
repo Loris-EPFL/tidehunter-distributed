@@ -102,16 +102,58 @@ class IntentSelection(unittest.TestCase):
             self.write(root, 'outside', intent('nqn.2026-01.test:outside', service=SERVICE + 16), 3_000)
             self.write(root, 'tcp', intent('nqn.2026-01.test:tcp', transport='tcp'), 4_000)
             self.write(root, 'other-address', intent('nqn.2026-01.test:x', address='10.0.0.9'), 5_000)
-            selected, candidates = fault_inject.newest_write_intent(
+            selected, candidates, directories = fault_inject.newest_write_intent(
                 root, transport='rdma', address=ADDRESS, service=SERVICE,
                 service_max=SERVICE + 15)
             self.assertEqual(selected, new)
             self.assertEqual(candidates, [old, new])
+            self.assertEqual(directories, [str(root)],
+                             'an exact registry is used as given')
             empty = root / 'empty'
             empty.mkdir()
-            with self.assertRaisesRegex(ValueError, 'no connection intent'):
+            with self.assertRaisesRegex(ValueError, 'no live-nvme-connections registry'):
                 fault_inject.newest_write_intent(
                     empty, transport='rdma', address=ADDRESS, service=SERVICE,
+                    service_max=SERVICE + 15)
+
+    def test_the_owner_window_is_searched_across_every_namespace_registry(self):
+        """The staged S1-4 tree carries one registry per opened namespace.
+
+        The failed cells prepared `remote/full_node_db/94970e38de08` and the
+        engine created `live/checkpoints`, `live/store/epoch_0` and
+        `live/store/perpetual` beneath it, each with its own
+        `live-nvme-connections`; the write path's controller is the newest
+        intent across all of them.
+        """
+        old = 'nqn.2026-01.test:db-a-p00000001-sub-01'
+        middle = 'nqn.2026-01.test:db-a-p00000001-sub-02'
+        new = 'nqn.2026-01.test:db-a-p00000001-sub-03'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'remote/full_node_db/94970e38de08'
+            namespaces = ('live/checkpoints', 'live/store/epoch_0', 'live/store/perpetual')
+            for namespace in namespaces:
+                (root / namespace / 'live-nvme-connections').mkdir(parents=True)
+            self.write(root / 'live/checkpoints/live-nvme-connections',
+                       'checkpoints', intent(old), 1_000)
+            self.write(root / 'live/store/perpetual/live-nvme-connections',
+                       'perpetual', intent(middle, service=SERVICE + 1), 1_500)
+            self.write(root / 'live/store/epoch_0/live-nvme-connections',
+                       'epoch', intent(new, service=SERVICE + 3), 2_000)
+            selected, candidates, directories = fault_inject.newest_write_intent(
+                root, transport='rdma', address=ADDRESS, service=SERVICE,
+                service_max=SERVICE + 15)
+            self.assertEqual(selected, new)
+            self.assertEqual(candidates, [old, middle, new])
+            self.assertEqual(directories, [
+                str(root / namespace / 'live-nvme-connections')
+                for namespace in namespaces])
+
+    def test_an_absent_root_is_named_in_the_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'remote/full_node_db/94970e38de08'
+            with self.assertRaisesRegex(ValueError, 'connection intent root is absent'):
+                fault_inject.newest_write_intent(
+                    root, transport='rdma', address=ADDRESS, service=SERVICE,
                     service_max=SERVICE + 15)
 
     def test_a_corrupt_intent_fails_closed(self):
@@ -380,6 +422,7 @@ class InjectionRun(unittest.TestCase):
             self.assertTrue(record['ok'], record)
             self.assertEqual(record['target']['nqn'], NQN)
             self.assertEqual(record['target']['intents'], str(intents))
+            self.assertEqual(record['target']['intent_directories'], [str(intents)])
             self.assertEqual(record['target']['candidates'],
                              ['nqn.2026-01.test:old', NQN])
 
@@ -420,7 +463,7 @@ class Specification(unittest.TestCase):
         fault_inject.validate_spec(self.base(intents='/run/intents',
                                              nqn=None, service_max=SERVICE + 15))
         fault_inject.validate_spec(self.base())
-        with self.assertRaisesRegex(ValueError, 'intent directory'):
+        with self.assertRaisesRegex(ValueError, 'database root'):
             fault_inject.validate_spec(self.base(nqn=None, service_max=SERVICE + 15))
         with self.assertRaisesRegex(ValueError, 'bounded service window'):
             fault_inject.validate_spec(self.base(nqn=None, intents='/run/intents',

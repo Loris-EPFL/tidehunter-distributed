@@ -536,16 +536,20 @@ def fleet_hosts(fleet, names, *, transport, live_transport):
     return control, live
 
 
-def controller_loss_intents(args, launcher):
-    """The coordinator's live connection intents directory on the injector host.
+def controller_loss_intent_root(args, launcher):
+    """The coordinator's database root on the injector host.
 
-    The engine publishes one intent per controller under the coordinator
-    database root, which the rehearsal already hands to `prepare_external` as
-    `--db-root`. An explicit `--controller-loss-intents` still wins.
+    The engine opens one database per namespace (`live/checkpoints`,
+    `live/store/epoch_0`, `live/store/perpetual`, and later epochs) and each
+    database publishes its own `<namespace>/live-nvme-connections` registry,
+    so the directory is one level below any single path the harness could
+    name: the injector searches every registry beneath the root the cell
+    already hands to `prepare_external` as `--db-root`. An explicit
+    `--controller-loss-intents` still wins.
     """
     if args.controller_loss_intents is not None:
         return Path(args.controller_loss_intents)
-    return launcher.remote_root() / 'live-nvme-connections'
+    return launcher.remote_root()
 
 
 def plan(coordinator, owners):
@@ -1438,12 +1442,13 @@ def main():
                              'the only NVMe-oF initiator; override for a rehearsal)')
     parser.add_argument('--controller-loss-nqn',
                         help='exact target NQN; otherwise --controller-loss-intents '
-                             'names the coordinator intents directory that selects the '
-                             'active write controller')
+                             'names the coordinator database root whose connection '
+                             'registries select the active write controller')
     parser.add_argument('--controller-loss-intents',
-                        help="override the coordinator's live-nvme-connections "
-                             'directory; by default it is derived from the '
-                             "coordinator database root this cell prepares")
+                        help="override the coordinator's database root; its "
+                             '`<namespace>/live-nvme-connections` registries are '
+                             'searched. By default it is the database root this cell '
+                             'prepares')
     parser.add_argument('--controller-loss-timeout', type=float, default=30.0,
                         help='injector reconnect and write-progress deadline in seconds')
     parser.add_argument('--controller-loss-gate-timeout', type=float,
@@ -1577,7 +1582,7 @@ def main():
         allow_local_ledger=args.allow_local_ledger,
         controller_loss=controller_loss, hold_seconds=args.hold_seconds)
     if controller_loss is not None:
-        controller_loss.intents = controller_loss_intents(args, launcher)
+        controller_loss.intents = controller_loss_intent_root(args, launcher)
     receipt = launcher.run(hosts)
     print(json.dumps(receipt))
     if receipt.get('status') in ('not_reached', 'invalid'):

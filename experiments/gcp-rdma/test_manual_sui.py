@@ -746,25 +746,25 @@ class ControllerLossInjection(unittest.TestCase):
         self.assertFalse(window['lines'])
         denied = Denied()
         self.assertIsNone(gate.kernel_log(denied, None)['since'])
-    def test_the_intent_directory_is_derived_from_the_coordinator_root(self):
+    def test_the_intent_root_is_derived_from_the_coordinator_root(self):
         launcher = self.launcher(MailboxDouble(self.root, self.root / 'guest'), None)
         root = launcher.remote_root()
         self.assertEqual(root.name, '94970e38de08', "the fixture names the database")
         args = SimpleNamespace(controller_loss_intents=None)
-        self.assertEqual(manual_sui.controller_loss_intents(args, launcher),
-                         root / 'live-nvme-connections',
-                         'the directory follows the coordinator database root')
+        self.assertEqual(manual_sui.controller_loss_intent_root(args, launcher), root,
+                         'the engine registers one intent directory per namespace '
+                         'beneath this root')
         override = self.root / 'operator-intents'
         self.assertEqual(
-            manual_sui.controller_loss_intents(
+            manual_sui.controller_loss_intent_root(
                 SimpleNamespace(controller_loss_intents=override), launcher),
             override, 'an explicit override still wins')
 
-    def test_the_derived_intent_directory_reaches_the_injector(self):
+    def test_the_derived_intent_root_reaches_the_injector(self):
         remote = MailboxDouble(self.root, self.root / 'guest')
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
         launcher = self.launcher(remote, None)
-        derived = manual_sui.controller_loss_intents(
+        derived = manual_sui.controller_loss_intent_root(
             SimpleNamespace(controller_loss_intents=None), launcher)
         gate = self.gate(remote, intents=derived)
         receipt = self.launcher(remote, gate, ledger=ledger,
@@ -778,8 +778,8 @@ class ControllerLossInjection(unittest.TestCase):
         evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
         self.assertEqual(evidence['intents'], str(derived))
         self.assertEqual(
-            derived, self.root / 'run/remote/full_node_db/94970e38de08/live-nvme-connections',
-            'the derived path is the coordinator root the cell prepared')
+            derived, self.root / 'run/remote/full_node_db/94970e38de08',
+            'the derived root is the coordinator root the cell prepared')
 
     def test_a_refused_write_path_preflight_fails_the_cell(self):
         refused = dict(INJECTOR_RECORD, ok=False,

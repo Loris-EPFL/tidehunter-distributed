@@ -11,12 +11,15 @@ It runs on the initiator, because the controller object being deleted is the
 local one: the coordinator host holds one controller per owner target. The
 active write controller is named either exactly (`--nqn`) or by the
 coordinator's newest connection intent inside the owner's live service window
-(`--intents`); the service window alone is never enough, because several epochs
-of one database share it. Before the delete the injector proves the selected
-controller is the one serving writes: it is `live`, a process holds a
-descriptor on its namespace, and that namespace's write sectors advance. After
-the delete a new controller inode for the same NQN and a completed write-resume
-episode are required when a metrics endpoint is given.
+(`--intents`); the service window alone is never enough, because several
+databases share it. The engine publishes one registry per database under the
+coordinator root (`<namespace>/live-nvme-connections`), so `--intents` names
+that root and every registry beneath it is searched. Before the delete the
+injector proves the selected controller is the one serving writes: it is
+`live`, a process holds a descriptor on its namespace, and that namespace's
+write sectors advance. After the delete a new controller inode for the same
+NQN and a completed write-resume episode are required when a metrics endpoint
+is given.
 
 Exit status is nonzero when any verification fails; the JSON record is written
 in both outcomes so the campaign retains the failed case.
@@ -63,8 +66,8 @@ def validate_spec(args):
     elif not (type(args.service_max) is int and args.service <= args.service_max <= 65535):
         raise ValueError('an intent target needs a bounded service window')
     if args.nqn is None and not args.intents:
-        raise ValueError('an exact NQN (--nqn) or the coordinator intent directory '
-                         '(--intents) is required: one service window holds every epoch')
+        raise ValueError('an exact NQN (--nqn) or the coordinator database root '
+                         '(--intents) is required: one service window holds every database')
     if args.transport not in ('tcp', 'rdma'):
         raise ValueError('transport must be tcp or rdma')
     if not 1 <= args.service <= 65535:
@@ -87,42 +90,70 @@ def select_controller(inventory, *, nqn, transport, address, service):
     return matches[0]
 
 
-def newest_write_intent(directory, *, transport, address, service, service_max):
+INTENT_DIRECTORY = 'live-nvme-connections'
+
+
+def intent_directories(root):
+    """Every coordinator live-connection registry under one database root.
+
+    The engine opens one database per namespace and publishes each database's
+    intent in its own `<namespace>/live-nvme-connections` directory: the Sui
+    replay registers `live/checkpoints`, `live/store/epoch_0` and
+    `live/store/perpetual` under the single `--db-root` the campaign prepares,
+    and the epoch directory rolls during the replay. A path that is itself a
+    registry, or one that names intent files directly, is used as given so an
+    operator or a rehearsal can still point at exactly one directory.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError(f'connection intent root is absent: {root}')
+    if root.name == INTENT_DIRECTORY or any(root.glob('*.json')):
+        return [root]
+    found = sorted(path for path in root.rglob(INTENT_DIRECTORY) if path.is_dir())
+    if not found:
+        raise ValueError(f'no {INTENT_DIRECTORY} registry under the coordinator '
+                         f'database root: {root}')
+    return found
+
+
+def newest_write_intent(database_root, *, transport, address, service, service_max):
     """Select the coordinator's newest connection intent of one owner window.
 
     The engine publishes one `live-nvme-connections/<nonce>.json` intent per
     controller it connects, and deletes it when that controller is retired, so
     the newest intent inside the owner's service window is the controller the
-    write path is using. Filenames are random nonces: recency is the file's
-    modification time, and the whole candidate list is retained as evidence.
+    write path is using. Every database of the coordinator publishes into its
+    own registry, and the owner window covers all of them, so the search spans
+    all registries beneath the database root. Filenames are random nonces:
+    recency is the file's modification time, and the whole candidate list is
+    retained as evidence.
     """
     if not (type(service) is int and type(service_max) is int and 1 <= service <= service_max <= 65535):
         raise ValueError('invalid service window')
-    root = Path(directory)
-    if not root.is_dir():
-        raise ValueError(f'connection intent directory is absent: {root}')
+    directories = intent_directories(database_root)
     matches = []
-    for path in sorted(root.glob('*.json')):
-        try:
-            intent = json.loads(path.read_text())
-        except (OSError, ValueError) as error:
-            raise ValueError(f'unreadable connection intent {path.name}: {error}') from error
-        target = intent.get('target') if isinstance(intent, dict) else None
-        if not isinstance(target, dict):
-            raise ValueError(f'connection intent {path.name} carries no target')
-        if target.get('transport') != transport or target.get('address') != address:
-            continue
-        port = target.get('service')
-        if not (isinstance(port, int) and service <= port <= service_max):
-            continue
-        nqn_value = target.get('nqn')
-        if not (isinstance(nqn_value, str) and manage.NQN.fullmatch(nqn_value)):
-            raise ValueError(f'connection intent {path.name} names no valid NQN')
-        matches.append((path.stat().st_mtime_ns, path.name, nqn_value))
+    for directory in directories:
+        for path in sorted(directory.glob('*.json')):
+            try:
+                intent = json.loads(path.read_text())
+            except (OSError, ValueError) as error:
+                raise ValueError(f'unreadable connection intent {path.name}: {error}') from error
+            target = intent.get('target') if isinstance(intent, dict) else None
+            if not isinstance(target, dict):
+                raise ValueError(f'connection intent {path.name} carries no target')
+            if target.get('transport') != transport or target.get('address') != address:
+                continue
+            port = target.get('service')
+            if not (isinstance(port, int) and service <= port <= service_max):
+                continue
+            nqn_value = target.get('nqn')
+            if not (isinstance(nqn_value, str) and manage.NQN.fullmatch(nqn_value)):
+                raise ValueError(f'connection intent {path.name} names no valid NQN')
+            matches.append((path.stat().st_mtime_ns, path.name, nqn_value))
     if not matches:
         raise ValueError('no connection intent inside the owner service window')
     matches.sort()
-    return matches[-1][2], [row[2] for row in matches]
+    return matches[-1][2], [row[2] for row in matches], [str(path) for path in directories]
 
 
 NAMESPACE = re.compile(r'nvme[0-9]+n[0-9]+')
@@ -340,10 +371,11 @@ def run(args, *, snapshot=None, delete=None,
     candidates = None
     selected_nqn = args.nqn
     if selected_nqn is None:
-        selected_nqn, candidates = newest_write_intent(
+        selected_nqn, candidates, directories = newest_write_intent(
             args.intents, transport=args.transport, address=address,
             service=args.service, service_max=args.service_max)
         record['target']['intents'] = str(args.intents)
+        record['target']['intent_directories'] = directories
         record['target']['candidates'] = candidates
     controller, identity = select_controller(inventory, nqn=selected_nqn,
         transport=args.transport, address=address, service=args.service)
@@ -482,9 +514,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nqn', help='exact owner target NQN to lose')
     parser.add_argument('--intents',
-                        help="the coordinator's live-nvme-connections directory; its "
+                        help="the coordinator's database root, the prepared "
+                             '`--db-root`; its registries under '
+                             '`<namespace>/live-nvme-connections` are searched and the '
                              'newest intent inside the owner service window names the '
-                             'active write controller')
+                             'active write controller. One exact registry directory is '
+                             'also accepted')
     parser.add_argument('--service-max', type=int,
                         help='upper bound of the owner target service window; '
                              'required when --nqn is absent')
