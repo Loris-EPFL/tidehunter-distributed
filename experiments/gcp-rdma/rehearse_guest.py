@@ -108,6 +108,44 @@ def admit_nvmet_fix(runtime, host, package):
     return {'candidate': candidate, 'loaded': loaded}
 
 
+def record_kernel_admission(prepared, live_transport):
+    """Record the kernel admission a real `ready` would read from the guests.
+
+    A container cannot run `modprobe` or provide `/dev/nvme-fabrics`, so the
+    live half is recorded instead: the pinned nvmet identity comes from each
+    worker's own receipt, and the initiator modules are recorded with the
+    campaign kernel and device. The real gate still judges the result: callers
+    pass it through `gcp_manual_compute.require_initiator`, so a record of the
+    wrong shape admits no cell.
+    """
+    import gcp_manual_compute
+    modules = gcp_manual_compute.initiator_modules(live_transport)
+    hosts = {}
+    for name in sorted(prepared):
+        loaded = ((((prepared[name] or {}).get('nvmet_fix') or {}).get('loaded') or {})
+                  .get('loaded_nvmet') or {})
+        if loaded.get('srcversion') != gcp_manual_compute.NVMET_SRCVERSION:
+            raise ValueError(f'{name}: the worker recorded no pinned nvmet srcversion')
+        hosts[name] = {
+            'kernel': gcp_manual_compute.KERNEL_RELEASE,
+            'nvmet_srcversion': loaded['srcversion'],
+            'nvmet_build_id': loaded['build_id'],
+            'initiator': {
+                'live_transport': live_transport,
+                'device': gcp_manual_compute.INITIATOR_DEVICE,
+                'char_device': True,
+                'modules': {module: {'srcversion': 'rehearsal-record',
+                                     'vermagic': gcp_manual_compute.KERNEL_RELEASE}
+                            for module in modules}}}
+    return {'kernel_release': gcp_manual_compute.KERNEL_RELEASE,
+            'nvmet_srcversion': gcp_manual_compute.NVMET_SRCVERSION,
+            'nvmet_build_id': gcp_manual_compute.NVMET_BUILD_ID,
+            'initiator': {'live_transport': live_transport,
+                          'device': gcp_manual_compute.INITIATOR_DEVICE,
+                          'modules': list(modules)},
+            'hosts': hosts}
+
+
 def fetch(store, key, generation=None, limit=MAX_PACKAGE):
     meta = store.head(key) if generation is None else {'generation': generation}
     data = store.get(key, generation=meta['generation'], max_bytes=limit)

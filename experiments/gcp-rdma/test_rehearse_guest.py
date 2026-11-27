@@ -67,5 +67,28 @@ class RecordedModuleAdmission(unittest.TestCase):
             self.call(self.runtime(), self.package(), observed)
 
 
+class RecordedKernelAdmission(unittest.TestCase):
+    def prepared(self):
+        return {'bench-0': {'nvmet_fix': {'loaded': {'loaded_nvmet': {
+            'srcversion': '9F99AF855591751D53D463D',
+            'build_id': '61aabd36adb3d8a51feb01cd289410d958c68c20'}}}}}
+
+    def test_the_recorded_initiator_passes_the_real_gate(self):
+        import gcp_manual_compute
+        admission = rehearse_guest.record_kernel_admission(self.prepared(), 'rdma')
+        gcp_manual_compute.require_initiator(admission, live_transport='rdma')
+        self.assertEqual(admission['initiator']['device'], '/dev/nvme-fabrics')
+        record = admission['hosts']['bench-0']
+        self.assertEqual(record['nvmet_srcversion'], '9F99AF855591751D53D463D')
+        self.assertEqual(set(record['initiator']['modules']),
+                         {'nvme_fabrics', 'nvme_tcp', 'rdma_cm', 'nvme_rdma'})
+
+    def test_a_worker_without_the_pinned_module_is_refused(self):
+        prepared = self.prepared()
+        prepared['bench-0']['nvmet_fix']['loaded']['loaded_nvmet']['srcversion'] = 'stock'
+        with self.assertRaises(ValueError):
+            rehearse_guest.record_kernel_admission(prepared, 'tcp')
+
+
 if __name__ == '__main__':
     unittest.main()

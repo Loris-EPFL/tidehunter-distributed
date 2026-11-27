@@ -64,6 +64,7 @@ import campaign_manifest
 import gcp_api
 import gcp_manual_compute
 import mailbox_exec
+import rehearse_guest
 import stage2_mechanism
 
 BUCKET = 'mysten-research-bench-artifacts'
@@ -412,6 +413,13 @@ class Rehearsal:
             self.state_path, api, bucket=BUCKET, timeout_seconds=timeout)
         prepared = executor.wait_workers(require=json.loads(
             (self.package / 'package-receipt.json').read_text())['manifest_sha256'])
+        # The containers cannot run `modprobe` or provide `/dev/nvme-fabrics`;
+        # the guest stub records the admission the real `ready` would read and
+        # the real gate judges the record here, before any cell reads the state.
+        admission = rehearse_guest.record_kernel_admission(prepared, 'rdma')
+        gcp_manual_compute.require_initiator(admission, live_transport='rdma')
+        self.state['kernel_admission'] = admission
+        self.state_path.write_text(json.dumps(self.state, indent=2) + '\n')
         self.step('worker ready', True, ', '.join(sorted(prepared)))
 
     # ---- cells ---------------------------------------------------------
