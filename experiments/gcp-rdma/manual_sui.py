@@ -640,7 +640,7 @@ class SuiLauncher:
             raise ValueError('the guest root must be absolute and identical on every host')
         if self.schema is None or not self.schema.is_dir():
             raise ValueError('a native schema from a source-identical local run is required')
-        if self.output.exists():
+        if self.output.exists() or self.lifecycle_root().exists():
             raise ValueError('run output must be fresh')
         if self.stage_dir.exists() and any(self.stage_dir.iterdir()):
             raise ValueError('external stage directory must be fresh')
@@ -721,12 +721,20 @@ class SuiLauncher:
                               + ', '.join(sorted(failed)))
         return failed
 
+    def lifecycle_root(self):
+        """Owner close and cleanup records, beside the run output.
+
+        `run.py` creates the run output itself and refuses an existing one,
+        and the first cleanup gate runs before `run.py` starts.
+        """
+        return self.output.with_name(self.output.name + '-owners')
+
     def write_lifecycle_evidence(self):
         for name, rows in (('owner-stops.json', self.stops),
                            ('owner-cleanup.json', self.cleanups)):
             if not rows:
                 continue
-            path = self.output / name
+            path = self.lifecycle_root() / name
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name(path.name + '.tmp')
             temporary.write_text(json.dumps(rows, indent=2, sort_keys=True) + '\n')
@@ -905,7 +913,8 @@ class SuiLauncher:
     def evidence_name(self, path):
         """Stable object name of one artifact, relative to its local root."""
         path = Path(path)
-        for base, label in ((self.output, ''), (self.config_dir, 'external/')):
+        for base, label in ((self.output, ''), (self.lifecycle_root(), 'owners/'),
+                            (self.config_dir, 'external/')):
             try:
                 return label + str(path.relative_to(base))
             except ValueError:
@@ -935,8 +944,8 @@ class SuiLauncher:
             rows.append(upload_module.artifact(path, self.evidence_name(path)))
         # The owner close and the between-cell cleanup are their own records:
         # a shutdown proof is useful only next to the signal that was used.
-        for path in (self.output / 'owner-stops.json',
-                     self.output / 'owner-cleanup.json'):
+        for path in (self.lifecycle_root() / 'owner-stops.json',
+                     self.lifecycle_root() / 'owner-cleanup.json'):
             if path.is_file():
                 rows.append(upload_module.artifact(path, self.evidence_name(path)))
         return rows
@@ -1024,8 +1033,8 @@ class SuiLauncher:
         a missing path is skipped, never invented.
         """
         rows, seen, skipped = [], set(), []
-        roots = ((self.output, ''), (self.config_dir, 'external/'),
-                 (self.stage_dir, 'stages/'))
+        roots = ((self.output, ''), (self.lifecycle_root(), 'owners/'),
+                 (self.config_dir, 'external/'), (self.stage_dir, 'stages/'))
         for root, label in roots:
             root = Path(root)
             if not root.is_dir():

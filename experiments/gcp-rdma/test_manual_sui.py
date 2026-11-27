@@ -1297,6 +1297,7 @@ class OwnerCloseGate(unittest.TestCase):
         launcher = manual_sui.SuiLauncher.__new__(manual_sui.SuiLauncher)
         launcher.remote = remote
         launcher.output = Path(root) / 'run'
+        launcher.config_dir = Path(root) / 'external'
         launcher.cleanup_root = Path(root) / 'nvmet'
         launcher.external = {'hosts': [
             dict(host='H1', partition=0, commands=[['owner']],
@@ -1320,8 +1321,20 @@ class OwnerCloseGate(unittest.TestCase):
             self.assertFalse(any(command.startswith('kill -')
                                  for command in remote.calls))
             self.assertIn('touch /guest/stop', remote.calls)
-            self.assertTrue((launcher.output / 'owner-stops.json').is_file())
-            self.assertTrue((launcher.output / 'owner-cleanup.json').is_file())
+            owners = launcher.lifecycle_root()
+            self.assertTrue((owners / 'owner-stops.json').is_file())
+            self.assertTrue((owners / 'owner-cleanup.json').is_file())
+            self.assertEqual(launcher.evidence_name(owners / 'owner-stops.json'),
+                             'owners/owner-stops.json')
+
+    def test_the_cleanup_gate_leaves_the_run_output_for_run_py_to_create(self):
+        # run.py refuses an existing output root; the first gate runs before it.
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = self.Remote()
+            launcher = self.launcher(remote, tmp)
+            launcher.cleanup_owners()
+            self.assertFalse(launcher.output.exists())
+            self.assertTrue((launcher.lifecycle_root() / 'owner-cleanup.json').is_file())
 
     def test_a_failed_cleanup_blocks_the_next_owner_start(self):
         with tempfile.TemporaryDirectory() as tmp:
