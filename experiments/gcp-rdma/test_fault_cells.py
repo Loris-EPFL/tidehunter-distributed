@@ -228,6 +228,47 @@ class SnapshotGate(unittest.TestCase):
         self.assertFalse(gate['reached'])
         self.assertIn('exited before', gate['reason'])
 
+    def test_the_gate_records_the_coordinator_wal_bytes(self):
+        """The next run must answer how many value bytes the engine had published.
+
+        `S1-2S-snapshot-native/attempt-3` missed the 8 GiB cadence at its first
+        60 s poll and retained nothing about the written volume. The gate now
+        carries the WAL's allocated bytes (a `set_len` preallocation allocates
+        no blocks, so allocated bytes are the written volume) and their delta
+        from the baseline.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            region.write_text('region v1')
+            wal = run.parent / 'coordinator' / 'wal_0000000000000000'
+            wal.write_bytes(b'x' * 8192)
+            before = wal.stat().st_blocks * 512
+            calls = []
+
+            def sleep(_):
+                calls.append(1)
+                if len(calls) == 1:
+                    with wal.open('ab') as handle:
+                        handle.write(b'y' * 8192)
+                    region.write_text('region v2 with the stored root')
+            with patch.object(fault_cells.time, 'sleep', sleep):
+                gate = self.driver().gate_snapshot(self.child(run), timeout=1)
+        self.assertTrue(gate['reached'], gate)
+        self.assertEqual(gate['wal_allocated_baseline'], before)
+        self.assertGreater(gate['observations'][-1]['wal_allocated_bytes'], before)
+        self.assertGreater(gate['observations'][-1]['wal_allocated_delta'], 0)
+
+    def test_a_coordinator_without_a_wal_reports_no_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            region.write_text('region v1')
+            driver = self.driver()
+            self.assertIsNone(driver._coordinator_wal_bytes(self.child(run)))
+            gate = driver.gate_snapshot(self.child(run), timeout=0.1)
+        self.assertIsNone(gate['wal_allocated_baseline'])
+        self.assertIsNone(gate['observations'][-1]['wal_allocated_bytes'])
+        self.assertIsNone(gate['observations'][-1]['wal_allocated_delta'])
+
 
 class OwnerWAL(unittest.TestCase):
     def cluster(self, views):
