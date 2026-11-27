@@ -174,53 +174,87 @@ class RestartReopen(unittest.TestCase):
                          reopened["backend"]["options"]["external_remote_config"])
         self.assertEqual(node["namespace"], kernel.LAYOUT_NAMESPACES[0])
 
-    def evidence(self, *, tail=3, kind="reopen", instance=12, nqn=None, routes=True):
+    PREVIOUS = [{"controller": "nvme7", "sysfs_device": 1, "sysfs_inode": 101}]
+
+    def present(self):
+        return [dict(row) for row in self.PREVIOUS]
+
+    def evidence(self, *, tail=3, kind="reopen", device=1, inode=202,
+                 instance=7, nqn=None, routes=True, controller=True):
         scope = "aa" * 16
         nqn = nqn or kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"
-        live = {"routes": [
-            {"namespace_identity": {"nqn": nqn, "controller_instance": instance}}]} \
-            if routes else {}
+        identity = {"nqn": nqn, "controller_instance": instance}
+        if controller:
+            identity["controller"] = {"sysfs_device": device, "sysfs_inode": inode}
+        live = {"routes": [{"namespace_identity": identity}]} if routes else {}
         return {"start": {
             "coordinator_open": {"kind": kind, "recovery": {"tail_batches": tail}},
             "live_nvmeof": live}}
 
-    def test_a_non_empty_replay_through_a_fresh_controller_is_clean(self):
-        defect = kernel.reopen_defect(self.evidence(), "aa" * 16, 0, ["nvme7"], "")
+    def defect(self, evidence=None, *, previous=None, present=None, stderr=""):
+        return kernel.reopen_defect(
+            self.evidence() if evidence is None else evidence,
+            "aa" * 16, 0,
+            self.PREVIOUS if previous is None else previous,
+            self.present() if present is None else present,
+            stderr)
+
+    def test_a_recycled_ordinal_with_a_new_controller_is_clean(self):
+        # The kernel frees the nvmeN ordinal with the old controller, so the
+        # replacement normally reuses the same ordinal; identity is the inode.
+        defect = self.defect(self.evidence(instance=7, device=1, inode=202))
         self.assertIsNone(defect)
 
-    def test_an_empty_replay_is_a_defect(self):
-        defect = kernel.reopen_defect(self.evidence(tail=0), "aa" * 16, 0, ["nvme7"], "")
-        self.assertIn("replayed no WAL batch", defect)
-
-    def test_a_reused_pre_restart_controller_is_a_defect(self):
-        defect = kernel.reopen_defect(self.evidence(instance=7), "aa" * 16, 0,
-                                      ["nvme7"], "")
+    def test_the_same_controller_inode_is_a_defect(self):
+        defect = self.defect(self.evidence(instance=9, device=1, inode=101))
         self.assertIn("reused the pre-restart controller", defect)
+
+    def test_a_pre_restart_controller_must_exist_when_the_reopen_starts(self):
+        # The kernel had already dropped the leftover: the check would pass on
+        # the old adoption path, so the proof must fail instead.
+        defect = self.defect(present=[])
+        self.assertIn("no pre-restart controller remained", defect)
+
+    def test_a_route_without_controller_identity_is_a_defect(self):
+        defect = self.defect(self.evidence(controller=False))
+        self.assertIn("no live controller identity", defect)
+
+    def test_an_empty_replay_is_a_defect(self):
+        defect = self.defect(self.evidence(tail=0))
+        self.assertIn("replayed no WAL batch", defect)
 
     def test_the_lost_controller_and_short_read_markers_fail_the_reopen(self):
         for marker in kernel.RESTART_FORBIDDEN_STDERR:
             with self.subTest(marker=marker):
-                defect = kernel.reopen_defect(self.evidence(), "aa" * 16, 0,
-                                              ["nvme7"], "error: " + marker)
+                defect = self.defect(stderr="error: " + marker)
                 self.assertIn(marker, defect)
 
     def test_the_open_must_be_a_reopen_with_a_live_route(self):
-        defect = kernel.reopen_defect(self.evidence(kind="create"), "aa" * 16, 0,
-                                      ["nvme7"], "")
+        defect = self.defect(self.evidence(kind="create"))
         self.assertIn("not 'reopen'", defect)
-        defect = kernel.reopen_defect(self.evidence(routes=False), "aa" * 16, 0,
-                                      ["nvme7"], "")
-        self.assertIn("no live route", defect)
-        defect = kernel.reopen_defect({}, "aa" * 16, 0, ["nvme7"], "")
+        defect = self.defect(self.evidence(routes=False))
+        self.assertIn("no live controller identity", defect)
+        defect = self.defect({})
         self.assertIn("no measurement start boundary", defect)
 
-    def test_scoped_controllers_name_only_their_database_partition(self):
+    def test_controller_identities_use_the_sysfs_inode_not_the_ordinal(self):
         scope = "aa" * 16
         document = {"controllers": {
             "nvme3": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"},
             "nvme4": {"subsysnqn": kernel.LAYOUT_SCOPE + "bb" * 16 + "-p00000000-sub-1"},
-            "nvme5": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000001-sub-1"}}}
-        self.assertEqual(kernel.scoped_controllers(document, scope, 0), ["nvme3"])
+            "nvme5": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000001-sub-1"},
+            # Listed by the inventory but gone from sysfs: no stable identity.
+            "nvme6": {"subsysnqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            class_root = Path(tmp) / "nvme-class"
+            for name in ("nvme3", "nvme5"):
+                (class_root / name).mkdir(parents=True)
+            meta = (class_root / "nvme3").stat()
+            with patch.object(kernel, "NVME_CONTROLLERS", class_root):
+                identities = kernel.controller_identities(document, scope, 0)
+            self.assertEqual([row["controller"] for row in identities], ["nvme3"])
+            self.assertEqual(identities[0]["sysfs_device"], meta.st_dev)
+            self.assertEqual(identities[0]["sysfs_inode"], meta.st_ino)
 
 
 class RestartOrchestration(unittest.TestCase):
@@ -250,6 +284,11 @@ class RestartOrchestration(unittest.TestCase):
         deployment, specs = kernel.campaign_modules()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "restart"
+            class_root = Path(tmp) / "nvme-class"
+            (class_root / "nvme7").mkdir(parents=True)
+            (class_root / "nvme8").mkdir()
+            previous = (class_root / "nvme7").stat()
+            replacement = (class_root / "nvme8").stat()
             events = []
             scope = "aa" * 16
             gate_path = {}
@@ -277,6 +316,8 @@ class RestartOrchestration(unittest.TestCase):
             def reopen(binary, spec, run_root, name):
                 events.append(("coordinator", "reopen"))
                 opened["spec"] = spec
+                # The retired controller is gone; the new one reused its ordinal.
+                (class_root / "nvme7").rmdir()
                 output = Path(run_root) / f"{name}-out"
                 output.mkdir(parents=True)
                 evidence = {"start": {
@@ -284,7 +325,9 @@ class RestartOrchestration(unittest.TestCase):
                                          "recovery": {"tail_batches": 4}},
                     "live_nvmeof": {"routes": [{"namespace_identity": {
                         "nqn": kernel.LAYOUT_SCOPE + scope + "-p00000000-sub-1",
-                        "controller_instance": 12}}]}}}
+                        "controller_instance": 7,
+                        "controller": {"sysfs_device": replacement.st_dev,
+                                       "sysfs_inode": replacement.st_ino}}}]}}}
                 (output / "measurement-read-evidence.json").write_text(
                     json.dumps(evidence))
                 return (subprocess.CompletedProcess([], 0, "", ""),
@@ -303,6 +346,7 @@ class RestartOrchestration(unittest.TestCase):
 
             with patch.object(deployment, "certificates",
                               lambda path, owners: path.mkdir()), \
+                    patch.object(kernel, "NVME_CONTROLLERS", class_root), \
                     patch.object(kernel, "start_owner", side_effect=owner), \
                     patch.object(kernel, "start_coordinator", side_effect=coordinator), \
                     patch.object(kernel, "run_coordinator", side_effect=reopen), \
@@ -310,7 +354,9 @@ class RestartOrchestration(unittest.TestCase):
                                  side_effect=lambda process: process.kill()
                                  or process.wait()), \
                     patch.object(kernel, "inventory",
-                                 side_effect=[controllers(["nvme7"]), controllers([])]), \
+                                 side_effect=[controllers(["nvme7"]),
+                                              controllers(["nvme7"]),
+                                              controllers([])]), \
                     patch.object(kernel, "database_scope",
                                  side_effect=lambda nodes: {
                                      kernel.owner_name(node): scope for node in nodes}), \
@@ -328,7 +374,9 @@ class RestartOrchestration(unittest.TestCase):
             self.assertIn(("kill", "owner"), events)
             self.assertTrue(evidence["complete"])
             self.assertEqual(evidence["tail_batches"], 4)
-            self.assertEqual(evidence["previous_controllers"], ["nvme7"])
+            self.assertEqual(evidence["previous_controllers"], [{
+                "controller": "nvme7", "sysfs_device": previous.st_dev,
+                "sysfs_inode": previous.st_ino}])
             self.assertEqual(evidence["killed_returncode"], -9)
             # The killed run stops at a gate; the reopen is one-owner and ungated.
             killed = json.loads((root / "owner-restart.json").read_text())
@@ -344,6 +392,34 @@ class RestartOrchestration(unittest.TestCase):
             self.assertTrue(gate_path["path"].is_file())
             self.assertTrue(specs.receipt_path(root, "native", 0).is_file())
             self.assertFalse(specs.receipt_path(root, "native", 1).exists())
+
+    def test_a_gate_timeout_kills_the_started_coordinator(self):
+        deployment, specs = kernel.campaign_modules()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "restart"
+            events = []
+            coordinator_process = {}
+
+            def owner(binary, node, log):
+                Path(node["ready"]).parent.mkdir(parents=True, exist_ok=True)
+                Path(node["ready"]).write_text("ready\n")
+                Path(str(node["ready"]) + ".durability.json").write_text("{}\n")
+                return self.Process("owner", 1001, events)
+
+            def coordinator(binary, spec_path, output, stdout_path, stderr_path):
+                # The write gate never appears, so the proof times out.
+                coordinator_process["p"] = self.Process("coordinator", 4242, events)
+                return coordinator_process["p"]
+
+            with patch.object(deployment, "certificates",
+                              lambda path, owners: path.mkdir()), \
+                    patch.object(kernel, "start_owner", side_effect=owner), \
+                    patch.object(kernel, "start_coordinator", side_effect=coordinator), \
+                    patch.object(kernel, "LAYOUT_SECONDS", 0):
+                with self.assertRaisesRegex(RuntimeError, "write gate expired"):
+                    kernel.restart_positive(deployment, specs, Path("/bin/true"), root)
+            self.assertIn(("kill", "coordinator"), events)
+            self.assertIsNotNone(coordinator_process["p"].returncode)
 
 
 class CampaignModules(unittest.TestCase):

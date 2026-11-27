@@ -32,6 +32,10 @@ LAYOUT_PORT = 24000
 LAYOUT_SECONDS = 180
 LAYOUT_SCOPE = "nqn.2026-01.local.tidehunter:db-"
 CONFIGFS = Path("/sys/kernel/config/nvmet")
+# Kernel controller class. The nvmeN ordinal comes from the kernel's
+# lowest-free IDA and is recycled on delete, so it names a slot, not a
+# controller; identity is the sysfs device/inode pair.
+NVME_CONTROLLERS = Path("/sys/class/nvme")
 
 # The owner-restart proof reuses the single-owner qualification geometry: 8 MiB
 # WAL members in 4 MiB fragments, so the replay crosses both boundaries.
@@ -567,20 +571,48 @@ def restart_spec(specs, document, root, *, case_id, coordinator, gated, reopen):
     return spec
 
 
-def scoped_controllers(document, scope, partition):
-    """The kernel controllers of one database's subsystem on this host."""
+def controller_identities(document, scope, partition):
+    """The sysfs identity of one database's kernel controllers on this host.
+
+    A recycled `nvmeN` ordinal is not identity: the new controller can reuse
+    the slot the retired one freed. The device/inode pair of the controller
+    directory names one kernel object.
+    """
     prefix = f"{LAYOUT_SCOPE}{scope}-p{partition:08x}-"
     controllers = document.get("controllers") or {}
-    return sorted(name for name, facts in controllers.items()
-                  if str((facts or {}).get("subsysnqn", "")).startswith(prefix))
+    identities = []
+    for name in sorted(controllers):
+        if not str((controllers[name] or {}).get("subsysnqn", "")).startswith(prefix):
+            continue
+        try:
+            meta = (NVME_CONTROLLERS / name).stat()
+        except OSError:
+            # A controller the kernel is still creating or deleting has no
+            # stable stat; it is not evidence of a live pre-restart object.
+            continue
+        identities.append({"controller": name, "sysfs_device": meta.st_dev,
+                           "sysfs_inode": meta.st_ino})
+    return identities
 
 
-def reopen_defect(evidence, scope, partition, previous_controllers, stderr):
+def controller_key(entity):
+    """The (device, inode) pair of a controller identity, or None."""
+    device = entity.get("sysfs_device")
+    inode = entity.get("sysfs_inode")
+    if type(device) is int and type(inode) is int:
+        return (device, inode)
+    return None
+
+
+def reopen_defect(evidence, scope, partition, previous_controllers,
+                  present_before_reopen, stderr):
     """The reason a restart reopen is unproven, or None when it is proven.
 
-    `evidence` is the reopened coordinator's `measurement-read-evidence.json`
-    and `previous_controllers` are the kernel controller names captured before
-    the coordinator was killed.
+    `evidence` is the reopened coordinator's `measurement-read-evidence.json`.
+    `previous_controllers` are the scoped sysfs identities captured before the
+    coordinator was killed; `present_before_reopen` are those that still
+    existed when the reopen started, which is what makes the check exercise
+    the old adoption path rather than a controller the kernel already dropped.
     """
     start = evidence.get("start") if isinstance(evidence, dict) else None
     if not isinstance(start, dict):
@@ -592,20 +624,25 @@ def reopen_defect(evidence, scope, partition, previous_controllers, stderr):
     tail = recovery.get("tail_batches")
     if type(tail) is not int or tail <= 0:
         return f"the reopen replayed no WAL batch (tail_batches={tail!r})"
+    previous = {key for key in map(controller_key, previous_controllers) if key}
+    present = {key for key in map(controller_key, present_before_reopen) if key}
+    if not previous & present:
+        return ("no pre-restart controller remained when the reopen started; "
+                "the check cannot prove recovery retired it")
     prefix = f"{LAYOUT_SCOPE}{scope}-p{partition:08x}-"
-    instances = set()
+    reopened = []
     for route in (start.get("live_nvmeof") or {}).get("routes") or []:
         identity = route.get("namespace_identity") or {}
-        instance = identity.get("controller_instance")
-        if str(identity.get("nqn", "")).startswith(prefix) and type(instance) is int:
-            instances.add(instance)
-    if not instances:
-        return "the reopen recorded no live route for its database"
-    previous = {int(name[4:]) for name in previous_controllers
-                if re.fullmatch(r"nvme[0-9]+", str(name))}
-    stale = sorted(instances & previous)
+        if not str(identity.get("nqn", "")).startswith(prefix):
+            continue
+        key = controller_key(identity.get("controller") or {})
+        if key is not None:
+            reopened.append(key)
+    if not reopened:
+        return "the reopen recorded no live controller identity for its database"
+    stale = sorted(set(reopened) & previous)
     if stale:
-        return f"the reopen reused the pre-restart controller instance {stale}"
+        return f"the reopen reused the pre-restart controller {stale}"
     for marker in RESTART_FORBIDDEN_STDERR:
         if marker in stderr:
             return f"the reopen stderr names {marker!r}"
@@ -650,6 +687,7 @@ def restart_positive(deployment, specs, binary, root):
     # The binary refuses a measurement gate whose parent directory is absent.
     gate.parent.mkdir(parents=True, exist_ok=True)
     processes = {}
+    first = None
     evidence = {"schema": 1, "kind": "owner_restart_reopen", "complete": False,
                 "wal_file_bytes": RESTART_WAL_FILE_BYTES}
     try:
@@ -676,7 +714,7 @@ def restart_positive(deployment, specs, binary, root):
                 raise RuntimeError("the coordinator write gate expired")
             time.sleep(0.1)
         scope = database_scope([node])[owner_name(node)]
-        previous = scoped_controllers(inventory(), scope, node["partition"])
+        previous = controller_identities(inventory(), scope, node["partition"])
         if not previous:
             raise RuntimeError(f"the killed coordinator holds no controller for {scope}")
         evidence["previous_controllers"] = previous
@@ -684,6 +722,7 @@ def restart_positive(deployment, specs, binary, root):
         os.killpg(first.pid, signal.SIGKILL)
         first.wait(timeout=60)
         evidence["killed_returncode"] = first.returncode
+        first = None
         # The restart is a new owner incarnation: the old target and its
         # controllers no longer serve, and the ready/receipt files are stale.
         kill_owner(processes.pop(owner_name(node)))
@@ -692,6 +731,9 @@ def restart_positive(deployment, specs, binary, root):
         processes[owner_name(node)] = start_owner(binary, node, log)
         wait_owners([node], processes)
         copy_receipts(nodes, specs, root, namespace, owners=1)
+        # The replay must find the pre-restart controller still present; if the
+        # kernel already dropped it, the check cannot prove it was retired.
+        present = controller_identities(inventory(), scope, node["partition"])
         # Reopen the same coordinator root: recovery must replay, not adopt.
         completed, _path, output = run_coordinator(
             binary, reopened, root, "owner-restart-reopen")
@@ -706,15 +748,16 @@ def restart_positive(deployment, specs, binary, root):
             read_evidence = json.loads(evidence_path.read_text())
         except (OSError, ValueError) as error:
             raise RuntimeError(f"the reopen wrote no read evidence: {error}") from error
-        defect = reopen_defect(read_evidence, scope, node["partition"], previous, stderr)
+        defect = reopen_defect(read_evidence, scope, node["partition"], previous,
+                               present, stderr)
         if defect is not None:
             raise RuntimeError(defect)
         evidence["tail_batches"] = (
             read_evidence["start"]["coordinator_open"]["recovery"]["tail_batches"])
-        remaining = scoped_controllers(inventory(), scope, node["partition"])
+        remaining = controller_identities(inventory(), scope, node["partition"])
         if remaining:
             raise RuntimeError("the reopen left pre-restart controllers: "
-                               + ", ".join(remaining))
+                               + ", ".join(row["controller"] for row in remaining))
         code = stop_owner(processes.pop(owner_name(node)), node)
         if code != 0:
             raise RuntimeError(f"the restarted owner stop exited {code}")
@@ -725,6 +768,14 @@ def restart_positive(deployment, specs, binary, root):
         evidence["complete"] = True
         return evidence
     finally:
+        # A coordinator that is still running owns the database lock and its
+        # controllers; it must not outlive a failed proof into the next step.
+        if first is not None and first.poll() is None:
+            try:
+                first.kill()
+                first.wait(timeout=30)
+            except BaseException:
+                pass
         for process in processes.values():
             if process.poll() is not None:
                 continue
