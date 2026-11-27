@@ -785,8 +785,9 @@ class CellDriver:
         The coordinator's index lives in `cr` (db.rs `CONTROL_REGION_FILE`); the
         snapshot writes a temp and renames it, so a store changes the file's
         size or mtime. The first observation is the baseline (the region also
-        appears at open), and a store counts only after at least `GATE_WRITES`
-        acknowledged writes, so the kill lands on a snapshot taken over data.
+        appears at open); the caller waits for the write gate first, so a store
+        is taken over data. This gate reads only files: the sample file is too
+        large to parse on every poll.
         """
         state = dict(previous=self._snapshot_files(child))
 
@@ -800,8 +801,7 @@ class CellDriver:
                        for name, value in current.items()
                        if previous.get(name) != value}
             state['previous'] = current
-            return dict(reached=(bool(changed) and acknowledged(child.rows()) >= GATE_WRITES),
-                        changed=changed, files=len(current))
+            return dict(reached=bool(changed), changed=changed, files=len(current))
         return self.wait_for(child, predicate, timeout=timeout, poll=0.1,
                              label='snapshot control-region store')
 
@@ -937,8 +937,12 @@ class CellDriver:
         record = dict(name='measure', role='measure', pid=child.process.pid,
                       started_unix_ns=child.started_unix_ns)
         try:
-            gate = (self.gate_writes(child, GATE_WRITES) if cut == 'publication'
-                    else self.gate_snapshot(child))
+            if cut == 'publication':
+                gate = self.gate_writes(child, GATE_WRITES)
+            else:
+                writes = self.gate_writes(child, GATE_WRITES)
+                gate = self.gate_snapshot(child) if writes.get('reached') else writes
+                gate['writes'] = writes
             record['gate'] = gate
             if not gate.get('reached'):
                 raise CellError(f"gate missed: {gate.get('reason')}")
