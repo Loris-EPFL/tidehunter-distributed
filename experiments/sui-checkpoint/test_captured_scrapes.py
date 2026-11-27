@@ -13,6 +13,14 @@ same way (every family and label kept, one bucket per histogram series), with
 `results.json` reduced to the keys the final-metrics validation and summary
 read. The final and foreground scrapes were byte-identical in that attempt, so
 the one scrape per mode serves both.
+
+`s1-1s-adapter-final.prom`, `s1-1s-remote-foreground-cache.prom` and
+`s1-0s-adapter-final.prom` are extractions of the S1-1-synchronous attempt 2
+final scrape, its foreground checkpoint-cache counters, and the settled
+S1-0-synchronous attempt 4 final scrape, each keeping every series of the
+family named in its test. `reopen-native-attempt2.log` keeps the two lines the
+S1-1-native attempt 2 reopen logged: the rpc-store bootstrap and the
+framework's stated ingestion range.
 """
 from pathlib import Path
 import io
@@ -196,6 +204,53 @@ class RealClusterScrape(unittest.TestCase):
             native_write_limit=self.result['native_write_profile_limit'])
 
 
+class ContendedAdapterSample(unittest.TestCase):
+    """A real final scrape taken while the engine's sampler was contended.
+
+    `s1-1s-adapter-final.prom` keeps every `tidehunter_adapter` series of
+    `campaign-hybrid-sui-2026-11-25/stage1/evidence/S1-1-synchronous/attempt-2/
+    remote-final.prom`. Its `live/store/perpetual` namespace carries only the
+    four sampler-status series: the engine copies each lock domain under
+    `try_lock` and marks the whole snapshot unavailable rather than blocking a
+    writer (`remote_db/concurrent.rs::try_visit_write_metrics`), and a
+    synchronous-tier publisher held one for that tick. The S1-0-synchronous
+    cell settled in all three namespaces; `s1-0s-adapter-final.prom` is the
+    same extraction from its final scrape.
+    """
+
+    def load(self, name):
+        return analyze.parse_metrics((FIXTURES / name).read_text())
+
+    def test_the_contended_scrape_carries_only_the_sampler_status(self):
+        counters = analyze.adapter_stats(self.load('s1-1s-adapter-final.prom'))
+        self.assertEqual(sorted(counters), sorted(NAMESPACES))
+        self.assertEqual(sorted(counters['live/store/perpetual']),
+                         ['local_sample_age_ms', 'local_sample_available',
+                          'local_sample_generation', 'local_sampler_stopped'])
+        self.assertEqual(counters['live/store/perpetual']['local_sample_available'], 0)
+        self.assertEqual(counters['live/store/perpetual']['local_sampler_stopped'], 0)
+        self.assertEqual(len(counters['live/checkpoints']), 145)
+        self.assertEqual(len(counters['live/store/epoch_0']), 145)
+
+    def test_only_a_settled_sample_is_a_usable_adapter_population(self):
+        self.assertEqual(
+            run.adapter_sample_error(self.load('s1-1s-adapter-final.prom'), NAMESPACES),
+            'live/store/perpetual: no usable adapter sample (last sample 1753 ms old)')
+        self.assertIsNone(
+            run.adapter_sample_error(self.load('s1-0s-adapter-final.prom'), NAMESPACES))
+
+    def test_the_coverage_gate_names_the_database_and_the_missing_family(self):
+        native = self.load('attempt2-native-final.prom')
+        with self.assertRaisesRegex(
+                ValueError,
+                'coverage: live/store/perpetual lacks: bulk_read_calls'):
+            run.validate_final_metrics(
+                self.load('s1-1s-adapter-final.prom'), native,
+                {'native': native, 'remote': self.load('s1-1s-remote-foreground-cache.prom')},
+                schema=NAMESPACES, databases={}, read_limit=0, write_limit=0,
+                native_write_limit=0)
+
+
 class PreCertificationFreshness(unittest.TestCase):
     """The final cut compares with the last replay scrape, not with itself.
 
@@ -306,12 +361,49 @@ class PreCertificationFreshness(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'regressed'):
             self.wait(['\n'.join(lines) + '\n'], baseline=baseline)
 
+    def contended(self, text):
+        """Replace the perpetual adapter block with the real contended sample."""
+        kept = [line for line in text.splitlines()
+                if not line.startswith('tidehunter_adapter{namespace="live/store/perpetual"')]
+        real = [line for line in
+                (FIXTURES / 's1-1s-adapter-final.prom').read_text().splitlines()
+                if line.startswith('tidehunter_adapter{namespace="live/store/perpetual"')]
+        self.assertEqual(len(real), 4)
+        return '\n'.join(kept + real) + '\n'
+
+    def test_the_real_contended_scrape_is_retried_until_the_sampler_settles(self):
+        settled = self.recorded(self.text(self.FINAL))
+        contended = self.recorded(self.contended(self.text(self.FINAL)))
+        observations = []
+        text, cut = self.wait([contended, settled],
+                              baseline=self.recorded(self.text(self.FOREGROUND)),
+                              observations=observations)
+        self.assertEqual(text, settled)
+        self.assertEqual(cut['final']['live']['completed_read_ops'],
+                         analyze.metric_cut(analyze.parse_metrics(settled),
+                                            self.NAMESPACES, remote=True)
+                         ['live']['completed_read_ops'])
+        self.assertIn('live/store/perpetual: no usable adapter sample',
+                      observations[0]['adapter_unavailable'])
+        self.assertEqual(self.retained, settled)
+
+    def test_a_permanently_contended_sample_never_qualifies_the_cut(self):
+        contended = self.recorded(self.contended(self.text(self.FINAL)))
+        observations = []
+        with self.assertRaisesRegex(TimeoutError, 'no usable adapter sample'):
+            self.wait([contended], baseline=self.recorded(self.text(self.FOREGROUND)),
+                      budget=0.5, observations=observations)
+        self.assertIn('adapter_unavailable', observations[-1])
+
     def test_lifecycle_and_hold_cells_keep_a_valid_cut(self):
         final = self.recorded(self.text(self.FINAL))
         _, cut = self.wait([final], baseline=self.recorded(self.text(self.FOREGROUND)))
         lifecycle = dict(status='clean-reopen-verified', audit_reopen={'equal': True},
                          tail_replay={'state_unchanged': True}, durable_cut={'tracked': True},
-                         no_new_export={'available': True}, tail_checkpoints=64)
+                         no_new_export={'available': True}, tail_checkpoints=64,
+                         reopen={'rpc_index_catchup': {
+                             'status': 'persisted-watermark-at-frozen-tip',
+                             'committer_batches': {}}})
         hold = dict(seconds=1800, requested_seconds=1800,
                     disk_samples=[{'namespace': 'a'}, {'namespace': 'a'}],
                     final={'databases': ['a']}, final_metrics_available=True)

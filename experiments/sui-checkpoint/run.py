@@ -207,11 +207,17 @@ def wait_for_final_metrics(child, shards, address, namespaces, *, remote, end, d
                 raise RuntimeError('final metrics scrape passed the certified tip: '
                                    + freshness_summary(observed, unavailable_observations, observations))
         try:
-            current = metric_cut(parse_metrics(text), namespaces, remote=remote)
+            decoded = parse_metrics(text)
+            current = metric_cut(decoded, namespaces, remote=remote)
         except MetricCutUnavailable as unavailable:
             unavailable_observations += 1
             record(dict(seconds=time.monotonic() - start, unavailable=True,
                         reason=str(unavailable)))
+            time.sleep(min(.1, max(0, end - time.monotonic())))
+            continue
+        sample_error = adapter_sample_error(decoded, namespaces)
+        if sample_error is not None:
+            record(dict(seconds=time.monotonic() - start, adapter_unavailable=sample_error))
             time.sleep(min(.1, max(0, end - time.monotonic())))
             continue
         record(dict(seconds=time.monotonic() - start,
@@ -686,6 +692,53 @@ REQUIRED_ADAPTER_STATS = frozenset((
     'write_profile_sampled_requests'))
 
 
+def adapter_sample_error(values, namespaces):
+    """Why one scrape carries no usable adapter sample for a selected database.
+
+    The engine copies each lock domain under `try_lock`, so a scrape that lands
+    while a writer holds one is marked `local_sample_available=0` instead of
+    blocking the writer; the sampler republishes on its next one-second tick.
+    Such a scrape carries no adapter counters at all, so a final scrape must be
+    taken from a settled sampler rather than from whichever scrape came first.
+    """
+    from analyze import adapter_stats
+    counters = adapter_stats(values)
+    missing = sorted(set(namespaces) - set(counters))
+    if missing:
+        return 'adapter counters absent for: ' + ', '.join(missing)
+    for name in sorted(namespaces):
+        stats = counters[name]
+        if stats.get('local_sampler_stopped') == 1:
+            return f'{name}: the adapter sampler stopped'
+        if stats.get('local_sample_available') != 1:
+            age = stats.get('local_sample_age_ms')
+            return (f'{name}: no usable adapter sample'
+                    + ('' if age is None else f' (last sample {age:.0f} ms old)'))
+    return None
+
+
+def adapter_population_error(counters, schema, read_limit, write_limit):
+    """Name the first selected database that lacks a required adapter family."""
+    unselected = sorted(set(counters) - set(schema))
+    if unselected:
+        return 'adapter counters name unselected databases: ' + ', '.join(unselected)
+    absent = sorted(set(schema) - set(counters))
+    if absent:
+        return 'adapter counters absent for: ' + ', '.join(absent)
+    for name in sorted(counters):
+        stats = counters[name]
+        lacking = sorted(REQUIRED_ADAPTER_STATS - set(stats))
+        if lacking:
+            return f'{name} lacks: ' + ', '.join(lacking)
+        if stats['remote_timing_available'] != 1:
+            return f'{name} reports remote timing unavailable'
+        if stats['read_profile_limit'] != read_limit or stats['write_profile_limit'] != write_limit:
+            return (f'{name} profile limits {stats["read_profile_limit"]:.0f}/'
+                    f'{stats["write_profile_limit"]:.0f} differ from the requested '
+                    f'{read_limit}/{write_limit}')
+    return None
+
+
 def validate_final_metrics(remote_values, native_values, foreground_values, *,
                            schema, databases, read_limit, write_limit,
                            native_write_limit):
@@ -698,14 +751,11 @@ def validate_final_metrics(remote_values, native_values, foreground_values, *,
     """
     from analyze import adapter_stats, checkpoint_sequence_cache_stats
     counters = adapter_stats(remote_values)
-    if counters and (set(counters) != set(schema)
-            or any(not REQUIRED_ADAPTER_STATS.issubset(stats)
-                   for stats in counters.values())
-            or any(stats['remote_timing_available'] != 1
-                   or stats['read_profile_limit'] != read_limit
-                   or stats['write_profile_limit'] != write_limit
-                   for stats in counters.values())):
-        raise ValueError('API/key/RPC/cache/stage instrumentation lacks selected DB coverage')
+    if counters:
+        error = adapter_population_error(counters, schema, read_limit, write_limit)
+        if error is not None:
+            raise ValueError('API/key/RPC/cache/stage instrumentation lacks selected DB '
+                             'coverage: ' + error)
     if counters and any(stats['scalar_read_ns_available'] != int(read_limit > 0)
            or stats['read_index_ns_available'] != int(read_limit > 0)
            for stats in counters.values()):

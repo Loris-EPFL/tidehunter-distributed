@@ -1,0 +1,4 @@
+checkpoint_sequence_lookup_cache{stat="backend_gets"} 1777
+checkpoint_sequence_lookup_cache{stat="busy_bypasses"} 0
+checkpoint_sequence_lookup_cache{stat="hits"} 1824
+checkpoint_sequence_lookup_cache{stat="misses"} 1777

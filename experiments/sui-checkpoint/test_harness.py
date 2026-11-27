@@ -1208,10 +1208,13 @@ class AggregateMetricCut(unittest.TestCase):
     """
 
     def scrape(self, *, reads=10, connects=1, keyspace='store', db='store', extra='',
-               watermark=7):
+               watermark=7, sample=1):
         db_label = f',db="{db}"' if db else ''
         return '\n'.join([
             f'last_executed_checkpoint {watermark}',
+            f'tidehunter_adapter{{namespace="live/store",stat="local_sample_available"}} {sample}',
+            'tidehunter_adapter{namespace="live/store",stat="local_sample_age_ms"} 500',
+            'tidehunter_adapter{namespace="live/store",stat="local_sampler_stopped"} 0',
             f'tidehunter_nvmeof_live_completed_read_ops_total {reads}',
             'tidehunter_nvmeof_live_completed_read_bytes_total 4096',
             'tidehunter_nvmeof_live_read_io_samples_total 4',
@@ -1359,6 +1362,20 @@ class AggregateMetricCut(unittest.TestCase):
                               baseline=self.scrape(), budget=30)
         self.assertEqual(len(cut['observations']), run.FINAL_METRIC_OBSERVATION_LIMIT)
         self.assertEqual(cut['final']['live']['completed_read_ops'], 11)
+
+    def test_a_contended_adapter_sample_is_retried_before_acceptance(self):
+        observations = []
+        text, cut = self.wait([self.scrape(reads=11, sample=0), self.scrape(reads=11)],
+                              baseline=self.scrape(), observations=observations)
+        self.assertEqual(text, self.scrape(reads=11))
+        self.assertEqual(cut['final']['live']['completed_read_ops'], 11)
+        self.assertEqual(observations[0]['adapter_unavailable'],
+                         'live/store: no usable adapter sample (last sample 500 ms old)')
+        stopped = []
+        with self.assertRaisesRegex(TimeoutError, 'no usable adapter sample'):
+            self.wait([self.scrape(sample=0)], baseline=self.scrape(), budget=0.5,
+                      observations=stopped)
+        self.assertIn('adapter_unavailable', stopped[-1])
 
     def test_missing_coordinator_namespace_is_retried_not_accepted(self):
         with self.assertRaises(TimeoutError):
