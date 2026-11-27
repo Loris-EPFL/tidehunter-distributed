@@ -1,0 +1,25 @@
+{
+ "schema": 1,
+ "source": "gs://mysten-research-bench-artifacts/campaign-hybrid-sui-2026-11-25/stage1/evidence/S1-5S-contend-native/attempt-3/receipt.json",
+ "note": "the fleet-A contend fence record as the pre-fix driver wrote it: no coordinator start clocks, no new-writer fence instant, so exclusivity cannot be judged",
+ "fence": {
+  "case": "contend",
+  "first_refusal_row": null,
+  "last_success_row": 89889,
+  "no_success_after_refusal": false,
+  "writers": 2,
+  "typed_refusal": true,
+  "refusal_source": "coordinator log",
+  "refusal_text": "kv-research: measurement end boundary failed: leased adoption boundary observed a failed or poisoned live client; backend shutdown failed: coordinator drain failed: Io(Custom { kind: Other, error: \"write core requires recovery; first causal failure: owner=Some(1) batch=Some(BatchVersion { epoch: 1, sequence: 89899 }) stage=live_group: coordinator lease lapsed on owner partition 1\" }); workload recorded 0 timeout/unknown and 975646 error/wrong-value outcomes",
+  "resumed_unix_ns": 1795817975435149251,
+  "first_acknowledged": 24354,
+  "second_acknowledged": 218861,
+  "stale_measurement_rows_excerpt": 400
+ },
+ "new_writer": {
+  "measurement_rows": 284398,
+  "measurement_successes": 218862,
+  "first_success_completed_ns": 1624106620
+ },
+ "stale_rows_excerpt": 600
+}

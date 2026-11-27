@@ -29,6 +29,7 @@ built from this file cannot be mistaken for a Sui-adapter result.
 """
 import argparse
 import copy
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -453,21 +454,25 @@ def read_rows(path):
     """Completed rows of `samples.csv`/`samples.csv.tmp`, header-keyed.
 
     One parser for the gate counters and the verdicts: a row with a different
-    field count is incomplete and skipped.
+    field count is incomplete and skipped. Fields are parsed as CSV, not split
+    on commas: `error_kind` carries the engine's typed refusal text, which
+    contains commas and is quoted by the writer, so a naive split dropped
+    exactly the refusal rows the fence verdict reads (fleet A's S1-5S receipts
+    recorded `first_refusal_row: null` for that reason).
     """
     path = Path(path)
     if not path.is_file():
         return []
-    header = None
     result = []
-    for line in path.read_text(errors='replace').splitlines():
+    with path.open(newline='', errors='replace') as stream:
+        reader = csv.reader(stream)
+        header = next(reader, None)
         if header is None:
-            header = line.split(',')
-            continue
-        values = line.split(',')
-        if len(values) != len(header):
-            continue
-        result.append(dict(zip(header, values)))
+            return []
+        for values in reader:
+            if len(values) != len(header):
+                continue
+            result.append(dict(zip(header, values)))
     return result
 
 
