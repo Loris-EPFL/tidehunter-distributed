@@ -816,6 +816,35 @@ class LifecycleChecks(unittest.TestCase):
             self.assertEqual(paths, {'live/checkpoints': direct,
                                      'live/store/perpetual': nested})
 
+    def lifecycle(self, tmp, tier):
+        output = Path(tmp) / 'out'
+        output.mkdir()
+        (output / 'remote-final.prom').write_text('')
+        adapter = {'live/checkpoints': {'write_commit_calls': 0}}
+        with patch.object(run, 'reopen', return_value=(dict(seconds=1.0), '')), \
+                patch.object(run, 'audit', return_value=dict(databases={}, rocksdb={})), \
+                patch.object(analyze, 'adapter_stats', return_value=adapter), \
+                patch.object(analyze, 'live_nvmeof_stats',
+                             return_value=dict(available=False, counters={})):
+            return run.lifecycle_checks(
+                None, bins=Path(tmp), root=Path(tmp), output=output,
+                remote_root=Path(tmp) / 'remote', namespaces={'live/checkpoints'},
+                address='rpc', metrics_address='metrics', producer_address='producer',
+                tip=1775, digest='D', bound=1776, extra={}, schemas={},
+                native_root=Path(tmp), config_path=Path(tmp), env={}, tier=tier,
+                audit_before=dict(databases={}, rocksdb={}))
+
+    def test_a_synchronous_reopen_has_no_durable_cut_record(self):
+        # durable_cut.rs tracks Native-tier writes only; synchronous writes none.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.lifecycle(tmp, 'synchronous')
+        self.assertFalse(result['durable_cut']['tracked'])
+        self.assertEqual(result['durable_cut']['namespaces'],
+                         {'live/checkpoints': dict(tracked=False, record=None)})
+        with tempfile.TemporaryDirectory() as tmp, \
+                self.assertRaisesRegex(ValueError, 'durable-cut record not found'):
+            self.lifecycle(tmp, 'native')
+
     def live(self, exposed, observed=2, fixtures=0):
         return dict(available=True, counters={
             'target_exposed_total': exposed, 'target_observed_partitions': observed,

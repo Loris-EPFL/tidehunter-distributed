@@ -1211,9 +1211,11 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
                      tail_checkpoints=64):
     """S1-1/S1-8: clean reopen, no new export, unchanged durable cut, same state."""
     from analyze import adapter_stats, live_nvmeof_stats, parse_metrics
+    # Only Native-tier writes are tracked by a durable cut (durable_cut.rs); a
+    # synchronous database writes no record, so its absence is the expected state.
     paths = durable_cut_paths(remote_root, namespaces)
     missing = sorted(set(namespaces) - set(paths))
-    if missing:
+    if missing and tier == 'native':
         raise ValueError('durable-cut record not found for namespace(s): '
                          + ', '.join(missing) + f' under {remote_root}')
     before_records = {name: durable_cut_record(path) for name, path in paths.items()}
@@ -1223,8 +1225,12 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
                              producer_address=producer_address, tip=tip,
                              digest=digest, bound=bound, extra=extra,
                              tail_checkpoints=tail_checkpoints)
+    if set(durable_cut_paths(remote_root, namespaces)) != set(paths):
+        raise ValueError('the set of durable-cut records changed across the reopen')
     after_records = {name: durable_cut_record(path) for name, path in paths.items()}
     cut = durable_cut_comparison(before_records, after_records)
+    for name in missing:
+        cut['namespaces'][name] = dict(tracked=False, record=None)
     if tier == 'native' and not cut['tracked']:
         raise ValueError('the native tier tracks a durable cut; none was recorded')
     exports = exports_comparison(before_live, live_nvmeof_stats(parse_metrics(metrics)))
