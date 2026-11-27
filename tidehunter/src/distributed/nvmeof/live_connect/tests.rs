@@ -1287,6 +1287,78 @@ fn adopt_reuses_the_live_controller_and_keeps_its_intent() {
     );
 }
 
+/// A recovery read must not reuse the controller a killed coordinator left on
+/// the subsystem the restarted owner replaced. The non-adopting retire removes
+/// both the controller and its intent; the write path still adopts.
+#[test]
+fn recovery_retires_its_identity_while_the_write_path_still_adopts() {
+    let temp = tempdir::TempDir::new("adopt-recovery-retire").unwrap();
+    let (registry, root) = adoption_registry(temp.path());
+    let target = adoption_target("nqn.2026-01.test:wal", 1);
+    let leftover = fixture_controller(
+        &root,
+        9,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let leftover_intent = registry.reserve(&adoption_intent(&target)).unwrap();
+    registry.reconcile().unwrap();
+    assert!(
+        leftover.exists() && leftover_intent.exists(),
+        "the write-mode reconcile keeps a live controller and its intent"
+    );
+    let deadline = Instant::now() + PROGRESS_CAP;
+    let remover = remove_controller_when_deleted(leftover.clone());
+    registry
+        .retire_identity(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("a recovery read retires its own identity");
+    remover.join().unwrap();
+    assert!(
+        !leftover.exists(),
+        "a recovery read must not bind the pre-restart controller: {}",
+        leftover.display()
+    );
+    assert!(
+        !leftover_intent.exists(),
+        "the retired intent must not block the fresh recovery connect: {}",
+        leftover_intent.display()
+    );
+    let fresh = registry
+        .reserve(&adoption_intent(&target))
+        .expect("the retired intent no longer conflicts with a fresh connect");
+    registry.remove_intent(&fresh).unwrap();
+    // The write path keeps adoption: the same live fixture is reused.
+    let write_controller = fixture_controller(
+        &root,
+        11,
+        &target,
+        ADOPT_HOST,
+        ADOPT_HOST_ID,
+        "live",
+        target.geometry,
+    );
+    let write_intent = registry.reserve(&adoption_intent(&target)).unwrap();
+    let mut adopted = registry
+        .try_adopt_controller(&target, ADOPT_HOST, ADOPT_HOST_ID, deadline)
+        .expect("the write path adopts a live matching controller")
+        .expect("a live controller with its intent is adoptable");
+    assert_eq!(
+        adopted.instance(),
+        11,
+        "the write path must reuse the recorded controller, never create one"
+    );
+    assert!(
+        write_controller.exists() && write_intent.exists(),
+        "adoption keeps both the controller and its durable intent"
+    );
+    let remover = remove_controller_when_deleted(write_controller);
+    adopted.disconnect(deadline).unwrap();
+    remover.join().unwrap();
+}
+
 #[test]
 fn geometry_mismatch_at_reconcile_retires_the_controller_and_removes_the_intent() {
     let temp = tempdir::TempDir::new("adopt-geometry-reconcile").unwrap();
@@ -1819,6 +1891,90 @@ fn resolver_verify_types_a_vanished_or_replaced_controller_as_lost() {
     assert!(crate::distributed::nvmeof::live_namespace::controller_lost(
         &error
     ));
+}
+
+/// A controller the kernel still connects is not ready: the resolver waits
+/// within its deadline instead of binding the disk or failing it as lost. An
+/// identity mismatch stays fatal.
+#[test]
+fn resolver_waits_for_a_connecting_controller_and_keeps_identity_fatal() {
+    let temp = tempdir::TempDir::new("resolver-wait-live").unwrap();
+    let controllers = temp.path().join("controllers");
+    let controller = controllers.join("nvme7");
+    std::fs::create_dir_all(&controller).unwrap();
+    let target = LiveConnectTarget {
+        nqn: "nqn.2026-01.test:sub".into(),
+        uuid: [1; 16],
+        nsid: 1,
+        bytes: 4096,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: Default::default(),
+    };
+    let host_nqn = "nqn.2026-01.test:host";
+    let host_id = [2; 16];
+    let write = |state: &str| {
+        std::fs::write(controller.join("subsysnqn"), "nqn.2026-01.test:sub\n").unwrap();
+        std::fs::write(controller.join("transport"), "tcp\n").unwrap();
+        std::fs::write(controller.join("hostnqn"), format!("{host_nqn}\n")).unwrap();
+        std::fs::write(
+            controller.join("hostid"),
+            "02020202-0202-0202-0202-020202020202\n",
+        )
+        .unwrap();
+        std::fs::write(
+            controller.join("address"),
+            "traddr=127.0.0.1,trsvcid=4420\n",
+        )
+        .unwrap();
+        std::fs::write(controller.join("state"), format!("{state}\n")).unwrap();
+    };
+    write("connecting");
+    let directory = File::open(&controller).unwrap();
+    let metadata = directory.metadata().unwrap();
+    let resolver = LiveNamespaceResolver {
+        target: target.clone(),
+        host_nqn: host_nqn.into(),
+        host_id,
+        name: "nvme7".into(),
+        directory,
+        inode: metadata.ino(),
+        device: metadata.dev(),
+        queue: OnceLock::new(),
+        controller_root: controllers.clone(),
+        udev_queue: temp.path().join("no-udev-queue"),
+        keep_alive_tmo: KEEP_ALIVE_TMO_SECS,
+    };
+    // The bounded wait ends at its own deadline and never reports a loss.
+    let error = resolver
+        .wait_live(Instant::now() + EXPECTED_TIMEOUT)
+        .expect_err("a controller the kernel still connects is not ready");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::TimedOut,
+        "readiness waits out the deadline; it does not fail as lost: {error}"
+    );
+    // The same controller becomes ready when the kernel turns it live.
+    write("live");
+    resolver
+        .wait_live(Instant::now() + PROGRESS_CAP)
+        .expect("a live controller is ready");
+    // A different subsystem identity is a real mismatch, even when live.
+    std::fs::write(controller.join("subsysnqn"), "nqn.2026-01.test:other\n").unwrap();
+    let error = resolver
+        .wait_live(Instant::now() + PROGRESS_CAP)
+        .expect_err("a changed subsystem identity is fatal");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::InvalidData,
+        "the mismatch keeps its fatal class: {error}"
+    );
+    assert!(
+        !crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "a live controller with another subsystem is not a lost controller: {error}"
+    );
 }
 
 /// The keep-alive never outlasts the resume budget it was chosen for.

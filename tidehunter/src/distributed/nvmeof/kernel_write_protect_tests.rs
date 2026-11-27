@@ -5,7 +5,9 @@
 //! Ignored by default: it needs root, `nvmet`, `nvmet-tcp`, `nvme-tcp`, a
 //! mounted configfs and a loopback listener. CI runs it in the kernel proof
 //! job. The fixture is a real configfs target, never the ordinary-file model.
-use super::live_connect::{LiveConnectTarget, LiveConnectionRegistry, RegistryMode};
+use super::live_connect::{
+    ControllerAdoption, LiveConnectTarget, LiveConnectionRegistry, RegistryMode,
+};
 use super::live_namespace::LiveNamespaceAccess;
 use super::live_storage::{FILES_PER_SUBSYSTEM, wal_export_name};
 use super::live_target::{LiveFileIdentity, LiveTargetManager};
@@ -95,6 +97,9 @@ fn write_protect_blocks_a_remote_write_and_keeps_the_export() {
             &config.host_nqn,
             rand::random::<[u8; 16]>(),
             LiveNamespaceAccess::ReadWrite,
+            // An admin-only proof owns no namespace I/O; never adopt another
+            // process's controller.
+            ControllerAdoption::Fresh,
             deadline,
         )
         .expect("connect a remote controller");

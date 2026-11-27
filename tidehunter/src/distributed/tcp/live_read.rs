@@ -26,7 +26,7 @@
 use super::LiveRecordLocation;
 use super::{Client, TcpError};
 use crate::distributed::hybrid::position::VersionPosition;
-use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
+use crate::distributed::nvmeof::live_connect::{ControllerAdoption, LiveConnectTarget};
 use crate::distributed::nvmeof::live_io::{
     LiveCompletion, LiveIo, LiveIoError, LiveIoResult, LiveIoStats, LiveSubmitOutcome,
     NamespaceSlot,
@@ -1490,6 +1490,7 @@ impl LiveReadCache {
                 &config.host_nqn,
                 config.host_id,
                 access,
+                ControllerAdoption::Adopt,
                 connect_deadline,
                 (
                     location.segment.partition,

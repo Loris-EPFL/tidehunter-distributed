@@ -257,6 +257,24 @@ impl LiveConnectionRegistry {
         }
     }
 
+    /// Every intent recorded for one controller identity.
+    fn identity_intents(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+    ) -> io::Result<Vec<(PathBuf, Intent)>> {
+        Ok(self
+            .intents()?
+            .into_iter()
+            .filter(|(_, intent)| {
+                intent.target.nqn == target.nqn
+                    && intent.host_nqn == host_nqn
+                    && intent.host_id == host_id
+            })
+            .collect())
+    }
+
     /// Keep or remove only the intents of one identity. The `-EALREADY`
     /// fallback uses this so it can never touch another subsystem's in-flight
     /// connect in the same registry.
@@ -267,14 +285,8 @@ impl LiveConnectionRegistry {
         host_id: [u8; 16],
         deadline: Instant,
     ) -> io::Result<()> {
-        for (path, intent) in self.intents()? {
+        for (path, intent) in self.identity_intents(target, host_nqn, host_id)? {
             remaining(deadline)?;
-            if intent.target.nqn != target.nqn
-                || intent.host_nqn != host_nqn
-                || intent.host_id != host_id
-            {
-                continue;
-            }
             match self.inner.mode {
                 RegistryMode::Retire => {
                     self.reconcile_retire_intent(&path, &intent, deadline)?;
@@ -283,6 +295,24 @@ impl LiveConnectionRegistry {
                     self.keep_one_matching_controller(&path, &intent, deadline)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Retire the intent and every controller of one identity before a
+    /// non-adopting connect. A recovery read must never reuse a controller an
+    /// earlier process left behind, and the durable intent would otherwise
+    /// block `reserve`.
+    pub(super) fn retire_identity(
+        &self,
+        target: &LiveConnectTarget,
+        host_nqn: &str,
+        host_id: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        for (path, intent) in self.identity_intents(target, host_nqn, host_id)? {
+            remaining(deadline)?;
+            self.reconcile_retire_intent(&path, &intent, deadline)?;
         }
         Ok(())
     }
@@ -645,15 +675,16 @@ impl LiveConnectionRegistry {
         self.inner.keep_alive_tmo
     }
 
-    pub fn connect(
+    pub(crate) fn connect(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
-        LiveController::connect(self, target, host_nqn, host_id, access, deadline)
+        LiveController::connect(self, target, host_nqn, host_id, access, adoption, deadline)
     }
     /// Connect and verify the controller alone, for admin-only users such as
     /// the commissioning write-protect path.

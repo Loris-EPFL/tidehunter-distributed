@@ -1,7 +1,8 @@
 //! Bounded controller sharing. Connection setup and shutdown are blocking and
 //! must run outside the reactor. A cached lease needs no pool lock to open I/O.
 use super::live_connect::{
-    LiveConnectTarget, LiveConnectionRegistry, LiveController, LiveNamespaceResolver,
+    ControllerAdoption, LiveConnectTarget, LiveConnectionRegistry, LiveController,
+    LiveNamespaceResolver,
 };
 use super::live_metrics::LiveControllerEvidence;
 use super::live_namespace::{LiveNamespace, LiveNamespaceAccess, LiveNamespaceBinding};
@@ -287,10 +288,11 @@ pub struct LiveControllerPool {
     changed: Condvar,
     #[cfg(any(test, feature = "test-utils"))]
     local_targets: Mutex<HashMap<LocalTargetKey, std::path::PathBuf>>,
-    /// Test only: the next connect reports a controller the kernel stopped,
-    /// exactly as a first-connect verify does.
+    /// Test only: the next connects report a controller the kernel stopped,
+    /// exactly as a first-connect verify does. A count keeps a retry budget
+    /// observable: the pool must consume exactly one per lost connect.
     #[cfg(test)]
-    fail_next_connect_lost: std::sync::atomic::AtomicBool,
+    fail_next_connect_lost: std::sync::atomic::AtomicU32,
 }
 impl LiveControllerPool {
     /// Local-file pool fixture. It does not create or qualify a kernel controller.
@@ -407,7 +409,7 @@ impl LiveControllerPool {
             #[cfg(any(test, feature = "test-utils"))]
             local_targets: Mutex::new(HashMap::new()),
             #[cfg(test)]
-            fail_next_connect_lost: std::sync::atomic::AtomicBool::new(false),
+            fail_next_connect_lost: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -601,7 +603,16 @@ impl LiveControllerPool {
     #[cfg(test)]
     pub(crate) fn fail_next_connect_lost(&self) {
         self.fail_next_connect_lost
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test only: whether an armed lost-connect remains unconsumed. A retry
+    /// budget test reads it to prove every attempt reached the connect.
+    #[cfg(test)]
+    pub(crate) fn connect_loss_pending(&self) -> bool {
+        self.fail_next_connect_lost
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
     }
 
     /// Whether the subsystem's cached controller is verifiably not live. Reads
@@ -660,18 +671,21 @@ impl LiveControllerPool {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
     ) -> io::Result<(LiveController, LiveNamespaceBinding)> {
         #[cfg(test)]
         if self
             .fail_next_connect_lost
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+            > 0
         {
             return Err(crate::distributed::nvmeof::live_namespace::controller_lost_error());
         }
@@ -700,7 +714,7 @@ impl LiveControllerPool {
             ));
         }
         self.registry
-            .connect(target, host_nqn, host_id, access, deadline)
+            .connect(target, host_nqn, host_id, access, adoption, deadline)
     }
 
     /// Must run on a bounded setup worker, never the reactor. Existing in-flight
@@ -713,8 +727,16 @@ impl LiveControllerPool {
         access: LiveNamespaceAccess,
         deadline: Instant,
     ) -> io::Result<(Arc<LiveControllerLease>, LivePoolAcquisition)> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, None)
-            .map(|(lease, acquisition, _)| (lease, acquisition))
+        self.acquire_inner(
+            target,
+            host_nqn,
+            host_id,
+            access,
+            ControllerAdoption::Adopt,
+            deadline,
+            None,
+        )
+        .map(|(lease, acquisition, _)| (lease, acquisition))
     }
     /// `get_or_connect` that also reports the blocking connect and eviction
     /// durations. The pool lock is held only for map operations: a controller
@@ -731,17 +753,29 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, None)
+        self.acquire_inner(
+            target,
+            host_nqn,
+            host_id,
+            access,
+            ControllerAdoption::Adopt,
+            deadline,
+            None,
+        )
     }
 
     /// File grant: tag the subsystem controller with the WAL subsystem it
     /// serves, so a retirement evicts the controller of its victims.
+    /// `adoption` is explicit at each call: a recovery read must never reuse a
+    /// controller the previous owner incarnation's process left behind.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_file(
         &self,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
         file: (u32, u64, u64),
     ) -> io::Result<(
@@ -749,7 +783,15 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, Some(file))
+        self.acquire_inner(
+            target,
+            host_nqn,
+            host_id,
+            access,
+            adoption,
+            deadline,
+            Some(file),
+        )
     }
 
     pub fn acquire_shared(
@@ -764,7 +806,15 @@ impl LiveControllerPool {
         LivePoolAcquisition,
         LivePoolTimings,
     )> {
-        self.acquire_inner(target, host_nqn, host_id, access, deadline, None)
+        self.acquire_inner(
+            target,
+            host_nqn,
+            host_id,
+            access,
+            ControllerAdoption::Adopt,
+            deadline,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,6 +824,7 @@ impl LiveControllerPool {
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
         file: Option<(u32, u64, u64)>,
     ) -> io::Result<(
@@ -887,7 +938,7 @@ impl LiveControllerPool {
         }
         drop(state);
         let started = Instant::now();
-        let result = self.connect(target, host_nqn, host_id, access, deadline);
+        let result = self.connect(target, host_nqn, host_id, access, adoption, deadline);
         let connect_time = started.elapsed();
         let mut state = self
             .state

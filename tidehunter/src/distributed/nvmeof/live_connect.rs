@@ -48,6 +48,21 @@ pub struct LiveConnectTarget {
     pub geometry: LiveQueueGeometry,
 }
 
+/// Whether a connect may reuse the controller a durable intent records.
+///
+/// The write path adopts: after an abrupt coordinator exit a healthy controller
+/// must not be torn down and recreated. A recovery read must never adopt. Its
+/// target may have been recreated under the same epoch-scoped export name by a
+/// new owner incarnation, and a leftover controller still pins the previous
+/// subsystem; the replay read would then bind a dead namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerAdoption {
+    /// Reuse a matching live controller when the registry keeps one.
+    Adopt,
+    /// Retire any matching intent and controller, then connect a new one.
+    Fresh,
+}
+
 /// The controller keep-alive timeout this engine requests, in seconds.
 ///
 /// The kernel default is also 5 s, but a resume reconnects with the same host
@@ -288,30 +303,45 @@ impl LiveController {
     /// In `Adopt` mode a durable intent's live controller is reused instead of
     /// deleted and recreated. A declined adoption is retired with its intent
     /// before the fresh connect, so a live blocker is never left behind.
+    /// `Fresh` never adopts: it retires the identity's intent and controller
+    /// first, because a recovery read must not bind the previous incarnation's
+    /// subsystem.
     fn connect(
         registry: &LiveConnectionRegistry,
         target: &LiveConnectTarget,
         host_nqn: &str,
         host_id: [u8; 16],
         access: LiveNamespaceAccess,
+        adoption: ControllerAdoption,
         deadline: Instant,
     ) -> io::Result<(Self, LiveNamespaceBinding)> {
         // Reject an invalid request before it can be compared against a durable
         // intent: a bad request must not retire a healthy controller.
         validate_connect_target(target, host_nqn, host_id)?;
-        if registry.adopts() {
-            match registry.try_adopt_controller(target, host_nqn, host_id, deadline) {
-                Ok(Some(mut controller)) => match controller.resolve_verified(access, deadline) {
-                    Ok(binding) => return Ok((controller, binding)),
-                    Err(error) => {
-                        let cleanup = controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT);
-                        if cleanup.is_err() {
-                            return Err(connect_error_after_cleanup(error, cleanup));
+        match adoption {
+            ControllerAdoption::Adopt if registry.adopts() => {
+                match registry.try_adopt_controller(target, host_nqn, host_id, deadline) {
+                    Ok(Some(mut controller)) => {
+                        match controller.resolve_verified(access, deadline) {
+                            Ok(binding) => return Ok((controller, binding)),
+                            Err(error) => {
+                                let cleanup =
+                                    controller.disconnect_inner(Instant::now() + CLEANUP_TIMEOUT);
+                                if cleanup.is_err() {
+                                    return Err(connect_error_after_cleanup(error, cleanup));
+                                }
+                            }
                         }
                     }
-                },
-                Ok(None) => {}
-                Err(error) => return Err(error),
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            ControllerAdoption::Adopt => {}
+            ControllerAdoption::Fresh => {
+                // A leftover intent would make `reserve` refuse this connect,
+                // and its controller may still pin the replaced subsystem.
+                registry.retire_identity(target, host_nqn, host_id, deadline)?;
             }
         }
         let mut controller =
@@ -572,6 +602,28 @@ impl LiveNamespaceResolver {
         Ok(())
     }
 
+    /// Waits, within `deadline`, until the pinned controller reports `live`.
+    ///
+    /// A controller the kernel is still connecting or resetting cannot serve a
+    /// namespace open yet. Its identity is re-verified on every pass, so a
+    /// mismatch stays fatal, and a vanished controller stays the typed lost
+    /// cause; only a live object with a non-`live` state waits.
+    fn wait_live(&self, deadline: Instant) -> io::Result<()> {
+        loop {
+            remaining(deadline)?;
+            self.verify()?;
+            match attr(&self.pinned().join("state")) {
+                Ok(state) if state == "live" => return Ok(()),
+                Ok(_) => {}
+                Err(error) if vanished(&error) => return Err(controller_lost_error()),
+                Err(error) => return Err(error),
+            }
+            // The same bounded poll the namespace scan uses: a namespace of a
+            // controller that is still connecting may need the connect window.
+            std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(20)));
+        }
+    }
+
     /// Resolve the single namespace owned by this controller, then perform the
     /// block, NVMe identity, geometry, access and transport verification.
     pub(crate) fn resolve_namespace(
@@ -582,11 +634,10 @@ impl LiveNamespaceResolver {
         deadline: Instant,
     ) -> io::Result<LiveNamespaceBinding> {
         loop {
-            // Deadline failures stay deadlines: the caller reports a typed
-            // timeout. A vanished or replaced controller fails `verify` (or an
-            // attribute read) with the typed lost cause before this point.
-            remaining(deadline)?;
-            self.verify()?;
+            // A leftover controller from a killed process can read live while
+            // the kernel still connects its replacement; wait for readiness
+            // instead of letting its disk reach the verify and fail fatally.
+            self.wait_live(deadline)?;
             let ctrl = std::fs::canonicalize(self.pinned()).map_err(lost_if_vanished)?;
             let mut candidates = Vec::new();
             for (name, p) in owned_visible_disks(Path::new("/sys/class/block"), &ctrl, &self.name)

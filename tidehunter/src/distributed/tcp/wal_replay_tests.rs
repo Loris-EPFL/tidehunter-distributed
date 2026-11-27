@@ -20,6 +20,8 @@ const PARTITION_BARRIER: u32 = u32::MAX - 8;
 const PARTITION_COMPLETES: u32 = u32::MAX - 9;
 const PARTITION_FULL_QUEUE: u32 = u32::MAX - 10;
 const PARTITION_SHUTDOWN: u32 = u32::MAX - 11;
+const PARTITION_RETRY: u32 = u32::MAX - 12;
+const PARTITION_RECONNECT: u32 = u32::MAX - 13;
 
 fn position_proof(
     node: &StorageNode,
@@ -612,4 +614,95 @@ fn a_shutdown_barrier_does_not_hold_the_queue_lock() {
         .join()
         .expect("the shutdown thread panicked")
         .expect("shutdown completes after the flusher drains");
+}
+
+/// A page whose controller is verifiably lost twice exhausts the retry budget:
+/// the client is marked broken and the replay does not restart the database.
+#[test]
+fn replay_page_stops_after_two_lost_controllers() {
+    let source = PageSource::new(PARTITION_RETRY);
+    let mut client = source.client();
+    // Reach the real connect path, as on the kernel: the local-file cache hook
+    // would install an entry and consume no connect attempt.
+    client.live_write_local_fixture = false;
+    source.pool.fail_next_connect_lost();
+    source.pool.fail_next_connect_lost();
+    let error = match client.replay_live_wal_page(2, 1, 0, 1, source.through) {
+        Ok(_) => panic!("a page with two lost controllers must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        client.session_present(),
+        None,
+        "a spent retry budget marks the client broken: {error}"
+    );
+    assert!(
+        !source.pool.connect_loss_pending(),
+        "both page attempts reached the connect: the budget is two reads"
+    );
+}
+
+/// One verifiably lost page read reconnects and then reads the same page. The
+/// first connect reports the loss; the retry opens the WAL through the local
+/// fixture and returns the frames, so a lost page is not a lost database.
+#[test]
+fn replay_page_reconnects_after_one_lost_controller() {
+    use crate::distributed::nvmeof::NvmeofTransport;
+    use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
+    use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
+    use crate::distributed::nvmeof::live_storage::{FILES_PER_SUBSYSTEM, wal_export_name};
+    let source = PageSource::new(PARTITION_RECONNECT);
+    let config = &source.fixture.config.partition;
+    let wal = source
+        .fixture
+        .config
+        .root
+        .join("epoch_0000000000000001/wal_0000000000000000");
+    assert!(
+        wal.is_file(),
+        "the epoch-1 WAL file exists: {}",
+        wal.display()
+    );
+    let name = wal_export_name(
+        FILES_PER_SUBSYSTEM,
+        config.inventory.database,
+        PARTITION_RECONNECT,
+        1,
+        0,
+    );
+    let target = LiveConnectTarget {
+        nqn: name.nqn,
+        uuid: name.uuid,
+        nsid: name.nsid,
+        bytes: config.wal_file_bytes,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: source.live_config.queue_geometry,
+    };
+    let mut client = source.client();
+    client.live_write_local_fixture = false;
+    source
+        .pool
+        .register_local_target(&target, LiveNamespaceAccess::ReadOnly, wal)
+        .unwrap();
+    source.pool.fail_next_connect_lost();
+    let page = client
+        .replay_live_wal_page(2, 1, 0, 1, source.through)
+        .expect("the retry reads the page through a fresh connection");
+    assert_eq!(
+        page.batches.len(),
+        3,
+        "the page keeps every batch the retry read"
+    );
+    assert!(
+        !source.pool.connect_loss_pending(),
+        "the first attempt reached the connect and consumed the armed loss"
+    );
+    assert_eq!(
+        client.session_present(),
+        Some(true),
+        "a successful retry leaves the client usable"
+    );
 }

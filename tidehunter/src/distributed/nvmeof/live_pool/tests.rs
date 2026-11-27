@@ -56,6 +56,7 @@ fn strict_and_shared_acquisitions_share_one_subsystem_controller() {
             HOST,
             [2; 16],
             LiveNamespaceAccess::ReadShared,
+            ControllerAdoption::Adopt,
             deadline,
             (0, 1, 1),
         )
@@ -113,6 +114,7 @@ fn acquire_two_sealed_namespaces(
             host,
             [2; 16],
             LiveNamespaceAccess::ReadOnly,
+            ControllerAdoption::Adopt,
             deadline,
             (0, 1, 0),
         )
@@ -123,6 +125,7 @@ fn acquire_two_sealed_namespaces(
             host,
             [2; 16],
             LiveNamespaceAccess::ReadOnly,
+            ControllerAdoption::Adopt,
             deadline,
             (0, 1, 1),
         )
@@ -635,5 +638,82 @@ fn acquire_types_a_first_connect_loss_as_lost() {
         .expect("the next acquire connects");
     assert_eq!(how, LivePoolAcquisition::Connected);
     drop(lease);
+    pool.shutdown(deadline).unwrap();
+}
+
+/// A replay page whose cached controller the kernel has stopped evicts that
+/// lease and reconnects. This is the pool half of the page retry: the entry is
+/// gone, the next connect reports its own loss, and the one after it connects.
+#[test]
+fn a_lost_cached_lease_is_evicted_and_the_next_acquire_reconnects() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    let dir = tempdir::TempDir::new("live-pool-replay-retry").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:replay");
+    let lost = pool
+        .cached_lease(&target.nqn)
+        .expect("the fixture entry is cached");
+    lost.force_controller_lost(true);
+    assert!(
+        pool.entry_lost(&target.nqn),
+        "the entry probe must name the stopped controller"
+    );
+    let path = dir.path().join("wal");
+    std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+    pool.register_local_target(&target, LiveNamespaceAccess::ReadWrite, path)
+        .unwrap();
+    let deadline = Instant::now() + PROGRESS_CAP;
+    pool.evict_lost(&target.nqn, deadline)
+        .expect("a verifiably lost lease is retired");
+    assert!(
+        pool.cached_lease(&target.nqn).is_none(),
+        "the retry must connect instead of reusing the lost lease"
+    );
+    // The first reconnect verifies a controller the kernel stopped, exactly as
+    // the real connect does; it must leave no entry for the retry.
+    pool.fail_next_connect_lost();
+    let error = match pool.acquire_shared(
+        &target,
+        HOST,
+        [2; 16],
+        LiveNamespaceAccess::ReadWrite,
+        deadline,
+    ) {
+        Ok(_) => panic!("the fixture first connect reports the stopped controller"),
+        Err(error) => error,
+    };
+    assert!(
+        crate::distributed::nvmeof::live_namespace::controller_lost(&error),
+        "the reconnect loss keeps its typed cause: {error}"
+    );
+    assert!(
+        pool.cached_lease(&target.nqn).is_none(),
+        "a lost reconnect releases its entry"
+    );
+    let (fresh, how, _) = pool
+        .acquire_shared(
+            &target,
+            HOST,
+            [2; 16],
+            LiveNamespaceAccess::ReadWrite,
+            deadline,
+        )
+        .expect("the retry connects a fresh controller");
+    assert_eq!(
+        how,
+        LivePoolAcquisition::Connected,
+        "the retry must connect, not reuse a cached lease"
+    );
+    assert!(
+        !Arc::ptr_eq(&fresh, &lost),
+        "the reconnect must not return the evicted lease"
+    );
+    assert!(
+        !fresh.controller_lost(),
+        "the reconnected fixture controller is live"
+    );
+    drop(fresh);
     pool.shutdown(deadline).unwrap();
 }
