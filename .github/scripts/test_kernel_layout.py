@@ -212,16 +212,17 @@ class RestartReopen(unittest.TestCase):
         return kernel.reopen_defect(
             self.evidence() if evidence is None else evidence, stderr)
 
-    def test_a_reopen_that_retired_the_leftover_controller_is_clean(self):
+    def test_a_reopen_that_replayed_its_tail_is_clean_with_or_without_a_leftover(self):
+        # The kernel may drop the pre-restart controller before the reopen; the
+        # counts are evidence, not a requirement.
         self.assertIsNone(self.defect())
+        self.assertIsNone(self.defect(self.evidence(retired=0, adoptable=0)))
 
-    def test_a_reopen_that_retired_nothing_adoptable_is_a_defect(self):
-        defect = self.defect(self.evidence(retired=1, adoptable=0))
-        self.assertIn("retired no adoptable pre-restart controller", defect)
-
-    def test_a_missing_adoptable_count_is_a_defect(self):
+    def test_missing_retirement_counts_are_a_defect(self):
         defect = self.defect(self.evidence(adoptable=None))
-        self.assertIn("retired_adoptable_leftovers=None", defect)
+        self.assertIn("lacks retired_adoptable_leftovers", defect)
+        defect = self.defect(self.evidence(retired=None))
+        self.assertIn("lacks retired_leftover_controllers", defect)
 
     def test_an_empty_replay_is_a_defect(self):
         defect = self.defect(self.evidence(tail=0))
