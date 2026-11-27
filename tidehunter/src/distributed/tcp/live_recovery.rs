@@ -10,20 +10,25 @@ use crate::distributed::nvmeof::live_io::{LiveIo, LiveIoError, LiveIoResult, Liv
 use crate::distributed::nvmeof::live_metrics::LiveTimingStage;
 use crate::distributed::nvmeof::live_metrics::{LiveNamespaceIdentity, LiveRouteEvidence};
 use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
-use crate::distributed::nvmeof::live_pool::{LiveControllerPool, LivePoolAcquisition};
+use crate::distributed::nvmeof::live_pool::{
+    LiveControllerLease, LiveControllerPool, LivePoolAcquisition,
+};
 use crate::distributed::storage::DurableBatch;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Page reads per recovery request: the first, plus one after a controller
 /// the sysfs probe proved lost was retired.
 const RECOVERY_PAGE_ATTEMPTS: u32 = 2;
 
-/// One failed page read. `lost_nqn` names the subsystem whose controller is
-/// verifiably not live, which is the only class a second read may replace.
+/// One failed page read. `retryable` marks the only class a second read may
+/// replace; `failed_lease` is the exact lease the attempt used, so the retry
+/// retires that object instead of letting the pool reuse it.
 struct RecoveryAttemptError {
     error: TcpError,
-    lost_nqn: Option<String>,
+    retryable: bool,
+    failed_lease: Option<Arc<LiveControllerLease>>,
 }
 
 impl From<TcpError> for RecoveryAttemptError {
@@ -36,8 +41,15 @@ impl RecoveryAttemptError {
     fn fatal(error: TcpError) -> Self {
         Self {
             error,
-            lost_nqn: None,
+            retryable: false,
+            failed_lease: None,
         }
+    }
+
+    /// Carry the lease this attempt used, so the retry retires exactly it.
+    fn with_lease(mut self, lease: &Arc<LiveControllerLease>) -> Self {
+        self.failed_lease = Some(lease.clone());
+        self
     }
 
     /// Classify a local page-read failure. The probe runs only here, on the
@@ -48,7 +60,8 @@ impl RecoveryAttemptError {
         let retry = retryable_recovery_failure(&error, lost);
         Self {
             error: TcpError::component(error),
-            lost_nqn: retry.then(|| nqn.to_owned()),
+            retryable: retry,
+            failed_lease: None,
         }
     }
 
@@ -144,13 +157,26 @@ impl Client {
                 Ok(page) => break Ok(page),
                 Err(RecoveryAttemptError {
                     error: _,
-                    lost_nqn: Some(nqn),
+                    retryable: true,
+                    failed_lease,
                 }) if attempts < RECOVERY_PAGE_ATTEMPTS => {
                     // The failed attempt released its epoch pin before this
-                    // point. Retire the lost controller so the retry connects
-                    // a new one instead of reusing the dead lease.
-                    let teardown = super::controller_teardown_deadline(config.connect_timeout_ms);
-                    let _ = pool.evict_lost(&nqn, teardown);
+                    // point. Retire the exact lease it used: a liveness probe
+                    // can read live again and veto a generic eviction, after
+                    // which the pool would reuse the failed lease. Retiring a
+                    // different lease another lane cached is forbidden.
+                    if let Some(lease) = failed_lease {
+                        let teardown =
+                            super::controller_teardown_deadline(config.connect_timeout_ms);
+                        if let Err(error) = pool.evict_lease(&lease, teardown) {
+                            break Err(TcpError::with_kind(
+                                io::ErrorKind::ConnectionAborted,
+                                format!(
+                                    "live recovery could not retire its failed controller: {error}"
+                                ),
+                            ));
+                        }
+                    }
                 }
                 Err(RecoveryAttemptError { error, .. }) => break Err(error),
             }
@@ -229,7 +255,8 @@ impl Client {
                     "{}; live recovery pin release failed: {cleanup}",
                     error.error
                 ));
-                error.lost_nqn = None;
+                error.retryable = false;
+                error.failed_lease = None;
                 Err(error)
             }
             (Ok(_), Err(error)) => Err(RecoveryAttemptError::fatal(error)),
@@ -303,7 +330,9 @@ impl Client {
                 .map_err(|error| RecoveryAttemptError::io(error, pool, &target.nqn))?;
             let (namespace, observed) = lease
                 .namespace(target.nsid, target.uuid, access, deadline)
-                .map_err(|error| RecoveryAttemptError::io(error, pool, &target.nqn))?;
+                .map_err(|error| {
+                    RecoveryAttemptError::io(error, pool, &target.nqn).with_lease(&lease)
+                })?;
             drop(setup);
             if let Some(counters) = &self.live_counters
                 && matches!(acquisition, LivePoolAcquisition::Connected)
@@ -382,10 +411,9 @@ impl Client {
                 drop(validation);
                 let before = io.stats();
                 let deadline = Instant::now() + Duration::from_millis(config.io_timeout_ms);
-                match io
-                    .submit_reads(1, &ranges, deadline)
-                    .map_err(|error| RecoveryAttemptError::live_io(error, pool, &target.nqn))?
-                {
+                match io.submit_reads(1, &ranges, deadline).map_err(|error| {
+                    RecoveryAttemptError::live_io(error, pool, &target.nqn).with_lease(&lease)
+                })? {
                     LiveSubmitOutcome::Submitted => {}
                     LiveSubmitOutcome::Full => {
                         return Err(RecoveryAttemptError::fatal(TcpError::new(
@@ -402,7 +430,8 @@ impl Client {
                             if let Some(counters) = &self.live_counters {
                                 record_read_io_stats(counters, &before, &io.stats(), true);
                             }
-                            return Err(RecoveryAttemptError::live_io(error, pool, &target.nqn));
+                            return Err(RecoveryAttemptError::live_io(error, pool, &target.nqn)
+                                .with_lease(&lease));
                         }
                     };
                     if let Some(completion) = completions.into_iter().next() {
@@ -422,7 +451,8 @@ impl Client {
                                 )));
                             }
                             Err(LiveIoError::Io(error)) => {
-                                return Err(RecoveryAttemptError::io(error, pool, &target.nqn));
+                                return Err(RecoveryAttemptError::io(error, pool, &target.nqn)
+                                    .with_lease(&lease));
                             }
                             Err(error) => {
                                 return Err(RecoveryAttemptError::fatal(TcpError::component(
@@ -467,7 +497,10 @@ impl Client {
                     io = LiveIo::new(
                         lease
                             .namespace(target.nsid, target.uuid, access, deadline)
-                            .map_err(|error| RecoveryAttemptError::io(error, pool, &target.nqn))?
+                            .map_err(|error| {
+                                RecoveryAttemptError::io(error, pool, &target.nqn)
+                                    .with_lease(&lease)
+                            })?
                             .0,
                         config.max_inflight_requests,
                         config.max_inflight_bytes,

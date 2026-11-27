@@ -944,3 +944,58 @@ fn a_fresh_acquisition_does_not_clear_a_worker_uncertain_quarantine() {
         .try_send(())
         .expect("release the timed-out worker so it cannot outlive the test");
 }
+
+/// The retry after a failed page read must retire the exact lease it used,
+/// even when a later liveness probe reads live and would veto `evict_lost`.
+#[test]
+fn evict_lease_retires_the_failed_lease_even_when_it_reads_live_again() {
+    const HOST: &str = "nqn.2026-01.test:host";
+    let dir = tempdir::TempDir::new("live-pool-evict-lease").unwrap();
+    let registry =
+        LiveConnectionRegistry::open(&dir.path().join("registry"), RegistryMode::Retire).unwrap();
+    let pool = LiveControllerPool::new(registry, 2, 1).unwrap();
+    let target = ready_idle(&pool, dir.path(), "nqn.2026-01.test:failed-lease");
+    let failed = pool
+        .cached_lease(&target.nqn)
+        .expect("the fixture entry is cached");
+    // The read reported the controller lost; the veto scenario is that its
+    // liveness probe reads live again before the retry.
+    failed.force_controller_lost(true);
+    failed.force_controller_lost(false);
+    assert!(
+        !failed.controller_lost(),
+        "the failed lease reads live at eviction time"
+    );
+    let path = dir.path().join("wal");
+    std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+    pool.register_local_target(&target, LiveNamespaceAccess::ReadWrite, path)
+        .unwrap();
+    let deadline = Instant::now() + PROGRESS_CAP;
+    pool.evict_lease(&failed, deadline)
+        .expect("the exact failed lease is retired without a liveness veto");
+    assert!(
+        pool.cached_lease(&target.nqn).is_none(),
+        "the failed lease is no longer cached"
+    );
+    // A Fresh retry reaches the connect path instead of reusing the lease.
+    let (fresh, how, _) = pool
+        .acquire_file(
+            &target,
+            HOST,
+            [2; 16],
+            LiveNamespaceAccess::ReadWrite,
+            ControllerAdoption::Fresh {
+                owner_incarnation: None,
+            },
+            deadline,
+            (0, 1, 0),
+        )
+        .expect("the retry connects a fresh controller");
+    assert_eq!(how, LivePoolAcquisition::Connected);
+    assert!(
+        !Arc::ptr_eq(&fresh, &failed),
+        "the retry must not reuse the failed lease"
+    );
+    drop(fresh);
+    pool.shutdown(deadline).unwrap();
+}

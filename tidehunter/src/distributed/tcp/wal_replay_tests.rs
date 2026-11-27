@@ -22,6 +22,7 @@ const PARTITION_FULL_QUEUE: u32 = u32::MAX - 10;
 const PARTITION_SHUTDOWN: u32 = u32::MAX - 11;
 const PARTITION_RETRY: u32 = u32::MAX - 12;
 const PARTITION_RECONNECT: u32 = u32::MAX - 13;
+const PARTITION_EVICT: u32 = u32::MAX - 14;
 
 fn position_proof(
     node: &StorageNode,
@@ -721,6 +722,96 @@ fn replay_page_reconnects_after_one_lost_controller() {
         source.pool.connect_attempts(),
         2,
         "the loss cost one connect and the retry cost one"
+    );
+    assert_eq!(
+        client.session_present(),
+        Some(true),
+        "a successful retry leaves the client usable"
+    );
+}
+
+/// A failed page read whose lease later probes live must still be retired by
+/// the retry. The fresh path reaches the connect, never the cached failed
+/// lease as `Reused`.
+#[test]
+fn replay_retry_retires_the_failed_lease_that_reads_live_again() {
+    use crate::distributed::nvmeof::NvmeofTransport;
+    use crate::distributed::nvmeof::live_connect::LiveConnectTarget;
+    use crate::distributed::nvmeof::live_namespace::LiveNamespaceAccess;
+    use crate::distributed::nvmeof::live_storage::{FILES_PER_SUBSYSTEM, wal_export_name};
+    let source = PageSource::new(PARTITION_EVICT);
+    let config = &source.fixture.config.partition;
+    let wal = source
+        .fixture
+        .config
+        .root
+        .join("epoch_0000000000000001/wal_0000000000000000");
+    assert!(
+        wal.is_file(),
+        "the epoch-1 WAL file exists: {}",
+        wal.display()
+    );
+    let name = wal_export_name(
+        FILES_PER_SUBSYSTEM,
+        config.inventory.database,
+        PARTITION_EVICT,
+        1,
+        0,
+    );
+    let page_target = LiveConnectTarget {
+        nqn: name.nqn.clone(),
+        uuid: name.uuid,
+        nsid: name.nsid,
+        bytes: config.wal_file_bytes,
+        block_size: 4096,
+        address: "127.0.0.1".into(),
+        service: 4420,
+        transport: NvmeofTransport::Tcp,
+        geometry: source.live_config.queue_geometry,
+    };
+    let mut client = source.client();
+    client.live_write_local_fixture = false;
+    // The retry's fresh connection uses the real fixture file.
+    source
+        .pool
+        .register_local_target(&page_target, LiveNamespaceAccess::ReadOnly, wal.clone())
+        .unwrap();
+    // Seed a Ready lease for another namespace of the same subsystem, so the
+    // page's namespace misses its cached member and its resolver reports the
+    // controller lost.
+    let mut seed_target = page_target.clone();
+    seed_target.nsid += 1;
+    source
+        .pool
+        .cache_local_shared_namespace(
+            &seed_target,
+            &source.live_config.host_nqn,
+            source.live_config.host_id,
+            &wal,
+        )
+        .unwrap();
+    let seed = source
+        .pool
+        .cached_lease(&name.nqn)
+        .expect("the seed lease is cached");
+    seed.force_controller_lost(true);
+    // The read failed; before the retry, the liveness probe reads live again.
+    seed.force_controller_lost(false);
+    assert!(
+        !seed.controller_lost(),
+        "the failed lease must read live at the retry, or the veto is not exercised"
+    );
+    let page = client
+        .replay_live_wal_page(2, 1, 0, 1, source.through)
+        .expect("the retry retires the exact failed lease and reads the page");
+    assert_eq!(page.batches.len(), 3, "the page keeps every batch");
+    let fresh = source
+        .pool
+        .cached_lease(&name.nqn)
+        .expect("the retry caches its fresh lease");
+    assert!(
+        !Arc::ptr_eq(&fresh, &seed),
+        "the retry must not reuse the failed lease as Reused"
     );
     assert_eq!(
         client.session_present(),

@@ -626,6 +626,37 @@ impl LiveControllerPool {
         }
     }
 
+    /// Retire exactly the lease a failed page read used, without a second
+    /// liveness probe.
+    ///
+    /// The retry must not reuse that lease. A generic `evict_lost` vetoes the
+    /// eviction when its probe reads live again, after which the pool returns
+    /// the failed lease as `Reused`. A different cached lease is left in
+    /// place; an entry that is absent, pending or closing cannot be reused by
+    /// this retry and is left for its owner.
+    pub(crate) fn evict_lease(
+        &self,
+        failed: &Arc<LiveControllerLease>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let key = failed.binding().nqn.clone();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("controller pool poisoned"))?;
+        match state.entries.get(&key) {
+            Some(Entry::Ready { lease, .. }) if Arc::ptr_eq(lease, failed) => {}
+            // Not cached under this key: the retry cannot reuse it. A
+            // pending or closing entry belongs to a lane that will decide.
+            _ => return Ok(()),
+        }
+        let controller = Self::begin_close(&mut state, &key)?;
+        let (state, result) =
+            self.finish_close(state, &key, controller, |c| c.disconnect(deadline))?;
+        drop(state);
+        result
+    }
+
     /// Test only: the next connect fails with the typed lost-controller error,
     /// as a first connect that verifies a controller the kernel stopped does.
     #[cfg(test)]
