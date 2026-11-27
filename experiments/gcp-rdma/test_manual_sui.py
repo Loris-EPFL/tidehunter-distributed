@@ -595,6 +595,38 @@ class ControllerLossCells(unittest.TestCase):
             'tidehunter_nvmeof_live_completed_write_ops_total 7\n',
             ('completed_write_ops_total',)), {'completed_write_ops_total': 7.0})
 
+    def test_the_gate_pools_the_per_database_live_family(self):
+        clock = [0.0]
+        writes = {'checkpoint': 10, 'epoch': 3}
+        def metrics(url):
+            return ''.join(f'tidehunter_nvmeof_live_completed_write_ops_total{{db="{db}"}} '
+                           f'{value}\n' for db, value in writes.items())
+        gate = manual_sui.ControllerLoss(
+            point='mid-frame', host='h0', address='10.0.0.2', service=4420,
+            service_max=4435, transport='rdma', metrics_url='http://x/metrics',
+            rpc_address='127.0.0.1:9000', output=Path('/nonexistent'),
+            now=lambda: clock[0], latest=lambda address: 2, metrics=metrics)
+        clock[0] = 0.0
+        first = gate.sample()
+        self.assertEqual(first['counters'], {'completed_write_ops_total': 13.0})
+        writes['epoch'] += 1
+        clock[0] = 1.0
+        second = gate.sample()
+        self.assertTrue(gate.fires(first, second)[0])
+
+    def test_the_real_attempt_carries_every_gate_counter(self):
+        text = (CHECKPOINT / 'fixtures/attempt2-remote-final.prom').read_text()
+        names = {name for counters in manual_sui.CONTROLLER_LOSS_COUNTERS.values()
+                 for name in counters}
+        sample = manual_sui.live_sample(text, names)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIsNotNone(sample[name], name)
+        for point in ('mid-frame', 'after-adoption'):
+            self.assertTrue(any(sample[name] > 0
+                                for name in manual_sui.CONTROLLER_LOSS_COUNTERS[point]),
+                            point)
+
 
 class ControllerLossInjection(unittest.TestCase):
     def setUp(self):

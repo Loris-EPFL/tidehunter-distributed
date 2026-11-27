@@ -227,22 +227,44 @@ def controller_loss_addresses(fixture):
     return values[0], values[1]
 
 
+def _live_decoder():
+    """Load the Sui-checkpoint analyzer under a unique module name.
+
+    Several experiment trees ship an `analyze` module earlier on `sys.path`
+    (kv-comparison loads one), so the shared decoder is loaded by file path
+    rather than by the ambiguous top-level name.
+    """
+    import importlib.util
+    name = 'sui_checkpoint_analyze'
+    module = sys.modules.get(name)
+    if module is None:
+        path = Path(__file__).resolve().parents[1] / 'sui-checkpoint' / 'analyze.py'
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def live_counters(text):
+    """Aggregate live counters from a scrape, pooled over the `db` label.
+
+    Sui registers one metrics registry per database with the constant `db`
+    label, so the engine family appears once per database. The shared decoder
+    is the one reader of that schema; duplicates fail closed there.
+    """
+    decoder = _live_decoder()
+    return decoder.live_nvmeof_stats(decoder.parse_metrics(text))['counters']
+
+
 def live_counter(text, name):
     """One aggregate live counter sample; duplicates fail closed."""
-    values = []
-    for line in text.splitlines():
-        if not line or line.startswith('#'):
-            continue
-        metric, _, value = line.partition(' ')
-        if metric == LIVE_PREFIX + name:
-            values.append(float(value))
-    if len(values) > 1:
-        raise ValueError(f'duplicate Prometheus metric: {LIVE_PREFIX + name}')
-    return values[0] if values else None
+    return live_counters(text).get(name)
 
 
 def live_sample(text, names):
-    return {name: live_counter(text, name) for name in names}
+    counters = live_counters(text)
+    return {name: counters.get(name) for name in names}
 
 
 class ControllerLoss:
