@@ -123,6 +123,20 @@ class GeneratedDocumentsAreCurrent(unittest.TestCase):
                                           transport=transport, owners=owners, tier=tier, wal=wal)
                     self.validate_with_engine(binary, root / 'deployment', config, nodes)
 
+    def test_each_owner_launch_carries_a_fresh_nonce(self):
+        """The engine refuses an external receipt whose launch nonce is empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, nodes = deployment.prepare(
+                root / 'deployment', {'db': {}}, root / 'remote',
+                shape_yamls={'db': 'key_spaces: []\n'}, hosts=['127.0.0.1'] * 2,
+                port=24000, transport='tcp', coordinator_cache=0)
+            nonces = [yaml.safe_load(Path(node['launch']).read_text())['launch_nonce']
+                      for node in nodes]
+        self.assertEqual(len(nonces), 2)
+        self.assertEqual(len(set(nonces)), 2)
+        self.assertTrue(all(len(nonce) == 32 for nonce in nonces))
+
     def test_obsolete_live_keys_and_mismatched_hosts_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

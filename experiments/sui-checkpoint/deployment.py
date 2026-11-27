@@ -242,7 +242,7 @@ def prepare(directory, schema, db_root, *, shape_yamls, hosts, port, transport, 
                 limits=dict(max_frame_bytes=16*MIB, max_connections=16, max_reads=256,
                     recovery_page_batches=128, io_timeout=dict(secs=60, nanos=0), polling='adaptive'),
                 listen=address, ready_file=str(runtime_node / 'ready'),
-                stop_file=str(runtime_node / 'stop'), launch_nonce='',
+                stop_file=str(runtime_node / 'stop'), launch_nonce=uuid.uuid4().hex,
                 durability=dict(tier=tier))
             dump(node_dir / 'launch.yaml', launch)
             nodes.append(dict(namespace=namespace, partition=partition, host=host,
