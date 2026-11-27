@@ -317,8 +317,9 @@ def layout_spec(specs, document, root, index, *, reopen):
                 batch=None, cache=0, reference=False)
     # One complete write batch after the restart, so both owners of the
     # database publish their namespace.
+    # No driver writes measurement releases here, so the run is not gated.
     spec = specs.run_config(case, Path(root), external={"native": {"document": document}},
-                            measurement_operations=26 if reopen else 8)
+                            measurement_operations=26 if reopen else 8, gated=False)
     spec["dataset"]["keys"] = 256
     if reopen:
         # The maintained second-open proof reuses the coordinator path: the

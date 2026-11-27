@@ -149,6 +149,9 @@ class CampaignModules(unittest.TestCase):
         # their namespaces again before the port check.
         self.assertEqual(spec["workload"]["mix"]["put"], 100)
         self.assertEqual(spec["phases"]["measurement_operations"], 26)
+        # No driver releases a measurement gate in CI; a gated spec would wait.
+        self.assertNotIn("measurement_gate", spec)
+        self.assertNotIn("measurement_completion_gate", spec)
         self.assertEqual(spec["backend"]["options"]["path"],
                          str(root / "stage3" / "db" / "owner-layout-0" / "coordinator"))
 

@@ -365,14 +365,23 @@ def measurement_gates(case, root, *, native_root=None):
 
 
 def run_config(case, root, *, native_root=None, external=None,
-               measurement_operations=MEASUREMENT_OPERATIONS):
+               measurement_operations=MEASUREMENT_OPERATIONS, gated=True):
+    """One kv-research spec for a stage-3 case.
+
+    `gated=False` omits the measurement handshake for a caller that runs the
+    binary with no driver to write the releases.
+    """
     distribution = ('uniform' if case['distribution'] == 'uniform'
                     else dict(zipf=dict(exponent=1.0)))
     workload = dict(kind='synthetic', distribution=distribution,
                     mix=MIXES[case['mix']], batch_size=case['batch'] or BATCH,
                     put_key_policy='overwrite')
-    begin_gate, completion_gate = measurement_gates(case, root,
-                                                    native_root=native_root)
+    gates = {}
+    if gated:
+        begin_gate, completion_gate = measurement_gates(case, root,
+                                                        native_root=native_root)
+        gates = dict(measurement_gate=begin_gate,
+                     measurement_completion_gate=completion_gate)
     return dict(
         schema_version=1, case_id=case['case_id'],
         backend=backend(case, root, native_root=native_root, external=external),
@@ -387,8 +396,7 @@ def run_config(case, root, *, native_root=None, external=None,
                     measurement_operations=measurement_operations),
         diagnostics=dict(write_profile_limit=0, read_profile_limit=0),
         qualification_only=False, source_revision=None,
-        measurement_gate=begin_gate,
-        measurement_completion_gate=completion_gate,
+        **gates,
         limits=dict(max_keys=KEYS, max_bytes=16 << 30,
                     max_operations=operation_limit(measurement_operations),
                     deadline_seconds=DEADLINE_SECONDS,
