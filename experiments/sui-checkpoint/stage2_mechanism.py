@@ -178,13 +178,18 @@ def cells():
     for tier in TIERS:
         for cut in ('publication', 'snapshot'):
             unit = f'S1-2S-{cut}-{tier}'
+            snapshot = cut == 'snapshot'
             rows.append(dict(
                 id=unit, stage='stage1', unit=unit, family='S1-2',
                 synthetic=True, tier=tier,
                 plan=dict(cut=cut, tiers='native, synchronous', cells='4'),
-                note='kill -9 the coordinator at the gated cut, reopen, full audit',
+                note=('kill -9 the coordinator after the snapshot pass stores a control '
+                      'region, reopen, full audit' if snapshot else
+                      'kill -9 the coordinator at 200 acknowledged writes, reopen, full audit'),
                 runs=[_run('measure', mix=_mix(put=100), value=4096,
-                           concurrency=4, measurement=1_000_000, deadline=600),
+                           concurrency=4,
+                           measurement=(SNAPSHOT_MEASUREMENT if snapshot else 1_000_000),
+                           deadline=900),
                       _verify_run(4_096, value=4096)]))
         unit = f'S1-3S-owner-{tier}'
         rows.append(dict(
@@ -449,6 +454,18 @@ def acknowledged(result, *, phase='measurement'):
 def failures(result, *, phase='measurement'):
     return [row for row in result
             if row.get('phase') == phase and row.get('outcome') == 'error']
+
+
+def refused(result, *, phase='measurement'):
+    """Rows where a mutation ended without success, in completion order.
+
+    A mutation whose transport failed has an unknown outcome, so the engine
+    records `unknown_mutation`, never `error` (runner.rs response
+    classification). A lease or fence refusal therefore appears here first,
+    and its `error_kind` carries the typed cause.
+    """
+    return [row for row in result
+            if row.get('phase') == phase and row.get('outcome') != 'success']
 
 
 def preflight(output, *, phase='measurement'):

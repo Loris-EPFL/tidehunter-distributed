@@ -109,6 +109,16 @@ def failures(result, *, phase='measurement'):
     return mechanism.failures(result, phase=phase)
 
 
+def refused(result, *, phase='measurement'):
+    """Mutation rows that did not succeed, in completion order.
+
+    A lease or fence refusal reaches a mutation as a transport failure, so the
+    engine records `unknown_mutation` (its mutation outcome is unknown), never
+    `error`. The first non-success row is therefore the first refusal.
+    """
+    return mechanism.refused(result, phase=phase)
+
+
 def preflight(output, *, phase='measurement'):
     """Raise before a verdict when a column or key it parses is absent."""
     problems = mechanism.preflight(output, phase=phase)
@@ -537,7 +547,13 @@ class Cluster:
         return {host: self.disk(host) for host in self.owners}
 
     def wal(self, host):
-        """Owner WAL files with size and mtime, and each durable root's mtime."""
+        """Owner WAL files with size and mtime, and each durable root's mtime.
+
+        The root is replaced by rename, so it is absent for an instant while a
+        pass stores a new one. A missing root is therefore not a failure: the
+        script ends with `exit 0` and the parser keeps only complete lines. A
+        transport failure still exits non-zero from the executor.
+        """
         script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
                   'find "$d" -maxdepth 1 -name "wal_*" -printf "%p %s %T@\\n" 2>/dev/null; '
                   'stat -c "%n %s %Y" "$d/partition-wal-root-v1" 2>/dev/null; done')
@@ -759,25 +775,43 @@ class CellDriver:
         return self.wait_for(child, predicate, timeout=timeout,
                              label=f'{count} acknowledged writes')
 
-    def gate_index_growth(self, child, *, timeout=GATE_TIMEOUT_SECONDS):
-        state = dict(previous=self._index_files(child))
+    def gate_snapshot(self, child, *, timeout=GATE_TIMEOUT_SECONDS):
+        """Wait until the snapshot pass stores a new control region.
+
+        The coordinator's index lives in `cr` (db.rs `CONTROL_REGION_FILE`); the
+        snapshot writes a temp and renames it, so a store changes the file's
+        size or mtime. The first observation is the baseline (the region also
+        appears at open), and a store counts only after at least `GATE_WRITES`
+        acknowledged writes, so the kill lands on a snapshot taken over data.
+        """
+        state = dict(previous=self._snapshot_files(child))
 
         def predicate():
-            current = self._index_files(child)
-            grew = {path: [state['previous'].get(path, 0), size]
-                    for path, size in current.items()
-                    if size > state['previous'].get(path, 0)}
+            current = self._snapshot_files(child)
+            previous = state['previous']
+            if not previous:
+                state['previous'] = current
+                return dict(reached=False, note='waiting for the control region')
+            changed = {name: [previous.get(name), value]
+                       for name, value in current.items()
+                       if previous.get(name) != value}
             state['previous'] = current
-            return dict(reached=bool(grew) and acknowledged(child.rows()) > 0,
-                        grew=grew, files=len(current))
-        return self.wait_for(child, predicate, timeout=timeout,
-                             label='coordinator index file growth')
+            return dict(reached=(bool(changed) and acknowledged(child.rows()) >= GATE_WRITES),
+                        changed=changed, files=len(current))
+        return self.wait_for(child, predicate, timeout=timeout, poll=0.1,
+                             label='snapshot control-region store')
 
-    def _index_files(self, child):
+    def _snapshot_files(self, child):
+        """Size and nanosecond mtime of the control region and its temp file."""
+        root = Path(child.output).parent / 'coordinator'
         values = {}
-        for path in sorted(child.output.rglob('index_*')):
-            if path.is_file():
-                values[str(path)] = path.stat().st_size
+        for name in ('cr', 'cr.v4.tmp'):
+            path = root / name
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            values[name] = [stat.st_size, stat.st_mtime_ns]
         return values
 
     def gate_retirement(self, host, cut, *, timeout=GATE_TIMEOUT_SECONDS):
@@ -829,18 +863,27 @@ class CellDriver:
         return record
 
     def stop_on_failure(self, child, count=1, *, timeout=300):
-        """Stop a coordinator whose write core failed; the error rows are evidence."""
+        """Stop a coordinator whose write core refused; the rows are evidence.
+
+        The refusal reaches a mutation as a transport failure, so the engine
+        records `unknown_mutation`, not `error`; `refused` keeps every
+        non-success mutation row.
+        """
+        found = []
+
         def predicate():
-            found = failures(child.rows())
+            found[:] = refused(child.rows())
             reached = len(found) >= count
-            return dict(reached=reached, errors=len(found),
+            return dict(reached=reached, refusals=len(found),
+                        text=found[0].get('error_kind') if reached else None,
                         unix_ns=now_ns() if reached else None)
         gate = self.wait_for(child, predicate, timeout=timeout,
-                             label=f'{count} typed write failure')
+                             label=f'{count} typed write refusal')
         if gate.get('reached'):
             child.signal(signal.SIGTERM)
         code = child.wait(120)
-        return dict(gate=gate, exit_code=code)
+        return dict(gate=gate, exit_code=code,
+                    refusal=found[0].get('error_kind') if found else None)
 
     # ---- run records --------------------------------------------------
     def part(self, name, run, child, observations, *, verdict=True):
@@ -880,7 +923,7 @@ class CellDriver:
                       started_unix_ns=child.started_unix_ns)
         try:
             gate = (self.gate_writes(child, GATE_WRITES) if cut == 'publication'
-                    else self.gate_index_growth(child))
+                    else self.gate_snapshot(child))
             record['gate'] = gate
             if not gate.get('reached'):
                 raise CellError(f"gate missed: {gate.get('reason')}")
@@ -1020,6 +1063,27 @@ class CellDriver:
                 raise CellError('owners published no sealed marker after the lease lapse')
             time.sleep(0.2)
 
+    def _refusal(self, rows_, *, phase='measurement'):
+        """First non-success and last success of one phase, in completion order.
+
+        `samples.csv` is written by one writer thread in completion order, so
+        the row order is the operation order. A mutation that the engine
+        refused records `unknown_mutation` because its outcome is unknown.
+        """
+        first = next((index for index, row in enumerate(rows_)
+                      if row.get('phase') == phase
+                      and row.get('outcome') != 'success'), None)
+        last_success = max((index for index, row in enumerate(rows_)
+                            if row.get('phase') == phase
+                            and row.get('outcome') == 'success'), default=None)
+        text = rows_[first].get('error_kind') if first is not None else None
+        return dict(first=first, last_success=last_success, text=text,
+                    typed=bool(text) and self.typed(text),
+                    refused=first is not None,
+                    no_success_after=(first is not None
+                                      and (last_success is None
+                                           or last_success < first)))
+
     def _lapse(self, child, host):
         result = dict(sealed_partitions=0)
         started = now_ns()
@@ -1077,20 +1141,13 @@ class CellDriver:
         finally:
             second.stop()
         first_rows = child.rows()
-        outcomes = [row.get('outcome') for row in first_rows]
-        first_error = next((index for index, value in enumerate(outcomes)
-                            if value == 'error'), None)
-        last_success = max((index for index, value in enumerate(outcomes)
-                            if value == 'success'), default=None)
-        result['first_error_row'] = first_error
-        result['last_success_row'] = last_success
+        refusal = self._refusal(first_rows)
+        result['first_refusal_row'] = refusal['first']
+        result['last_success_row'] = refusal['last_success']
         result['first_acknowledged'] = acknowledged(first_rows)
         result['second_acknowledged'] = acknowledged(second.rows())
-        result['stale_write_refused'] = first_error is not None
-        result['no_success_after_refusal'] = (first_error is not None and
-                                              (last_success is None or
-                                               last_success < first_error))
-        text = first_rows[first_error].get('error_kind') if first_error is not None else None
+        result['stale_write_refused'] = refusal['refused']
+        result['no_success_after_refusal'] = refusal['no_success_after']
         result['refusal_text'] = text
         result['typed_refusal'] = bool(text) and self.typed(text)
         # The stale case's fence latency: from A's resume to the observed first
@@ -1132,7 +1189,7 @@ class CellDriver:
     def typed(text):
         lowered = text.lower()
         return any(token in lowered for token in
-                   ('lease', 'fenc', 'write protect', 'write-protect',
+                   ('lease', 'fenc', 'authority', 'write protect', 'write-protect',
                     'write protected', 'permission denied', 'stale coordinator',
                     'read-only', 'read only'))
 
@@ -1330,6 +1387,15 @@ def failure_artifacts(output, config_dir):
                                     reason='rebuildable owner archive'))
                 continue
             if path.stat().st_size > FAILURE_ARTIFACT_LIMIT:
+                if path.name == 'samples.csv':
+                    # The refusal rows are the verdict's evidence, so a run
+                    # above the upload bound still ships a bounded excerpt:
+                    # header, first rows, every early non-success row, last rows.
+                    excerpt = sample_excerpt(path)
+                    name = label + excerpt.relative_to(root).as_posix()
+                    if name not in seen:
+                        seen.add(name)
+                        rows.append(campaign_upload.artifact(excerpt, name))
                 skipped.append(dict(path=str(path),
                                     reason='above the failure upload bound'))
                 continue
