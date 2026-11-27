@@ -589,7 +589,10 @@ class MailboxExec(host_exec.HostExecution):
         """
         if not isinstance(script, str) or not script.startswith('/'):
             raise ValueError('an absolute admitted script is required')
-        command = 'exec ' + ' '.join(
+        # The orchestrator and its children import modules from the staged
+        # build tree; bytecode written there changes the frozen source
+        # inventory that the next cell verifies.
+        command = 'exec env PYTHONDONTWRITEBYTECODE=1 ' + ' '.join(
             [shlex.quote(gcp_runtime.GUEST_PYTHON), shlex.quote(script)]
             + [shlex.quote(str(item)) for item in argv])
         code, out, err = self.finish(host, self.submit(
