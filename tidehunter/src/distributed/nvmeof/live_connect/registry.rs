@@ -222,15 +222,24 @@ impl LiveConnectionRegistry {
 
     /// Retire one intent's matching controllers and remove the intent. Shared
     /// by the whole-registry reconcile and the `-EALREADY` bounded reconcile.
+    ///
+    /// With `classify`, each controller is classified on the same pinned
+    /// `ControllerMatch` it is retired from: live, queue-geometry-verified and
+    /// the intent target compatible with the caller. The adoptable count rises
+    /// only after that controller's retirement succeeds, so it can never name
+    /// a controller the retirement did not process.
     fn reconcile_retire_intent(
         &self,
         intent_path: &Path,
         intent: &Intent,
         deadline: Instant,
-    ) -> io::Result<usize> {
-        let mut retired = 0;
+        classify: bool,
+        compatible: bool,
+    ) -> io::Result<RecoveryRetirements> {
+        let mut counts = RecoveryRetirements::default();
         for controller in self.matching_controllers(intent)? {
             remaining(deadline)?;
+            let live = controller.state == "live";
             let mut owned = self.controller_from_match(
                 intent.target.clone(),
                 &intent.host_nqn,
@@ -239,22 +248,26 @@ impl LiveConnectionRegistry {
                 intent_path.to_owned(),
             );
             owned.verify()?;
+            let adoptable = classify && compatible && live && owned.verify_queue_geometry().is_ok();
             let state = attr(&owned.pinned().join("state"))?;
             if matches!(state.as_str(), "deleting" | "deleting (no IO)" | "dead") {
                 owned.deletion = DeletionState::Initiated;
             }
             owned.retire(deadline)?;
-            retired += 1;
+            counts.retired += 1;
+            if adoptable {
+                counts.adoptable += 1;
+            }
         }
         self.remove_intent(intent_path)?;
-        Ok(retired)
+        Ok(counts)
     }
 
     fn reconcile_retire(&self) -> io::Result<()> {
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         for (path, intent) in self.intents()? {
             remaining(deadline)?;
-            self.reconcile_retire_intent(&path, &intent, deadline)?;
+            self.reconcile_retire_intent(&path, &intent, deadline, false, false)?;
         }
         Ok(())
     }
@@ -338,7 +351,7 @@ impl LiveConnectionRegistry {
             remaining(deadline)?;
             match self.inner.mode {
                 RegistryMode::Retire => {
-                    self.reconcile_retire_intent(&path, &intent, deadline)?;
+                    self.reconcile_retire_intent(&path, &intent, deadline, false, false)?;
                 }
                 RegistryMode::Adopt => {
                     self.keep_one_matching_controller(&path, &intent, deadline)?;
@@ -373,13 +386,11 @@ impl LiveConnectionRegistry {
                 && intent.target.service == target.service
                 && intent.target.transport == target.transport
                 && intent.target.geometry == target.geometry;
-            let adoptable = !own && compatible && self.adoptable_match(&intent, &path, deadline)?;
-            let retired = self.reconcile_retire_intent(&path, &intent, deadline)?;
+            let counts =
+                self.reconcile_retire_intent(&path, &intent, deadline, !own, compatible)?;
             if !own {
-                outcome.retired += retired;
-                if adoptable {
-                    outcome.adoptable += 1;
-                }
+                outcome.retired += counts.retired;
+                outcome.adoptable += counts.adoptable;
             }
         }
         if outcome.retired > 0 {
@@ -393,34 +404,6 @@ impl LiveConnectionRegistry {
                 .fetch_add(outcome.adoptable as u64, Ordering::Relaxed);
         }
         Ok(outcome)
-    }
-
-    /// Whether this intent has a controller the Adopt path would have kept:
-    /// live, identity-verified and queue-geometry-verified. The caller already
-    /// proved the intent's target compatible with the Fresh caller.
-    fn adoptable_match(
-        &self,
-        intent: &Intent,
-        intent_path: &Path,
-        deadline: Instant,
-    ) -> io::Result<bool> {
-        for candidate in self.matching_controllers(intent)? {
-            remaining(deadline)?;
-            if candidate.state != "live" {
-                continue;
-            }
-            let controller = self.controller_from_match(
-                intent.target.clone(),
-                &intent.host_nqn,
-                intent.host_id,
-                candidate,
-                intent_path.to_owned(),
-            );
-            if controller.verify().is_ok() && controller.verify_queue_geometry().is_ok() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Whether this registry instance published `path`.
