@@ -517,7 +517,7 @@ class AggregateReplacement(unittest.TestCase):
                 'tidehunter_nvmeof_live_completed_read_ops_total{partition="0"}': 4})
 
 
-NAMESPACE = 'live/db'
+NAMESPACE = 'live/store/perpetual'
 
 
 def scrape(*, cache_mib=0, hits=0, misses=5, batches=6, live=True, protect=2):
@@ -637,10 +637,15 @@ class PerCellCriteria(unittest.TestCase):
         self.assertIn('owner_fetch_fraction', evidence)
         self.assertIn('no hit counter', evidence['per_cell_value_cache'])
 
-    def test_three_write_batches_per_checkpoint_is_required(self):
+    def test_three_perpetual_write_batches_per_checkpoint_is_required(self):
+        # Real S1-0 replays commit 5,329 perpetual batches for 1,776 checkpoints:
+        # three per checkpoint plus one before the first.
         self.assertEqual(self.checks('M1-c4-native', scrape(batches=6))['failures'], [])
+        self.assertEqual(self.checks('M1-c4-native', scrape(batches=7))['failures'], [])
         checks = self.checks('M1-c4-native', scrape(batches=4))
-        self.assertTrue(any('reads 2.0, not 3' in item for item in checks['failures']))
+        self.assertTrue(any('read 2.0, not 3' in item for item in checks['failures']))
+        checks = self.checks('M1-c4-native', scrape(batches=9))
+        self.assertTrue(any('read 4.5, not 3' in item for item in checks['failures']))
 
     def test_a_lifecycle_cell_needs_the_reopen_evidence(self):
         checks = self.checks('S1-1-native', scrape())
