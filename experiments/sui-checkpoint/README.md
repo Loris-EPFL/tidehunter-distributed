@@ -203,6 +203,12 @@ Neither source has a per-partition counter, a sample-generation counter, or a
 per-owner availability flag, and no value-cache hit counter exists. M2 therefore
 uses `owner_fetch_fraction`: aggregate owner read operations divided by
 coordinator `get` calls. It is a request ratio, not a hit rate or byte ratio.
+The denominator source is named. `db_op` get observations are preferred. When
+the family is absent or every series holds zero observations but the adapter
+recorded read calls, the summary states that typed fact and uses the adapter
+`read_calls` total instead. A remote final cut with zero `db_op` observations
+while the adapter shows served reads is a hard `db_op not recorded` defect, not
+an available zero-latency population and not a transient miss.
 The harness **does not expect, emit or fabricate** per-partition samples. The final cut needs one post-certified aggregate
 publication advance over the last replay scrape in remote mode and coordinator
 coverage of every audited live namespace. A full replay finishes before
@@ -540,8 +546,13 @@ Use a separate fresh run with all three limits zero for clean comparisons.
 Do not pool runs with different read, remote-write or native-write budgets.
 OS page cache is neither flushed nor claimed cold.
 Analysis retains all `rocksdb_` wrapper and `db_op_` engine series, including
-epoch/perpetual labels without the word `checkpoint`. Wrapper means use
-histogram sum/count and are not p50 or disjoint wall-clock stages. The local RSS
+epoch/perpetual labels without the word `checkpoint`. The summary carries one
+per-op wrapper latency table per mode and one joined native/remote comparison
+table; rows keep their `cf_name`/`db_name` scope and are never pooled. Wrapper
+means use histogram sum/count and are not p50 or disjoint wall-clock stages.
+Percentiles are cumulative-histogram bucket intervals `[lower, upper]` with a
+null upper endpoint for the unbounded `+Inf` bucket; no lower bound is reported
+as a point percentile. The local RSS
 summary includes local shard processes; externally hosted shard RSS is separate.
 
 Node startup has a 30-second deadline, RPC startup a five-minute bound,

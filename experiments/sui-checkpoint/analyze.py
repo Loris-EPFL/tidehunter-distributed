@@ -317,30 +317,96 @@ def coordinator_stats(values):
               'bucket bounds are approximations, not raw quantiles')
 
 
-def owner_fetch_fraction(live, coordinator):
+ADAPTER_READ_COUNTERS = ('read_calls', 'read_keys', 'read_rpcs')
+ADAPTER_WRITE_COUNTERS = ('write_commit_calls',)
+
+
+def _adapter_totals(adapter):
+    """Sum the named adapter counters over every published namespace."""
+    if not adapter:
+        return {}
+    return {name: sum(int(stats.get(name) or 0) for stats in adapter.values())
+            for name in ADAPTER_READ_COUNTERS + ADAPTER_WRITE_COUNTERS}
+
+
+def db_op_recording(coordinator, adapter=None):
+    """Reconcile the engine `db_op` populations with the adapter counters.
+
+    The engine registers the `db_op` family at open. A distributed data path
+    that never times an operation leaves every series at zero while the adapter
+    counters show served reads. That state is `not recorded`, not an available
+    zero-latency population. The adapter totals name all published namespaces.
+    """
+    rows = [row for database in coordinator['operations'].values()
+            for keyspace in database.values() for row in keyspace.values()]
+    observed = sum(int(row['count'] or 0) for row in rows)
+    totals = _adapter_totals(adapter)
+    state = 'recorded' if observed else ('zero' if rows else 'absent')
+    fact = dict(state=state, observations=observed, series=len(rows),
+                adapter_read_calls=totals.get('read_calls'),
+                adapter_write_commit_calls=totals.get('write_commit_calls'),
+                reason=('db_op populations hold observations' if state == 'recorded' else
+                        'db_op series are registered with zero observations' if state == 'zero' else
+                        'no db_op series was published'))
+    fact['recorded'] = state == 'recorded'
+    return fact
+
+
+class DbOpNotRecorded(ValueError):
+    """A coordinator cut lacks engine db_op observations; a typed, permanent defect."""
+
+    def __init__(self, fact):
+        self.fact = fact
+        reads, writes = fact['adapter_read_calls'] or 0, fact['adapter_write_commit_calls'] or 0
+        self.reason = ('db_op not recorded: ' + fact['reason']
+                       + f' while adapter counters show {reads} read call(s) '
+                       + f'and {writes} write commit(s)')
+        super().__init__(self.reason)
+
+
+def owner_fetch_fraction(live, coordinator, adapter=None):
     """Owner read requests per coordinator API get; not a cache-hit counter.
 
     The engine has no value-cache hit counter at this revision. This derived
     fraction is the plan's substitute: aggregate owner read operations divided
     by coordinator get operations. It counts requests, so a multi-get and a
-    point get both appear as their typed-store get calls, and it is unavailable
-    when either population is absent or empty.
+    point get both appear as their typed-store get calls.
+
+    The source of the denominator is named. `db_op` observations are preferred.
+    When the family is absent or every series holds zero observations but the
+    adapter recorded read calls, the denominator is the adapter `read_calls`
+    total, and the returned `db_op` fact states the engine defect.
     """
     reads = live.get('completed_read_ops')
-    gets = sum(keyspace['get']['count']
-               for database in coordinator['operations'].values()
-               for keyspace in database.values()
-               if 'get' in keyspace and keyspace['get']['count'] is not None)
-    if reads is None or gets is None:
-        return dict(available=False, reason='owner read or coordinator get population missing',
-                    owner_read_ops=reads, api_gets=gets, fraction=None)
-    if gets == 0:
-        return dict(available=False, reason='no coordinator get calls observed',
-                    owner_read_ops=reads, api_gets=gets, fraction=None)
-    return dict(available=True, reason=None, owner_read_ops=reads, api_gets=gets,
-                fraction=reads / gets,
-                scope='aggregate owner read ops divided by coordinator get calls; '
-                      'requests, not value-cache hits or bytes')
+    get_rows = [keyspace['get'] for database in coordinator['operations'].values()
+                for keyspace in database.values() if 'get' in keyspace]
+    gets = sum(row['count'] for row in get_rows if row['count'] is not None)
+    totals = _adapter_totals(adapter)
+    read_calls = totals.get('read_calls')
+    fact = db_op_recording(coordinator, adapter)
+    row = dict(owner_read_ops=reads, api_gets=None, fraction=None, source=None,
+               db_op=fact, adapter_read_calls=read_calls,
+               adapter_read_keys=totals.get('read_keys'),
+               adapter_read_rpcs=totals.get('read_rpcs'))
+    if reads is None:
+        return row | dict(available=False,
+                          reason='owner read operation population missing')
+    if gets:
+        return row | dict(available=True, reason=None, api_gets=gets,
+                          source='coordinator db_op get populations',
+                          fraction=reads / gets,
+                          scope='aggregate owner read ops divided by coordinator get calls; '
+                                'requests, not value-cache hits or bytes')
+    if read_calls:
+        return row | dict(available=True, reason=None, api_gets=read_calls,
+                          source='adapter read_calls; ' + fact['reason'],
+                          fraction=reads / read_calls,
+                          scope='aggregate owner read ops divided by adapter coordinator '
+                                'read calls; requests, not value-cache hits or bytes')
+    return row | dict(available=False,
+                      reason=('coordinator db_op get series present with zero observations '
+                              'and no adapter read calls' if get_rows else
+                              'no coordinator get calls observed'))
 
 
 def coordinator_covers(stats, namespace):
@@ -368,13 +434,26 @@ PRE_CERTIFICATION_BASELINE = 'pre-certification replay scrape'
 
 
 def metric_cut(values, namespaces, *, remote):
-    """Decode one scrape into the aggregate live and coordinator populations."""
+    """Decode one scrape into the aggregate live and coordinator populations.
+
+    A coordinator cut must show recorded engine `db_op` observations. The
+    engine registers the family at open, so an all-zero population while the
+    adapter counters show served reads is a typed `db_op not recorded` defect,
+    not an available zero-latency population and not a transient miss.
+    """
     live = live_nvmeof_stats(values)
     coordinator = coordinator_stats(values)
+    adapter = adapter_stats(values)
+    coordinator['db_op'] = db_op_recording(coordinator, adapter)
     if remote and not live['available']:
         raise MetricCutUnavailable('remote scrape lacks the aggregate tidehunter_nvmeof_live_* family')
     if remote and not coordinator['available']:
         raise MetricCutUnavailable('remote scrape lacks coordinator read/lock metrics')
+    if remote and not coordinator['db_op']['recorded']:
+        reads = coordinator['db_op']['adapter_read_calls'] or 0
+        writes = coordinator['db_op']['adapter_write_commit_calls'] or 0
+        if reads or writes:
+            raise DbOpNotRecorded(coordinator['db_op'])
     if coordinator['available']:
         missing = [ns for ns in namespaces if not coordinator_covers(coordinator, ns)]
         if missing:
@@ -586,21 +665,30 @@ def summarize_verified(verified):
                 for key in ('pswpin','pswpout')},foreground_metrics=foreground)
         if mode in final_by_mode:
             final = final_by_mode[mode]
+            final_adapter = adapter_stats(final)
+            final_coordinator = coordinator_stats(final)
+            final_coordinator['db_op'] = db_op_recording(final_coordinator, final_adapter)
             summary['modes'][mode].update(final_metrics_freshness=replay['final_metrics_freshness'],
-                final_metrics=final, final_adapter_by_namespace=adapter_stats(final),
+                final_metrics=final, final_adapter_by_namespace=final_adapter,
                 final_live_nvmeof=live_nvmeof_stats(final),
-                final_coordinator=coordinator_stats(final),
+                final_coordinator=final_coordinator,
+                final_wrapper_latencies=wrapper_latency_table(final),
                 final_metrics_scope='post-certified scrape cut; excluded from foreground metrics/timing; not quiescent physical IO')
+        adapter = adapter_stats(foreground)
+        coordinator = coordinator_stats(foreground)
+        coordinator['db_op'] = db_op_recording(coordinator, adapter)
         summary['modes'][mode]['checkpoint_completion'] = checkpoint_completion_observation(foreground)
-        summary['modes'][mode]['adapter_by_namespace'] = adapter_stats(foreground)
+        summary['modes'][mode]['adapter_by_namespace'] = adapter
         summary['modes'][mode]['live_nvmeof'] = live_nvmeof_stats(foreground)
-        summary['modes'][mode]['coordinator'] = coordinator_stats(foreground)
+        summary['modes'][mode]['coordinator'] = coordinator
         summary['modes'][mode]['owner_fetch_fraction'] = owner_fetch_fraction(
-            summary['modes'][mode]['live_nvmeof'], summary['modes'][mode]['coordinator'])
+            summary['modes'][mode]['live_nvmeof'], coordinator, adapter)
+        summary['modes'][mode]['wrapper_latencies'] = wrapper_latency_table(foreground)
         summary['modes'][mode]['disk'] = result.get('disk')
         summary['modes'][mode]['checkpoint_sequence_cache_counts'] = checkpoint_sequence_cache_stats(foreground)
         summary['modes'][mode]['execution_cache_api_calls'] = {k:v for k,v in foreground.items() if k.startswith('execution_cache_db_read_calls')}
         summary['modes'][mode]['execution_cache_keys'] = {k:v for k,v in foreground.items() if k.startswith('execution_cache_requests')}
+    summary['wrapper_latency_comparison'] = wrapper_latency_comparison(final_by_mode)
     summary['remote_over_native']=summary['modes']['remote']['foreground_seconds']/summary['modes']['native']['foreground_seconds']
     for namespace, comparison in audit['databases'].items():
         summary['table_counts'][namespace]={name:entry['records'] for name,entry in comparison['native']['tables'].items()}
@@ -755,6 +843,56 @@ def adapter_means(stats):
 def wrapper_latencies(values):
     """All typed-store latency histograms, including empty populations."""
     return _histogram_rows(values, r'rocksdb_\w+_latency_seconds')
+
+
+def _wrapper_evidence(row):
+    """One decoded wrapper histogram with interval-labelled percentiles."""
+    return dict(count=row['count'], mean_us=row['mean_us'], available=row['available'],
+                reason=row['reason'], quantiles={
+                    name: dict(available=q['available'],
+                               interval_us=[q['lower_us'], q['upper_us']] if q['available'] else None,
+                               lower_us=q['lower_us'], upper_us=q['upper_us'],
+                               upper_unbounded=q['upper_unbounded'], reason=q['reason'])
+                    for name, q in row['quantiles'].items()})
+
+
+def _wrapper_key(row):
+    return (row['metric'].removeprefix('rocksdb_').removesuffix('_latency_seconds'),
+            tuple(sorted(row['labels'].items())))
+
+
+def wrapper_latency_table(values):
+    """Sui typed-store wrapper latencies per op and per `cf_name`/`db_name`.
+
+    The wrapper (Sui `crates/typed-store`) records a histogram per op and per
+    column family (or per database for a schema-batch commit). Scopes are never
+    pooled. Percentiles are cumulative-histogram bucket intervals [lower,
+    upper] in microseconds; a null upper endpoint is the unbounded +Inf bucket.
+    """
+    rows = {}
+    for row in wrapper_latencies(values):
+        op, labels = _wrapper_key(row)
+        rows[(op, labels)] = _wrapper_evidence(row) | dict(op=op, labels=dict(labels))
+    return dict(rows=[rows[key] for key in sorted(rows)],
+                units='microseconds; mean is sum/count',
+                quantile_form='bucket interval [lower, upper]; null upper is unbounded; never a point',
+                scope='Sui typed-store rocksdb_*_latency_seconds, one row per op and scope label')
+
+
+def wrapper_latency_comparison(values_by_mode):
+    """One per-op table across modes, joined on (op, scope label)."""
+    rows = {}
+    for mode, values in sorted(values_by_mode.items()):
+        for row in wrapper_latencies(values):
+            key = _wrapper_key(row)
+            op, labels = key
+            rows.setdefault(key, dict(op=op, labels=dict(labels)))[mode] = _wrapper_evidence(row)
+    return dict(rows=[rows[key] for key in sorted(rows)],
+                modes=sorted(values_by_mode),
+                units='microseconds; mean is sum/count',
+                quantile_form='bucket interval [lower, upper]; null upper is unbounded; never a point',
+                scope='one per-op comparison of the Sui typed-store wrapper histograms; '
+                      'no pooling across column families, databases or modes')
 
 
 def checkpoint_completion_observation(values, *, required=False):
@@ -967,7 +1105,7 @@ def value_cache_check(values, namespaces):
         return _state('fail', 'no value-cache lookup was observed; a hit rate '
                               'needs an observed population', lookups=lookups)
     fraction = owner_fetch_fraction(live_nvmeof_stats(values),
-                                    coordinator_stats(values))
+                                    coordinator_stats(values), adapter_stats(values))
     return _state('pass', None, accounting=accounting,
                   owner_fetch_fraction=fraction,
                   per_cell_value_cache='not_exported: the per-cell native LRU that '
