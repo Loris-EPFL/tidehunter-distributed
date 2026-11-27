@@ -15,9 +15,9 @@ class ManifestBindings(unittest.TestCase):
         value = manifest.manifest()
         self.assertEqual(value['campaign']['id'], 'campaign-hybrid-sui-2026-11-25')
         self.assertEqual(value['owner']['decided_utc'], '2026-11-26')
-        self.assertEqual(value['budget']['cap_usd'], 260.00)
+        self.assertEqual(value['budget']['cap_usd'], 300.00)
         self.assertEqual(value['budget']['spent_usd'], 76.40)
-        self.assertEqual(value['budget']['remaining_usd'], 183.60)
+        self.assertEqual(value['budget']['remaining_usd'], 223.60)
         self.assertEqual(value['owner']['cap_usd'], value['budget']['cap_usd'])
         ceilings = {stage['id']: stage['ceiling_usd'] for stage in value['stages']}
         self.assertEqual(ceilings, {'stage1': 60.42, 'stage2': 72.50, 'stage3': 24.17})

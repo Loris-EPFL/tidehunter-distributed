@@ -5,12 +5,12 @@
   "max_duration_seconds": 14400,
   "quote_description": "USD conservative CI reservation for exactly six z4m-highmem-16 hosts in us-central1 for at most four hours: public on-demand VM/mandatory-Local-SSD rate $3.287109973 per host-hour, rounded compute base $78.90; $11.10 allowance for boot disks, object storage/requests and result transfer. Source: https://cloud.google.com/products/compute/pricing/storage-optimized . Estimate, not an invoice or project-wide hard spending cap; extra fleets, other machine types/regions and artifact retention beyond the campaign are not included in this CI quote. The reviewed manual campaign has its own aggregate $145 quote for one six-host six-hour fleet, including in-place runtime preparation and first-two-host qualification before the suite: rounded compute $118.34 and up to $26.66 for non-compute charges. The editable weekly limit applies to the shared GCP benchmark ledger for both manual and CI campaigns; paid CI activation stays disabled until guest-image and artifact-volume admission are qualified.",
   "campaign": {
-    "cap_usd": 260.0,
+    "cap_usd": 300.0,
     "spent_usd": 76.4,
     "hosts": 3,
     "nanodollars_per_host_hour": 3287109973,
     "ceiling_numer": 14500,
     "ceiling_denom": 11834,
-    "note": "Conservative campaign cap and already-spent total from checkpoint-work/cluster-campaign-2026-11-25/WATCH-STATE.md: stage 0 $4.03 plus the failed stage-1 fleet $72.4. `spent_usd` is updated by the operator after each fleet; the create refusal adds the price-based ceiling of the requested window."
+    "note": "Conservative campaign cap and already-spent total from checkpoint-work/cluster-campaign-2026-11-25/WATCH-STATE.md: stage 0 $4.03 plus the failed stage-1 fleet $72.4. The owner raised the cap from $260 to $300 on 2026-11-27 so stages 1-3 can all run. `spent_usd` is updated by the operator after each fleet; the create refusal adds the price-based ceiling of the requested window."
   }
 }

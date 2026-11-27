@@ -100,9 +100,11 @@ OWNER = dict(
     approval=('stages 1-3, the full option, parity branch feat/nvmeof-only, '
               'concurrency 1-16 only, stage 3 variant A'),
     grants_usd=[dict(reason='stages 1 and 2 ceiling', amount=21.03),
-                dict(reason='stage 3 ceiling', amount=17.09)],
+                dict(reason='stage 3 ceiling', amount=17.09),
+                dict(reason='2026-11-27: cap raised so stages 1-3 can all run',
+                     amount=40.00)],
     cap_usd=float(CAMPAIGN_BUDGET['cap_usd']),
-    note='the owner writes the two grants and the cap in coordination/LEDGER.md')
+    note='the owner writes the grants and the cap in coordination/LEDGER.md')
 
 BUDGET = dict(
     cap_usd=float(CAMPAIGN_BUDGET['cap_usd']),
