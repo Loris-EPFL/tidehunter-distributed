@@ -260,6 +260,13 @@ class Campaign(unittest.TestCase):
         self.assertEqual(blob['size'], 100000)
         self.assertEqual(self.store.get(blob['object']), source.read_bytes())
 
+    def test_send_file_sets_the_mode_for_a_staged_executable(self):
+        target = Path(self.scratch.name) / 'guest/storage-node'
+        source = Path(self.scratch.name) / 'storage-node'
+        source.write_bytes(b'binary')
+        self.client.send_file(FLEET[1]['name'], target, source, mode=0o755)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+
     def test_stage_tree_copies_a_directory_through_the_bucket(self):
         build = Path(self.scratch.name) / 'build'
         (build / 'binaries').mkdir(parents=True)

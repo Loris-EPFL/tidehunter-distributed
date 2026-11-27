@@ -966,7 +966,8 @@ def main():
         state = json.loads(Path(args.fleet_state).read_text())
         campaign = Path('/mnt/tidehunter') / state['run_id'] / 'campaign'
         binary = Path(args.binary)
-        remote.send_file(coordinator, campaign / 'binaries' / binary.name, binary)
+        remote.send_file(coordinator, campaign / 'binaries' / binary.name, binary,
+                         mode=0o755)
         external = []
         for item in args.external or []:
             tier, _, local = item.partition('=')

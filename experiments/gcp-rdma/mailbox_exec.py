@@ -382,13 +382,19 @@ class MailboxExec(host_exec.HostExecution):
             stdout_object=self.transfer_key(index, operation_id, 'stdout'))
         return self.finish(host, reference)
 
-    def send_file(self, host, path, local, *, operation_id=None):
-        """Copy one local file to a guest path through the bucket."""
+    def send_file(self, host, path, local, *, operation_id=None, mode=None):
+        """Copy one local file to a guest path through the bucket.
+
+        A streamed copy creates the destination with the writer's umask, so a
+        caller that stages an executable must name its mode.
+        """
         destination = Path(path)
+        command = (f'mkdir -p {shlex.quote(str(destination.parent))} && '
+                   f'cat > {shlex.quote(str(destination))}')
+        if mode is not None:
+            command += f' && chmod {mode:o} {shlex.quote(str(destination))}'
         return self.send_local(
-            host, f'mkdir -p {shlex.quote(str(destination.parent))} && '
-                  f'cat > {shlex.quote(str(destination))}', local,
-            operation_id=operation_id)
+            host, command, local, operation_id=operation_id)
 
     def staging_key(self, name, digest):
         """The one bucket key of a tree under this run, addressed by its digest."""

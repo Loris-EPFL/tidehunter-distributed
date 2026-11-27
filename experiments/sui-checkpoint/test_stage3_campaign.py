@@ -984,6 +984,12 @@ class ClusterDispatch(unittest.TestCase):
             mock.call('bench-' + 'a' * 16 + '-0', synchronous,
                       Path('/mnt/tidehunter/bench-' + 'a' * 16
                            + '/campaign/external/synchronous'))])
+        self.assertIn(
+            mock.call('bench-' + 'a' * 16 + '-0',
+                      Path('/mnt/tidehunter/bench-' + 'a' * 16
+                           + '/campaign/binaries/storage-node'),
+                      binary, mode=0o755),
+            remote.send_file.call_args_list)
 
     def test_the_build_and_schema_are_staged_when_no_external_is_named(self):
         with tempfile.TemporaryDirectory() as tmp:
