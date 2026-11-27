@@ -788,22 +788,51 @@ class CellDriver:
         appears at open); the caller waits for the write gate first, so a store
         is taken over data. This gate reads only files: the sample file is too
         large to parse on every poll.
+
+        Each observation also carries the coordinator WAL's allocated bytes, so
+        the evidence says how many value bytes the engine had published at the
+        cut: the cadence is `index_value_bytes()`, not the WAL position, and
+        `S1-2S-snapshot-native` missed the 8 GiB default with a 101 s run.
         """
+        baseline = self._coordinator_wal_bytes(child)
         state = dict(previous=self._snapshot_files(child))
 
         def predicate():
             current = self._snapshot_files(child)
             previous = state['previous']
+            wal = self._coordinator_wal_bytes(child)
+            row = dict(wal_allocated_bytes=wal,
+                       wal_allocated_delta=(None if baseline is None or wal is None
+                                            else wal - baseline))
             if not previous:
                 state['previous'] = current
-                return dict(reached=False, note='waiting for the control region')
+                return dict(row, reached=False, note='waiting for the control region')
             changed = {name: [previous.get(name), value]
                        for name, value in current.items()
                        if previous.get(name) != value}
             state['previous'] = current
-            return dict(reached=bool(changed), changed=changed, files=len(current))
-        return self.wait_for(child, predicate, timeout=timeout, poll=0.1,
+            return dict(row, reached=bool(changed), changed=changed, files=len(current))
+        gate = self.wait_for(child, predicate, timeout=timeout, poll=0.1,
                              label='snapshot control-region store')
+        gate['wal_allocated_baseline'] = baseline
+        return gate
+
+    def _coordinator_wal_bytes(self, child):
+        """Allocated bytes of the coordinator's WAL files, or None.
+
+        `set_len` gives each new index WAL file its apparent size without
+        allocating blocks, so the allocated count is the written volume. A file
+        that cannot be stat'ed is skipped, and no WAL at all answers None.
+        """
+        root = Path(child.output).parent / 'coordinator'
+        total, seen = 0, False
+        for path in root.glob('wal_*'):
+            try:
+                total += path.stat().st_blocks * 512
+            except OSError:
+                continue
+            seen = True
+        return total if seen else None
 
     def _snapshot_files(self, child):
         """Size and nanosecond mtime of the control region and its temp file."""

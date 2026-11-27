@@ -28,6 +28,7 @@ Every synthetic cell is labelled `synthetic` and its plan family, so a table
 built from this file cannot be mistaken for a Sui-adapter result.
 """
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -60,11 +61,20 @@ FENCE_CASES = ('contend', 'lapse', 'stale', 'sealed')
 # config admission limit of 300 s and above the slowest owner-ready wait here,
 # so a driver that never releases fails the run with the engine's own error.
 MEASUREMENT_GATE_SECONDS = 240
-# The snapshot cut must outlive the snapshot thread's 60 s first poll and pass
-# the production 8 GiB value-byte root cadence. 3,500,000 x 4,096 B = 14.3 GiB
-# of value bytes; at the measured 41k put/s the run lasts about 85 s, so the
-# first poll stores a control region before the run ends.
+# The snapshot cut must outlive the snapshot thread's 60 s first poll. The
+# cadence is `snapshot_written_bytes` of published value bytes (`hybrid/
+# snapshot.rs` -> `index_value_bytes()`), 8 GiB by production default, and
+# `S1-2S-snapshot-native` at 3,500,000 x 4,096 B = 14.3 GiB of value bytes
+# missed the cut anyway: the run completed in 101.1 s at the measured 35.3k
+# put/s, the 8 GiB crossing fell within ~1 s of the first poll (next one is
+# 120 s, past the run), so no control region was stored and the driver stopped
+# with `gate missed`. The cells therefore force the cadence to
+# `SNAPSHOT_ROOT_BYTES` (a quarter of the value bytes a 60 s window writes) and
+# keep 3,500,000 operations so the run lasts >= 90 s at 35.3k put/s.
 SNAPSHOT_MEASUREMENT = 3_500_000
+# Forced `index.snapshot_written_bytes` of the snapshot cells: 256 MiB, an
+# eighth of the 8 GiB default and far below the 8.7 GiB a 60 s window writes.
+SNAPSHOT_ROOT_BYTES = 256 << 20
 # The columns every verdict parser reads: `phase` and `outcome` select rows,
 # `operation` selects a metric, `api_ns` carries the exact sample and
 # `completed_ns`/`bytes` carry the stage-3 call window and payload.
@@ -191,6 +201,8 @@ def cells():
                 note=('kill -9 the coordinator after the snapshot pass stores a control '
                       'region, reopen, full audit' if snapshot else
                       'kill -9 the coordinator at 200 acknowledged writes, reopen, full audit'),
+                index_overrides=(dict(snapshot_written_bytes=SNAPSHOT_ROOT_BYTES)
+                                 if snapshot else None),
                 runs=[_run('measure', mix=_mix(put=100), value=4096,
                            concurrency=4,
                            measurement=(SNAPSHOT_MEASUREMENT if snapshot else 1_000_000),
@@ -278,10 +290,18 @@ def spec(cell, run, context, *, path, evidence):
                   measurement_operations=run['measurement'])
     operations = (run['keys'] if run['preload'] or run['verify'] else 0) \
         + run['warmup'] + run['measurement']
+    # A cell may force one coordinator index field (the snapshot cells force
+    # `snapshot_written_bytes`); the rest of the prepared deployment is used as
+    # written. `RemoteDatabaseConfig.index` is `#[serde(default)]`, so the
+    # partial object takes the engine's production values for every other row.
+    remote = copy.deepcopy(context['remote'])
+    overrides = cell.get('index_overrides')
+    if overrides:
+        remote.setdefault('index', {}).update(overrides)
     options = dict(
         transport=context['transport'], path=str(path), evidence=str(evidence),
         owners=OWNERS, key_count=run['keys'],
-        external_remote_config=context['remote'],
+        external_remote_config=remote,
         external_owner_durability_receipts=list(context['receipts']),
         durability_tier=cell['tier'], value_cache_size=0,
         coordinator_read_cache_bytes=context['remote']['read_cache_bytes'])

@@ -89,17 +89,33 @@ class CellTable(unittest.TestCase):
                 self.assertEqual(run['mix']['delete'], 0)
 
     def test_the_snapshot_cut_outlives_the_snapshot_poll_and_byte_cadence(self):
+        """The cut must be certain at the first 60 s poll, not a byte-volume race.
+
+        `S1-2S-snapshot-native/attempt-3` ran the 3,500,000 row and completed
+        3,565,536 operations in 101.1 s (35.3k put/s), yet no control region was
+        stored: 14.3 GiB of value bytes crosses the production 8 GiB cadence at
+        ~59 s, within a second of the first 60 s poll, and the next poll is at
+        120 s, past the run. The cells now force `index.snapshot_written_bytes`
+        to 256 MiB, an eighth of the production value, and keep 3,500,000
+        operations so the run lasts 101 s at the measured rate.
+        """
         for tier in mechanism.TIERS:
             cell = mechanism.find(f'S1-2S-snapshot-{tier}')
             run = cell['runs'][0]
             self.assertEqual(run['measurement'], mechanism.SNAPSHOT_MEASUREMENT)
-            # The first snapshot check is 60 s after open and the root trigger
-            # is 8 GiB of value bytes; the run must pass both.
-            self.assertGreater(run['measurement'] * run['value'], 8 << 30)
-            self.assertLessEqual(run['measurement'] * run['value'], 16 << 30)
+            self.assertEqual(cell['index_overrides'],
+                             dict(snapshot_written_bytes=mechanism.SNAPSHOT_ROOT_BYTES))
+            self.assertEqual(mechanism.SNAPSHOT_ROOT_BYTES, 256 << 20)
+            # 3,500,000 x 4,096 B at the measured 35.3k put/s is 101 s, so the
+            # first poll at 60 s runs over data.
+            self.assertGreater(mechanism.SNAPSHOT_MEASUREMENT * run['value'],
+                               8 << 30)
+            self.assertLessEqual(mechanism.SNAPSHOT_MEASUREMENT * run['value'],
+                                 16 << 30)
             self.assertGreaterEqual(run['deadline'], 900)
             publication = mechanism.find(f'S1-2S-publication-{tier}')
             self.assertEqual(publication['runs'][0]['measurement'], 1_000_000)
+            self.assertIsNone(publication['index_overrides'])
 
     def test_unknown_cell_fails(self):
         with self.assertRaisesRegex(ValueError, 'unknown mechanism cell'):
@@ -136,6 +152,20 @@ class Specs(unittest.TestCase):
         self.assertEqual(len(spec['key_namespace_hex']), 32)
         self.assertEqual(spec['phases']['measurement_operations'], run['measurement'])
         self.assertEqual(spec['limits']['deadline_seconds'], run['deadline'])
+        self.assertNotIn('index', options['external_remote_config'],
+                         'a publication cell uses the prepared deployment as written')
+
+    def test_a_snapshot_spec_forces_only_the_root_cadence(self):
+        cell = mechanism.find('S1-2S-snapshot-synchronous')
+        base = context()
+        spec = mechanism.spec(cell, cell['runs'][0], base,
+                              path='/owned/coordinator', evidence='/owned/evidence')
+        remote = spec['backend']['options']['external_remote_config']
+        self.assertEqual(remote['index'], dict(snapshot_written_bytes=256 << 20))
+        self.assertEqual(remote['read_cache_bytes'], 0)
+        self.assertEqual(remote['storage'], {})
+        self.assertNotIn('index', base['remote'],
+                         'the prepared deployment is not mutated in place')
 
     def test_limit_covers_dataset_and_operations(self):
         for cell in mechanism.cells():
