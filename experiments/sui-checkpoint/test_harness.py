@@ -943,6 +943,11 @@ class LifecycleChecks(unittest.TestCase):
 class ReopenWithFakes(unittest.TestCase):
     """The reopen orchestration against a fake node, RPC and metrics server."""
 
+    # The real S1-1-native attempt 2 reopen lines: the rpc-store resumed and
+    # the framework resumed all ten pipelines from the frozen tip watermark.
+    REOPEN_LOG = (Path(__file__).resolve().parent / 'fixtures' /
+                  'reopen-native-attempt2.log').read_text()
+
     class Child:
         returncode = -signal.SIGTERM
 
@@ -952,6 +957,8 @@ class ReopenWithFakes(unittest.TestCase):
 
         def start(self, name, command, extra=None):
             self.commands.append((name, [str(part) for part in command], extra))
+            Path(self.root).mkdir(parents=True, exist_ok=True)
+            (Path(self.root) / f'{name}.log').write_text(ReopenWithFakes.REOPEN_LOG)
             return ReopenWithFakes.Child()
 
         def stop(self, child):
@@ -973,8 +980,15 @@ class ReopenWithFakes(unittest.TestCase):
         def read(self, size=-1):
             return self.data
 
-    def reopen(self, root, *, producer_delta='', tail=2):
-        owned = self.Owned(root)
+    def assert_reopened(self, log, owned):
+        self.assertEqual(log, owned.root / 'reopen.log',
+                         'the wait reads the phase log from the experiment output root')
+        self.assertIn('Ingestion range cohort=0 start=1776', log.read_text())
+
+    def reopen(self, root, *, producer_delta='', tail=2, after_status=None):
+        # The configuration root (`root`) and the experiment output root
+        # (`root/experiment`, where Owned writes phase logs) differ at run time.
+        owned = self.Owned(Path(root) / 'experiment')
 
         def rpc(address, method, params):
             sequence = int(params[0])
@@ -987,11 +1001,15 @@ class ReopenWithFakes(unittest.TestCase):
             scraped.append(url)
             return self.Response(b'last_executed_checkpoint 1775\n')
 
+        def catchup(child, address, log, tip, metrics):
+            self.assert_reopened(log, owned)
+            return metrics, dict(status='persisted-watermark-at-frozen-tip',
+                                 committer_batches={})
+
         with patch.object(run.checkpoint, 'wait_rpc', lambda child, address: 1775), \
-                patch.object(run.checkpoint, 'wait_for_rpc_indexes',
-                             lambda child, address, tip, metrics: (
-                                 scraped.append(address) or metrics,
-                                 dict(status='all-ten-committed-at-frozen-tip'))), \
+                patch.object(run.checkpoint, 'wait_for_reopened_indexes', catchup), \
+                patch.object(run.checkpoint, 'reopened_index_state',
+                             after_status or run.checkpoint.reopened_index_state), \
                 patch.object(run.checkpoint, 'rpc', rpc), \
                 patch.object(run.urllib.request, 'urlopen', urlopen):
             receipt, metrics = run.reopen(
@@ -1000,8 +1018,10 @@ class ReopenWithFakes(unittest.TestCase):
                 producer_address='producer', tip=1775, digest='D1775', bound=1776,
                 extra={'SUI_SHARDED_WAL_CONFIG': 'config.json'},
                 tail_checkpoints=tail)
-        # The node serves Prometheus on its metrics address, not on JSON-RPC.
-        self.assertEqual(scraped, ['http://node-metrics/metrics', 'node-metrics'])
+        # The node serves Prometheus on its metrics address, not on JSON-RPC:
+        # once before the wait and once after the tail read-back.
+        self.assertEqual(scraped, ['http://node-metrics/metrics',
+                                   'http://node-metrics/metrics'])
         return owned, receipt, metrics
 
     def test_reopen_certifies_the_tip_and_reads_back_the_tail(self):
@@ -1019,13 +1039,19 @@ class ReopenWithFakes(unittest.TestCase):
             self.assertEqual(command[-2:], ['--run-with-range-checkpoint', '1776'],
                              'the inclusive bound stays above the persisted watermark')
             self.assertEqual(extra, {'SUI_SHARDED_WAL_CONFIG': 'config.json'})
-            self.assertEqual((Path(tmp) / 'reopen-final.prom').read_bytes(),
+            self.assertEqual((Path(tmp) / 'experiment' / 'reopen-final.prom').read_bytes(),
                              b'last_executed_checkpoint 1775\n')
 
     def test_a_changed_tail_digest_fails_the_reopen(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 self.assertRaisesRegex(RuntimeError, 'differs after the reopen'):
             self.reopen(tmp, producer_delta='!', tail=1)
+
+    def test_an_index_state_that_changed_during_the_tail_read_back_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                self.assertRaisesRegex(RuntimeError, 'changed state during the tail read-back'):
+            self.reopen(tmp, after_status=lambda metrics, log, tip: dict(
+                status='all-ten-committed-at-frozen-tip', committer_batches={'balance': 1}))
 
 
 class CampaignBuildTargets(unittest.TestCase):

@@ -1306,6 +1306,11 @@ def lifecycle_check(result):
         return _state('fail', 'the reopen audit is not equal')
     if (lifecycle.get('tail_replay') or {}).get('state_unchanged') is not True:
         return _state('fail', 'the tail replay changed state')
+    catchup = (lifecycle.get('reopen') or {}).get('rpc_index_catchup') or {}
+    if catchup.get('status') not in ('persisted-watermark-at-frozen-tip',
+                                     'all-ten-committed-at-frozen-tip'):
+        return _state('fail', 'the reopen states no indexer resume frontier',
+                      status=catchup.get('status'))
     return _state('pass', None, durable_cut=lifecycle.get('durable_cut'),
                   no_new_export=lifecycle.get('no_new_export'),
                   tail_checkpoints=lifecycle.get('tail_checkpoints'))

@@ -22,6 +22,13 @@ def index_metrics(checkpoint, names=None):
     )
 
 
+def attempt_metrics(batches, names=None):
+    return "\n".join(
+        f'rpc_store_indexer_total_committer_batches_attempted{{pipeline="{name}"}} {batches}'
+        for name in sorted(support.RPC_INDEX_PIPELINES if names is None else names)
+    )
+
+
 def local_audit():
     tables = {"default": {"records": 2, "key_bytes": 8, "value_bytes": 16, "digest_xor": [1] * 32}}
     return {"wal_recovery": "AbsoluteConsistency", "tables": tables,
@@ -122,6 +129,127 @@ class RpcContract(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 support.wait_rpc(SimpleNamespace(poll=lambda: None), "source:1")
             rpc.assert_not_called()
+
+
+class ReopenedIndexContract(unittest.TestCase):
+    """The cleaned-reopen index premise, from the real S1-1-native attempt 2 log.
+
+    `fixtures/reopen-native-attempt2.log` keeps the two lines the reopened node
+    logged after the frozen 1775-checkpoint replay: the rpc-store bootstrap and
+    the framework's stated ingestion range. Both come from
+    `gs://mysten-research-bench-artifacts/campaign-hybrid-sui-2026-11-25/stage1/
+    evidence/S1-1-native/attempt-2/reopen.log` with the store-path line dropped.
+    """
+
+    ROOT = Path(__file__).resolve().parent
+    LOG = (ROOT / 'fixtures' / 'reopen-native-attempt2.log').read_text()
+    TIP = 1775
+
+    def test_the_real_reopen_states_a_persisted_tip_watermark_and_no_commit(self):
+        resume = support.rpc_index_resume(self.LOG, self.TIP)
+        self.assertEqual(resume['start'], self.TIP + 1)
+        self.assertEqual(resume['cohorts'], [dict(
+            cohort=0, start=self.TIP + 1,
+            pipelines=["epochs", "tx_seq_by_digest", "tx_metadata_by_seq",
+                       "object_version_by_checkpoint", "object_by_owner", "object_by_type",
+                       "balance", "package_versions", "transaction_bitmap", "event_bitmap"])])
+        self.assertEqual(support.rpc_index_bootstrap(self.LOG),
+                         dict(action='Resume', lowest_available=0, highest_committed=self.TIP))
+        state = support.reopened_index_state('last_executed_checkpoint 1775\n', self.LOG, self.TIP)
+        self.assertEqual(state['status'], 'persisted-watermark-at-frozen-tip')
+        self.assertEqual(state['frontiers'], {})
+        self.assertEqual(state['committer_batches'], {})
+        self.assertEqual(state['bootstrap']['action'], 'Resume')
+
+    def test_the_real_replayed_scrape_publishes_both_commit_families(self):
+        # Proves the absence after a reopen is the observable, not a parser loss.
+        values = (self.ROOT / 'fixtures' / 'attempt4-remote-final.prom').read_text()
+        self.assertEqual(set(support.rpc_index_frontiers(values, self.TIP)),
+                         support.RPC_INDEX_PIPELINES)
+        self.assertEqual(set(support.rpc_committer_attempts(values)), support.RPC_INDEX_PIPELINES)
+
+    def test_the_real_replay_scrape_minus_its_commit_families_is_a_resume(self):
+        # A resumed node publishes the frontier gauge and the attempt counter
+        # only when a batch lands, so a reopen scrape is this scrape with those
+        # two per-process families dropped and nothing else changed.
+        text = (self.ROOT / 'fixtures' / 'attempt4-remote-final.prom').read_text()
+        resumed = '\n'.join(line for line in text.splitlines() if not line.startswith((
+            'rpc_store_indexer_watermark_checkpoint_in_db{',
+            'rpc_store_indexer_total_committer_batches_attempted{')))
+        self.assertEqual(support.rpc_index_frontiers(resumed, self.TIP), {})
+        self.assertEqual(support.rpc_committer_attempts(resumed), {})
+        state = support.reopened_index_state(resumed, self.LOG, self.TIP)
+        self.assertEqual(state['status'], 'persisted-watermark-at-frozen-tip')
+
+    def test_a_resume_below_the_tip_or_missing_a_pipeline_is_refused(self):
+        below = self.LOG.replace('start=1776', 'start=1775')
+        with self.assertRaisesRegex(ValueError, 'resumed from checkpoint 1774'):
+            support.rpc_index_resume(below, self.TIP)
+        missing = self.LOG.replace('"balance", ', '')
+        with self.assertRaisesRegex(ValueError, 'cover each index pipeline once'):
+            support.rpc_index_resume(missing, self.TIP)
+        with self.assertRaisesRegex(ValueError, 'unknown'):
+            support.rpc_index_resume(self.LOG.replace('"balance"', '"unknown"'), self.TIP)
+        self.assertIsNone(support.rpc_index_resume('starting up\n', self.TIP))
+
+    def test_a_reopen_that_rebuilt_instead_of_resuming_is_refused(self):
+        rebuilt = self.LOG.replace('action=Resume', 'action=Restore')
+        with self.assertRaisesRegex(RuntimeError, 'instead of resuming'):
+            support.reopened_index_state('last_executed_checkpoint 1775\n', rebuilt, self.TIP)
+        stale = self.LOG.replace('highest_committed=Some(1775)', 'highest_committed=Some(1774)')
+        with self.assertRaisesRegex(RuntimeError, 'not the frozen tip'):
+            support.reopened_index_state('last_executed_checkpoint 1775\n', stale, self.TIP)
+        with self.assertRaisesRegex(RuntimeError, 'did not state its rpc-store bootstrap'):
+            support.reopened_index_state(
+                'last_executed_checkpoint 1775\n',
+                '\n'.join(line for line in self.LOG.splitlines()
+                          if 'bootstrapping' not in line), self.TIP)
+        self.assertIsNone(support.reopened_index_state('', 'starting up\n', self.TIP))
+
+    def test_a_reopen_that_committed_is_judged_by_the_commit_it_published(self):
+        attempts = attempt_metrics(self.TIP + 1)
+        with self.assertRaisesRegex(RuntimeError, 'attempted indexer commits'):
+            support.reopened_index_state(attempts, self.LOG, self.TIP)
+        partial = index_metrics(self.TIP, support.RPC_INDEX_PIPELINES - {'balance'})
+        with self.assertRaisesRegex(RuntimeError, 'only part of the RPC pipelines: balance'):
+            support.reopened_index_state(partial, self.LOG, self.TIP)
+        state = support.reopened_index_state(index_metrics(self.TIP), self.LOG, self.TIP)
+        self.assertEqual(state['status'], 'all-ten-committed-at-frozen-tip')
+
+    def test_the_reopened_wait_polls_until_the_node_states_its_frontier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'reopen.log'
+            child = SimpleNamespace(poll=lambda: None)
+            clock = [0.0]
+
+            def monotonic():
+                clock[0] += 0.25
+                return clock[0]
+
+            def appear(*args, **kwargs):
+                log.write_text(self.LOG)
+                return io.BytesIO(b'last_executed_checkpoint 1775\n')
+
+            with patch.object(support.time, 'monotonic', side_effect=monotonic), \
+                    patch.object(support.time, 'sleep'), \
+                    patch.object(support.urllib.request, 'urlopen', side_effect=appear) as opened:
+                metrics, state = support.wait_for_reopened_indexes(
+                    child, 'source:1', log, self.TIP, '')
+            self.assertEqual(metrics, 'last_executed_checkpoint 1775\n')
+            self.assertEqual(state['status'], 'persisted-watermark-at-frozen-tip')
+            self.assertEqual([row['status'] for row in state['observations']], [None, state['status']])
+            self.assertEqual(opened.call_count, 1)
+            with patch.object(support.time, 'monotonic', return_value=0), \
+                    patch.object(support.time, 'sleep'), \
+                    patch.object(support.urllib.request, 'urlopen',
+                                 side_effect=lambda *a, **k: io.BytesIO(b'')) as opened:
+                with self.assertRaisesRegex(RuntimeError, 'fixed sample budget'):
+                    support.wait_for_reopened_indexes(SimpleNamespace(poll=lambda: None),
+                                                      'source:1', Path(tmp) / 'absent.log', self.TIP, '')
+                self.assertEqual(opened.call_count, 480)
+            with self.assertRaisesRegex(RuntimeError, 'did not state its indexer resume frontier'):
+                support.wait_for_reopened_indexes(SimpleNamespace(poll=lambda: 1), 'source:1',
+                                                  Path(tmp) / 'absent.log', self.TIP, '')
 
 
 class ProgressContract(unittest.TestCase):

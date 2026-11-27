@@ -647,9 +647,14 @@ class PerCellCriteria(unittest.TestCase):
         self.assertEqual(checks['checks']['lifecycle']['state'], 'missing_counter')
         self.assertTrue(any('lifecycle' in item for item in checks['failures']))
         lifecycle = dict(status='clean-reopen-verified', audit_reopen=dict(equal=True),
-                         tail_replay=dict(state_unchanged=True))
+                         tail_replay=dict(state_unchanged=True),
+                         reopen=dict(rpc_index_catchup=dict(
+                             status='persisted-watermark-at-frozen-tip')))
         self.assertEqual(self.checks('S1-1-native', scrape(),
                                      lifecycle=lifecycle)['failures'], [])
+        without = dict(lifecycle, reopen=dict(rpc_index_catchup=dict(status=None)))
+        checks = self.checks('S1-1-native', scrape(), lifecycle=without)
+        self.assertEqual(checks['checks']['lifecycle']['state'], 'fail')
 
     def test_the_hold_cell_needs_a_sampled_hold(self):
         hold = dict(requested_seconds=1800, seconds=1801,

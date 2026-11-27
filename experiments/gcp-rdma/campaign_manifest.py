@@ -247,7 +247,8 @@ STAGE1_CASES = [
                                'a clean reopen creates no new export',
                                'the durable cut does not extend after flush_durable',
                                'the tail replay is idempotent',
-                               'all ten RPC index pipelines commit at the frozen tip']),
+                               'all ten RPC index pipelines resume from the persisted '
+                               'tip watermark and commit nothing']),
     _fault_row('coordinator crash', 'S1-2', 32),
     _fault_row('owner process crash', 'S1-3', 16),
     _manual_row('W1 resume after controller loss', 'S1-4', 30,

@@ -516,11 +516,15 @@ built `sui-node-*` binary); when they are present the runner sets the same
 values for both measured nodes and records MiB, bytes, the effective floor and
 each env row in `results.json:knobs`. `--lifecycle-checks` adds the clean-reopen checks of
 S1-1/S1-8 after the normal replay and first audit, with `--tail-checkpoints K`
-(default 64) bounding the tail sample: the restarted measured node must
-re-commit all ten RPC index pipelines at the frozen tip, read the certified
-`getCheckpoint(tip)` digest, match the producer's last K digests, add no new
-live-target export, not extend the CRC-framed `durable-cut.v1` record, and pass
-the second audit. The forced map-pressure mechanism cell uses
+(default 64) bounding the tail sample: the restarted measured node must resume
+all ten RPC index pipelines from their persisted tip watermark, read the
+certified `getCheckpoint(tip)` digest, match the producer's last K digests, add
+no new live-target export, not extend the CRC-framed `durable-cut.v1` record,
+and pass the second audit. A resumed pipeline commits nothing, so the
+committed-frontier gauge is absent after a clean reopen; the cell records the
+framework's `Ingestion range` (all ten pipelines from `tip + 1`) and the
+rpc-store bootstrap (`Resume` to `tip`) instead, and reads them again after the
+tail read-back to prove nothing committed in between. The forced map-pressure mechanism cell uses
 `--max-maps 3 --max-index-maps 3`: the lowest non-panicking value for both, so
 value-map pressure is maximal without touching the index minimum.
 Native

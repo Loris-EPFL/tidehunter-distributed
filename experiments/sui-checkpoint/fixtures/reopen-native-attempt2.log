@@ -1,0 +1,2 @@
+2026-11-27T17:30:51.000223Z  INFO sui_core::rpc_store_embed: bootstrapping embedded rpc-store action=Resume lowest_available=0 highest_committed=Some(1775)
+2026-11-27T17:30:51.044586Z  INFO sui_indexer_alt_framework: Ingestion range cohort=0 start=1776 pipelines=["epochs", "tx_seq_by_digest", "tx_metadata_by_seq", "object_version_by_checkpoint", "object_by_owner", "object_by_type", "balance", "package_versions", "transaction_bitmap", "event_bitmap"]

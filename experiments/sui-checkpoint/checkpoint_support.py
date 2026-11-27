@@ -48,18 +48,157 @@ RPC_INDEX_PIPELINES = frozenset(("object_by_owner", "object_by_type", "balance",
     "transaction_bitmap", "event_bitmap"))
 
 
-def rpc_index_frontiers(metrics, checkpoint):
-    frontiers = {}
+def pipeline_series(metrics, family):
+    """One non-negative integer per RPC pipeline for a `family{pipeline=...}` series."""
+    values = {}
     for line in metrics.splitlines():
-        if not line.startswith("rpc_store_indexer_watermark_checkpoint_in_db{"):
+        if not line.startswith(family + "{"):
             continue
         metric, value = line.rsplit(" ", 1)
         name = re.search(r'(?:\{|,)pipeline="([^"]+)"(?:,|\})', metric)
         number = float(value)
-        if name is None or name[1] not in RPC_INDEX_PIPELINES or name[1] in frontiers or not number.is_integer() or not 0 <= number <= checkpoint:
-            raise ValueError("invalid, duplicate or out-of-range committed RPC frontier")
-        frontiers[name[1]] = int(number)
+        if name is None or name[1] not in RPC_INDEX_PIPELINES or name[1] in values or not number.is_integer() or number < 0:
+            raise ValueError(f"invalid or duplicate {family} pipeline")
+        values[name[1]] = int(number)
+    return values
+
+
+def rpc_index_frontiers(metrics, checkpoint):
+    frontiers = pipeline_series(metrics, "rpc_store_indexer_watermark_checkpoint_in_db")
+    if any(value > checkpoint for value in frontiers.values()):
+        raise ValueError("out-of-range committed RPC frontier")
     return frontiers
+
+
+def rpc_committer_attempts(metrics):
+    """Batches each committer attempted in this process; absent means none were attempted.
+
+    The committer counts an attempt before it writes, and it is the only writer
+    of a pipeline's watermark, so a pipeline absent from this family
+    re-executed and re-committed nothing at all.
+    """
+    return pipeline_series(metrics, "rpc_store_indexer_total_committer_batches_attempted")
+
+
+RPC_INDEX_RESUME = re.compile(r"Ingestion range cohort=(\d+) start=(\d+) pipelines=\[(.*)\]")
+RPC_INDEX_BOOTSTRAP = re.compile(
+    r"bootstrapping embedded rpc-store action=(\w+) lowest_available=(\d+) "
+    r"highest_committed=(None|Some\((\d+)\))")
+
+
+def rpc_index_bootstrap(log):
+    """The rpc-store bootstrap action the node logged, or None before it states one."""
+    stated = None
+    for line in log.splitlines():
+        match = RPC_INDEX_BOOTSTRAP.search(line)
+        if match is None:
+            continue
+        if stated is not None:
+            raise ValueError("the node stated its rpc-store bootstrap twice")
+        action, lowest, _, number = match.groups()
+        if action not in ("Resume", "SeedHistory", "Restore"):
+            raise ValueError("unknown rpc-store bootstrap action")
+        stated = {"action": action, "lowest_available": int(lowest),
+                  "highest_committed": None if number is None else int(number)}
+    return stated
+
+
+def rpc_index_resume(log, checkpoint):
+    """Where the framework resumes its ten pipelines, or None before the node states it.
+
+    `Indexer::run` reads every pipeline's persisted watermark and logs one
+    `Ingestion range` per cohort with the smallest `watermark + 1` it will
+    ingest from. A clean reopen at the frozen tip therefore states
+    `start = checkpoint + 1` for all ten pipelines while committing nothing.
+    """
+    cohorts, names = [], []
+    for line in log.splitlines():
+        match = RPC_INDEX_RESUME.search(line)
+        if match is None:
+            continue
+        cohort, start, listed = int(match[1]), int(match[2]), [
+            name.strip().strip('"') for name in match[3].split(",") if name.strip()]
+        if not listed or any(name not in RPC_INDEX_PIPELINES for name in listed):
+            raise ValueError("the node resumed an unknown index pipeline")
+        cohorts.append({"cohort": cohort, "start": start, "pipelines": listed})
+        names.extend(listed)
+    if not cohorts:
+        return None
+    if len({row["cohort"] for row in cohorts}) != len(cohorts) or sorted(names) != sorted(RPC_INDEX_PIPELINES):
+        raise ValueError("the stated ingestion cohorts do not cover each index pipeline once")
+    start = min(row["start"] for row in cohorts)
+    if start != checkpoint + 1:
+        raise ValueError(f"the node resumed from checkpoint {start - 1}, not the frozen tip {checkpoint}")
+    return {"start": start, "checkpoint": checkpoint, "cohorts": cohorts,
+            "scope": "the persisted per-pipeline watermark the framework read at startup"}
+
+
+def reopened_index_state(metrics, log, checkpoint):
+    """How a reopened node's ten indexers stand against the frozen tip.
+
+    A clean reopen resumes every pipeline from its persisted watermark, so the
+    framework schedules from `checkpoint + 1` and ingests nothing. The committer
+    publishes `rpc_store_indexer_watermark_checkpoint_in_db` only when a batch
+    lands, so that family is absent after a resume; a node that re-executed the
+    checkpoints instead publishes all ten at the tip. Returns None while the
+    node has not yet stated its resume frontier.
+    """
+    frontiers = rpc_index_frontiers(metrics, checkpoint)
+    attempts = rpc_committer_attempts(metrics)
+    if frontiers:
+        missing = sorted(RPC_INDEX_PIPELINES - set(frontiers))
+        behind = sorted(name for name, value in frontiers.items() if value != checkpoint)
+        if missing or behind:
+            raise RuntimeError("the reopened node committed only part of the RPC pipelines: "
+                               + ", ".join(missing + behind))
+        return {"status": "all-ten-committed-at-frozen-tip", "checkpoint": checkpoint,
+                "frontiers": frontiers, "committer_batches": attempts,
+                "scope": "the reopened node re-executed checkpoints"}
+    if any(attempts.values()):
+        raise RuntimeError("the reopened node attempted indexer commits without publishing "
+                           "a committed frontier: "
+                           + ", ".join(sorted(name for name, value in attempts.items() if value)))
+    resume = rpc_index_resume(log, checkpoint)
+    if resume is None:
+        return None
+    bootstrap = rpc_index_bootstrap(log)
+    if bootstrap is None:
+        raise RuntimeError("the reopened node did not state its rpc-store bootstrap action")
+    if bootstrap["action"] != "Resume":
+        raise RuntimeError(f"the reopened rpc-store bootstrapped with {bootstrap['action']} "
+                           "instead of resuming the persisted indexes")
+    if bootstrap["highest_committed"] != checkpoint:
+        raise RuntimeError("the reopened rpc-store restored to checkpoint "
+                           f"{bootstrap['highest_committed']}, not the frozen tip {checkpoint}")
+    return {"status": "persisted-watermark-at-frozen-tip", "checkpoint": checkpoint,
+            "frontiers": {}, "committer_batches": {}, "resume": resume, "bootstrap": bootstrap,
+            "scope": "the persisted watermark each pipeline resumes from; the committer "
+                     "published nothing because the frozen tip schedules no checkpoint"}
+
+
+def wait_for_reopened_indexes(child, address, log, checkpoint, metrics):
+    """Wait until the reopened node states where its indexers resume.
+
+    Unlike the replay wait, a clean reopen commits nothing: the committed-frontier
+    gauge only appears when a batch lands, so the observable is the framework's
+    resume frontier read back from the persisted watermarks.
+    """
+    start = time.monotonic()
+    observations = []
+    for _ in range(480):
+        state = reopened_index_state(metrics, log.read_text() if log.exists() else "", checkpoint)
+        observations.append({"seconds": time.monotonic() - start,
+                             "status": None if state is None else state["status"]})
+        if state is not None:
+            state.update({"seconds": time.monotonic() - start, "observations": observations,
+                          "note": "read before the tail read-back; excluded from the foreground replay"})
+            return metrics, state
+        if child.poll() is not None or time.monotonic() - start >= 120:
+            raise RuntimeError("the reopened node did not state its indexer resume frontier at the frozen tip")
+        time.sleep(0.25)
+        with urllib.request.urlopen(f"http://{address}/metrics", timeout=1) as response:
+            metrics = response.read(32 << 20).decode()
+    raise RuntimeError("reopened indexer wait exceeded fixed sample budget")
 
 
 def wait_for_rpc_indexes(child, address, checkpoint, metrics):

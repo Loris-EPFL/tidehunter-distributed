@@ -1169,6 +1169,9 @@ def reopen(owned, *, binary, root, address, metrics_address, producer_address, t
     through the reopened RPC surface and compared with the producer.
     """
     start = time.monotonic()
+    # `Owned.start` writes every phase log under the experiment output root,
+    # which is not the configuration root the node reads `remote.yaml` from.
+    log = owned.root / 'reopen.log'
     child = owned.start('reopen', [binary, '--config-path', root / 'remote.yaml',
                                   '--run-with-range-checkpoint', replay_bound(bound)], extra)
     stop = None
@@ -1176,7 +1179,8 @@ def reopen(owned, *, binary, root, address, metrics_address, producer_address, t
         checkpoint.wait_rpc(child, address)
         with urllib.request.urlopen(f'http://{metrics_address}/metrics', timeout=5) as response:
             metrics = response.read(32 << 20).decode()
-        metrics, catchup = checkpoint.wait_for_rpc_indexes(child, metrics_address, tip, metrics)
+        metrics, catchup = checkpoint.wait_for_reopened_indexes(
+            child, metrics_address, log, tip, metrics)
         certified = checkpoint.rpc(address, 'sui_getCheckpoint', [str(tip)])
         first = max(0, tip - tail_checkpoints + 1)
         sample = []
@@ -1186,6 +1190,15 @@ def reopen(owned, *, binary, root, address, metrics_address, producer_address, t
             if (int(node['sequenceNumber']) != sequence or node['digest'] != source['digest']):
                 raise RuntimeError(f'tail checkpoint {sequence} differs after the reopen')
             sample.append(dict(sequenceNumber=sequence, digest=node['digest']))
+        # The indexers must still stand where they resumed: a commit during the
+        # tail read-back would mean the frozen tip scheduled work after all.
+        with urllib.request.urlopen(f'http://{metrics_address}/metrics', timeout=5) as response:
+            metrics = response.read(32 << 20).decode()
+        after = checkpoint.reopened_index_state(metrics, log.read_text(), tip)
+        if after is None or after['status'] != catchup['status']:
+            raise RuntimeError('the reopened indexers changed state during the tail read-back')
+        catchup['after_tail'] = dict(status=after['status'],
+                                     committer_batches=after['committer_batches'])
     finally:
         stop = owned.stop(child)
     if stop['sigkill'] or stop['reaped_returncode'] not in (0, -signal.SIGTERM):
