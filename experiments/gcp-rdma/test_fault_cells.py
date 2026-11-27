@@ -248,6 +248,21 @@ class OwnerWAL(unittest.TestCase):
         command = cluster.remote.calls[-1][1]
         self.assertIn('done; exit 0', command)
 
+    def test_a_root_line_is_kept_out_of_the_wal_files(self):
+        class Rows(FakeRemote):
+            def run(self, host, command, *, stdin=None, check=True):
+                return 0, (b'/g/db-x/wal_0000000000000000 4096 1.5\n'
+                           b'/g/db-x/partition-wal-root-v1 512 2.5\n'), b''
+
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.remote = Rows()
+        cluster.owner_root = lambda host: Path('/guest')
+        view = cluster.wal('h1')
+        self.assertEqual(view['files'], {
+            '/g/db-x/wal_0000000000000000': dict(size=4096, mtime=1.5)})
+        self.assertEqual(view['roots'], {
+            '/g/db-x/partition-wal-root-v1': dict(size=512, mtime=2.5)})
+
     def test_a_transport_failure_still_reports_its_cause(self):
         class Failing(FakeRemote):
             def run(self, host, command, *, stdin=None, check=True):
