@@ -520,8 +520,11 @@ S1-1/S1-8 after the normal replay and first audit, with `--tail-checkpoints K`
 all ten RPC index pipelines from their persisted tip watermark, read the
 certified `getCheckpoint(tip)` digest, match the producer's last K digests, add
 no new live-target export, not extend the CRC-framed `durable-cut.v1` record,
-and pass the second audit. A resumed pipeline commits nothing, so the
-committed-frontier gauge is absent after a clean reopen; the cell records the
+and pass the second audit. A resumed pipeline attempts no batch, so
+`rpc_store_indexer_total_committer_batches_attempted` stays zero; its
+committed-frontier gauge child is bound at zero when the committer starts and is
+not evidence of a commit, so a commit is judged by the attempt counter and by
+the frontier value, never by the gauge family's presence. The cell records the
 framework's `Ingestion range` (all ten pipelines from `tip + 1`) and the
 rpc-store bootstrap (`Resume` to `tip`) instead, and reads them again after the
 tail read-back to prove nothing committed in between. The forced map-pressure mechanism cell uses

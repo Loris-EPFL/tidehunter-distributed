@@ -207,14 +207,68 @@ class ReopenedIndexContract(unittest.TestCase):
         self.assertIsNone(support.reopened_index_state('', 'starting up\n', self.TIP))
 
     def test_a_reopen_that_committed_is_judged_by_the_commit_it_published(self):
-        attempts = attempt_metrics(self.TIP + 1)
-        with self.assertRaisesRegex(RuntimeError, 'attempted indexer commits'):
+        attempts = attempt_metrics(1)
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'attempted batches without committing all ten pipelines at the frozen tip 1775: balance'):
             support.reopened_index_state(attempts, self.LOG, self.TIP)
         partial = index_metrics(self.TIP, support.RPC_INDEX_PIPELINES - {'balance'})
-        with self.assertRaisesRegex(RuntimeError, 'only part of the RPC pipelines: balance'):
-            support.reopened_index_state(partial, self.LOG, self.TIP)
-        state = support.reopened_index_state(index_metrics(self.TIP), self.LOG, self.TIP)
+        with self.assertRaisesRegex(
+                RuntimeError, 'without committing all ten pipelines.*: balance'):
+            support.reopened_index_state(partial + '\n' + attempts, self.LOG, self.TIP)
+        state = support.reopened_index_state(
+            index_metrics(self.TIP) + '\n' + attempts, self.LOG, self.TIP)
         self.assertEqual(state['status'], 'all-ten-committed-at-frozen-tip')
+        self.assertEqual(state['committer_batches'],
+                         {name: 1 for name in support.RPC_INDEX_PIPELINES})
+
+    def test_a_commit_reports_the_checkpoint_it_landed_at(self):
+        # A batch that landed below the frozen tip is a real defect and must name
+        # the checkpoint, not be counted as a committed tip.
+        short = index_metrics(self.TIP - 1)
+        with self.assertRaisesRegex(
+                RuntimeError, r'at the frozen tip 1775: .*balance@1774'):
+            support.reopened_index_state(short + '\n' + attempt_metrics(1), self.LOG, self.TIP)
+        # A non-zero frontier with no attempted batch is a watermark this process
+        # cannot have written; it is refused instead of read as a commit.
+        with self.assertRaisesRegex(
+                RuntimeError, r'published a committed frontier without attempting a batch: balance@1775'):
+            support.reopened_index_state(index_metrics(self.TIP), self.LOG, self.TIP)
+
+    def test_the_bound_frontier_child_is_not_a_commit(self):
+        """A resumed node binds all ten frontier children and leaves them at zero.
+
+        `CheckpointLagMetricReporter::new_for_pipeline` binds one
+        `rpc_store_indexer_watermark_checkpoint_in_db{pipeline=...}` child per
+        committer at construction, and Prometheus publishes every bound child at
+        its zero value (`prometheus-0.13.4/src/vec.rs::get_or_create_metric`
+        builds a fresh metric; a compiled registry scrape prints `... 0`). The
+        real replay scrape carries both commit families at the tip; zeroing the
+        frontier values and dropping the attempt counters is the state the same
+        registry publishes after a resume that committed nothing. S1-1-native and
+        S1-8 at both tiers failed here because presence was read as a commit.
+        """
+        text = (self.ROOT / 'fixtures' / 'attempt4-remote-final.prom').read_text()
+        resumed = '\n'.join(
+            ('rpc_store_indexer_watermark_checkpoint_in_db{pipeline="'
+             + line.split('pipeline="', 1)[1].split('"', 1)[0] + '"} 0')
+            if line.startswith('rpc_store_indexer_watermark_checkpoint_in_db{') else line
+            for line in text.splitlines()
+            if not line.startswith('rpc_store_indexer_total_committer_batches_attempted{'))
+        self.assertEqual(support.rpc_index_frontiers(resumed, self.TIP),
+                         {name: 0 for name in support.RPC_INDEX_PIPELINES})
+        self.assertEqual(support.rpc_committer_attempts(resumed), {})
+        state = support.reopened_index_state(resumed, self.LOG, self.TIP)
+        self.assertEqual(state['status'], 'persisted-watermark-at-frozen-tip')
+        self.assertEqual(state['frontiers'], {name: 0 for name in support.RPC_INDEX_PIPELINES})
+        self.assertEqual(state['committer_batches'], {})
+        # Pipelines bind their child as they start, so a partially bound family is
+        # also a resume; only the attempt counter decides a commit.
+        partially_bound = '\n'.join(
+            line for line in resumed.splitlines()
+            if not line.startswith('rpc_store_indexer_watermark_checkpoint_in_db{pipeline="balance"'))
+        self.assertEqual(support.reopened_index_state(partially_bound, self.LOG, self.TIP)['status'],
+                         'persisted-watermark-at-frozen-tip')
 
     def test_the_reopened_wait_polls_until_the_node_states_its_frontier(self):
         with tempfile.TemporaryDirectory() as tmp:
