@@ -255,5 +255,34 @@ class Stages(unittest.TestCase):
         self.assertEqual([row['id'] for row in rows], ['M8-stale-native'])
 
 
+class Gates(unittest.TestCase):
+    """The mechanism spec carries the binary-side measurement handshake."""
+
+    def test_the_spec_declares_two_distinct_pairs_under_the_evidence(self):
+        cell = mechanism.find('M6-w1-c16')
+        spec = mechanism.spec(cell, cell['runs'][0], context(),
+                              path='/c', evidence='/e')
+        begin, end = spec['measurement_gate'], spec['measurement_completion_gate']
+        self.assertEqual(begin['ready_file'], '/e/measurement.ready')
+        self.assertEqual(begin['release_file'], '/e/measurement.release')
+        self.assertEqual(end['ready_file'], '/e/measurement-complete.ready')
+        self.assertEqual(len({begin['ready_file'], begin['release_file'],
+                              end['ready_file'], end['release_file']}), 4)
+        self.assertEqual(begin['timeout_seconds'], mechanism.MEASUREMENT_GATE_SECONDS)
+
+    def test_preflight_names_a_missing_manifest_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / 'samples.csv').write_text(
+                'phase,operation,outcome,api_ns,completed_ns,bytes\n'
+                'measurement,read,success,1,1,0\n')
+            (output / 'manifest.json').write_text('{"status": "completed"}')
+            (output / 'summary.json').write_text(
+                '{"phase_counts": {"realized_mix": {}}}')
+            problems = mechanism.preflight(output)
+        self.assertEqual(problems, ['manifest.json lacks key(s): '
+                                    'errors_or_wrong_values, completed_operations'])
+
+
 if __name__ == '__main__':
     unittest.main()

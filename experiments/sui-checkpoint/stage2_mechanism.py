@@ -31,7 +31,9 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shlex
 import sys
+import threading
 
 sys.dont_write_bytecode = True
 
@@ -54,6 +56,17 @@ UNIT_PREFIX = 'mechanism'
 # The four fence cases the plan runs on both tiers: S1-5S, and the stage-2 M8
 # view of the same eight runs.
 FENCE_CASES = ('contend', 'lapse', 'stale', 'sealed')
+# The binary's own bound while it waits at a measurement marker. It is below the
+# config admission limit of 300 s and above the slowest owner-ready wait here,
+# so a driver that never releases fails the run with the engine's own error.
+MEASUREMENT_GATE_SECONDS = 240
+# The columns every verdict parser reads: `phase` and `outcome` select rows,
+# `operation` selects a metric, `api_ns` carries the exact sample and
+# `completed_ns`/`bytes` carry the stage-3 call window and payload.
+SAMPLE_COLUMNS = ('phase', 'operation', 'outcome', 'api_ns',
+                  'completed_ns', 'bytes')
+# The keys `verify` reads without a family test.
+MANIFEST_KEYS = ('status', 'errors_or_wrong_values', 'completed_operations')
 
 
 def unit_namespace(unit):
@@ -275,9 +288,25 @@ def spec(cell, run, context, *, path, evidence):
         diagnostics=dict(write_profile_limit=0, read_profile_limit=0),
         qualification_only=False,
         source_revision=None,
+        measurement_gate=measurement_gate(evidence, 'measurement'),
+        measurement_completion_gate=measurement_gate(evidence, 'measurement-complete'),
         limits=dict(max_keys=run['keys'], max_bytes=16 << 30,
                     max_operations=max(operations, 1),
                     deadline_seconds=run['deadline'], shutdown_grace_seconds=30))
+
+
+def measurement_gate(directory, name):
+    """The binary-side arm/disarm marker pair of one measurement boundary.
+
+    The binary creates `<name>.ready` and waits for `<name>.release`; the driver
+    writes the release. The completion pair holds the window closed until the
+    driver has observed the end of measurement. Both directories exist before
+    the run starts, because the engine admits only existing marker parents.
+    """
+    directory = Path(directory)
+    return dict(ready_file=str(directory / f'{name}.ready'),
+                release_file=str(directory / f'{name}.release'),
+                timeout_seconds=MEASUREMENT_GATE_SECONDS)
 
 
 def write(root, cell_ids=None):
@@ -380,25 +409,162 @@ def _distribution(output, phase, operation, metric, outcome='success'):
 
 
 def _sample_rows(output, phase='measurement', operation=None, outcome='success'):
-    path = Path(output) / 'samples.csv'
-    if not path.is_file():
-        return []
-    lines = path.read_text(errors='replace').splitlines()
-    if not lines:
-        return []
-    header = lines[0].split(',')
     result = []
-    for line in lines[1:]:
-        values = line.split(',')
-        if len(values) != len(header):
-            continue
-        row = dict(zip(header, values))
+    for row in read_rows(Path(output) / 'samples.csv'):
         if row.get('phase') != phase or row.get('outcome') != outcome:
             continue
         if operation is not None and row.get('operation') != operation:
             continue
         result.append(row)
     return result
+
+
+def read_rows(path):
+    """Completed rows of `samples.csv`/`samples.csv.tmp`, header-keyed.
+
+    One parser for the gate counters and the verdicts: a row with a different
+    field count is incomplete and skipped.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return []
+    header = None
+    result = []
+    for line in path.read_text(errors='replace').splitlines():
+        if header is None:
+            header = line.split(',')
+            continue
+        values = line.split(',')
+        if len(values) != len(header):
+            continue
+        result.append(dict(zip(header, values)))
+    return result
+
+
+def acknowledged(result, *, phase='measurement'):
+    return sum(1 for row in result
+               if row.get('phase') == phase and row.get('outcome') == 'success')
+
+
+def failures(result, *, phase='measurement'):
+    return [row for row in result
+            if row.get('phase') == phase and row.get('outcome') == 'error']
+
+
+def preflight(output, *, phase='measurement'):
+    """Problems that would make every verdict of this run fail.
+
+    It runs the same parsers as the verdicts: `read_rows`/`acknowledged` over
+    `samples.csv`, `_manifest` keys, and the `summary.json` realized mix. A
+    renamed column or manifest key therefore fails the first cell with a
+    message that names the missing field, not an empty count deep in a gate.
+    """
+    output = Path(output)
+    problems = []
+    samples = output / 'samples.csv'
+    if not samples.is_file():
+        problems.append(f'{output}: samples.csv is missing')
+    else:
+        rows = read_rows(samples)
+        header = (samples.read_text(errors='replace').splitlines() or [''])[0].split(',')
+        missing = [column for column in SAMPLE_COLUMNS if column not in header]
+        if missing:
+            problems.append('samples.csv lacks column(s): ' + ', '.join(missing))
+        elif not rows:
+            problems.append('samples.csv has no complete row')
+        elif not any(row.get('phase') == phase for row in rows):
+            problems.append(f'samples.csv has no {phase} row')
+    manifest_path = output / 'manifest.json'
+    if not manifest_path.is_file():
+        problems.append(f'{output}: manifest.json is missing')
+    else:
+        manifest = json.loads(manifest_path.read_text())
+        missing = [key for key in MANIFEST_KEYS if key not in manifest]
+        if missing:
+            problems.append('manifest.json lacks key(s): ' + ', '.join(missing))
+    summary_path = output / 'summary.json'
+    if not summary_path.is_file():
+        problems.append(f'{output}: summary.json is missing')
+    else:
+        summary = json.loads(summary_path.read_text())
+        phase_counts = summary.get('phase_counts')
+        if not isinstance(phase_counts, dict) or 'realized_mix' not in phase_counts:
+            problems.append('summary.json lacks phase_counts.realized_mix')
+    return problems
+
+
+class LocalGates:
+    """Release a local run's measurement markers from the driver side.
+
+    `prepare` removes the markers of an earlier attempt and creates their
+    directory, because the binary refuses markers that already exist. `run`
+    loops until the run ends: each ready marker is answered with its release.
+    """
+
+    def __init__(self, spec_path):
+        self.spec_path = Path(spec_path)
+        self._pairs = None
+
+    def pairs(self):
+        if self._pairs is not None:
+            return self._pairs
+        if not self.spec_path.is_file():
+            return []
+        document = json.loads(self.spec_path.read_text())
+        pairs = []
+        for key in ('measurement_gate', 'measurement_completion_gate'):
+            gate = document.get(key) or {}
+            if gate.get('ready_file') and gate.get('release_file'):
+                pairs.append((Path(gate['ready_file']), Path(gate['release_file'])))
+        self._pairs = pairs
+        return pairs
+
+    def prepare(self):
+        for ready, release in self.pairs():
+            for marker in (ready, release):
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.unlink(missing_ok=True)
+
+    def serve(self):
+        for ready, release in self.pairs():
+            if ready.exists() and not release.exists():
+                release.write_text('released\n')
+        return None
+
+    def run(self, stop):
+        while not stop.wait(0.02):
+            self.serve()
+
+
+class RemoteGates(LocalGates):
+    """`LocalGates` over the SSH callback, for a run on another host.
+
+    Marker paths are absolute on the host that runs the binary, so the
+    preparation and the release both go through the same remote seam.
+    """
+
+    def __init__(self, spec_path, remote, host):
+        super().__init__(spec_path)
+        self.remote, self.host = remote, host
+
+    def prepare(self):
+        pairs = self.pairs()
+        if not pairs:
+            return
+        directories = sorted({str(ready.parent) for ready, _ in pairs})
+        markers = [str(marker) for pair in pairs for marker in pair]
+        self.remote.shell(self.host, 'mkdir -p ' + ' '.join(
+            shlex.quote(directory) for directory in directories), check=False)
+        self.remote.shell(self.host, 'rm -f ' + ' '.join(
+            shlex.quote(marker) for marker in markers), check=False)
+
+    def serve(self):
+        for ready, release in self.pairs():
+            if (self.remote.exists(self.host, ready)
+                    and not self.remote.exists(self.host, release)):
+                self.remote.shell(self.host,
+                                  f'printf "released\\n" > {shlex.quote(str(release))}',
+                                  check=False)
 
 
 def _quantiles(output, operation, *, field='api_ns'):

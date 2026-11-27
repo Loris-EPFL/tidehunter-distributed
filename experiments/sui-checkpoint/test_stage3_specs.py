@@ -124,7 +124,8 @@ class StageThreeSpecs(unittest.TestCase):
                 self.assertEqual(set(document), {
                     'schema_version', 'case_id', 'backend', 'seed', 'namespace',
                     'dataset', 'workload', 'execution', 'phases', 'diagnostics',
-                    'qualification_only', 'source_revision', 'limits'})
+                    'qualification_only', 'source_revision', 'measurement_gate',
+                    'measurement_completion_gate', 'limits'})
                 mix = document['workload']['mix']
                 if 'put_batch' in path.name or 'get_many' in path.name or 'A7' in path.name or 'A8' in path.name:
                     self.assertEqual(document['workload']['batch_size'], 26)

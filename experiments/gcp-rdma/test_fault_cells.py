@@ -3,12 +3,15 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import types
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
+
+import yaml
 
 import fault_cells
 
@@ -213,58 +216,110 @@ class OwnerRolls(unittest.TestCase):
 
 
 class Receipts(unittest.TestCase):
+    """One receipt per partition, bound to this launch and this process."""
+
+    def prepared(self, directory, *, tier='native', pids=(101, 102), nonce='n'):
+        """A deployment of namespace `ns` with a launch file per owner."""
+        config = Path(directory)
+        nodes = []
+        for partition, host in enumerate(('h1', 'h2')):
+            launch = config / 'ns' / f'node-{partition}' / 'launch.yaml'
+            launch.parent.mkdir(parents=True)
+            launch.write_text(yaml.safe_dump(dict(
+                partition=partition, listen=f'10.0.0.{partition + 1}:9400',
+                launch_nonce=f'{nonce}-{partition}', durability=dict(tier=tier))))
+            nodes.append(dict(namespace='ns', partition=partition, host=host,
+                              launch=str(launch), ready=f'/guest/ns/node-{partition}/ready'))
+        (config / 'nodes.json').write_text(json.dumps(nodes))
+        (config / 'config.json').write_text(json.dumps(
+            {'databases': {'ns': {'read_cache_bytes': 0,
+                                  'tls': {'transport': {'kind': 'tcp'}}}}}))
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.config_dir, cluster.remote = config, FakeRemote()
+        cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
+        cluster.tier = tier
+        cluster.namespaces = {
+            'h1': [dict(partition=0, pid=pids[0], process_group=pids[0], stopped=False)],
+            'h2': [dict(partition=1, pid=pids[1], process_group=pids[1], stopped=False)]}
+        cluster.bind('ns')
+        return cluster
+
+    def receipt(self, partition, *, pid, nonce='n', tier='native',
+                address=None):
+        return dict(partition=partition, address=address or f'10.0.0.{partition + 1}:9400',
+                    launch_nonce=f'{nonce}-{partition}', pid=pid, boot_id='b',
+                    started_unix_ns=1, durability=dict(tier=tier))
+
+    def seed(self, cluster, *, pids=(101, 102), **changes):
+        files = {}
+        for partition in (0, 1):
+            body = self.receipt(partition, pid=pids[partition], **changes)
+            files[f'/guest/ns/node-{partition}/ready.durability.json'] = \
+                json.dumps(body).encode()
+        cluster.remote.files.update(files)
+
     def test_receipts_are_copied_in_partition_order(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory)
-            (config / 'nodes.json').write_text(json.dumps([
-                dict(namespace='ns', partition=1, host='h2', ready='/guest/node-1/ready'),
-                dict(namespace='other', partition=0, host='h9', ready='/guest/other/ready'),
-                dict(namespace='ns', partition=0, host='h1', ready='/guest/node-0/ready'),
-            ]))
-            remote = FakeRemote(files={
-                '/guest/node-0/ready.durability.json': b'{"partition": 0}',
-                '/guest/node-1/ready.durability.json': b'{"partition": 1}',
-            })
-            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
-            cluster.config_dir, cluster.remote = config, remote
-            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
+            cluster = self.prepared(directory)
+            self.seed(cluster)
             rows = cluster.receipts('ns')
         self.assertEqual([row['partition'] for row in rows], [0, 1])
-        self.assertEqual(rows[0]['receipt'], {'partition': 0})
+        self.assertEqual([row['pid'] for row in rows], [101, 102])
+        self.assertEqual(rows[0]['receipt']['launch_nonce'], 'n-0')
 
     def test_the_context_serializes_receipt_paths(self):
         """`external_owner_durability_receipts` is a list of path strings."""
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory)
-            (config / 'nodes.json').write_text(json.dumps([
-                dict(namespace='ns', partition=0, host='h1', ready='/guest/node-0/ready'),
-                dict(namespace='ns', partition=1, host='h2', ready='/guest/node-1/ready')]))
-            (config / 'config.json').write_text(json.dumps(
-                {'databases': {'ns': {'read_cache_bytes': 0,
-                                      'tls': {'transport': {'kind': 'tcp'}}}}}))
-            remote = FakeRemote(files={
-                '/guest/node-0/ready.durability.json': b'{"partition": 0}',
-                '/guest/node-1/ready.durability.json': b'{"partition": 1}'})
-            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
-            cluster.config_dir, cluster.remote = config, remote
-            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
+            cluster = self.prepared(directory)
+            self.seed(cluster)
             rows = cluster.receipts('ns')
             context = cluster.context('ns', rows)
-            expected = [str(config / 'receipts/node-0.json'),
-                        str(config / 'receipts/node-1.json')]
+            expected = [str(Path(directory) / 'receipts/node-0.json'),
+                        str(Path(directory) / 'receipts/node-1.json')]
         self.assertEqual(context['receipts'], expected)
         self.assertTrue(all(isinstance(path, str) for path in context['receipts']))
 
+    def test_a_receipt_from_another_incarnation_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = self.prepared(directory)
+            self.seed(cluster, pids=(9999, 102))
+            with self.assertRaisesRegex(fault_cells.CellError, 'stale or foreign'):
+                cluster.receipts('ns')
+
+    def test_a_receipt_from_another_launch_nonce_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = self.prepared(directory)
+            self.seed(cluster, nonce='old')
+            with self.assertRaisesRegex(fault_cells.CellError, 'launch nonce'):
+                cluster.receipts('ns')
+
+    def test_a_receipt_of_another_tier_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = self.prepared(directory)
+            self.seed(cluster, tier='synchronous')
+            with self.assertRaisesRegex(fault_cells.CellError, 'tier synchronous'):
+                cluster.receipts('ns')
+
+    def test_a_receipt_of_another_partition_or_endpoint_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = self.prepared(directory)
+            self.seed(cluster)
+            body = self.receipt(0, pid=101, address='10.9.9.9:9400')
+            cluster.remote.files['/guest/ns/node-0/ready.durability.json'] = \
+                json.dumps(body).encode()
+            with self.assertRaisesRegex(fault_cells.CellError, 'address'):
+                cluster.receipts('ns')
+            body = self.receipt(1, pid=101)
+            cluster.remote.files['/guest/ns/node-0/ready.durability.json'] = \
+                json.dumps(body).encode()
+            with self.assertRaisesRegex(fault_cells.CellError, 'partition 1 != 0'):
+                cluster.receipts('ns')
+
     def test_missing_receipt_coverage_fails(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = Path(directory)
-            (config / 'nodes.json').write_text(json.dumps([
-                dict(namespace='ns', partition=0, host='h1', ready='/guest/node-0/ready')]))
-            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
-            cluster.config_dir = config
-            cluster.remote = FakeRemote(files={
-                '/guest/node-0/ready.durability.json': b'{}'})
-            cluster.guest_root, cluster.owners = Path('/guest'), ['h1', 'h2']
+            cluster = self.prepared(directory)
+            cluster.owners = ['h1']
+            self.seed(cluster)
             with self.assertRaisesRegex(fault_cells.CellError, 'do not cover'):
                 cluster.receipts('ns')
 
@@ -659,6 +714,7 @@ class LedgerClose(unittest.TestCase):
             def __init__(self, **kwargs):
                 self.__dict__.update(kwargs)
                 self.failure = failure
+                self.stops = []
                 created.append(self)
 
             def admit(self):
@@ -691,7 +747,14 @@ class LedgerClose(unittest.TestCase):
                 run = self.cell['runs'][0]
                 out = self.cluster.output / 'measure' / 'run'
                 out.mkdir(parents=True)
-                (out / 'manifest.json').write_text('{}')
+                (out / 'manifest.json').write_text(json.dumps(dict(
+                    status='completed', errors_or_wrong_values=0,
+                    completed_operations=1)))
+                (out / 'summary.json').write_text(json.dumps(dict(
+                    phase_counts=dict(realized_mix={}))))
+                (out / 'samples.csv').write_text(
+                    'phase,operation,outcome,api_ns,completed_ns,bytes\n'
+                    'measurement,put,success,1,1,4096\n')
                 return [dict(name='measure', role=run['role'], run=run, verdict=True,
                              output=str(out), log='', pid=1, started_unix_ns=1,
                              finished_unix_ns=2, exit_code=0, observations={})]
@@ -897,3 +960,224 @@ class CellList(unittest.TestCase):
         self.assertEqual({cell['family'] for cell in value['cells']},
                          {'M6', 'M9', 'M13'})
         self.assertNotIn('M8', {cell['id'].split('-')[0] for cell in value['cells']})
+
+
+class OwnerStopGuard(unittest.TestCase):
+    """A guest root is never removed under a live owner of an earlier cell."""
+
+    class Remote:
+        def __init__(self, *, alive, survive=False):
+            self.alive, self.survive = set(alive), survive
+            self.calls = []
+
+        def shell(self, host, command, *, stdin=None, check=True):
+            self.calls.append((host, command, stdin))
+            if command.startswith("sh -c 'for f in"):
+                return 0, ''.join(f'{pid} /guest/owner-{pid}.pid\n'
+                                  for pid in sorted(self.alive)).encode(), b''
+            if command.startswith('kill -TERM'):
+                if not self.survive:
+                    self.alive.clear()
+                return 0, b'', b''
+            if command.startswith('kill -KILL'):
+                if not self.survive:
+                    self.alive.clear()
+                return 0, b'', b''
+            return 0, b'', b''
+
+        def exists(self, host, path):
+            match = re.fullmatch(r'/proc/([0-9]+)', str(path))
+            if match:
+                return int(match.group(1)) in self.alive
+            return False
+
+        def read_bytes(self, host, path):
+            if str(path).endswith('/cmdline'):
+                return b'/guest/storage-node\0--experimental-storage-node\0'
+            raise fault_cells.CellError(f'{host}: missing {path}')
+
+    def cluster(self, remote):
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.remote, cluster.guest_root = remote, Path('/guest')
+        cluster.owners, cluster.stops = ['h1', 'h2'], []
+        return cluster
+
+    def test_a_live_previous_owner_is_stopped_before_the_root_is_removed(self):
+        remote = self.Remote(alive=[11])
+        cluster = self.cluster(remote)
+        with patch.object(fault_cells, 'OWNER_STOP_GRACE_SECONDS', 0.05), \
+                patch.object(fault_cells.time, 'sleep', lambda _: None):
+            records = cluster._stop_previous_owners('h1')
+        self.assertFalse(records[0]['forced'])
+        self.assertFalse(records[0]['still_alive'])
+        self.assertEqual(records[0]['grace_seconds'], 0.05)
+        self.assertTrue(any(call[1].startswith('kill -TERM -11')
+                            for call in remote.calls))
+        self.assertEqual(cluster.stops, records)
+
+    def test_an_owner_that_survives_the_grace_fails_the_cell(self):
+        remote = self.Remote(alive=[11], survive=True)
+        cluster = self.cluster(remote)
+        with patch.object(fault_cells, 'OWNER_STOP_GRACE_SECONDS', 0.05), \
+                patch.object(fault_cells.time, 'sleep', lambda _: None):
+            with self.assertRaisesRegex(fault_cells.CellError, 'still alive'):
+                cluster._stop_previous_owners('h1')
+        self.assertTrue(any(call[1].startswith('kill -KILL -11')
+                            for call in remote.calls))
+        self.assertTrue(cluster.stops[0]['forced'])
+
+    def test_a_recycled_pid_is_not_an_owner(self):
+        class Recycled(self.Remote):
+            def read_bytes(self, host, path):
+                if str(path).endswith('/cmdline'):
+                    return b'python3\0train.py\0'
+                raise AssertionError(path)
+        cluster = self.cluster(Recycled(alive=[11]))
+        self.assertEqual(cluster.live_previous_owners('h1'), [])
+
+
+class StopVerdict(unittest.TestCase):
+    def cell(self):
+        return fault_cells.mechanism.find('M6-w1-c16')
+
+    def test_a_clean_coordinator_stop_passes(self):
+        record = fault_cells.stop_verdict(self.cell(), [
+            dict(process='coordinator', part='measure', forced=False,
+                 still_alive=False, exit_code=0, duration_seconds=0.2)])
+        self.assertTrue(record['ok'], record)
+        self.assertEqual(record['role'], 'stop')
+
+    def test_a_forced_kill_is_never_a_clean_stop(self):
+        record = fault_cells.stop_verdict(self.cell(), [
+            dict(process='coordinator', part='measure', forced=True,
+                 still_alive=False, exit_code=-9, duration_seconds=30.1)])
+        self.assertFalse(record['ok'])
+        self.assertFalse(record['checks'][0]['ok'])
+
+    def test_an_owner_stop_is_part_of_the_cell_verdict(self):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        driver.cluster = types.SimpleNamespace(stops=[
+            dict(host='h1', partition=0, pid=1, signal='SIGTERM',
+                 grace_seconds=90, duration_seconds=1.0, forced=False,
+                 still_alive=False, exit_code=None)])
+        parts = [dict(name='measure', stop=dict(
+            process='coordinator', signal=None, grace_seconds=30,
+            duration_seconds=0.1, forced=False, still_alive=False, exit_code=0))]
+        records = fault_cells.stop_records(driver, parts)
+        self.assertEqual([row.get('process') for row in records],
+                         ['coordinator', None])
+        self.assertEqual([row['part'] for row in records], ['measure', 'owners'])
+        self.assertTrue(fault_cells.stop_verdict(self.cell(), records)['ok'])
+
+
+class Preflight(unittest.TestCase):
+    def tree(self, root, *, header=None, manifest=None):
+        out = Path(root)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'samples.csv').write_text(
+            (header or 'phase,operation,outcome,api_ns,completed_ns,bytes')
+            + '\nmeasurement,put,success,1,1,4096\n')
+        (out / 'manifest.json').write_text(json.dumps(
+            manifest or dict(status='completed', errors_or_wrong_values=0,
+                             completed_operations=1)))
+        (out / 'summary.json').write_text(json.dumps(
+            dict(phase_counts=dict(realized_mix={}))))
+        return out
+
+    def test_a_complete_run_has_no_problems(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(fault_cells.mechanism.preflight(self.tree(tmp)), [])
+
+    def test_a_renamed_column_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.tree(tmp, header='phase,operation,result,api_ns,'
+                                        'completed_ns,bytes')
+            problems = fault_cells.mechanism.preflight(out)
+        self.assertEqual(problems, ['samples.csv lacks column(s): outcome'])
+
+    def test_a_renamed_manifest_key_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.tree(tmp, manifest=dict(status='completed',
+                                               errors_or_wrong_values=0))
+            with self.assertRaisesRegex(fault_cells.CellError,
+                                        'manifest.json lacks key\\(s\\): '
+                                        'completed_operations'):
+                fault_cells.preflight(out)
+
+    def test_the_gate_counter_and_the_verdict_share_one_parser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.tree(tmp)
+            parsed = fault_cells.rows(out / 'samples.csv')
+        self.assertEqual(fault_cells.acknowledged(parsed), 1)
+        self.assertEqual(fault_cells.failures(parsed), [])
+
+
+class MeasurementGates(unittest.TestCase):
+    """The mechanism RunConfig declares the engine's own handshake."""
+
+    def test_every_run_declares_both_gate_pairs(self):
+        cell = fault_cells.mechanism.find('M6-w1-c16')
+        spec = fault_cells.mechanism.spec(
+            cell, cell['runs'][0], {'transport': {'kind': 'tcp'},
+                                    'remote': {'read_cache_bytes': 0},
+                                    'receipts': []},
+            path='/c', evidence='/e/evidence')
+        self.assertEqual(spec['measurement_gate']['ready_file'],
+                         '/e/evidence/measurement.ready')
+        self.assertEqual(spec['measurement_gate']['release_file'],
+                         '/e/evidence/measurement.release')
+        self.assertEqual(spec['measurement_completion_gate']['ready_file'],
+                         '/e/evidence/measurement-complete.ready')
+        self.assertNotEqual(spec['measurement_gate']['release_file'],
+                            spec['measurement_completion_gate']['release_file'])
+
+    def test_the_driver_answers_ready_with_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / 'spec.json'
+            spec.write_text(json.dumps(dict(
+                measurement_gate=dict(ready_file=str(Path(tmp) / 'm.ready'),
+                                      release_file=str(Path(tmp) / 'm.release')),
+                measurement_completion_gate=dict(
+                    ready_file=str(Path(tmp) / 'c.ready'),
+                    release_file=str(Path(tmp) / 'c.release')))))
+            gates = fault_cells.mechanism.LocalGates(spec)
+            (Path(tmp) / 'm.release').write_text('stale')
+            gates.prepare()
+            self.assertFalse((Path(tmp) / 'm.release').exists())
+            (Path(tmp) / 'm.ready').write_text('ready')
+            gates.serve()
+            self.assertTrue((Path(tmp) / 'm.release').exists())
+            self.assertFalse((Path(tmp) / 'c.release').exists())
+
+
+class OwnerCellStop(unittest.TestCase):
+    """The engine's stop marker is the owner's first close path."""
+
+    class Remote:
+        def __init__(self):
+            self.alive = {11}
+            self.calls = []
+
+        def shell(self, host, command, *, stdin=None, check=True):
+            self.calls.append((host, command, stdin))
+            if command.startswith('touch /guest/stop'):
+                self.alive.clear()
+            return 0, b'', b''
+
+        def exists(self, host, path):
+            return str(path) == '/proc/11' and 11 in self.alive
+
+    def test_a_marker_close_records_no_signal_and_a_duration(self):
+        remote = self.Remote()
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.remote, cluster.owners, cluster.stops = remote, ['h1'], []
+        cluster.namespaces = {'h1': [dict(partition=0, pid=11, process_group=11,
+                                          stopped=False, stop='/guest/stop')]}
+        records = cluster.stop()
+        self.assertEqual(records[0]['signal'], 'stop-file')
+        self.assertFalse(records[0]['forced'])
+        self.assertFalse(records[0]['still_alive'])
+        self.assertGreaterEqual(records[0]['duration_seconds'], 0.0)
+        self.assertFalse(any(call[1].startswith('kill -')
+                             for call in remote.calls))
+        self.assertEqual(cluster.stops, records)

@@ -38,7 +38,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -52,10 +54,18 @@ import host_exec
 import mailbox_exec
 import manual_sui
 import stage2_mechanism as mechanism
+import stage3_specs
 
 BINARY = 'storage-node'
 OWNER_READY_SECONDS = 180
 GATE_TIMEOUT_SECONDS = 600
+# The coordinator declares its own close bound as `shutdown_grace_seconds` in
+# the RunConfig this driver writes, so its stop allowance is the same constant.
+COORDINATOR_STOP_GRACE_SECONDS = stage3_specs.SHUTDOWN_GRACE_SECONDS
+# An owner is not the measured process and its close path tears down every live
+# NVMe-oF target, then writes and syncs a shutdown proof per database; the old
+# proven controller allowed 90 s for exactly that (`cleanup_timeout`).
+OWNER_STOP_GRACE_SECONDS = 90
 # A failed attempt uploads what it still holds before the fleet is deleted. The
 # local coordinator database, TLS material and any bulk storage tree never
 # travel, and one oversized file must not consume the whole failure budget.
@@ -86,30 +96,22 @@ def quote(value):
 
 def rows(path):
     """Completed rows of `samples.csv`/`samples.csv.tmp`, header-keyed."""
-    path = Path(path)
-    if not path.is_file():
-        return []
-    header = None
-    result = []
-    for line in path.read_text(errors='replace').splitlines():
-        if header is None:
-            header = line.split(',')
-            continue
-        values = line.split(',')
-        if len(values) != len(header):
-            continue
-        result.append(dict(zip(header, values)))
-    return result
+    return mechanism.read_rows(path)
 
 
 def acknowledged(result, *, phase='measurement'):
-    return sum(1 for row in result
-               if row.get('phase') == phase and row.get('outcome') == 'success')
+    return mechanism.acknowledged(result, phase=phase)
 
 
 def failures(result, *, phase='measurement'):
-    return [row for row in result
-            if row.get('phase') == phase and row.get('outcome') == 'error']
+    return mechanism.failures(result, phase=phase)
+
+
+def preflight(output, *, phase='measurement'):
+    """Raise before a verdict when a column or key it parses is absent."""
+    problems = mechanism.preflight(output, phase=phase)
+    if problems:
+        raise CellError('; '.join(problems))
 
 
 class Cluster:
@@ -136,6 +138,7 @@ class Cluster:
         self.manifest = json.loads((self.build_root / 'build-manifest.json').read_text())
         self.external = None
         self.namespaces = {}
+        self.stops = []
 
     # ---- admission -----------------------------------------------------
     def admit(self):
@@ -213,11 +216,81 @@ class Cluster:
             host, archive = record['host'], Path(record['archive'])
             if digest(archive) != record['archive_sha256']:
                 raise ValueError('owner archive changed after preparation')
+            self._stop_previous_owners(host)
             self.remote.shell(host, f'rm -rf {quote(self.guest_root)} && '
                                     f'mkdir -p {quote(self.guest_root)}')
             self.remote.shell(host, f'tar -xzf - -C {quote(self.guest_root)}',
                               stdin=archive.read_bytes())
             self.remote.shell(host, f'chmod +x {quote(self.guest_root / BINARY)}')
+
+    def live_previous_owners(self, host):
+        """`(pid, pidfile)` of owners of an earlier cell that are still running.
+
+        The pidfile is the only durable record after this driver lost its
+        workspace, so it is the first check. A recycled pid is not an owner:
+        its command line must name the guest binary or this guest root.
+        """
+        script = ('for f in "$1"/owner-*.pid; do [ -f "$f" ] || continue; '
+                  'read -r pid < "$f"; [ -n "$pid" ] && [ -d "/proc/$pid" ] && '
+                  'echo "$pid $f"; done')
+        code, out, err = self.remote.shell(
+            host, f'sh -c {quote(script)} -- {quote(self.guest_root)}', check=False)
+        if code != 0:
+            raise CellError(f'{host}: cannot check for a previous owner: '
+                            f'{err.decode(errors="replace")[-300:]}')
+        found = []
+        for line in out.decode().splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            pid = int(parts[0])
+            command = self.remote.read_bytes(host, f'/proc/{pid}/cmdline')
+            if (str(self.guest_root).encode() not in command
+                    and b'--experimental-storage-node' not in command):
+                continue
+            found.append((pid, parts[1]))
+        return found
+
+    def _stop_previous_owners(self, host):
+        """A guest root is deleted only when no owner of an earlier cell is alive.
+
+        A live owner is stopped through the normal group path (SIGTERM, then the
+        owner grace). A forced kill is recorded as a failed stop, and a process
+        that survives even that fails the cell instead of losing its storage.
+        """
+        previous = self.live_previous_owners(host)
+        if not previous:
+            return []
+        records = []
+        for pid, pidfile in previous:
+            started = time.monotonic()
+            self.remote.shell(host, f'kill -TERM -{pid}', check=False)
+            deadline = time.monotonic() + OWNER_STOP_GRACE_SECONDS
+            while self.remote.exists(host, f'/proc/{pid}'):
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.2)
+            forced = self.remote.exists(host, f'/proc/{pid}')
+            if forced:
+                self.remote.shell(host, f'kill -KILL -{pid}', check=False)
+                deadline = time.monotonic() + 10
+                while self.remote.exists(host, f'/proc/{pid}'):
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.1)
+            alive = self.remote.exists(host, f'/proc/{pid}')
+            record = dict(host=host, partition=None, pid=pid, pidfile=pidfile,
+                          signal='SIGTERM', grace_seconds=OWNER_STOP_GRACE_SECONDS,
+                          duration_seconds=round(time.monotonic() - started, 3),
+                          forced=forced, still_alive=alive,
+                          source='previous cell', exit_code=None)
+            records.append(record)
+            if alive:
+                self.stops.extend(records)
+                raise CellError(f'{host}: previous owner {pid} is still alive; '
+                                'refusing to remove its guest root')
+        self.stops.extend(records)
+        return records
 
     # ---- owner lifecycle ----------------------------------------------
     def nodes(self):
@@ -232,12 +305,16 @@ class Cluster:
                 continue
             base = Path(node['launch']).relative_to(self.config_dir)
             guest = self.guest_root / base
+            launch = yaml.safe_load((self.config_dir / base).read_text())
             # `launch` is a controller path (the archive member); `ready` and
             # `stop` are guest paths because the owner writes them (deployment.prepare).
             ready = Path(node['ready'])
             entry = dict(node, guest_launch=str(guest),
                          guest_ready=str(ready),
                          guest_storage=str(guest.parent / 'storage'),
+                         launch_nonce=launch.get('launch_nonce'),
+                         listen=launch.get('listen'),
+                         launch_tier=(launch.get('durability') or {}).get('tier'),
                          command=[str(self.guest_root / BINARY),
                                   '--experimental-storage-node', str(guest)])
             self.owner_nodes.setdefault(node['host'], []).append(entry)
@@ -273,7 +350,8 @@ class Cluster:
             for node in rows:
                 pid = self._start_group(host, node, truncate=True)
                 started.append(dict(partition=node['partition'], pid=pid,
-                                    process_group=pid, stopped=False))
+                                    process_group=pid, stopped=False,
+                                    stop=node.get('stop')))
             self.namespaces[host] = started
             for node in rows:
                 self._wait_ready(host, node['guest_ready'])
@@ -300,12 +378,49 @@ class Cluster:
             if pid in previous:
                 raise CellError(f'{host}: restarted owner reused PID {pid}')
             started.append(dict(partition=node['partition'], pid=pid,
-                                process_group=pid, stopped=False))
+                                process_group=pid, stopped=False,
+                                stop=node.get('stop')))
         self.namespaces[host] = started
         for node in rows:
             self._wait_ready(host, node['guest_ready'])
         return dict(host=host, previous=previous, current=[row['pid'] for row in started],
                     restarted_unix_ns=now_ns())
+
+    def running_pid(self, host, partition):
+        for row in self.namespaces.get(host, []):
+            if row['partition'] == partition:
+                return row['pid']
+        raise CellError(f'{host}: partition {partition} has no running owner')
+
+    def confirm_receipt(self, host, node, receipt):
+        """Refuse a receipt that is not this partition, tier and incarnation.
+
+        This is `cloud_controller.confirm_owner_durability` plus the endpoint:
+        the receipt must name the launch nonce written in this cell's launch
+        file, the process this cell started, the listen address that process
+        bound and the cell's durability tier. A receipt from an earlier
+        incarnation or an earlier cell therefore cannot be admitted.
+        """
+        pid = self.running_pid(host, node['partition'])
+        nonce = node.get('launch_nonce')
+        if not isinstance(nonce, str) or not nonce:
+            raise CellError(f'{host}: launch file has no launch nonce')
+        problems = []
+        if receipt.get('partition') != node['partition']:
+            problems.append(f'partition {receipt.get("partition")} != {node["partition"]}')
+        durability = receipt.get('durability')
+        if not isinstance(durability, dict) or durability.get('tier') != self.tier:
+            problems.append(f'tier {(durability or {}).get("tier")} != {self.tier}')
+        if receipt.get('pid') != pid:
+            problems.append(f'pid {receipt.get("pid")} != running {pid}')
+        if receipt.get('launch_nonce') != nonce:
+            problems.append(f'launch nonce {receipt.get("launch_nonce")} != {nonce}')
+        if receipt.get('address') != node.get('listen'):
+            problems.append(f'address {receipt.get("address")} != {node.get("listen")}')
+        if problems:
+            raise CellError(f'{host}: durability receipt is stale or foreign: '
+                            + '; '.join(problems))
+        return receipt
 
     def receipts(self, namespace):
         """Copy one owner durability receipt per partition to the controller."""
@@ -315,34 +430,85 @@ class Cluster:
         directory.mkdir(parents=True, exist_ok=True)
         paths = []
         for node in nodes:
+            host = node['host']
+            bound = self.owner_nodes[host][0]
+            if bound['partition'] != node['partition']:
+                raise CellError(f'{host}: bound owner differs from the deployment')
             ready = Path(node['ready'])
             guest = ready.with_name(ready.name + '.durability.json')
             path = directory / f'node-{node["partition"]}.json'
-            path.write_bytes(self.remote.read_bytes(node['host'], guest))
+            path.write_bytes(self.remote.read_bytes(host, guest))
+            receipt = json.loads(path.read_text())
+            self.confirm_receipt(host, bound, receipt)
             paths.append(dict(path=str(path), partition=node['partition'],
-                              receipt=json.loads(path.read_text())))
+                              launch_nonce=receipt['launch_nonce'],
+                              pid=receipt['pid'], receipt=receipt))
         if len(paths) != len(self.owners):
             raise CellError('durability receipts do not cover every owner')
         return paths
 
     def stop(self):
+        """Close every owner group and record the outcome.
+
+        The engine's own close path is its typed stop marker: the owner leaves
+        `serve`, tears down every live target and syncs a shutdown proof per
+        database. The declared owner grace covers that path. A group still
+        alive after it gets SIGTERM, then SIGKILL, and a forced kill is a failed
+        stop, never a clean one. A detached owner is reaped by init, so its exit
+        code is not readable; `exit_code` is None and the record names the
+        signal, the wait and the duration instead.
+        """
+        records = []
         for host, namespaces in self.namespaces.items():
             for namespace in namespaces:
-                if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                    self.remote.shell(host, f'kill -TERM -{namespace["process_group"]}',
-                                      check=False)
-            deadline = time.monotonic() + 30
-            while any(self.remote.exists(host, f'/proc/{row["pid"]}') for row in namespaces):
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.2)
-            for namespace in namespaces:
-                if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
-                    self.remote.shell(host, f'kill -KILL -{namespace["process_group"]}',
-                                      check=False)
-                namespace['stopped'] = not self.remote.exists(
+                alive = self.remote.exists(host, f'/proc/{namespace["pid"]}')
+                started = time.monotonic()
+                record = dict(host=host, partition=namespace['partition'],
+                              pid=namespace['pid'], signal=None,
+                              grace_seconds=OWNER_STOP_GRACE_SECONDS,
+                              duration_seconds=0.0, forced=False,
+                              still_alive=False, source='cell', exit_code=None)
+                if alive:
+                    stop_file = namespace.get('stop')
+                    if stop_file:
+                        record['signal'] = 'stop-file'
+                        self.remote.shell(host, f'touch {quote(stop_file)}',
+                                          check=False)
+                        deadline = time.monotonic() + OWNER_STOP_GRACE_SECONDS
+                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
+                            if time.monotonic() > deadline:
+                                break
+                            time.sleep(0.2)
+                    if self.remote.exists(host, f'/proc/{namespace["pid"]}'):
+                        record['signal'] = ((record['signal'] + '+SIGTERM')
+                                            if record['signal'] else 'SIGTERM')
+                        self.remote.shell(
+                            host, f'kill -TERM -{namespace["process_group"]}',
+                            check=False)
+                        deadline = time.monotonic() + 10
+                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
+                            if time.monotonic() > deadline:
+                                break
+                            time.sleep(0.1)
+                    record['forced'] = self.remote.exists(
+                        host, f'/proc/{namespace["pid"]}')
+                    if record['forced']:
+                        self.remote.shell(
+                            host, f'kill -KILL -{namespace["process_group"]}',
+                            check=False)
+                        deadline = time.monotonic() + 10
+                        while self.remote.exists(host, f'/proc/{namespace["pid"]}'):
+                            if time.monotonic() > deadline:
+                                break
+                            time.sleep(0.1)
+                record['still_alive'] = self.remote.exists(
                     host, f'/proc/{namespace["pid"]}')
+                record['duration_seconds'] = round(time.monotonic() - started, 3)
+                namespace['stopped'] = not record['still_alive']
+                records.append(record)
         self.namespaces = {}
+        self.stops.extend(records)
+        return records
 
     # ---- host evidence -------------------------------------------------
     def owner_root(self, host):
@@ -456,12 +622,26 @@ class Coordinator:
         self.output.mkdir(parents=True, exist_ok=False)
         self.log = self.directory / f'{name}.log'
         self.stream = self.log.open('xb')
+        # The measurement window is binary-gated: the run creates its ready
+        # marker and waits for the release this process writes. `prepare`
+        # removes a stale pair and creates the marker directory.
+        self.gates = mechanism.LocalGates(spec)
+        self.gates.prepare()
         self.process = subprocess.Popen([str(binary), '--config', str(spec),
                                          '--output', str(self.output)],
                                         stdout=self.stream, stderr=subprocess.STDOUT,
                                         start_new_session=True)
         self.started_unix_ns = now_ns()
         self.killed_unix_ns = None
+        self.stop_record = None
+        self._gate_stop = threading.Event()
+        self._gate_thread = threading.Thread(target=self.gates.run,
+                                             args=(self._gate_stop,), daemon=True)
+        self._gate_thread.start()
+
+    def close_gates(self):
+        self._gate_stop.set()
+        self._gate_thread.join(timeout=5)
 
     def alive(self):
         return self.process.poll() is None
@@ -492,13 +672,31 @@ class Coordinator:
             pass
 
     def stop(self):
+        """Stop the coordinator with the engine's own declared grace.
+
+        The record keeps the real exit code and the measured duration. A run
+        that needs SIGKILL after the grace is a failed stop, never a clean one.
+        """
+        started = time.monotonic()
+        record = dict(process='coordinator', signal=None,
+                      grace_seconds=COORDINATOR_STOP_GRACE_SECONDS,
+                      duration_seconds=0.0, forced=False, still_alive=False,
+                      exit_code=self.process.returncode)
         if self.process.poll() is None:
+            record['signal'] = 'SIGTERM'
             self.signal(signal.SIGTERM)
             try:
-                self.process.wait(timeout=30)
+                record['exit_code'] = self.process.wait(
+                    timeout=COORDINATOR_STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                self.kill()
+                record['forced'] = True
+                record['exit_code'] = self.kill()
+        record['still_alive'] = self.process.poll() is None
+        record['duration_seconds'] = round(time.monotonic() - started, 3)
+        self.close_gates()
         self.stream.close()
+        self.stop_record = record
+        return record
 
 
 class CellDriver:
@@ -660,6 +858,7 @@ class CellDriver:
                     pid=child.process.pid, started_unix_ns=child.started_unix_ns,
                     finished_unix_ns=now_ns(),
                     exit_code=child.process.returncode,
+                    stop=getattr(child, 'stop_record', None),
                     observations=observations)
 
     # ---- families -----------------------------------------------------
@@ -699,6 +898,7 @@ class CellDriver:
             child.stop()
         record['finished_unix_ns'] = now_ns()
         record['exit_code'] = child.process.returncode
+        record['stop'] = getattr(child, 'stop_record', None)
         record['log'] = str(child.log)
         record['output'] = str(child.output)
         self.parts.append(dict(record, run=run, verdict=False, observations=dict(
@@ -744,6 +944,7 @@ class CellDriver:
             child.stop()
         record['finished_unix_ns'] = now_ns()
         record['exit_code'] = child.process.returncode
+        record['stop'] = getattr(child, 'stop_record', None)
         record['log'] = str(child.log)
         record['output'] = str(child.output)
         restart = self.cluster.restart_owner(host)
@@ -773,6 +974,7 @@ class CellDriver:
             child.stop()
         record['finished_unix_ns'] = now_ns()
         record['exit_code'] = child.process.returncode
+        record['stop'] = getattr(child, 'stop_record', None)
         record['log'] = str(child.log)
         record['output'] = str(child.output)
         restart = self.cluster.restart_owner(host)
@@ -809,6 +1011,7 @@ class CellDriver:
         finally:
             child.stop()
         record['a_output'] = str(child.output)
+        record['stop'] = getattr(child, 'stop_record', None)
         self.fence = record
         self.parts.append(self.part('fence-a', run, child, dict(role='fence-a'),
                                     verdict=None))
@@ -977,6 +1180,36 @@ def verdict_parts(driver, parts):
     if driver.fence is not None:
         records.append(fence_record(driver))
     return records
+
+
+def stop_records(driver, parts):
+    """Every stop of the cell: each coordinator part and every owner group."""
+    records = []
+    for part in parts:
+        record = part.get('stop')
+        if record:
+            records.append(dict(record, part=part.get('name'),
+                                process='coordinator', output=part.get('output')))
+    records.extend(dict(row, part='owners') for row in driver.cluster.stops)
+    return records
+
+
+def stop_verdict(cell, records):
+    """A forced kill is a failed stop; a survivor fails it too."""
+    checks = []
+    for row in records:
+        label = (f"{row.get('part')} {row.get('process') or 'owner'}"
+                 if row.get('process') else
+                 f"{row.get('part')} owner {row.get('partition')}")
+        if 'host' in row:
+            label += f" on {row['host']}"
+        checks.append(mechanism._check(label + ' stopped without a forced kill',
+                                       not row.get('forced'), row))
+        checks.append(mechanism._check(label + ' left no live process',
+                                       not row.get('still_alive'), row))
+    return dict(cell=cell['id'], role='stop', synthetic=True,
+                ok=all(check['ok'] for check in checks), checks=checks,
+                stops=records)
 
 
 def crash_checks(cell, observations):
@@ -1312,7 +1545,13 @@ def main():
                 raise CellError(f'no driver for {family}')
         finally:
             cluster.stop()
+        for part in parts:
+            # The killed runs keep their rows in `samples.csv.tmp`; only a
+            # completed run is parsed by the verdict.
+            if part.get('verdict', True):
+                preflight(part['output'])
         records = verdict_parts(driver, parts)
+        records.append(stop_verdict(cell, stop_records(driver, parts)))
         ok = all(record['ok'] for record in records)
         receipt = dict(schema=1, cell=cell['id'], stage=cell['stage'],
                        unit=cell['unit'], tier=tier, synthetic=True,
@@ -1324,6 +1563,7 @@ def main():
         if ok:
             if evidence is not None:
                 evidence.persist(ledger, entry, artifacts)
+                ledger.save()
             else:
                 campaign_upload.pass_local(ledger, entry, artifacts)
         else:

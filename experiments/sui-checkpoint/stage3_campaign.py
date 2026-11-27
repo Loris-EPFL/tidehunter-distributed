@@ -25,6 +25,14 @@ In cluster mode the two tier preparations are made on the coordinator host from
 control and RDMA live-target addresses (coordinator read cache off); a retry in
 the same fleet reuses them.
 
+One preparation therefore re-provisions the same database on the same port for
+every cell of its tier, while the owners stay up across the arm-A cells. The
+local rehearsal fixture cannot reach the target configfs, so it cannot prove
+that path: the evidence is the CI owner-layout step's restart pass, which kills
+every owner of a three-database, two-owner deployment and restarts them on the
+same preparation; startup reconcile removes only each owner's own objects and
+the second coordinator reopens and republishes every namespace.
+
 Rehearsal mode (`--mode rehearsal`): every cell runs the single-host trusted TCP
 ordinary-file fixture on this host. The results and the ledger entry say
 `rehearsal`; the mode is not a campaign measurement.
@@ -76,11 +84,17 @@ import host_exec
 import mailbox_exec
 import manual_sui
 import proc_sampler
+import stage2_mechanism as mechanism
 import stage3_specs
 
 STAGE = 'stage3'
 OWNER_READY_SECONDS = 120
-OWNER_STOP_SECONDS = 30
+# An owner is not the measured process: its close path tears down every live
+# NVMe-oF target, then writes and syncs a shutdown proof per database. The old
+# proven controller allowed 90 s for that (`cleanup_timeout`); the 30 s cell
+# bound is the coordinator's own `shutdown_grace_seconds`, not the owner's.
+OWNER_STOP_SECONDS = 90
+OWNER_KILL_SECONDS = 10
 TIER_ORDER = {'native': 0, 'synchronous': 1}
 
 
@@ -183,9 +197,17 @@ class LocalRunner:
         sampler = proc_sampler.Sampler(self.remote)
         for host, pid, role in watchers:
             sampler.watch_host(host, pid, role)
+        # The measurement window is binary-gated: the driver answers each ready
+        # marker with its release, so the window is never inferred from rows.
+        gates = mechanism.LocalGates(cell['path'])
+        gates.prepare()
         started = time.time_ns()
+        begun = time.monotonic()
         process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
+        gate_stop = threading.Event()
+        gate_thread = threading.Thread(target=gates.run, args=(gate_stop,), daemon=True)
+        gate_thread.start()
         sampler.watch_local(process.pid, 'coordinator' if cell['arm'] == 'A' else 'store')
         sampler.start()
         try:
@@ -198,24 +220,41 @@ class LocalRunner:
                                       label=cell_label(cell))
             raise CellFailure(f'cell exceeded {timeout} s', self.record(
                 cell, output, command, None, started, archived, stdout=stdout,
-                stderr=stderr, resources=resources)) from None
+                stderr=stderr, resources=resources, stop=self.stop_record(
+                    process, begun, forced=True))) from None
+        finally:
+            gate_stop.set()
+            gate_thread.join(timeout=5)
         sampler.stop()
         resources = sampler.write(output, case=cell['id'], mode=self.mode,
                                   label=cell_label(cell))
         record = self.record(cell, output, command, process.returncode, started,
-                             archived, stdout=stdout, stderr=stderr, resources=resources)
+                             archived, stdout=stdout, stderr=stderr,
+                             resources=resources, stop=self.stop_record(process, begun))
         if process.returncode != 0:
             raise CellFailure(f'exit {process.returncode}: {record["stderr_tail"]}', record)
         collect_evidence(database / 'evidence', output / 'evidence')
         return record
 
+    def stop_record(self, process, begun, *, forced=False):
+        """The cell process's exit code and the time it took to close.
+
+        A process the driver had to kill after its bound is a failed stop, never
+        a clean one. The exit code is the real one the child returned.
+        """
+        return dict(process='coordinator', signal='SIGKILL' if forced else None,
+                    grace_seconds=stage3_specs.SHUTDOWN_GRACE_SECONDS,
+                    duration_seconds=round(time.monotonic() - begun, 3),
+                    forced=forced, still_alive=process.poll() is None,
+                    exit_code=process.returncode)
+
     def record(self, cell, output, command, exit_code, started, archived, *,
-               stdout=None, stderr=None, resources=None):
+               stdout=None, stderr=None, resources=None, stop=None):
         return dict(cell=cell['id'], mode=self.mode, execution='local',
                     label=cell_label(cell), resources=resources,
                     host=socket.gethostname(), client_host=socket.gethostname(),
                     store_host=socket.gethostname(), command=command,
-                    exit_code=exit_code, started_unix_ns=started,
+                    exit_code=exit_code, stop=stop, started_unix_ns=started,
                     finished_unix_ns=time.time_ns(), archived_database=archived,
                     database=str(self.data_root / 'stage3' / 'db' / cell['id']),
                     output=str(output),
@@ -263,10 +302,16 @@ class HostRunner:
             result['value'] = self.remote.shell(
                 self.host, ' '.join(quote(part) for part in command), check=False)
 
+        gates = mechanism.RemoteGates(cell['path'], self.remote, self.host)
+        gates.prepare()
         thread = threading.Thread(target=call, daemon=True)
         sampler = proc_sampler.Sampler(self.remote)
         started = time.time_ns()
+        begun = time.monotonic()
         thread.start()
+        gate_stop = threading.Event()
+        gate_thread = threading.Thread(target=gates.run, args=(gate_stop,), daemon=True)
+        gate_thread.start()
         pid = self._pid(remote_spec)
         if pid is not None:
             sampler.watch_host(self.host, pid, 'store')
@@ -276,6 +321,8 @@ class HostRunner:
         if timed_out and pid is not None:
             self.remote.shell(self.host, f'kill -KILL {pid}', check=False)
             thread.join(60)
+        gate_stop.set()
+        gate_thread.join(timeout=5)
         sampler.stop()
         if timed_out:
             resources = sampler.write(output, case=cell['id'], mode=self.mode,
@@ -285,7 +332,12 @@ class HostRunner:
                     cell=cell['id'], mode=self.mode, execution='host',
                     label=cell_label(cell), resources=resources, host=self.host,
                     client_host=self.host, store_host=self.host, command=command,
-                    sampled_pid=pid, exit_code=None, started_unix_ns=started,
+                    sampled_pid=pid, exit_code=None, stop=dict(
+                        process='coordinator', signal='SIGKILL',
+                        grace_seconds=stage3_specs.SHUTDOWN_GRACE_SECONDS,
+                        duration_seconds=round(time.monotonic() - begun, 3),
+                        forced=True, still_alive=thread.is_alive(), exit_code=None),
+                    started_unix_ns=started,
                     finished_unix_ns=time.time_ns(), archived_database='remote-fresh',
                     database=str(database), output=str(remote_output),
                     local_output=str(output), timeout_seconds=timeout,
@@ -294,7 +346,12 @@ class HostRunner:
         record = dict(cell=cell['id'], mode=self.mode, execution='host',
                       label=cell_label(cell), resources=None, host=self.host,
                       client_host=self.host, store_host=self.host, command=command,
-                      sampled_pid=pid, exit_code=code, started_unix_ns=started,
+                      sampled_pid=pid, exit_code=code, stop=dict(
+                          process='coordinator', signal=None,
+                          grace_seconds=stage3_specs.SHUTDOWN_GRACE_SECONDS,
+                          duration_seconds=round(time.monotonic() - begun, 3),
+                          forced=False, still_alive=False, exit_code=code),
+                      started_unix_ns=started,
                       finished_unix_ns=time.time_ns(), archived_database='remote-fresh',
                       database=str(database), output=str(remote_output),
                       local_output=str(output),
@@ -389,6 +446,62 @@ class Owners:
         self.installed = None
         self.namespaces = {}
         self.receipts = []
+        self.stops = []
+
+    def _previous_owners(self, host):
+        """`(pid, pidfile)` of owners of an earlier installation still alive."""
+        script = ('for f in "$1"/owner-*.pid; do [ -f "$f" ] || continue; '
+                  'read -r pid < "$f"; [ -n "$pid" ] && [ -d "/proc/$pid" ] && '
+                  'echo "$pid $f"; done')
+        code, out, err = self.remote.shell(
+            host, f'sh -c {quote(script)} -- {quote(self.guest_root)}', check=False)
+        if code != 0:
+            raise ValueError(f'{host}: cannot check for a previous owner: '
+                             f'{err.decode(errors="replace")[-300:]}')
+        found = []
+        for line in out.decode().splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            pid = int(parts[0])
+            command = self.remote.read_bytes(host, f'/proc/{pid}/cmdline')
+            if (str(self.guest_root).encode() not in command
+                    and b'--experimental-storage-node' not in command):
+                continue
+            found.append((pid, parts[1]))
+        return found
+
+    def _stop_previous(self, host):
+        """Never delete a guest root under a live owner of an earlier install."""
+        records = []
+        for pid, pidfile in self._previous_owners(host):
+            started = time.monotonic()
+            self.remote.shell(host, f'kill -TERM -{pid}', check=False)
+            deadline = time.monotonic() + OWNER_STOP_SECONDS
+            while self.remote.exists(host, f'/proc/{pid}'):
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.2)
+            forced = self.remote.exists(host, f'/proc/{pid}')
+            if forced:
+                self.remote.shell(host, f'kill -KILL -{pid}', check=False)
+                deadline = time.monotonic() + OWNER_KILL_SECONDS
+                while self.remote.exists(host, f'/proc/{pid}'):
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.1)
+            alive = self.remote.exists(host, f'/proc/{pid}')
+            records.append(dict(host=host, partition=None, pid=pid, pidfile=pidfile,
+                                signal='SIGTERM', grace_seconds=OWNER_STOP_SECONDS,
+                                duration_seconds=round(time.monotonic() - started, 3),
+                                forced=forced, still_alive=alive, exit_code=None,
+                                source='previous install'))
+            if alive:
+                self.stops.extend(records)
+                raise ValueError(f'{host}: previous owner {pid} is still alive; '
+                                 'refusing to remove its guest root')
+        self.stops.extend(records)
+        return records
 
     def _install(self, prepared):
         for record in prepared['manifest']['hosts']:
@@ -396,6 +509,7 @@ class Owners:
             if ledger_module.sha256_file(archive) != record['archive_sha256']:
                 raise ValueError(f'owner archive changed after preparation: {archive}')
             host = record['host']
+            self._stop_previous(host)
             self.remote.shell(host, f'rm -rf {quote(self.guest_root)} && '
                                     f'mkdir -p {quote(self.guest_root)}')
             self.remote.shell(host, f'tar -xzf - -C {quote(self.guest_root)}',
@@ -466,7 +580,8 @@ class Owners:
                 time.sleep(0.1)
             pid = int(self.remote.read_bytes(host, pidfile).strip())
             self.namespaces[host] = dict(partition=partition, command=command, pid=pid,
-                                         process_group=pid, log=str(log), stopped=False)
+                                         process_group=pid, log=str(log), stopped=False,
+                                         stop=record['stop_files'][index])
         for record in prepared['manifest']['hosts']:
             ready = record['ready_files'][index]
             deadline = time.monotonic() + OWNER_READY_SECONDS
@@ -505,28 +620,65 @@ class Owners:
         return rows
 
     def stop(self):
+        """Close every owner group with the declared owner grace.
+
+        The engine leaves `serve` when its typed stop marker appears, then tears
+        down every live target and syncs a shutdown proof per database; the
+        grace covers that path. A group still alive after it gets SIGTERM, then
+        SIGKILL, and a forced kill is a failed stop, never a clean one. A
+        detached owner is reaped by init, so its exit code is not readable;
+        the record names the signal, the wait and whether it survived.
+        """
         failures = []
         for host, entry in self.namespaces.items():
             if entry.get('stopped'):
                 continue
-            self.remote.shell(host, f'kill -TERM -{entry["process_group"]}', check=False)
-            deadline = time.monotonic() + OWNER_STOP_SECONDS
-            while self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.2)
-            if self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                self.remote.shell(host, f'kill -KILL -{entry["process_group"]}', check=False)
-                deadline = time.monotonic() + 10
-                while self.remote.exists(host, f'/proc/{entry["pid"]}'):
-                    if time.monotonic() > deadline:
-                        break
-                    time.sleep(0.1)
-            entry['stopped'] = not self.remote.exists(host, f'/proc/{entry["pid"]}')
+            started = time.monotonic()
+            record = dict(host=host, partition=entry['partition'], pid=entry['pid'],
+                          signal=None, grace_seconds=OWNER_STOP_SECONDS,
+                          duration_seconds=0.0, forced=False, still_alive=False,
+                          exit_code=None)
+            alive = self.remote.exists(host, f'/proc/{entry["pid"]}')
+            if alive:
+                if entry.get('stop'):
+                    record['signal'] = 'stop-file'
+                    self.remote.shell(host, f'touch {quote(entry["stop"])}', check=False)
+                    deadline = time.monotonic() + OWNER_STOP_SECONDS
+                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                        if time.monotonic() > deadline:
+                            break
+                        time.sleep(0.2)
+                if self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                    record['signal'] = ((record['signal'] + '+SIGTERM')
+                                        if record['signal'] else 'SIGTERM')
+                    self.remote.shell(host, f'kill -TERM -{entry["process_group"]}',
+                                      check=False)
+                    deadline = time.monotonic() + OWNER_KILL_SECONDS
+                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                        if time.monotonic() > deadline:
+                            break
+                        time.sleep(0.1)
+                record['forced'] = self.remote.exists(host, f'/proc/{entry["pid"]}')
+                if record['forced']:
+                    self.remote.shell(host, f'kill -KILL -{entry["process_group"]}',
+                                      check=False)
+                    deadline = time.monotonic() + OWNER_KILL_SECONDS
+                    while self.remote.exists(host, f'/proc/{entry["pid"]}'):
+                        if time.monotonic() > deadline:
+                            break
+                        time.sleep(0.1)
+            record['still_alive'] = self.remote.exists(host, f'/proc/{entry["pid"]}')
+            record['duration_seconds'] = round(time.monotonic() - started, 3)
+            entry['stopped'] = not record['still_alive']
+            self.stops.append(record)
             if not entry['stopped']:
                 failures.append(host)
         self.active = None if not failures else self.active
         return failures
+
+    def forced(self, since=0):
+        """Hosts whose stop since `since` needed SIGKILL; that is a failure."""
+        return [row['host'] for row in self.stops[since:] if row.get('forced')]
 
 
 ARM_B_SYNCHRONOUS_CELLS = 8
@@ -595,6 +747,19 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
     return output
 
 
+def preflight(output, *, cell):
+    """Fail at the first cell when a parsed column or key is renamed.
+
+    It runs the same parsers as the verdicts: the gate counter over
+    `samples.csv`, the manifest keys `verify` reads and the summary's realized
+    mix. The probe and the calibration cells run before the grid, so a renamed
+    field is named here, not in cell 40.
+    """
+    problems = mechanism.preflight(output)
+    if problems:
+        raise ValueError(f'{cell} preflight: ' + '; '.join(problems))
+
+
 def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout,
               allow_local_ledger=False):
     """Phase A: one arm-B synchronous write cell before anything else runs."""
@@ -606,6 +771,7 @@ def run_probe(*, path, identity, runner, owners, root, ledger, bucket, timeout,
     output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
                             stale_root=Path(root) / 'stage3' / 'stale', timeout=timeout,
                             allow_local_ledger=allow_local_ledger)
+    preflight(output, cell=cell['id'])
     totals = proc_sampler.sample_totals(output / 'samples.csv')
     record = json.loads((output / 'run.json').read_text())
     return dict(cell=cell['id'], host=record.get('host'), output=str(output),
@@ -654,6 +820,7 @@ def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
                                 stale_root=root / 'stage3' / 'stale', timeout=timeout,
                                 watchers=owners.watchers(),
                                 allow_local_ledger=allow_local_ledger)
+        preflight(output, cell=cell['id'])
         totals = proc_sampler.sample_totals(output / 'samples.csv')
         rates[family] = totals['calls_per_second']
         cells.append(dict(cell=cell['id'], measurement_calls=totals['calls'],
@@ -686,7 +853,8 @@ def schedule(cells):
                                            TIER_ORDER[cell['tier']]))
 
 
-def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watchers=()):
+def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watchers=(),
+             stops=()):
     """Run one cell from a fresh database and output; return its artifacts."""
     if timeout is None:
         timeout = stage3_specs.cell_timeout(cell['path'])
@@ -696,8 +864,12 @@ def run_cell(cell, runner, *, output, stale_root, attempt, timeout=None, watcher
                             watchers=watchers)
     except CellFailure as error:
         write_record(output, dict(error.record, failure=str(error)))
+        if stops:
+            write_stops(Path(output) / 'owner-stops.json', stops)
         raise
     write_record(output, record)
+    if stops:
+        write_stops(Path(output) / 'owner-stops.json', stops)
     return artifacts(output)
 
 
@@ -728,14 +900,20 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
             try:
                 if runner is None:
                     raise ValueError(f'arm {cell["arm"]} cell {cell["id"]} has no runner')
+                before = len(owners.stops) if owners is not None else 0
                 if cell['arm'] == 'B' and owners is not None:
                     owners.stop()
                 if cell['arm'] == 'A' and owners is not None:
                     owners.start(cell['tier'])
+                forced = owners.forced(before) if owners is not None else []
+                if forced:
+                    raise ValueError('owner stop needed a forced kill on '
+                                     + ', '.join(sorted(forced)))
                 produced = run_cell(
                     cell, runner, output=output, stale_root=stale_root,
                     attempt=entry['attempts'], timeout=timeout,
-                    watchers=owners.watchers() if (owners and cell['arm'] == 'A') else ())
+                    watchers=owners.watchers() if (owners and cell['arm'] == 'A') else (),
+                    stops=owners.stops[before:] if owners is not None else ())
                 if bucket is not None:
                     bucket.publish(cell['id'], produced, output, attempt=entry['attempts'])
                     ledger.mark_passed(entry, produced, store=bucket.ledger_store)
@@ -757,17 +935,32 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                     break
     finally:
         if owners is not None:
+            before = len(owners.stops)
             failed = owners.stop()
+            forced = owners.forced(before)
             results.append(dict(id='owner-processes',
-                                status='failed' if failed else 'stopped',
-                                detail=sorted(failed)))
+                                status='failed' if failed or forced else 'stopped',
+                                detail=sorted(failed), forced=sorted(forced)))
+            write_stops(root / 'stage3' / 'owner-stops.json', owners.stops)
     return results, planned
 
 
+def write_stops(path, stops):
+    """One durable owner-stop record per stop, on the campaign root."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(list(stops), indent=2, sort_keys=True) + '\n')
+    return path
+
+
 def save(ledger, bucket):
-    if bucket is None:
-        ledger.save()
-    else:
+    """Write the merged ledger locally, then to the campaign object.
+
+    The local copy is the resume state of this host: a coordinator-host loss
+    must not take the whole ledger with it.
+    """
+    ledger.save()
+    if bucket is not None:
         bucket.save(ledger)
 
 
