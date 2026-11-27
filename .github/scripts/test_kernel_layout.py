@@ -35,9 +35,9 @@ class LayoutDefect(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.configfs(Path(tmp))
             write_links(root / "ports" / "1000",
-                        [kernel.LAYOUT_SCOPE + "aa" * 16 + "-p0-sub-1"])
+                        [kernel.LAYOUT_SCOPE + "aa" * 16 + "-p00000000-sub-1"])
             write_links(root / "ports" / "1002",
-                        [kernel.LAYOUT_SCOPE + "bb" * 16 + "-p0-sub-2"])
+                        [kernel.LAYOUT_SCOPE + "bb" * 16 + "-p00000000-sub-2"])
             for node, hexes, port in (("a", "aa" * 16, 1000), ("b", "bb" * 16, 1002)):
                 write_launch(root / f"{node}.yaml", root / "roots" / hexes, port)
                 (root / "roots" / hexes / f"db-{hexes}").mkdir(parents=True)
@@ -51,8 +51,8 @@ class LayoutDefect(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.configfs(Path(tmp))
             write_links(root / "ports" / "1000", [
-                kernel.LAYOUT_SCOPE + "aa" * 16 + "-p0-sub-1",
-                kernel.LAYOUT_SCOPE + "cc" * 16 + "-p0-sub-3"])
+                kernel.LAYOUT_SCOPE + "aa" * 16 + "-p00000000-sub-1",
+                kernel.LAYOUT_SCOPE + "cc" * 16 + "-p00000000-sub-3"])
             node = {"namespace": "a", "partition": 0, "launch": str(root / "a.yaml")}
             write_launch(node["launch"], root / "roots", 1000)
             (root / "roots" / f"db-{'aa' * 16}").mkdir(parents=True)
@@ -73,7 +73,7 @@ class LayoutDefect(unittest.TestCase):
     def test_teardown_reports_the_residual_objects_of_each_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.configfs(Path(tmp))
-            residual = kernel.LAYOUT_SCOPE + "aa" * 16 + "-p0-sub-1"
+            residual = kernel.LAYOUT_SCOPE + "aa" * 16 + "-p00000000-sub-1"
             (root / "subsystems" / residual).mkdir()
             write_links(root / "ports" / "1000", [residual])
             with patch.object(kernel, "CONFIGFS", root):

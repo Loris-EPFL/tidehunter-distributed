@@ -387,7 +387,7 @@ def layout_defect(nodes, scopes):
     for node in nodes:
         pool = owner_launch(node)["host"]["live_target_pool"]
         expected[pool["public_port_base"]] = (
-            f"{LAYOUT_SCOPE}{scopes[owner_name(node)]}-p{node['partition']}-")
+            f"{LAYOUT_SCOPE}{scopes[owner_name(node)]}-p{node['partition']:08x}-")
     ports = CONFIGFS / "ports"
     observed = {}
     for port in sorted(ports.iterdir(), key=lambda path: path.name):
@@ -516,7 +516,7 @@ def layout_observed(nodes, scopes):
     for node in nodes:
         pool = owner_launch(node)["host"]["live_target_pool"]
         observed[pool["public_port_base"]] = (
-            f"{scopes[owner_name(node)]}-p{node['partition']}")
+            f"{scopes[owner_name(node)]}-p{node['partition']:08x}")
     return observed
 
 
