@@ -18,10 +18,14 @@
 //! the same pass able to unlink instead of leaving `cleanup_pending` behind.
 //!
 //! Bounded: one task, a fixed period, a wall-clock bound, and a stop flag set
-//! when the completion gate is released or times out. A failed put is expected
-//! after the driver kills an owner on a retirement cell; it is counted and
-//! never fails the run, because the coordinator's own typed terminal failure is
-//! the cell's evidence.
+//! when the completion gate is released or times out. While it runs it also
+//! re-requests the pass at a fixed period, as Sui's periodic pruner does, so a
+//! deferred pass (a committed retirement whose victim still ends at the
+//! allocator) or a freeze above the cut gets another pass; a request while a
+//! pass runs coalesces into one follow-up pass. A failed put is expected after
+//! the driver kills an owner on a retirement cell; it is counted and never
+//! fails the run, because the coordinator's own typed terminal failure is the
+//! cell's evidence.
 
 use crate::backend::KvBackend;
 use crate::config::RelocationFuelConfig;
@@ -43,6 +47,8 @@ pub struct RelocationFuel {
 #[derive(Default)]
 struct FuelCounts {
     puts: u64,
+    /// Accepted re-requests; the runner makes the first request.
+    requests: u64,
     errors: u64,
     first_error: Option<String>,
 }
@@ -75,11 +81,35 @@ impl RelocationFuel {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let period = period(plan);
+        let retry = Duration::from_secs(u64::from(plan.retry_seconds.max(1)));
         let until = Instant::now() + Duration::from_secs(u64::from(plan.max_seconds));
         let task = tokio::spawn(async move {
             let mut cursor = 1_u64;
             let mut next = Instant::now() + period;
+            let mut next_request = Instant::now() + retry;
             while !flag.load(Ordering::Relaxed) && Instant::now() < until {
+                // A deferred pass (a committed retirement whose victim still
+                // ends at the allocator) or a freeze above the cut needs another
+                // pass. Asking again while a pass runs coalesces: the relocator
+                // holds one pending flag, so any number of requests becomes one
+                // follow-up pass and never a queue (`sui/relocation.rs`
+                // "Request a pass; coalesces with a queued one").
+                let now = Instant::now();
+                if now >= next_request {
+                    match backend.start_relocation() {
+                        Ok(()) => counts.requests = counts.requests.saturating_add(1),
+                        Err(error) => {
+                            counts.errors = counts.errors.saturating_add(1);
+                            if counts.first_error.is_none() {
+                                counts.first_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                    next_request += retry;
+                    if next_request <= now {
+                        next_request = now + retry;
+                    }
+                }
                 let id = cursor % keys.max(1);
                 cursor = cursor.wrapping_add(1);
                 rewrite(
@@ -143,7 +173,9 @@ impl RelocationFuel {
             "requested": true,
             "puts_per_second": plan.puts_per_second,
             "max_seconds": plan.max_seconds,
+            "retry_seconds": plan.retry_seconds,
             "puts": counts.puts,
+            "requests": counts.requests,
             "errors": counts.errors,
             "first_error": counts.first_error,
             "seconds_request_to_release": requested.elapsed().as_secs_f64(),

@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicU64;
 /// Records every rewrite; fails every put at or after `fail_after`.
 struct FuelBackend {
     puts: AtomicU64,
+    relocation_requests: AtomicU64,
     writes: Mutex<Vec<(tidehunter::minibytes::Bytes, tidehunter::minibytes::Bytes)>>,
     fail_after: Option<u64>,
 }
@@ -15,6 +16,7 @@ impl FuelBackend {
     fn new(fail_after: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             puts: AtomicU64::new(0),
+            relocation_requests: AtomicU64::new(0),
             writes: Mutex::new(Vec::new()),
             fail_after,
         })
@@ -38,6 +40,11 @@ impl KvBackend for FuelBackend {
         }
     }
 
+    fn start_relocation(&self) -> BackendResult<()> {
+        self.relocation_requests.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn get(&self, _key: &[u8]) -> BackendResult<Option<tidehunter::minibytes::Bytes>> {
         Ok(None)
     }
@@ -49,11 +56,9 @@ impl KvBackend for FuelBackend {
     ) -> BackendResult<()> {
         let index = self.puts.fetch_add(1, Ordering::Relaxed);
         if self.fail_after.is_some_and(|limit| index >= limit) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "owner write failed",
-            )
-            .into());
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "owner write failed").into(),
+            );
         }
         self.writes.lock().unwrap().push((key, value));
         Ok(())
@@ -81,10 +86,11 @@ impl KvBackend for FuelBackend {
     }
 }
 
-fn plan(puts_per_second: u32, max_seconds: u32) -> RelocationFuelConfig {
+fn plan(puts_per_second: u32, max_seconds: u32, retry_seconds: u32) -> RelocationFuelConfig {
     RelocationFuelConfig {
         puts_per_second,
         max_seconds,
+        retry_seconds,
     }
 }
 
@@ -101,7 +107,7 @@ async fn the_first_rewrite_lands_before_the_request_and_the_rate_is_bounded() {
         100,
         64,
         1.0,
-        plan(50, 5),
+        plan(50, 5, 300),
     )
     .await;
     assert!(backend.puts.load(Ordering::Relaxed) >= 1);
@@ -112,6 +118,9 @@ async fn the_first_rewrite_lands_before_the_request_and_the_rate_is_bounded() {
     assert!(record["joined"].as_bool().unwrap(), "{record}");
     assert_eq!(record["errors"].as_u64(), Some(0), "{record}");
     assert_eq!(record["puts_per_second"].as_u64(), Some(50), "{record}");
+    // The re-request period is far outside this window: the runner's own
+    // request is the only one.
+    assert_eq!(record["requests"].as_u64(), Some(0), "{record}");
     assert!(puts >= 2, "{record}");
     // At most the configured rate, plus the pre-request rewrite, plus one call
     // already in flight at the stop.
@@ -136,7 +145,7 @@ async fn the_wall_clock_bound_ends_the_stream_without_a_stop() {
         100,
         64,
         1.0,
-        plan(1_000, 1),
+        plan(1_000, 1, 300),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(1_400)).await;
@@ -161,7 +170,7 @@ async fn failed_rewrites_are_counted_and_never_fail_the_run() {
         100,
         64,
         1.0,
-        plan(500, 5),
+        plan(500, 5, 300),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -175,5 +184,38 @@ async fn failed_rewrites_are_counted_and_never_fail_the_run() {
             .unwrap()
             .contains("owner write failed"),
         "{record}"
+    );
+}
+
+/// The gate-held stream re-requests the pass at its period, as Sui's periodic
+/// pruner does, so a deferred pass or a late freeze gets another pass; it stops
+/// asking the moment it is stopped.
+#[tokio::test]
+async fn the_pass_is_re_requested_at_the_period_and_stops_at_release() {
+    let backend = FuelBackend::new(None);
+    let fuel = RelocationFuel::start(
+        Arc::clone(&backend),
+        [5; 16],
+        3,
+        100,
+        64,
+        1.0,
+        plan(1_000, 5, 1),
+    )
+    .await;
+    // The runner makes the first request; the stream adds its own at the period.
+    assert_eq!(backend.relocation_requests.load(Ordering::Relaxed), 0);
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    let re_requests = backend.relocation_requests.load(Ordering::Relaxed);
+    assert!(re_requests >= 1, "no re-request within one period");
+    let record = fuel.finish(Duration::from_secs(2)).await;
+    assert!(record["joined"].as_bool().unwrap(), "{record}");
+    assert_eq!(record["requests"].as_u64(), Some(re_requests), "{record}");
+    assert_eq!(record["retry_seconds"].as_u64(), Some(1), "{record}");
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    assert_eq!(
+        backend.relocation_requests.load(Ordering::Relaxed),
+        re_requests,
+        "a stopped stream keeps requesting"
     );
 }

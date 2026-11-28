@@ -251,6 +251,11 @@ pub struct RelocationFuelConfig {
     /// Wall-clock bound of the stream; the completion gate is the real bound.
     #[serde(default = "default_fuel_max_seconds")]
     pub max_seconds: u32,
+    /// Period of the repeated pass request, as Sui's periodic pruner does. A
+    /// request while a pass runs coalesces into one follow-up pass, so a
+    /// deferred pass or a freeze above the cut gets another pass.
+    #[serde(default = "default_fuel_retry_seconds")]
+    pub retry_seconds: u32,
 }
 
 impl Default for RelocationFuelConfig {
@@ -258,6 +263,7 @@ impl Default for RelocationFuelConfig {
         Self {
             puts_per_second: default_fuel_puts_per_second(),
             max_seconds: default_fuel_max_seconds(),
+            retry_seconds: default_fuel_retry_seconds(),
         }
     }
 }
@@ -273,10 +279,17 @@ fn default_fuel_max_seconds() -> u32 {
     300
 }
 
+/// Sui's pruner cadence, so a gated cell asks for the pass like a live system.
+fn default_fuel_retry_seconds() -> u32 {
+    10
+}
+
 /// The admitted fuel rate: nonzero, and far below a measurement rate.
 pub const RELOCATION_FUEL_PUTS_PER_SECOND: std::ops::RangeInclusive<u32> = 1..=4_096;
 /// The admitted fuel bound: nonzero, and no longer than a long cell.
 pub const RELOCATION_FUEL_MAX_SECONDS: std::ops::RangeInclusive<u32> = 1..=600;
+/// The admitted re-request period: nonzero, and no longer than a long cell.
+pub const RELOCATION_FUEL_RETRY_SECONDS: std::ops::RangeInclusive<u32> = 1..=600;
 
 fn default_true() -> bool {
     true
@@ -475,6 +488,9 @@ impl RunConfig {
             }
             if !RELOCATION_FUEL_MAX_SECONDS.contains(&fuel.max_seconds) {
                 return invalid("phases.relocation.max_seconds must be in 1..=600");
+            }
+            if !RELOCATION_FUEL_RETRY_SECONDS.contains(&fuel.retry_seconds) {
+                return invalid("phases.relocation.retry_seconds must be in 1..=600");
             }
         }
         for (gate, name) in [

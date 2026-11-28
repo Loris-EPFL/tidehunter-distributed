@@ -630,13 +630,15 @@ fn relocation_phase_accepts_a_bool_or_an_explicit_fuel_bound() {
     assert_eq!(serde_json::to_string(&on).unwrap(), "true");
 
     let tuned: RelocationPhase =
-        serde_json::from_str(r#"{"puts_per_second":128,"max_seconds":30}"#).unwrap();
+        serde_json::from_str(r#"{"puts_per_second":128,"max_seconds":30,"retry_seconds":5}"#)
+            .unwrap();
     assert!(tuned.requested());
     assert_eq!(
         tuned.fuel(),
         Some(RelocationFuelConfig {
             puts_per_second: 128,
             max_seconds: 30,
+            retry_seconds: 5,
         })
     );
     // Omitted fields take the documented defaults, not zero.
@@ -646,6 +648,7 @@ fn relocation_phase_accepts_a_bool_or_an_explicit_fuel_bound() {
         Some(RelocationFuelConfig {
             puts_per_second: 64,
             max_seconds: 300,
+            retry_seconds: 10,
         })
     );
 }
@@ -661,19 +664,27 @@ fn relocation_fuel_bounds_are_validated() {
     for fuel in [
         RelocationFuelConfig {
             puts_per_second: 0,
-            max_seconds: 30,
+            ..RelocationFuelConfig::default()
         },
         RelocationFuelConfig {
             puts_per_second: 4_097,
-            max_seconds: 30,
+            ..RelocationFuelConfig::default()
         },
         RelocationFuelConfig {
-            puts_per_second: 300,
             max_seconds: 0,
+            ..RelocationFuelConfig::default()
         },
         RelocationFuelConfig {
-            puts_per_second: 300,
             max_seconds: 601,
+            ..RelocationFuelConfig::default()
+        },
+        RelocationFuelConfig {
+            retry_seconds: 0,
+            ..RelocationFuelConfig::default()
+        },
+        RelocationFuelConfig {
+            retry_seconds: 601,
+            ..RelocationFuelConfig::default()
         },
     ] {
         config.phases.relocation = RelocationPhase::Fuel(fuel);
@@ -682,11 +693,13 @@ fn relocation_fuel_bounds_are_validated() {
     config.phases.relocation = RelocationPhase::Fuel(RelocationFuelConfig {
         puts_per_second: 4_096,
         max_seconds: 600,
+        retry_seconds: 600,
     });
     assert!(config.validate().is_ok());
     config.phases.relocation = RelocationPhase::Fuel(RelocationFuelConfig {
         puts_per_second: 1,
         max_seconds: 1,
+        retry_seconds: 1,
     });
     assert!(config.validate().is_ok());
 }
