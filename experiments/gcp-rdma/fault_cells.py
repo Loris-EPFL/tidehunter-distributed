@@ -1919,20 +1919,19 @@ class CellDriver:
             return None
         return None if started is None else started + completed
 
-    def _log_refusal(self, child):
-        """A typed refusal from the coordinator's own final line, if any.
+    def _log_refusal(self, child, offset=None):
+        """A typed causal line appended after `offset`, if any.
 
-        A sample row carries the backend error the refused call returned; the
-        coordinator's summary line names the first causal failure. The log is
-        the fallback when the row text does not carry the typed class.
+        The log is the fallback when a refusal row does not carry the typed
+        class. Only bytes written **after** the stale writer was proven stopped
+        may describe this fence: scanning the whole log would let a pre-freeze
+        refusal, followed by unrelated post-release output, pass as this cell's
+        self-fence. Without the frozen offset the line is not attributable and
+        nothing is returned.
         """
-        log = getattr(child, 'log', None)
-        if log is None:
+        if offset is None:
             return None
-        try:
-            text = Path(log).read_text(errors='replace')
-        except OSError:
-            return None
+        text = self._log_appended(child, offset)
         for line in text.splitlines():
             if 'causal failure' in line and self.typed(line):
                 return line.strip()
@@ -1945,6 +1944,7 @@ class CellDriver:
         started = freeze['unix_ns']
         result['paused_unix_ns'] = started
         result['freeze'] = freeze
+        result['log_offset_at_freeze'] = self._log_offset(child)
         result.update(self._seal_wait(self.cluster.owners, started))
         at_fence = self.fence_owner_snapshot()
         result['fence_owner_unix_ns'] = self._marker_instant(at_fence, baseline)
@@ -1958,7 +1958,8 @@ class CellDriver:
         rows_ = child.rows()
         refusal = self._refusal(rows_)
         text, typed = refusal['text'], refusal['typed']
-        if not typed and (logged := self._log_refusal(child)):
+        if not typed and (logged := self._log_refusal(
+                child, result.get('log_offset_at_freeze'))):
             text, typed = logged, True
             result['refusal_source'] = 'coordinator log'
         result['first_refusal_row'] = refusal['first']
@@ -2258,6 +2259,9 @@ class CellDriver:
         process that is killed before it writes its summary.
         """
         freeze = child.freeze()
+        # Only bytes appended after this point can describe this fence: the
+        # writer is proven stopped, so the offset is a stable watermark.
+        log_offset = self._log_offset(child)
         source = Path(child.output).parent / 'coordinator'
         copy = self.cluster.root('fence-b')
         if copy.exists():
@@ -2268,7 +2272,8 @@ class CellDriver:
         # the launch may already contain B's generation and ledger rewrite.
         baseline = self.fence_owner_snapshot()
         result = dict(copied_root=str(copy), freeze=freeze,
-                      paused_unix_ns=freeze['unix_ns'])
+                      paused_unix_ns=freeze['unix_ns'],
+                      log_offset_at_freeze=log_offset)
         second, at_fence, after = None, None, None
         try:
             second = self.launch(run, 'fence-b', path=copy)
@@ -2297,7 +2302,8 @@ class CellDriver:
         first_rows = child.rows()
         refusal = self._refusal(first_rows)
         text, typed = refusal['text'], refusal['typed']
-        if not typed and (logged := self._log_refusal(child)):
+        if not typed and (logged := self._log_refusal(
+                child, result.get('log_offset_at_freeze'))):
             text, typed = logged, True
             result['refusal_source'] = 'coordinator log'
         result['first_refusal_row'] = refusal['first']

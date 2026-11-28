@@ -2500,20 +2500,42 @@ class StaleFenceMeasurement(unittest.TestCase):
         self.assertTrue(refusal['no_success_after'])
 
     def test_an_untyped_row_takes_the_causal_line_from_the_log(self):
+        typed = ('kv-research: measurement end boundary failed: write core '
+                 'requires recovery; first causal failure: owner=Some(0) '
+                 'stage=live_group: coordinator lease lapsed on owner '
+                 'partition 0\n')
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / 'run.log'
-            log.write_text('kv-research: measurement end boundary failed: write core '
-                           'requires recovery; first causal failure: owner=Some(0) '
-                           'stage=live_group: coordinator lease lapsed on owner '
-                           'partition 0\n')
+            # A line written before the freeze cannot describe this fence.
+            log.write_text(typed)
             driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
             child = types.SimpleNamespace(log=log)
+            offset = driver._log_offset(child)
             rows_ = [dict(phase='measurement', outcome='unknown_mutation',
                           error_kind='Connection refused', completed_ns='5')]
             refusal = driver._refusal(rows_)
             self.assertFalse(refusal['typed'])
-            logged = driver._log_refusal(child)
+            # A self-fence leaves no refusal row at all.
+            self_rows = [dict(phase='measurement', outcome='success',
+                              completed_ns='1')]
+            self_refusal = driver._refusal(self_rows)
+            self.assertIsNone(driver._log_refusal(child),
+                              'no frozen offset: the line is not attributable')
+            with log.open('a') as stream:
+                stream.write('measurement end boundary failed: unrelated output\n')
+            self.assertIsNone(driver._log_refusal(child, offset),
+                              'a pre-freeze typed line plus post-release output is '
+                              'not this fence')
+            self.assertEqual(
+                driver._refusal_kind(child, self_rows, self_refusal, None),
+                (None, None), 'no post-freeze typed line, no self-fence')
+            with log.open('a') as stream:
+                stream.write(typed)
+            logged = driver._log_refusal(child, offset)
+            kind, _ = driver._refusal_kind(child, self_rows, self_refusal,
+                                           'coordinator log')
         self.assertIn('coordinator lease lapsed', logged)
+        self.assertEqual(kind, 'coordinator-self-fence')
 
     def test_a_success_after_a_refusal_is_a_second_writer(self):
         driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
