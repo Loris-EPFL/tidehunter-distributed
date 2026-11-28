@@ -760,6 +760,12 @@ class IndexRowsAgreement(unittest.TestCase):
         self.assertIn('native node', message)
 
 
+def db_op(database, write_batches):
+    """The `db_op` write-batch series of one database: count and zero sum."""
+    labels = f'ks="",op="write_batch",db="{database}"'
+    return [f'db_op_count{{{labels}}} {write_batches}', f'db_op_sum{{{labels}}} 0']
+
+
 class LifecycleChecks(unittest.TestCase):
     def test_durable_cut_record_is_the_engine_crc_frame(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -816,19 +822,22 @@ class LifecycleChecks(unittest.TestCase):
             self.assertEqual(paths, {'live/checkpoints': direct,
                                      'live/store/perpetual': nested})
 
-    def lifecycle(self, tmp, tier):
+    def lifecycle(self, tmp, tier, *, before=None, after=None, adapter=None,
+                  namespaces=frozenset({'live/checkpoints'})):
         output = Path(tmp) / 'out'
         output.mkdir()
-        (output / 'remote-final.prom').write_text('')
-        adapter = {'live/checkpoints': {'write_commit_calls': 0}}
-        with patch.object(run, 'reopen', return_value=(dict(seconds=1.0), '')), \
+        (output / 'remote-final.prom').write_text(
+            '\n'.join(db_op('checkpoint', 3551)) + '\n' if before is None else before)
+        metrics = '\n'.join(db_op('checkpoint', 0)) + '\n' if after is None else after
+        adapter = {'live/checkpoints': {'write_commit_calls': 0}} if adapter is None else adapter
+        with patch.object(run, 'reopen', return_value=(dict(seconds=1.0), metrics)), \
                 patch.object(run, 'audit', return_value=dict(databases={}, rocksdb={})), \
                 patch.object(analyze, 'adapter_stats', return_value=adapter), \
                 patch.object(analyze, 'live_nvmeof_stats',
                              return_value=dict(available=False, counters={})):
             return run.lifecycle_checks(
                 None, bins=Path(tmp), root=Path(tmp), output=output,
-                remote_root=Path(tmp) / 'remote', namespaces={'live/checkpoints'},
+                remote_root=Path(tmp) / 'remote', namespaces=set(namespaces),
                 address='rpc', metrics_address='metrics', producer_address='producer',
                 tip=1775, digest='D', bound=1776, extra={}, schemas={},
                 native_root=Path(tmp), config_path=Path(tmp), env={}, tier=tier,
@@ -844,6 +853,71 @@ class LifecycleChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 self.assertRaisesRegex(ValueError, 'durable-cut record not found'):
             self.lifecycle(tmp, 'native')
+
+    AUDITED = frozenset({'live/checkpoints', 'live/store/epoch_0',
+                         'live/store/perpetual'})
+
+    def write_populations(self, values):
+        return '\n'.join(line for database, count in zip(
+            ('checkpoint', 'epoch', 'perpetual'), values)
+            for line in db_op(database, count)) + '\n'
+
+    def sampled(self, **overrides):
+        counters = {'live/checkpoints': {'write_commit_calls': 0},
+                    'live/store/epoch_0': {'local_sample_available': 0},
+                    'live/store/perpetual': {'write_commit_calls': 0}}
+        counters.update(overrides)
+        return counters
+
+    def test_an_unsampled_namespace_still_proves_an_exact_zero(self):
+        # Attempt 5: the reopened epoch store opened about 0.7 s before the last
+        # scrape, so its one-second sampler published status labels and no
+        # write-commit value. The exact db_op population reads zero anyway.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.lifecycle(
+                tmp, 'synchronous', before=self.write_populations((3551, 7817, 5333)),
+                after=self.write_populations((0, 0, 0)), adapter=self.sampled(),
+                namespaces=self.AUDITED)
+        tail = result['tail_replay']
+        self.assertEqual(tail['publishes_by_database'],
+                         {'checkpoint': dict(before=3551, after=0),
+                          'epoch': dict(before=7817, after=0),
+                          'perpetual': dict(before=5333, after=0)})
+        self.assertIsNone(tail['adapter_write_commit_samples']['live/store/epoch_0'])
+        self.assertIn('exact', tail['publishes_source'])
+
+    def test_a_missing_write_population_after_the_reopen_is_unknown(self):
+        after = '\n'.join(db_op('checkpoint', 0) + db_op('perpetual', 0)) + '\n'
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+                ValueError, 'no write-batch population for: epoch'):
+            self.lifecycle(tmp, 'synchronous',
+                           before=self.write_populations((3551, 7817, 5333)),
+                           after=after, adapter=self.sampled(),
+                           namespaces=self.AUDITED)
+
+    def test_a_replay_scrape_without_write_populations_cannot_compare(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+                ValueError, 'cannot be compared'):
+            self.lifecycle(tmp, 'synchronous', before='',
+                           after=self.write_populations((0, 0, 0)), adapter=self.sampled(),
+                           namespaces=self.AUDITED)
+
+    def test_a_reopen_that_commits_a_batch_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+                ValueError, 'published write batches in: epoch=3'):
+            self.lifecycle(tmp, 'synchronous',
+                           before=self.write_populations((3551, 7817, 5333)),
+                           after=self.write_populations((0, 3, 0)),
+                           adapter=self.sampled(), namespaces=self.AUDITED)
+
+    def test_a_sampled_commit_counter_contradicts_the_exact_zero(self):
+        counters = self.sampled(**{'live/store/epoch_0': {'write_commit_calls': 2}})
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+                ValueError, 'sampled write commits for: live/store/epoch_0'):
+            self.lifecycle(tmp, 'synchronous',
+                           before=self.write_populations((3551, 7817, 5333)),
+                           after=self.write_populations((0, 0, 0)),
+                           adapter=counters, namespaces=self.AUDITED)
 
     def live(self, exposed, observed=2, fixtures=0, readonly=0, errors=0, owned=None):
         return dict(available=True, counters={

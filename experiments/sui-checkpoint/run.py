@@ -1297,6 +1297,58 @@ def reopen(owned, *, binary, root, address, metrics_address, producer_address, t
                                  'the producer')), metrics
 
 
+def reopen_write_populations(before, after):
+    """Exact write-batch populations of every database, before and after a reopen.
+
+    The adapter `write_commit_calls` gauge is a one-second sample of the engine
+    commit stage: a database whose sampler has not ticked publishes its status
+    labels and no commit counter at all, and on a reopen the epoch store opens
+    late enough to miss the final scrape. The typed-store `db_op` write-batch
+    histogram is exact instead. The adapter registers the family at open and
+    publishes every series at zero for a database that committed nothing, and a
+    scrape reads the histogram live, so a zero is an observed zero rather than
+    an unsampled value. A database the replay wrote must reappear in the reopen
+    scrape; a missing population is an unknown, never a zero.
+    """
+    from analyze import coordinator_stats
+
+    def populations(values):
+        result = {}
+        for database, keyspaces in coordinator_stats(values)['operations'].items():
+            name = database or ''
+            for operations in keyspaces.values():
+                row = operations.get('write_batch')
+                if row is None:
+                    continue
+                if row['count'] is None:
+                    raise ValueError('a db_op write-batch series carries no count for: '
+                                     + (name or '<unlabelled>'))
+                result[name] = result.get(name, 0) + int(row['count'])
+        return result
+
+    before, after = populations(before), populations(after)
+    if not before:
+        raise ValueError('the replay scrape published no db_op write-batch population; '
+                         'the reopen cannot be compared against it')
+    missing = sorted(set(before) - set(after))
+    if missing:
+        raise ValueError('the reopened node published no write-batch population for: '
+                         + ', '.join(name or '<unlabelled>' for name in missing))
+    writing = sorted((name, count) for name, count in after.items() if count)
+    if writing:
+        raise ValueError('the reopen published write batches in: '
+                         + ', '.join(f'{name or "<unlabelled>"}={count}'
+                                     for name, count in writing)
+                         + ' instead of replaying the tail')
+    return dict(
+        databases={name: dict(before=before[name], after=after[name])
+                   for name in sorted(before)},
+        source='db_op write-batch observation counts of the reopened node: the exact '
+               'process-lifetime histogram, registered at open and published at zero for '
+               'a database that committed nothing; it does not depend on the one-second '
+               'adapter sampler and therefore covers a store opened just before the scrape')
+
+
 def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
                      address, metrics_address, producer_address, tip, digest, bound, extra,
                      schemas, native_root, config_path, env, tier, audit_before,
@@ -1329,23 +1381,31 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
     counters = adapter_stats(parse_metrics(metrics))
     if not counters:
         raise ValueError('the reopened node published no adapter counters')
-    publishes = {name: int(stats.get('write_commit_calls', -1))
-                 for name, stats in counters.items()}
-    if set(publishes) != set(namespaces):
+    if set(counters) != set(namespaces):
         raise ValueError('reopened adapter counters do not cover the audited namespaces')
-    absent = sorted(name for name, value in publishes.items() if value < 0)
-    if absent:
-        raise ValueError('the reopened node lacks the write-commit counter for: '
-                         + ', '.join(absent))
-    if any(publishes.values()):
-        raise ValueError('the reopen published a checkpoint instead of replaying the tail')
+    # A published sample is evidence; its absence is not. The sampler ticks once
+    # a second and the epoch store opens late on a reopen, so attempt 5's epoch
+    # namespace carried its status labels and no write-commit value at all.
+    samples = {name: stats.get('write_commit_calls')
+               for name, stats in counters.items()}
+    advanced = sorted(name for name, value in samples.items() if value)
+    if advanced:
+        raise ValueError('the reopened node sampled write commits for: '
+                         + ', '.join(advanced))
+    publishes = reopen_write_populations(
+        parse_metrics((output / 'remote-final.prom').read_text()), parse_metrics(metrics))
     audit_after = audit(root, output, bins, schemas, native_root, remote_root,
                         config_path, env, label='-reopen')
     return dict(
         status='clean-reopen-verified', tail_checkpoints=tail_checkpoints,
         reopen=receipt, reopen_fence=exports, durable_cut=cut,
         tail_replay=dict(
-            state_unchanged=True, publishes=publishes,
+            state_unchanged=True, publishes_by_database=publishes['databases'],
+            publishes_source=publishes['source'],
+            adapter_write_commit_samples=samples,
+            adapter_sample_scope='one-second sampled gauge; a namespace that has not '
+                                 'sampled publishes no value, so only a published '
+                                 'non-zero value is evidence',
             sui_rescheduled_checkpoints=0,
             source='engine open replays the owner WAL tail above the durable cut; '
                    'the pinned Sui schedules from highest_executed + 1'),
