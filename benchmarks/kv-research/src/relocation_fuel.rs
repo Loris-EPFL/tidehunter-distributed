@@ -35,24 +35,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// One running stream: its stop flag, its optional task, and its plan.
+/// One running stream: its stop flag, its task, and its plan.
 pub struct RelocationFuel {
     stop: Arc<AtomicBool>,
-    task: Option<tokio::task::JoinHandle<FuelCounts>>,
+    task: tokio::task::JoinHandle<FuelCounts>,
     plan: RelocationFuelConfig,
 }
 
 impl Drop for RelocationFuel {
     /// A dropped stream must not outlive its owner. The runner's early `?`
-    /// returns drop this value; a detached task would keep rewriting dataset
-    /// keys to `max_seconds` after the run had already failed. The stop flag
-    /// ends the loop at its next check, and the abort also cancels a call that
-    /// is already in flight at the backend.
+    /// returns drop this value, and cancelling `run` drops it inside `finish`'s
+    /// join; a detached task would keep rewriting dataset keys after the run had
+    /// already failed. The stop flag ends the loop at its next check, and the
+    /// abort also cancels a call that is already in flight at the backend. The
+    /// handle therefore stays on the value for its whole life: `finish` awaits
+    /// it in place instead of taking it.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.task.abort();
     }
 }
 
@@ -146,11 +146,7 @@ impl RelocationFuel {
             }
             counts
         });
-        Self {
-            stop,
-            task: Some(task),
-            plan,
-        }
+        Self { stop, task, plan }
     }
 
     /// Stop the stream and join it. `grace` bounds the join: one call already in
@@ -168,25 +164,19 @@ impl RelocationFuel {
         self.stop.store(true, Ordering::Relaxed);
         let plan = self.plan;
         let mut joined = true;
-        let counts = match self.task.take() {
-            Some(mut task) => match tokio::time::timeout(grace, &mut task).await {
-                Ok(Ok(counts)) => counts,
-                Ok(Err(error)) => {
-                    joined = false;
-                    FuelCounts {
-                        first_error: Some(format!("fuel task failed: {error}")),
-                        ..FuelCounts::default()
-                    }
+        // The handle is awaited in place, so a caller that cancels this future
+        // during the join still reaches `Drop` with the task in hand.
+        let counts = match tokio::time::timeout(grace, &mut self.task).await {
+            Ok(Ok(counts)) => counts,
+            Ok(Err(error)) => {
+                joined = false;
+                FuelCounts {
+                    first_error: Some(format!("fuel task failed: {error}")),
+                    ..FuelCounts::default()
                 }
-                Err(_) => {
-                    task.abort();
-                    joined = false;
-                    FuelCounts::default()
-                }
-            },
-            // A consumed value cannot be `finish`ed twice; report no join
-            // rather than a fabricated one.
-            None => {
+            }
+            Err(_) => {
+                self.task.abort();
                 joined = false;
                 FuelCounts::default()
             }

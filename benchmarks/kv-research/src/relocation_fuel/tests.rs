@@ -317,3 +317,57 @@ async fn dropping_the_stream_cancels_its_parked_put_without_finish() {
         "a rewrite started after the drop"
     );
 }
+
+/// Cancelling the caller's future inside `finish`'s join (a deadline, a
+/// `select!`) drops the whole `RelocationFuel`, so the parked backend call must
+/// still be cancelled: the handle is awaited in place, never taken. A zero-time
+/// outer timeout polls `finish` once — far enough to reach the join — and then
+/// drops it, with no sleep in the premise.
+#[tokio::test]
+async fn cancelling_the_join_still_aborts_the_stream() {
+    let backend = FuelBackend::parking();
+    let fuel = RelocationFuel::start(
+        Arc::clone(&backend),
+        [2; 16],
+        4,
+        100,
+        64,
+        1.0,
+        plan(1_000, 60, 10),
+    )
+    .await;
+    for _ in 0..64 {
+        if backend.parked.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked.load(Ordering::Relaxed),
+        1,
+        "the loop never parked"
+    );
+    let puts = backend.puts.load(Ordering::Relaxed);
+    let cancelled = tokio::time::timeout(
+        Duration::ZERO,
+        fuel.finish(Duration::from_secs(60), Duration::ZERO),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the join returned while a put was parked"
+    );
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked_dropped.load(Ordering::Relaxed),
+        1,
+        "cancellation during the join detached the stream"
+    );
+    assert_eq!(
+        backend.puts.load(Ordering::Relaxed),
+        puts,
+        "a rewrite started after the cancellation"
+    );
+}
