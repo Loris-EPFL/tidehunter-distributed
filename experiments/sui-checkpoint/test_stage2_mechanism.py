@@ -106,6 +106,28 @@ class CellTable(unittest.TestCase):
                 self.assertEqual(spec['phases']['relocation'],
                                  run.get('relocation', False), cell['id'])
 
+    def test_a_relocation_cell_declares_one_shape_for_every_run(self):
+        # The coordinator's reopen rejects a changed shape, so the measure and
+        # verify specs of one cell must declare the same keyspaces; only the
+        # relocation phase (and the marker write) may differ.
+        for cell in mechanism.cells():
+            relocation = any(run.get('relocation') for run in cell['runs'])
+            shapes = set()
+            phases = []
+            for run in cell['runs']:
+                spec = mechanism.spec(cell, run, context(), path='/c', evidence='/e')
+                self.assertEqual(
+                    bool(spec['backend']['options'].get('relocation_marker', False)),
+                    relocation, cell['id'])
+                shapes.add(spec['backend']['options'].get('relocation_marker', False))
+                phases.append(bool(spec['phases']['relocation']))
+            self.assertEqual(len(shapes), 1, cell['id'])
+            if relocation:
+                self.assertTrue(any(phases), cell['id'])
+                if len(cell['runs']) > 1:
+                    # A reopen declares the same shape but writes no marker.
+                    self.assertIn(False, phases, cell['id'])
+
     def test_verify_runs_are_read_only_and_explicit(self):
         for cell in mechanism.cells():
             verify = [run for run in cell['runs'] if run['role'] == 'verify']

@@ -51,9 +51,11 @@ pub(super) struct Options {
     /// Per-keyspace value-cache entries; zero disables the cache (the default).
     #[serde(default)]
     pub(super) value_cache_size: usize,
-    /// Declare the second, filtered relocation-marker keyspace. Set by the
-    /// measure run of a relocation cell only; a reopen without it retains the
-    /// keyspace through the registry and simply does not expose it.
+    /// Declare the second, filtered relocation-marker keyspace. Every run of a
+    /// relocation cell sets it: the coordinator rejects a reopen whose shape
+    /// changed (`authority configuration differs from the recorded authority`),
+    /// so the verify run must declare the same shape. Only a run with a
+    /// relocation phase writes a marker into it.
     #[serde(default)]
     pub(super) relocation_marker: bool,
 }
