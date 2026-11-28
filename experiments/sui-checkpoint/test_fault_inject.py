@@ -317,6 +317,40 @@ class InjectionRun(unittest.TestCase):
             self.assertGreaterEqual(record['reconnect_seconds'], 0)
             self.assertEqual(record['processes_after'][0]['pid'], os.getpid())
 
+    def test_a_resume_that_follows_the_reconnect_is_polled_for(self):
+        """The episode is on the write path, so it can land after the first sample."""
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            state = dict(deleted=False, calls=0, polls=0)
+            def snapshot():
+                return inventory('nvme2', 2) if state['deleted'] else inventory()
+            def latest(address):
+                state['calls'] += 1
+                return 10 if state['calls'] == 1 else 11
+            def scraped(url):
+                if not state['deleted']:
+                    return metrics(10, connects=1)
+                state['polls'] += 1
+                return (metrics(14, connects=2) if state['polls'] < 3
+                        else metrics(14, connects=2, attempts=1, frames=1))
+            def read(address, sequence):
+                return {'sequenceNumber': str(sequence)}
+            with patch.object(fault_inject.manage, 'SYS_NVME', root):
+                record = fault_inject.run(self.args(), snapshot=snapshot,
+                    delete=lambda *a: state.update(deleted=True), latest=latest,
+                    metrics=scraped, clock=clock.monotonic, sleep=clock.sleep,
+                    read_checkpoint=read, **self.preflight())
+        self.assertTrue(record['ok'], record)
+        self.assertEqual(record['resume_poll']['samples'], 3)
+        self.assertFalse(record['resume_poll']['exhausted'])
+        self.assertGreater(record['resume_poll']['elapsed_seconds'], 0)
+        self.assertEqual([row['resume_attempts']
+                          for row in record['resume_poll']['observations']], [0, 0, 1])
+        self.assertEqual(record['resume'], dict(resume_attempts=1, resume_rewrites=1,
+                                                resume_frames=1, resume_refused=0))
+
     def test_a_loss_without_a_resume_episode_is_refused(self):
         clock = FakeClock()
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,7 +363,7 @@ class InjectionRun(unittest.TestCase):
                 state['calls'] += 1
                 return 10 if state['calls'] == 1 else 11
             def metrics_only_reconnect(url):
-                return (metrics(10, connects=1) if state['calls'] <= 1
+                return (metrics(10, connects=1) if not state['deleted']
                         else metrics(14, connects=2))
             with patch.object(fault_inject.manage, 'SYS_NVME', root):
                 record = fault_inject.run(self.args(), snapshot=snapshot,
@@ -340,6 +374,10 @@ class InjectionRun(unittest.TestCase):
             self.assertFalse(record['ok'])
             self.assertIn('no write-resume episode', record['reason'])
             self.assertIn('no frame was rewritten', record['reason'])
+            self.assertTrue(record['resume_poll']['exhausted'])
+            self.assertGreater(record['resume_poll']['samples'], 1)
+            self.assertGreaterEqual(record['resume_poll']['elapsed_seconds'],
+                                    self.args().timeout - fault_inject.RESUME_POLL_CADENCE)
 
     def test_a_stale_epoch_is_refused_before_any_delete(self):
         clock = FakeClock()

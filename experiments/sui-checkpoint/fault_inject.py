@@ -19,7 +19,8 @@ injector proves the selected controller is the one serving writes: it is
 `live`, a process holds a descriptor on its namespace, and that namespace's
 write sectors advance. After the delete a new controller inode for the same
 NQN and a completed write-resume episode are required when a metrics endpoint
-is given.
+is given; the resume counters are polled until they advance or `--timeout`
+expires, because the episode follows the write path's own break.
 
 Exit status is nonzero when any verification fails; the JSON record is written
 in both outcomes so the campaign retains the failed case.
@@ -54,6 +55,13 @@ def _load_manage():
 
 
 manage = _load_manage()
+
+# The W1 episode that follows a loss starts on the write path's own failure, not
+# on the new controller: a scrape taken right after the reconnect can still read
+# zero. The wait is an evidence poll, never a fixed sleep, and its bound is the
+# injector's own `--timeout`.
+RESUME_POLL_CADENCE = 0.05
+RESUME_POLL_OBSERVATIONS = 4
 
 
 class InjectionError(ValueError):
@@ -337,6 +345,39 @@ def wait_for_progress(address, before, *, timeout, clock=time.monotonic, sleep=t
         sleep(min(.25, max(0, timeout - (clock() - start))))
 
 
+def wait_for_resume(url, before, *, timeout, metrics=scrape_metrics, clock=time.monotonic,
+                    sleep=time.sleep, cadence=RESUME_POLL_CADENCE):
+    """Poll the live counters until the W1 episode that follows the loss appears.
+
+    A one-shot scrape right after the reconnect races the engine's resume: the
+    episode starts when the leased write path observes its own break, not when
+    the controller reappears, so the first sample can still read zero. The wait
+    is bounded by the injector's existing `--timeout`, and the sample it stops
+    on is the record's after pair either way. `exhausted` says whether the
+    counters advanced before that bound; it is evidence, not an extra verdict.
+    """
+    counters = before.get('counters', {})
+    base_attempts = counters.get('resume_attempts_total') or 0
+    base_frames = counters.get('resume_frames_total') or 0
+    start = clock()
+    samples = 0
+    observations = []
+    while True:
+        sample = live_counters(metrics(url))
+        counters = sample.get('counters', {})
+        attempts = counters.get('resume_attempts_total') or 0
+        frames = counters.get('resume_frames_total') or 0
+        samples += 1
+        observations.append(dict(seconds=clock() - start, resume_attempts=attempts,
+                                 resume_frames=frames))
+        del observations[:-RESUME_POLL_OBSERVATIONS]
+        advanced = attempts > base_attempts and frames > base_frames
+        if advanced or clock() - start >= timeout:
+            return sample, dict(samples=samples, elapsed_seconds=clock() - start,
+                                exhausted=not advanced, observations=observations)
+        sleep(min(cadence, max(0, timeout - (clock() - start))))
+
+
 def process_state(pids):
     rows = []
     for pid in pids:
@@ -482,7 +523,12 @@ def run(args, *, snapshot=None, delete=None,
         new_checkpoint = read_checkpoint(args.sui_rpc, after_sequence)
         record['new_checkpoint_sequence'] = after_sequence
         record['new_checkpoint_read'] = bool(canonical(new_checkpoint))
-        after_metrics = live_counters(metrics(args.metrics_url)) if args.metrics_url else None
+        if args.metrics_url and before_metrics is not None:
+            after_metrics, record['resume_poll'] = wait_for_resume(
+                args.metrics_url, before_metrics, timeout=args.timeout,
+                metrics=metrics, clock=clock, sleep=sleep)
+        else:
+            after_metrics = live_counters(metrics(args.metrics_url)) if args.metrics_url else None
         if before_metrics is not None and after_metrics is not None:
             from analyze import live_nvmeof_deltas
             record['live_after'] = after_metrics

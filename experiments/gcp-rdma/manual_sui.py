@@ -1550,7 +1550,8 @@ def main():
                              'searched. By default it is the database root this cell '
                              'prepares')
     parser.add_argument('--controller-loss-timeout', type=float, default=30.0,
-                        help='injector reconnect and write-progress deadline in seconds')
+                        help='injector reconnect, write-progress and resume-poll deadline '
+                             'in seconds')
     parser.add_argument('--controller-loss-gate-timeout', type=float,
                         help='deadline for observing the point; default: 2 * deadline + 600 s')
     parser.add_argument('--controller-loss-probe-seconds', type=float, default=1.0,
