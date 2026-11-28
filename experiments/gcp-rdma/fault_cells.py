@@ -2013,7 +2013,8 @@ class CellDriver:
             result['fence_reject_window_ms'], result['fence_reject_reason'] = (
                 self._self_fence_window(
                     result['fence_unix_ns'], resumed_ns=result.get('resumed_unix_ns'),
-                    log_ns=result['self_fence_log_unix_ns']))
+                    log_ns=result['self_fence_log_unix_ns'],
+                    baseline_ns=(baseline or {}).get('unix_ns')))
         elif latency_kind == 'row' and result['fence_unix_ns'] is None:
             result['fence_reject_reason'] = 'the fence instant is missing'
         result.update(self.fence_audit(child))
@@ -2143,22 +2144,25 @@ class CellDriver:
         truncated log must never read as a post-release report.
 
         The fence instant is bracketed by the owner snapshots: `(baseline_ns,
-        fence_ns]` for a contention cell, or exactly `fence_ns` for a
-        write-protect cell. The bound spans the harness pause (`includes_pause`);
-        the post-release part is kept separately (`post_release_upper_ms`).
+        fence_ns]`, where `fence_ns` is the driver's first observation of the
+        fence (an upper bound on it) and `baseline_ns` the snapshot taken
+        before the freeze. The bound uses `baseline_ns` so it contains the true
+        interval; it spans the harness pause (`includes_pause`); the
+        post-release part is kept separately (`post_release_upper_ms`).
         """
-        if fence_ns is None or resumed_ns is None or log_ns is None:
+        if (fence_ns is None or resumed_ns is None or log_ns is None
+                or baseline_ns is None):
             missing = [name for name, value in (('fence', fence_ns),
                                                 ('release', resumed_ns),
-                                                ('log write', log_ns))
+                                                ('log write', log_ns),
+                                                ('pre-freeze baseline', baseline_ns))
                        if value is None]
             return None, ('the self-fence instant is not measurable: '
                           + ', '.join(missing) + ' is missing')
         if log_ns < resumed_ns:
             return None, ('the final log write precedes the release, so it cannot '
                           'contain a post-release report')
-        upper_ref = fence_ns if baseline_ns is None else baseline_ns
-        upper = (log_ns - upper_ref) / 1e6
+        upper = (log_ns - baseline_ns) / 1e6
         if resumed_ns < fence_ns or upper < 0:
             return None, ('the self-fence bracket is inconsistent: the release or the '
                           'final log write precedes the fence')

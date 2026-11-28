@@ -979,6 +979,20 @@ class SelfFenceEvidence(unittest.TestCase):
         self.assertEqual(window['post_release_upper_ms'],
                          (self.LOG_WRITE - self.RESUMED) / 1e6)
 
+    def test_the_self_fence_bound_starts_at_the_pre_freeze_baseline(self):
+        # The driver observes the seal after it happened; only the baseline
+        # taken before the freeze precedes the true fence.
+        observed = self.AT_FENCE
+        window, reason = fault_cells.CellDriver._self_fence_window(
+            observed, resumed_ns=self.RESUMED, log_ns=self.LOG_WRITE,
+            baseline_ns=self.BASELINE)
+        self.assertIsNone(reason)
+        self.assertEqual(window['upper_ms'], (self.LOG_WRITE - self.BASELINE) / 1e6)
+        window, reason = fault_cells.CellDriver._self_fence_window(
+            observed, resumed_ns=self.RESUMED, log_ns=self.LOG_WRITE, baseline_ns=None)
+        self.assertIsNone(window)
+        self.assertIn('pre-freeze baseline', reason)
+
     def test_a_log_write_before_the_release_is_never_a_refusal(self):
         # The regression input: the log mtime predates SIGCONT, so it cannot
         # contain a post-release refusal. A stale or truncated log must fail.
