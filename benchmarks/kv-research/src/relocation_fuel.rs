@@ -192,16 +192,20 @@ impl RelocationFuel {
                 next += period;
             }
         });
-        let first_rewrite_ready = tokio::time::timeout(join_bound, first_rewrite)
-            .await
-            .is_ok_and(|received| received.is_ok());
-        Self {
+        // The guard exists before this function awaits anything: a caller that
+        // cancels `start` (a run deadline, a `select!`) drops `Self`, and its
+        // Drop must reach the task. Only then wait for the first rewrite.
+        let mut fuel = Self {
             stop,
             task,
             counts,
             plan,
-            first_rewrite_ready,
-        }
+            first_rewrite_ready: false,
+        };
+        fuel.first_rewrite_ready = tokio::time::timeout(join_bound, first_rewrite)
+            .await
+            .is_ok_and(|received| received.is_ok());
+        fuel
     }
 
     /// Stop the stream and join it.

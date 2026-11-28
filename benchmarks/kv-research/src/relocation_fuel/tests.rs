@@ -469,3 +469,48 @@ async fn the_first_rewrite_runs_inside_the_task_and_a_missed_bound_is_an_error()
         "the aborted first rewrite survived"
     );
 }
+
+/// Cancelling the caller's future *inside `start`'s readiness wait* (the run's
+/// deadline, a `select!` while the first rewrite is still in flight) drops the
+/// half-built stream, so the guard must already exist: the parked first rewrite
+/// is cancelled and no put follows.
+#[tokio::test]
+async fn cancelling_start_still_aborts_the_stream() {
+    let backend = FuelBackend::parking_from(0);
+    let starter_backend = Arc::clone(&backend);
+    // The caller of `start` is itself a task here, so aborting it drops the
+    // `start` future exactly as a cancelled `run` would.
+    let starter = tokio::spawn(async move {
+        RelocationFuel::start(
+            starter_backend,
+            request([8; 16], 1, 100, 64, 1.0, plan(1_000, 60, 300), bound()),
+        )
+        .await
+    });
+    for _ in 0..64 {
+        if backend.parked.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked.load(Ordering::Relaxed),
+        1,
+        "the first rewrite never parked"
+    );
+    let puts = backend.puts.load(Ordering::Relaxed);
+    starter.abort();
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked_dropped.load(Ordering::Relaxed),
+        1,
+        "cancelling start detached the stream"
+    );
+    assert_eq!(
+        backend.puts.load(Ordering::Relaxed),
+        puts,
+        "a rewrite started after the cancellation"
+    );
+}
