@@ -1205,20 +1205,28 @@ class CellDriver:
 
     @staticmethod
     def _log_offset(child):
-        """Bytes in the coordinator log now: the pre-kill watermark."""
+        """Bytes in the coordinator log now, or `None` when it cannot be read.
+
+        `None` is not `0`: a log that cannot be stat'ed has no watermark, and a
+        caller that must attribute later lines cannot treat it as an empty file.
+        Returning 0 here would make a later successful read scan the whole log,
+        including lines written before the freeze.
+        """
         try:
             return Path(child.log).stat().st_size
-        except (AttributeError, OSError):
-            return 0
+        except (AttributeError, OSError, TypeError):
+            return None
 
     @staticmethod
     def _log_appended(child, offset):
-        """Text the coordinator appended to its log after `offset`."""
+        """Text the coordinator appended after `offset`; no watermark, no text."""
+        if offset is None:
+            return ''
         try:
             with Path(child.log).open('rb') as stream:
                 stream.seek(offset)
                 return stream.read().decode('utf-8', 'replace')
-        except (AttributeError, OSError):
+        except (AttributeError, OSError, TypeError, ValueError):
             return ''
 
     def stop_on_terminal_failure(self, child, *, partition, log_offset, timeout=180):
@@ -2124,20 +2132,20 @@ class CellDriver:
 
     @staticmethod
     def _self_fence_window(fence_ns, *, resumed_ns, log_ns, baseline_ns=None):
-        """Bound fence -> refusal for a self-fence, which has no sample row.
+        """Upper-bound fence -> refusal for a self-fence, which has no sample row.
 
-        The refusal is observable only after the release: the writer is stopped
-        until `resumed_ns`, and the typed causal line that ends its run is part
-        of the final log write, so the log must be written **at or after** the
-        release. A log mtime before it proves nothing and is rejected: a stale
-        or truncated log must never read as a post-release refusal.
+        The typed causal line is printed by the stale writer's final log write,
+        after the release. That line dates the cause's report, not the cause:
+        the engine caches its first cause and appends it to later errors, so
+        the cause may have latched earlier. The bracket is therefore only an
+        upper bound on the refusal (`report_bound`), with no lower bound. A log
+        mtime before the release proves nothing and is rejected: a stale or
+        truncated log must never read as a post-release report.
 
         The fence instant is bracketed by the owner snapshots: `(baseline_ns,
         fence_ns]` for a contention cell, or exactly `fence_ns` for a
-        write-protect cell. The interval spans the harness pause, so it is
-        reported as such (`includes_pause`) and the post-release part is kept
-        separately (`post_release_upper_ms`); it bounds the latency, it does not
-        measure the engine's detection.
+        write-protect cell. The bound spans the harness pause (`includes_pause`);
+        the post-release part is kept separately (`post_release_upper_ms`).
         """
         if fence_ns is None or resumed_ns is None or log_ns is None:
             missing = [name for name, value in (('fence', fence_ns),
@@ -2148,20 +2156,18 @@ class CellDriver:
                           + ', '.join(missing) + ' is missing')
         if log_ns < resumed_ns:
             return None, ('the final log write precedes the release, so it cannot '
-                          'contain a post-release refusal')
+                          'contain a post-release report')
         upper_ref = fence_ns if baseline_ns is None else baseline_ns
-        lower = (resumed_ns - fence_ns) / 1e6
         upper = (log_ns - upper_ref) / 1e6
-        if lower < 0 or upper < lower:
+        if resumed_ns < fence_ns or upper < 0:
             return None, ('the self-fence bracket is inconsistent: the release or the '
                           'final log write precedes the fence')
-        return dict(lower_ms=lower, upper_ms=upper, includes_pause=True,
+        return dict(lower_ms=None, upper_ms=upper, report_bound=True,
+                    includes_pause=True,
                     post_release_upper_ms=(log_ns - resumed_ns) / 1e6,
-                    basis=('stale writer release to its final log write, bracketed '
-                           'by the owner snapshots; spans the harness pause' if
-                           baseline_ns is not None else
-                           'stale writer release to its final log write; spans the '
-                           'harness pause')), None
+                    basis=('fence to the stale writer\'s cause report (final log '
+                           'write), an upper bound on the refusal; the cause may '
+                           'have latched earlier; spans the harness pause')), None
 
     @staticmethod
     def _latency_kind(refusal_kind, wall):

@@ -899,8 +899,8 @@ class SelfFenceEvidence(unittest.TestCase):
         self.assertEqual(latency['kind'], 'coordinator-self-fence')
         self.assertEqual(latency['source'], 'self-fence')
         self.assertIsNone(latency['exact_ms'])
-        self.assertEqual(latency['window']['lower_ms'],
-                         (self.RESUMED - self.AT_FENCE) / 1e6)
+        self.assertIsNone(latency['window']['lower_ms'])
+        self.assertTrue(latency['window']['report_bound'])
         self.assertEqual(latency['window']['upper_ms'],
                          (self.LOG_WRITE - self.BASELINE) / 1e6)
         self.assertTrue(latency['window']['includes_pause'],
@@ -972,7 +972,9 @@ class SelfFenceEvidence(unittest.TestCase):
             self.AT_FENCE, resumed_ns=self.RESUMED, log_ns=self.LOG_WRITE,
             baseline_ns=self.BASELINE)
         self.assertIsNone(reason)
-        self.assertGreater(window['upper_ms'], window['lower_ms'])
+        self.assertGreater(window['upper_ms'], 0)
+        self.assertIsNone(window['lower_ms'])
+        self.assertTrue(window['report_bound'])
         self.assertTrue(window['includes_pause'])
         self.assertEqual(window['post_release_upper_ms'],
                          (self.LOG_WRITE - self.RESUMED) / 1e6)
@@ -2536,6 +2538,40 @@ class StaleFenceMeasurement(unittest.TestCase):
                                            'coordinator log')
         self.assertIn('coordinator lease lapsed', logged)
         self.assertEqual(kind, 'coordinator-self-fence')
+
+    CAUSAL = ('kv-research: measurement end boundary failed: write core requires '
+              'recovery; first causal failure: owner=Some(0) stage=live_group: '
+              'coordinator lease lapsed on owner partition 0\n')
+
+    def test_a_failed_watermark_is_not_an_empty_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'run.log'
+            driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+            child = types.SimpleNamespace(log=log)
+            offset = driver._log_offset(child)
+            self.assertIsNone(offset, 'a missing log has no watermark')
+            # The pre-freeze text becomes readable after the failed capture. A
+            # zero watermark would scan it as if it were written after the
+            # freeze; `None` must stay unattributable.
+            log.write_text(self.CAUSAL)
+            self.assertIsNone(driver._log_refusal(child, offset))
+            self.assertEqual(driver._log_appended(child, offset), '')
+            self.assertIsNone(
+                driver._log_offset(types.SimpleNamespace(log=None)))
+
+    def test_an_empty_log_at_the_freeze_keeps_its_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'run.log'
+            log.write_text('')
+            driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+            child = types.SimpleNamespace(log=log)
+            offset = driver._log_offset(child)
+            self.assertEqual(offset, 0,
+                             'an existing empty log is still a watermark')
+            with log.open('a') as stream:
+                stream.write(self.CAUSAL)
+            self.assertIn('coordinator lease lapsed',
+                          driver._log_refusal(child, offset))
 
     def test_a_success_after_a_refusal_is_a_second_writer(self):
         driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
