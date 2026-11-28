@@ -103,6 +103,12 @@ def _mix(read=0, put=0, delete=0, missing_read=0, get_many=0, put_batch=0):
     return dict(read=read, put=put, delete=delete, missing_read=missing_read,
                 get_many=get_many, put_batch=put_batch)
 
+# The post-measurement relocation phase (kv-research `phases.relocation`). The
+# fuel stream only has to keep one batch above the pass's frozen cut; at the
+# default 300 puts/s it shared the adoption lane with the pass's copy reads and
+# M9 (44.2k copy reads) missed the 240 s gate on fleet D. 20 puts/s keeps the
+# cut below the tip and leaves the lane to the copy.
+RELOCATION_FUEL = dict(puts_per_second=20)
 
 def _run(role, *, mix, value=8192, batch=2, concurrency=4, keys=KEYS,
          preload=True, verify=False, warmup=0, measurement=20_000, deadline=900,
@@ -190,7 +196,7 @@ def cells():
                  'its engine geometry because TH_* is a Sui-adapter knob',
             runs=[_run('measure', mix=_mix(put=100), value=16_384,
                        concurrency=4, measurement=32_768, deadline=1_800,
-                       relocation=True)]))
+                       relocation=RELOCATION_FUEL)]))
 
     # M13: 132 KB Synchronous batch. The covering flush is visible as
     # `leased_flush_covered_frames_total` on the coordinator's live family.
@@ -243,7 +249,7 @@ def cells():
                 note='kill -9 the owner at the observed retirement cut, restart, full audit',
                 runs=[_run('measure', mix=_mix(put=100), value=8192,
                            concurrency=4, measurement=65_536, deadline=1_200,
-                           relocation=True),
+                           relocation=RELOCATION_FUEL),
                       _verify_run(4_096)]))
         for case in FENCE_CASES:
             unit = f'S1-5S-{case}-{tier}'
