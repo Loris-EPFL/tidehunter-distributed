@@ -878,9 +878,17 @@ def verify(cell, output, *, observations=None):
         checks.append(_check('two owner WAL file rolls observed', highest >= 2,
                              dict(highest_file_id=highest, rolls=rolls)))
         checks.append(_check('no wrong value or write error', errors == 0, errors))
+        # The proof is the owner-side unlink the driver observed before it
+        # released the gate; the owner control-event count is reported only,
+        # because the retirement may travel on a session the event log does
+        # not tag with the retirement request codes.
+        retirement = observations.get('retirement') or {}
+        last = (retirement.get('observations') or [{}])[-1]
+        gone = {host: files for host, files in (last.get('gone') or {}).items() if files}
         checks.append(_check('retirement pass reached the owners',
-                             (observations.get('retire_requests') or 0) > 0,
-                             observations.get('retire_requests')))
+                             retirement.get('reached') is True and bool(gone),
+                             dict(gone=gone, note=retirement.get('note'),
+                                  retire_requests=observations.get('retire_requests'))))
 
     if cell['family'] == 'M13':
         frames = stats.get('leased_frames_total', 0.0)

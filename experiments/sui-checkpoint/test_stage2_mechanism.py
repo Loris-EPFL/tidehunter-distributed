@@ -346,15 +346,25 @@ class Verification(unittest.TestCase):
         cell = mechanism.find('M9-roll2-native')
         with tempfile.TemporaryDirectory() as directory:
             write_run(directory)
+            retired = dict(reached=True, note='owner WAL file retired by the relocation pass',
+                           observations=[dict(gone={'h1': [], 'h2': []}),
+                                         dict(gone={'h1': ['/s/epoch_1/wal_0'], 'h2': []})])
             record = mechanism.verify(cell, directory, observations=dict(
                 role='measure', owner_rolls={'h1': {'max_file_id': 3}},
-                retire_requests=4))
+                retirement=retired, retire_requests=0))
         self.assertTrue(record['ok'], record)
         with tempfile.TemporaryDirectory() as directory:
             write_run(directory)
             record = mechanism.verify(cell, directory, observations=dict(
+                role='measure', owner_rolls={'h1': {'max_file_id': 3}},
+                retirement=dict(reached=True, observations=[dict(gone={'h1': []})]),
+                retire_requests=4))
+        self.assertFalse(record['ok'])
+        with tempfile.TemporaryDirectory() as directory:
+            write_run(directory)
+            record = mechanism.verify(cell, directory, observations=dict(
                 role='measure', owner_rolls={'h1': {'max_file_id': 0}},
-                retire_requests=0))
+                retirement=retired))
         self.assertFalse(record['ok'])
 
     def test_verify_run_requires_reopen_and_a_clean_audit(self):
