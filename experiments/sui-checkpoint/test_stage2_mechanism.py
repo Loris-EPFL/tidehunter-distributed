@@ -20,14 +20,15 @@ def write_run(directory, *, status='completed', completed=1000, errors=0,
               phase_counts=None, distributions=None, role='measure',
               read_rpc=10, open_kind='create', recovery=None, live=None,
               max_pending_read_bytes=64 << 20, flight_metadata_bytes=6_408_864,
-              device_reads=None, measurement=True):
+              device_reads=None, measurement=True, key_bytes=32):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'summary.json').write_text(json.dumps(dict(
         status=status, durability={}, started_unix_seconds=0.0,
         finished_unix_seconds=1.0, execution={},
-        backend={'configuration': {'client': {
-            'max_pending_read_bytes': max_pending_read_bytes}}},
+        backend={'configuration': {
+            'client': {'max_pending_read_bytes': max_pending_read_bytes},
+            'key_bytes': key_bytes}},
         phase_counts=phase_counts or {'realized_mix': {}},
         distributions=distributions or {}, limitations=[])))
     (directory / 'manifest.json').write_text(json.dumps(dict(
@@ -229,7 +230,7 @@ class Verification(unittest.TestCase):
             return cell, mechanism.verify(cell, directory)
 
     def test_m6_reports_latency_and_owner_reads(self):
-        # 26 keys x 16 concurrent x 25,867 B per member fits the 60.7 MB credit,
+        # 26 keys x 16 concurrent x 25,999 B per member fits the 60.7 MB credit,
         # so two owners give exactly two RPCs per call and the bound is asserted.
         cell, record = self._m6_run('M6-w26-c16', calls=20_000,
                                     read_rpc=40_000, device_reads=520_000)
@@ -245,7 +246,7 @@ class Verification(unittest.TestCase):
         self.assertTrue(checks['native contention counter is not claimed']['ok'])
 
     def test_m6_page256_wave_over_credit_is_not_applicable(self):
-        # 256 keys x 16 concurrent x 25,867 B = 105.9 MB is 1.75x the 60.7 MB
+        # 256 keys x 16 concurrent x 25,999 B = 106.5 MB is 1.75x the 60.7 MB
         # credit, so the dispatch splits each owner group and 92,017 RPCs for
         # 20,000 calls is not a violation of the per-owner statement.
         cell, record = self._m6_run(
@@ -255,11 +256,11 @@ class Verification(unittest.TestCase):
         rpc = checks['owner read RPCs per call at most one per owner']
         self.assertTrue(rpc['ok'], rpc)
         self.assertTrue(rpc['detail']['not_applicable'], rpc)
-        self.assertEqual(rpc['detail']['per_call'] if 'per_call' in rpc['detail'] else
-                         rpc['detail']['read_rpc_count'] / rpc['detail']['calls'], 4.60085)
-        self.assertGreater(rpc['detail']['wave_ratio'], 1.7)
-        self.assertLess(rpc['detail']['wave_ratio'], 1.8)
-        self.assertEqual(rpc['detail']['member_charge_bytes'], 25_867)
+        self.assertEqual(rpc['detail']['per_call'], 4.60085)
+        self.assertGreater(rpc['detail']['wave_ratio'], 1.75)
+        self.assertLess(rpc['detail']['wave_ratio'], 1.76)
+        self.assertEqual(rpc['detail']['member_frame_bytes'], 8_236)
+        self.assertEqual(rpc['detail']['member_charge_bytes'], 25_999)
         self.assertEqual(rpc['detail']['credit_bytes'], 60_700_000)
         self.assertTrue(checks['device reads per measured key at most 1.05']['ok'],
                         checks)

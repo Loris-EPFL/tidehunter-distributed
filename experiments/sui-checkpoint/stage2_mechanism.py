@@ -47,6 +47,9 @@ OWNERS = 2
 # bookkeeping, the BatchSignal Arc and vector growth). A read wave fits the
 # pending-read byte credit only when every member can be admitted at once.
 MEMBER_CHARGE_FIXED_BYTES = 523
+# `codec.rs` member layout: 8-byte member header, 4-byte native Put header.
+MEMBER_HEADER_BYTES = 8
+PUT_NATIVE_HEADER_BYTES = 4
 DEVICE_READS_PER_KEY_LIMIT = 1.05
 TIERS = ('native', 'synchronous')
 UNIFORM = 'uniform'
@@ -466,14 +469,21 @@ def measurement_evidence(output):
                     'read_singleflight_metadata_bytes'))
 
 
-def member_charge(value_frame_bytes):
-    """The engine's per-member pending-read charge for one value frame.
+def member_charge(frame_bytes):
+    """The engine's per-member pending-read charge for one encoded member frame.
 
-    Mirrors `member_charge` in `remote_db/pending_read.rs`: the frame length is
-    the only variable part, and `MEMBER_CHARGE_FIXED_BYTES` is the fixed
+    Mirrors `member_charge` in `remote_db/pending_read.rs`, which charges
+    `position.address.len`. That length is what `codec.rs` `describe_mutation`
+    builds for a Put: the 8-byte member header, the 4-byte native Put header,
+    the key and the value. `MEMBER_CHARGE_FIXED_BYTES` is the fixed
     VersionPosition, HashMap-bucket, BatchSignal and vector-growth cost.
     """
-    return 3 * (value_frame_bytes + 256) + MEMBER_CHARGE_FIXED_BYTES
+    return 3 * (frame_bytes + 256) + MEMBER_CHARGE_FIXED_BYTES
+
+
+def member_frame_bytes(value_bytes, key_bytes):
+    """The encoded member length `pending_read.rs` charges (`describe_mutation`)."""
+    return MEMBER_HEADER_BYTES + PUT_NATIVE_HEADER_BYTES + key_bytes + value_bytes
 
 
 def _number(value):
@@ -486,6 +496,14 @@ def _configured_max_pending_read_bytes(output):
     configuration = backend.get('configuration') or {}
     client = configuration.get('client') or {}
     value = _number(client.get('max_pending_read_bytes'))
+    return int(value) if value is not None else None
+
+
+def _configured_key_bytes(output):
+    """The run's synthetic key width, part of the encoded member frame."""
+    backend = _summary(output).get('backend') or {}
+    configuration = backend.get('configuration') or {}
+    value = _number(configuration.get('key_bytes'))
     return int(value) if value is not None else None
 
 
@@ -750,35 +768,42 @@ def verify(cell, output, *, observations=None):
         # `member_charge` prices each member; `dispatch_traced` cuts an owner
         # group at `max_bytes = max_pending_read_bytes - flight_metadata_bytes`,
         # so a larger wave is split into several RPCs per owner.
-        charge = member_charge(run['value'])
-        wave_bytes = keys_per_call * charge * run['concurrency']
+        key_bytes = _configured_key_bytes(output)
+        frame_bytes = (member_frame_bytes(run['value'], key_bytes)
+                       if key_bytes is not None else None)
+        charge = member_charge(frame_bytes) if frame_bytes is not None else None
+        wave_bytes = (keys_per_call * charge * run['concurrency']
+                      if charge is not None else None)
         max_pending = _configured_max_pending_read_bytes(output)
         flight = _number(read['flight_metadata_bytes'])
         credit = None
         if max_pending is not None and flight is not None:
             credit = max_pending - int(flight)
-        wave_ratio = (wave_bytes / credit) if credit is not None and credit > 0 else None
+        wave_ratio = (wave_bytes / credit
+                      if wave_bytes is not None and credit is not None and credit > 0
+                      else None)
         detail = dict(read_rpc_count=rpc, calls=calls, owners=OWNERS,
                       keys_per_call=keys_per_call,
                       concurrency=run['concurrency'],
+                      key_bytes=key_bytes, member_frame_bytes=frame_bytes,
                       member_charge_bytes=charge, wave_bytes=wave_bytes,
                       max_pending_read_bytes=max_pending,
                       flight_metadata_bytes=flight, credit_bytes=credit,
-                      wave_ratio=wave_ratio, source=read['source'])
+                      wave_ratio=wave_ratio, source=read['source'],
+                      per_call=(rpc / calls if rpc is not None and calls else None))
         if rpc is None or not calls:
             detail.update(not_applicable=True,
                           reason='no measurement-window read_rpc_count delta')
             checks.append(_check('owner read RPCs per call at most one per owner',
                                  True, detail))
-        elif credit is None or credit <= 0:
+        elif charge is None or credit is None or credit <= 0:
             detail.update(not_applicable=True,
                           reason='pending-read credit is not measurable '
-                                 '(configured max or read_singleflight_metadata_bytes '
-                                 'gauge missing)')
+                                 '(configured max, key width or '
+                                 'read_singleflight_metadata_bytes gauge missing)')
             checks.append(_check('owner read RPCs per call at most one per owner',
                                  True, detail))
         elif wave_bytes <= credit:
-            detail['per_call'] = rpc / calls
             checks.append(_check('owner read RPCs per call at most one per owner',
                                  rpc / calls <= OWNERS, detail))
         else:
