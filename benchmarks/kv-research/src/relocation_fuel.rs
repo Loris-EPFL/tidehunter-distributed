@@ -35,11 +35,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// One running stream: its stop flag, its joined task, and the request instant.
+/// One running stream: its stop flag, its joined task, and its plan.
 pub struct RelocationFuel {
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<FuelCounts>,
-    requested: Instant,
     plan: RelocationFuelConfig,
 }
 
@@ -66,7 +65,6 @@ impl RelocationFuel {
         entropy: f64,
         plan: RelocationFuelConfig,
     ) -> Self {
-        let requested = Instant::now();
         let mut counts = FuelCounts::default();
         rewrite(
             backend.as_ref(),
@@ -134,22 +132,20 @@ impl RelocationFuel {
             }
             counts
         });
-        Self {
-            stop,
-            task,
-            requested,
-            plan,
-        }
+        Self { stop, task, plan }
     }
 
     /// Stop the stream and join it. `grace` bounds the join: one call already in
     /// flight can hold the task until the backend's own timeout, and a stuck one
     /// is aborted rather than delaying the run.
-    pub async fn finish(self, grace: Duration) -> serde_json::Value {
+    ///
+    /// `request_to_release` is measured by the caller between `start_relocation`
+    /// and the completion gate's return, never by this task: the join can wait on
+    /// one slow put, and this stream's start is one rewrite before the request.
+    pub async fn finish(self, grace: Duration, request_to_release: Duration) -> serde_json::Value {
         let Self {
             stop,
             mut task,
-            requested,
             plan,
         } = self;
         stop.store(true, Ordering::Relaxed);
@@ -178,7 +174,7 @@ impl RelocationFuel {
             "requests": counts.requests,
             "errors": counts.errors,
             "first_error": counts.first_error,
-            "seconds_request_to_release": requested.elapsed().as_secs_f64(),
+            "seconds_request_to_release": request_to_release.as_secs_f64(),
             "joined": joined,
             "purpose": "rewrites dataset keys with their deterministic payloads so the \
                         relocation pass finds a batch above its frozen scan cut and the \

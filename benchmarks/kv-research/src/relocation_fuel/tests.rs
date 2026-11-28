@@ -112,9 +112,13 @@ async fn the_first_rewrite_lands_before_the_request_and_the_rate_is_bounded() {
     .await;
     assert!(backend.puts.load(Ordering::Relaxed) >= 1);
     tokio::time::sleep(Duration::from_millis(220)).await;
-    let record = fuel.finish(Duration::from_secs(2)).await;
+    let request_to_release = Duration::from_millis(220);
+    let record = fuel
+        .finish(Duration::from_secs(2), request_to_release)
+        .await;
     let puts = record["puts"].as_u64().unwrap();
     let seconds = record["seconds_request_to_release"].as_f64().unwrap();
+    assert!((seconds - 0.220).abs() < 1e-9, "{record}");
     assert!(record["joined"].as_bool().unwrap(), "{record}");
     assert_eq!(record["errors"].as_u64(), Some(0), "{record}");
     assert_eq!(record["puts_per_second"].as_u64(), Some(50), "{record}");
@@ -149,10 +153,13 @@ async fn the_wall_clock_bound_ends_the_stream_without_a_stop() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(1_400)).await;
-    let record = fuel.finish(Duration::from_millis(200)).await;
+    let record = fuel
+        .finish(Duration::from_millis(200), Duration::from_secs(1))
+        .await;
     assert!(record["joined"].as_bool().unwrap(), "{record}");
-    assert!(
-        record["seconds_request_to_release"].as_f64().unwrap() >= 1.0,
+    assert_eq!(
+        record["seconds_request_to_release"].as_f64(),
+        Some(1.0),
         "{record}"
     );
     assert!(record["puts"].as_u64().unwrap() <= 1_003, "{record}");
@@ -174,7 +181,9 @@ async fn failed_rewrites_are_counted_and_never_fail_the_run() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let record = fuel.finish(Duration::from_secs(2)).await;
+    let record = fuel
+        .finish(Duration::from_secs(2), Duration::from_millis(80))
+        .await;
     assert!(record["joined"].as_bool().unwrap(), "{record}");
     assert_eq!(record["puts"].as_u64(), Some(1), "{record}");
     assert!(record["errors"].as_u64().unwrap() >= 1, "{record}");
@@ -208,9 +217,16 @@ async fn the_pass_is_re_requested_at_the_period_and_stops_at_release() {
     tokio::time::sleep(Duration::from_millis(1_250)).await;
     let re_requests = backend.relocation_requests.load(Ordering::Relaxed);
     assert!(re_requests >= 1, "no re-request within one period");
-    let record = fuel.finish(Duration::from_secs(2)).await;
+    let record = fuel
+        .finish(Duration::from_secs(2), Duration::from_millis(1_250))
+        .await;
     assert!(record["joined"].as_bool().unwrap(), "{record}");
     assert_eq!(record["requests"].as_u64(), Some(re_requests), "{record}");
+    assert_eq!(
+        record["seconds_request_to_release"].as_f64(),
+        Some(1.25),
+        "{record}"
+    );
     assert_eq!(record["retry_seconds"].as_u64(), Some(1), "{record}");
     tokio::time::sleep(Duration::from_millis(1_250)).await;
     assert_eq!(

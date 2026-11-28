@@ -167,6 +167,7 @@ pub async fn run<B: KvBackend>(
     let mut measurement_drained = false;
     let mut relocation_requested = false;
     let mut relocation_fuel: Option<crate::relocation_fuel::RelocationFuel> = None;
+    let mut relocation_requested_at: Option<Instant> = None;
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -352,6 +353,7 @@ pub async fn run<B: KvBackend>(
                         .await,
                     );
                 }
+                relocation_requested_at = Some(Instant::now());
                 match backend.start_relocation() {
                     Ok(()) => relocation_requested = true,
                     Err(error) => {
@@ -463,10 +465,21 @@ pub async fn run<B: KvBackend>(
     // pass's cut behind the tip and allocates past the file the pass retires.
     // Its failed puts after an owner kill are counts, never this run's failure.
     let relocation_fuel = match relocation_fuel {
-        Some(fuel) => Some(
-            fuel.finish(Duration::from_secs(config.limits.shutdown_grace_seconds))
+        Some(fuel) => {
+            // The gate return, not the join: a slow put must not stretch the
+            // request-to-release interval this record reports.
+            let released = Instant::now();
+            let request_to_release = relocation_requested_at.map_or(Duration::ZERO, |requested| {
+                released.saturating_duration_since(requested)
+            });
+            Some(
+                fuel.finish(
+                    Duration::from_secs(config.limits.shutdown_grace_seconds),
+                    request_to_release,
+                )
                 .await,
-        ),
+            )
+        }
         None => None,
     };
     let mut write_wait_metrics_exported = false;
