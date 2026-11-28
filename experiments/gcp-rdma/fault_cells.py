@@ -2039,9 +2039,13 @@ class CellDriver:
         proves nothing. A `coordinator-self-fence` is emitted before the frame
         is encoded, so it has no row and no order to read: its proof is the
         owner side (a new generation and a rewritten ledger on every owner, no
-        growth of the stale generation) plus no stale success after the fence
-        instant on the stale writer's own clock, with acknowledged rows > 0.
-        Every missing part fails closed and is named.
+        growth of the stale generation), with acknowledged rows > 0 and the
+        stale writer's row clock present. Successes that complete after the
+        fence instant are reported, not convicted, as in the owner-row path:
+        a frame sent before the freeze can be acknowledged after the resume,
+        and any write the owner accepted after the fence grows the stale
+        generation, which the owner proof convicts. Every missing part fails
+        closed and is named.
         """
         acknowledged_rows = sum(
             1 for row in cls._measurement_rows(rows_) if row.get('outcome') == 'success')
@@ -2072,23 +2076,27 @@ class CellDriver:
         elif stale_after is None:
             proof['reason'] = ('the stale writer\'s row clock is missing, so no success '
                                'after the fence instant can be ruled out')
-        elif stale_after:
-            proof['reason'] = (f'{stale_after} stale-writer write(s) completed after '
-                               'the fence instant')
-        elif not owner.get('evidence_available'):
-            proof['reason'] = ('the self-fence has no owner-side evidence: no new '
-                               'generation or write-protect marker was captured')
-        elif not owner.get('fence_counters_increased'):
-            proof['reason'] = (owner.get('reason')
-                               or 'the owners published no fence before the self-fence')
-        elif not owner.get('no_stale_growth'):
-            proof['reason'] = (owner.get('reason')
-                               or 'the stale generation\'s WAL gained files or bytes')
-        elif owner.get('reason'):
-            proof['reason'] = owner['reason']
         else:
-            proof['clean'] = True
+            if stale_after:
+                proof['completions_after_fence_reported'] = stale_after
+            proof.update(cls._self_fence_owner_verdict(owner))
         return proof
+
+    @staticmethod
+    def _self_fence_owner_verdict(owner):
+        """The owner-side half of a self-fence proof, failing closed."""
+        if not owner.get('evidence_available'):
+            return dict(reason='the self-fence has no owner-side evidence: no new '
+                               'generation or write-protect marker was captured')
+        if not owner.get('fence_counters_increased'):
+            return dict(reason=owner.get('reason')
+                        or 'the owners published no fence before the self-fence')
+        if not owner.get('no_stale_growth'):
+            return dict(reason=owner.get('reason')
+                        or 'the stale generation\'s WAL gained files or bytes')
+        if owner.get('reason'):
+            return dict(reason=owner['reason'])
+        return dict(clean=True)
 
     @classmethod
     def _refusal_kind(cls, child, rows_, refusal, source):
@@ -2368,9 +2376,17 @@ class CellDriver:
             result['sealed_read_ok'] = code == 0 and manifest['errors_or_wrong_values'] == 0
         finally:
             reader.stop()
-        result['sealed_write_refused'] = result.get('stale_write_refused', False)
+        result['sealed_write_refused'] = self._sealed_write_refused(result)
         result['sealed_write_text'] = result.get('refusal_text')
         return result
+
+    @staticmethod
+    def _sealed_write_refused(result):
+        """A sealed generation refused the stale writer: an owner refusal row,
+        or a typed coordinator self-fence, which refuses before encoding and so
+        leaves no row."""
+        return bool(result.get('stale_write_refused')
+                    or result.get('refusal_kind') == 'coordinator-self-fence')
 
     @staticmethod
     def typed(text):

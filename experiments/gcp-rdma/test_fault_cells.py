@@ -928,18 +928,16 @@ class SelfFenceEvidence(unittest.TestCase):
         self.assertIn('gained files or bytes',
                       named['exclusive writes are proven']['detail']['reason'])
 
-    def test_a_self_fence_with_a_stale_success_after_the_fence_fails(self):
+    def test_a_self_fence_reports_completions_after_the_fence_without_conviction(self):
+        # A frame sent before the freeze can be acknowledged after the resume;
+        # the owner proof (no stale growth) convicts a write accepted after it.
         proof = self.proof(stale_after=2)
-        self.assertFalse(proof['clean'])
-        self.assertIn('2 stale-writer write(s)', proof['reason'])
-        record = self.record(self.fence(proof=proof, window=None,
-                                        reason='not measured'))
-        self.assertFalse(record['ok'])
-        named = {check['check']: check for check in record['checks']}
-        self.assertFalse(named['no stale-writer write completed after the fence']['ok'])
-        self.assertIn('2 stale-writer',
-                      named['no stale-writer write completed after the fence'][
-                          'detail']['reason'])
+        self.assertTrue(proof['clean'], proof)
+        self.assertEqual(proof['completions_after_fence_reported'], 2)
+        grown = self.proof(stale_after=2, no_stale_growth=False,
+                           reason='the stale generation\'s WAL gained files or bytes')
+        self.assertFalse(grown['clean'])
+        self.assertIn('gained files or bytes', grown['reason'])
 
     def test_a_self_fence_without_the_owner_proof_fails_closed(self):
         for kwargs in (dict(evidence_available=False),
@@ -1868,6 +1866,13 @@ owner_fence=dict(evidence_available=True, fence_counters_increased=True,
                                    fence_reject_ms=3.0,
                                    write_protect_apply_ms=900.0))
         self.assertFalse(record['ok'])
+
+    def test_a_sealed_self_fence_counts_as_a_refused_write(self):
+        refused = fault_cells.CellDriver._sealed_write_refused
+        self.assertTrue(refused(dict(stale_write_refused=False,
+                                     refusal_kind='coordinator-self-fence')))
+        self.assertTrue(refused(dict(stale_write_refused=True, refusal_kind='owner-row')))
+        self.assertFalse(refused(dict(stale_write_refused=False, refusal_kind=None)))
 
 
 class DryRun(unittest.TestCase):
