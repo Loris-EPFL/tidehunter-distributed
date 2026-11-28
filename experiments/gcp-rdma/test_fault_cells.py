@@ -1822,6 +1822,37 @@ class CrashChecks(unittest.TestCase):
             self.assertIsNone(hung['exit_code'])
             self.assertIn('did not exit', hung['reason'])
 
+    def test_every_relocator_cause_names_its_partition(self):
+        texts = {
+            'relocation page of partition 0 generation 1 failed: TLS session truncated': 0,
+            'relocation session to partition 1 failed: refused': 1,
+            'retirement request to partition 0 failed: refused': 0,
+            'retirement list of partition 1 generation 2 failed: eof': 1,
+            'sealed retirement of partition 0 generation 3 failed: eof': 0,
+            'retirement session to partition 1 failed: eof': 1,
+        }
+        for text, partition in texts.items():
+            with self.subTest(text=text):
+                self.assertEqual(
+                    {int(m) for m in fault_cells.RELOCATOR_CAUSE.findall(text)},
+                    {partition})
+        # The fleet D attempt: the relocator's page fetch from the killed owner.
+        attempt = ('kv-research: post-workload qualification failed: qualification put: '
+                   'Tidehunter error: Io(Custom { kind: Other, error: "write core '
+                   'requires recovery; first causal failure: owner=None batch=None '
+                   'stage=write_core: relocation page of partition 0 generation 1 '
+                   'failed: TLS session truncated: peer closed the connection without '
+                   'close_notify" })')
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'run.log'
+            log.write_text(attempt + '\n')
+            driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+            child = types.SimpleNamespace(log=log, wait=lambda timeout: 1)
+            record = driver.stop_on_terminal_failure(child, partition=0, log_offset=0)
+            self.assertTrue(record['typed'], record)
+            other = driver.stop_on_terminal_failure(child, partition=1, log_offset=0)
+            self.assertFalse(other['typed'], other)
+
 
 class FenceVerdict(unittest.TestCase):
     def records(self, fence):

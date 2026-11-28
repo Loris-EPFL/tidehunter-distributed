@@ -62,6 +62,12 @@ import stage3_specs
 BINARY = 'storage-node'
 OWNER_READY_SECONDS = 180
 GATE_TIMEOUT_SECONDS = 600
+# Relocator causes that name the owner partition they reached (relocation.rs,
+# dead_wal_files.rs); group 1 is the partition.
+RELOCATOR_CAUSE = re.compile(
+    r'(?:relocation session to|relocation page of|retirement session to|'
+    r'retirement request to|retirement list of|sealed retirement of) '
+    r'partition (\d+)\b[^:]*? failed')
 # The coordinator declares its own close bound as `shutdown_grace_seconds` in
 # the RunConfig this driver writes, so its stop allowance is the same constant.
 COORDINATOR_STOP_GRACE_SECONDS = stage3_specs.SHUTDOWN_GRACE_SECONDS
@@ -1238,19 +1244,22 @@ class CellDriver:
         owner, and the run ends with the typed first-failure record in
         `run.log`. The relocator's own failure poisons the write core through
         `begin_failure` with no partition (`owner=None ... stage=write_core`)
-        and names the partition in its cause (`dead_wal_files.rs`
-        "retirement request to partition N failed" or "sealed retirement of
-        partition N generation G failed"); a per-owner worker records
-        `owner=Some(N)`. Either names the killed owner; another partition does
-        not. Only the bytes appended after the pre-signal watermark count, so
-        a line written before the kill cannot satisfy the check.
+        and names the partition in its cause: `relocation.rs` "relocation
+        session to partition N failed" / "relocation page of partition N
+        generation G failed", `dead_wal_files.rs` "retirement session to
+        partition N failed" / "retirement request to partition N failed" /
+        "retirement list of partition N generation G failed" / "sealed
+        retirement of partition N generation G failed". A per-owner worker
+        records `owner=Some(N)`. Either names the killed owner; another
+        partition does not. Only the bytes appended after the pre-signal
+        watermark count, so a line written before the kill cannot satisfy the
+        check.
         """
         code = child.wait(timeout)
         text = self._log_appended(child, log_offset).strip()
         owner = f'owner=Some({partition})'
-        retired = ('stage=write_core' in text and (
-            f'retirement request to partition {partition} failed' in text
-            or f'sealed retirement of partition {partition} generation' in text))
+        named = {int(match) for match in RELOCATOR_CAUSE.findall(text)}
+        retired = 'stage=write_core' in text and partition in named
         typed = (partition is not None and 'first causal failure' in text
                  and (owner in text or retired))
         record = dict(exit_code=code, partition=partition,
