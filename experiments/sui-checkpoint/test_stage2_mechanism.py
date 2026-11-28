@@ -347,6 +347,21 @@ class Verification(unittest.TestCase):
         self.assertTrue(checks['full dataset verified, no torn value'])
         self.assertTrue(checks['coordinator was killed, not shut down'])
 
+    def test_the_owner_restart_verdict_leaves_the_failure_to_the_crash_part(self):
+        """The verify run cannot carry the crash evidence, so it must not ask."""
+        cell = mechanism.find('S1-3S-owner-native')
+        with tempfile.TemporaryDirectory() as directory:
+            write_run(directory, open_kind='reopen')
+            record = mechanism.verify(cell, directory, observations=dict(
+                role='verify', gate=dict(reached=True, label='200 acknowledged writes'),
+                kill=dict(pids=[18130]),
+                restart=dict(previous=[18130], current=[18175])))
+        names = [check['check'] for check in record['checks']]
+        self.assertTrue(record['ok'], record)
+        self.assertNotIn('coordinator recorded a typed write failure', names)
+        self.assertIn('owner was killed with SIGKILL', names)
+        self.assertIn('coordinator reopened the existing database', names)
+
     def test_wrong_value_fails_the_audit(self):
         cell = mechanism.find('S1-3S-owner-native')
         with tempfile.TemporaryDirectory() as directory:

@@ -738,15 +738,40 @@ class CrashChecks(unittest.TestCase):
         self.assertFalse(all(check['ok'] for check in checks))
 
     def test_an_owner_kill_needs_the_typed_failure(self):
-        cell = fault_cells.mechanism.find('S1-6S-unlink-native')
-        checks = fault_cells.crash_checks(cell, dict(
-            gate=dict(reached=True, cut='unlink', note='after the unlink'),
-            kill=dict(pids=[10]),
-            failure=dict(gate=dict(reached=True, errors=1))))
-        self.assertTrue(all(check['ok'] for check in checks), checks)
+        cell = fault_cells.mechanism.find('S1-3S-owner-native')
+        text = ('Tidehunter error: Io(Custom { kind: Other, error: "write core requires '
+                'recovery; first causal failure: owner=Some(0) batch=Some(BatchVersion { '
+                'epoch: 1, sequence: 140261 }) stage=live_resume: Connection refused '
+                '(os error 111)" })')
+        # Attempt-3 shape: `wait_for` returns the reached observation inside
+        # `observations`, so the count and the typed text live there, not on the
+        # gate. The measure part is the one that carries `failure`.
+        reached = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, label='200 acknowledged writes'),
+            kill=dict(pids=[18130]),
+            failure=dict(exit_code=1, refusal=text, gate=dict(
+                reached=True, seconds=4.05, label='1 typed write refusal',
+                observations=[dict(reached=True, refusals=925_283, text=text,
+                                   unix_ns=1_795_837_610_224_438_148)]))))
+        checks = {check['check']: check for check in reached}
+        self.assertTrue(all(check['ok'] for check in reached), reached)
+        detail = checks['coordinator recorded a typed write failure']['detail']
+        self.assertEqual(detail['refusals'], 925_283)
+        self.assertIn('stage=live_resume', detail['text'])
+        self.assertEqual(detail['unix_ns'], 1_795_837_610_224_438_148)
+
+        # A non-success row without an error class is not a typed failure.
+        untyped = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, label='200 acknowledged writes'),
+            kill=dict(pids=[18130]),
+            failure=dict(gate=dict(reached=True, observations=[
+                dict(reached=True, refusals=1, text=None)]))))
+        self.assertFalse(all(check['ok'] for check in untyped), untyped)
+
         missing = fault_cells.crash_checks(cell, dict(
-            gate=dict(reached=True, cut='unlink'), kill=dict(pids=[10]),
-            failure=dict(gate=dict(reached=False, errors=0))))
+            gate=dict(reached=True, label='200 acknowledged writes'),
+            kill=dict(pids=[18130]),
+            failure=dict(gate=dict(reached=False))))
         self.assertFalse(all(check['ok'] for check in missing))
 
 

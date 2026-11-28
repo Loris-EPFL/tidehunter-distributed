@@ -1858,10 +1858,15 @@ def crash_checks(cell, observations):
                                        'still_alive' not in kill,
                                        kill.get('pids')))
         found = failure.get('gate') or {}
+        # `wait_for` returns the reached observation inside `observations`;
+        # the gate itself carries no `refusals`/`text`. The refusal must name
+        # an error class: a bare non-success row is not a typed failure.
+        last = (found.get('observations') or [{}])[-1]
+        text = last.get('text') or failure.get('refusal')
         checks.append(mechanism._check('coordinator recorded a typed write failure',
-                                       found.get('reached') is True,
-                                       dict(refusals=found.get('refusals'),
-                                            text=found.get('text'))))
+                                       found.get('reached') is True and bool(text),
+                                       dict(refusals=last.get('refusals'),
+                                            text=text, unix_ns=last.get('unix_ns'))))
     return checks
 
 

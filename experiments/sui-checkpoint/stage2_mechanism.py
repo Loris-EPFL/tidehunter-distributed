@@ -931,10 +931,6 @@ def verify(cell, output, *, observations=None):
         checks.append(_check('owner was killed with SIGKILL',
                              bool(kill.get('pids')) and 'still_alive' not in kill,
                              kill.get('pids')))
-        failure = observations.get('failure') or {}
-        found = failure.get('gate') or {}
-        checks.append(_check('coordinator recorded a typed write failure',
-                             found.get('reached') is True, found.get('errors')))
 
     return dict(cell=cell['id'], role=role, tier=cell['tier'], synthetic=True,
                 ok=all(check['ok'] for check in checks), checks=checks,
