@@ -1,0 +1,185 @@
+//! Bounded post-measurement write stream for the relocation pass.
+//!
+//! A requested pass freezes its scan cut `Q = min(Version B durable, index
+//! applied, held latch)` and derives its terminal from an observed
+//! `StopRelocation` or from the first scanned batch at or above `Q`
+//! (`remote_db/relocation.rs` `stream_reports`). A measurement that drained
+//! leaves `Q` at the published tip, so a keyspace without a relocation filter
+//! reaches `EndOfWal`, reports `NoWork`, adopts no callback start and retires
+//! nothing. Relocation is requested after the measurement boundary, when the
+//! closed loop has stopped, so the cell has to keep a small stream of writes in
+//! flight for the pass to find a batch above `Q`.
+//!
+//! The stream rewrites existing dataset keys with their deterministic payloads,
+//! so a post-restart audit compares the same bytes it expects. The appends also
+//! allocate past the whole-file target the pass derives: a committed retirement
+//! whose victim still ends at the allocator detaches nothing until the next
+//! allocation (`storage/file_retirement.rs`), so this stream is also what keeps
+//! the same pass able to unlink instead of leaving `cleanup_pending` behind.
+//!
+//! Bounded: one task, a fixed period, a wall-clock bound, and a stop flag set
+//! when the completion gate is released or times out. A failed put is expected
+//! after the driver kills an owner on a retirement cell; it is counted and
+//! never fails the run, because the coordinator's own typed terminal failure is
+//! the cell's evidence.
+
+use crate::backend::KvBackend;
+use crate::config::RelocationFuelConfig;
+use crate::workload::{key_bytes, value_bytes};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// One running stream: its stop flag, its joined task, and the request instant.
+pub struct RelocationFuel {
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<FuelCounts>,
+    requested: Instant,
+    plan: RelocationFuelConfig,
+}
+
+/// Counts of the stream. Errors after an owner kill are expected evidence.
+#[derive(Default)]
+struct FuelCounts {
+    puts: u64,
+    errors: u64,
+    first_error: Option<String>,
+}
+
+impl RelocationFuel {
+    /// Start the stream. The first rewrite completes before this returns: the
+    /// pass freezes `Q` as soon as its worker picks the request up, and only an
+    /// appended batch is visible to the scan at or above that cut.
+    pub async fn start<B: KvBackend>(
+        backend: Arc<B>,
+        namespace: [u8; 16],
+        seed: u64,
+        keys: u64,
+        value_size: usize,
+        entropy: f64,
+        plan: RelocationFuelConfig,
+    ) -> Self {
+        let requested = Instant::now();
+        let mut counts = FuelCounts::default();
+        rewrite(
+            backend.as_ref(),
+            &namespace,
+            seed,
+            0,
+            value_size,
+            entropy,
+            &mut counts,
+        )
+        .await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let period = period(plan);
+        let until = Instant::now() + Duration::from_secs(u64::from(plan.max_seconds));
+        let task = tokio::spawn(async move {
+            let mut cursor = 1_u64;
+            let mut next = Instant::now() + period;
+            while !flag.load(Ordering::Relaxed) && Instant::now() < until {
+                let id = cursor % keys.max(1);
+                cursor = cursor.wrapping_add(1);
+                rewrite(
+                    backend.as_ref(),
+                    &namespace,
+                    seed,
+                    id,
+                    value_size,
+                    entropy,
+                    &mut counts,
+                )
+                .await;
+                // Fixed period: a slow call is not followed by a burst that
+                // catches up, so the rate never exceeds `puts_per_second`.
+                let now = Instant::now();
+                if next > now {
+                    tokio::time::sleep_until(next).await;
+                } else {
+                    next = now;
+                }
+                next += period;
+            }
+            counts
+        });
+        Self {
+            stop,
+            task,
+            requested,
+            plan,
+        }
+    }
+
+    /// Stop the stream and join it. `grace` bounds the join: one call already in
+    /// flight can hold the task until the backend's own timeout, and a stuck one
+    /// is aborted rather than delaying the run.
+    pub async fn finish(self, grace: Duration) -> serde_json::Value {
+        let Self {
+            stop,
+            mut task,
+            requested,
+            plan,
+        } = self;
+        stop.store(true, Ordering::Relaxed);
+        let mut joined = true;
+        let counts = match tokio::time::timeout(grace, &mut task).await {
+            Ok(Ok(counts)) => counts,
+            Ok(Err(error)) => {
+                joined = false;
+                FuelCounts {
+                    first_error: Some(format!("fuel task failed: {error}")),
+                    ..FuelCounts::default()
+                }
+            }
+            Err(_) => {
+                task.abort();
+                joined = false;
+                FuelCounts::default()
+            }
+        };
+        serde_json::json!({
+            "requested": true,
+            "puts_per_second": plan.puts_per_second,
+            "max_seconds": plan.max_seconds,
+            "puts": counts.puts,
+            "errors": counts.errors,
+            "first_error": counts.first_error,
+            "seconds_request_to_release": requested.elapsed().as_secs_f64(),
+            "joined": joined,
+            "purpose": "rewrites dataset keys with their deterministic payloads so the \
+                        relocation pass finds a batch above its frozen scan cut and the \
+                        owner can detach the file it retires",
+        })
+    }
+}
+
+fn period(plan: RelocationFuelConfig) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(plan.puts_per_second.max(1)))
+}
+
+async fn rewrite<B: KvBackend>(
+    backend: &B,
+    namespace: &[u8; 16],
+    seed: u64,
+    id: u64,
+    value_size: usize,
+    entropy: f64,
+    counts: &mut FuelCounts,
+) {
+    let key = key_bytes(namespace, seed, id);
+    let value = value_bytes(namespace, seed, id, value_size, entropy);
+    match backend.put(key, value).await {
+        Ok(()) => counts.puts = counts.puts.saturating_add(1),
+        Err(error) => {
+            counts.errors = counts.errors.saturating_add(1);
+            if counts.first_error.is_none() {
+                counts.first_error = Some(error.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

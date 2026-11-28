@@ -191,10 +191,93 @@ pub struct PhaseConfig {
     /// Request one relocation pass after the measurement boundary and before
     /// the completion gate. The worker publishes no non-test completion
     /// signal, so the gate is the bound and the driver releases it only after
-    /// it observes the owner-side retirement.
+    /// it observes the owner-side retirement. `true` uses the default fuel
+    /// stream; an object sets its rate and bound. See [`RelocationPhase`].
     #[serde(default)]
-    pub relocation: bool,
+    pub relocation: RelocationPhase,
 }
+
+/// Post-measurement relocation request and its fuel stream.
+///
+/// The pass freezes its scan cut at `min(Version B durable, index applied, held
+/// latch)`. A measurement that drained leaves that cut at the published tip, so
+/// a keyspace without a relocation filter reaches `EndOfWal` and the pass is
+/// `NoWork`: no copy, no callback start, no retirement. The fuel stream rewrites
+/// dataset keys while the pass runs, which keeps the cut behind the tip and
+/// allocates past the file the pass derives as its whole-file target.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RelocationPhase {
+    /// `false` requests nothing; `true` requests one pass with the default fuel.
+    Enabled(bool),
+    /// Explicit fuel bounds; implies a request.
+    Fuel(RelocationFuelConfig),
+}
+
+impl Default for RelocationPhase {
+    fn default() -> Self {
+        Self::Enabled(false)
+    }
+}
+
+impl RelocationPhase {
+    /// Whether one pass is requested.
+    #[must_use]
+    pub fn requested(self) -> bool {
+        match self {
+            Self::Enabled(enabled) => enabled,
+            Self::Fuel(_) => true,
+        }
+    }
+
+    /// The fuel stream that must accompany the request, if one is requested.
+    #[must_use]
+    pub fn fuel(self) -> Option<RelocationFuelConfig> {
+        match self {
+            Self::Enabled(false) => None,
+            Self::Enabled(true) => Some(RelocationFuelConfig::default()),
+            Self::Fuel(config) => Some(config),
+        }
+    }
+}
+
+/// Bounds of the post-measurement rewrite stream.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelocationFuelConfig {
+    /// Rewrites per second. The stream never exceeds this rate.
+    #[serde(default = "default_fuel_puts_per_second")]
+    pub puts_per_second: u32,
+    /// Wall-clock bound of the stream; the completion gate is the real bound.
+    #[serde(default = "default_fuel_max_seconds")]
+    pub max_seconds: u32,
+}
+
+impl Default for RelocationFuelConfig {
+    fn default() -> Self {
+        Self {
+            puts_per_second: default_fuel_puts_per_second(),
+            max_seconds: default_fuel_max_seconds(),
+        }
+    }
+}
+
+/// A few hundred rewrites per second keeps the cut behind the tip without
+/// approaching the measured write rate (thousands per second in these cells).
+fn default_fuel_puts_per_second() -> u32 {
+    300
+}
+
+/// Covers the longest completion gate (300 s).
+fn default_fuel_max_seconds() -> u32 {
+    300
+}
+
+/// The admitted fuel rate: nonzero, and far below a measurement rate.
+pub const RELOCATION_FUEL_PUTS_PER_SECOND: std::ops::RangeInclusive<u32> = 1..=4_096;
+/// The admitted fuel bound: nonzero, and no longer than a long cell.
+pub const RELOCATION_FUEL_MAX_SECONDS: std::ops::RangeInclusive<u32> = 1..=600;
+
 fn default_true() -> bool {
     true
 }
@@ -381,10 +464,18 @@ impl RunConfig {
                 "mapped-WAL eviction requires Linux, test-utils, a native or tidehunter backend, and a measurement phase",
             );
         }
-        if self.phases.relocation && self.measurement_completion_gate.is_none() {
+        if self.phases.relocation.requested() && self.measurement_completion_gate.is_none() {
             return invalid(
                 "a relocation phase requires a measurement_completion_gate to bound the pass",
             );
+        }
+        if let Some(fuel) = self.phases.relocation.fuel() {
+            if !RELOCATION_FUEL_PUTS_PER_SECOND.contains(&fuel.puts_per_second) {
+                return invalid("phases.relocation.puts_per_second must be in 1..=4096");
+            }
+            if !RELOCATION_FUEL_MAX_SECONDS.contains(&fuel.max_seconds) {
+                return invalid("phases.relocation.max_seconds must be in 1..=600");
+            }
         }
         for (gate, name) in [
             (&self.measurement_gate, "measurement_gate"),

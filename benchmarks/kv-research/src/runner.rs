@@ -166,6 +166,7 @@ pub async fn run<B: KvBackend>(
     let mut read_end = serde_json::Value::Null;
     let mut measurement_drained = false;
     let mut relocation_requested = false;
+    let mut relocation_fuel: Option<crate::relocation_fuel::RelocationFuel> = None;
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -332,7 +333,25 @@ pub async fn run<B: KvBackend>(
                 }
             }
             reporter.snapshot()?;
-            if config.phases.relocation {
+            if config.phases.relocation.requested() {
+                // The pass freezes its scan cut as soon as the worker picks the
+                // request up. A drained measurement leaves that cut at the
+                // published tip, so the stream starts first and stops when the
+                // completion gate is released or times out.
+                if let Some(fuel) = config.phases.relocation.fuel() {
+                    relocation_fuel = Some(
+                        crate::relocation_fuel::RelocationFuel::start(
+                            Arc::clone(&backend),
+                            namespace,
+                            config.seed,
+                            config.dataset.keys,
+                            config.dataset.value_size,
+                            config.dataset.entropy,
+                            fuel,
+                        )
+                        .await,
+                    );
+                }
                 match backend.start_relocation() {
                     Ok(()) => relocation_requested = true,
                     Err(error) => {
@@ -440,6 +459,16 @@ pub async fn run<B: KvBackend>(
         ));
         reporter.snapshot()?;
     }
+    // The fuel stream lives exactly as long as the completion gate: it keeps the
+    // pass's cut behind the tip and allocates past the file the pass retires.
+    // Its failed puts after an owner kill are counts, never this run's failure.
+    let relocation_fuel = match relocation_fuel {
+        Some(fuel) => Some(
+            fuel.finish(Duration::from_secs(config.limits.shutdown_grace_seconds))
+                .await,
+        ),
+        None => None,
+    };
     let mut write_wait_metrics_exported = false;
     if config.diagnostics.write_timeline_limit > 0 {
         let (timeline, mut error) = if timeline_armed {
@@ -658,6 +687,7 @@ pub async fn run<B: KvBackend>(
             "outstanding_at_finalization": totals.0.saturating_sub(totals.1).saturating_sub(totals.2),
             "realized_mix": reporter.realized_mix(),
         }),
+        relocation_fuel,
         distributions: reporter.distribution_summaries(),
         limitations: vec![
             "Finite local workload phases are not evidence of sustainable steady-state capacity.".to_owned(),

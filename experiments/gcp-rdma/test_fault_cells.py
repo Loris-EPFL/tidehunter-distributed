@@ -1014,6 +1014,28 @@ class CrashChecks(unittest.TestCase):
                 child(), partition=0, log_offset=offset)
             self.assertFalse(elsewhere['typed'], elsewhere)
 
+            # The relocation fuel stream keeps rewriting dataset keys while the
+            # completion gate holds (`phases.relocation`). After the owner kill
+            # its put can be the first causal failure; a per-owner write names
+            # the killed owner, so the predicate holds with owner=Some(killed).
+            fuel_text = ('kv-research: measurement completion gate failed: '
+                         'write core requires recovery; first causal failure: '
+                         'owner=Some(0) batch=Some(BatchVersion { epoch: 1, '
+                         'sequence: 4242 }) stage=write_core: owner append '
+                         'failed: Connection reset by peer (os error 104)')
+            offset = driver._log_offset(child())
+            append(fuel_text)
+            fuel = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=offset)
+            self.assertTrue(fuel['typed'], fuel)
+            self.assertIn('owner=Some(0)', fuel['text'])
+            # The same fuel failure naming another owner stays outside the cut.
+            offset = driver._log_offset(child())
+            append(fuel_text.replace('owner=Some(0)', 'owner=Some(1)'))
+            fuel_elsewhere = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=offset)
+            self.assertFalse(fuel_elsewhere['typed'], fuel_elsewhere)
+
             # No exit: the bounded wait is recorded, never read as a failure.
             offset = driver._log_offset(child())
             append(text)

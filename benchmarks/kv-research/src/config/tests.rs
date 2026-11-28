@@ -91,7 +91,7 @@ fn config() -> RunConfig {
             measurement_key_sweep: false,
             aging_operations: 0,
             measurement_operations: 2,
-            relocation: false,
+            relocation: RelocationPhase::Enabled(false),
         },
         qualification_only: false,
         source_revision: None,
@@ -607,12 +607,86 @@ fn validates_optional_measurement_gate_paths_and_timeout() {
 #[test]
 fn relocation_phase_requires_a_completion_gate() {
     let mut config = config();
-    config.phases.relocation = true;
+    config.phases.relocation = RelocationPhase::Enabled(true);
     assert!(config.validate().is_err());
     config.measurement_completion_gate = Some(MeasurementGateConfig {
         ready_file: PathBuf::from("/tmp/kv-completion-ready"),
         release_file: PathBuf::from("/tmp/kv-completion-release"),
         timeout_seconds: 240,
+    });
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn relocation_phase_accepts_a_bool_or_an_explicit_fuel_bound() {
+    let off: RelocationPhase = serde_json::from_str("false").unwrap();
+    assert!(!off.requested());
+    assert_eq!(off.fuel(), None);
+    assert_eq!(serde_json::to_string(&off).unwrap(), "false");
+
+    let on: RelocationPhase = serde_json::from_str("true").unwrap();
+    assert!(on.requested());
+    assert_eq!(on.fuel(), Some(RelocationFuelConfig::default()));
+    assert_eq!(serde_json::to_string(&on).unwrap(), "true");
+
+    let tuned: RelocationPhase =
+        serde_json::from_str(r#"{"puts_per_second":128,"max_seconds":30}"#).unwrap();
+    assert!(tuned.requested());
+    assert_eq!(
+        tuned.fuel(),
+        Some(RelocationFuelConfig {
+            puts_per_second: 128,
+            max_seconds: 30,
+        })
+    );
+    // Omitted fields take the documented defaults, not zero.
+    let partial: RelocationPhase = serde_json::from_str(r#"{"puts_per_second":64}"#).unwrap();
+    assert_eq!(
+        partial.fuel(),
+        Some(RelocationFuelConfig {
+            puts_per_second: 64,
+            max_seconds: 300,
+        })
+    );
+}
+
+#[test]
+fn relocation_fuel_bounds_are_validated() {
+    let mut config = config();
+    config.measurement_completion_gate = Some(MeasurementGateConfig {
+        ready_file: PathBuf::from("/tmp/kv-completion-ready"),
+        release_file: PathBuf::from("/tmp/kv-completion-release"),
+        timeout_seconds: 240,
+    });
+    for fuel in [
+        RelocationFuelConfig {
+            puts_per_second: 0,
+            max_seconds: 30,
+        },
+        RelocationFuelConfig {
+            puts_per_second: 4_097,
+            max_seconds: 30,
+        },
+        RelocationFuelConfig {
+            puts_per_second: 300,
+            max_seconds: 0,
+        },
+        RelocationFuelConfig {
+            puts_per_second: 300,
+            max_seconds: 601,
+        },
+    ] {
+        config.phases.relocation = RelocationPhase::Fuel(fuel);
+        assert!(config.validate().is_err(), "{fuel:?} must be refused");
+    }
+    config.phases.relocation = RelocationPhase::Fuel(RelocationFuelConfig {
+        puts_per_second: 4_096,
+        max_seconds: 600,
+    });
+    assert!(config.validate().is_ok());
+    config.phases.relocation = RelocationPhase::Fuel(RelocationFuelConfig {
+        puts_per_second: 1,
+        max_seconds: 1,
     });
     assert!(config.validate().is_ok());
 }

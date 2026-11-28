@@ -199,6 +199,11 @@ pub struct RunSummary {
     pub backend: BackendInfo,
     pub execution: serde_json::Value,
     pub phase_counts: serde_json::Value,
+    /// Post-measurement relocation fuel: the bounded rewrite stream that keeps
+    /// the pass's scan cut behind the published tip. `None` when no relocation
+    /// was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relocation_fuel: Option<serde_json::Value>,
     pub distributions: serde_json::Value,
     pub limitations: Vec<String>,
 }

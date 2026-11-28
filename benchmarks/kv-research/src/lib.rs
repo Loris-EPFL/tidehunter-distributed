@@ -21,6 +21,7 @@
 pub mod backend;
 pub mod backends;
 pub mod config;
+pub mod relocation_fuel;
 pub mod report;
 pub mod runner;
 pub mod workload;

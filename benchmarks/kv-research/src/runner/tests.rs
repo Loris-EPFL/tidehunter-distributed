@@ -1519,6 +1519,7 @@ async fn interference_catches_up_late_reads_but_bounds_scheduler_lateness_and_pu
             backend: backend.info(),
             execution: serde_json::json!({}),
             phase_counts: serde_json::json!({}),
+            relocation_fuel: None,
             distributions: reporter.distribution_summaries(),
             limitations: Vec::new(),
         };
@@ -1727,6 +1728,7 @@ async fn stalled_sample_writer_fails_interference_without_delaying_admission_or_
         backend: backend.info(),
         execution: serde_json::json!({}),
         phase_counts: serde_json::json!({}),
+        relocation_fuel: None,
         distributions: reporter.distribution_summaries(),
         limitations: Vec::new(),
     };
@@ -1814,6 +1816,7 @@ async fn interference_timeouts_cancel_async_calls_and_leave_no_pending_work() {
             backend: backend.info(),
             execution: serde_json::json!({}),
             phase_counts: serde_json::json!({}),
+            relocation_fuel: None,
             distributions: reporter.distribution_summaries(),
             limitations: Vec::new(),
         };
