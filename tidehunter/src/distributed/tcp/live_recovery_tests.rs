@@ -69,9 +69,14 @@ fn recovery_retries_a_lost_controller_but_never_a_live_read_verdict() {
         !retryable_lost_read(&deadline, true),
         "a deadline is never a controller resume: {deadline}"
     );
-    let other = io::Error::from_raw_os_error(libc::EREMOTEIO);
-    assert!(
-        !retryable_lost_read(&other, true),
-        "an unclassified errno stays fatal even after a loss: {other}"
-    );
+    // `EREMOTEIO` is a Linux target rejection; the rule it proves (an errno the
+    // predicate never classifies stays fatal) holds on every target.
+    #[cfg(target_os = "linux")]
+    {
+        let other = io::Error::from_raw_os_error(libc::EREMOTEIO);
+        assert!(
+            !retryable_lost_read(&other, true),
+            "an unclassified errno stays fatal even after a loss: {other}"
+        );
+    }
 }
