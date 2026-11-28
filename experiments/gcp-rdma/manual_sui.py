@@ -464,6 +464,19 @@ class ControllerLoss:
             return NotReached('not reached: no flush in replay (' + reason + ')')
         return LaunchError(f'controller-loss point {self.point} was {reason}')
 
+    def miss_evidence(self, reason):
+        """Retain the gate series of a point the replay did not reach.
+
+        `run.py` can ask for its final evidence before the gate fires: the
+        point is then over, and a miss that kept no record would fail the cell
+        with no proof of where the replay stood. The samples are that proof.
+        """
+        self.evidence = dict(point=self.point, host=self.host, injected=False,
+                             reason=reason, gate_timeout=self.gate_timeout,
+                             samples=self.samples)
+        self.write_evidence()
+        return self.miss(reason)
+
     def argv(self, output):
         argv = [sys.executable, str(INJECTOR),
                 '--transport', self.transport, '--address', self.address,
@@ -1332,7 +1345,7 @@ class SuiLauncher:
                     self.write_resources(binding)
                     resources_written = True
                     if self.controller_loss is not None and not self.controller_loss.done:
-                        raise self.controller_loss.miss(
+                        raise self.controller_loss.miss_evidence(
                             'not observed before the replay requested its final evidence')
                 if resources_written and (self.controller_loss is None
                                           or self.controller_loss.done):

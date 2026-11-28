@@ -903,6 +903,29 @@ class ControllerLossInjection(unittest.TestCase):
                             for row in evidence['samples']))
         self.assertFalse([row for row in remote.requests if 'fault_inject.py' in row['command']])
 
+    def test_a_point_the_replay_outruns_keeps_its_gate_series(self):
+        """run.py asked for its final evidence while the gate had not fired."""
+        remote = MailboxDouble(self.root, self.root / 'guest')
+        ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
+        gate = self.gate(remote, gate_timeout=600.0,
+                         metrics=lambda url: 'tidehunter_nvmeof_live_completed_write_ops_total 0\n',
+                         latest=lambda address: 3)
+        with self.assertRaisesRegex(manual_sui.LaunchError,
+                                    'before the replay requested its final evidence'):
+            self.launcher(remote, gate, ledger=ledger,
+                          cell_id='S1-4-mid-frame-native',
+                          allow_local_ledger=True).run(
+                manual_sui.plan('coordinator', ['10.0.0.2', '10.0.0.3']))
+        self.assertEqual(ledger.status('stage1', 'S1-4-mid-frame-native'), 'failed')
+        self.assertFalse([row for row in remote.requests if 'fault_inject.py' in row['command']])
+        evidence = json.loads((self.root / 'run/controller-loss/evidence.json').read_text())
+        self.assertFalse(evidence['injected'])
+        self.assertIn('final evidence', evidence['reason'])
+        self.assertEqual(evidence['gate_timeout'], 600.0)
+        self.assertTrue(evidence['samples'])
+        self.assertFalse(any(row['counters'].get('completed_write_ops_total')
+                             for row in evidence['samples']))
+
     def test_a_synchronous_flush_point_that_never_fires_is_not_reached(self):
         remote = MailboxDouble(self.root, self.root / 'guest')
         ledger = manual_sui.ledger_module.Ledger(self.root / 'ledger.json')
