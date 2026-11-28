@@ -1270,14 +1270,43 @@ def admission_checks(values, *, live_transport):
 
 
 # Upstream Sui commits three batches per checkpoint to the perpetual store
-# (plan 8.1); the other namespaces carry their own per-checkpoint writes. The
-# node also commits at most this many batches before the first checkpoint.
+# (plan 8.1); the other namespaces carry their own per-checkpoint writes. Before
+# the first checkpoint the node commits few batches of its own: a frozen-replay
+# native arm commits three per checkpoint plus one, so two are admitted.
 PERPETUAL_SUFFIX = '/store/perpetual'
 STARTUP_PERPETUAL_BATCHES = 2
+# The remote adapter records a single-key put or delete as a one-operation write
+# batch, while the native engine records it as `insert` or `remove` of the key's
+# keyspace. The two arms are therefore compared as write populations, not as
+# one operation label.
+REMOTE_COMMIT_OPS = ('write_batch', 'insert', 'remove')
 
 
-def write_batch_check(values, namespaces, checkpoint_count):
-    """Perpetual-store write batches per completed checkpoint, from the adapter."""
+def _database_ops(values):
+    """`db_op` observation counts keyed by database label, then operation.
+
+    The counts are summed over keyspaces: a write batch carries the untagged
+    empty keyspace, a single-key write the keyspace it touched.
+    """
+    result = {}
+    for database, keyspaces in coordinator_stats(values)['operations'].items():
+        counts = result.setdefault(database, {})
+        for operations in keyspaces.values():
+            for op, row in operations.items():
+                counts[op] = counts.get(op, 0) + int(row['count'] or 0)
+    return result
+
+
+def write_batch_check(values_by_mode, namespaces, checkpoint_count):
+    """Perpetual-store write batches per checkpoint, from both arms' `db_op`.
+
+    The native arm is held to upstream's three batches per checkpoint plus the
+    startup allowance. The remote arm is held to the native arm's write
+    population instead: the adapter labels a single-key put or delete as a
+    one-operation write batch, so its `write_batch` count includes the native
+    `insert` and `remove` counts of the same replay. Comparing the arms this way
+    tests write-parity of the replay, not the adapter's operation labelling.
+    """
     if not isinstance(checkpoint_count, int) or checkpoint_count < 1:
         raise ValueError('a checkpoint population is required')
     perpetual = sorted(name for name in namespaces if name.endswith(PERPETUAL_SUFFIX))
@@ -1285,21 +1314,36 @@ def write_batch_check(values, namespaces, checkpoint_count):
         return _state('missing_counter', 'exactly one perpetual-store namespace is required',
                       namespaces=sorted(namespaces))
     name = perpetual[0]
-    calls = adapter_stats(values).get(name, {}).get('write_commit_calls')
-    if calls is None:
-        return _state('missing_counter', 'the write-commit counter is absent',
-                      missing=[f'{name}:write_commit_calls'])
-    batches = int(calls)
-    extra = batches - 3 * checkpoint_count
-    payload = dict(namespace=name, batches=batches, checkpoints=checkpoint_count,
+    database = name.rsplit('/', 1)[-1]
+    native = _database_ops(values_by_mode.get('native') or {}).get(database, {})
+    remote = _database_ops(values_by_mode.get('remote') or {}).get(database, {})
+    batches = native.get('write_batch')
+    if batches is None:
+        return _state('missing_counter', 'the native write-batch population is absent',
+                      namespace=name, missing=[f'{database}:write_batch'])
+    commits = remote.get('write_batch')
+    if commits is None:
+        return _state('missing_counter', 'the remote write-batch population is absent',
+                      namespace=name, missing=[f'{database}:write_batch'])
+    single_key = sum(native.get(op, 0) for op in REMOTE_COMMIT_OPS[1:])
+    startup = batches - 3 * checkpoint_count
+    payload = dict(namespace=name, database=database, checkpoints=checkpoint_count,
+                   native_batches=batches, native_single_key_writes=single_key,
+                   remote_commits=commits,
                    write_batches_per_checkpoint=batches / checkpoint_count,
-                   startup_batches=extra,
-                   source='write_commit_calls of the perpetual store divided by replayed '
-                          'checkpoints; upstream writes three batches per checkpoint, '
-                          f'plus at most {STARTUP_PERPETUAL_BATCHES} before the first')
-    if not 0 <= extra <= STARTUP_PERPETUAL_BATCHES:
-        return _state('fail', f'perpetual write batches per checkpoint read '
+                   startup_batches=startup,
+                   source='db_op observations of the perpetual database; upstream writes '
+                          'three batches per checkpoint, and the adapter records a '
+                          'single-key put or delete as a one-operation write batch, so '
+                          'remote write batches equal native write batches plus native '
+                          'insert and remove')
+    if not 0 <= startup <= STARTUP_PERPETUAL_BATCHES:
+        return _state('fail', f'native perpetual write batches per checkpoint read '
                               f'{batches / checkpoint_count}, not 3', **payload)
+    expected = batches + single_key
+    if commits != expected:
+        return _state('fail', f'remote perpetual write batches read {commits}, not the '
+                              f'native write population {expected}', **payload)
     return _state('pass', None, **payload)
 
 
@@ -1368,7 +1412,7 @@ def cell_checks(result, values_by_mode, namespaces, *, checkpoint_count):
                                    (result.get('cache') or {}).get('coordinator_bytes', 0))
                                // int(1024 * 1024)),
         value_cache=value_cache_check(values_by_mode['remote'], namespaces),
-        write_batches=write_batch_check(values_by_mode['remote'], namespaces,
+        write_batches=write_batch_check(values_by_mode, namespaces,
                                         checkpoint_count),
         lifecycle=lifecycle_check(result),
         hold=hold_check(result))

@@ -520,16 +520,32 @@ class AggregateReplacement(unittest.TestCase):
 NAMESPACE = 'live/store/perpetual'
 
 
-def scrape(*, cache_mib=0, hits=0, misses=5, batches=6, live=True, protect=2):
+def db_op(database, op, count, *, ks=''):
+    """One `db_op` histogram series: a count and a zero sum, no buckets."""
+    labels = f'op="{op}",ks="{ks}",db="{database}"'
+    return [f'db_op_count{{{labels}}} {count}', f'db_op_sum{{{labels}}} 0']
+
+
+def native_scrape(*, batches=6, inserted=0, removed=0):
+    """The native arm's perpetual-database write population."""
+    rows = db_op('perpetual', 'write_batch', batches)
+    rows += db_op('perpetual', 'insert', inserted, ks='objects')
+    rows += db_op('perpetual', 'remove', removed, ks='transactions')
+    return analyze.parse_metrics('\n'.join(rows) + '\n')
+
+
+def scrape(*, cache_mib=0, hits=0, misses=5, batches=6, commits=None,
+           live=True, protect=2):
     """One measured-node scrape with the adapter, keyspace and live families."""
-    rows = [
+    commits = batches if commits is None else commits
+    rows = db_op('perpetual', 'write_batch', commits) + [
         f'tidehunter_adapter{{namespace="{NAMESPACE}",stat="{name}"}} {value}'
         for name, value in (
             ('value_cache_hits', hits), ('value_cache_misses', misses),
             ('cache_hits', hits), ('cache_misses', misses),
             ('cache_entries', 0), ('cache_budget_bytes', cache_mib * 1024 * 1024),
             ('read_calls', misses), ('read_keys', misses), ('read_rpcs', misses),
-            ('write_commit_calls', batches))]
+            ('write_commit_calls', commits))]
     rows += [
         f'tidehunter_keyspace_read_cache{{keyspace="objects",keyspace_id="3",'
         f'namespace="{NAMESPACE}",stat="{name}"}} {value}'
@@ -557,10 +573,11 @@ class PerCellCriteria(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def checks(self, cell_id, values, **overrides):
+    def checks(self, cell_id, values, *, native=None, checkpoint_count=2, **overrides):
         return analyze.cell_checks(self.result(cell_id, **overrides),
-                                   {'remote': values}, [NAMESPACE],
-                                   checkpoint_count=2)
+                                   {'native': native or native_scrape(),
+                                    'remote': values}, [NAMESPACE],
+                                   checkpoint_count=checkpoint_count)
 
     def test_the_admission_cell_proves_the_rdma_live_path_and_lists_the_rest(self):
         for cell_id in ('S1-0-native', 'S1-0-synchronous'):
@@ -638,14 +655,45 @@ class PerCellCriteria(unittest.TestCase):
         self.assertIn('no hit counter', evidence['per_cell_value_cache'])
 
     def test_three_perpetual_write_batches_per_checkpoint_is_required(self):
-        # Real S1-0 replays commit 5,329 perpetual batches for 1,776 checkpoints:
-        # three per checkpoint plus one before the first.
+        # Real fleet A replays commit 5,329 native perpetual batches for 1,776
+        # checkpoints: three per checkpoint plus one before the first.
         self.assertEqual(self.checks('M1-c4-native', scrape(batches=6))['failures'], [])
-        self.assertEqual(self.checks('M1-c4-native', scrape(batches=7))['failures'], [])
-        checks = self.checks('M1-c4-native', scrape(batches=4))
+        self.assertEqual(self.checks('M1-c4-native', scrape(batches=7),
+                                     native=native_scrape(batches=7))['failures'], [])
+        checks = self.checks('M1-c4-native', scrape(batches=4),
+                             native=native_scrape(batches=4))
         self.assertTrue(any('read 2.0, not 3' in item for item in checks['failures']))
-        checks = self.checks('M1-c4-native', scrape(batches=9))
+        checks = self.checks('M1-c4-native', scrape(batches=9),
+                             native=native_scrape(batches=9))
         self.assertTrue(any('read 4.5, not 3' in item for item in checks['failures']))
+
+    def test_remote_write_batches_match_the_native_write_population(self):
+        # Fleet A, 1,776 checkpoints: native commits 5,329 write batches plus
+        # four single-key writes; the remote adapter labels those four as write
+        # batches, so its commit population is 5,333, not a parity defect.
+        native = native_scrape(batches=5329, inserted=3, removed=1)
+        checks = self.checks('M1-c4-native', scrape(batches=5329, commits=5333),
+                             native=native, checkpoint_count=1776)
+        self.assertEqual(checks['failures'], [])
+        entry = checks['checks']['write_batches']['evidence']
+        self.assertEqual((entry['native_batches'], entry['native_single_key_writes'],
+                          entry['remote_commits'], entry['startup_batches']),
+                         (5329, 4, 5333, 1))
+        checks = self.checks('M1-c4-native', scrape(batches=5329, commits=5334),
+                             native=native, checkpoint_count=1776)
+        self.assertTrue(any('remote perpetual write batches read 5334' in item
+                            for item in checks['failures']))
+        checks = self.checks('M1-c4-native', scrape(batches=5332, commits=5336),
+                             native=native_scrape(batches=5332, inserted=3, removed=1),
+                             checkpoint_count=1776)
+        self.assertTrue(any('native perpetual write batches per checkpoint read' in item
+                            for item in checks['failures']))
+        # The remote arm may not pass by committing the native count alone: the
+        # adapter's single-key writes belong in its write population.
+        checks = self.checks('M1-c4-native', scrape(batches=5329, commits=5329),
+                             native=native, checkpoint_count=1776)
+        self.assertTrue(any('native write population 5333' in item
+                            for item in checks['failures']))
 
     def test_a_lifecycle_cell_needs_the_reopen_evidence(self):
         checks = self.checks('S1-1-native', scrape())
