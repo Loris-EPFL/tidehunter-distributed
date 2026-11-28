@@ -1883,16 +1883,6 @@ class CellDriver:
         return max(walls) if walls else None
 
     @staticmethod
-    def _run_end_ns(child):
-        """Wall clock of the process's run end from its own summary, or None."""
-        summary = Path(child.output) / 'summary.json'
-        try:
-            finished = json.loads(summary.read_text()).get('finished_unix_seconds')
-        except (OSError, ValueError):
-            return None
-        return None if finished is None else int(round(float(finished) * 1e9))
-
-    @staticmethod
     def _wall_origin_ns(child):
         """Unix nanoseconds of the runner's `t0`, the base of `completed_ns`.
 
@@ -1977,8 +1967,6 @@ class CellDriver:
         result['typed_refusal'] = typed
         result['stale_write_refused'] = refusal['refused']
         result['no_success_after_refusal'] = refusal['no_success_after']
-        result['stale_rows'] = self._stale_row_proof(rows_, refusal)
-        result['stale_rows_clean'] = result['stale_rows']['clean']
         # The fence of a lapse cell is the owner's write-protect, applied while
         # the coordinator was paused: after it, the sealed generation may not be
         # written by that coordinator again.
@@ -1988,24 +1976,39 @@ class CellDriver:
         result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
         result['stale_success_after_fence'] = self._stale_after_fence(
             child, rows_, result['fence_unix_ns'])
-        result.update(self.fence_audit(child))
         refusal_kind, wall = self._refusal_kind(
             child, rows_, refusal, result.get('refusal_source'))
         result['refusal_kind'] = refusal_kind
         result['refusal_unix_ns'] = wall
-        result['fence_reject_ms'], result['fence_reject_window_ms'] = self._fence_window(
-            result['fence_unix_ns'], wall, self._last_success_ns(child, rows_),
-            self._run_end_ns(child))
         # The row-level verdict; `fence_record` adds the audit and is the one
-        # that publishes `exclusive`/`writers`.
+        # that publishes `exclusive`/`writers`. The owner proof comes first: a
+        # self-fence has no row, so its row proof is the owner proof.
         result['owner_fence'] = self.owner_fence_proof(
             baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'),
             fence_kind='write-protect')
+        result['stale_rows'] = self._stale_row_proof(
+            rows_, refusal, refusal_kind=refusal_kind,
+            stale_after=result['stale_success_after_fence'],
+            owner_fence=result['owner_fence'])
+        result['stale_rows_clean'] = result['stale_rows']['clean']
+        result['fence_reject_ms'] = (
+            None if wall is None or result['fence_unix_ns'] is None
+            else (wall - result['fence_unix_ns']) / 1e6)
+        result['fence_reject_window_ms'] = None
+        result['fence_reject_reason'] = None
+        if wall is None:
+            result['self_fence_log_unix_ns'] = self._log_mtime_ns(child)
+            result['fence_reject_window_ms'], result['fence_reject_reason'] = (
+                self._self_fence_window(
+                    result['fence_unix_ns'], resumed_ns=result.get('resumed_unix_ns'),
+                    log_ns=result['self_fence_log_unix_ns']))
+        result.update(self.fence_audit(child))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=bool(result.get('sealed_partitions')),
             owner_fence=result['owner_fence'],
-            rows_clean=result['stale_rows_clean'])
+            rows_clean=result['stale_rows_clean'],
+            rows_reason=result['stale_rows'].get('reason'))
         return result
 
     @staticmethod
@@ -2022,32 +2025,64 @@ class CellDriver:
         return min(instants) if instants else None
 
     @classmethod
-    def _stale_row_proof(cls, rows_, refusal):
-        """The clock-free half: every success precedes the first refusal.
+    def _stale_row_proof(cls, rows_, refusal, *, refusal_kind, stale_after,
+                         owner_fence):
+        """The writer-side half, chosen by the refusal kind.
 
-        `samples.csv` is written by one writer thread in completion order, so a
-        success row after the first refusal is a write that completed under the
-        new authority. A cell with no acknowledged write proves nothing and is
-        named, never passed.
+        An `owner-row` refusal is a sample row: every acknowledged success must
+        precede it in completion order, and a cell with no acknowledged write
+        proves nothing. A `coordinator-self-fence` is emitted before the frame
+        is encoded, so it has no row and no order to read: its proof is the
+        owner side (a new generation and a rewritten ledger on every owner, no
+        growth of the stale generation) plus no stale success after the fence
+        instant on the stale writer's own clock, with acknowledged rows > 0.
+        Every missing part fails closed and is named.
         """
         acknowledged_rows = sum(
             1 for row in cls._measurement_rows(rows_) if row.get('outcome') == 'success')
-        clean = bool(refusal.get('refused')
-                     and refusal.get('no_success_after')
-                     and acknowledged_rows > 0)
-        proof = dict(acknowledged=acknowledged_rows,
+        proof = dict(kind=refusal_kind, acknowledged=acknowledged_rows,
                      first_refusal_row=refusal.get('first'),
                      last_success_row=refusal.get('last_success'),
                      no_success_after_refusal=bool(refusal.get('no_success_after')),
-                     clean=clean)
-        if refusal.get('refused') is None:
-            proof['reason'] = 'the stale writer recorded no refusal row'
-        elif acknowledged_rows == 0:
-            proof['reason'] = ('the stale writer recorded no acknowledged write '
-                               'before its refusal')
-        elif not refusal.get('no_success_after'):
-            proof['reason'] = ('a stale-writer write succeeded after its first '
-                               'refusal')
+                     stale_success_after_fence=stale_after, clean=False)
+        if refusal_kind == 'owner-row':
+            if refusal.get('refused') is None:
+                proof['reason'] = 'the stale writer recorded no refusal row'
+            elif acknowledged_rows == 0:
+                proof['reason'] = ('the stale writer recorded no acknowledged write '
+                                   'before its refusal')
+            elif not refusal.get('no_success_after'):
+                proof['reason'] = ('a stale-writer write succeeded after its first '
+                                   'refusal')
+            else:
+                proof['clean'] = True
+            return proof
+        if refusal_kind != 'coordinator-self-fence':
+            proof['reason'] = ('the stale writer recorded no typed refusal row and the '
+                               'coordinator log carries no typed causal line')
+            return proof
+        owner = owner_fence or {}
+        if acknowledged_rows == 0:
+            proof['reason'] = 'the stale writer recorded no acknowledged write'
+        elif stale_after is None:
+            proof['reason'] = ('the stale writer\'s row clock is missing, so no success '
+                               'after the fence instant can be ruled out')
+        elif stale_after:
+            proof['reason'] = (f'{stale_after} stale-writer write(s) completed after '
+                               'the fence instant')
+        elif not owner.get('evidence_available'):
+            proof['reason'] = ('the self-fence has no owner-side evidence: no new '
+                               'generation or write-protect marker was captured')
+        elif not owner.get('fence_counters_increased'):
+            proof['reason'] = (owner.get('reason')
+                               or 'the owners published no fence before the self-fence')
+        elif not owner.get('no_stale_growth'):
+            proof['reason'] = (owner.get('reason')
+                               or 'the stale generation\'s WAL gained files or bytes')
+        elif owner.get('reason'):
+            proof['reason'] = owner['reason']
+        else:
+            proof['clean'] = True
         return proof
 
     @classmethod
@@ -2066,36 +2101,55 @@ class CellDriver:
         return None, None
 
     @staticmethod
-    def _fence_window(fence_ns, refusal_ns, last_success_ns, run_end_ns):
-        """Fence-reject latency, or the window that bounds it.
+    def _log_mtime_ns(child):
+        """The final log write: the last instant the stale writer could run."""
+        try:
+            return Path(child.log).stat().st_mtime_ns
+        except (AttributeError, OSError):
+            return None
 
-        Exact when the refusal is a sample row; otherwise the refusal happened
-        after the stale writer's last success and before its run ended.
+    @staticmethod
+    def _self_fence_window(fence_ns, *, resumed_ns, log_ns, baseline_ns=None):
+        """Bound fence -> refusal for a self-fence, which has no sample row.
+
+        The writer cannot refuse before `resumed_ns` (it was stopped) and cannot
+        run after its final log write (`log_ns`). The fence instant is bracketed
+        by the owner snapshots: `(baseline_ns, fence_ns]` for a contention cell,
+        or exactly `fence_ns` for a write-protect cell. The plan requires the
+        fence-reject time to be recorded, so a missing part is a named failure
+        and never a silent pass.
         """
-        if fence_ns is None:
-            return None, None
-        if refusal_ns is not None:
-            return (refusal_ns - fence_ns) / 1e6, None
-        lower = (None if last_success_ns is None
-                 else max(0.0, (last_success_ns - fence_ns) / 1e6))
-        upper = None if run_end_ns is None else max(0.0, (run_end_ns - fence_ns) / 1e6)
-        if lower is None and upper is None:
-            return None, None
-        return None, dict(lower_ms=lower, upper_ms=upper)
+        if fence_ns is None or resumed_ns is None or log_ns is None:
+            missing = [name for name, value in (('fence', fence_ns),
+                                                ('release', resumed_ns),
+                                                ('log write', log_ns))
+                       if value is None]
+            return None, ('the self-fence instant is not measurable: '
+                          + ', '.join(missing) + ' is missing')
+        upper_ref = fence_ns if baseline_ns is None else baseline_ns
+        lower = (resumed_ns - fence_ns) / 1e6
+        upper = (log_ns - upper_ref) / 1e6
+        if lower < 0 or upper < lower:
+            return None, ('the self-fence bracket is inconsistent: the release or the '
+                          'final log write precedes the fence')
+        return dict(lower_ms=lower, upper_ms=upper, includes_pause=False,
+                    basis=('stale writer release to its final log write, bracketed '
+                           'by the owner snapshots' if baseline_ns is not None else
+                           'stale writer release to its final log write')), None
 
     @staticmethod
     def _exclusive(refusal_kind, stale_after, *, new_authority, owner_fence=None,
-                   rows_clean=None):
+                   rows_clean=None, rows_reason=None):
         """Whether exclusive writes are proven, and the first missing proof.
 
-        `rows_clean` is the clock-free half: every acknowledged write of the
-        stale writer precedes its first refusal in completion order.
-        `stale_after` is reported but not convicted: a row that *completed*
-        after the fence instant can be a write the owner accepted before it and
-        acknowledged after the frozen writer resumed (attempt 4's lapse cell had
-        three). The accept-time evidence is the owner side: nothing landed in
-        the stale generation after the write-protect, which the kernel enforces
-        before the marker is written. `owner_fence` is that half.
+        `rows_clean` is the writer-side half, chosen by the kind: the completion
+        order for an owner-row refusal, or the owner proof plus no post-fence
+        success for a self-fence. `stale_after` is reported but not convicted: a
+        row that *completed* after the fence instant can be a write the owner
+        accepted before it and acknowledged after the frozen writer resumed.
+        The accept-time evidence is the owner side: nothing landed in the stale
+        generation after the write-protect, which the kernel enforces before the
+        marker is written. `owner_fence` is that half.
         A deterministic-payload readback is not this evidence.
         """
         if refusal_kind is None:
@@ -2103,13 +2157,13 @@ class CellDriver:
         if not new_authority:
             return False, 'the new authority recorded no progress (no new writer, no seal)'
         if rows_clean is None:
-            return False, ('the stale writer\'s completion-order evidence is missing '
-                           '(no acknowledged write or no refusal row)'
+            return False, ('the stale writer\'s write-side proof is missing '
+                           '(no acknowledged write, refusal row or owner evidence)'
                            + (f'; the wall clock shows {stale_after} completion(s) '
                               'after the fence' if stale_after else ''))
         if rows_clean is not True:
-            return False, ('the stale writer\'s completion order shows a success after '
-                           'its first refusal')
+            return False, (rows_reason
+                           or 'the stale writer\'s write-side proof fails')
         if not owner_fence or not owner_fence.get('evidence_available'):
             return False, ('no owner-side fence evidence: no seal or write-protect marker '
                            'and no per-generation WAL listing was captured')
@@ -2211,8 +2265,6 @@ class CellDriver:
         result['no_success_after_refusal'] = refusal['no_success_after']
         result['refusal_text'] = text
         result['typed_refusal'] = typed
-        result['stale_rows'] = self._stale_row_proof(first_rows, refusal)
-        result['stale_rows_clean'] = result['stale_rows']['clean']
         second_rows = second.rows() if second is not None else []
         result['second_acknowledged'] = acknowledged(second_rows)
         result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
@@ -2231,22 +2283,37 @@ class CellDriver:
         result['resume_reject_ms'] = (
             None if wall is None or result.get('resumed_unix_ns') is None
             else (wall - result['resumed_unix_ns']) / 1e6)
-        result['fence_reject_ms'], result['fence_reject_window_ms'] = (
-            None, None)
-        window, reason = self._contend_window(
-            result['fence_unix_ns'], (baseline or {}).get('unix_ns'), wall,
-            result.get('resumed_unix_ns'), result.get('pause_ms'))
-        result['fence_reject_window_ms'] = window
-        result['fence_reject_reason'] = reason
         # The row-level verdict; `fence_record` adds the owner-side proof and is
-        # the one that publishes `exclusive`/`writers`.
+        # the one that publishes `exclusive`/`writers`. The owner proof comes
+        # first: a self-fence has no row, so its row proof is the owner proof.
         result['owner_fence'] = self.owner_fence_proof(
             baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'))
+        result['stale_rows'] = self._stale_row_proof(
+            first_rows, refusal, refusal_kind=refusal_kind,
+            stale_after=result['stale_success_after_fence'],
+            owner_fence=result['owner_fence'])
+        result['stale_rows_clean'] = result['stale_rows']['clean']
+        result['fence_reject_ms'] = None
+        result['fence_reject_window_ms'] = None
+        result['fence_reject_reason'] = None
+        if wall is not None:
+            result['fence_reject_window_ms'], result['fence_reject_reason'] = (
+                self._contend_window(
+                    result['fence_unix_ns'], (baseline or {}).get('unix_ns'), wall,
+                    result.get('resumed_unix_ns'), result.get('pause_ms')))
+        else:
+            result['self_fence_log_unix_ns'] = self._log_mtime_ns(child)
+            result['fence_reject_window_ms'], result['fence_reject_reason'] = (
+                self._self_fence_window(
+                    result['fence_unix_ns'], resumed_ns=result.get('resumed_unix_ns'),
+                    log_ns=result['self_fence_log_unix_ns'],
+                    baseline_ns=(baseline or {}).get('unix_ns')))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=result['second_measurement_rows'] > 0,
             owner_fence=result['owner_fence'],
-            rows_clean=result['stale_rows_clean'])
+            rows_clean=result['stale_rows_clean'],
+            rows_reason=result['stale_rows'].get('reason'))
         return result
 
     def _sealed(self, child):
@@ -2403,7 +2470,8 @@ def fault_cells_exclusive(fence):
                        if fence.get('case') in ('contend', 'stale')
                        else (fence.get('sealed_partitions') or 0) >= 1),
         owner_fence=fence.get('owner_fence'),
-        rows_clean=fence.get('stale_rows_clean'))
+        rows_clean=fence.get('stale_rows_clean'),
+        rows_reason=(fence.get('stale_rows') or {}).get('reason'))
 
 
 def fence_record(driver):

@@ -813,6 +813,190 @@ class Attempt4FenceEvidence(unittest.TestCase):
         self.assertGreater(window['resume_ms'], 0)
 
 
+class SelfFenceEvidence(unittest.TestCase):
+    """A lease-lapse self-fence has no refusal row: the owner proof decides.
+
+    The coordinator emits the self-fence before the frame is encoded, so
+    `_refusal` sees no row and `no_success_after_refusal` is false by
+    construction. The writer-side proof is then the owner side (a new generation
+    and a rewritten ledger on every owner, no growth of the stale generation)
+    plus no stale success after the fence instant on the stale writer's clock.
+    """
+
+    AT_FENCE = 1_795_850_049_466_631_559
+    BASELINE = 1_795_850_039_400_000_000
+    RESUMED = 1_795_850_055_218_500_000
+    LOG_WRITE = 1_795_850_056_000_000_000
+    TEXT = ('kv-research: measurement end boundary failed: leased adoption '
+            'boundary observed a failed or poisoned live client; write core '
+            'requires recovery; first causal failure: owner=Some(1) '
+            'stage=live_group: coordinator lease lapsed on owner partition 1')
+    ROWS = [dict(phase='measurement', outcome='success', completed_ns='0'),
+            dict(phase='measurement', outcome='success', completed_ns='1')]
+    REFUSAL = dict(refused=False, first=None, last_success=1,
+                   no_success_after=False, typed=True, text=TEXT)
+
+    def owner(self, **overrides):
+        value = dict(
+            evidence_available=True, fence_kind='generation',
+            fence_counters_increased=True, fence_hosts=['h0', 'h1'],
+            new_epoch_dirs={'h0': ['/g/epoch_2'], 'h1': ['/g/epoch_2']},
+            manifest_rewritten={'h0': True, 'h1': True},
+            sealed_before={'h0': 0, 'h1': 0},
+            sealed_at_fence={'h0': 1, 'h1': 1},
+            stale_generations=['h0:/g/epoch_1', 'h1:/g/epoch_1'],
+            stale_growth=dict(missing=[], new_files=[], grown=[]),
+            no_stale_growth=True, reason=None)
+        value.update(overrides)
+        return value
+
+    def proof(self, *, stale_after=0, **overrides):
+        return fault_cells.CellDriver._stale_row_proof(
+            self.ROWS, self.REFUSAL,
+            refusal_kind='coordinator-self-fence', stale_after=stale_after,
+            owner_fence=self.owner(**overrides))
+
+    def fence(self, *, proof, window, reason=None, **overrides):
+        value = dict(
+            case='contend', tier='native',
+            refusal_kind='coordinator-self-fence', refusal_text=self.TEXT,
+            refusal_source='coordinator log', first_refusal_row=None,
+            last_success_row=1, stale_write_refused=True, typed_refusal=True,
+            no_success_after_refusal=False,
+            stale_rows=proof, stale_rows_clean=proof['clean'],
+            stale_success_after_fence=proof['stale_success_after_fence'],
+            fence_unix_ns=self.AT_FENCE, resumed_unix_ns=self.RESUMED,
+            self_fence_log_unix_ns=self.LOG_WRITE,
+            fence_reject_ms=None, fence_reject_window_ms=window,
+            fence_reject_reason=reason,
+            second_measurement_rows=200,
+            root_refused=dict(refused=True, opened=False, exit_code=1,
+                              text='owner high-water 2 exceeds the allocated '
+                                   'generation 1'),
+            owner_fence=self.owner())
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def record(fence):
+        return fault_cells.fence_record(types.SimpleNamespace(
+            cell=dict(id='S1-5S-lapse-native'), parts=[], fence=fence))
+
+    def test_the_self_fence_record_passes(self):
+        proof = self.proof()
+        self.assertTrue(proof['clean'], proof)
+        window, reason = fault_cells.CellDriver._self_fence_window(
+            self.AT_FENCE, resumed_ns=self.RESUMED, log_ns=self.LOG_WRITE,
+            baseline_ns=self.BASELINE)
+        self.assertIsNone(reason)
+        record = self.record(self.fence(proof=proof, window=window))
+        self.assertTrue(record['ok'], record)
+        named = {check['check']: check for check in record['checks']}
+        self.assertTrue(named['no stale-writer write completed after the fence']['ok'])
+        self.assertTrue(named['exclusive writes are proven']['ok'])
+        latency = named['fence latency measured or bounded']['detail']
+        self.assertEqual(latency['kind'], 'coordinator-self-fence')
+        self.assertIsNone(latency['exact_ms'])
+        self.assertEqual(latency['window']['lower_ms'],
+                         (self.RESUMED - self.AT_FENCE) / 1e6)
+        self.assertEqual(latency['window']['upper_ms'],
+                         (self.LOG_WRITE - self.BASELINE) / 1e6)
+
+    def test_a_self_fence_with_a_grown_epoch1_file_fails(self):
+        proof = self.proof(no_stale_growth=False,
+                           stale_growth=dict(missing=[], new_files=[],
+                                             grown=['/g/epoch_1/wal_0']),
+                           reason='the stale generation\'s WAL gained files or '
+                                  'bytes after the fence')
+        self.assertFalse(proof['clean'])
+        self.assertIn('gained files or bytes', proof['reason'])
+        record = self.record(self.fence(proof=proof, window=None,
+                                        reason='not measured'))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['no stale-writer write completed after the fence']['ok'])
+        self.assertIn('gained files or bytes',
+                      named['no stale-writer write completed after the fence'][
+                          'detail']['reason'])
+        self.assertFalse(named['exclusive writes are proven']['ok'])
+        self.assertIn('gained files or bytes',
+                      named['exclusive writes are proven']['detail']['reason'])
+
+    def test_a_self_fence_with_a_stale_success_after_the_fence_fails(self):
+        proof = self.proof(stale_after=2)
+        self.assertFalse(proof['clean'])
+        self.assertIn('2 stale-writer write(s)', proof['reason'])
+        record = self.record(self.fence(proof=proof, window=None,
+                                        reason='not measured'))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['no stale-writer write completed after the fence']['ok'])
+        self.assertIn('2 stale-writer',
+                      named['no stale-writer write completed after the fence'][
+                          'detail']['reason'])
+
+    def test_a_self_fence_without_the_owner_proof_fails_closed(self):
+        for kwargs in (dict(evidence_available=False),
+                       dict(fence_counters_increased=False,
+                            reason='the owners published no new generation'),
+                       dict(no_stale_growth=False,
+                            reason='the stale generation\'s WAL gained files '
+                                   'or bytes')):
+            with self.subTest(**kwargs):
+                proof = self.proof(**kwargs)
+                self.assertFalse(proof['clean'])
+                self.assertTrue(proof.get('reason'))
+
+    def test_a_self_fence_without_a_log_instant_is_not_measurable(self):
+        window, reason = fault_cells.CellDriver._self_fence_window(
+            self.AT_FENCE, resumed_ns=self.RESUMED, log_ns=None,
+            baseline_ns=self.BASELINE)
+        self.assertIsNone(window)
+        self.assertIn('not measurable', reason)
+        # The plan requires the fence-reject time to be recorded, so a missing
+        # bound fails the cell instead of passing silently.
+        record = self.record(self.fence(proof=self.proof(), window=None,
+                                        reason=reason))
+        self.assertFalse(record['ok'])
+        detail = [check for check in record['checks']
+                  if check['check'] == 'fence latency measured or bounded'][0]
+        self.assertFalse(detail['ok'])
+        self.assertIn('not measurable', detail['detail']['reason'])
+
+    def test_the_self_fence_window_is_bounded_by_the_release_and_the_log(self):
+        window, reason = fault_cells.CellDriver._self_fence_window(
+            self.AT_FENCE, resumed_ns=self.RESUMED, log_ns=self.LOG_WRITE,
+            baseline_ns=self.BASELINE)
+        self.assertIsNone(reason)
+        self.assertGreater(window['upper_ms'], window['lower_ms'])
+        self.assertFalse(window['includes_pause'])
+        late, reason = fault_cells.CellDriver._self_fence_window(
+            self.AT_FENCE, resumed_ns=self.RESUMED,
+            log_ns=self.BASELINE - 1_000_000, baseline_ns=self.BASELINE)
+        self.assertIsNone(late)
+        self.assertIn('inconsistent', reason)
+
+    def test_the_owner_row_kind_keeps_the_completion_order_proof(self):
+        rows_ = self.ROWS + [dict(phase='measurement', outcome='unknown_mutation',
+                                  completed_ns='2')]
+        refusal = dict(refused=True, first=2, last_success=1,
+                       no_success_after=True, typed=True, text='lease lapsed')
+        proof = fault_cells.CellDriver._stale_row_proof(
+            rows_, refusal, refusal_kind='owner-row', stale_after=0,
+            owner_fence=None)
+        self.assertTrue(proof['clean'], proof)
+        after = rows_ + [dict(phase='measurement', outcome='success',
+                              completed_ns='3')]
+        # `_refusal` derives this from the rows; here it is passed as the
+        # driver receives it, with a success after the first refusal.
+        stale_refusal = dict(refusal, no_success_after=False)
+        proof = fault_cells.CellDriver._stale_row_proof(
+            after, stale_refusal, refusal_kind='owner-row', stale_after=0,
+            owner_fence=None)
+        self.assertFalse(proof['clean'])
+        self.assertIn('succeeded after its first refusal', proof['reason'])
+
+
 class OwnerFenceProof(unittest.TestCase):
     """The owner-side counter is the generation, not a marker count."""
 
