@@ -680,6 +680,65 @@ class OwnerWAL(unittest.TestCase):
         self.assertTrue(gate['reached'])
         self.assertIn('directory sync', gate['note'])
 
+    def test_the_wal_baseline_stops_when_the_coordinator_exited(self):
+        cluster = self.cluster([dict(host='h1', files={}, roots={})])
+        driver = fault_cells.CellDriver(
+            cluster, fault_cells.mechanism.find('S1-6S-unlink-native'))
+        dead = types.SimpleNamespace(alive=lambda: False)
+        with patch.object(fault_cells.time, 'sleep', lambda _: None):
+            self.assertIsNone(driver._wait_for_wal_baseline('h1', timeout=30, child=dead))
+
+    def test_the_retirement_gate_stops_when_the_coordinator_exited(self):
+        class Dying:
+            """Alive for the baseline, gone at the first retirement poll."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def alive(self):
+                self.calls += 1
+                return self.calls <= 1
+
+            def completion_ready(self):
+                return True
+
+        view = dict(host='h1',
+                    files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
+                    roots={})
+        cluster = self.cluster([view])
+        driver = fault_cells.CellDriver(
+            cluster, fault_cells.mechanism.find('S1-6S-unlink-native'))
+        with patch.object(fault_cells.time, 'sleep', lambda _: None):
+            gate = driver.gate_retirement('h1', 'unlink', timeout=30, child=Dying())
+        self.assertFalse(gate['reached'])
+        self.assertEqual(gate['reason'],
+                         'coordinator exited before the owner retirement')
+
+    def test_the_retirement_poll_stops_when_the_coordinator_exited(self):
+        class Dying:
+            def __init__(self):
+                self.calls = 0
+
+            def alive(self):
+                self.calls += 1
+                return self.calls <= 1
+
+            def completion_ready(self):
+                return True
+
+        view = dict(host='h1',
+                    files={'/g/wal_0000000000000000': dict(size=1, mtime=1.0)},
+                    roots={})
+        cluster = self.cluster([view])
+        cluster.owners = ['h1']
+        driver = fault_cells.CellDriver(
+            cluster, fault_cells.mechanism.find('S1-6S-unlink-native'))
+        with patch.object(fault_cells.time, 'sleep', lambda _: None):
+            gate = driver.await_owner_retirement(Dying(), timeout=30)
+        self.assertFalse(gate['reached'])
+        self.assertEqual(gate['reason'],
+                         'coordinator exited before the owner retirement')
+
 
 class OwnerRolls(unittest.TestCase):
     def test_the_highest_wal_file_id_proves_the_roll(self):

@@ -916,15 +916,19 @@ class CellDriver:
             return {}
         return {'cr': [stat.st_size, stat.st_mtime_ns]}
 
-    def _wait_for_wal_baseline(self, host, *, timeout=GATE_TIMEOUT_SECONDS):
+    def _wait_for_wal_baseline(self, host, *, timeout=GATE_TIMEOUT_SECONDS, child=None):
         """A WAL baseline taken after the owner wrote, not at launch.
 
         The measurement run preloads before the relocation phase, so the first
         files appear seconds after launch. Baselining an empty tree would make
-        the later unlink unobservable.
+        the later unlink unobservable. A run that has already exited has no
+        baseline: `None` lets the gate name the exit instead of polling to its
+        timeout.
         """
         deadline = time.monotonic() + timeout
         while True:
+            if child is not None and not child.alive():
+                return None
             view = self.cluster.wal(host)
             if view['files']:
                 return view
@@ -941,7 +945,13 @@ class CellDriver:
         is released once a file disappears, and the binary's own gate timeout
         bounds the wait if it never does.
         """
-        before = {host: self._wait_for_wal_baseline(host) for host in self.cluster.owners}
+        before = {}
+        for host in self.cluster.owners:
+            view = self._wait_for_wal_baseline(host, child=child)
+            if view is None:
+                return dict(reached=False, observations=[],
+                            reason='coordinator exited before the owner retirement')
+            before[host] = view
         ready = self.wait_for(
             child, lambda: dict(reached=child.completion_ready()), timeout=timeout,
             label='measurement completion gate', poll=0.05)
@@ -951,6 +961,10 @@ class CellDriver:
         started = time.monotonic()
         observations = []
         while True:
+            if not child.alive():
+                return dict(reached=False,
+                            reason='coordinator exited before the owner retirement',
+                            observations=observations[-20:])
             current = {host: self.cluster.wal(host) for host in self.cluster.owners}
             gone = {host: [path for path in before[host]['files']
                            if path not in current[host]['files']]
@@ -970,13 +984,19 @@ class CellDriver:
 
     def gate_retirement(self, host, cut, *, timeout=GATE_TIMEOUT_SECONDS, child=None):
         base_started = time.monotonic()
-        before = (self._wait_for_wal_baseline(host, timeout=timeout)
+        before = (self._wait_for_wal_baseline(host, timeout=timeout, child=child)
                   if child is not None else self.cluster.wal(host))
+        if before is None:
+            return dict(reached=False, cut=cut,
+                        reason='coordinator exited before the owner retirement')
         if cut == 'dir-sync':
             # A root exists only after the owner's first store. The rewrite
             # being cut on is a change of an existing root, so baseline once
             # one exists instead of treating its first creation as a rewrite.
             while not before['roots']:
+                if child is not None and not child.alive():
+                    return dict(reached=False, cut=cut,
+                                reason='coordinator exited before the owner retirement')
                 if time.monotonic() - base_started >= timeout:
                     return dict(reached=False, cut=cut,
                                 reason='no durable root to baseline')
@@ -996,6 +1016,10 @@ class CellDriver:
         started = time.monotonic()
         observations = []
         while True:
+            if child is not None and not child.alive():
+                return dict(reached=False, cut=cut,
+                            reason='coordinator exited before the owner retirement',
+                            observations=observations[-20:])
             current = self.cluster.wal(host)
             gone = [path for path in baseline if path not in current['files']]
             moved = [path for path, row in current['roots'].items()
