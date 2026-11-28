@@ -41,7 +41,7 @@ class Store:
 class CampaignCap(unittest.TestCase):
     def test_the_reviewed_cap_and_spent_total_are_in_the_document(self):
         campaign = gcp_budget.load()['campaign']
-        self.assertEqual(campaign['cap_usd'], 300.0)
+        self.assertEqual(campaign['cap_usd'], 500.0)
         self.assertEqual(campaign['spent_usd'], 76.4)
         self.assertEqual(campaign['hosts'], 3)
 
@@ -62,18 +62,18 @@ class CampaignCap(unittest.TestCase):
             admitted = gcp_budget.admit_campaign(hours, 3)
             self.assertEqual(admitted['fleet_ceiling_usd'], ceiling)
             self.assertEqual(admitted['spent_usd'], 76.40)
-            self.assertEqual(admitted['cap_usd'], 300.00)
+            self.assertEqual(admitted['cap_usd'], 500.00)
             self.assertAlmostEqual(
-                admitted['remaining_after_usd'], 223.60 - ceiling, places=2)
+                admitted['remaining_after_usd'], 423.60 - ceiling, places=2)
 
     def test_a_window_that_crosses_the_cap_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'campaign cap'):
-            gcp_budget.admit_campaign(20, 3)
+            gcp_budget.admit_campaign(40, 3)
 
     def test_spent_plus_the_ceiling_above_the_cap_is_refused(self):
         path = Path(__file__).with_name('budget.json')
         value = json.loads(path.read_text())
-        value['campaign']['spent_usd'] = 250.00
+        value['campaign']['spent_usd'] = 450.00
         with self.assertRaisesRegex(ValueError, 'campaign cap'):
             gcp_budget.admit_campaign(5, 3, value)
 
@@ -85,12 +85,12 @@ class CampaignCap(unittest.TestCase):
         admitted = gcp_budget.admit_campaign(5, 3, store=store,
                                              run_id='bench-1', stage='stage1')
         self.assertEqual(admitted['committed_usd'], 60.42)
-        self.assertAlmostEqual(admitted['remaining_after_usd'], 223.60 - 60.42, places=2)
+        self.assertAlmostEqual(admitted['remaining_after_usd'], 423.60 - 60.42, places=2)
         # Another stage sums on top of the first.
         admitted = gcp_budget.admit_campaign(6, 3, store=store,
                                              run_id='bench-1', stage='stage2')
         self.assertEqual(admitted['committed_usd'], 60.42)
-        self.assertAlmostEqual(admitted['remaining_after_usd'], 223.60 - 60.42 - 72.50, places=2)
+        self.assertAlmostEqual(admitted['remaining_after_usd'], 423.60 - 60.42 - 72.50, places=2)
         gcp_budget.reserve_window(store, 'bench-1', 'stage2', 6, 3)
         self.assertEqual(gcp_budget.committed_cents(store), 6042 + 7250)
         with self.assertRaisesRegex(ValueError, 'conflicts|different window'):
@@ -101,6 +101,8 @@ class CampaignCap(unittest.TestCase):
         gcp_budget.reserve_window(store, 'bench-1', 'stage1', 5, 3)
         gcp_budget.reserve_window(store, 'bench-1', 'stage2', 6, 3)
         gcp_budget.reserve_window(store, 'bench-1', 'stage3', 2, 3)
+        for stage in ('stage4', 'stage5', 'stage6'):
+            gcp_budget.reserve_window(store, 'bench-1', stage, 6, 3)
         with self.assertRaisesRegex(ValueError, 'campaign cap'):
             gcp_budget.admit_campaign(6, 3, store=store,
                                       run_id='bench-1', stage='extra')
