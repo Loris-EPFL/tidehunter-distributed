@@ -183,7 +183,11 @@ class SnapshotGate(unittest.TestCase):
         run = Path(root) / 'measure' / 'run'
         run.mkdir(parents=True)
         (run / 'samples.csv.tmp').write_text(sample_rows(fault_cells.GATE_WRITES))
-        region = Path(root) / 'measure' / 'coordinator' / 'cr'
+        # The gate derives the database from the spec the child opened:
+        # `kv-research` appends `coordinator` to `backend.options.path`.
+        (run.parent / 'spec.json').write_text(json.dumps(
+            {'backend': {'options': {'path': str(run.parent / 'coordinator')}}}))
+        region = run.parent / 'coordinator' / 'coordinator' / 'cr'
         region.parent.mkdir(parents=True)
         return run, region
 
@@ -207,7 +211,37 @@ class SnapshotGate(unittest.TestCase):
         self.assertTrue(gate['reached'], gate)
         self.assertIn('cr', gate['observations'][-1]['changed'])
 
-    def test_creating_the_region_at_open_is_not_a_store(self):
+    def test_the_first_appearance_of_cr_is_the_store(self):
+        """A fresh database has no region until the pass stores one.
+
+        `S1-2S-snapshot-*` opens `kind: create` and `cr` appears only at the
+        first store, so the appearance is the cut; treating it as a baseline
+        would make the gate wait for a second store that the run never reaches.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            self.assertFalse(region.exists())
+            calls = []
+
+            def sleep(_):
+                calls.append(1)
+                if len(calls) == 2:
+                    region.write_bytes(b'stored root')
+            with patch.object(fault_cells.time, 'sleep', sleep):
+                gate = self.driver().gate_snapshot(self.child(run), timeout=1)
+        self.assertTrue(gate['reached'], gate)
+        first = gate['observations'][0]
+        self.assertEqual(first['files'], 0)
+        self.assertEqual(first['changed'], {})
+        changed = gate['observations'][-1]['changed']
+        self.assertEqual(list(changed), ['cr'])
+        self.assertIsNone(changed['cr'][0])
+        size, mtime_ns = changed['cr'][1]
+        self.assertEqual(size, len(b'stored root'))
+        self.assertIsInstance(mtime_ns, int)
+
+    def test_the_temp_file_alone_never_fires(self):
+        """`cr.v4.tmp` exists before the rename: a cut there loses the store."""
         with tempfile.TemporaryDirectory() as tmp:
             run, region = self.tree(tmp)
             calls = []
@@ -215,10 +249,19 @@ class SnapshotGate(unittest.TestCase):
             def sleep(_):
                 calls.append(1)
                 if len(calls) == 1:
-                    region.write_text('created at open')
+                    region.with_name('cr.v4.tmp').write_bytes(b'partial region')
             with patch.object(fault_cells.time, 'sleep', sleep):
-                gate = self.driver().gate_snapshot(self.child(run), timeout=0.3)
+                gate = self.driver().gate_snapshot(self.child(run), timeout=0.05)
         self.assertFalse(gate['reached'], gate)
+        for row in gate['observations']:
+            self.assertEqual(row['changed'], {})
+            self.assertEqual(row['files'], 0)
+
+    def test_the_coordinator_database_follows_the_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, region = self.tree(tmp)
+            self.assertEqual(self.driver()._coordinator_database(
+                self.child(run)), region.parent)
 
     def test_a_dead_coordinator_ends_the_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,7 +270,9 @@ class SnapshotGate(unittest.TestCase):
                                           rows=lambda: [])
             gate = self.driver().gate_snapshot(child, timeout=1)
         self.assertFalse(gate['reached'])
-        self.assertIn('exited before', gate['reason'])
+        self.assertEqual(
+            gate['reason'],
+            'coordinator exited before snapshot control-region store')
 
     def test_the_gate_records_the_coordinator_wal_bytes(self):
         """The next run must answer how many value bytes the engine had published.
@@ -241,7 +286,7 @@ class SnapshotGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run, region = self.tree(tmp)
             region.write_text('region v1')
-            wal = run.parent / 'coordinator' / 'wal_0000000000000000'
+            wal = region.parent / 'wal_0000000000000000'
             wal.write_bytes(b'x' * 8192)
             before = wal.stat().st_blocks * 512
             calls = []

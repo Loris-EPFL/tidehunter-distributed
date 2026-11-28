@@ -838,12 +838,15 @@ class CellDriver:
     def gate_snapshot(self, child, *, timeout=GATE_TIMEOUT_SECONDS):
         """Wait until the snapshot pass stores a new control region.
 
-        The coordinator's index lives in `cr` (db.rs `CONTROL_REGION_FILE`); the
-        snapshot writes a temp and renames it, so a store changes the file's
-        size or mtime. The first observation is the baseline (the region also
-        appears at open); the caller waits for the write gate first, so a store
-        is taken over data. This gate reads only files: the sample file is too
-        large to parse on every poll.
+        The coordinator's index lives in `cr` (db.rs `CONTROL_REGION_FILE`) under
+        the database directory the backend derives from the spec
+        (`options.path/coordinator`); the snapshot writes a temp and renames it,
+        so a store changes the file's size or mtime. A fresh database has no
+        `cr` until the first store, so its appearance is the store; a reopen
+        starts from the region the previous run left, so a changed `cr` is the
+        store. The caller waits for the write gate first, so a store is taken
+        over data. This gate reads only files: the sample file is too large to
+        parse on every poll.
 
         Each observation also carries the coordinator WAL's allocated filesystem
         footprint, which bounds what the engine had written at the cut. It is a
@@ -861,9 +864,6 @@ class CellDriver:
             row = dict(coordinator_wal_footprint_bytes=wal,
                        coordinator_wal_footprint_delta=(
                            None if baseline is None or wal is None else wal - baseline))
-            if not previous:
-                state['previous'] = current
-                return dict(row, reached=False, note='waiting for the control region')
             changed = {name: [previous.get(name), value]
                        for name, value in current.items()
                        if previous.get(name) != value}
@@ -877,6 +877,18 @@ class CellDriver:
                                'and not a value-byte count')
         return gate
 
+    def _coordinator_database(self, child):
+        """The coordinator database directory of one run.
+
+        `kv-research` opens `backend.options.path/coordinator` as the database
+        (`benchmarks/kv-research/src/backends/tidehunter.rs`, `coordinator_path`)
+        and the hybrid index writes `cr` and its WAL files there. The spec sits
+        beside the child's output, so this reads the document the child opened
+        instead of rebuilding the backend's path from the driver's side.
+        """
+        spec = json.loads((Path(child.output).parent / 'spec.json').read_text())
+        return Path(spec['backend']['options']['path']) / 'coordinator'
+
     def _coordinator_wal_footprint(self, child):
         """Allocated filesystem footprint of the coordinator's WAL files, or None.
 
@@ -885,7 +897,7 @@ class CellDriver:
         written. A file that cannot be stat'ed is skipped, and no WAL at all
         answers None.
         """
-        root = Path(child.output).parent / 'coordinator'
+        root = self._coordinator_database(child)
         total, seen = 0, False
         for path in root.glob('wal_*'):
             try:
@@ -896,17 +908,13 @@ class CellDriver:
         return total if seen else None
 
     def _snapshot_files(self, child):
-        """Size and nanosecond mtime of the control region and its temp file."""
-        root = Path(child.output).parent / 'coordinator'
-        values = {}
-        for name in ('cr', 'cr.v4.tmp'):
-            path = root / name
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            values[name] = [stat.st_size, stat.st_mtime_ns]
-        return values
+        """Size and nanosecond mtime of the control region, or empty before it exists."""
+        path = self._coordinator_database(child) / 'cr'
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return {}
+        return {'cr': [stat.st_size, stat.st_mtime_ns]}
 
     def _wait_for_wal_baseline(self, host, *, timeout=GATE_TIMEOUT_SECONDS):
         """A WAL baseline taken after the owner wrote, not at launch.
