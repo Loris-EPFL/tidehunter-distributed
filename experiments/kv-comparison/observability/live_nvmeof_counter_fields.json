@@ -83,6 +83,7 @@
     "publication_samples",
     "queue_ns",
     "queue_samples",
+    "read_controller_resumes",
     "read_io_ns",
     "read_io_samples",
     "read_lane_pin_failures",

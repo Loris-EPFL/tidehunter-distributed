@@ -72,7 +72,9 @@ LIVE_NVMEOF_EXTRA_FIELDS = (
     "leased_submit_ready_left_full_batches", "leased_deferred_submits",
     # W1 write resume: monotonic attempt, rewrite, frame and refusal counts
     # (fetch_add in live_metrics.rs), so they are measurement deltas too.
-    "resume_attempts", "resume_rewrites", "resume_frames", "resume_refused")
+    "resume_attempts", "resume_rewrites", "resume_frames", "resume_refused",
+    # Read controller loss: the verified-lost read resumes (monotonic event count).
+    "read_controller_resumes")
 LIVE_NVMEOF_EXTRA_STAGES = ("delivery", "controller_connect", "controller_disconnect", "leased_write",
                             "extent_switch", "adoption_async", "adoption_settle")
 # Lifetime maxima (gauge peaks): exported as boundary snapshots, never as deltas.

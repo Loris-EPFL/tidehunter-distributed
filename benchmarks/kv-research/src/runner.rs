@@ -832,6 +832,7 @@ const LIVE_NVMEOF_DELTA_FIELDS: &[&str] = &[
     "namespace_setup_samples",
     "read_io_ns",
     "read_io_samples",
+    "read_controller_resumes",
     "route_evidence_dropped",
     "fence_evidence_dropped",
     "lane_inflight_samples",

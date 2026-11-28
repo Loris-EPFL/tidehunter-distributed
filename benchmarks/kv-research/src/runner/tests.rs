@@ -3259,6 +3259,7 @@ fn live_interval_requires_complete_monotone_route_counters() {
         "leased_flush_samples",
         "leased_flush_covered_frames",
         "read_lane_pin_failures",
+        "read_controller_resumes",
         "leased_bytes",
         "leased_skip_markers",
         "extents_leased",
