@@ -18,12 +18,16 @@ def context(receipts=('r0.json', 'r1.json')):
 
 def write_run(directory, *, status='completed', completed=1000, errors=0,
               phase_counts=None, distributions=None, role='measure',
-              read_rpc=10, open_kind='create', recovery=None, live=None):
+              read_rpc=10, open_kind='create', recovery=None, live=None,
+              max_pending_read_bytes=64 << 20, flight_metadata_bytes=6_408_864,
+              device_reads=None, measurement=True):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'summary.json').write_text(json.dumps(dict(
         status=status, durability={}, started_unix_seconds=0.0,
-        finished_unix_seconds=1.0, backend={}, execution={},
+        finished_unix_seconds=1.0, execution={},
+        backend={'configuration': {'client': {
+            'max_pending_read_bytes': max_pending_read_bytes}}},
         phase_counts=phase_counts or {'realized_mix': {}},
         distributions=distributions or {}, limitations=[])))
     (directory / 'manifest.json').write_text(json.dumps(dict(
@@ -32,14 +36,24 @@ def write_run(directory, *, status='completed', completed=1000, errors=0,
     live_lines = [f'tidehunter_nvmeof_live_{name} {value}'
                   for name, value in (live or {}).items()]
     (directory / 'live.prom').write_text('\n'.join(live_lines) + '\n')
-    (directory / 'measurement-read-evidence.json').write_text(json.dumps(dict(
-        start=dict(coordinator=dict(read_rpc_count=read_rpc),
-                   coordinator_open=dict(kind=open_kind,
-                                         recovery=recovery or dict(
-                                             tail_batches=3, tail_bytes=4096,
-                                             below_cut_skipped=0, fencing_ns=10))),
-        deltas=dict(coordinator=dict(available=True,
-                                     counters=dict(read_rpc_count=read_rpc))))))
+    if measurement:
+        nvme = dict(available=device_reads is not None,
+                    counters={} if device_reads is None
+                    else {'completed_read_ops': device_reads})
+        (directory / 'measurement-read-evidence.json').write_text(json.dumps(dict(
+            start=dict(coordinator=dict(
+                           read_rpc_count=read_rpc,
+                           read_singleflight_metadata_bytes=flight_metadata_bytes),
+                       coordinator_open=dict(kind=open_kind,
+                                             recovery=recovery or dict(
+                                                 tail_batches=3, tail_bytes=4096,
+                                                 below_cut_skipped=0, fencing_ns=10))),
+            deltas=dict(coordinator=dict(available=True,
+                                         counters=dict(read_rpc_count=read_rpc))),
+            live_nvmeof=nvme)))
+    (directory / 'read-evidence.json').write_text(json.dumps(dict(
+        coordinator=dict(read_rpc_count=read_rpc, kind=open_kind),
+        coordinator_open=dict(kind=open_kind))))
     return directory
 
 
@@ -201,21 +215,81 @@ class Specs(unittest.TestCase):
 
 
 class Verification(unittest.TestCase):
-    def test_m6_reports_latency_and_owner_reads(self):
-        cell = mechanism.find('M6-w26-c16')
+    def _m6_run(self, cell_id, *, calls, read_rpc, device_reads, **extra):
+        cell = mechanism.find(cell_id)
         with tempfile.TemporaryDirectory() as directory:
-            write_run(directory, completed=20_000, read_rpc=40_000,
+            write_run(directory, completed=calls, read_rpc=read_rpc,
+                      device_reads=device_reads,
                       phase_counts={'realized_mix': {
-                          'measurement.get_many': {'offered': 20_000, 'fraction': 1.0}}},
+                          'measurement.get_many': {'offered': calls, 'fraction': 1.0}}},
                       distributions={'measurement.get_many.api.success':
-                                     {'count': 20_000, 'p50_upper_bound_ns': 10,
-                                      'p99_upper_bound_ns': 20}})
-            record = mechanism.verify(cell, directory)
+                                     {'count': calls, 'p50_upper_bound_ns': 10,
+                                      'p99_upper_bound_ns': 20}},
+                      **extra)
+            return cell, mechanism.verify(cell, directory)
+
+    def test_m6_reports_latency_and_owner_reads(self):
+        # 26 keys x 16 concurrent x 25,867 B per member fits the 60.7 MB credit,
+        # so two owners give exactly two RPCs per call and the bound is asserted.
+        cell, record = self._m6_run('M6-w26-c16', calls=20_000,
+                                    read_rpc=40_000, device_reads=520_000)
         self.assertTrue(record['ok'], record)
         checks = {check['check']: check for check in record['checks']}
         self.assertEqual(checks['owner read RPCs per call at most one per owner']
                          ['detail']['per_call'], 2.0)
+        self.assertNotIn('not_applicable',
+                         checks['owner read RPCs per call at most one per owner']['detail'])
+        self.assertTrue(checks['device reads per measured key at most 1.05']['ok'])
+        self.assertEqual(checks['device reads per measured key at most 1.05']
+                         ['detail']['per_key'], 1.0)
         self.assertTrue(checks['native contention counter is not claimed']['ok'])
+
+    def test_m6_page256_wave_over_credit_is_not_applicable(self):
+        # 256 keys x 16 concurrent x 25,867 B = 105.9 MB is 1.75x the 60.7 MB
+        # credit, so the dispatch splits each owner group and 92,017 RPCs for
+        # 20,000 calls is not a violation of the per-owner statement.
+        cell, record = self._m6_run(
+            'M6-page256-c16', calls=20_000, read_rpc=92_017,
+            device_reads=4_956_160)
+        checks = {check['check']: check for check in record['checks']}
+        rpc = checks['owner read RPCs per call at most one per owner']
+        self.assertTrue(rpc['ok'], rpc)
+        self.assertTrue(rpc['detail']['not_applicable'], rpc)
+        self.assertEqual(rpc['detail']['per_call'] if 'per_call' in rpc['detail'] else
+                         rpc['detail']['read_rpc_count'] / rpc['detail']['calls'], 4.60085)
+        self.assertGreater(rpc['detail']['wave_ratio'], 1.7)
+        self.assertLess(rpc['detail']['wave_ratio'], 1.8)
+        self.assertEqual(rpc['detail']['member_charge_bytes'], 25_867)
+        self.assertEqual(rpc['detail']['credit_bytes'], 60_700_000)
+        self.assertTrue(checks['device reads per measured key at most 1.05']['ok'],
+                        checks)
+        self.assertAlmostEqual(
+            checks['device reads per measured key at most 1.05']['detail']['per_key'],
+            0.968)
+        self.assertTrue(record['ok'], record)
+
+    def test_m6_device_read_ratio_above_limit_fails(self):
+        cell, record = self._m6_run(
+            'M6-page256-c16', calls=20_000, read_rpc=92_017,
+            device_reads=6_144_000)
+        checks = {check['check']: check for check in record['checks']}
+        self.assertFalse(checks['device reads per measured key at most 1.05']['ok'])
+        self.assertAlmostEqual(
+            checks['device reads per measured key at most 1.05']['detail']['per_key'],
+            1.2)
+        self.assertFalse(record['ok'])
+
+    def test_m6_requires_the_measurement_evidence(self):
+        # read-evidence.json is cumulative through preload and warmup, so it
+        # cannot stand in for the measurement-window device-read delta.
+        cell, record = self._m6_run(
+            'M6-w26-c16', calls=20_000, read_rpc=40_000,
+            device_reads=None, measurement=False)
+        checks = {check['check']: check for check in record['checks']}
+        device = checks['device reads per measured key at most 1.05']
+        self.assertFalse(device['ok'])
+        self.assertIn('measurement-read-evidence.json', device['detail']['reason'])
+        self.assertFalse(record['ok'])
 
     def test_m13_requires_a_covering_flush(self):
         cell = mechanism.find('M13-batch132-synchronous')

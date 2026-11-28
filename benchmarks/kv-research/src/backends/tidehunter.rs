@@ -1171,7 +1171,8 @@ impl KvBackend for TidehunterBackend {
             db.visit_timing_metrics(|name, value| {
                 if matches!(
                     name,
-                    "read_profile_live_inline"
+                    "read_singleflight_metadata_bytes"
+                        | "read_profile_live_inline"
                         | "write_authority_prepare_ns"
                         | "write_authority_admit_ns"
                         | "write_authority_windows"

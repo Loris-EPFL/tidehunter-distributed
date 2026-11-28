@@ -110,13 +110,17 @@ Consequently a read of a clean unloaded cell fetches the member from its owner
 even though the coordinator's LRU still holds the value: that owner round trip
 is the price of the ordering guarantee. A Sui batch read resolves every key at
 one sampled cut with the same lookup, serves a resident value inline, and
-fetches all misses in one batched owner read per owner; a retired member is
-retried per slot through the scalar path, which re-resolves its key exactly once,
+fetches all misses in one batched owner read per owner while one concurrent wave
+of members fits the pending-read byte credit (`max_pending_read_bytes` minus the
+flight metadata); a wave above it is split, so one call can issue several owner
+reads per owner. A retired member is retried per slot through the scalar path,
+which re-resolves its key exactly once,
 as native `Db::multi_get`'s per-key `Db::get` does. A keyspace whose index key is
 a reduction of the full key (`KeyIndexing::Reduction`, Sui's digest keyspaces)
 takes the same batched read: the batch returns each member's own key, a slot
 whose member names another full key with the same reduction answers absent, and
-the page still costs one owner read per owner. A keyspace with a relocation
+the page still costs one owner read per owner under the same byte-credit
+condition. A keyspace with a relocation
 filter keeps the same cut-checked lookup: a filtered relocation marks dropped
 keys `Removed` while deliberately leaving their resident value, and only the
 index-first lookup answers not-found for them. A latched read consults the LRU

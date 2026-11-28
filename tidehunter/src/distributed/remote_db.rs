@@ -1926,7 +1926,11 @@ impl RemoteDatabase {
     /// A keyspace whose index key is a reduction of the full key is fetched the
     /// same way: the member's own key binds each slot, a member naming another
     /// full key with the same reduction answers absent, and the page costs one
-    /// owner read per owner (see [`Self::get_many_with`]). A failed owner page
+    /// owner read per owner while one concurrent wave of members fits the
+    /// pending-read byte credit (`max_pending_read_bytes` minus
+    /// `flight_metadata_bytes`; `pending_read.rs` `member_charge`). A wave above
+    /// the credit is split, so one call can issue several owner reads per owner
+    /// (see [`Self::get_many_with`]). A failed owner page
     /// there re-reads every slot through the scalar reduced read even though
     /// this is not the live read: the failure cannot be attributed to one slot,
     /// and the scalar read is what verified the full key before the page
@@ -1948,7 +1952,10 @@ impl RemoteDatabase {
 
     /// The batch read of the Sui adapter at the current publication cut: the
     /// keys are resolved at that one cut, a resident value answers inline, and
-    /// every miss is fetched in one batched owner read per owner. Native
+    /// every miss is fetched in one batched owner read per owner while one
+    /// concurrent wave of members fits the pending-read byte credit; a wave
+    /// above it is split, so one call can issue several owner reads per owner.
+    /// Native
     /// `multi_get` runs one `Db::get` per key, so a retired member is retried
     /// per slot (see [`Self::get_many_with`]).
     pub(super) fn get_many_live<K: AsRef<[u8]>>(

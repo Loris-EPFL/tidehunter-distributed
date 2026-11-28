@@ -471,7 +471,9 @@ impl ValueReader {
     /// `RemoteDatabase::read_value`).
     ///
     /// Owner grouping, the page bound, the call deadline and a test fault are the
-    /// same as [`Self::read_many`], so a page costs one owner read per owner.
+    /// same as [`Self::read_many`], so a page costs one owner read per owner while
+    /// one concurrent wave of members fits the pending-read byte credit; a wave
+    /// above it is split into several owner reads per owner.
     pub(crate) fn read_many_entries(
         &self,
         ks: KeySpace,

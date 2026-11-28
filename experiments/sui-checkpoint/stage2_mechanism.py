@@ -42,6 +42,12 @@ sys.dont_write_bytecode = True
 KEYS = 65_536
 SEED = 1775
 OWNERS = 2
+# A member is charged `3 * (frame_bytes + 256) + 523` (`pending_read.rs`
+# `member_charge`: three wire buckets, the VersionPosition and HashMap
+# bookkeeping, the BatchSignal Arc and vector growth). A read wave fits the
+# pending-read byte credit only when every member can be admitted at once.
+MEMBER_CHARGE_FIXED_BYTES = 523
+DEVICE_READS_PER_KEY_LIMIT = 1.05
 TIERS = ('native', 'synchronous')
 UNIFORM = 'uniform'
 # 2 x (65,536 + KEY_BYTES(32) + 32) + 96 = 131,296 B: the plan's mainnet batch is
@@ -431,6 +437,58 @@ def evidence(output):
     return dict(source=None, open=None, read_rpc_count=None, available=False)
 
 
+def measurement_evidence(output):
+    """Measurement-boundary evidence only; the close-time fallback is excluded.
+
+    `read-evidence.json` is cumulative from adapter open, so its device-read
+    counters include preload and warmup. Only `measurement-read-evidence.json`
+    has the start/end delta of the measurement window. A missing counter is
+    null, never zero.
+    """
+    path = Path(output) / 'measurement-read-evidence.json'
+    if not path.is_file():
+        return dict(source=None, available=False, nvme_available=False,
+                    open=None, read_rpc_count=None,
+                    completed_read_ops=None, flight_metadata_bytes=None)
+    value = _json(path)
+    start = value.get('start') or {}
+    coordinator = start.get('coordinator') or {}
+    deltas = (value.get('deltas') or {}).get('coordinator') or {}
+    nvme = value.get('live_nvmeof') or {}
+    nvme_counters = nvme.get('counters') or {}
+    return dict(source=str(path),
+                available=bool(deltas.get('available', False)),
+                nvme_available=bool(nvme.get('available', False)),
+                open=start.get('coordinator_open'),
+                read_rpc_count=(deltas.get('counters') or {}).get('read_rpc_count'),
+                completed_read_ops=nvme_counters.get('completed_read_ops'),
+                flight_metadata_bytes=coordinator.get(
+                    'read_singleflight_metadata_bytes'))
+
+
+def member_charge(value_frame_bytes):
+    """The engine's per-member pending-read charge for one value frame.
+
+    Mirrors `member_charge` in `remote_db/pending_read.rs`: the frame length is
+    the only variable part, and `MEMBER_CHARGE_FIXED_BYTES` is the fixed
+    VersionPosition, HashMap-bucket, BatchSignal and vector-growth cost.
+    """
+    return 3 * (value_frame_bytes + 256) + MEMBER_CHARGE_FIXED_BYTES
+
+
+def _number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _configured_max_pending_read_bytes(output):
+    """The coordinator's configured pending-read byte cap of this run."""
+    backend = _summary(output).get('backend') or {}
+    configuration = backend.get('configuration') or {}
+    client = configuration.get('client') or {}
+    value = _number(client.get('max_pending_read_bytes'))
+    return int(value) if value is not None else None
+
+
 def _distribution(output, phase, operation, metric, outcome='success'):
     key = f'{phase}.{operation}.{metric}.{outcome}'
     row = _summary(output)['distributions'].get(key)
@@ -652,22 +710,85 @@ def verify(cell, output, *, observations=None):
     errors = manifest['errors_or_wrong_values']
 
     if cell['family'] == 'M6':
+        run = cell['runs'][0]
+        operation = 'get_many' if cell['id'].startswith(('M6-w4', 'M6-w8', 'M6-w26',
+                                                         'M6-page')) else 'read'
+        keys_per_call = run['batch'] if operation == 'get_many' else 1
         calls = sum(int(value) for key, value in counts.items()
                     if key in ('measurement.get_many', 'measurement.read'))
-        read = evidence(output)
+        measured_keys = calls * keys_per_call
+        read = measurement_evidence(output)
         rpc = read['read_rpc_count']
         checks.append(_check('no wrong value or read error', errors == 0, errors))
         checks.append(_check('every read call answered',
                              calls > 0 and manifest['completed_operations'] >= calls,
                              dict(calls=calls,
                                   completed=manifest['completed_operations'])))
-        if rpc is not None and calls:
+        # Device reads are per logical key, so the measurement-window NVMe-oF
+        # delta is the only denominator: the close-time evidence predates the
+        # measurement and includes preload and warmup.
+        device_reads = read['completed_read_ops']
+        if read['nvme_available'] and device_reads is not None and measured_keys:
+            per_key = device_reads / measured_keys
+            checks.append(_check(
+                'device reads per measured key at most 1.05',
+                per_key <= DEVICE_READS_PER_KEY_LIMIT,
+                dict(completed_device_read_ops=device_reads,
+                     measured_keys=measured_keys, per_key=per_key,
+                     limit=DEVICE_READS_PER_KEY_LIMIT, source=read['source'])))
+        else:
+            checks.append(_check(
+                'device reads per measured key at most 1.05', False,
+                dict(completed_device_read_ops=device_reads,
+                     measured_keys=measured_keys,
+                     limit=DEVICE_READS_PER_KEY_LIMIT, source=read['source'],
+                     reason='measurement-read-evidence.json must carry the '
+                            'measurement-window live_nvmeof.completed_read_ops '
+                            'delta; read-evidence.json includes warmup')))
+        # One owner read per owner per call holds only while one concurrent
+        # wave of members fits the pending-read byte credit. `pending_read.rs`
+        # `member_charge` prices each member; `dispatch_traced` cuts an owner
+        # group at `max_bytes = max_pending_read_bytes - flight_metadata_bytes`,
+        # so a larger wave is split into several RPCs per owner.
+        charge = member_charge(run['value'])
+        wave_bytes = keys_per_call * charge * run['concurrency']
+        max_pending = _configured_max_pending_read_bytes(output)
+        flight = _number(read['flight_metadata_bytes'])
+        credit = None
+        if max_pending is not None and flight is not None:
+            credit = max_pending - int(flight)
+        wave_ratio = (wave_bytes / credit) if credit is not None and credit > 0 else None
+        detail = dict(read_rpc_count=rpc, calls=calls, owners=OWNERS,
+                      keys_per_call=keys_per_call,
+                      concurrency=run['concurrency'],
+                      member_charge_bytes=charge, wave_bytes=wave_bytes,
+                      max_pending_read_bytes=max_pending,
+                      flight_metadata_bytes=flight, credit_bytes=credit,
+                      wave_ratio=wave_ratio, source=read['source'])
+        if rpc is None or not calls:
+            detail.update(not_applicable=True,
+                          reason='no measurement-window read_rpc_count delta')
             checks.append(_check('owner read RPCs per call at most one per owner',
-                                 rpc / calls <= OWNERS,
-                                 dict(read_rpc_count=rpc, calls=calls,
-                                      per_call=rpc / calls, owners=OWNERS)))
-        operation = 'get_many' if cell['id'].startswith(('M6-w4', 'M6-w8', 'M6-w26',
-                                                         'M6-page')) else 'read'
+                                 True, detail))
+        elif credit is None or credit <= 0:
+            detail.update(not_applicable=True,
+                          reason='pending-read credit is not measurable '
+                                 '(configured max or read_singleflight_metadata_bytes '
+                                 'gauge missing)')
+            checks.append(_check('owner read RPCs per call at most one per owner',
+                                 True, detail))
+        elif wave_bytes <= credit:
+            detail['per_call'] = rpc / calls
+            checks.append(_check('owner read RPCs per call at most one per owner',
+                                 rpc / calls <= OWNERS, detail))
+        else:
+            detail.update(not_applicable=True,
+                          reason='the concurrent read wave exceeds the '
+                                 'pending-read byte credit, so an owner group '
+                                 'is split and one call can issue several RPCs '
+                                 'per owner')
+            checks.append(_check('owner read RPCs per call at most one per owner',
+                                 True, detail))
         latency = _distribution(output, 'measurement', operation, 'api')
         exact = _quantiles(output, operation) or {}
         checks.append(_check('api latency recorded', latency['count'] > 0,
