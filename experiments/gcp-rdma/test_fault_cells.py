@@ -920,11 +920,9 @@ class CrashChecks(unittest.TestCase):
 
     def test_a_retirement_kill_needs_the_terminals_typed_failure(self):
         cell = fault_cells.mechanism.find('S1-6S-unlink-native')
-        text = ('kv-research: final background health failed: BackgroundFailure { '
-                'role: Relocator, reason: Panic("relocation error: Io(Custom { kind: '
-                'Other, error: \\"write core requires recovery; first causal failure: '
-                'owner=Some(0) batch=Some(BatchVersion { epoch: 1, sequence: 42 }) '
-                'stage=live_resume: Connection refused (os error 111)\\" })") }')
+        text = ('kv-research: post-workload qualification failed: write core requires '
+                'recovery; first causal failure: owner=None batch=None '
+                'stage=write_core: Connection refused (os error 111)')
         passed = fault_cells.crash_checks(cell, dict(
             gate=dict(reached=True, cut='unlink', note='after the unlink'),
             kill=dict(pids=[10], partition=0),
@@ -934,7 +932,7 @@ class CrashChecks(unittest.TestCase):
         self.assertTrue(all(check['ok'] for check in passed), passed)
         detail = checks['coordinator recorded a typed write failure']['detail']
         self.assertEqual(detail['exit_code'], 1)
-        self.assertIn('owner=Some(0)', detail['text'])
+        self.assertIn('owner=None', detail['text'])
 
         # A sample-row gate cannot satisfy the retirement check: no later phase
         # writes rows, and a stray pre-kill row proves nothing.
@@ -997,6 +995,14 @@ class CrashChecks(unittest.TestCase):
             wrong = driver.stop_on_terminal_failure(
                 child(), partition=0, log_offset=offset)
             self.assertFalse(wrong['typed'], wrong)
+
+            # The relocator's own failure carries no partition.
+            offset = driver._log_offset(child())
+            append(text.replace('owner=Some(0) batch=Some(BatchVersion { epoch: 1, '
+                                'sequence: 42 })', 'owner=None batch=None'))
+            relocator = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=offset)
+            self.assertTrue(relocator['typed'], relocator)
 
             # No exit: the bounded wait is recorded, never read as a failure.
             offset = driver._log_offset(child())

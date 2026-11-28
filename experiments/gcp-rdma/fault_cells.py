@@ -1110,17 +1110,20 @@ class CellDriver:
 
         A retirement kill lands after the measurement window, so no sample row
         follows it and the write-refusal gate cannot see the failure. The
-        failure is the coordinator's exit: the relocation pass writes through
-        the leased owner path, reaches the dead owner, and the run ends with
-        the typed first-failure record in `run.log`. Only the bytes appended
-        after the pre-signal watermark count, so a line written before the kill
+        failure is the coordinator's exit: the relocation pass reaches the dead
+        owner, and the run ends with the typed first-failure record in
+        `run.log`. The relocator's own failure poisons the write core through
+        `begin_failure` with no partition (`owner=None ... stage=write_core`);
+        a per-owner worker records `owner=Some(N)`. Either is the post-kill
+        cause; another owner's partition is not. Only the bytes appended after
+        the pre-signal watermark count, so a line written before the kill
         cannot satisfy the check.
         """
         code = child.wait(timeout)
         text = self._log_appended(child, log_offset).strip()
         owner = f'owner=Some({partition})'
         typed = (partition is not None and 'first causal failure' in text
-                 and owner in text)
+                 and (owner in text or 'owner=None' in text))
         record = dict(exit_code=code, partition=partition,
                       log_offset=log_offset, text=text, typed=typed,
                       unix_ns=now_ns())
