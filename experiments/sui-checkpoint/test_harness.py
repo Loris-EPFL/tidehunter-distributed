@@ -845,27 +845,42 @@ class LifecycleChecks(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, 'durable-cut record not found'):
             self.lifecycle(tmp, 'native')
 
-    def live(self, exposed, observed=2, fixtures=0):
+    def live(self, exposed, observed=2, fixtures=0, readonly=0, errors=0, owned=None):
         return dict(available=True, counters={
-            'target_exposed_total': exposed, 'target_observed_partitions': observed,
-            'target_fixture_partitions': fixtures})
+            'target_exposed_total': exposed,
+            'target_owned_namespaces': exposed if owned is None else owned,
+            'target_observed_partitions': observed,
+            'target_fixture_partitions': fixtures,
+            'target_readonly_commission_total': readonly,
+            'target_errors_total': errors})
 
-    def test_exports_comparison_refuses_a_new_export(self):
-        compared = run.exports_comparison(self.live(6), self.live(6))
+    def test_reopen_fence_state_records_the_open_snapshot(self):
+        # Attempt 4: the pre-close snapshot is 0 per db because it was taken at
+        # the earlier open; the reopen's fence snapshot adopts four owner
+        # exports and records no read-only commission at the fence.
+        compared = run.reopen_fence_state(self.live(0), self.live(4, owned=4))
         self.assertEqual({key: compared[key] for key in
                           ('available', 'reason', 'before', 'after',
-                           'observed_partitions', 'fixture_partitions')},
-                         dict(available=True, reason=None, before=6, after=6,
-                              observed_partitions=2, fixture_partitions=0))
-        self.assertIn('post-reopen scrape', compared['scope'])
-        with self.assertRaisesRegex(ValueError, '1 new export'):
-            run.exports_comparison(self.live(6), self.live(7))
+                           'observed_partitions', 'fixture_partitions',
+                           'owned_namespaces', 'readonly_commission_total',
+                           'target_errors_total')},
+                         dict(available=True, reason=None, before=0, after=4,
+                              observed_partitions=2, fixture_partitions=0,
+                              owned_namespaces=4, readonly_commission_total=0,
+                              target_errors_total=0))
+        self.assertIn('open fence snapshot', compared['scope'])
+        with self.assertRaisesRegex(ValueError, 'read-only export'):
+            run.reopen_fence_state(self.live(0), self.live(4, readonly=1))
+        with self.assertRaisesRegex(ValueError, 'target error'):
+            run.reopen_fence_state(self.live(0), self.live(4, errors=1))
+        with self.assertRaisesRegex(ValueError, 'fewer namespace'):
+            run.reopen_fence_state(self.live(0), self.live(4, owned=5))
         with self.assertRaisesRegex(ValueError, 'regressed'):
-            run.exports_comparison(self.live(7), self.live(6))
-        fixture = run.exports_comparison(self.live(0, fixtures=2), self.live(0, fixtures=2))
+            run.reopen_fence_state(self.live(7), self.live(6))
+        fixture = run.reopen_fence_state(self.live(0, fixtures=2), self.live(0, fixtures=2))
         self.assertFalse(fixture['available'])
         self.assertIn('fixture target', fixture['reason'])
-        missing = run.exports_comparison(dict(available=False, counters={}),
+        missing = run.reopen_fence_state(dict(available=False, counters={}),
                                          self.live(0))
         self.assertFalse(missing['available'])
 

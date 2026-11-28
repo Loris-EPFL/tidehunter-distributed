@@ -1162,8 +1162,23 @@ def durable_cut_comparison(before, after):
                       'offline state audit and the clean reopen')
 
 
-def exports_comparison(before, after):
-    """A clean reopen adopts exposed namespaces; it must not export new ones."""
+def reopen_fence_state(before, after):
+    """State of the reopen's open fence: no read-only commission, no error.
+
+    This gate claims only the reopen-fence snapshot. `target_exposed_total` is a
+    per-open fence snapshot of the owner's cumulative `namespaces_exposed`
+    counter, so it is not comparable across a restart: the pre-close scrape
+    records the earlier open, before that run's write exports, and the offline
+    state audit opens a generation in between. The reopen may therefore publish
+    the fence's own first file and adopt the exports already held by the live
+    owners.
+
+    A replay-created export is not observable at this build: the fence snapshot
+    is taken before the tail replay, and the owner's inline export statistics
+    (`LiveInlineExportStats.resolve`/`replay`) are not exported as metrics. D26
+    itself is proven by `clean_restart_replays_only_the_tail_and_creates_no_export`
+    in `tidehunter/src/distributed/remote_db/open_tests.rs`.
+    """
     reason = 'the aggregate tidehunter_nvmeof_live_* family is missing from one scrape'
     if not before['available'] or not after['available']:
         return dict(available=False, reason=reason)
@@ -1172,7 +1187,11 @@ def exports_comparison(before, after):
         raise ValueError('aggregate live NVMe-oF population changed across the reopen')
     exposed, previous = later.get('target_exposed_total'), prior.get('target_exposed_total')
     observed, fixtures = later.get('target_observed_partitions'), later.get('target_fixture_partitions')
-    if exposed is None or previous is None or observed is None or fixtures is None:
+    readonly = later.get('target_readonly_commission_total')
+    errors = later.get('target_errors_total')
+    owned = later.get('target_owned_namespaces')
+    if any(value is None for value in
+           (exposed, previous, observed, fixtures, readonly, errors, owned)):
         return dict(available=False, reason='live target exposure counters are absent')
     if fixtures and observed and fixtures >= observed:
         return dict(available=False,
@@ -1181,12 +1200,22 @@ def exports_comparison(before, after):
                     fixture_partitions=fixtures)
     if exposed < previous:
         raise ValueError('live target exposure counter regressed across the reopen')
-    if exposed > previous:
-        raise ValueError(f'a clean reopen created {exposed - previous} new export(s)')
+    if readonly:
+        raise ValueError(
+            f'the reopen fence commissioned {readonly} read-only export(s); replay must '
+            'reuse the permanent exports of the sealed generation')
+    if errors:
+        raise ValueError(f'the reopen fence recorded {errors} target error(s)')
+    if exposed < owned:
+        raise ValueError(
+            f'the reopen fence exposes {exposed - owned} fewer namespace(s) than it owns')
     return dict(available=True, reason=None, before=previous, after=exposed,
                 observed_partitions=observed, fixture_partitions=fixtures,
-                scope='the pre-close scrape against the post-reopen scrape; the offline '
-                      'state audit opens the same authority in between')
+                owned_namespaces=owned, readonly_commission_total=readonly,
+                target_errors_total=errors,
+                scope="the reopen's open fence snapshot; exposed is recorded, "
+                      'never compared for equality, and a replay-created export is not '
+                      'observable at this build')
 
 
 def audit_comparison(before, after):
@@ -1272,7 +1301,7 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
                      address, metrics_address, producer_address, tip, digest, bound, extra,
                      schemas, native_root, config_path, env, tier, audit_before,
                      tail_checkpoints=64):
-    """S1-1/S1-8: clean reopen, no new export, unchanged durable cut, same state."""
+    """S1-1/S1-8: clean reopen fence state, unchanged durable cut, same state."""
     from analyze import adapter_stats, live_nvmeof_stats, parse_metrics
     # Only Native-tier writes are tracked by a durable cut (durable_cut.rs); a
     # synchronous database writes no record, so its absence is the expected state.
@@ -1296,7 +1325,7 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
         cut['namespaces'][name] = dict(tracked=False, record=None)
     if tier == 'native' and not cut['tracked']:
         raise ValueError('the native tier tracks a durable cut; none was recorded')
-    exports = exports_comparison(before_live, live_nvmeof_stats(parse_metrics(metrics)))
+    exports = reopen_fence_state(before_live, live_nvmeof_stats(parse_metrics(metrics)))
     counters = adapter_stats(parse_metrics(metrics))
     if not counters:
         raise ValueError('the reopened node published no adapter counters')
@@ -1314,7 +1343,7 @@ def lifecycle_checks(owned, *, bins, root, output, remote_root, namespaces,
                         config_path, env, label='-reopen')
     return dict(
         status='clean-reopen-verified', tail_checkpoints=tail_checkpoints,
-        reopen=receipt, no_new_export=exports, durable_cut=cut,
+        reopen=receipt, reopen_fence=exports, durable_cut=cut,
         tail_replay=dict(
             state_unchanged=True, publishes=publishes,
             sui_rescheduled_checkpoints=0,
@@ -1373,7 +1402,7 @@ def main():
                         help='TH_INDEX_BLOB_CACHE_BYTES in MiB; 0 keeps the engine default (cache off). '
                              'The frozen Sui must read the row for both measured nodes')
     parser.add_argument('--lifecycle-checks', action='store_true',
-                        help='after a full replay: clean reopen, no new export, unchanged durable '
+                        help='after a full replay: clean reopen fence state, unchanged durable '
                              'cut, tail replay idempotence and a second audit (S1-1/S1-8)')
     parser.add_argument('--tail-checkpoints', type=int, default=64,
                         help='last K checkpoints read back through the reopened node')
