@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import types
@@ -482,6 +483,38 @@ class OwnerWAL(unittest.TestCase):
         iterator = iter(views)
         cluster.wal = lambda host: next(iterator)
         return cluster
+
+    def test_the_listing_reads_owner_files_under_the_epoch_directories(self):
+        """The real listing script, executed over a real nested owner tree.
+
+        The engine writes `wal_*`, `partition-wal-root-v1` and
+        `partition-seal-v5` under `db-<hex>/epoch_<hex>`, not at the database
+        root. The script is run by `sh`, not answered from canned output.
+        """
+        class ShellRemote(FakeRemote):
+            def run(self, host, command, *, stdin=None, check=True):
+                self.calls.append((host, command, stdin))
+                done = subprocess.run(command, shell=True, capture_output=True)
+                return done.returncode, done.stdout, done.stderr
+
+        with tempfile.TemporaryDirectory() as root:
+            epoch = Path(root) / ('db-' + 'a' * 32) / 'epoch_0000000000000001'
+            epoch.mkdir(parents=True)
+            wal = epoch / 'wal_0000000000000000'
+            wal.write_bytes(b'x' * 11)
+            durable = epoch / 'partition-wal-root-v1'
+            durable.write_bytes(b'r' * 5)
+            (epoch / 'partition-seal-v5').write_bytes(b's')
+            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+            cluster.remote = ShellRemote()
+            cluster.owner_root = lambda host: Path(root)
+            view = cluster.wal('h1')
+            self.assertEqual(set(view['files']), {str(wal)})
+            self.assertEqual(set(view['roots']), {str(durable)})
+            self.assertEqual(cluster.rolls('h1')['max_file_id'], 0)
+            seals = cluster.seal_markers('h1')
+            self.assertEqual(seals['databases'], 1)
+            self.assertEqual(seals['sealed'], 1)
 
     def test_the_listing_exits_zero_while_a_root_is_mid_rename(self):
         """The durable root is replaced by rename; a missing root is not a failure."""

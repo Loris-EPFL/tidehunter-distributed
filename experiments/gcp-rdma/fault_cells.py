@@ -78,6 +78,12 @@ SAMPLE_EXCERPT_ROWS = 200
 FAILURE_SKIP_PARTS = ('coordinator', 'tls', 'storage')
 GATE_WRITES = 200
 FENCE_WRITES = 20
+# The engine nests every per-generation owner file under
+# `db-<database>/epoch_<generation>`, so each listing walks that pair instead of
+# the database directory alone. The loops are quoted once and shared by every
+# WAL and seal listing.
+EPOCH_LISTING = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
+                 'for g in "$d"/epoch_*; do [ -d "$g" ] || continue; ')
 WAL = re.compile(r'^wal_([0-9a-f]{16})$')
 DATABASE = re.compile(r'^db-[0-9a-f]{32}$')
 
@@ -558,9 +564,9 @@ class Cluster:
         """
         # `find -printf %T@` carries fractional seconds; `stat -c %Y` would
         # miss a root rewrite inside the same second.
-        script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
-                  'find "$d" -maxdepth 1 \\( -name "wal_*" -o -name "partition-wal-root-v1" \\) '
-                  '-printf "%p %s %T@\\n" 2>/dev/null; done; exit 0')
+        script = (EPOCH_LISTING +
+                  'find "$g" -maxdepth 1 \\( -name "wal_*" -o -name "partition-wal-root-v1" \\) '
+                  '-printf "%p %s %T@\\n" 2>/dev/null; done; done; exit 0')
         code, out, err = self.remote.shell(
             host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
@@ -579,24 +585,37 @@ class Cluster:
         return dict(host=host, files=files, roots=roots, unix_ns=now_ns())
 
     def seal_markers(self, host):
-        """Owner databases that published a sealed WAL or live-target marker."""
-        names = self.owner_databases(host)
-        if not names:
-            return dict(databases=0, sealed=0)
-        script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
-                  'n=$(ls -1 "$d/live-target/sealed" 2>/dev/null | wc -l); '
-                  's=$(ls -1 "$d"/partition-seal-v5 2>/dev/null | wc -l); echo "$d $n $s"; done')
+        """Owner databases that published a sealed WAL or live-target marker.
+
+        `partition-seal-v5` is a per-generation file under
+        `db-<database>/epoch_<generation>` (`storage.rs` `SEAL`), while the
+        live-target marker stays at the database root. A database is sealed
+        when either count is positive.
+        """
+        db_script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
+                     'n=$(ls -1 "$d/live-target/sealed" 2>/dev/null | wc -l); '
+                     'echo "db $d $n"; done')
+        epoch_script = (EPOCH_LISTING +
+                        'c=$(ls -1 "$g"/partition-seal-v5 2>/dev/null | wc -l); '
+                        'echo "epoch $d $c"; done; done')
+        script = f'{db_script}; {epoch_script}'
         code, out, err = self.remote.shell(
             host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
             raise CellError(f'{host}: cannot read the sealed markers')
-        databases = sealed = 0
+        live, epochs = {}, {}
         for line in out.decode().splitlines():
             parts = line.split()
-            if len(parts) == 3:
-                databases += 1
-                if int(parts[1]) > 0 or int(parts[2]) > 0:
-                    sealed += 1
+            if len(parts) != 3:
+                continue
+            kind, path, count = parts
+            if kind == 'db':
+                live[path] = int(count)
+            elif kind == 'epoch':
+                epochs[path] = epochs.get(path, 0) + int(count)
+        databases = len(live)
+        sealed = sum(1 for path, count in live.items()
+                     if count > 0 or epochs.get(path, 0) > 0)
         return dict(host=host, databases=databases, sealed=sealed, unix_ns=now_ns())
 
     def generation_wal(self, host):
@@ -607,8 +626,7 @@ class Cluster:
         that tells whether the stale generation received anything after the
         fence: the new coordinator writes its own generation.
         """
-        script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
-                  'for g in "$d"/epoch_*; do [ -d "$g" ] || continue; '
+        script = (EPOCH_LISTING +
                   'find "$g" -maxdepth 1 -name "wal_*" -printf "%p %s %T@\\n" '
                   '2>/dev/null; done; done; exit 0')
         code, out, err = self.remote.shell(
