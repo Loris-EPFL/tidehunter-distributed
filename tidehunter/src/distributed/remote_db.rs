@@ -659,8 +659,9 @@ pub struct RecoveryStats {
     /// Retained older generations the loaded control region did not name, so
     /// the open replayed them from offset 0. Zero in steady state: every store
     /// names every retained generation (`hybrid::region::older_replay_from`).
-    /// Non-zero is legitimate only for a generation that opened and closed
-    /// before any store, and is a defect otherwise.
+    /// Non-zero is legitimate only for a generation that ended (clean close or
+    /// crash) before its first control-region store, and is a defect
+    /// otherwise.
     pub old_generation_replayed_from_zero: u64,
     /// Rows of the loaded control region that name a generation this open does
     /// not retain (trimmed after the store). The open skips them; the next
