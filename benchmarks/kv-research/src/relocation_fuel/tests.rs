@@ -4,12 +4,26 @@ use crate::workload::{key_bytes, value_bytes};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
-/// Records every rewrite; fails every put at or after `fail_after`.
+/// Records every rewrite; fails every put at or after `fail_after`, and parks
+/// every put at or after `park_after` until its future is dropped.
 struct FuelBackend {
     puts: AtomicU64,
     relocation_requests: AtomicU64,
     writes: Mutex<Vec<(tidehunter::minibytes::Bytes, tidehunter::minibytes::Bytes)>>,
     fail_after: Option<u64>,
+    park_after: Option<u64>,
+    parked: AtomicU64,
+    parked_dropped: AtomicU64,
+}
+
+/// Counts one parked call whose future was dropped: the only proof that a
+/// cancellation reached a backend call already in flight.
+struct ParkedPut<'a>(&'a AtomicU64);
+
+impl Drop for ParkedPut<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl FuelBackend {
@@ -19,6 +33,22 @@ impl FuelBackend {
             relocation_requests: AtomicU64::new(0),
             writes: Mutex::new(Vec::new()),
             fail_after,
+            park_after: None,
+            parked: AtomicU64::new(0),
+            parked_dropped: AtomicU64::new(0),
+        })
+    }
+
+    /// The first rewrite returns; every later one parks until it is cancelled.
+    fn parking() -> Arc<Self> {
+        Arc::new(Self {
+            puts: AtomicU64::new(0),
+            relocation_requests: AtomicU64::new(0),
+            writes: Mutex::new(Vec::new()),
+            fail_after: None,
+            park_after: Some(1),
+            parked: AtomicU64::new(0),
+            parked_dropped: AtomicU64::new(0),
         })
     }
 }
@@ -59,6 +89,11 @@ impl KvBackend for FuelBackend {
             return Err(
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "owner write failed").into(),
             );
+        }
+        if self.park_after.is_some_and(|limit| index >= limit) {
+            self.parked.fetch_add(1, Ordering::Relaxed);
+            let _parked = ParkedPut(&self.parked_dropped);
+            std::future::pending::<()>().await;
         }
         self.writes.lock().unwrap().push((key, value));
         Ok(())
@@ -233,5 +268,52 @@ async fn the_pass_is_re_requested_at_the_period_and_stops_at_release() {
         backend.relocation_requests.load(Ordering::Relaxed),
         re_requests,
         "a stopped stream keeps requesting"
+    );
+}
+
+/// A stream dropped without `finish` (the runner's early `?` returns) must not
+/// keep running to `max_seconds`: the drop sets the stop flag and aborts the
+/// task, which cancels a backend call already in flight. The parked call is the
+/// seam: a stop flag alone cannot end it, so its dropped guard is the proof.
+#[tokio::test]
+async fn dropping_the_stream_cancels_its_parked_put_without_finish() {
+    let backend = FuelBackend::parking();
+    let fuel = RelocationFuel::start(
+        Arc::clone(&backend),
+        [6; 16],
+        8,
+        100,
+        64,
+        1.0,
+        plan(1_000, 60, 10),
+    )
+    .await;
+    // The first rewrite completed inside `start`; the loop's next one parks.
+    for _ in 0..64 {
+        if backend.parked.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked.load(Ordering::Relaxed),
+        1,
+        "the loop never parked"
+    );
+    let puts = backend.puts.load(Ordering::Relaxed);
+    assert_eq!(backend.parked_dropped.load(Ordering::Relaxed), 0);
+    drop(fuel);
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked_dropped.load(Ordering::Relaxed),
+        1,
+        "the parked call survived the drop"
+    );
+    assert_eq!(
+        backend.puts.load(Ordering::Relaxed),
+        puts,
+        "a rewrite started after the drop"
     );
 }

@@ -35,11 +35,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// One running stream: its stop flag, its joined task, and its plan.
+/// One running stream: its stop flag, its optional task, and its plan.
 pub struct RelocationFuel {
     stop: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<FuelCounts>,
+    task: Option<tokio::task::JoinHandle<FuelCounts>>,
     plan: RelocationFuelConfig,
+}
+
+impl Drop for RelocationFuel {
+    /// A dropped stream must not outlive its owner. The runner's early `?`
+    /// returns drop this value; a detached task would keep rewriting dataset
+    /// keys to `max_seconds` after the run had already failed. The stop flag
+    /// ends the loop at its next check, and the abort also cancels a call that
+    /// is already in flight at the backend.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 /// Counts of the stream. Errors after an owner kill are expected evidence.
@@ -132,7 +146,11 @@ impl RelocationFuel {
             }
             counts
         });
-        Self { stop, task, plan }
+        Self {
+            stop,
+            task: Some(task),
+            plan,
+        }
     }
 
     /// Stop the stream and join it. `grace` bounds the join: one call already in
@@ -142,25 +160,33 @@ impl RelocationFuel {
     /// `request_to_release` is measured by the caller between `start_relocation`
     /// and the completion gate's return, never by this task: the join can wait on
     /// one slow put, and this stream's start is one rewrite before the request.
-    pub async fn finish(self, grace: Duration, request_to_release: Duration) -> serde_json::Value {
-        let Self {
-            stop,
-            mut task,
-            plan,
-        } = self;
-        stop.store(true, Ordering::Relaxed);
+    pub async fn finish(
+        mut self,
+        grace: Duration,
+        request_to_release: Duration,
+    ) -> serde_json::Value {
+        self.stop.store(true, Ordering::Relaxed);
+        let plan = self.plan;
         let mut joined = true;
-        let counts = match tokio::time::timeout(grace, &mut task).await {
-            Ok(Ok(counts)) => counts,
-            Ok(Err(error)) => {
-                joined = false;
-                FuelCounts {
-                    first_error: Some(format!("fuel task failed: {error}")),
-                    ..FuelCounts::default()
+        let counts = match self.task.take() {
+            Some(mut task) => match tokio::time::timeout(grace, &mut task).await {
+                Ok(Ok(counts)) => counts,
+                Ok(Err(error)) => {
+                    joined = false;
+                    FuelCounts {
+                        first_error: Some(format!("fuel task failed: {error}")),
+                        ..FuelCounts::default()
+                    }
                 }
-            }
-            Err(_) => {
-                task.abort();
+                Err(_) => {
+                    task.abort();
+                    joined = false;
+                    FuelCounts::default()
+                }
+            },
+            // A consumed value cannot be `finish`ed twice; report no join
+            // rather than a fabricated one.
+            None => {
                 joined = false;
                 FuelCounts::default()
             }
