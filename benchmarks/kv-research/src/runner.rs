@@ -168,6 +168,12 @@ pub async fn run<B: KvBackend>(
     let mut relocation_requested = false;
     let mut relocation_fuel: Option<crate::relocation_fuel::RelocationFuel> = None;
     let mut relocation_requested_at: Option<Instant> = None;
+    // A stopped fuel stream is joined only after its current put returns: the
+    // campaign adapter's put body is synchronous (`db.insert` waits for
+    // publication) and abort cannot cancel it. The bound is the backend's own
+    // client lifecycle bound plus one margin, never a constant of this runner;
+    // the spec's request timeout is the documented fallback.
+    let fuel_join_bound = fuel_join_bound(&info, &config);
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -343,12 +349,15 @@ pub async fn run<B: KvBackend>(
                     relocation_fuel = Some(
                         crate::relocation_fuel::RelocationFuel::start(
                             Arc::clone(&backend),
-                            namespace,
-                            config.seed,
-                            config.dataset.keys,
-                            config.dataset.value_size,
-                            config.dataset.entropy,
-                            fuel,
+                            crate::relocation_fuel::FuelRequest {
+                                namespace,
+                                seed: config.seed,
+                                keys: config.dataset.keys,
+                                value_size: config.dataset.value_size,
+                                entropy: config.dataset.entropy,
+                                plan: fuel,
+                                join_bound: fuel_join_bound,
+                            },
                         )
                         .await,
                     );
@@ -472,13 +481,7 @@ pub async fn run<B: KvBackend>(
             let request_to_release = relocation_requested_at.map_or(Duration::ZERO, |requested| {
                 released.saturating_duration_since(requested)
             });
-            Some(
-                fuel.finish(
-                    Duration::from_secs(config.limits.shutdown_grace_seconds),
-                    request_to_release,
-                )
-                .await,
-            )
+            Some(fuel.finish(fuel_join_bound, request_to_release).await)
         }
         None => None,
     };
@@ -752,6 +755,32 @@ pub async fn run<B: KvBackend>(
         return Err(invalid(fatal_reason.as_deref().unwrap_or("run failed")));
     }
     Ok(())
+}
+
+/// Slack over the engine's client bound: scheduling, the stop check between
+/// puts, and the abort of the task itself.
+const FUEL_JOIN_MARGIN: Duration = Duration::from_secs(1);
+
+/// The join bound of the relocation fuel stream: at least the runner's shutdown
+/// grace, and at least one put already inside the backend plus a margin.
+///
+/// The engine reports its client lifecycle bound in `BackendInfo::configuration`
+/// (`client.lifecycle_timeout_ms`, the coordinator timeout raised to the
+/// lifecycle floor); a backend that reports none falls back to the spec's
+/// request timeout, which is the adapter's per-call ceiling.
+fn fuel_join_bound(info: &BackendInfo, config: &RunConfig) -> Duration {
+    let put = info
+        .configuration
+        .get("client")
+        .and_then(|client| client.get("lifecycle_timeout_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|millis| *millis > 0)
+        .map_or_else(
+            || Duration::from_millis(config.execution.request_timeout_ms),
+            Duration::from_millis,
+        );
+    Duration::from_secs(config.limits.shutdown_grace_seconds)
+        .max(put.saturating_add(FUEL_JOIN_MARGIN))
 }
 
 /// Durability contract and matched comparison cohort, copied into summary and manifest.

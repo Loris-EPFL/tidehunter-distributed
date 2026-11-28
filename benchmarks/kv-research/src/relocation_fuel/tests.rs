@@ -14,6 +14,7 @@ struct FuelBackend {
     park_after: Option<u64>,
     parked: AtomicU64,
     parked_dropped: AtomicU64,
+    block: Option<Duration>,
 }
 
 /// Counts one parked call whose future was dropped: the only proof that a
@@ -36,19 +37,41 @@ impl FuelBackend {
             park_after: None,
             parked: AtomicU64::new(0),
             parked_dropped: AtomicU64::new(0),
+            block: None,
         })
     }
 
     /// The first rewrite returns; every later one parks until it is cancelled.
     fn parking() -> Arc<Self> {
+        Self::parking_from(1)
+    }
+
+    /// Every put from `first` on parks until its future is cancelled.
+    fn parking_from(first: u64) -> Arc<Self> {
         Arc::new(Self {
             puts: AtomicU64::new(0),
             relocation_requests: AtomicU64::new(0),
             writes: Mutex::new(Vec::new()),
             fail_after: None,
-            park_after: Some(1),
+            park_after: Some(first),
             parked: AtomicU64::new(0),
             parked_dropped: AtomicU64::new(0),
+            block: None,
+        })
+    }
+
+    /// Every put body blocks synchronously for `block`, like the campaign
+    /// adapter's `db.insert`, which no abort can cancel.
+    fn blocking(block: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            puts: AtomicU64::new(0),
+            relocation_requests: AtomicU64::new(0),
+            writes: Mutex::new(Vec::new()),
+            fail_after: None,
+            park_after: None,
+            parked: AtomicU64::new(0),
+            parked_dropped: AtomicU64::new(0),
+            block: Some(block),
         })
     }
 }
@@ -85,6 +108,11 @@ impl KvBackend for FuelBackend {
         value: tidehunter::minibytes::Bytes,
     ) -> BackendResult<()> {
         let index = self.puts.fetch_add(1, Ordering::Relaxed);
+        if let Some(block) = self.block {
+            // A synchronous body on the blocking pool: aborting the fuel task
+            // drops this future but not the work already inside the backend.
+            let _ = tokio::task::spawn_blocking(move || std::thread::sleep(block)).await;
+        }
         if self.fail_after.is_some_and(|limit| index >= limit) {
             return Err(
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "owner write failed").into(),
@@ -121,6 +149,32 @@ impl KvBackend for FuelBackend {
     }
 }
 
+/// The join bound the runner derives from the backend's client bound, pinned
+/// for these tests: long enough to cover a put in flight.
+fn bound() -> Duration {
+    Duration::from_secs(2)
+}
+
+fn request(
+    namespace: [u8; 16],
+    seed: u64,
+    keys: u64,
+    value_size: usize,
+    entropy: f64,
+    plan: RelocationFuelConfig,
+    join_bound: Duration,
+) -> FuelRequest {
+    FuelRequest {
+        namespace,
+        seed,
+        keys,
+        value_size,
+        entropy,
+        plan,
+        join_bound,
+    }
+}
+
 fn plan(puts_per_second: u32, max_seconds: u32, retry_seconds: u32) -> RelocationFuelConfig {
     RelocationFuelConfig {
         puts_per_second,
@@ -137,12 +191,7 @@ async fn the_first_rewrite_lands_before_the_request_and_the_rate_is_bounded() {
     let backend = FuelBackend::new(None);
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [7; 16],
-        11,
-        100,
-        64,
-        1.0,
-        plan(50, 5, 300),
+        request([7; 16], 11, 100, 64, 1.0, plan(50, 5, 300), bound()),
     )
     .await;
     assert!(backend.puts.load(Ordering::Relaxed) >= 1);
@@ -179,12 +228,7 @@ async fn the_wall_clock_bound_ends_the_stream_without_a_stop() {
     let backend = FuelBackend::new(None);
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [3; 16],
-        5,
-        100,
-        64,
-        1.0,
-        plan(1_000, 1, 300),
+        request([3; 16], 5, 100, 64, 1.0, plan(1_000, 1, 300), bound()),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(1_400)).await;
@@ -207,12 +251,7 @@ async fn failed_rewrites_are_counted_and_never_fail_the_run() {
     let backend = FuelBackend::new(Some(1));
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [9; 16],
-        2,
-        100,
-        64,
-        1.0,
-        plan(500, 5, 300),
+        request([9; 16], 2, 100, 64, 1.0, plan(500, 5, 300), bound()),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -239,12 +278,7 @@ async fn the_pass_is_re_requested_at_the_period_and_stops_at_release() {
     let backend = FuelBackend::new(None);
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [5; 16],
-        3,
-        100,
-        64,
-        1.0,
-        plan(1_000, 5, 1),
+        request([5; 16], 3, 100, 64, 1.0, plan(1_000, 5, 1), bound()),
     )
     .await;
     // The runner makes the first request; the stream adds its own at the period.
@@ -280,12 +314,7 @@ async fn dropping_the_stream_cancels_its_parked_put_without_finish() {
     let backend = FuelBackend::parking();
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [6; 16],
-        8,
-        100,
-        64,
-        1.0,
-        plan(1_000, 60, 10),
+        request([6; 16], 8, 100, 64, 1.0, plan(1_000, 60, 10), bound()),
     )
     .await;
     // The first rewrite completed inside `start`; the loop's next one parks.
@@ -328,12 +357,7 @@ async fn cancelling_the_join_still_aborts_the_stream() {
     let backend = FuelBackend::parking();
     let fuel = RelocationFuel::start(
         Arc::clone(&backend),
-        [2; 16],
-        4,
-        100,
-        64,
-        1.0,
-        plan(1_000, 60, 10),
+        request([2; 16], 4, 100, 64, 1.0, plan(1_000, 60, 10), bound()),
     )
     .await;
     for _ in 0..64 {
@@ -369,5 +393,79 @@ async fn cancelling_the_join_still_aborts_the_stream() {
         backend.puts.load(Ordering::Relaxed),
         puts,
         "a rewrite started after the cancellation"
+    );
+}
+
+/// A put whose body blocks synchronously for longer than the runner's
+/// shutdown grace but inside the derived join bound is joined after the stop:
+/// the bound, not the grace, decides.
+#[tokio::test]
+async fn a_put_longer_than_the_shutdown_grace_is_joined_after_stop() {
+    let backend = FuelBackend::blocking(Duration::from_millis(200));
+    let join_bound = Duration::from_millis(500);
+    let fuel = RelocationFuel::start(
+        Arc::clone(&backend),
+        request([1; 16], 9, 100, 64, 1.0, plan(1_000, 60, 300), join_bound),
+    )
+    .await;
+    // `start` waited for the first rewrite, which already blocked inside the
+    // task; the loop is inside the next blocking put now.
+    let record = fuel.finish(join_bound, Duration::ZERO).await;
+    assert!(record["joined"].as_bool().unwrap(), "{record}");
+    assert_eq!(record["join_timed_out"].as_bool(), Some(false), "{record}");
+    assert_eq!(record["join_bound_seconds"].as_f64(), Some(0.5), "{record}");
+    assert!(record["puts"].as_u64().unwrap() >= 2, "{record}");
+    assert_eq!(record["errors"].as_u64(), Some(0), "{record}");
+}
+
+/// The first rewrite belongs to the task, not to `start`: a first put that
+/// never returns is attempted (and counted) inside the task, `start` returns at
+/// its bound instead of hanging, and a join that misses the bound is reported
+/// as an error with the counts the task recorded.
+#[tokio::test]
+async fn the_first_rewrite_runs_inside_the_task_and_a_missed_bound_is_an_error() {
+    let backend = FuelBackend::parking_from(0);
+    let join_bound = Duration::from_millis(50);
+    let fuel = RelocationFuel::start(
+        Arc::clone(&backend),
+        request([3; 16], 6, 100, 64, 1.0, plan(1_000, 60, 300), join_bound),
+    )
+    .await;
+    assert_eq!(
+        backend.parked.load(Ordering::Relaxed),
+        1,
+        "the first rewrite is not inside the task"
+    );
+    assert_eq!(
+        backend.puts.load(Ordering::Relaxed),
+        1,
+        "the attempt is counted"
+    );
+    assert_eq!(backend.writes.lock().unwrap().len(), 0);
+    let record = fuel.finish(join_bound, Duration::ZERO).await;
+    assert_eq!(record["joined"].as_bool(), Some(false), "{record}");
+    assert_eq!(record["join_timed_out"].as_bool(), Some(true), "{record}");
+    assert_eq!(
+        record["first_rewrite_ready"].as_bool(),
+        Some(false),
+        "{record}"
+    );
+    assert!(
+        record["first_error"]
+            .as_str()
+            .unwrap()
+            .contains("join bound"),
+        "{record}"
+    );
+    assert_eq!(record["puts"].as_u64(), Some(0), "{record}");
+    // `abort` is a request: the parked future is dropped at the task's next
+    // poll, which the yields let the runtime reach.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        backend.parked_dropped.load(Ordering::Relaxed),
+        1,
+        "the aborted first rewrite survived"
     );
 }
