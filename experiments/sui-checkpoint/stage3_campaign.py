@@ -837,6 +837,10 @@ def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
         before = len(owners.stops)
         cleanups_before = len(owners.cleanups)
         owners.reset('native')
+        forced = owners.forced(before)
+        if forced:
+            raise ValueError('owner stop needed a forced kill on '
+                             + ', '.join(sorted(forced)))
         output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
                                 stale_root=root / 'stage3' / 'stale', timeout=timeout,
                                 watchers=owners.watchers(),

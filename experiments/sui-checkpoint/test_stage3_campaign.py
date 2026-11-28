@@ -473,7 +473,7 @@ class Driver(unittest.TestCase):
             stage3_campaign.extract_archive(buffer.getvalue(),
                                             self.base / 'target')
 
-    def test_schedule_runs_arm_a_before_arm_b_one_start_per_tier(self):
+    def test_schedule_runs_arm_a_before_arm_b(self):
         cells = [dict(id='b-sync', arm='B', tier='synchronous'),
                  dict(id='a-sync', arm='A', tier='synchronous'),
                  dict(id='b-native', arm='B', tier='native'),
