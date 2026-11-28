@@ -1,5 +1,6 @@
 """Stage-3 driver: local arm, host arm, owner lifecycle, upload-before-pass."""
 import csv
+import collections
 import hashlib
 import json
 import os
@@ -472,7 +473,7 @@ class Driver(unittest.TestCase):
             stage3_campaign.extract_archive(buffer.getvalue(),
                                             self.base / 'target')
 
-    def test_schedule_runs_arm_a_before_arm_b_one_start_per_tier(self):
+    def test_schedule_runs_arm_a_before_arm_b(self):
         cells = [dict(id='b-sync', arm='B', tier='synchronous'),
                  dict(id='a-sync', arm='A', tier='synchronous'),
                  dict(id='b-native', arm='B', tier='native'),
@@ -545,6 +546,45 @@ class Driver(unittest.TestCase):
         receipts = owners.start('native')
         self.assertEqual([row['launch_nonce'] for row in receipts], ['', ''])
         self.assertEqual(owners.stop(), [])
+
+    def test_each_arm_a_cell_gets_an_empty_owner_root(self):
+        """Two arm-A cells of one tier never share a one-database catalogue.
+
+        Every cell's coordinator mints a new database identity and an owner
+        keeps each provisioned database, so the second start must follow a
+        removed guest root, not the first cell's owner process.
+        """
+        remote = FakeRemote()
+        preparations = self.external()
+        owners = stage3_campaign.Owners(remote, preparations, root=self.root,
+                                        guest_root=self.base / 'guest')
+        self.seed_owner_files(remote, preparations['native'], 'native')
+        path = self.root / 'stage3' / 'spec' / 'S3-A9-c2-native-cache0.json'
+        path.write_text(json.dumps({'case_id': path.stem}))
+        second = dict(self.cells[0], id=path.stem, unit=path.stem, path=str(path),
+                      config_hash=ledger_module.config_hash(
+                          spec=ledger_module.sha256_file(path), knobs={},
+                          engine_rev='e', sui_rev='s', binary_ids={'kv': 'b'}))
+        results, planned = self.run_campaign(cells=[self.cells[0], second],
+                                             owners=owners)
+        self.assertEqual([row['id'] for row in planned],
+                         [self.cells[0]['id'], second['id']])
+        self.assertEqual([row['status'] for row in results
+                          if row['id'] != 'owner-processes'], ['passed', 'passed'])
+        guest = str(self.base / 'guest')
+        wipes = collections.Counter(host for host, command in remote.calls
+                                    if command.startswith(f'rm -rf {guest}'))
+        self.assertEqual(sorted(wipes.values()), [2, 2])
+        stops = [index for index, (_, command) in enumerate(remote.calls)
+                 if command.startswith('touch')]
+        self.assertTrue(stops and any(
+            command.startswith(f'rm -rf {guest}')
+            for _, command in remote.calls[stops[0]:]))
+        # The second cell met no live owner of the first cell: each host is
+        # closed once before its wipe and once at the end of the run.
+        self.assertEqual(sorted(collections.Counter(
+            row['host'] for row in owners.stops).values()), [2, 2])
+        self.assertEqual(owners.forced(), [])
 
     def test_arm_b_stops_the_owner_set_first(self):
         remote = FakeRemote()

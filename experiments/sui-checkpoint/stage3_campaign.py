@@ -25,8 +25,13 @@ In cluster mode the two tier preparations are made on the coordinator host from
 control and RDMA live-target addresses (coordinator read cache off); a retry in
 the same fleet reuses them.
 
-One preparation therefore re-provisions the same database on the same port for
-every cell of its tier, while the owners stay up across the arm-A cells. The
+Each cell's coordinator directory is fresh, so the engine mints a new database
+identity per cell and provisions it on the tier's owners. `kv-research` closes
+without a drop and the scenario owner admits one database, so an owner that
+stayed up would refuse the second identity (`owner database limit 1 reached`).
+Every arm-A cell therefore runs on a freshly installed owner set: the driver
+stops the owners, removes each guest root (catalogue and databases) and
+reinstalls the tier's archive before it starts them. The
 local rehearsal fixture cannot reach the target configfs, so it cannot prove
 that path: the evidence is the CI owner-layout step's restart pass, which kills
 every owner of a three-database, two-owner deployment and restarts them on the
@@ -56,7 +61,8 @@ and the device-write ratio.
 
 `--resume` skips passed cells whose config hash matches and reruns failed,
 pending, invalid and interrupted ones in plan order: arm A native and
-synchronous cells first, then arm B, each tier in one owner start. `--only` and
+synchronous cells first, then arm B; each arm-A cell runs on a freshly
+installed owner set. `--only` and
 `--from` narrow the plan; unit members always run together.
 """
 import argparse
@@ -563,6 +569,23 @@ class Owners:
                              + ', '.join(sorted(failed)))
         return failed
 
+    def reset(self, tier):
+        """Meet the next arm-A cell with an empty owner root.
+
+        Every cell's coordinator mints a new database identity, an owner keeps
+        every provisioned database in its persisted catalogue, `kv-research`
+        closes without a drop and the preparation admits `max_databases=1`.
+        A running owner therefore cannot take the next cell's database; stop
+        it, remove the guest root `install` reinstalls, and start it again.
+        """
+        failures = self.stop()
+        if failures:
+            raise ValueError('owner stop or configfs cleanup failed on '
+                             + ', '.join(sorted(set(failures)))
+                             + '; refusing to reset the owner root')
+        self.installed = None
+        return self.start(tier)
+
     def start(self, tier):
         if self.active == tier:
             return self.receipts
@@ -710,7 +733,7 @@ def phase_cell(*, path, case, identity, group):
 
 
 def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
-                   watchers=(), allow_local_ledger=False):
+                   watchers=(), stops=(), cleanups=(), allow_local_ledger=False):
     """One phase-A/B cell under the same ledger and upload rules as the grid."""
     if bucket is None and not allow_local_ledger:
         raise ValueError('a passed cell needs a verified evidence upload; '
@@ -722,7 +745,8 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
     output = Path(root) / 'stage3' / cell['unit'] / 'out' / cell['id']
     try:
         produced = run_cell(cell, runner, output=output, stale_root=stale_root,
-                            attempt=entry['attempts'], timeout=timeout, watchers=watchers)
+                            attempt=entry['attempts'], timeout=timeout, watchers=watchers,
+                            stops=stops, cleanups=cleanups)
         if bucket is not None:
             bucket.publish(cell['id'], produced, output, attempt=entry['attempts'])
             ledger.mark_passed(entry, produced, store=bucket.ledger_store)
@@ -732,6 +756,7 @@ def run_phase_cell(cell, runner, *, root, ledger, bucket, stale_root, timeout,
     except Exception as error:
         # A failed phase cell uploads what it did write before the ledger says
         # failed, so the fleet DELETE cannot destroy the only copy.
+        write_lifecycle(output, stops=stops, cleanups=cleanups)
         ledger.fail(entry, error)
         if bucket is not None:
             bucket.evidence.persist_failure(entry, failure_artifacts(output), error)
@@ -803,15 +828,24 @@ def calibrate(*, root, runner, owners, ledger, bucket, external, identity_for,
     """Phase B: three calibration cells, then the frozen per-family counts."""
     root = Path(root)
     paths = write_calibration_specs(root, external=external)
-    owners.start('native')
     rates, cells = {}, []
     for family, path in zip(CALIBRATION_FAMILIES, paths):
         case = calibration_case(family)
         cell = phase_cell(path=path, case=case, group='calibration',
                           identity=identity_for(path, dict(calibration=family)))
+        # One fresh database per cell on an owner set that admits one database.
+        before = len(owners.stops)
+        cleanups_before = len(owners.cleanups)
+        owners.reset('native')
+        forced = owners.forced(before)
+        if forced:
+            raise ValueError('owner stop needed a forced kill on '
+                             + ', '.join(sorted(forced)))
         output = run_phase_cell(cell, runner, root=root, ledger=ledger, bucket=bucket,
                                 stale_root=root / 'stage3' / 'stale', timeout=timeout,
                                 watchers=owners.watchers(),
+                                stops=owners.stops[before:],
+                                cleanups=owners.cleanups[cleanups_before:],
                                 allow_local_ledger=allow_local_ledger)
         preflight(output, cell=cell['id'])
         totals = proc_sampler.sample_totals(output / 'samples.csv')
@@ -841,7 +875,7 @@ def write_projection(root, bucket, document):
 
 
 def schedule(cells):
-    """Arm A before arm B, and one owner start per tier: native, then synchronous."""
+    """Arm A before arm B; every arm-A cell gets a fresh owner installation."""
     return sorted(cells, key=lambda cell: (cell.get('arm') == 'B',
                                            TIER_ORDER[cell['tier']]))
 
@@ -904,7 +938,7 @@ def run_campaign(cells, *, local, root, ledger, remote=None, owners=None, bucket
                 if cell['arm'] == 'B' and owners is not None:
                     owners.stop()
                 if cell['arm'] == 'A' and owners is not None:
-                    owners.start(cell['tier'])
+                    owners.reset(cell['tier'])
                 forced = owners.forced(before) if owners is not None else []
                 if forced:
                     raise ValueError('owner stop needed a forced kill on '
