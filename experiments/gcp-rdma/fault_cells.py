@@ -1113,17 +1113,22 @@ class CellDriver:
         failure is the coordinator's exit: the relocation pass reaches the dead
         owner, and the run ends with the typed first-failure record in
         `run.log`. The relocator's own failure poisons the write core through
-        `begin_failure` with no partition (`owner=None ... stage=write_core`);
-        a per-owner worker records `owner=Some(N)`. Either is the post-kill
-        cause; another owner's partition is not. Only the bytes appended after
-        the pre-signal watermark count, so a line written before the kill
-        cannot satisfy the check.
+        `begin_failure` with no partition (`owner=None ... stage=write_core`)
+        and names the partition in its cause (`dead_wal_files.rs`
+        "retirement request to partition N failed" or "sealed retirement of
+        partition N generation G failed"); a per-owner worker records
+        `owner=Some(N)`. Either names the killed owner; another partition does
+        not. Only the bytes appended after the pre-signal watermark count, so
+        a line written before the kill cannot satisfy the check.
         """
         code = child.wait(timeout)
         text = self._log_appended(child, log_offset).strip()
         owner = f'owner=Some({partition})'
+        retired = ('stage=write_core' in text and (
+            f'retirement request to partition {partition} failed' in text
+            or f'sealed retirement of partition {partition} generation' in text))
         typed = (partition is not None and 'first causal failure' in text
-                 and (owner in text or 'owner=None' in text))
+                 and (owner in text or retired))
         record = dict(exit_code=code, partition=partition,
                       log_offset=log_offset, text=text, typed=typed,
                       unix_ns=now_ns())
@@ -1444,13 +1449,14 @@ class CellDriver:
                 # the very run that missed the cut is lost again.
                 self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
-            child.release_completion()
             # The kill lands after the measurement window, so no sample row
             # follows it: the failure evidence is the coordinator's own
-            # terminal error. The log watermark is taken before the signal, so
-            # only text appended after the kill can satisfy the gate.
+            # terminal error. The log watermark is taken and the owner killed
+            # while the completion gate still holds the run, so the run cannot
+            # exit before the kill and only text appended after it counts.
             log_offset = self._log_offset(child)
             record['kill'] = self.kill_owner(host, f'retirement {cut}')
+            child.release_completion()
             record['failure'] = self.stop_on_terminal_failure(
                 child, partition=record['kill'].get('partition'),
                 log_offset=log_offset)
