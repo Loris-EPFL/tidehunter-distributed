@@ -86,10 +86,79 @@ EPOCH_LISTING = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
                  'for g in "$d"/epoch_*; do [ -d "$g" ] || continue; ')
 WAL = re.compile(r'^wal_([0-9a-f]{16})$')
 DATABASE = re.compile(r'^db-[0-9a-f]{32}$')
+# The owner persists its fence ledger here (`tcp/inventory.rs` `MANIFEST`); the
+# fence rewrites it before the new epoch can serve a write.
+INVENTORY_MANIFEST = 'tcp-node-inventory-v1'
+# `fencing_generations::check_owner_status` refuses a stale root with this text.
+FENCING_DISAGREEMENT = 'fencing inventory disagrees'
+HIGH_WATER = 'high-water'
+# A stopped process reaches state `T` in microseconds; the allowance only covers
+# a loaded host, never an unfrozen writer.
+FREEZE_TIMEOUT_SECONDS = 5.0
+FROZEN_STATES = ('T', 't')
+GONE_STATES = ('Z', 'X')
 
 
 class CellError(RuntimeError):
     """A precondition, gate or verification failed; evidence is still retained."""
+
+
+def process_group_states(pgid):
+    """State letter of every live process in `pgid` (`/proc/<pid>/stat`)."""
+    states = {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            text = (entry / 'stat').read_text()
+        except OSError:
+            continue
+        # `comm` may contain spaces and parentheses, so split after the last
+        # `)`: the fields are state, ppid, pgrp, session, ...
+        try:
+            fields = text.rsplit(')', 1)[1].split()
+            state, pgrp = fields[0], int(fields[2])
+        except (IndexError, ValueError):
+            continue
+        if pgrp == pgid:
+            states[int(entry.name)] = state
+    return states
+
+
+def freeze_group(pgid, *, timeout=FREEZE_TIMEOUT_SECONDS):
+    """SIGSTOP a process group and prove every member reached state `T`.
+
+    A signal is queued, not applied: `killpg` returns while the writer still
+    runs. A cell that copies a root or launches a second authority after an
+    unverified stop can therefore race the very write it means to exclude.
+    A zombie cannot write, so it is reported as gone instead of blocking.
+    """
+    started = time.monotonic()
+    try:
+        os.killpg(pgid, signal.SIGSTOP)
+    except ProcessLookupError as error:
+        raise CellError(f'cannot freeze process group {pgid}: it is gone') from error
+    deadline = started + timeout
+    while True:
+        states = process_group_states(pgid)
+        alive = {pid: state for pid, state in states.items()
+                 if state not in GONE_STATES}
+        if states and alive and all(state in FROZEN_STATES
+                                    for state in alive.values()):
+            return dict(pids=sorted(states), states=states,
+                        gone=sorted(pid for pid in states if pid not in alive),
+                        unix_ns=now_ns(),
+                        waited_ms=round((time.monotonic() - started) * 1e3, 3))
+        if not states:
+            raise CellError(f'cannot freeze process group {pgid}: no live process')
+        if not alive:
+            raise CellError(f'process group {pgid} has no live process to freeze')
+        if time.monotonic() > deadline:
+            raise CellError(
+                f'process group {pgid} did not stop within {timeout}s: '
+                + ', '.join(f'{pid}={state}'
+                            for pid, state in sorted(alive.items())))
+        time.sleep(0.005)
 
 
 def digest(path):
@@ -585,16 +654,30 @@ class Cluster:
         return dict(host=host, files=files, roots=roots, unix_ns=now_ns())
 
     def seal_markers(self, host):
-        """Owner databases that published a sealed WAL or live-target marker.
+        """Owner fence evidence: write-protect markers, generations and manifest.
 
         `partition-seal-v5` is a per-generation file under
-        `db-<database>/epoch_<generation>` (`storage.rs` `SEAL`), while the
-        live-target marker stays at the database root. A database is sealed
-        when either count is positive.
+        `db-<database>/epoch_<generation>` (`storage.rs` `SEAL`); the live
+        write-protect marker is a file under `db-<database>/live-target/sealed`
+        (`nvmeof/live_target.rs` `write_sealed`); the owner's fence ledger is the
+        root file `tcp-node-inventory-v1` (`tcp/inventory.rs` `MANIFEST`).
+
+        The marker count alone is not a fence invariant: `protect_live_targets`
+        publishes nothing when the fenced epoch has no writable live binding.
+        The generation directory and the ledger rewrite are unconditional, so
+        all three are returned with their mtimes: a count proves a marker, a
+        mtime names the fence instant on the owner clock.
         """
-        db_script = ('for d in "$1"/db-*; do [ -d "$d" ] || continue; '
-                     'n=$(ls -1 "$d/live-target/sealed" 2>/dev/null | wc -l); '
-                     'echo "db $d $n"; done')
+        db_script = (
+            'for d in "$1"/db-*; do [ -d "$d" ] || continue; '
+            'n=$(ls -1 "$d/live-target/sealed" 2>/dev/null | wc -l); '
+            'echo "db $d $n"; '
+            'find "$d/live-target/sealed" -maxdepth 1 -type f '
+            '-printf "seal %p %s %T@\\n" 2>/dev/null; '
+            'find "$d" -maxdepth 1 -type f '
+            '-printf "rootfile %p %s %T@\\n" 2>/dev/null; '
+            'find "$d" -maxdepth 1 -type d -name "epoch_*" '
+            '-printf "epochdir %p %T@\\n" 2>/dev/null; done')
         epoch_script = (EPOCH_LISTING +
                         'c=$(ls -1 "$g"/partition-seal-v5 2>/dev/null | wc -l); '
                         'echo "epoch $d $c"; done; done')
@@ -603,20 +686,33 @@ class Cluster:
             host, f'sh -c {quote(script)} -- {quote(self.owner_root(host))}', check=False)
         if code != 0:
             raise CellError(f'{host}: cannot read the sealed markers')
-        live, epochs = {}, {}
+        live, epochs, markers, epoch_dirs, rootfiles = {}, {}, {}, {}, {}
         for line in out.decode().splitlines():
             parts = line.split()
-            if len(parts) != 3:
+            if not parts:
                 continue
-            kind, path, count = parts
-            if kind == 'db':
-                live[path] = int(count)
-            elif kind == 'epoch':
-                epochs[path] = epochs.get(path, 0) + int(count)
+            kind = parts[0]
+            try:
+                if kind == 'db' and len(parts) == 3:
+                    live[parts[1]] = int(parts[2])
+                elif kind == 'epoch' and len(parts) == 3:
+                    epochs[parts[1]] = epochs.get(parts[1], 0) + int(parts[2])
+                elif kind == 'seal' and len(parts) == 4:
+                    markers[parts[1]] = dict(size=int(parts[2]),
+                                             mtime=float(parts[3]))
+                elif kind == 'rootfile' and len(parts) == 4:
+                    rootfiles[parts[1]] = dict(size=int(parts[2]),
+                                               mtime=float(parts[3]))
+                elif kind == 'epochdir' and len(parts) == 3:
+                    epoch_dirs[parts[1]] = dict(mtime=float(parts[2]))
+            except ValueError:
+                continue
         databases = len(live)
         sealed = sum(1 for path, count in live.items()
                      if count > 0 or epochs.get(path, 0) > 0)
-        return dict(host=host, databases=databases, sealed=sealed, unix_ns=now_ns())
+        return dict(host=host, databases=databases, sealed=sealed,
+                    markers=markers, epoch_dirs=epoch_dirs,
+                    rootfiles=rootfiles, unix_ns=now_ns())
 
     def generation_wal(self, host):
         """Owner `wal_*` files per `epoch_<generation>` directory.
@@ -694,6 +790,7 @@ class Coordinator:
         self.started_unix_ns = now_ns()
         self.killed_unix_ns = None
         self.stop_record = None
+        self.freeze_record = None
         self._gate_stop = threading.Event()
         self._gate_thread = threading.Thread(target=self.gates.run,
                                              args=(self._gate_stop,), daemon=True)
@@ -736,6 +833,25 @@ class Coordinator:
             os.killpg(self.process.pid, value)
         except ProcessLookupError:
             pass
+
+    def freeze(self, *, timeout=FREEZE_TIMEOUT_SECONDS):
+        """Stop the coordinator and prove the stop, before anything depends on it."""
+        if self.process.poll() is not None:
+            raise CellError(f'the coordinator exited ({self.process.returncode}) '
+                            'before it could be frozen')
+        self.freeze_record = freeze_group(self.process.pid, timeout=timeout)
+        return self.freeze_record
+
+    def resume(self):
+        """Release the coordinator; the instant before SIGCONT is the release.
+
+        `killpg` returns while the signal is still in flight, so a stamp after
+        it is later than the first post-release write. The caller compares rows
+        against the pre-signal stamp and reports the bracket width.
+        """
+        released = now_ns()
+        self.signal(signal.SIGCONT)
+        return dict(released_unix_ns=released, release_returned_unix_ns=now_ns())
 
     def stop(self):
         """Stop the coordinator with the engine's own declared grace.
@@ -1150,57 +1266,142 @@ class CellDriver:
                     wal={host: self.cluster.generation_wal(host) for host in hosts})
 
     @staticmethod
-    def owner_fence_proof(baseline, at_fence, after, *, authority_unix_ns):
+    def owner_fence_proof(baseline, at_fence, after, *, authority_unix_ns,
+                          fence_kind='generation'):
         """The owner-side half of exclusivity, or the named reason it is absent.
 
-        Three snapshots are required: `baseline` before the stale writer is
-        stopped, `at_fence` while it is still stopped, and `after` the run.
+        Three snapshots are required: `baseline` before the new authority is
+        launched (or, for a lapse cell, before the pause), `at_fence` after the
+        owners published the fence, and `after` once the writers stopped.
+        `baseline` is also the stale writer's generation set: a generation
+        present before the launch cannot belong to the new authority.
 
-        - The fence marker must **strictly increase** from `baseline` to
-          `at_fence` (an equal positive count is a marker that predates this
-          fence, not one this fence published), and `at_fence` must be taken no
-          later than `authority_unix_ns`, the new authority's first accepted
-          write.
-        - Every generation listed in `at_fence` must still be present in `after`
-          with the same file set and identical size and mtime. A generation or
-          file that disappears is incomplete evidence, not absence of growth.
+        `fence_kind` names the engine fence, because the two publish different
+        records:
+
+        - `generation` (contend/stale): **every** owner creates exactly one new
+          `epoch_*` directory and rewrites the inventory ledger. One owner's
+          advance never stands in for the others. That record is unconditional;
+          the sealed-marker count is corroboration only because
+          `protect_live_targets` writes no marker when the fenced epoch has no
+          writable live binding.
+        - `write-protect` (lapse/sealed): lease expiry seals the current
+          generation in place, on **every** owner. No new epoch exists and the
+          ledger is unchanged; the new write-protect markers are the record.
+
+        The snapshot must bracket `authority_unix_ns`: taken after the baseline
+        and no earlier than the fence. The engine publishes the fence before a
+        new authority can serve a write (`tcp/control.rs` activate-after-fence),
+        so the bracket plus the order is the proof; no owner clock is compared
+        to a coordinator clock.
+
+        The stale set is the generations present in **both** snapshots, and the
+        fence snapshot is the reference for size and mtime: a write that landed
+        between the baseline and the fence was accepted before it, so only a
+        change after the fence is growth. An empty set is no evidence, never
+        "nothing grew". All three snapshots are retained verbatim.
         """
-        proof = dict(evidence_available=False, fence_counters_increased=None,
-                     scraped_unix_ns=None, stale_generations=[], stale_growth=None,
-                     no_stale_growth=None, reason=None)
+        proof = dict(evidence_available=False, fence_kind=fence_kind,
+                     fence_counters_increased=None,
+                     fence_hosts=[], fence_hosts_missing=[], scraped_unix_ns=None,
+                     baseline_unix_ns=None, after_unix_ns=None,
+                     new_epoch_dirs={}, new_markers={}, manifest_rewritten={},
+                     sealed_before={}, sealed_at_fence={},
+                     fence_owner_unix_ns=None, stale_generations=[],
+                     stale_reference={}, stale_hosts_missing=[],
+                     snapshots=None, stale_growth=None, no_stale_growth=None,
+                     reason=None)
         if not baseline or not at_fence or not after:
             proof['reason'] = ('no complete owner-side fence snapshot set (baseline, '
                                'at the fence, after the run) was captured')
             return proof
+        proof['baseline_unix_ns'] = baseline.get('unix_ns')
         proof['scraped_unix_ns'] = at_fence.get('unix_ns')
+        proof['after_unix_ns'] = after.get('unix_ns')
         before_seals = baseline.get('seals') or {}
         at_seals = at_fence.get('seals') or {}
         if not before_seals or not at_seals:
             proof['reason'] = 'no owner seal marker was readable at either snapshot'
             return proof
-        raised = []
+        if (set(before_seals) != set(at_seals)
+                or set(at_seals) != set(after.get('seals') or {})):
+            proof['reason'] = ('the owner snapshots do not cover the same hosts, so '
+                               'a partial fence could read as a full one')
+            return proof
+        before_ns, at_ns = baseline.get('unix_ns'), at_fence.get('unix_ns')
+        if (before_ns is None or at_ns is None or after.get('unix_ns') is None
+                or not before_ns < at_ns <= after.get('unix_ns')):
+            proof['reason'] = ('the owner snapshots are not ordered '
+                               'baseline < at the fence <= after')
+            return proof
+        if authority_unix_ns is not None and not (before_ns < authority_unix_ns <= at_ns):
+            proof['reason'] = ('the owner fence snapshot does not bracket the fence '
+                               'instant')
+            return proof
+        raised, owner_instants = [], []
         for host, at in at_seals.items():
             before = before_seals.get(host) or {}
-            if int(at.get('sealed') or 0) > int(before.get('sealed') or 0):
+            new = sorted(set(at.get('epoch_dirs') or {})
+                         - set(before.get('epoch_dirs') or {}))
+            proof['new_epoch_dirs'][host] = new
+            before_markers = before.get('markers') or {}
+            new_markers = sorted(set(at.get('markers') or {}) - set(before_markers))
+            proof['new_markers'][host] = new_markers
+            before_files = before.get('rootfiles') or {}
+            at_files = at.get('rootfiles') or {}
+            rewritten = any(Path(path).name == INVENTORY_MANIFEST
+                            and before_files.get(path) != entry
+                            for path, entry in at_files.items())
+            proof['manifest_rewritten'][host] = rewritten
+            proof['sealed_before'][host] = int(before.get('sealed') or 0)
+            proof['sealed_at_fence'][host] = int(at.get('sealed') or 0)
+            for path in new:
+                owner_instants.append((at['epoch_dirs'][path].get('mtime'), path))
+            for path in new_markers:
+                owner_instants.append((at['markers'][path].get('mtime'), path))
+            if fence_kind == 'write-protect':
+                protected = bool(new_markers) or (
+                    int(at.get('sealed') or 0) > int(before.get('sealed') or 0))
+                if protected:
+                    raised.append(host)
+            elif len(new) == 1 and rewritten:
                 raised.append(host)
-        proof['fence_counters_increased'] = bool(raised)
+        if owner_instants:
+            instants = sorted(instant for instant, _ in owner_instants
+                              if instant is not None)
+            proof['fence_owner_unix_ns'] = instants[0] if instants else None
         proof['fence_hosts'] = raised
+        proof['fence_hosts_missing'] = sorted(set(at_seals) - set(raised))
+        # One owner's advance is not "the owners fenced": every owner must show
+        # its own record, or a second owner that never fenced reads as covered.
+        proof['fence_counters_increased'] = (bool(at_seals)
+                                             and set(raised) == set(at_seals))
 
-        # The stale generations are those present while the writer is stopped;
-        # each must be byte-for-byte unchanged afterwards.
-        generations = sorted(
-            f'{host}:{generation}'
-            for host, row in (at_fence.get('wal') or {}).items()
-            for generation in (row.get('generations') or {}))
-        proof['stale_generations'] = generations
+        # The stale generations exist in both snapshots; the fence snapshot is
+        # the reference. A write that landed between the baseline and the fence
+        # was accepted before the fence and is not post-fence growth.
+        stale = {}
+        for host, at_row in (at_fence.get('wal') or {}).items():
+            base_row = (baseline.get('wal') or {}).get(host) or {}
+            stale[host] = {
+                generation: files
+                for generation, files in (at_row.get('generations') or {}).items()
+                if generation in (base_row.get('generations') or {})}
+            proof['stale_generations'].extend(
+                sorted(f'{host}:{generation}' for generation in stale[host]))
+        proof['stale_generations'].sort()
+        proof['stale_reference'] = {
+            f'{host}:{generation}': files
+            for host, generations in stale.items()
+            for generation, files in generations.items()}
         missing, grown, new_files = [], [], []
-        for host, row in (at_fence.get('wal') or {}).items():
+        for host, generations in stale.items():
             later = ((after.get('wal') or {}).get(host) or {}).get('generations') or {}
-            for generation, files in (row.get('generations') or {}).items():
-                if generation not in later:
+            for generation, files in generations.items():
+                current = later.get(generation)
+                if current is None:
                     missing.append(generation)
                     continue
-                current = later.get(generation) or {}
                 for path, entry in files.items():
                     later_entry = current.get(path)
                     if later_entry is None:
@@ -1213,14 +1414,33 @@ class CellDriver:
                         new_files.append(path)
         proof['stale_growth'] = dict(missing=missing, new_files=new_files,
                                      grown=grown)
-        proof['no_stale_growth'] = not (missing or new_files or grown)
+        # An empty intersection is no evidence: every owner must hold at least
+        # one generation that existed before the fence and at it, or a host
+        # with nothing to compare must never read as "nothing grew".
+        empty = sorted(host for host, generations in stale.items() if not generations)
+        proof['stale_hosts_missing'] = empty
+        proof['no_stale_growth'] = (bool(stale) and not empty
+                                    and not (missing or new_files or grown))
+        proof['snapshots'] = dict(
+            baseline=dict(unix_ns=before_ns, seals=before_seals),
+            at_fence=dict(unix_ns=at_ns, seals=at_seals),
+            after=dict(unix_ns=after.get('unix_ns'),
+                       seals=after.get('seals') or {}))
         proof['evidence_available'] = True
         if not proof['fence_counters_increased']:
-            proof['reason'] = ('the owners published no new fence or write-protect marker '
-                               'between the baseline and the fence')
-        elif authority_unix_ns is not None and proof['scraped_unix_ns'] > authority_unix_ns:
-            proof['reason'] = ('the owner-side fence snapshot was taken after the new '
-                               'authority\'s first accepted write')
+            proof['reason'] = (
+                'the owners published no new write-protect marker between the '
+                'baseline and the fence'
+                if fence_kind == 'write-protect' else
+                'the owners published no new generation and no ledger rewrite '
+                'between the baseline and the fence')
+        elif not proof['no_stale_growth'] and proof['stale_hosts_missing']:
+            proof['reason'] = ('no generation is present in both owner snapshots on '
+                               + ', '.join(proof['stale_hosts_missing'])
+                               + ', so stale growth cannot be ruled out')
+        elif not stale:
+            proof['reason'] = ('no owner listed a generation at the fence, so stale '
+                               'growth cannot be ruled out')
         elif missing:
             proof['reason'] = ('the stale generation\'s WAL listing is incomplete after '
                                'the fence: ' + ', '.join(sorted(missing)[:3]))
@@ -1239,9 +1459,15 @@ class CellDriver:
         idempotent write reads back identically and a clean pass says nothing
         about whether the stale writer's frame was adopted. Exclusivity needs
         stale-generation adoption evidence, which this run cannot produce.
+
+        The engine opens a database by fencing a new generation, so this is only
+        meaningful while A's root still holds the current generation (`lapse`,
+        `sealed`). A root the owners have out-ranked is refused at open; that is
+        `fence_authority_refusal`, not an integrity pass.
         """
         audit = dict(audit_available=False, audit_read_ms=None,
-                     audit_integrity_ok=None, audit_text=None)
+                     audit_integrity_ok=None, audit_text=None,
+                     audit_exit_code=None)
         run = mechanism.read_run(4_096, value=4_096, verify=True, deadline=300)
         source = Path(child.output).parent / 'coordinator'
         started = now_ns()
@@ -1252,18 +1478,72 @@ class CellDriver:
             return audit
         try:
             code = reader.wait(300)
+            audit['audit_exit_code'] = code
             audit['audit_read_ms'] = (now_ns() - started) / 1e6
-            manifest = json.loads((Path(reader.output) / 'manifest.json').read_text())
+            try:
+                manifest = json.loads(
+                    (Path(reader.output) / 'manifest.json').read_text())
+            except (OSError, ValueError) as error:
+                # The engine refuses the root before the runner creates its
+                # output directory, so the reason is in the run log, never in
+                # the missing path.
+                audit['audit_text'] = (
+                    f'the audit run produced no manifest (exit {code}): {error}; '
+                    f'log: {self._run_tail(reader) or "<empty>"}')
+                return audit
             wrong = manifest.get('errors_or_wrong_values')
             audit['audit_integrity_ok'] = code == 0 and wrong == 0
             audit['audit_available'] = True
             audit['audit_text'] = (f'verify_existing_dataset exit {code}, '
                                    f'errors_or_wrong_values {wrong}')
-        except (OSError, ValueError) as error:
-            audit['audit_text'] = f'the audit run did not finish: {error}'
         finally:
             reader.stop()
         return audit
+
+    @staticmethod
+    def _run_tail(reader, limit=800):
+        """The last bytes of one run's log, for a failure that wrote no artifact."""
+        log = getattr(reader, 'log', None)
+        try:
+            return Path(log).read_text(errors='replace')[-limit:].strip()
+        except (AttributeError, OSError):
+            return ''
+
+    def fence_authority_refusal(self, child):
+        """Prove the owners out-rank the stale writer's root.
+
+        A's root records the generation it allocated. Once the new authority has
+        fenced a higher generation, `remote_db.rs` checks the owners' high-water
+        against that allocation (`fencing_generations::check_owner_status`) and
+        refuses the open with `owner high-water N exceeds the allocated
+        generation M`. That refusal is durable owner-side evidence that the
+        fence preceded any reopen; a run that opens proves nothing and is a
+        failure here, never a pass.
+        """
+        probe = dict(available=False, refused=False, opened=False,
+                     exit_code=None, read_ms=None, text=None)
+        run = mechanism.read_run(4_096, value=4_096, verify=True, deadline=300)
+        source = Path(child.output).parent / 'coordinator'
+        started = now_ns()
+        try:
+            reader = self.launch(run, 'fence-verify', path=source)
+        except (OSError, ValueError) as error:
+            probe['text'] = f'the authority probe did not open: {error}'
+            return probe
+        try:
+            code = reader.wait(300)
+            probe['exit_code'] = code
+            probe['read_ms'] = (now_ns() - started) / 1e6
+            text = self._run_tail(reader)
+            probe['opened'] = (Path(reader.output) / 'manifest.json').is_file()
+            probe['text'] = text or f'the authority probe wrote no log (exit {code})'
+            probe['refused'] = (not probe['opened'] and code not in (0, None)
+                                and FENCING_DISAGREEMENT in text
+                                and HIGH_WATER in text)
+            probe['available'] = bool(text)
+        finally:
+            reader.stop()
+        return probe
 
     def keep_rows(self, child, name):
         """Copy a bounded sample excerpt of one run into the cell output.
@@ -1482,7 +1762,6 @@ class CellDriver:
     def fence_cell(self):
         case = self.cell['case']
         run = self.cell['runs'][0]
-        host = self.cluster.owners[0]
         child = self.open(run, 'fence-a')
         record = dict(case=case, tier=self.cell['tier'], owners=len(self.cluster.owners),
                       started_unix_ns=now_ns())
@@ -1496,11 +1775,11 @@ class CellDriver:
                 self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             if case == 'lapse':
-                record.update(self._lapse(child, host))
+                record.update(self._lapse(child))
             elif case in ('contend', 'stale'):
                 record.update(self._contend(child, case))
             elif case == 'sealed':
-                record.update(self._sealed(child, host))
+                record.update(self._sealed(child))
             else:
                 raise CellError(f'unknown fence case {case}')
         finally:
@@ -1512,16 +1791,38 @@ class CellDriver:
                                     verdict=None))
         return self.parts
 
-    def _seal_wait(self, host, started, *, timeout=180):
+    def _seal_wait(self, hosts, started, *, timeout=180):
+        """Wait until **every** owner published its write-protect marker.
+
+        A lease lapses per owner, and the fence is complete only when every
+        owner has write-protected. `S1-5S-lapse-native` attempt 4 reported
+        `databases: 1` because the old loop scraped `owners[0]` alone: a resume
+        in that gap can renew with an owner whose watchdog has not fired yet and
+        then write. The fence instant is the **last** owner's, so the cell never
+        proves a property it did not test.
+        """
+        hosts = list(hosts)
         deadline = time.monotonic() + timeout
+        seen = {}
         while True:
-            markers = self.cluster.seal_markers(host)
-            if markers['sealed'] >= 1:
-                return dict(sealed_partitions=markers['sealed'],
-                            databases=markers['databases'],
-                            write_protect_apply_ms=(now_ns() - started) / 1e6)
+            for host in hosts:
+                if host in seen:
+                    continue
+                markers = self.cluster.seal_markers(host)
+                if markers['sealed'] >= 1:
+                    seen[host] = ((now_ns() - started) / 1e6, markers)
+            if len(seen) == len(hosts):
+                last = max(seen.items(), key=lambda item: item[1][0])
+                return dict(
+                    sealed_partitions=sum(row['sealed'] for _, row in seen.values()),
+                    databases=max(row['databases'] for _, row in seen.values()),
+                    write_protect_apply_ms=last[1][0],
+                    sealed_hosts={host: elapsed for host, (elapsed, _) in seen.items()},
+                    write_protect_last_host=last[0])
             if time.monotonic() > deadline:
-                raise CellError('owners published no sealed marker after the lease lapse')
+                pending = [host for host in hosts if host not in seen]
+                raise CellError('owners published no sealed marker after the lease '
+                                'lapse: ' + ', '.join(pending))
             time.sleep(0.2)
 
     def _refusal(self, rows_, *, phase='measurement'):
@@ -1573,17 +1874,6 @@ class CellDriver:
             return None
         return sum(1 for wall, row in zip(walls, measurement)
                    if row.get('outcome') == 'success' and wall > fence_ns)
-
-    @classmethod
-    def _first_success_ns(cls, child, rows_):
-        """Wall clock of the first successful measurement write, or None."""
-        for row in cls._measurement_rows(rows_):
-            if row.get('outcome') != 'success':
-                continue
-            wall = cls._row_wall_ns(child, row)
-            if wall is not None:
-                return wall
-        return None
 
     @classmethod
     def _last_success_ns(cls, child, rows_):
@@ -1658,17 +1948,20 @@ class CellDriver:
                 return line.strip()
         return None
 
-    def _lapse(self, child, host):
+    def _lapse(self, child):
         result = dict(sealed_partitions=0)
         baseline = self.fence_owner_snapshot()
-        started = now_ns()
-        child.signal(signal.SIGSTOP)
+        freeze = child.freeze()
+        started = freeze['unix_ns']
         result['paused_unix_ns'] = started
-        result.update(self._seal_wait(host, started))
+        result['freeze'] = freeze
+        result.update(self._seal_wait(self.cluster.owners, started))
         at_fence = self.fence_owner_snapshot()
-        resumed = now_ns()
-        child.signal(signal.SIGCONT)
-        result['resumed_unix_ns'] = resumed
+        result['fence_owner_unix_ns'] = self._marker_instant(at_fence, baseline)
+        release = child.resume()
+        result['resumed_unix_ns'] = release['released_unix_ns']
+        result['release_returned_unix_ns'] = release['release_returned_unix_ns']
+        result['pause_ms'] = (release['released_unix_ns'] - started) / 1e6
         result['failure'] = self.stop_on_failure(child, count=1, timeout=180)
         result['a_exit'] = result['failure'].get('exit_code')
         after = self.fence_owner_snapshot()
@@ -1684,6 +1977,8 @@ class CellDriver:
         result['typed_refusal'] = typed
         result['stale_write_refused'] = refusal['refused']
         result['no_success_after_refusal'] = refusal['no_success_after']
+        result['stale_rows'] = self._stale_row_proof(rows_, refusal)
+        result['stale_rows_clean'] = result['stale_rows']['clean']
         # The fence of a lapse cell is the owner's write-protect, applied while
         # the coordinator was paused: after it, the sealed generation may not be
         # written by that coordinator again.
@@ -1704,12 +1999,56 @@ class CellDriver:
         # The row-level verdict; `fence_record` adds the audit and is the one
         # that publishes `exclusive`/`writers`.
         result['owner_fence'] = self.owner_fence_proof(
-            baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'))
+            baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'),
+            fence_kind='write-protect')
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=bool(result.get('sealed_partitions')),
-            owner_fence=result['owner_fence'])
+            owner_fence=result['owner_fence'],
+            rows_clean=result['stale_rows_clean'])
         return result
+
+    @staticmethod
+    def _marker_instant(at_fence, baseline):
+        """Earliest owner-clock write-protect/seal instant new since the baseline."""
+        before = {host: (row.get('markers') or {})
+                  for host, row in ((baseline or {}).get('seals') or {}).items()}
+        instants = []
+        for host, row in ((at_fence or {}).get('seals') or {}).items():
+            known = before.get(host) or {}
+            for path, entry in (row.get('markers') or {}).items():
+                if path not in known and entry.get('mtime') is not None:
+                    instants.append(entry['mtime'])
+        return min(instants) if instants else None
+
+    @classmethod
+    def _stale_row_proof(cls, rows_, refusal):
+        """The clock-free half: every success precedes the first refusal.
+
+        `samples.csv` is written by one writer thread in completion order, so a
+        success row after the first refusal is a write that completed under the
+        new authority. A cell with no acknowledged write proves nothing and is
+        named, never passed.
+        """
+        acknowledged_rows = sum(
+            1 for row in cls._measurement_rows(rows_) if row.get('outcome') == 'success')
+        clean = bool(refusal.get('refused')
+                     and refusal.get('no_success_after')
+                     and acknowledged_rows > 0)
+        proof = dict(acknowledged=acknowledged_rows,
+                     first_refusal_row=refusal.get('first'),
+                     last_success_row=refusal.get('last_success'),
+                     no_success_after_refusal=bool(refusal.get('no_success_after')),
+                     clean=clean)
+        if refusal.get('refused') is None:
+            proof['reason'] = 'the stale writer recorded no refusal row'
+        elif acknowledged_rows == 0:
+            proof['reason'] = ('the stale writer recorded no acknowledged write '
+                               'before its refusal')
+        elif not refusal.get('no_success_after'):
+            proof['reason'] = ('a stale-writer write succeeded after its first '
+                               'refusal')
+        return proof
 
     @classmethod
     def _refusal_kind(cls, child, rows_, refusal, source):
@@ -1745,23 +2084,32 @@ class CellDriver:
         return None, dict(lower_ms=lower, upper_ms=upper)
 
     @staticmethod
-    def _exclusive(refusal_kind, stale_after, *, new_authority, owner_fence=None):
+    def _exclusive(refusal_kind, stale_after, *, new_authority, owner_fence=None,
+                   rows_clean=None):
         """Whether exclusive writes are proven, and the first missing proof.
 
-        `owner_fence` is the owner-side half: the owners published their fence or
-        write-protect marker before the new authority's first accepted write, and
-        the stale generation's WAL gained no file and no byte afterwards. A
-        deterministic-payload readback is not this evidence.
+        `rows_clean` is the clock-free half: every acknowledged write of the
+        stale writer precedes its first refusal in completion order.
+        `stale_after` is reported but not convicted: a row that *completed*
+        after the fence instant can be a write the owner accepted before it and
+        acknowledged after the frozen writer resumed (attempt 4's lapse cell had
+        three). The accept-time evidence is the owner side: nothing landed in
+        the stale generation after the write-protect, which the kernel enforces
+        before the marker is written. `owner_fence` is that half.
+        A deterministic-payload readback is not this evidence.
         """
         if refusal_kind is None:
             return False, 'the stale writer recorded no typed refusal (row or self-fence)'
         if not new_authority:
             return False, 'the new authority recorded no progress (no new writer, no seal)'
-        if stale_after is None:
-            return False, ('the stale writer\'s rows or the fence instant are missing, '
-                           'so no write after the fence can be ruled out')
-        if stale_after:
-            return False, f'{stale_after} stale-writer write(s) completed after the fence'
+        if rows_clean is None:
+            return False, ('the stale writer\'s completion-order evidence is missing '
+                           '(no acknowledged write or no refusal row)'
+                           + (f'; the wall clock shows {stale_after} completion(s) '
+                              'after the fence' if stale_after else ''))
+        if rows_clean is not True:
+            return False, ('the stale writer\'s completion order shows a success after '
+                           'its first refusal')
         if not owner_fence or not owner_fence.get('evidence_available'):
             return False, ('no owner-side fence evidence: no seal or write-protect marker '
                            'and no per-generation WAL listing was captured')
@@ -1775,26 +2123,59 @@ class CellDriver:
             return False, owner_fence['reason']
         return True, None
 
+    @staticmethod
+    def _contend_window(fence_ns, baseline_ns, refusal_ns, resumed_ns, pause_ms):
+        """Bound fence -> observed refusal on the driver's own clock.
+
+        `baseline` precedes the launch, so the fence is strictly after it; the
+        `at_fence` snapshot is taken after the new authority's accepted writes,
+        so the fence is strictly before it. Hence the fence instant lies in
+        `(baseline, at_fence]` and the refusal bounds are computed from both
+        ends. The window contains the controlled pause: it bounds the latency,
+        it does not measure the engine's detection.
+        """
+        if None in (fence_ns, baseline_ns, refusal_ns, resumed_ns):
+            return None, ('the fence, baseline or refusal instant is missing, so no '
+                          'fence-to-refusal bound exists')
+        if refusal_ns < resumed_ns:
+            return None, ('the refusal row predates the release instant: the row '
+                          'clock and the freeze bracket disagree')
+        return dict(
+            lower_ms=(refusal_ns - fence_ns) / 1e6,
+            upper_ms=(refusal_ns - baseline_ns) / 1e6,
+            resume_ms=(refusal_ns - resumed_ns) / 1e6,
+            pause_ms=pause_ms,
+            includes_pause=True), None
+
     def _contend(self, child, case):
-        """Freeze A, copy its root, start B on the copy, then resume A.
+        """Freeze A (proven), copy its root, start B on the copy, release A.
 
         `samples.csv` is written by one writer thread in completion order, so the
         row order is the operation order: every success of A must precede its
         first refusal. That is the "a stale writer cannot change data" check and
         it needs no timestamp from A's own clock.
+
+        The owner snapshots bracket the fence: `baseline` is read after the
+        proven freeze and before B is launched, `at_fence` after B has accepted
+        writes while A is still frozen. The fence instant used for A's rows is
+        the `at_fence` stamp, so the comparison never needs a clock from a
+        process that is killed before it writes its summary.
         """
-        child.signal(signal.SIGSTOP)
+        freeze = child.freeze()
         source = Path(child.output).parent / 'coordinator'
         copy = self.cluster.root('fence-b')
         if copy.exists():
             shutil.rmtree(copy)
         shutil.copytree(source, copy)
         run = self.cell['runs'][0]
-        second = self.launch(run, 'fence-b', path=copy)
-        result = dict(copied_root=str(copy))
-        # The owner-side baseline is taken before the new writer can be accepted.
+        # Read before the launch: B fences at open, so a baseline taken after
+        # the launch may already contain B's generation and ledger rewrite.
         baseline = self.fence_owner_snapshot()
+        result = dict(copied_root=str(copy), freeze=freeze,
+                      paused_unix_ns=freeze['unix_ns'])
+        second, at_fence, after = None, None, None
         try:
+            second = self.launch(run, 'fence-b', path=copy)
             gate = self.gate_writes(second, FENCE_WRITES, timeout=300)
             result['second_gate'] = gate
             if not gate.get('reached'):
@@ -1802,15 +2183,21 @@ class CellDriver:
             # At the fence, read while the stale writer is still stopped and
             # before it may run again.
             at_fence = self.fence_owner_snapshot()
-            child.signal(signal.SIGCONT)
-            result['resumed_unix_ns'] = now_ns()
+            release = child.resume()
+            result['resumed_unix_ns'] = release['released_unix_ns']
+            result['release_returned_unix_ns'] = release['release_returned_unix_ns']
+            result['pause_ms'] = (release['released_unix_ns'] - freeze['unix_ns']) / 1e6
             result['failure'] = self.stop_on_failure(child, count=1)
-            after = self.fence_owner_snapshot()
         finally:
-            second.stop()
-            # The new writer's own rows are the fence's evidence; the failure
-            # upload keeps 30 MiB of samples.csv.tmp that no verdict reads.
-            self.keep_rows(second, 'fence-b')
+            try:
+                if second is not None:
+                    second.stop()
+                    # The new writer's own rows are the fence's evidence; the
+                    # failure upload keeps 30 MiB of samples.csv.tmp that no
+                    # verdict reads.
+                    self.keep_rows(second, 'fence-b')
+            finally:
+                after = self.fence_owner_snapshot()
         first_rows = child.rows()
         refusal = self._refusal(first_rows)
         text, typed = refusal['text'], refusal['typed']
@@ -1820,46 +2207,50 @@ class CellDriver:
         result['first_refusal_row'] = refusal['first']
         result['last_success_row'] = refusal['last_success']
         result['first_acknowledged'] = acknowledged(first_rows)
-        result['second_acknowledged'] = acknowledged(second.rows())
         result['stale_write_refused'] = refusal['refused']
         result['no_success_after_refusal'] = refusal['no_success_after']
         result['refusal_text'] = text
         result['typed_refusal'] = typed
-        second_rows = second.rows()
+        result['stale_rows'] = self._stale_row_proof(first_rows, refusal)
+        result['stale_rows_clean'] = result['stale_rows']['clean']
+        second_rows = second.rows() if second is not None else []
+        result['second_acknowledged'] = acknowledged(second_rows)
         result['first_started_unix_ns'] = getattr(child, 'started_unix_ns', None)
         result['second_started_unix_ns'] = getattr(second, 'started_unix_ns', None)
         result['second_measurement_rows'] = len(self._measurement_rows(second_rows))
-        # The fence is the new coordinator's first completed write, converted to
-        # the same wall clock as the stale writer's rows. Without both start
-        # clocks the comparison is impossible and the verdict says so.
-        if (result['first_started_unix_ns'] is not None
-                and result['second_started_unix_ns'] is not None):
-            result['fence_unix_ns'] = self._first_success_ns(second, second_rows)
-            result['second_last_success_unix_ns'] = self._last_success_ns(second, second_rows)
-        else:
-            result['fence_unix_ns'] = None
+        result['second_last_success_unix_ns'] = self._last_success_ns(second, second_rows)
+        result['fence_unix_ns'] = (at_fence or {}).get('unix_ns')
+        result['fence_owner_unix_ns'] = self._marker_instant(at_fence, baseline)
         result['stale_success_after_fence'] = self._stale_after_fence(
             child, first_rows, result['fence_unix_ns'])
-        result.update(self.fence_audit(child))
+        result['root_refused'] = self.fence_authority_refusal(child)
         refusal_kind, wall = self._refusal_kind(
             child, first_rows, refusal, result.get('refusal_source'))
         result['refusal_kind'] = refusal_kind
         result['refusal_unix_ns'] = wall
-        result['fence_reject_ms'], result['fence_reject_window_ms'] = self._fence_window(
-            result['fence_unix_ns'], wall, self._last_success_ns(child, first_rows),
-            self._run_end_ns(child))
-        # The row-level verdict; `fence_record` adds the audit and is the one
-        # that publishes `exclusive`/`writers`.
+        result['resume_reject_ms'] = (
+            None if wall is None or result.get('resumed_unix_ns') is None
+            else (wall - result['resumed_unix_ns']) / 1e6)
+        result['fence_reject_ms'], result['fence_reject_window_ms'] = (
+            None, None)
+        window, reason = self._contend_window(
+            result['fence_unix_ns'], (baseline or {}).get('unix_ns'), wall,
+            result.get('resumed_unix_ns'), result.get('pause_ms'))
+        result['fence_reject_window_ms'] = window
+        result['fence_reject_reason'] = reason
+        # The row-level verdict; `fence_record` adds the owner-side proof and is
+        # the one that publishes `exclusive`/`writers`.
         result['owner_fence'] = self.owner_fence_proof(
             baseline, at_fence, after, authority_unix_ns=result.get('fence_unix_ns'))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
             new_authority=result['second_measurement_rows'] > 0,
-            owner_fence=result['owner_fence'])
+            owner_fence=result['owner_fence'],
+            rows_clean=result['stale_rows_clean'])
         return result
 
-    def _sealed(self, child, host):
-        result = self._lapse(child, host)
+    def _sealed(self, child):
+        result = self._lapse(child)
         run = mechanism.read_run(4_096, value=4096, verify=True, deadline=300)
         # The reader opens A's own coordinator root: the sealed generation is the
         # data under test, not a fresh database.
@@ -2011,7 +2402,8 @@ def fault_cells_exclusive(fence):
         new_authority=((fence.get('second_measurement_rows') or 0) > 0
                        if fence.get('case') in ('contend', 'stale')
                        else (fence.get('sealed_partitions') or 0) >= 1),
-        owner_fence=fence.get('owner_fence'))
+        owner_fence=fence.get('owner_fence'),
+        rows_clean=fence.get('stale_rows_clean'))
 
 
 def fence_record(driver):
@@ -2020,23 +2412,30 @@ def fence_record(driver):
     The plan's property is "a stale coordinator cannot write after the new
     coordinator's fence". A refusal is accepted as an owner-side typed refusal
     row or as the coordinator's own typed lease-lapse self-fence
-    (`coordinator_lease.rs` emits it before frame encoding), and it only counts
-    together with exclusivity: the stale writer recorded no completed success
-    after the fence, the new authority proceeded, and the audit is clean when an
-    audit part exists. A missing proof is a named failure, never a pass.
+    (`coordinator_lease.rs` emits it before frame encoding). It only counts with
+    exclusivity: the stale writer's writes all precede its first refusal in
+    completion order (the clock-free proof), no success follows the fence on the
+    corroborating wall clock, the new authority proceeded, the owners published
+    their fence before it could write, and the stale generation's WAL gained
+    nothing. A missing proof is a named failure, never a pass.
     """
     fence = driver.fence
     case = fence['case']
     audit_parts = [part for part in getattr(driver, 'parts', [])
                    if part.get('role') == 'verify']
-    fence.setdefault('audit_available', bool(audit_parts))
-    if not audit_parts:
-        fence.setdefault('audit_note',
-                         'the fence audit is recorded in the fence record itself, not '
-                         'as a verdict part')
+    if case in ('lapse', 'sealed'):
+        fence.setdefault('audit_available', bool(audit_parts))
+        if not audit_parts:
+            fence.setdefault('audit_note',
+                             'the fence audit is recorded in the fence record itself, '
+                             'not as a verdict part')
     fence.setdefault('owner_fence', None)
     fence['exclusive'], fence['exclusivity_reason'] = fault_cells_exclusive(fence)
     fence['writers'] = 1 if fence['exclusive'] else 2
+    stale_after = fence.get('stale_success_after_fence')
+    rows_clean = fence.get('stale_rows_clean')
+    stale_rows = fence.get('stale_rows') or {}
+    row_reason = stale_rows.get('reason')
     checks = [
         mechanism._check('the stale writer was refused (owner row or coordinator self-fence)',
                          fence.get('refusal_kind') is not None,
@@ -2050,27 +2449,47 @@ def fence_record(driver):
                          dict(second_measurement_rows=fence.get('second_measurement_rows'),
                               sealed_partitions=fence.get('sealed_partitions'))),
         mechanism._check('no stale-writer write completed after the fence',
-                         fence.get('stale_success_after_fence') == 0,
-                         dict(stale_success_after_fence=fence.get('stale_success_after_fence'),
+                         rows_clean is True,
+                         dict(stale_rows_clean=rows_clean,
+                              stale_rows=stale_rows or None,
+                              stale_success_after_fence=stale_after,
                               fence_unix_ns=fence.get('fence_unix_ns'),
-                              first_started_unix_ns=fence.get('first_started_unix_ns'),
-                              second_started_unix_ns=fence.get('second_started_unix_ns'),
-                              reason=fence.get('exclusivity_reason'))),
+                              fence_owner_unix_ns=fence.get('fence_owner_unix_ns'),
+                              resumed_unix_ns=fence.get('resumed_unix_ns'),
+                              resume_reject_ms=fence.get('resume_reject_ms'),
+                              note=('completions after the fence can be writes the '
+                                    'owner accepted before it and acknowledged after '
+                                    'the release; the sealed generation\'s growth is '
+                                    'the accept-time evidence'),
+                              reason=(row_reason or fence.get('exclusivity_reason')))),
         mechanism._check('exclusive writes are proven', fence.get('exclusive') is True,
                          dict(reason=fence.get('exclusivity_reason'),
                               refusal_kind=fence.get('refusal_kind'),
-                              stale_success_after_fence=fence.get('stale_success_after_fence'),
+                              stale_rows_clean=rows_clean,
+                              stale_success_after_fence=stale_after,
                               second_measurement_rows=fence.get('second_measurement_rows'),
                               sealed_partitions=fence.get('sealed_partitions'))),
     ]
-    checks.append(mechanism._check(
-        'the fence audit ran over the stale writer\'s root (integrity only)',
-        fence.get('audit_available') is True,
-        dict(available=fence.get('audit_available'),
-             integrity_ok=fence.get('audit_integrity_ok'),
-             text=fence.get('audit_text'),
-             scope='deterministic-payload readback; not exclusivity evidence',
-             note=fence.get('audit_note'))))
+    if case in ('contend', 'stale'):
+        probe = fence.get('root_refused') or {}
+        checks.append(mechanism._check(
+            'the stale writer\'s root was refused as an authority after the fence',
+            probe.get('refused') is True,
+            dict(refused=probe.get('refused'),
+                 opened=probe.get('opened'),
+                 exit_code=probe.get('exit_code'),
+                 read_ms=probe.get('read_ms'),
+                 text=probe.get('text'),
+                 scope='the owners out-rank the stale root; not an integrity readback')))
+    else:
+        checks.append(mechanism._check(
+            'the fence audit ran over the stale writer\'s root (integrity only)',
+            fence.get('audit_available') is True,
+            dict(available=fence.get('audit_available'),
+                 integrity_ok=fence.get('audit_integrity_ok'),
+                 text=fence.get('audit_text'),
+                 scope='deterministic-payload readback; not exclusivity evidence',
+                 note=fence.get('audit_note'))))
     owner = fence.get('owner_fence') or {}
     if not owner:
         owner = dict(reason='no owner-side fence snapshot was taken',
@@ -2081,8 +2500,16 @@ def fence_record(driver):
         and owner.get('fence_counters_increased') is True,
         dict(available=owner.get('evidence_available'),
              counters_increased=owner.get('fence_counters_increased'),
+             fence_hosts=owner.get('fence_hosts'),
+             fence_hosts_missing=owner.get('fence_hosts_missing'),
+             new_epoch_dirs=owner.get('new_epoch_dirs'),
+             manifest_rewritten=owner.get('manifest_rewritten'),
+             sealed_before=owner.get('sealed_before'),
+             sealed_at_fence=owner.get('sealed_at_fence'),
+             baseline_unix_ns=owner.get('baseline_unix_ns'),
              scraped_unix_ns=owner.get('scraped_unix_ns'),
              fence_unix_ns=fence.get('fence_unix_ns'),
+             fence_owner_unix_ns=owner.get('fence_owner_unix_ns'),
              reason=owner.get('reason'))))
     checks.append(mechanism._check(
         'the stale generation gained nothing after the fence',
@@ -2091,6 +2518,7 @@ def fence_record(driver):
         dict(available=owner.get('evidence_available'),
              generations=owner.get('stale_generations'),
              growth=owner.get('stale_growth'),
+             hosts_missing=owner.get('stale_hosts_missing'),
              reason=owner.get('reason'))))
     if case == 'sealed':
         checks.append(mechanism._check('sealed generation is readable',
@@ -2100,13 +2528,17 @@ def fence_record(driver):
                                        fence.get('sealed_write_refused') is True,
                                        fence.get('sealed_write_text')))
     if case in ('contend', 'lapse', 'stale', 'sealed'):
+        window = fence.get('fence_reject_window_ms')
         checks.append(mechanism._check(
             'fence latency measured or bounded',
-            fence.get('fence_reject_ms') is not None
-            or fence.get('fence_reject_window_ms') is not None,
+            fence.get('fence_reject_ms') is not None or window is not None,
             dict(kind=fence.get('refusal_kind'),
                  exact_ms=fence.get('fence_reject_ms'),
-                 window=fence.get('fence_reject_window_ms'))))
+                 window=window,
+                 resume_reject_ms=fence.get('resume_reject_ms'),
+                 pause_ms=fence.get('pause_ms'),
+                 fence_owner_unix_ns=fence.get('fence_owner_unix_ns'),
+                 reason=fence.get('fence_reject_reason'))))
     if case in ('lapse', 'sealed'):
         checks.append(mechanism._check('write-protect apply latency measured',
                                        fence.get('write_protect_apply_ms') is not None,

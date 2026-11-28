@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -433,15 +434,14 @@ class FenceExclusivity(unittest.TestCase):
         self.assertFalse(named['exclusive writes are proven']['ok'])
         self.assertIn('missing',
                       named['exclusive writes are proven']['detail']['reason'])
-        self.assertFalse(record['fence']['audit_available'])
-        self.assertIn('recorded in the fence record', record['fence']['audit_note'])
         self.assertFalse(record['fence']['exclusive'])
-        named_checks = {check['check']: check for check in record['checks']}
-        self.assertFalse(named_checks[
+        self.assertFalse(named[
+            'the stale writer\'s root was refused as an authority after the fence']['ok'])
+        self.assertFalse(named[
             'the owners fenced before the new authority\'s first accepted write']['ok'])
         self.assertIn('no owner-side fence snapshot',
-                      named_checks['the owners fenced before the new authority\'s '
-                                   'first accepted write']['detail']['reason'])
+                      named['the owners fenced before the new authority\'s '
+                            'first accepted write']['detail']['reason'])
 
     def test_the_real_stale_rows_are_judged_against_the_new_writers_fence(self):
         rows_ = fault_cells.rows(ROOT / 'experiments/gcp-rdma/fixtures' / 's1-5s-contend-a-excerpt.csv')
@@ -506,7 +506,16 @@ class FenceExclusivity(unittest.TestCase):
         real = self.fixture('s1-5s-contend-attempt3.json')
         fence = dict(real['fence'], refusal_kind='owner-row', exclusive=True,
                      writers=1, stale_success_after_fence=0,
+                     stale_rows_clean=True,
+                     stale_rows=dict(clean=True, acknowledged=10941,
+                                     first_refusal_row=76477,
+                                     last_success_row=76476,
+                                     no_success_after_refusal=True),
                      audit_available=True, audit_integrity_ok=True,
+                     root_refused=dict(refused=True, opened=False, exit_code=1,
+                                       text='owner 0 fencing inventory disagrees: '
+                                            'owner high-water 2 exceeds the '
+                                            'allocated generation 1'),
                      second_measurement_rows=real['new_writer']['measurement_rows'],
                      owner_fence=dict(evidence_available=True,
                                       fence_counters_increased=True,
@@ -539,7 +548,12 @@ class FenceExclusivity(unittest.TestCase):
         fence = dict(case='lapse', refusal_kind='coordinator-self-fence',
                      refusal_text='coordinator lease lapsed on owner partition 1',
                      first_refusal_row=None, exclusive=True, writers=1,
-                     stale_success_after_fence=0, sealed_partitions=1,
+                     stale_success_after_fence=0,
+                     stale_rows_clean=True,
+                     stale_rows=dict(clean=True, acknowledged=4096,
+                                     first_refusal_row=None, last_success_row=None,
+                                     no_success_after_refusal=True),
+                     sealed_partitions=1,
                      audit_available=True, audit_integrity_ok=True,
                      owner_fence=dict(evidence_available=True,
                                       fence_counters_increased=True,
@@ -557,6 +571,496 @@ class FenceExclusivity(unittest.TestCase):
         self.assertTrue(latency['ok'])
         self.assertEqual(latency['detail']['kind'], 'coordinator-self-fence')
         self.assertEqual(latency['detail']['window'], dict(lower_ms=0.0, upper_ms=420.0))
+
+
+class Attempt4FenceEvidence(unittest.TestCase):
+    """The real attempt-4 contend record: every check passes on its shape.
+
+    The numbers are from
+    `scratch/CampaignFleetC/evidence/S1-5S-contend-native/attempt-4/receipt.json`
+    and `fence-verify/run.log`. The synchronous variant produced the same
+    record, so one shape covers both. The stale writer refused at row 76,477
+    after 10,941 acknowledged writes; the new authority wrote 699,902 rows; the
+    stale generation's WAL did not change.
+    """
+
+    AT_FENCE = 1_795_850_049_466_631_559
+    BASELINE = 1_795_850_039_400_000_000
+    AFTER = 1_795_850_059_400_000_000
+    REFUSED = 1_795_850_055_218_909_783
+    RELEASED = 1_795_850_055_218_500_000
+    PAUSED = 1_795_850_386_456_226_135
+    LAPSE_FENCE = 1_795_850_393_451_614_069
+    HOST0 = '10.128.0.19'
+    HOST1 = '10.128.0.25'
+    DB = '/mnt/guest/node/storage/db-eccec204df373e8da8115089136169bd'
+    EPOCH1 = [f'{HOST0}:{DB}/epoch_0000000000000001',
+              f'{HOST1}:{DB}/epoch_0000000000000001']
+    EPOCH2 = [f'{HOST0}:{DB}/epoch_0000000000000002',
+              f'{HOST1}:{DB}/epoch_0000000000000002']
+    HIGH_WATER = ('kv-research: Tidehunter error: Io(Custom { kind: Other, '
+                  'error: "owner 0 fencing inventory disagrees: owner high-water '
+                  '2 exceeds the allocated generation 1" })')
+
+    def fence(self, **overrides):
+        owner = dict(
+            evidence_available=True, fence_kind='generation',
+            fence_counters_increased=True, fence_hosts=['h0', 'h1'],
+            new_epoch_dirs={'h0': [self.EPOCH2[0]], 'h1': [self.EPOCH2[1]]},
+            new_markers={'h0': [f'{self.HOST0}:{self.DB}/live-target/sealed/aa'],
+                         'h1': [f'{self.HOST1}:{self.DB}/live-target/sealed/bb']},
+            manifest_rewritten={'h0': True, 'h1': True},
+            sealed_before={'h0': 0, 'h1': 0},
+            sealed_at_fence={'h0': 1, 'h1': 1},
+            baseline_unix_ns=self.BASELINE,
+            scraped_unix_ns=self.AT_FENCE,
+            after_unix_ns=self.AFTER,
+            fence_owner_unix_ns=1_795_850_039_600_000_000,
+            stale_generations=self.EPOCH1,
+            stale_growth=dict(missing=[], new_files=[], grown=[]),
+            no_stale_growth=True, reason=None)
+        pause = (self.RELEASED - self.BASELINE) / 1e6
+        value = dict(
+            case='contend', tier='native',
+            refusal_kind='owner-row',
+            refusal_text=('Tidehunter error: Io(Custom { kind: Other, error: '
+                          '"write core requires recovery; first causal failure: '
+                          'owner=Some(0) batch=Some(BatchVersion { epoch: 1, '
+                          'sequence: 76485 }) stage=live_group: coordinator lease '
+                          'lapsed on owner partition 0" })'),
+            first_refusal_row=76477, last_success_row=76476,
+            stale_rows_clean=True,
+            stale_rows=dict(clean=True, acknowledged=10941,
+                            first_refusal_row=76477, last_success_row=76476,
+                            no_success_after_refusal=True),
+            stale_success_after_fence=0,
+            fence_unix_ns=self.AT_FENCE,
+            fence_owner_unix_ns=1_795_850_039_600_000_000,
+            resumed_unix_ns=self.RELEASED,
+            resume_reject_ms=(self.REFUSED - self.RELEASED) / 1e6,
+            pause_ms=pause,
+            fence_reject_ms=None,
+            fence_reject_window_ms=dict(
+                lower_ms=(self.REFUSED - self.AT_FENCE) / 1e6,
+                upper_ms=(self.REFUSED - self.BASELINE) / 1e6,
+                resume_ms=(self.REFUSED - self.RELEASED) / 1e6,
+                pause_ms=pause, includes_pause=True),
+            fence_reject_reason=None,
+            second_measurement_rows=699902, second_acknowledged=699902,
+            root_refused=dict(available=True, refused=True, opened=False,
+                              exit_code=1, read_ms=101.09742,
+                              text=self.HIGH_WATER),
+            owner_fence=owner)
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def record(fence):
+        return fault_cells.fence_record(types.SimpleNamespace(
+            cell=dict(id='S1-5S-contend-native'), parts=[], fence=fence))
+
+    def test_the_attempt4_record_passes_every_check(self):
+        record = self.record(self.fence())
+        self.assertTrue(record['ok'], record)
+        self.assertEqual(record['fence']['writers'], 1)
+        named = {check['check']: check for check in record['checks']}
+        self.assertTrue(named['no stale-writer write completed after the fence']['ok'])
+        self.assertEqual(
+            named['the stale writer\'s root was refused as an authority '
+                  'after the fence']['detail']['exit_code'], 1)
+        latency = named['fence latency measured or bounded']['detail']
+        self.assertIsNone(latency['exact_ms'])
+        self.assertGreater(latency['window']['resume_ms'], 0,
+                           'the release stamp precedes SIGCONT')
+        self.assertLess(latency['window']['lower_ms'], latency['window']['upper_ms'])
+
+    def test_the_attempt4_lapse_record_passes_with_three_in_flight_completions(self):
+        """The lapse cell accepted three writes before its resume.
+
+        They completed after the fence instant but the sealed generation did not
+        grow, so the owner accepted them before the write-protect and only the
+        acknowledgement landed after the release. The clock-free row proof and
+        the owner-side growth proof pass; the count is reported, not convicted.
+        """
+        owner = dict(
+            evidence_available=True, fence_kind='write-protect',
+            fence_counters_increased=True, fence_hosts=['h0', 'h1'],
+            new_epoch_dirs={'h0': [], 'h1': []},
+            new_markers={'h0': [f'{self.HOST0}:{self.DB}/live-target/sealed/aa'],
+                         'h1': [f'{self.HOST1}:{self.DB}/live-target/sealed/bb']},
+            manifest_rewritten={'h0': False, 'h1': False},
+            sealed_before={'h0': 0, 'h1': 0},
+            sealed_at_fence={'h0': 1, 'h1': 1},
+            baseline_unix_ns=self.PAUSED,
+            scraped_unix_ns=self.LAPSE_FENCE + 5_248,
+            after_unix_ns=1_795_850_397_200_000_000,
+            fence_owner_unix_ns=self.LAPSE_FENCE - 400_000_000,
+            stale_generations=self.EPOCH1,
+            stale_growth=dict(missing=[], new_files=[], grown=[]),
+            no_stale_growth=True, reason=None)
+        fence = dict(self.fence(), case='lapse', tier='native',
+                     sealed_partitions=1, databases=1,
+                     write_protect_apply_ms=6995.387934,
+                     fence_unix_ns=self.LAPSE_FENCE,
+                     resumed_unix_ns=1_795_850_396_986_000_000,
+                     resume_reject_ms=(self.REFUSED - 1_795_850_396_986_000_000) / 1e6,
+                     pause_ms=(self.LAPSE_FENCE - self.PAUSED) / 1e6,
+                     stale_success_after_fence=3,
+                     stale_rows_clean=True,
+                     stale_rows=dict(clean=True, acknowledged=275040,
+                                     first_refusal_row=275041,
+                                     last_success_row=275040,
+                                     no_success_after_refusal=True),
+                     fence_reject_ms=3535.458554,
+                     fence_reject_window_ms=None,
+                     audit_available=True, audit_integrity_ok=True,
+                     owner_fence=owner)
+        record = self.record(fence)
+        self.assertTrue(record['ok'], record)
+        named = {check['check']: check for check in record['checks']}
+        detail = named['no stale-writer write completed after the fence']['detail']
+        self.assertEqual(detail['stale_success_after_fence'], 3)
+        self.assertTrue(detail['stale_rows_clean'])
+        self.assertIn('accept-time', detail['note'])
+
+    def test_a_success_after_the_refusal_is_named(self):
+        fence = self.fence(
+            stale_rows_clean=False,
+            stale_rows=dict(clean=False, acknowledged=10941,
+                            first_refusal_row=76477, last_success_row=76480,
+                            no_success_after_refusal=False,
+                            reason='a stale-writer write succeeded after its '
+                                   'first refusal'))
+        record = self.record(fence)
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['no stale-writer write completed after the fence']['ok'])
+        self.assertIn('succeeded after its first refusal',
+                      named['no stale-writer write completed after the fence'][
+                          'detail']['reason'])
+        self.assertFalse(named['exclusive writes are proven']['ok'])
+
+    def test_a_grown_epoch1_file_is_named(self):
+        owner = dict(self.fence()['owner_fence'],
+                     no_stale_growth=False,
+                     stale_growth=dict(missing=[], new_files=[],
+                                       grown=[f'{self.EPOCH1[0]}/wal_0000000000000004']),
+                     reason='the stale generation\'s WAL gained files or bytes '
+                            'after the fence')
+        record = self.record(self.fence(owner_fence=owner))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['the stale generation gained nothing after the '
+                               'fence']['ok'])
+        self.assertIn('gained files or bytes',
+                      named['the stale generation gained nothing after the '
+                            'fence']['detail']['reason'])
+
+    def test_no_new_generation_is_named(self):
+        owner = dict(self.fence()['owner_fence'],
+                     fence_counters_increased=False,
+                     fence_hosts=[],
+                     new_epoch_dirs={'h0': [], 'h1': []},
+                     reason='the owners published no new generation and no '
+                            'ledger rewrite between the baseline and the fence')
+        record = self.record(self.fence(owner_fence=owner))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['the owners fenced before the new authority\'s '
+                               'first accepted write']['ok'])
+        self.assertFalse(named['exclusive writes are proven']['ok'])
+
+    def test_one_owner_without_a_new_generation_is_named(self):
+        owner = dict(self.fence()['owner_fence'],
+                     fence_counters_increased=False,
+                     fence_hosts=['h0'], fence_hosts_missing=['h1'],
+                     new_epoch_dirs={'h0': [self.EPOCH2[0]], 'h1': []},
+                     reason='the owners published no new generation and no '
+                            'ledger rewrite between the baseline and the fence')
+        record = self.record(self.fence(owner_fence=owner))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        detail = named['the owners fenced before the new authority\'s first '
+                       'accepted write']['detail']
+        self.assertFalse(detail['counters_increased'])
+        self.assertEqual(detail['fence_hosts_missing'], ['h1'])
+
+    def test_a_verify_run_that_opened_is_not_a_refusal(self):
+        record = self.record(self.fence(root_refused=dict(
+            available=True, refused=False, opened=True, exit_code=0,
+            read_ms=900.0, text='verify_existing_dataset exit 0, '
+                                'errors_or_wrong_values 0')))
+        self.assertFalse(record['ok'])
+        named = {check['check']: check for check in record['checks']}
+        self.assertFalse(named['the stale writer\'s root was refused as an '
+                               'authority after the fence']['ok'])
+
+    def test_a_refusal_before_the_release_fails_the_latency(self):
+        window, reason = fault_cells.CellDriver._contend_window(
+            990, 900, 1_000, 1_000_000_000, 10.0)
+        self.assertIsNone(window, 'a refusal before the release is a broken row clock')
+        self.assertIn('predates the release', reason)
+
+    def test_the_attempt4_negative_delta_is_what_the_old_stamp_measured(self):
+        # The old record stamped `resumed` after SIGCONT: refusal - resumed was
+        # -0.099535 ms in native and -0.006144 ms in synchronous. A release
+        # stamp taken before the signal makes the same refusal positive.
+        old = (1_795_850_055_218_909_783 - 1_795_850_055_219_009_318) / 1e6
+        self.assertLess(old, 0)
+        window, reason = fault_cells.CellDriver._contend_window(
+            self.AT_FENCE, self.BASELINE, self.REFUSED, self.RELEASED, 10.0)
+        self.assertIsNone(reason)
+        self.assertGreater(window['resume_ms'], 0)
+
+
+class OwnerFenceProof(unittest.TestCase):
+    """The owner-side counter is the generation, not a marker count."""
+
+    EPOCH1 = '/g/db-a/epoch_0000000000000001'
+    EPOCH2 = '/g/db-a/epoch_0000000000000002'
+    EPOCH3 = '/g/db-a/epoch_0000000000000003'
+
+    @classmethod
+    def snapshot(cls, unix_ns, epochs, markers, manifest_mtime, wal, sizes=None,
+                 host='H'):
+        sizes = sizes or {}
+        return dict(
+            unix_ns=unix_ns,
+            seals={host: dict(
+                host=host, databases=1, sealed=1 if markers else 0,
+                markers={f'/g/{host}/live-target/sealed/{index:02x}':
+                         dict(size=1, mtime=3.0) for index in range(markers)},
+                epoch_dirs={epoch: dict(mtime=2.0) for epoch in epochs},
+                rootfiles={f'/g/{host}/tcp-node-inventory-v1':
+                           dict(size=8, mtime=manifest_mtime)},
+                unix_ns=0)},
+            wal={host: dict(host=host, unix_ns=0, generations={
+                epoch: {f'{epoch}/wal_0000000000000000':
+                        dict(size=sizes.get(epoch, 4096), mtime=1.0)}
+                for epoch in wal})})
+
+    @staticmethod
+    def combine(*rows):
+        """Merge per-host snapshots taken at the same instant."""
+        merged = dict(unix_ns=rows[0]['unix_ns'], seals={}, wal={})
+        for row in rows:
+            merged['seals'].update(row['seals'])
+            merged['wal'].update(row['wal'])
+        return merged
+
+    def three(self, *, after_sizes=None, at_epochs=(EPOCH1, EPOCH2),
+              at_markers=1, baseline_epochs=(EPOCH1,)):
+        return (self.snapshot(10, list(baseline_epochs), 0, 1.0, list(baseline_epochs)),
+                self.snapshot(20, list(at_epochs), at_markers, 2.0, list(at_epochs)),
+                self.snapshot(30, list(at_epochs), at_markers, 2.0,
+                              list(at_epochs), sizes=after_sizes))
+
+    def proof(self, snapshots, *, authority=20, kind='generation'):
+        return fault_cells.CellDriver.owner_fence_proof(
+            *snapshots, authority_unix_ns=authority, fence_kind=kind)
+
+    def test_the_stale_set_is_the_pre_launch_generation(self):
+        proof = self.proof(self.three())
+        self.assertTrue(proof['evidence_available'], proof)
+        self.assertEqual(proof['stale_generations'], [f'H:{self.EPOCH1}'])
+        self.assertEqual(proof['new_epoch_dirs'], {'H': [self.EPOCH2]})
+        self.assertEqual(proof['manifest_rewritten'], {'H': True})
+        self.assertTrue(proof['fence_counters_increased'])
+        self.assertTrue(proof['no_stale_growth'])
+        self.assertIsNone(proof['reason'])
+
+    def test_growth_in_the_new_generation_is_not_stale_growth(self):
+        # `after` lists the new authority's generation with a file the fence
+        # snapshot did not have; only the stale generation is compared.
+        after = self.snapshot(30, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                              [self.EPOCH1, self.EPOCH2])
+        after['wal']['H']['generations'][self.EPOCH2][f'{self.EPOCH2}/wal_x'] = \
+            dict(size=4096, mtime=9.0)
+        baseline, at_fence, _ = self.three()
+        proof = self.proof((baseline, at_fence, after))
+        self.assertTrue(proof['no_stale_growth'], proof)
+
+    def test_a_grown_stale_file_is_named(self):
+        proof = self.proof(self.three(after_sizes={self.EPOCH1: 8192}))
+        self.assertFalse(proof['no_stale_growth'])
+        self.assertEqual(proof['stale_growth']['grown'],
+                         [f'{self.EPOCH1}/wal_0000000000000000'])
+        self.assertIn('gained files or bytes', proof['reason'])
+
+    def test_a_wal_change_between_baseline_and_at_fence_is_not_growth(self):
+        # The write was accepted before the fence and landed before the fence
+        # snapshot; only a change after the fence is growth.
+        baseline = self.snapshot(10, [self.EPOCH1], 0, 1.0, [self.EPOCH1])
+        at_fence = self.snapshot(20, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                                 [self.EPOCH1, self.EPOCH2],
+                                 sizes={self.EPOCH1: 8192})
+        after = self.snapshot(30, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                              [self.EPOCH1, self.EPOCH2],
+                              sizes={self.EPOCH1: 8192})
+        proof = self.proof((baseline, at_fence, after))
+        self.assertTrue(proof['no_stale_growth'], proof)
+        self.assertEqual(
+            proof['stale_reference'][f'H:{self.EPOCH1}'][
+                f'{self.EPOCH1}/wal_0000000000000000']['size'], 8192,
+            'the fence snapshot, not the baseline, is the reference')
+
+    def test_every_owner_must_advance(self):
+        second = '/g/db-b/epoch_0000000000000001'
+        baseline = self.combine(
+            self.snapshot(10, [self.EPOCH1], 0, 1.0, [self.EPOCH1]),
+            self.snapshot(10, [second], 0, 1.0, [second], host='H2'))
+        at_fence = self.combine(
+            self.snapshot(20, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                          [self.EPOCH1, self.EPOCH2]),
+            # H2 publishes a marker and a ledger rewrite but no generation.
+            self.snapshot(20, [second], 1, 2.0, [second], host='H2'))
+        after = self.combine(
+            self.snapshot(30, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                          [self.EPOCH1, self.EPOCH2]),
+            self.snapshot(30, [second], 1, 2.0, [second], host='H2'))
+        proof = self.proof((baseline, at_fence, after))
+        self.assertFalse(proof['fence_counters_increased'])
+        self.assertEqual(proof['fence_hosts'], ['H'])
+        self.assertEqual(proof['fence_hosts_missing'], ['H2'])
+        self.assertIn('no new generation', proof['reason'])
+
+    def test_an_empty_intersection_is_not_no_growth(self):
+        baseline = self.snapshot(10, [self.EPOCH1], 0, 1.0, [self.EPOCH1])
+        at_fence = self.snapshot(20, [self.EPOCH3], 1, 2.0, [self.EPOCH3])
+        proof = self.proof((baseline, at_fence, at_fence))
+        self.assertTrue(proof['evidence_available'])
+        self.assertFalse(proof['no_stale_growth'],
+                         'an empty generation set is no evidence')
+        self.assertEqual(proof['stale_hosts_missing'], ['H'])
+        self.assertIn('no generation is present in both', proof['reason'])
+
+    def test_a_host_without_a_stale_generation_is_named(self):
+        second = '/g/db-b/epoch_0000000000000001'
+        baseline = self.combine(
+            self.snapshot(10, [self.EPOCH1], 0, 1.0, [self.EPOCH1]),
+            self.snapshot(10, [second], 0, 1.0, [second], host='H2'))
+        at_fence = self.combine(
+            self.snapshot(20, [self.EPOCH1, self.EPOCH2], 1, 2.0,
+                          [self.EPOCH1, self.EPOCH2]),
+            # H2 advanced, but its pre-fence generation is gone from the fence
+            # snapshot: nothing to compare, so the proof must fail.
+            self.snapshot(20, ['/g/db-b/epoch_0000000000000002'], 1, 2.0,
+                          ['/g/db-b/epoch_0000000000000002'], host='H2'))
+        proof = self.proof((baseline, at_fence, at_fence))
+        self.assertFalse(proof['no_stale_growth'])
+        self.assertEqual(proof['stale_hosts_missing'], ['H2'])
+        self.assertIn('H2', proof['reason'])
+
+    def test_the_owner_snapshots_are_retained_verbatim(self):
+        baseline, at_fence, after = self.three()
+        proof = self.proof((baseline, at_fence, after))
+        snapshots = proof['snapshots']
+        self.assertEqual(snapshots['baseline'], dict(unix_ns=10,
+                                                     seals=baseline['seals']))
+        self.assertEqual(snapshots['at_fence'], dict(unix_ns=20,
+                                                     seals=at_fence['seals']))
+        self.assertEqual(snapshots['after'], dict(unix_ns=30,
+                                                  seals=after['seals']))
+        marker = snapshots['at_fence']['seals']['H']['markers'][
+            '/g/H/live-target/sealed/00']
+        self.assertEqual(marker, dict(size=1, mtime=3.0))
+        self.assertIn('/g/H/tcp-node-inventory-v1',
+                      snapshots['at_fence']['seals']['H']['rootfiles'])
+
+    def test_exactly_one_new_generation_is_required(self):
+        proof = self.proof(self.three(at_epochs=(self.EPOCH1, self.EPOCH2,
+                                                 self.EPOCH3)))
+        self.assertFalse(proof['fence_counters_increased'])
+        self.assertIn('no new generation', proof['reason'])
+
+    def test_a_baseline_after_the_fence_finds_nothing_new(self):
+        proof = self.proof(self.three(baseline_epochs=(self.EPOCH1, self.EPOCH2)))
+        self.assertFalse(proof['fence_counters_increased'])
+        self.assertIn('no new generation', proof['reason'])
+        # The stale set is then a superset that includes the new authority's
+        # generation: conservative, never a vacuous pass.
+        self.assertEqual(proof['stale_generations'],
+                         [f'H:{self.EPOCH1}', f'H:{self.EPOCH2}'])
+
+    def test_the_write_protect_kind_accepts_markers_without_a_generation(self):
+        snapshots = self.three(at_epochs=(self.EPOCH1,), at_markers=1)
+        self.assertTrue(self.proof(snapshots, kind='write-protect')
+                        ['fence_counters_increased'])
+        self.assertFalse(self.proof(snapshots, kind='generation')
+                         ['fence_counters_increased'])
+
+    def test_a_partial_snapshot_set_is_not_evidence(self):
+        baseline, at_fence, after = self.three()
+        after = dict(after, seals={})
+        proof = self.proof((baseline, at_fence, after))
+        self.assertFalse(proof['evidence_available'])
+        self.assertIn('same hosts', proof['reason'])
+
+    def test_the_authority_instant_must_be_inside_the_bracket(self):
+        proof = self.proof(self.three(), authority=5)
+        self.assertFalse(proof['evidence_available'])
+        self.assertIn('does not bracket', proof['reason'])
+
+
+class FreezeGuard(unittest.TestCase):
+    """A SIGSTOP is queued, not applied: the stop must be proven."""
+
+    def test_freeze_group_proves_state_t_for_every_member(self):
+        process = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        try:
+            record = fault_cells.freeze_group(process.pid, timeout=5.0)
+            self.assertEqual(record['states'], {process.pid: 'T'})
+            self.assertEqual(record['pids'], [process.pid])
+        finally:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+
+    def test_a_missing_group_is_a_named_setup_failure(self):
+        with self.assertRaisesRegex(fault_cells.CellError, 'it is gone'):
+            fault_cells.freeze_group(2 ** 22 + 12345, timeout=0.1)
+
+
+class SealWait(unittest.TestCase):
+    """A lapse fence is only real when every owner has write-protected."""
+
+    def test_the_fence_instant_is_the_last_owners_write_protect(self):
+        polls = {'H1': [0, 1, 1], 'H2': [0, 0, 1]}
+        index = dict.fromkeys(polls, 0)
+
+        def marker(host):
+            values = polls[host]
+            value = values[min(index[host], len(values) - 1)]
+            index[host] += 1
+            return dict(sealed=value, databases=1)
+
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.owners = ['H1', 'H2']
+        cluster.seal_markers = marker
+        driver.cluster = cluster
+        clock = iter([10_000_000, 20_000_000])
+        with patch.object(fault_cells, 'now_ns', side_effect=lambda: next(clock)), \
+                patch.object(fault_cells.time, 'sleep', lambda _: None):
+            result = driver._seal_wait(['H1', 'H2'], 0)
+        # H1 sealed on the second poll, H2 on the third: releasing after H1
+        # alone is what let attempt 4's three stale writes through.
+        self.assertEqual(result['sealed_hosts'], {'H1': 10.0, 'H2': 20.0})
+        self.assertEqual(result['write_protect_apply_ms'], 20.0)
+        self.assertEqual(result['write_protect_last_host'], 'H2')
+        self.assertEqual(result['sealed_partitions'], 2)
+
+    def test_a_pending_owner_is_named_never_skipped(self):
+        driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.owners = ['H1', 'H2']
+        cluster.seal_markers = lambda host: dict(
+            sealed=1 if host == 'H1' else 0, databases=1)
+        driver.cluster = cluster
+        with patch.object(fault_cells.time, 'monotonic',
+                          side_effect=[0.0, 1000.0]), \
+                patch.object(fault_cells.time, 'sleep', lambda _: None):
+            with self.assertRaisesRegex(fault_cells.CellError, 'H2'):
+                driver._seal_wait(['H1', 'H2'], 0, timeout=1)
 
 
 class OwnerWAL(unittest.TestCase):
@@ -600,6 +1104,39 @@ class OwnerWAL(unittest.TestCase):
             seals = cluster.seal_markers('h1')
             self.assertEqual(seals['databases'], 1)
             self.assertEqual(seals['sealed'], 1)
+            self.assertEqual(seals['epoch_dirs'],
+                             {str(epoch): dict(mtime=epoch.stat().st_mtime)})
+
+    def test_the_fence_evidence_keeps_marker_paths_generations_and_the_ledger(self):
+        """A count is not enough: the fence record must name what it read."""
+        class ShellRemote(FakeRemote):
+            def run(self, host, command, *, stdin=None, check=True):
+                self.calls.append((host, command, stdin))
+                done = subprocess.run(command, shell=True, capture_output=True)
+                return done.returncode, done.stdout, done.stderr
+
+        with tempfile.TemporaryDirectory() as root:
+            database = Path(root) / ('db-' + 'b' * 32)
+            epochs = [database / 'epoch_0000000000000001',
+                      database / 'epoch_0000000000000002']
+            for epoch in epochs:
+                epoch.mkdir(parents=True)
+            marker_dir = database / 'live-target' / 'sealed'
+            marker_dir.mkdir(parents=True)
+            marker = marker_dir / 'aabb'
+            marker.write_bytes(b'marker')
+            ledger = database / 'tcp-node-inventory-v1'
+            ledger.write_bytes(b'ledger')
+            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+            cluster.remote = ShellRemote()
+            cluster.owner_root = lambda host: Path(root)
+            seals = cluster.seal_markers('h1')
+        self.assertEqual(seals['sealed'], 1)
+        self.assertEqual(set(seals['markers']), {str(marker)})
+        self.assertEqual(seals['markers'][str(marker)]['size'], len(b'marker'))
+        self.assertEqual(set(seals['epoch_dirs']), {str(epoch) for epoch in epochs})
+        self.assertEqual(set(seals['rootfiles']), {str(ledger)})
+        self.assertEqual(seals['rootfiles'][str(ledger)]['size'], len(b'ledger'))
 
     def test_the_listing_exits_zero_while_a_root_is_mid_rename(self):
         """The durable root is replaced by rename; a missing root is not a failure."""
@@ -1059,11 +1596,19 @@ class FenceVerdict(unittest.TestCase):
                                    refusal_kind='owner-row',
                                    refusal_text='coordinator lease lapsed',
                                    no_success_after_refusal=True,
+                                   stale_rows_clean=True,
+                                   stale_rows=dict(clean=True, acknowledged=39,
+                                                   first_refusal_row=40,
+                                                   last_success_row=39,
+                                                   no_success_after_refusal=True),
                                    first_error_row=40, last_success_row=39,
                                    first_refusal_row=40,
                                    stale_success_after_fence=0, exclusive=True,
                                    second_measurement_rows=200,
-                                   audit_available=True, audit_integrity_ok=True,
+                                   root_refused=dict(refused=True, opened=False,
+                                                     exit_code=1,
+                                                     text='owner high-water 2 exceeds '
+                                                          'the allocated generation 1'),
 owner_fence=dict(evidence_available=True, fence_counters_increased=True,
                                        no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
                                        stale_growth=dict(new_files=[], grown=[]),
@@ -1551,6 +2096,17 @@ class StaleFenceMeasurement(unittest.TestCase):
         def signal(self, value):
             self.signals.append(value)
 
+        def freeze(self):
+            # The driver must prove the stop before it copies or launches.
+            self.signals.append('frozen')
+            return dict(unix_ns=1_000_000_000, pids=[4242], states={4242: 'T'},
+                        gone=[], waited_ms=0.2)
+
+        def resume(self):
+            self.signals.append('released')
+            return dict(released_unix_ns=1_040_000_000,
+                        release_returned_unix_ns=1_040_000_120)
+
         def stop(self):
             pass
 
@@ -1579,66 +2135,122 @@ class StaleFenceMeasurement(unittest.TestCase):
         def stop(self):
             self.stopped = True
 
-    def test_the_stale_case_records_the_resume_to_refusal_latency(self):
+    EPOCH1 = '/guest/db-' + 'a' * 32 + '/epoch_0000000000000001'
+    EPOCH2 = '/guest/db-' + 'a' * 32 + '/epoch_0000000000000002'
+    MANIFEST = '/guest/db-' + 'a' * 32 + '/tcp-node-inventory-v1'
+
+    @classmethod
+    def owner_snapshots(cls):
+        """The owner evidence one generation fence leaves, in order.
+
+        `baseline` predates the launch (one generation, no write-protect marker,
+        ledger as opened), `at_fence` follows the new authority's accepted
+        writes (one new generation, a marker, a rewritten ledger), and `after`
+        follows its stop with the stale generation untouched.
+        """
+
+        def seals(epochs, markers, manifest_mtime):
+            return {'H1': dict(
+                host='H1', databases=1, sealed=1 if markers else 0,
+                markers={f'/guest/db-x/live-target/sealed/{index:02x}':
+                         dict(size=8, mtime=2.0) for index in range(markers)},
+                epoch_dirs={epoch: dict(mtime=1.5) for epoch in epochs},
+                rootfiles={cls.MANIFEST: dict(size=64, mtime=manifest_mtime)},
+                unix_ns=0)}
+
+        def wal(generations):
+            return {'H1': dict(host='H1', unix_ns=0, generations={
+                generation: {f'{generation}/wal_0000000000000000':
+                             dict(size=4096, mtime=1.0)}
+                for generation in generations})}
+
+        return [
+            dict(unix_ns=1_000_100_000, seals=seals([cls.EPOCH1], 0, 1.0),
+                 wal=wal([cls.EPOCH1])),
+            dict(unix_ns=1_020_000_000,
+                 seals=seals([cls.EPOCH1, cls.EPOCH2], 1, 2.0),
+                 wal=wal([cls.EPOCH1, cls.EPOCH2])),
+            dict(unix_ns=1_100_000_000,
+                 seals=seals([cls.EPOCH1, cls.EPOCH2], 1, 2.0),
+                 wal=wal([cls.EPOCH1, cls.EPOCH2])),
+        ]
+
+    def contended(self, tmp, case):
+        """Run `_contend` over the attempt-4 shape with every I/O stubbed."""
+        root = Path(tmp) / 'fence-a'
+        (root / 'coordinator').mkdir(parents=True)
+        child = self.Child(root / 'run')
+        cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
+        cluster.output = Path(tmp)
+        cluster.owners = ['H1']
+        cluster.local = lambda name: cluster.output / name
+        cluster.root = lambda name: cluster.local(name) / 'coordinator'
+        driver = fault_cells.CellDriver(
+            cluster, fault_cells.mechanism.find(f'S1-5S-{case}-native'))
+        second = self.Second(Path(tmp) / 'fence-b' / 'run')
+        probe = dict(available=True, refused=True, opened=False, exit_code=1,
+                     read_ms=101.1,
+                     text='owner 0 fencing inventory disagrees: owner high-water 2 '
+                          'exceeds the allocated generation 1')
+        with patch.object(driver, 'fence_owner_snapshot',
+                          side_effect=self.owner_snapshots()), \
+                patch.object(driver, 'launch', return_value=second), \
+                patch.object(driver, 'gate_writes',
+                             return_value=dict(reached=True)), \
+                patch.object(driver, 'stop_on_failure',
+                             return_value=dict(gate=dict(reached=True), exit_code=1)), \
+                patch.object(driver, 'fence_authority_refusal', return_value=probe):
+            result = driver._contend(child, case)
+        return driver, result, second, child
+
+    def test_the_contend_cell_bounds_the_fence_and_reports_the_resume_delta(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / 'fence-a'
-            (root / 'coordinator').mkdir(parents=True)
-            child = self.Child(root / 'run')
-            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
-            cluster.output = Path(tmp)
-            cluster.owners = ['H1', 'H2']
-            cluster.local = lambda name: cluster.output / name
-            cluster.root = lambda name: cluster.local(name) / 'coordinator'
-            seals = dict(n=0)
-            def marker(host):
-                seals['n'] += 1
-                return dict(sealed=0 if seals['n'] == 1 else 1)
-            cluster.seal_markers = marker
-            cluster.generation_wal = lambda host: dict(generations={
-                '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
-                                  dict(size=4096, mtime=1.0)}})
-            driver = fault_cells.CellDriver(
-                cluster, fault_cells.mechanism.find('S1-5S-stale-native'))
-            second = self.Second(Path(tmp) / 'fence-b' / 'run')
-            gate = dict(reached=True, errors=1, unix_ns=1_050_000_000)
-            with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
-                    patch.object(driver, 'launch', return_value=second), \
-                    patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
-                    patch.object(driver, 'stop_on_failure',
-                                 return_value=dict(gate=gate, exit_code=1)):
-                with patch.object(driver, 'fence_audit', return_value=dict(
-                        audit_available=True, audit_integrity_ok=True,
-                     owner_fence=dict(evidence_available=True,
-                                      fence_counters_increased=True,
-                                      no_stale_growth=True,
-                                      stale_generations=['h0:/db-1/epoch_3'],
-                                      stale_growth=dict(new_files=[], grown=[]),
-                                      scraped_unix_ns=5, reason=None),
-                        audit_read_ms=1.0, audit_text='verify ok')):
-                    result = driver._contend(child, 'stale')
-        self.assertEqual(result['resumed_unix_ns'], 1_000_000_000)
-        # The fence is the new writer's first completed write at +10 ms on its
-        # own clock; the stale writer's refusal completed at +50 ms.
-        self.assertEqual(result['fence_unix_ns'], 1_010_000_000)
-        self.assertEqual(result['fence_reject_ms'], 40.0)
+            driver, result, second, child = self.contended(tmp, 'contend')
+        self.assertIn('frozen', child.signals)
+        self.assertIn('released', child.signals)
+        # The fence instant is the post-gate snapshot, never a clock from the
+        # killed new writer; the release stamp precedes SIGCONT so the stale
+        # writer's first post-release refusal can never be negative.
+        self.assertEqual(result['fence_unix_ns'], 1_020_000_000)
+        self.assertEqual(result['resumed_unix_ns'], 1_040_000_000)
+        self.assertEqual(result['pause_ms'], 40.0)
+        self.assertEqual(result['resume_reject_ms'], 10.0)
+        self.assertIsNone(result['fence_reject_ms'])
+        window = result['fence_reject_window_ms']
+        self.assertEqual(window['lower_ms'], 30.0)
+        self.assertEqual(window['upper_ms'], 49.9)
+        self.assertEqual(window['resume_ms'], 10.0)
+        self.assertTrue(window['includes_pause'])
         self.assertEqual(result['refusal_kind'], 'owner-row')
+        self.assertTrue(result['stale_rows_clean'], result['stale_rows_reason'])
         self.assertEqual(result['stale_success_after_fence'], 0)
         self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
-        self.assertTrue(result['stale_write_refused'])
-        self.assertTrue(result['typed_refusal'])
+        self.assertTrue(result['root_refused']['refused'])
         self.assertTrue(second.stopped)
-        fence = dict(result, case='stale', tier='native', owner_fence=dict(
-            evidence_available=True, fence_counters_increased=True,
-            no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
-            stale_growth=dict(new_files=[], grown=[]), scraped_unix_ns=5, reason=None))
+        owner = result['owner_fence']
+        self.assertTrue(owner['fence_counters_increased'], owner)
+        self.assertEqual(owner['new_epoch_dirs'], {'H1': [self.EPOCH2]})
+        self.assertEqual(owner['stale_generations'], [f'H1:{self.EPOCH1}'])
+        self.assertFalse(owner['stale_growth']['grown'])
         record = fault_cells.fence_record(
-            types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
-                                  fence=fence))
+            types.SimpleNamespace(cell=driver.cell, parts=[],
+                                  fence=dict(result, case='contend', tier='native')))
         self.assertTrue(record['ok'], record)
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
         self.assertEqual(latency['detail']['kind'], 'owner-row')
-        self.assertEqual(latency['detail']['exact_ms'], 40.0)
+        self.assertEqual(latency['detail']['window']['lower_ms'], 30.0)
+
+    def test_the_stale_cell_uses_the_same_fence_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver, result, _, _ = self.contended(tmp, 'stale')
+        record = fault_cells.fence_record(
+            types.SimpleNamespace(cell=driver.cell, parts=[],
+                                  fence=dict(result, case='stale', tier='native')))
+        self.assertTrue(record['ok'], record)
+        self.assertIn('the stale writer\'s root was refused as an authority '
+                      'after the fence',
+                      {check['check'] for check in record['checks']})
 
     def test_a_refusal_is_the_first_non_success_measurement_row(self):
         driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
@@ -1680,59 +2292,18 @@ class StaleFenceMeasurement(unittest.TestCase):
         self.assertFalse(refusal['no_success_after'])
 
     def test_a_contend_cell_reports_the_fence_latency_with_its_kind(self):
+        """The rewritten cell keeps the owner-row kind and a bounded window."""
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / 'fence-a'
-            (root / 'coordinator').mkdir(parents=True)
-            child = self.Child(root / 'run')
-            cluster = fault_cells.Cluster.__new__(fault_cells.Cluster)
-            cluster.output = Path(tmp)
-            cluster.owners = ['H1', 'H2']
-            cluster.local = lambda name: cluster.output / name
-            cluster.root = lambda name: cluster.local(name) / 'coordinator'
-            seals = dict(n=0)
-            def marker(host):
-                seals['n'] += 1
-                return dict(sealed=0 if seals['n'] == 1 else 1)
-            cluster.seal_markers = marker
-            cluster.generation_wal = lambda host: dict(generations={
-                '/db-1/epoch_3': {'/db-1/epoch_3/wal_0000000000000000':
-                                  dict(size=4096, mtime=1.0)}})
-            driver = fault_cells.CellDriver(
-                cluster, fault_cells.mechanism.find('S1-5S-contend-native'))
-            with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
-                    patch.object(driver, 'launch',
-                                 return_value=self.Second(Path(tmp) / 'fence-b' / 'run')), \
-                    patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
-                    patch.object(driver, 'stop_on_failure',
-                                 return_value=dict(gate=dict(reached=True, errors=1),
-                                                   exit_code=1)):
-                with patch.object(driver, 'fence_audit', return_value=dict(
-                        audit_available=True, audit_integrity_ok=True,
-                     owner_fence=dict(evidence_available=True,
-                                      fence_counters_increased=True,
-                                      no_stale_growth=True,
-                                      stale_generations=['h0:/db-1/epoch_3'],
-                                      stale_growth=dict(new_files=[], grown=[]),
-                                      scraped_unix_ns=5, reason=None),
-                        audit_read_ms=1.0, audit_text='verify ok')):
-                    result = driver._contend(child, 'contend')
-        # A contend cell reports the same quantity as a stale cell, and says
-        # which kind of refusal it measured.
-        self.assertEqual(result['fence_unix_ns'], 1_010_000_000)
-        self.assertEqual(result['fence_reject_ms'], 40.0)
+            driver, result, _, _ = self.contended(tmp, 'contend')
         self.assertEqual(result['refusal_kind'], 'owner-row')
-        self.assertTrue(result['stale_rows_exclusive'], result['stale_rows_reason'])
-        fence = dict(result, case='contend', tier='native', owner_fence=dict(
-            evidence_available=True, fence_counters_increased=True,
-            no_stale_growth=True, stale_generations=['h0:/db-1/epoch_3'],
-            stale_growth=dict(new_files=[], grown=[]), scraped_unix_ns=5, reason=None))
+        self.assertEqual(result['fence_reject_window_ms']['resume_ms'], 10.0)
         record = fault_cells.fence_record(
-            types.SimpleNamespace(cell=driver.cell, parts=[dict(role='verify')],
-                                  fence=fence))
-        self.assertTrue(record['ok'], record)
+            types.SimpleNamespace(cell=driver.cell, parts=[],
+                                  fence=dict(result, case='contend', tier='native')))
         latency = [check for check in record['checks']
                    if check['check'] == 'fence latency measured or bounded'][0]
         self.assertEqual(latency['detail']['kind'], 'owner-row')
+        self.assertIsNone(latency['detail']['exact_ms'])
 
 
 class FenceAuditRun(unittest.TestCase):
