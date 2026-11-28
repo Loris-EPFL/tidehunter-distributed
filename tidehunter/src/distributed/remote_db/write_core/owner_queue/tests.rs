@@ -1,11 +1,11 @@
 use super::*;
 use crate::distributed::codec::{BatchLimits, Mutation};
+use crate::distributed::test_bounds::PROGRESS_CAP;
 use crate::distributed::types::{BatchId, BatchVersion};
 use crate::key_shape::{KeyShape, KeySpace, KeyType};
 use minibytes::Bytes;
 use std::sync::{Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
 
 fn batch() -> CompleteBatch {
     CompleteBatch::new(
@@ -72,7 +72,7 @@ fn owner_queue_wake_never_lost() {
                 }
                 assert!(attempt + 1 < ENTRIES * 2, "queue drain exceeded its bound");
                 if queue.park() {
-                    pending.recv_timeout(Duration::from_secs(5)).unwrap();
+                    pending.recv_timeout(PROGRESS_CAP).unwrap();
                     queue.unpark();
                 }
             }

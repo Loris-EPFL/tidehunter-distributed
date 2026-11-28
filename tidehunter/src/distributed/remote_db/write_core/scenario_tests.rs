@@ -1,8 +1,9 @@
 //! Option-D scenarios driven through the real caller, owner-worker and
 //! publication paths of a five-owner mTLS fixture. Ordering comes from
-//! one-shot test hooks and condition predicates, never from elapsed time; the
-//! only deadline-driven case is the caller timeout, whose resolution is held
-//! by a hook until the caller has returned.
+//! one-shot test hooks and condition predicates, never from elapsed time. The
+//! caller-timeout case arms a one-shot expired deadline: resolution is held by
+//! a hook until after the caller returned, so the caller observes the timeout
+//! without waiting for a clock.
 
 mod crash_cut;
 mod readable;
@@ -409,8 +410,11 @@ fn ring_wrap_under_full_slot_credits_waits_for_release_and_resolution() {
 #[test]
 fn caller_timeout_then_late_resolution_reuses_only_after_both() {
     const CAPACITY: u64 = 4;
-    // The caller deadline is the configured timeout. Resolution is held by a
-    // hook until after the caller returned, so the timeout always fires first.
+    // The caller deadline is the configured timeout in production. Here the
+    // next caller's deadline is armed already expired and resolution is held by
+    // a hook until after the caller returned, so the caller observes the
+    // timeout without a wall-clock delay; the rest of the test keeps the
+    // fixture's progress bound, which is a hang guard for real publication.
     let fixture = Fixture::new_with_root(
         tempdir::TempDir::new("write-core-caller-timeout").unwrap(),
         2,
@@ -419,7 +423,6 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
         2,
         |config| {
             config.max_pending_batches = CAPACITY as usize;
-            config.timeout = Duration::from_secs(2);
         },
         |_| {},
     );
@@ -427,7 +430,11 @@ fn caller_timeout_then_late_resolution_reuses_only_after_both() {
     let core = Arc::clone(&db.core);
     let operation = fixture.operation(0, 1);
     let (hook, publishing, resume) = gate();
-    core.test_hooks.lock().before_publish = Some(hook);
+    {
+        let mut hooks = core.test_hooks.lock();
+        hooks.before_publish = Some(hook);
+        hooks.expire_next_write_deadline = true;
+    }
     let caller = spawn_write(&core, operation, vec![put(1, 1)]);
     publishing.recv_timeout(WAIT).unwrap();
     let original = version(&core, 0);

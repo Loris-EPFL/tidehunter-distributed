@@ -814,8 +814,34 @@ fn would_block(file: &File) -> bool {
         )
 }
 
+/// True when no open file description holds the disk lock. `WouldBlock` is the
+/// only evidence of a holder: any other `flock` failure (a signal, or no lock
+/// record under memory pressure) is not proof of one, so a caller that must not
+/// read a single instant waits with [`wait_until`].
 fn unlocked(path: &Path) -> bool {
     File::open(path).unwrap().try_lock().is_ok()
+}
+
+/// Waits for `condition`, which another thread reaches by releasing a lock it
+/// took. The wait follows that release and is bounded by the shared hang guard.
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PROGRESS_CAP;
+    while !condition() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn the_unlocked_probe_sees_a_disk_held_by_another_description() {
+    let temp = tempdir::TempDir::new("unlocked-probe").expect("temp dir");
+    let disk = temp.path().join("nvme9n1");
+    File::create(&disk).expect("create the disk");
+    let holder = File::open(&disk).expect("open the holder");
+    holder.lock().expect("hold the disk lock");
+    assert!(!unlocked(&disk), "a held disk reports as unlocked");
+    holder.unlock().expect("release the disk lock");
+    assert!(unlocked(&disk), "a released disk reports as locked");
 }
 
 /// Fake sysfs and /dev for controller `nvme9`: a plain disk `nvme9n1`, a
@@ -929,18 +955,15 @@ fn teardown_lock_timeout_issues_no_delete() {
     probe.lock_shared().unwrap();
     let mut locks = Vec::new();
     let mut deleted = false;
+    // The deadline is already expired: the probe cannot be displaced, so the
+    // attempt times out at its first check and the test never waits on a
+    // clock. What the test observes is the deletion decision and the lock
+    // state, not how long the attempt waited.
+    let deadline = Instant::now() - Duration::from_millis(1);
     let error = retire_locked(
         &mut locks,
         true,
-        || {
-            lock_controller_disks(
-                &block,
-                &dev,
-                &ctrl,
-                "nvme9",
-                Instant::now() + EXPECTED_TIMEOUT,
-            )
-        },
+        || lock_controller_disks(&block, &dev, &ctrl, "nvme9", deadline),
         || {
             deleted = true;
             Ok(())
@@ -950,8 +973,14 @@ fn teardown_lock_timeout_issues_no_delete() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(!deleted, "delete issued without the lock");
     assert!(locks.is_empty());
-    // Locks already taken in the failed attempt are released.
-    assert!(unlocked(&dev.join("nvme9n2")));
+    // Locks already taken in the failed attempt are released. The attempt also
+    // left a lock helper waiting on the probe's disk; dropping the probe lets
+    // it take and release that lock, so the wait follows that release for
+    // every disk of the controller instead of reading one instant.
+    drop(probe);
+    wait_until("the failed attempt released every disk it locked", || {
+        unlocked(&dev.join("nvme9n1")) && unlocked(&dev.join("nvme9n2"))
+    });
 }
 
 #[test]

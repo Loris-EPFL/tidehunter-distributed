@@ -150,6 +150,10 @@ pub(in crate::distributed::remote_db) struct TestHooks {
     pub before_publish: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub before_release: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     pub fail_publication: Option<u64>,
+    /// One-shot: the next caller's resolution deadline is already expired, so a
+    /// held resolution times that caller out on an observed event instead of
+    /// after a real delay.
+    pub expire_next_write_deadline: bool,
     /// Replaces the configuration-derived bound of `await_copies_durable`.
     pub copy_durable_timeout: Option<std::time::Duration>,
     /// Sends the keyspace and first reduced key, then parks before re-point.

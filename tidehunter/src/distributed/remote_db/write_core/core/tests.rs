@@ -63,7 +63,7 @@ fn begin_failure_fences_cached_and_completed_values_before_notifications() {
         .expect("the position names a served partition");
     database.clear_read_cache();
     let completed = core.reads.submit_member(node, position).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + WAIT;
     while completed.try_result().unwrap().is_none() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -106,7 +106,7 @@ fn begin_failure_fences_cached_and_completed_values_before_notifications() {
 #[test]
 fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
     use crate::distributed::types::BatchVersion;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let fixture = Fixture::new();
     let database = fixture.open();
@@ -132,9 +132,7 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
         let core = &core;
         scope.spawn(move || {
             slot_started.send(()).unwrap();
-            let result = core
-                .sequencer
-                .wait(version, Instant::now() + Duration::from_secs(5));
+            let result = core.sequencer.wait(version, Instant::now() + WAIT);
             slot_finished.send(result.map(|_| ())).unwrap();
         });
         let prefix_started = started.clone();
@@ -150,10 +148,10 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
         scope.spawn(move || {
             read_started.send(()).unwrap();
             read_finished
-                .send(core.reads.wait_admission(
-                    read_generation,
-                    Some(Instant::now() + Duration::from_secs(5)),
-                ))
+                .send(
+                    core.reads
+                        .wait_admission(read_generation, Some(Instant::now() + WAIT)),
+                )
                 .unwrap();
         });
         scope.spawn(move || {
@@ -167,7 +165,7 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
                 .unwrap();
         });
         for _ in 0..4 {
-            starting.recv_timeout(Duration::from_secs(1)).unwrap();
+            starting.recv_timeout(WAIT).unwrap();
         }
         wait_for("admission waiter queued", || {
             core.admission.queued_waiters() == 1
@@ -175,11 +173,10 @@ fn finish_failure_releases_every_waiter_without_reusing_unknowns() {
         core.begin_failure(&LocalDbError::new("injected waiter failure"));
         core.finish_failure();
         for _ in 0..4 {
+            let result = finishing.recv_timeout(WAIT).unwrap();
             assert!(
-                finishing
-                    .recv_timeout(Duration::from_secs(1))
-                    .unwrap()
-                    .is_err()
+                result.is_err(),
+                "a waiter outlived the injected failure: {result:?}"
             );
         }
     });
@@ -217,7 +214,7 @@ fn sparse_view_excludes_exactly_unpublished_and_floor_passes_resolved() {
     use crate::distributed::codec::Mutation;
     use crate::distributed::types::BatchVersion;
     use crate::key_shape::KeySpace;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let put = |key: u32, value: u8| Mutation::Put {
         keyspace: KeySpace(0),
@@ -252,7 +249,7 @@ fn sparse_view_excludes_exactly_unpublished_and_floor_passes_resolved() {
         [gap, chained, successor, independent].map(|version| version.sequence),
         [0, 1, 2, 4]
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     for sequence in [1, 2, 4] {
         while !core.publication_settled(sequence) {
             core.ensure_healthy().unwrap();
