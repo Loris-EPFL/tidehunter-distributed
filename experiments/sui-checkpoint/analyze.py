@@ -1286,14 +1286,20 @@ def _database_ops(values):
     """`db_op` observation counts keyed by database label, then operation.
 
     The counts are summed over keyspaces: a write batch carries the untagged
-    empty keyspace, a single-key write the keyspace it touched.
+    empty keyspace, a single-key write the keyspace it touched. A series without
+    a count maps to `None` for its operation, never to zero, so a partial scrape
+    cannot be read as an observed absence of writes.
     """
     result = {}
     for database, keyspaces in coordinator_stats(values)['operations'].items():
         counts = result.setdefault(database, {})
         for operations in keyspaces.values():
             for op, row in operations.items():
-                counts[op] = counts.get(op, 0) + int(row['count'] or 0)
+                total = counts.get(op)
+                if total is None and op in counts:
+                    continue
+                counts[op] = (None if row['count'] is None
+                              else (total or 0) + int(row['count']))
     return result
 
 
@@ -1325,7 +1331,14 @@ def write_batch_check(values_by_mode, namespaces, checkpoint_count):
     if commits is None:
         return _state('missing_counter', 'the remote write-batch population is absent',
                       namespace=name, missing=[f'{database}:write_batch'])
-    single_key = sum(native.get(op, 0) for op in REMOTE_COMMIT_OPS[1:])
+    single_key = 0
+    for op in REMOTE_COMMIT_OPS[1:]:
+        count = native.get(op)
+        if count is None:
+            return _state('missing_counter',
+                          'the native single-key write population is absent',
+                          namespace=name, missing=[f'{database}:{op}'])
+        single_key += count
     startup = batches - 3 * checkpoint_count
     payload = dict(namespace=name, database=database, checkpoints=checkpoint_count,
                    native_batches=batches, native_single_key_writes=single_key,

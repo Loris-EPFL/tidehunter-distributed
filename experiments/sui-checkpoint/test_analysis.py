@@ -694,6 +694,18 @@ class PerCellCriteria(unittest.TestCase):
                              native=native, checkpoint_count=1776)
         self.assertTrue(any('native write population 5333' in item
                             for item in checks['failures']))
+        # A partial scrape is a missing counter, never an assumed zero: the
+        # native engine publishes the single-key populations even when empty.
+        without_remove = {metric: value for metric, value in native.items()
+                          if 'op="remove"' not in metric}
+        checks = self.checks('M1-c4-native', scrape(batches=5329, commits=5333),
+                             native=without_remove, checkpoint_count=1776)
+        self.assertEqual(checks['checks']['write_batches']['state'], 'missing_counter')
+        without_count = {metric: value for metric, value in native.items()
+                         if not metric.startswith('db_op_count{op="write_batch"')}
+        checks = self.checks('M1-c4-native', scrape(batches=5329, commits=5329),
+                             native=without_count, checkpoint_count=1776)
+        self.assertEqual(checks['checks']['write_batches']['state'], 'missing_counter')
 
     def test_a_lifecycle_cell_needs_the_reopen_evidence(self):
         checks = self.checks('S1-1-native', scrape())
