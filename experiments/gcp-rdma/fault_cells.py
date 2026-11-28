@@ -673,7 +673,7 @@ class Cluster:
 class Coordinator:
     """One local coordinator process over the prepared deployment."""
 
-    def __init__(self, *, binary, spec, directory, name='run'):
+    def __init__(self, *, binary, spec, directory, name='run', hold_completion=False):
         self.directory = Path(directory)
         self.output = self.directory / name
         self.output.mkdir(parents=True, exist_ok=False)
@@ -681,8 +681,11 @@ class Coordinator:
         self.stream = self.log.open('xb')
         # The measurement window is binary-gated: the run creates its ready
         # marker and waits for the release this process writes. `prepare`
-        # removes a stale pair and creates the marker directory.
-        self.gates = mechanism.LocalGates(spec)
+        # removes a stale pair and creates the marker directory. A relocation
+        # cell holds the completion gate until its owner-side retirement gate
+        # passes, because the relocation worker has no non-test completion
+        # signal.
+        self.gates = mechanism.LocalGates(spec, hold_completion=hold_completion)
         self.gates.prepare()
         self.process = subprocess.Popen([str(binary), '--config', str(spec),
                                          '--output', str(self.output)],
@@ -695,6 +698,12 @@ class Coordinator:
         self._gate_thread = threading.Thread(target=self.gates.run,
                                              args=(self._gate_stop,), daemon=True)
         self._gate_thread.start()
+
+    def completion_ready(self):
+        return self.gates.completion_ready()
+
+    def release_completion(self):
+        self.gates.release_completion()
 
     def close_gates(self):
         self._gate_stop.set()
@@ -781,7 +790,8 @@ class CellDriver:
         spec = self.spec(run, name, path=path, receipts=receipts)
         self.cluster.local(name).mkdir(parents=True, exist_ok=True)
         return Coordinator(binary=self.cluster.binary, spec=spec,
-                           directory=self.cluster.local(name), name=run_name)
+                           directory=self.cluster.local(name), name=run_name,
+                           hold_completion=bool(run.get('relocation')))
 
     def bind_context(self, *, receipts=None):
         """Establish the namespace, owner receipts and transport of this cell."""
@@ -898,9 +908,62 @@ class CellDriver:
             values[name] = [stat.st_size, stat.st_mtime_ns]
         return values
 
-    def gate_retirement(self, host, cut, *, timeout=GATE_TIMEOUT_SECONDS):
+    def _wait_for_wal_baseline(self, host, *, timeout=GATE_TIMEOUT_SECONDS):
+        """A WAL baseline taken after the owner wrote, not at launch.
+
+        The measurement run preloads before the relocation phase, so the first
+        files appear seconds after launch. Baselining an empty tree would make
+        the later unlink unobservable.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            view = self.cluster.wal(host)
+            if view['files']:
+                return view
+            if time.monotonic() > deadline:
+                raise CellError('owners wrote no WAL file to baseline')
+            time.sleep(0.2)
+
+    def await_owner_retirement(self, child, *, timeout=GATE_TIMEOUT_SECONDS):
+        """Observe the post-measurement relocation pass retire owner WAL files.
+
+        The worker publishes no non-test completion signal, so the driver holds
+        the binary's measurement completion gate and watches the owner files:
+        the pass copies survivors and then unlinks whole retired files. The gate
+        is released once a file disappears, and the binary's own gate timeout
+        bounds the wait if it never does.
+        """
+        before = {host: self._wait_for_wal_baseline(host) for host in self.cluster.owners}
+        ready = self.wait_for(
+            child, lambda: dict(reached=child.completion_ready()), timeout=timeout,
+            label='measurement completion gate', poll=0.05)
+        if not ready.get('reached'):
+            return dict(reached=False, reason=ready.get('reason'),
+                        observations=ready.get('observations', []))
+        started = time.monotonic()
+        observations = []
+        while True:
+            current = {host: self.cluster.wal(host) for host in self.cluster.owners}
+            gone = {host: [path for path in before[host]['files']
+                           if path not in current[host]['files']]
+                    for host in self.cluster.owners}
+            observations.append(dict(gone=gone,
+                                     files={host: len(view['files'])
+                                            for host, view in current.items()}))
+            if any(gone.values()):
+                return dict(reached=True, seconds=time.monotonic() - started,
+                            observations=observations[-20:],
+                            note='owner WAL file retired by the relocation pass')
+            if time.monotonic() - started >= timeout:
+                return dict(reached=False,
+                            reason=f'no owner retirement within {timeout}s',
+                            observations=observations[-20:])
+            time.sleep(0.1)
+
+    def gate_retirement(self, host, cut, *, timeout=GATE_TIMEOUT_SECONDS, child=None):
         base_started = time.monotonic()
-        before = self.cluster.wal(host)
+        before = (self._wait_for_wal_baseline(host, timeout=timeout)
+                  if child is not None else self.cluster.wal(host))
         if cut == 'dir-sync':
             # A root exists only after the owner's first store. The rewrite
             # being cut on is a change of an existing root, so baseline once
@@ -913,6 +976,15 @@ class CellDriver:
                 before = self.cluster.wal(host)
         baseline = dict(before['files'])
         roots = dict(before['roots'])
+        if child is not None:
+            # The relocation pass starts just before the completion gate, so the
+            # gate's ready marker names the moment the retirement request is in
+            # flight; the files baseline above predates it.
+            ready = self.wait_for(
+                child, lambda: dict(reached=child.completion_ready()),
+                timeout=timeout, label='measurement completion gate', poll=0.05)
+            if not ready.get('reached'):
+                return dict(reached=False, cut=cut, reason=ready.get('reason'))
         started = time.monotonic()
         observations = []
         while True:
@@ -1157,19 +1229,28 @@ class CellDriver:
         run = self.cell['runs'][0]
         child = self.open(run, 'measure')
         before = self.cluster.disks()
+        retirement = None
         try:
+            if run.get('relocation'):
+                retirement = self.await_owner_retirement(child)
+                if not retirement.get('reached'):
+                    raise CellError(f"retirement missed: {retirement.get('reason')}")
+                child.release_completion()
             code = child.wait(run['deadline'] + 300)
             if code is None:
                 raise CellError('measure run did not finish within its deadline')
             if code != 0:
                 raise CellError(f'measure run exited {code}; see {child.log}')
         finally:
+            if run.get('relocation'):
+                child.release_completion()
             child.stop()
         after = self.cluster.disks()
         rolls = {host: self.cluster.rolls(host) for host in self.cluster.owners}
         self.parts.append(self.part('measure', run, child,
                                     dict(role='measure', owner_before=before,
-                                         owner_after=after, owner_rolls=rolls)))
+                                         owner_after=after, owner_rolls=rolls,
+                                         retirement=retirement)))
         return self.parts
 
     def crash(self):
@@ -1272,7 +1353,10 @@ class CellDriver:
         record = dict(name='measure', role='measure', pid=child.process.pid,
                       started_unix_ns=child.started_unix_ns)
         try:
-            gate = self.gate_retirement(host, cut)
+            # The relocation pass that retires the file starts after the
+            # measurement, just before this run's completion gate. The gate is
+            # held until the owner-side cut is observed, then released.
+            gate = self.gate_retirement(host, cut, child=child)
             record['gate'] = gate
             if not gate.get('reached'):
                 # A missed gate aborts before any part is appended, and the
@@ -1280,9 +1364,11 @@ class CellDriver:
                 # the very run that missed the cut is lost again.
                 self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
+            child.release_completion()
             record['kill'] = self.kill_owner(host, f'retirement {cut}')
             record['failure'] = self.stop_on_failure(child)
         finally:
+            child.release_completion()
             child.stop()
         record['finished_unix_ns'] = now_ns()
         record['exit_code'] = child.process.returncode

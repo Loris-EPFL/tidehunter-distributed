@@ -252,6 +252,13 @@ pub trait KvBackend: Send + Sync + 'static {
     /// boundary. Backends must not sample owners while it is open.
     fn set_measurement_window(&self, _open: bool) {}
 
+    /// Request one background relocation pass after the measurement phase.
+    /// The request returns at once; the completion gate bounds the pass because
+    /// the worker has no non-test completion signal.
+    fn start_relocation(&self) -> BackendResult<()> {
+        Err(unsupported("post-measurement relocation"))
+    }
+
     /// Observe read counters outside timed API calls. Unsupported backends report absence.
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         Ok(

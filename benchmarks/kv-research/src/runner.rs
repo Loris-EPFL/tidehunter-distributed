@@ -165,6 +165,7 @@ pub async fn run<B: KvBackend>(
     let mut read_start = serde_json::Value::Null;
     let mut read_end = serde_json::Value::Null;
     let mut measurement_drained = false;
+    let mut relocation_requested = false;
     if !config.qualification_only
         && fatal_reason.is_none()
         && config.phases.measurement_operations > 0
@@ -331,6 +332,19 @@ pub async fn run<B: KvBackend>(
                 }
             }
             reporter.snapshot()?;
+            if config.phases.relocation {
+                match backend.start_relocation() {
+                    Ok(()) => relocation_requested = true,
+                    Err(error) => {
+                        failed = true;
+                        let reason = format!("post-measurement relocation request failed: {error}");
+                        fatal_reason = Some(fatal_reason.map_or_else(
+                            || reason.clone(),
+                            |previous| format!("{previous}; {reason}"),
+                        ));
+                    }
+                }
+            }
         }
     }
     if config.diagnostics.valkey_profile_limit > 0 {
@@ -674,6 +688,8 @@ pub async fn run<B: KvBackend>(
             "warmup_key_sweep": config.phases.warmup_key_sweep,
             "aging_operations": config.phases.aging_operations, "measurement_operations": config.phases.measurement_operations,
             "measurement_key_sweep": config.phases.measurement_key_sweep,
+            "relocation": config.phases.relocation,
+            "relocation_requested": relocation_requested,
             "sustainability_claim": false},
         "qualification_failure": fatal_reason,
     });

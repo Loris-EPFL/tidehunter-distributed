@@ -188,6 +188,12 @@ pub struct PhaseConfig {
     pub aging_operations: u64,
     /// Zero is allowed only when `qualification_only` is true.
     pub measurement_operations: u64,
+    /// Request one relocation pass after the measurement boundary and before
+    /// the completion gate. The worker publishes no non-test completion
+    /// signal, so the gate is the bound and the driver releases it only after
+    /// it observes the owner-side retirement.
+    #[serde(default)]
+    pub relocation: bool,
 }
 fn default_true() -> bool {
     true
@@ -373,6 +379,11 @@ impl RunConfig {
         {
             return invalid(
                 "mapped-WAL eviction requires Linux, test-utils, a native or tidehunter backend, and a measurement phase",
+            );
+        }
+        if self.phases.relocation && self.measurement_completion_gate.is_none() {
+            return invalid(
+                "a relocation phase requires a measurement_completion_gate to bound the pass",
             );
         }
         for (gate, name) in [

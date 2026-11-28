@@ -91,6 +91,7 @@ fn config() -> RunConfig {
             measurement_key_sweep: false,
             aging_operations: 0,
             measurement_operations: 2,
+            relocation: false,
         },
         qualification_only: false,
         source_revision: None,
@@ -602,6 +603,20 @@ fn validates_optional_measurement_gate_paths_and_timeout() {
     config.diagnostics.write_profile_limit = 65_537;
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn relocation_phase_requires_a_completion_gate() {
+    let mut config = config();
+    config.phases.relocation = true;
+    assert!(config.validate().is_err());
+    config.measurement_completion_gate = Some(MeasurementGateConfig {
+        ready_file: PathBuf::from("/tmp/kv-completion-ready"),
+        release_file: PathBuf::from("/tmp/kv-completion-release"),
+        timeout_seconds: 240,
+    });
+    assert!(config.validate().is_ok());
+}
+
 #[test]
 fn existing_dataset_verification_requires_read_only_owned_namespace() {
     let mut config = config();

@@ -105,14 +105,20 @@ def _mix(read=0, put=0, delete=0, missing_read=0, get_many=0, put_batch=0):
 
 
 def _run(role, *, mix, value=8192, batch=2, concurrency=4, keys=KEYS,
-         preload=True, verify=False, warmup=0, measurement=20_000, deadline=900):
-    """One `kv-research` invocation inside a cell unit."""
+         preload=True, verify=False, warmup=0, measurement=20_000, deadline=900,
+         relocation=False):
+    """One `kv-research` invocation inside a cell unit.
+
+    `relocation=True` requests one non-test relocation pass after the
+    measurement boundary and before the completion gate; the driver holds that
+    gate until it observes the pass retire an owner WAL file.
+    """
     if batch < 2:
         raise ValueError('a run needs batch_size >= 2; width 1 is a point get')
     return dict(role=role, mix=mix, value=value, batch=batch,
                 concurrency=concurrency, keys=keys, preload=preload,
                 verify=verify, warmup=warmup, measurement=measurement,
-                deadline=deadline)
+                deadline=deadline, relocation=relocation)
 
 
 def read_run(reads, *, value=8192, verify=False, deadline=300):
@@ -183,7 +189,8 @@ def cells():
             note='owner WAL rolls by written volume; the coordinator index keeps '
                  'its engine geometry because TH_* is a Sui-adapter knob',
             runs=[_run('measure', mix=_mix(put=100), value=16_384,
-                       concurrency=4, measurement=32_768, deadline=1_800)]))
+                       concurrency=4, measurement=32_768, deadline=1_800,
+                       relocation=True)]))
 
     # M13: 132 KB Synchronous batch. The covering flush is visible as
     # `leased_flush_covered_frames_total` on the coordinator's live family.
@@ -235,7 +242,8 @@ def cells():
                 plan=dict(cut=cut, tiers='native, synchronous', cells='4'),
                 note='kill -9 the owner at the observed retirement cut, restart, full audit',
                 runs=[_run('measure', mix=_mix(put=100), value=8192,
-                           concurrency=4, measurement=65_536, deadline=1_200),
+                           concurrency=4, measurement=65_536, deadline=1_200,
+                           relocation=True),
                       _verify_run(4_096)]))
         for case in FENCE_CASES:
             unit = f'S1-5S-{case}-{tier}'
@@ -297,7 +305,8 @@ def spec(cell, run, context, *, path, evidence):
     phases = dict(preload=run['preload'],
                   verify_existing_dataset=run['verify'],
                   warmup_operations=run['warmup'], aging_operations=0,
-                  measurement_operations=run['measurement'])
+                  measurement_operations=run['measurement'],
+                  relocation=run.get('relocation', False))
     operations = (run['keys'] if run['preload'] or run['verify'] else 0) \
         + run['warmup'] + run['measurement']
     # A cell may force one coordinator index field (the snapshot cells force
@@ -622,10 +631,16 @@ class LocalGates:
     `prepare` removes the markers of an earlier attempt and creates their
     directory, because the binary refuses markers that already exist. `run`
     loops until the run ends: each ready marker is answered with its release.
+
+    `hold_completion` leaves the measurement completion gate unanswered until
+    the driver calls `release_completion`. The binary itself bounds that wait
+    (`timeout_seconds`), and the driver holds it only while it observes the
+    owner-side retirement of the post-measurement relocation pass.
     """
 
-    def __init__(self, spec_path):
+    def __init__(self, spec_path, *, hold_completion=False):
         self.spec_path = Path(spec_path)
+        self.hold_completion = hold_completion
         self._pairs = None
 
     def pairs(self):
@@ -642,6 +657,20 @@ class LocalGates:
         self._pairs = pairs
         return pairs
 
+    def completion_pair(self):
+        pairs = self.pairs()
+        return pairs[1] if len(pairs) > 1 else None
+
+    def completion_ready(self):
+        pair = self.completion_pair()
+        return bool(pair and pair[0].exists())
+
+    def release_completion(self):
+        pair = self.completion_pair()
+        if pair and pair[0].exists() and not pair[1].exists():
+            pair[1].parent.mkdir(parents=True, exist_ok=True)
+            pair[1].write_text('released\n')
+
     def prepare(self):
         for ready, release in self.pairs():
             for marker in (ready, release):
@@ -649,7 +678,11 @@ class LocalGates:
                 marker.unlink(missing_ok=True)
 
     def serve(self):
-        for ready, release in self.pairs():
+        held = self.completion_pair() if self.hold_completion else None
+        for pair in self.pairs():
+            if pair == held:
+                continue
+            ready, release = pair
             if ready.exists() and not release.exists():
                 release.write_text('released\n')
         return None

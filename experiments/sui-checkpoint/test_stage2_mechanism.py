@@ -93,6 +93,19 @@ class CellTable(unittest.TestCase):
                             and cell['runs'][0]['mix']['read'] == 100
                             for cell in mechanism.cells()))
 
+    def test_only_retirement_cells_request_relocation(self):
+        for cell in mechanism.cells():
+            measure = [run for run in cell['runs'] if run['role'] == 'measure']
+            requested = [run.get('relocation') for run in measure]
+            if cell['family'] in ('M9', 'S1-6'):
+                self.assertTrue(all(requested), cell['id'])
+            else:
+                self.assertFalse(any(requested), cell['id'])
+            for run in cell['runs']:
+                spec = mechanism.spec(cell, run, context(), path='/c', evidence='/e')
+                self.assertEqual(spec['phases']['relocation'],
+                                 run.get('relocation', False), cell['id'])
+
     def test_verify_runs_are_read_only_and_explicit(self):
         for cell in mechanism.cells():
             verify = [run for run in cell['runs'] if run['role'] == 'verify']

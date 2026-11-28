@@ -883,7 +883,7 @@ class ReopenPath(unittest.TestCase):
 
     def test_the_verify_run_reopens_the_killed_root_exactly_once(self):
         class Child:
-            def __init__(self, *, binary, spec, directory, name='run'):
+            def __init__(self, *, binary, spec, directory, name='run', hold_completion=False):
                 self.output = Path(directory) / name
                 self.output.mkdir(parents=True, exist_ok=False)
                 (self.output / 'manifest.json').write_text('{}')
@@ -919,7 +919,7 @@ class ReopenPath(unittest.TestCase):
                           for row in receipts])
 
             class Child:
-                def __init__(self, *, binary, spec, directory, name='run'):
+                def __init__(self, *, binary, spec, directory, name='run', hold_completion=False):
                     self.output = Path(directory) / name
                     self.output.mkdir(parents=True, exist_ok=True)
 

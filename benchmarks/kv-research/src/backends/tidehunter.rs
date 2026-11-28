@@ -1151,6 +1151,11 @@ impl KvBackend for TidehunterBackend {
         self.owner_sample_gate.set_measuring(open);
     }
 
+    fn start_relocation(&self) -> BackendResult<()> {
+        let db = self.db.as_ref().ok_or("backend is shutting down")?;
+        db.start_relocation().map_err(native_error)
+    }
+
     fn read_observation(&self) -> BackendResult<serde_json::Value> {
         let db = self.db.as_ref().ok_or("backend is shutting down")?;
         let live_nvmeof = self.live_boundary_snapshot(db)?;
