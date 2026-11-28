@@ -330,6 +330,12 @@ def spec(cell, run, context, *, path, evidence):
         external_owner_durability_receipts=list(context['receipts']),
         durability_tier=cell['tier'], value_cache_size=0,
         coordinator_read_cache_bytes=context['remote']['read_cache_bytes'])
+    if run.get('relocation'):
+        # The measure run of a relocation cell declares the second, filtered
+        # marker keyspace: one marker entry is the pass's terminal on every
+        # tier. The verify run keeps one keyspace; the registry retains the
+        # marker keyspace and does not expose it, so the audit never sees it.
+        options['relocation_marker'] = True
     return dict(
         schema_version=1, case_id=f"{cell['id']}-{run['role']}",
         backend=dict(kind='tidehunter', options=options),

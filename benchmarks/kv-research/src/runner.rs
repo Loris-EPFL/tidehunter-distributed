@@ -127,6 +127,27 @@ pub async fn run<B: KvBackend>(
             }
         }
     }
+    // The relocation marker: one entry in the backend's filtered marker keyspace,
+    // written after the preload so its record pins the pass's whole-file target
+    // at the preload boundary on every durability tier, with no dependence on
+    // the frozen scan cut. The audit dataset stays in the unfiltered keyspace.
+    let mut relocation_marker = false;
+    if fatal_reason.is_none() && !config.qualification_only && config.phases.relocation.requested()
+    {
+        let key = key_bytes(
+            &namespace,
+            config.seed,
+            crate::backend::RELOCATION_MARKER_KEY_ID,
+        );
+        let value = Bytes::copy_from_slice(crate::backend::RELOCATION_MARKER_VALUE);
+        match backend.write_relocation_marker(key, value).await {
+            Ok(written) => relocation_marker = written,
+            Err(error) => {
+                failed = true;
+                fatal_reason = Some(format!("relocation marker write failed: {error}"));
+            }
+        }
+    }
     for (phase, count) in [
         ("warmup", config.phases.warmup_operations),
         ("aging", config.phases.aging_operations),
@@ -735,6 +756,7 @@ pub async fn run<B: KvBackend>(
             "aging_operations": config.phases.aging_operations, "measurement_operations": config.phases.measurement_operations,
             "measurement_key_sweep": config.phases.measurement_key_sweep,
             "relocation": config.phases.relocation,
+            "relocation_marker": relocation_marker,
             "relocation_requested": relocation_requested,
             "sustainability_claim": false},
         "qualification_failure": fatal_reason,

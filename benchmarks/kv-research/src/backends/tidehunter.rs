@@ -568,6 +568,8 @@ pub struct TidehunterBackend {
     owner_sample_gate: OwnerSampleGate,
     db: Option<std::sync::Arc<sui::Db>>,
     keyspace: tidehunter::key_shape::KeySpace,
+    /// The filtered marker keyspace, present only when the options declare it.
+    relocation_marker: Option<tidehunter::key_shape::KeySpace>,
     endpoints: Vec<(u32, String)>,
     owners: usize,
     backend_name: &'static str,
@@ -633,13 +635,30 @@ fn confirm_owner_receipts(
     Ok(())
 }
 
-fn synthetic_shape(value_cache_size: usize) -> KeyShape {
-    KeyShape::new_single_config(
+fn synthetic_shape(value_cache_size: usize, relocation_marker: bool) -> KeyShape {
+    let mut builder = tidehunter::key_shape::KeyShapeBuilder::new();
+    builder.add_key_space_config(
+        "root",
         32,
         16,
         KeyType::uniform(64),
         KeySpaceConfig::default().with_value_cache_size(value_cache_size),
-    )
+    );
+    if relocation_marker {
+        // The marker keyspace holds one entry and never a dataset key. Its
+        // filter stops the pass at that record, which is the deterministic
+        // terminal of a filterless dataset (`dead_wal_files_tests` uses the
+        // same construction for both tiers).
+        builder.add_key_space_config(
+            "relocation_marker",
+            32,
+            1,
+            KeyType::uniform(64),
+            KeySpaceConfig::default()
+                .with_relocation_filter(|_: &[u8], _: &[u8]| tidehunter::Decision::StopRelocation),
+        );
+    }
+    builder.build()
 }
 
 // Shared async factory interface; the existing owner harness opens synchronously.
@@ -650,7 +669,12 @@ async fn open_for(
     registry: &prometheus::Registry,
 ) -> BackendResult<TidehunterBackend> {
     let options = parse_options(value)?;
-    open_with_shape(value, registry, synthetic_shape(options.value_cache_size)).await
+    open_with_shape(
+        value,
+        registry,
+        synthetic_shape(options.value_cache_size, options.relocation_marker),
+    )
+    .await
 }
 
 #[allow(clippy::unused_async)]
@@ -763,6 +787,15 @@ async fn open_with_shape(
     }
     let coordinator_path = options.path.join("coordinator");
     let selected_backend = "tidehunter_live_nvmeof";
+    // The data keyspace is first in every declared order; the marker keyspace,
+    // when declared, is the second (`Db::open` reconciles by name, so the name
+    // and not the id is the persisted contract).
+    let (keyspace, relocation_marker) = {
+        let mut keyspaces = shape.iter_ks();
+        let keyspace = keyspaces.next().ok_or("empty distributed key shape")?.id();
+        let marker = keyspaces.next().map(|descriptor| descriptor.id());
+        (keyspace, marker)
+    };
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
         "live_queue_geometry": remote_config.live_nvme.queue_geometry,
@@ -777,6 +810,7 @@ async fn open_with_shape(
         "batch_atomicity_scope": "crash_recovery_only; no serializable visibility/isolation claim",
         "key_count": options.key_count,
         "value_cache_entries_per_keyspace": options.value_cache_size,
+        "relocation_marker_keyspace": relocation_marker.is_some(),
         "key_bytes": 32,
         "keyshape_mutexes": 16,
         "keyshape_cells_per_mutex": 64,
@@ -864,11 +898,6 @@ async fn open_with_shape(
         "recovery_outcome": "an operation with a lost acknowledgement can be present after recovery: unknown outcome, not exactly-once",
     });
     fs::create_dir_all(&coordinator_path)?;
-    let keyspace = shape
-        .iter_ks()
-        .next()
-        .ok_or("empty distributed key shape")?
-        .id();
     let open_kind = if fs::read_dir(&coordinator_path)?.next().is_some() {
         OpenKind::Reopen
     } else {
@@ -945,6 +974,7 @@ async fn open_with_shape(
     Ok(TidehunterBackend {
         db: Some(db),
         keyspace,
+        relocation_marker,
         endpoints,
         owners: options.owners,
         backend_name: selected_backend,
@@ -1739,6 +1769,18 @@ impl KvBackend for TidehunterBackend {
             .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
         db.insert(self.keyspace, key, value).map_err(native_error)?;
         Ok(())
+    }
+
+    async fn write_relocation_marker(&self, key: Bytes, value: Bytes) -> BackendResult<bool> {
+        let Some(keyspace) = self.relocation_marker else {
+            return Ok(false);
+        };
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("backend is shutting down"))?;
+        db.insert(keyspace, key, value).map_err(native_error)?;
+        Ok(true)
     }
 
     async fn delete(&self, key: Bytes) -> BackendResult<()> {

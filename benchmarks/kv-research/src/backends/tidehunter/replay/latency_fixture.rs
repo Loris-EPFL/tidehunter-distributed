@@ -497,6 +497,7 @@ pub async fn run(driver_path: &Path, output: &Path) -> BackendResult<()> {
             TidehunterBackend {
                 db: Some(db),
                 keyspace,
+            relocation_marker: None,
                 endpoints: configuration
                     .endpoints
                     .iter()

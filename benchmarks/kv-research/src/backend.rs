@@ -209,6 +209,14 @@ pub struct BackendInfo {
     pub configuration: serde_json::Value,
 }
 
+/// Logical id of the relocation marker, outside every dataset and interference
+/// id, so the marker never aliases a measured key.
+pub const RELOCATION_MARKER_KEY_ID: u64 = u64::MAX;
+
+/// Payload of the marker entry. Its keyspace exists only to carry this record,
+/// and that keyspace's relocation filter stops at every entry in it.
+pub const RELOCATION_MARKER_VALUE: &[u8] = b"kv-relocation-stop-v1";
+
 /// Generic dispatch avoids a boxed future/allocation on every local cache hit.
 /// A timed-out mutation has an unknown outcome; cancellation is not rollback.
 /// `get_many` returns exactly one entry per key, in caller order, or an error.
@@ -257,6 +265,19 @@ pub trait KvBackend: Send + Sync + 'static {
     /// the worker has no non-test completion signal.
     fn start_relocation(&self) -> BackendResult<()> {
         Err(unsupported("post-measurement relocation"))
+    }
+
+    /// Write one relocation marker into the backend's filtered marker keyspace,
+    /// if it declares one, and report whether it did. The marker is the pass's
+    /// deterministic terminal: a `StopRelocation` record in the scanned region,
+    /// independent of the frozen scan cut. A backend without a marker keyspace
+    /// reports `false` and writes nothing; the audit dataset is never touched.
+    fn write_relocation_marker(
+        &self,
+        _key: tidehunter::minibytes::Bytes,
+        _value: tidehunter::minibytes::Bytes,
+    ) -> impl Future<Output = BackendResult<bool>> + Send {
+        async { Ok(false) }
     }
 
     /// Observe read counters outside timed API calls. Unsupported backends report absence.

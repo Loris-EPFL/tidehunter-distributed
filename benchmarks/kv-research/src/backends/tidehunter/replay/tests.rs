@@ -247,7 +247,7 @@ fn fixture_at(
             .unwrap()
             .node_name);
         databases.insert(id, TidehunterBackend {
-            db:Some(db),keyspace,
+            db:Some(db),keyspace,relocation_marker:None,
             endpoints:config.endpoints.iter().map(|e|(e.partition,e.address.clone())).collect(),owners:1,
             backend_name:"tidehunter_tcp",durability_tier:DurabilityTier::Native,evidence_path:base.clone(),
             effective_configuration:serde_json::json!({"fixture_route":"leased","database":tidehunter::distributed::tcp::host::identity::database_hex(&database),"remote":config}),

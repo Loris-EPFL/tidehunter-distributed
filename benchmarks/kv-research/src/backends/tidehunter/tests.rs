@@ -781,7 +781,7 @@ fn rejects_selected_ofi_before_services_when_feature_is_disabled() {
 #[test]
 fn value_cache_size_reaches_the_synthetic_shape() {
     for cache in [0, 1_000] {
-        let shape = super::synthetic_shape(cache);
+        let shape = super::synthetic_shape(cache, false);
         let document = serde_json::to_value(&shape).expect("keyspace shape serializes");
         assert_eq!(
             document["key_spaces"][0]["inner"]["config"]["value_cache_size"],
@@ -856,4 +856,43 @@ fn value_cache_option_is_admitted_and_bounded() {
     }))
     .unwrap_err();
     assert!(error.to_string().contains("value_cache_size"), "{error}");
+}
+
+/// The relocation cells declare a second keyspace; every other cell keeps the
+/// single root keyspace it has always had, so no other shape or persisted
+/// database changes. The marker keyspace's filter is engine-side
+/// (`dead_wal_files_tests::dead_sealed_serving_file_is_unlinked_while_writes_continue`
+/// proves the Stop terminal retires a file on both tiers with the same
+/// construction); this test pins the harness shape and the option.
+#[test]
+fn only_relocation_cells_declare_the_marker_keyspace() {
+    let plain = super::synthetic_shape(0, false);
+    let keyspaces: Vec<_> = plain.iter_ks().collect();
+    assert_eq!(
+        keyspaces.len(),
+        1,
+        "the default shape stays single-keyspace"
+    );
+    assert_eq!(keyspaces[0].name(), "root");
+
+    let marker = super::synthetic_shape(0, true);
+    let keyspaces: Vec<_> = marker.iter_ks().collect();
+    assert_eq!(keyspaces.len(), 2, "the marker shape adds one keyspace");
+    assert_eq!(keyspaces[0].name(), "root");
+    assert_eq!(keyspaces[1].name(), "relocation_marker");
+    assert_ne!(
+        keyspaces[0].id(),
+        keyspaces[1].id(),
+        "the marker keyspace is a distinct keyspace"
+    );
+
+    // The option is what selects it, and it defaults off.
+    let default: super::Options = super::parse_options(&serde_json::json!({
+        "transport": {"kind": "tcp-trusted"},
+        "path": "/tmp/relocation-marker-option",
+        "owners": 1,
+        "external_remote_config": external_remote_options()
+    }))
+    .expect("the option defaults to false");
+    assert!(!default.relocation_marker);
 }

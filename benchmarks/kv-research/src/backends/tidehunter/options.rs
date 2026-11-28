@@ -51,6 +51,11 @@ pub(super) struct Options {
     /// Per-keyspace value-cache entries; zero disables the cache (the default).
     #[serde(default)]
     pub(super) value_cache_size: usize,
+    /// Declare the second, filtered relocation-marker keyspace. Set by the
+    /// measure run of a relocation cell only; a reopen without it retains the
+    /// keyspace through the registry and simply does not expose it.
+    #[serde(default)]
+    pub(super) relocation_marker: bool,
 }
 
 /// Local ordinary-file fixture owner WAL geometry. The fixture's default is the

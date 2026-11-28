@@ -858,6 +858,8 @@ struct MemoryBackend {
     health_failure_at: Option<usize>,
     health_calls: AtomicUsize,
     read_failure_at: Option<usize>,
+    /// Order of `write_relocation_marker` and `start_relocation`, when observed.
+    relocation_order: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 impl MemoryBackend {
@@ -883,6 +885,7 @@ impl MemoryBackend {
             health_failure_at: None,
             health_calls: AtomicUsize::new(0),
             read_failure_at: None,
+            relocation_order: None,
         }
     }
 
@@ -936,6 +939,24 @@ impl KvBackend for MemoryBackend {
             configuration: serde_json::json!({"durability_tier": "native"}),
         }
     }
+    fn start_relocation(&self) -> BackendResult<()> {
+        if let Some(order) = &self.relocation_order {
+            order.lock().unwrap().push("request");
+        }
+        Ok(())
+    }
+
+    async fn write_relocation_marker(
+        &self,
+        _key: tidehunter::minibytes::Bytes,
+        _value: tidehunter::minibytes::Bytes,
+    ) -> BackendResult<bool> {
+        if let Some(order) = &self.relocation_order {
+            order.lock().unwrap().push("marker");
+        }
+        Ok(self.relocation_order.is_some())
+    }
+
     fn check_background_health(&self) -> Option<BackendResult<()>> {
         let failure_at = self.health_failure_at?;
         let call = self.health_calls.fetch_add(1, Ordering::Relaxed);
@@ -3514,4 +3535,51 @@ fn live_nvmeof_counter_fields_cover_every_serialized_live_counter() {
     let mut fields = [LIVE_NVMEOF_DELTA_FIELDS, LIVE_NVMEOF_PEAK_FIELDS].concat();
     fields.sort_unstable();
     assert_eq!(serialized, fields);
+}
+
+/// The marker entry must be in the scanned region before the pass is asked for:
+/// it is the pass's only deterministic terminal for a filterless dataset on
+/// every tier. The manifest carries the outcome, so a backend without a marker
+/// keyspace is visible as `false` rather than silently unfiltered.
+#[tokio::test]
+async fn the_relocation_marker_is_written_before_the_request() {
+    let guard = result_directory("relocation-marker-order");
+    let directory = guard.path().to_path_buf();
+    let output = directory.join("result");
+    let ready = directory.join("complete");
+    let release = directory.join("observed");
+    let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let mut backend = MemoryBackend::new(false, false);
+    backend.relocation_order = Some(Arc::clone(&order));
+    let mut config = read_test_config();
+    config.phases.relocation =
+        crate::config::RelocationPhase::Fuel(crate::config::RelocationFuelConfig {
+            puts_per_second: 20,
+            max_seconds: 1,
+            retry_seconds: 1,
+        });
+    config.measurement_completion_gate = Some(crate::config::MeasurementGateConfig {
+        ready_file: ready.clone(),
+        release_file: release.clone(),
+        timeout_seconds: 2,
+    });
+    let controller = tokio::spawn(async move {
+        wait_for_marker(&ready).await;
+        std::fs::write(release, b"observed").unwrap();
+    });
+    run(backend, config, &output, prometheus::Registry::new())
+        .await
+        .unwrap();
+    controller.await.unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["marker", "request"],
+        "the marker must precede the request"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["run"]["phase_semantics"]["relocation_marker"], true,
+        "the marker write is not recorded"
+    );
 }
