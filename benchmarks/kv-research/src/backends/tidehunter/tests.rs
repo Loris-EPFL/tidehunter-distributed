@@ -896,3 +896,30 @@ fn only_relocation_cells_declare_the_marker_keyspace() {
     .expect("the option defaults to false");
     assert!(!default.relocation_marker);
 }
+
+/// The replay backend builds multi-keyspace shapes from trace tables; the marker
+/// keyspace is declared by name, never by position, so such a shape must report
+/// no marker (and the manifest must not claim one).
+#[test]
+fn a_multi_keyspace_shape_reports_no_marker_without_the_option() {
+    let mut builder = tidehunter::key_shape::KeyShapeBuilder::new();
+    builder.add_key_space("root", 32, 1, KeyType::uniform(64));
+    builder.add_key_space("trace_table_7", 32, 1, KeyType::uniform(64));
+    let replay_like = builder.build();
+    assert_eq!(super::marker_keyspace(&replay_like, false), None);
+    assert_eq!(
+        super::marker_keyspace(&replay_like, true),
+        None,
+        "no keyspace is named relocation_marker"
+    );
+
+    // A declared shape resolves it wherever it sits, never by position.
+    let mut builder = tidehunter::key_shape::KeyShapeBuilder::new();
+    builder.add_key_space("root", 32, 1, KeyType::uniform(64));
+    builder.add_key_space("trace_table_7", 32, 1, KeyType::uniform(64));
+    builder.add_key_space("relocation_marker", 32, 1, KeyType::uniform(64));
+    let declared = builder.build();
+    let marker = super::marker_keyspace(&declared, true).expect("declared by name");
+    assert_eq!(marker, declared.iter_ks().nth(2).unwrap().id());
+    assert_eq!(super::marker_keyspace(&declared, false), None);
+}

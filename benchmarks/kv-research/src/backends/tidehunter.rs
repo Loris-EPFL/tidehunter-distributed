@@ -635,6 +635,27 @@ fn confirm_owner_receipts(
     Ok(())
 }
 
+/// Name of the marker keyspace in the declared shape.
+const RELOCATION_MARKER_KEYSPACE: &str = "relocation_marker";
+
+/// The marker keyspace of `shape`, only when the options declare it.
+///
+/// Resolved by name, never by position: the replay backend builds
+/// multi-keyspace shapes from trace tables, so the second declared keyspace is
+/// not this one. The distributed route reopens a coordinator only with the exact
+/// recorded shape YAML (`authority configuration differs from the recorded
+/// authority`), so there is no registry reconciliation to lean on and a shape
+/// that lacks the declared name yields no marker keyspace at all.
+fn marker_keyspace(shape: &KeyShape, declared: bool) -> Option<tidehunter::key_shape::KeySpace> {
+    if !declared {
+        return None;
+    }
+    shape
+        .iter_ks()
+        .find(|descriptor| descriptor.name() == RELOCATION_MARKER_KEYSPACE)
+        .map(|descriptor| descriptor.id())
+}
+
 fn synthetic_shape(value_cache_size: usize, relocation_marker: bool) -> KeyShape {
     let mut builder = tidehunter::key_shape::KeyShapeBuilder::new();
     builder.add_key_space_config(
@@ -650,7 +671,7 @@ fn synthetic_shape(value_cache_size: usize, relocation_marker: bool) -> KeyShape
         // terminal of a filterless dataset (`dead_wal_files_tests` uses the
         // same construction for both tiers).
         builder.add_key_space_config(
-            "relocation_marker",
+            RELOCATION_MARKER_KEYSPACE,
             32,
             1,
             KeyType::uniform(64),
@@ -787,15 +808,12 @@ async fn open_with_shape(
     }
     let coordinator_path = options.path.join("coordinator");
     let selected_backend = "tidehunter_live_nvmeof";
-    // The data keyspace is first in every declared order; the marker keyspace,
-    // when declared, is the second (`Db::open` reconciles by name, so the name
-    // and not the id is the persisted contract).
-    let (keyspace, relocation_marker) = {
-        let mut keyspaces = shape.iter_ks();
-        let keyspace = keyspaces.next().ok_or("empty distributed key shape")?.id();
-        let marker = keyspaces.next().map(|descriptor| descriptor.id());
-        (keyspace, marker)
-    };
+    let keyspace = shape
+        .iter_ks()
+        .next()
+        .ok_or("empty distributed key shape")?
+        .id();
+    let relocation_marker = marker_keyspace(&shape, options.relocation_marker);
     let mut effective_configuration = serde_json::json!({
         "backend": selected_backend,
         "live_queue_geometry": remote_config.live_nvme.queue_geometry,
