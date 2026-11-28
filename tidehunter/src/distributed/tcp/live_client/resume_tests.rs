@@ -885,7 +885,7 @@ fn eio_with_a_live_controller_fail_stops() {
 
 /// `EREMOTEIO` is a typed target or media rejection. It stays fatal even when
 /// the pinned controller is verifiably gone, because the ambiguous class is
-/// exactly `EIO`/`EBADF`.
+/// exactly `EIO`/`EBADF`/`ENOSPC`.
 #[test]
 fn eremoteio_fail_stops_even_when_the_controller_is_gone() {
     let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
@@ -909,6 +909,75 @@ fn eremoteio_fail_stops_even_when_the_controller_is_gone() {
     assert!(
         error.to_string().contains("errno 121"),
         "the refusal names the target errno: {error}"
+    );
+    assert!(client.live_write_failed, "the writer fail-stops");
+    let counts = counters(&fixture);
+    assert_eq!(counts.resume_attempts, 0, "no resume episode ran");
+    assert_eq!(counts.resume_rewrites, 0, "nothing was rewritten");
+}
+
+/// A leased write that fails `-ENOSPC` while the kernel tears its namespace
+/// down is the write-side form of the short namespace read: the capacity
+/// reaches zero before sysfs reflects the deletion. With the probe's verdict it
+/// is a data break, so W1 resumes and the caller never sees the error.
+#[test]
+fn enospc_from_a_deleting_controller_resumes() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    // The namespace capacity is already zero, and the pinned controller is not
+    // live: a stopped controller, not a full filesystem.
+    client.leased_test_controller_lost(true);
+    client.leased_test_fail_write(-libc::ENOSPC);
+    submit(&mut client, &fixture, 1);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the ENOSPC of a deleting controller is resumed");
+    assert!(
+        !client.live_write_failed,
+        "a resumed ENOSPC never poisons the writer"
+    );
+    let counts = counters(&fixture);
+    assert!(
+        counts.resume_attempts >= 1,
+        "the ENOSPC started a resume episode: {counts:?}"
+    );
+    assert_eq!(counts.resume_refused, 0, "the resume was not refused");
+    assert_eq!(released.len(), 2, "both frames were released once");
+    for (sequence, (_, receipts)) in released.iter().enumerate() {
+        assert_reads_back(&fixture, &fixture.batch(sequence as u64), &receipts[0]);
+    }
+}
+
+/// The same `-ENOSPC` with a live controller is the filesystem's verdict: the
+/// writer fail-stops and nothing is retried.
+#[test]
+fn enospc_with_a_live_controller_fail_stops() {
+    let fixture = Fixture::new(DurabilityTier::Native, 64 * 1024);
+    let mut client = resumed_writer(&fixture);
+    let mut released = Vec::new();
+    submit(&mut client, &fixture, 0);
+    client
+        .drain_leased_flights(&mut released, None)
+        .expect("the first frame completes");
+    client.leased_test_controller_lost(false);
+    client.leased_test_fail_write(-libc::ENOSPC);
+    submit(&mut client, &fixture, 1);
+    let error = client
+        .drain_leased_flights(&mut released, None)
+        .expect_err("a live controller's ENOSPC is a filesystem verdict");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::Other,
+        "a filesystem ENOSPC is not a transient break: {error}"
+    );
+    assert!(
+        error.to_string().contains("errno 28"),
+        "the refusal names the filesystem errno: {error}"
     );
     assert!(client.live_write_failed, "the writer fail-stops");
     let counts = counters(&fixture);

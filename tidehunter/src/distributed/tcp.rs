@@ -505,15 +505,25 @@ pub(crate) fn is_transient_errno(errno: i32) -> bool {
     .contains(&errno)
 }
 
-/// Whether an errno is ambiguous between a media error and a controller the
+/// Whether an errno is ambiguous between a device verdict and a controller the
 /// kernel has already stopped. `EIO` is what a cancelled in-flight command and a
 /// dead namespace gendisk return (`NVME_SC_HOST_ABORTED_CMD` and `GD_DEAD` both
-/// map to `BLK_STS_IOERR`), and `EBADF` is a closed namespace descriptor. Such
-/// an errno is a transient break only when the pinned controller is verified not
-/// live; otherwise it stays a media verdict.
+/// map to `BLK_STS_IOERR`), and `EBADF` is a closed namespace descriptor. A
+/// leased write adds `ENOSPC`: while the kernel tears a namespace down its
+/// capacity reaches zero (`block nvmeXnY: no available path - failing I/O`), so
+/// the write fails `-ENOSPC` before sysfs reflects the deletion. Such an errno
+/// is a transient break only when the pinned controller is verified not live;
+/// otherwise it stays that device's verdict, and a real `ENOSPC` is never
+/// retried.
 pub(crate) fn is_lost_io_errno(errno: i32) -> bool {
-    matches!(errno, libc::EIO | libc::EBADF)
+    matches!(errno, libc::EIO | libc::EBADF | libc::ENOSPC)
 }
+
+/// One bounded second probe for a failure class that races the kernel's
+/// controller teardown: the read path's short namespace read and the write
+/// path's `ENOSPC`. The first probe can still see a live controller; the caller
+/// probes once more after this pause and decides once. Never a retry loop.
+pub(crate) const CONTROLLER_LOSS_REPROBE: Duration = Duration::from_millis(1);
 
 /// A namespace open that failed because the pinned controller is gone is the
 /// same resumable break as an EIO on the queue, so the write and read paths

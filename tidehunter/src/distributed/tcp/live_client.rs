@@ -566,14 +566,19 @@ impl LiveWriteQueue {
     }
 }
 
-/// Whether `error` names a break of `lease`'s controller rather than a media
+/// Whether `error` names a break of `lease`'s controller rather than a device
 /// verdict.
 ///
-/// Only `EIO` and `EBADF` are ambiguous: they are what a cancelled command and
-/// a dead namespace gendisk return, and also what a media error returns. Every
-/// other errno answers with one comparison and no sysfs read, so the write path
-/// pays nothing until a break is already being classified. `last_write_errno`
+/// Only `EIO`, `EBADF` and `ENOSPC` are ambiguous: a cancelled command, a dead
+/// namespace gendisk and a namespace whose capacity dropped while the kernel
+/// stopped it, and each is also what a media or filesystem verdict returns.
+/// Every other errno answers with one comparison and no sysfs read, so the write
+/// path pays nothing until a break is already being classified. `last_write_errno`
 /// is the completed write's errno, which an unknown write records separately.
+///
+/// `ENOSPC` races the teardown the way the read path's short read does, so it
+/// gets one bounded second probe. A real `ENOSPC` on a live controller stays the
+/// filesystem's verdict.
 ///
 /// Both inputs are passed in, so an error path that already holds the queue
 /// mutably (buffer admission) can still classify without a second borrow.
@@ -590,14 +595,28 @@ fn lost_controller(
         crate::distributed::nvmeof::live_io::LiveIoError::UnknownWrite => last_write_errno,
         _ => None,
     };
-    if !errno.is_some_and(super::is_lost_io_errno) {
+    let Some(errno) = errno.filter(|errno| super::is_lost_io_errno(*errno)) else {
         return false;
-    }
+    };
     #[cfg(test)]
     if let Some(lost) = override_lost {
         return lost;
     }
-    lease.is_some_and(|lease| lease.controller_lost())
+    let Some(lease) = lease else {
+        return false;
+    };
+    if lease.controller_lost() {
+        return true;
+    }
+    // `ENOSPC` is the write-side race of the read path's short read: the
+    // namespace's capacity reaches zero before sysfs reflects the deletion, so
+    // the first probe can still see a live controller. One bounded second
+    // probe decides; the probe never loops.
+    if errno == libc::ENOSPC {
+        std::thread::sleep(super::CONTROLLER_LOSS_REPROBE);
+        return lease.controller_lost();
+    }
+    false
 }
 
 impl super::Client {
@@ -1995,9 +2014,10 @@ impl super::Client {
                     }
                     // A flush CQE reports `UnknownWrite` both for a late
                     // deadline and for a device error, so the errno decides:
-                    // `ENOSPC`/`EFBIG`/`EINVAL` are the filesystem's verdict
-                    // and a retry is never issued. `EIO` is a cancelled command
-                    // when the controller is verifiably gone, and a media
+                    // `EFBIG`/`EINVAL` are the filesystem's verdict and a retry
+                    // is never issued. `EIO` and `ENOSPC` are a vanished
+                    // controller when the probe says so (the capacity of a
+                    // namespace being torn down reaches zero), and a device
                     // verdict otherwise. Only a deadline that recorded no error
                     // is the probe of 7.3.
                     return Err(match write_errno {

@@ -1018,7 +1018,7 @@ impl Client {
 /// write queue is mutably borrowed. `errno` is the latest completed write's
 /// errno, read by the caller under that borrow. `controller_lost` says the
 /// caller verified that the pinned controller is not live, which decides the
-/// ambiguous `EIO`/`EBADF` class only.
+/// ambiguous `EIO`/`EBADF`/`ENOSPC` class only.
 pub(super) fn classify_io_error(
     error: LiveIoError,
     errno: Option<i32>,
@@ -1027,8 +1027,9 @@ pub(super) fn classify_io_error(
     match error {
         // Classify here, before `io::ErrorKind` folds the errno into
         // `Uncategorized`: a lost device is a resumable break, a rejected
-        // command is not. `EIO` and `EBADF` are a break only when the caller
-        // proved the controller is gone; otherwise they keep the media verdict.
+        // command is not. `EIO`, `EBADF` and `ENOSPC` are a break only when the
+        // caller proved the controller is gone; otherwise they keep the device
+        // verdict.
         LiveIoError::Io(error)
             if error.raw_os_error().is_some_and(|errno| {
                 is_transient_errno(errno) || (controller_lost && is_lost_io_errno(errno))

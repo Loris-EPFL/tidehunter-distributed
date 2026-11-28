@@ -585,9 +585,9 @@ fn grant_controller_lost(grant: &Grant) -> bool {
 /// A short read races the kernel's controller teardown: the CQE can retire
 /// before sysfs reflects the deletion, so the first probe can still see a live
 /// controller and the loss would poison the authority. For the short-read
-/// class only, one second probe runs after [`POOL_RETRY`] when the request
-/// deadline still allows it. The lane worker may block for that single
-/// millisecond on this error path; the probe never loops.
+/// class only, one second probe runs after [`super::CONTROLLER_LOSS_REPROBE`]
+/// when the request deadline still allows it. The lane worker may block for that
+/// single millisecond on this error path; the probe never loops.
 fn read_controller_lost(
     error: &std::io::Error,
     deadline: Instant,
@@ -604,7 +604,7 @@ fn read_controller_lost(
     if now >= deadline {
         return false;
     }
-    std::thread::sleep(POOL_RETRY.min(deadline - now));
+    std::thread::sleep(super::CONTROLLER_LOSS_REPROBE.min(deadline - now));
     retryable_lost_read(error, probe())
 }
 
