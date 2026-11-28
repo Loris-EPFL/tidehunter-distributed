@@ -351,6 +351,19 @@ class FenceExclusivity(unittest.TestCase):
     def fixture(self, name):
         return json.loads((ROOT / 'experiments/gcp-rdma/fixtures' / name).read_text())
 
+    @staticmethod
+    def clocked_child(directory, *, spawn_ns=1_000_000_000, origin_ns=None):
+        """A part whose rows can be placed on the wall clock.
+
+        The runner stamps its origin only in `summary.json`; the spawn time is
+        earlier by the process start and backend setup.
+        """
+        output = Path(directory) / 'run'
+        output.mkdir(parents=True, exist_ok=True)
+        (output / 'summary.json').write_text(json.dumps(dict(
+            started_unix_seconds=(spawn_ns if origin_ns is None else origin_ns) / 1e9)))
+        return types.SimpleNamespace(started_unix_ns=spawn_ns, output=output)
+
     def driver(self, fence, parts=()):
         driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
         driver.cell = dict(id='S1-5S-contend-native')
@@ -388,34 +401,61 @@ class FenceExclusivity(unittest.TestCase):
     def test_the_real_stale_rows_are_judged_against_the_new_writers_fence(self):
         rows_ = fault_cells.rows(ROOT / 'experiments/gcp-rdma/fixtures' / 's1-5s-contend-a-excerpt.csv')
         real = self.fixture('s1-5s-contend-attempt3.json')['new_writer']
-        child = types.SimpleNamespace(started_unix_ns=1_000_000_000,
-                                      output=Path('/nonexistent'))
-        # The real excerpt keeps every early non-success row and drops the
-        # successes (the receipt's last_success_row is 89,156 of the full file),
-        # so it can never prove the property on its own: the verdict must read
-        # the live rows and both start clocks.
-        measurement = [row for row in rows_ if row['phase'] == 'measurement']
-        self.assertTrue(measurement)
-        self.assertEqual({row['outcome'] for row in measurement} - {'success'},
-                         {row['outcome'] for row in measurement})
-        self.assertIsNone(fault_cells.CellDriver._last_success_ns(child, rows_))
-        self.assertEqual(fault_cells.CellDriver._stale_after_fence(child, rows_, 1), 0)
-        self.assertIsNone(fault_cells.CellDriver._stale_after_fence(child, rows_, None),
-                          'no fence instant is never read as zero')
-        # The counting itself: two successes at +1 s and +3 s, a fence between
-        # them finds the later one.
-        late = [dict(phase='measurement', outcome='success', completed_ns='1000000000'),
-                dict(phase='measurement', outcome='success', completed_ns='3000000000')]
-        self.assertEqual(fault_cells.CellDriver._stale_after_fence(
-            child, late, 1_000_000_000 + 3_500_000_000), 0)
-        self.assertEqual(fault_cells.CellDriver._stale_after_fence(
-            child, late, 1_000_000_000 + 2_000_000_000), 1)
-        self.assertIsNone(fault_cells.CellDriver._stale_after_fence(
-            child, [dict(phase='measurement', outcome='success')], 1))
-        second = types.SimpleNamespace(started_unix_ns=5_000_000_000,
-                                       output=Path('/nonexistent'))
+        with tempfile.TemporaryDirectory() as directory:
+            child = self.clocked_child(directory)
+            # The real excerpt keeps every early non-success row and drops the
+            # successes (the receipt's last_success_row is 89,156 of the full
+            # file), so it can never prove the property on its own: the verdict
+            # must read the live rows and both start clocks.
+            measurement = [row for row in rows_ if row['phase'] == 'measurement']
+            self.assertTrue(measurement)
+            self.assertEqual({row['outcome'] for row in measurement} - {'success'},
+                             {row['outcome'] for row in measurement})
+            self.assertIsNone(fault_cells.CellDriver._last_success_ns(child, rows_))
+            self.assertEqual(fault_cells.CellDriver._stale_after_fence(child, rows_, 1), 0)
+            self.assertIsNone(fault_cells.CellDriver._stale_after_fence(child, rows_, None),
+                              'no fence instant is never read as zero')
+            # The counting itself: two successes at +1 s and +3 s, a fence
+            # between them finds the later one.
+            late = [dict(phase='measurement', outcome='success', completed_ns='1000000000'),
+                    dict(phase='measurement', outcome='success', completed_ns='3000000000')]
+            self.assertEqual(fault_cells.CellDriver._stale_after_fence(
+                child, late, 1_000_000_000 + 3_500_000_000), 0)
+            self.assertEqual(fault_cells.CellDriver._stale_after_fence(
+                child, late, 1_000_000_000 + 2_000_000_000), 1)
+            self.assertIsNone(fault_cells.CellDriver._stale_after_fence(
+                child, [dict(phase='measurement', outcome='success')], 1))
+            self.clocked_child(Path(directory) / 'b', spawn_ns=5_000_000_000)
         self.assertEqual(real['first_success_completed_ns'], 1_624_106_620)
         self.assertGreater(real['measurement_successes'], 0)
+
+    def test_row_wall_time_counts_from_the_runner_start_not_the_spawn(self):
+        """The observed 0.93 s spawn offset hid a post-fence success."""
+        with tempfile.TemporaryDirectory() as directory:
+            spawn_ns = 1_000_000_000
+            child = self.clocked_child(directory, spawn_ns=spawn_ns,
+                                       origin_ns=spawn_ns + 930_000_000)
+            rows_ = [dict(phase='measurement', outcome='success',
+                          completed_ns='500000000')]
+            # The row completes 0.5 s after the runner origin, which the run
+            # stamped 0.93 s after the spawn: its true wall time is 1.43 s
+            # after spawn. A fence at +1.0 s falls between the old spawn base
+            # (0.5 s) and the true time, so this stale success was miscounted.
+            fence_ns = spawn_ns + 1_000_000_000
+            self.assertEqual(fault_cells.CellDriver._stale_after_fence(
+                child, rows_, fence_ns), 1)
+            self.assertEqual(fault_cells.CellDriver._refusal_wall_ns(
+                child, rows_[0]), spawn_ns + 930_000_000 + 500_000_000)
+        # An interrupted part has no summary and no other origin artifact, so
+        # its rows have no wall clock. The spawn time is known-wrong and is
+        # never used: the verdict reports missing evidence, which `_stale_
+        # after_fence` does as None.
+        without_summary = types.SimpleNamespace(started_unix_ns=1_000_000_000,
+                                                output=Path('/nonexistent'))
+        self.assertIsNone(fault_cells.CellDriver._refusal_wall_ns(
+            without_summary, dict(completed_ns='1')))
+        self.assertIsNone(fault_cells.CellDriver._stale_after_fence(
+            without_summary, rows_ * 2, 1))
 
     def test_recorded_clocks_and_no_stale_success_is_a_pass(self):
         real = self.fixture('s1-5s-contend-attempt3.json')
@@ -1270,6 +1310,11 @@ class StaleFenceMeasurement(unittest.TestCase):
     class Child:
         def __init__(self, output):
             self.output = Path(output)
+            self.output.mkdir(parents=True, exist_ok=True)
+            # The runner stamps its row clock origin in summary.json; the
+            # spawn time is earlier and is not a substitute.
+            (self.output / 'summary.json').write_text(json.dumps(
+                dict(started_unix_seconds=1.0)))
             self.signals = []
             self.started_unix_ns = 1_000_000_000
 
@@ -1289,10 +1334,13 @@ class StaleFenceMeasurement(unittest.TestCase):
                          completed_ns='50000000')]
 
     class Second:
-        def __init__(self, started_unix_ns=1_000_000_000):
+        def __init__(self, output, started_unix_ns=1_000_000_000):
             self.stopped = False
             self.started_unix_ns = started_unix_ns
-            self.output = Path('/nonexistent')
+            self.output = Path(output)
+            self.output.mkdir(parents=True, exist_ok=True)
+            (self.output / 'summary.json').write_text(json.dumps(
+                dict(started_unix_seconds=started_unix_ns / 1e9)))
 
         def rows(self):
             return [dict(phase='measurement', outcome='success', error_kind='',
@@ -1321,7 +1369,7 @@ class StaleFenceMeasurement(unittest.TestCase):
                                   dict(size=4096, mtime=1.0)}})
             driver = fault_cells.CellDriver(
                 cluster, fault_cells.mechanism.find('S1-5S-stale-native'))
-            second = self.Second()
+            second = self.Second(Path(tmp) / 'fence-b' / 'run')
             gate = dict(reached=True, errors=1, unix_ns=1_050_000_000)
             with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
                     patch.object(driver, 'launch', return_value=second), \
@@ -1422,7 +1470,8 @@ class StaleFenceMeasurement(unittest.TestCase):
             driver = fault_cells.CellDriver(
                 cluster, fault_cells.mechanism.find('S1-5S-contend-native'))
             with patch.object(fault_cells, 'now_ns', return_value=1_000_000_000), \
-                    patch.object(driver, 'launch', return_value=self.Second()), \
+                    patch.object(driver, 'launch',
+                                 return_value=self.Second(Path(tmp) / 'fence-b' / 'run')), \
                     patch.object(driver, 'gate_writes', return_value=dict(reached=True)), \
                     patch.object(driver, 'stop_on_failure',
                                  return_value=dict(gate=dict(reached=True, errors=1),

@@ -1510,9 +1510,36 @@ class CellDriver:
         return None if finished is None else int(round(float(finished) * 1e9))
 
     @staticmethod
+    def _wall_origin_ns(child):
+        """Unix nanoseconds of the runner's `t0`, the base of `completed_ns`.
+
+        Samples count from the runner's monotonic origin, whose wall clock is
+        the summary's `started_unix_seconds`; the runner writes no earlier
+        artifact. The spawn time is not a substitute: it is earlier by the
+        process start and backend setup, so a row timed from it lands before it
+        happened and a success after a fence reads as one before it. A part
+        without a summary (an interrupted or force-stopped run) therefore has
+        no row clock, and the verdict reports the missing evidence.
+        """
+        cached = getattr(child, 'wall_origin_ns', None)
+        if cached is not None:
+            return cached or None
+        origin = None
+        try:
+            summary = json.loads((Path(child.output) / 'summary.json').read_text())
+            started = summary.get('started_unix_seconds')
+            if started is not None:
+                origin = int(round(float(started) * 1e9))
+        except (AttributeError, OSError, TypeError, ValueError):
+            origin = None
+        # 0 marks "no origin", so the next call does not re-read the directory.
+        child.wall_origin_ns = origin or 0
+        return origin
+
+    @staticmethod
     def _refusal_wall_ns(child, row):
-        """Wall time of a completed sample: process start plus completed_ns."""
-        started = getattr(child, 'started_unix_ns', None)
+        """Wall time of a completed sample: runner origin plus completed_ns."""
+        started = CellDriver._wall_origin_ns(child)
         try:
             completed = int(row.get('completed_ns', ''))
         except (TypeError, ValueError):
