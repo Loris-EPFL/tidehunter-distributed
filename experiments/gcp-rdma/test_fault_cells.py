@@ -859,6 +859,94 @@ class CrashChecks(unittest.TestCase):
             failure=dict(gate=dict(reached=False))))
         self.assertFalse(all(check['ok'] for check in missing))
 
+    def test_a_retirement_kill_needs_the_terminals_typed_failure(self):
+        cell = fault_cells.mechanism.find('S1-6S-unlink-native')
+        text = ('kv-research: final background health failed: BackgroundFailure { '
+                'role: Relocator, reason: Panic("relocation error: Io(Custom { kind: '
+                'Other, error: \\"write core requires recovery; first causal failure: '
+                'owner=Some(0) batch=Some(BatchVersion { epoch: 1, sequence: 42 }) '
+                'stage=live_resume: Connection refused (os error 111)\\" })") }')
+        passed = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, cut='unlink', note='after the unlink'),
+            kill=dict(pids=[10], partition=0),
+            failure=dict(exit_code=1, partition=0, text=text, typed=True,
+                         log_offset=0, unix_ns=1)))
+        checks = {check['check']: check for check in passed}
+        self.assertTrue(all(check['ok'] for check in passed), passed)
+        detail = checks['coordinator recorded a typed write failure']['detail']
+        self.assertEqual(detail['exit_code'], 1)
+        self.assertIn('owner=Some(0)', detail['text'])
+
+        # A sample-row gate cannot satisfy the retirement check: no later phase
+        # writes rows, and a stray pre-kill row proves nothing.
+        vacuous = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, cut='unlink'),
+            kill=dict(pids=[10], partition=0),
+            failure=dict(gate=dict(reached=True, observations=[
+                dict(reached=True, refusals=1, text='coordinator lease lapsed')]))))
+        self.assertFalse(all(check['ok'] for check in vacuous), vacuous)
+
+        # A clean exit with no typed cause is not a typed failure.
+        clean = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, cut='unlink'),
+            kill=dict(pids=[10], partition=0),
+            failure=dict(exit_code=0, partition=0, text='', typed=False)))
+        self.assertFalse(all(check['ok'] for check in clean), clean)
+
+        # A typed line without an exit is not the coordinator's terminal error.
+        hung = fault_cells.crash_checks(cell, dict(
+            gate=dict(reached=True, cut='unlink'),
+            kill=dict(pids=[10], partition=0),
+            failure=dict(exit_code=None, partition=0, text=text, typed=True,
+                         reason='coordinator did not exit within 180s of the owner kill')))
+        self.assertFalse(all(check['ok'] for check in hung), hung)
+
+    def test_only_text_appended_after_the_kill_is_a_terminal_failure(self):
+        text = ('kv-research: backend shutdown failed: write core requires recovery; '
+                'first causal failure: owner=Some(0) batch=Some(BatchVersion { epoch: 1, '
+                'sequence: 42 }) stage=live_resume: Connection refused (os error 111)')
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'run.log'
+            log.write_text('kv-research: pre-kill warning with no cause\n')
+            driver = fault_cells.CellDriver.__new__(fault_cells.CellDriver)
+
+            def append(line):
+                with log.open('a') as stream:
+                    stream.write(line + '\n')
+
+            def child(code=1):
+                return types.SimpleNamespace(log=log, wait=lambda timeout: code)
+
+            offset = driver._log_offset(child())
+            append(text)
+            record = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=offset)
+            self.assertTrue(record['typed'], record)
+            self.assertEqual(record['exit_code'], 1)
+            self.assertNotIn('pre-kill warning', record['text'])
+            self.assertIn('owner=Some(0)', record['text'])
+
+            # Nothing appended: the pre-kill bytes cannot satisfy the gate.
+            quiet = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=log.stat().st_size)
+            self.assertFalse(quiet['typed'], quiet)
+            self.assertEqual(quiet['text'], '')
+
+            # Another owner's cause is not the killed owner's failure.
+            offset = driver._log_offset(child())
+            append(text.replace('owner=Some(0)', 'owner=Some(1)'))
+            wrong = driver.stop_on_terminal_failure(
+                child(), partition=0, log_offset=offset)
+            self.assertFalse(wrong['typed'], wrong)
+
+            # No exit: the bounded wait is recorded, never read as a failure.
+            offset = driver._log_offset(child())
+            append(text)
+            hung = driver.stop_on_terminal_failure(
+                child(code=None), partition=0, log_offset=offset)
+            self.assertIsNone(hung['exit_code'])
+            self.assertIn('did not exit', hung['reason'])
+
 
 class FenceVerdict(unittest.TestCase):
     def records(self, fence):

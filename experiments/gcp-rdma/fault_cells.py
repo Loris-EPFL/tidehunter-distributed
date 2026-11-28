@@ -1024,9 +1024,12 @@ class CellDriver:
         return record
 
     def kill_owner(self, host, reason):
-        record = dict(host=host, reason=reason, kill_unix_ns=now_ns(),
-                      pids=[row['pid'] for row in self.cluster.namespaces.get(host, [])])
-        for namespace in self.cluster.namespaces.get(host, []):
+        rows = self.cluster.namespaces.get(host, [])
+        record = dict(host=host, reason=reason,
+                      partition=rows[0].get('partition') if rows else None,
+                      kill_unix_ns=now_ns(),
+                      pids=[row['pid'] for row in rows])
+        for namespace in rows:
             self.cluster.remote.shell(host, f'kill -KILL -{namespace["process_group"]}',
                                       check=False)
             deadline = time.monotonic() + 30
@@ -1059,6 +1062,48 @@ class CellDriver:
         code = child.wait(120)
         return dict(gate=gate, exit_code=code,
                     refusal=found[0].get('error_kind') if found else None)
+
+    @staticmethod
+    def _log_offset(child):
+        """Bytes in the coordinator log now: the pre-kill watermark."""
+        try:
+            return Path(child.log).stat().st_size
+        except (AttributeError, OSError):
+            return 0
+
+    @staticmethod
+    def _log_appended(child, offset):
+        """Text the coordinator appended to its log after `offset`."""
+        try:
+            with Path(child.log).open('rb') as stream:
+                stream.seek(offset)
+                return stream.read().decode('utf-8', 'replace')
+        except (AttributeError, OSError):
+            return ''
+
+    def stop_on_terminal_failure(self, child, *, partition, log_offset, timeout=180):
+        """Wait for the coordinator's own typed failure after an owner kill.
+
+        A retirement kill lands after the measurement window, so no sample row
+        follows it and the write-refusal gate cannot see the failure. The
+        failure is the coordinator's exit: the relocation pass writes through
+        the leased owner path, reaches the dead owner, and the run ends with
+        the typed first-failure record in `run.log`. Only the bytes appended
+        after the pre-signal watermark count, so a line written before the kill
+        cannot satisfy the check.
+        """
+        code = child.wait(timeout)
+        text = self._log_appended(child, log_offset).strip()
+        owner = f'owner=Some({partition})'
+        typed = (partition is not None and 'first causal failure' in text
+                 and owner in text)
+        record = dict(exit_code=code, partition=partition,
+                      log_offset=log_offset, text=text, typed=typed,
+                      unix_ns=now_ns())
+        if code is None:
+            record['reason'] = (f'coordinator did not exit within {timeout}s '
+                                'of the owner kill')
+        return record
 
     def fence_owner_snapshot(self):
         """Timestamped owner-side fence evidence: seals and per-generation WAL.
@@ -1373,8 +1418,15 @@ class CellDriver:
                 self.write_gate(child, gate)
                 raise CellError(f"gate missed: {gate.get('reason')}")
             child.release_completion()
+            # The kill lands after the measurement window, so no sample row
+            # follows it: the failure evidence is the coordinator's own
+            # terminal error. The log watermark is taken before the signal, so
+            # only text appended after the kill can satisfy the gate.
+            log_offset = self._log_offset(child)
             record['kill'] = self.kill_owner(host, f'retirement {cut}')
-            record['failure'] = self.stop_on_failure(child)
+            record['failure'] = self.stop_on_terminal_failure(
+                child, partition=record['kill'].get('partition'),
+                log_offset=log_offset)
         finally:
             child.release_completion()
             child.stop()
@@ -1892,16 +1944,30 @@ def crash_checks(cell, observations):
                                        bool(kill.get('pids')) and
                                        'still_alive' not in kill,
                                        kill.get('pids')))
-        found = failure.get('gate') or {}
-        # `wait_for` returns the reached observation inside `observations`;
-        # the gate itself carries no `refusals`/`text`. The refusal must name
-        # an error class: a bare non-success row is not a typed failure.
-        last = (found.get('observations') or [{}])[-1]
-        text = last.get('text') or failure.get('refusal')
-        checks.append(mechanism._check('coordinator recorded a typed write failure',
-                                       found.get('reached') is True and bool(text),
-                                       dict(refusals=last.get('refusals'),
-                                            text=text, unix_ns=last.get('unix_ns'))))
+        if cell['family'] == 'S1-6':
+            # The retirement kill lands after the measurement window, so no
+            # sample row follows it. The typed failure is the coordinator's own
+            # terminal error, appended to run.log after the kill watermark.
+            text = failure.get('text') or ''
+            checks.append(mechanism._check(
+                'coordinator recorded a typed write failure',
+                (failure.get('typed') is True and bool(text)
+                 and failure.get('exit_code') not in (0, None)),
+                dict(exit_code=failure.get('exit_code'), text=text,
+                     partition=failure.get('partition'),
+                     log_offset=failure.get('log_offset'),
+                     unix_ns=failure.get('unix_ns'))))
+        else:
+            found = failure.get('gate') or {}
+            # `wait_for` returns the reached observation inside `observations`;
+            # the gate itself carries no `refusals`/`text`. The refusal must name
+            # an error class: a bare non-success row is not a typed failure.
+            last = (found.get('observations') or [{}])[-1]
+            text = last.get('text') or failure.get('refusal')
+            checks.append(mechanism._check('coordinator recorded a typed write failure',
+                                           found.get('reached') is True and bool(text),
+                                           dict(refusals=last.get('refusals'),
+                                                text=text, unix_ns=last.get('unix_ns'))))
     return checks
 
 
