@@ -869,6 +869,7 @@ class SelfFenceEvidence(unittest.TestCase):
             self_fence_log_unix_ns=self.LOG_WRITE,
             fence_reject_ms=None, fence_reject_window_ms=window,
             fence_reject_reason=reason,
+            fence_reject_kind='self-fence' if window is not None else None,
             second_measurement_rows=200,
             root_refused=dict(refused=True, opened=False, exit_code=1,
                               text='owner high-water 2 exceeds the allocated '
@@ -896,11 +897,16 @@ class SelfFenceEvidence(unittest.TestCase):
         self.assertTrue(named['exclusive writes are proven']['ok'])
         latency = named['fence latency measured or bounded']['detail']
         self.assertEqual(latency['kind'], 'coordinator-self-fence')
+        self.assertEqual(latency['source'], 'self-fence')
         self.assertIsNone(latency['exact_ms'])
         self.assertEqual(latency['window']['lower_ms'],
                          (self.RESUMED - self.AT_FENCE) / 1e6)
         self.assertEqual(latency['window']['upper_ms'],
                          (self.LOG_WRITE - self.BASELINE) / 1e6)
+        self.assertTrue(latency['window']['includes_pause'],
+                        'the interval spans the harness pause')
+        self.assertEqual(latency['window']['post_release_upper_ms'],
+                         (self.LOG_WRITE - self.RESUMED) / 1e6)
 
     def test_a_self_fence_with_a_grown_epoch1_file_fails(self):
         proof = self.proof(no_stale_growth=False,
@@ -969,12 +975,49 @@ class SelfFenceEvidence(unittest.TestCase):
             baseline_ns=self.BASELINE)
         self.assertIsNone(reason)
         self.assertGreater(window['upper_ms'], window['lower_ms'])
-        self.assertFalse(window['includes_pause'])
-        late, reason = fault_cells.CellDriver._self_fence_window(
+        self.assertTrue(window['includes_pause'])
+        self.assertEqual(window['post_release_upper_ms'],
+                         (self.LOG_WRITE - self.RESUMED) / 1e6)
+
+    def test_a_log_write_before_the_release_is_never_a_refusal(self):
+        # The regression input: the log mtime predates SIGCONT, so it cannot
+        # contain a post-release refusal. A stale or truncated log must fail.
+        window, reason = fault_cells.CellDriver._self_fence_window(
             self.AT_FENCE, resumed_ns=self.RESUMED,
-            log_ns=self.BASELINE - 1_000_000, baseline_ns=self.BASELINE)
-        self.assertIsNone(late)
-        self.assertIn('inconsistent', reason)
+            log_ns=self.RESUMED - 1_000_000, baseline_ns=self.BASELINE)
+        self.assertIsNone(window)
+        self.assertIn('precedes the release', reason)
+        record = self.record(self.fence(
+            proof=self.proof(), window=None, reason=reason))
+        self.assertFalse(record['ok'])
+        detail = [check for check in record['checks']
+                  if check['check'] == 'fence latency measured or bounded'][0]
+        self.assertFalse(detail['ok'])
+        self.assertIn('precedes the release', detail['detail']['reason'])
+
+    def test_the_latency_source_never_falls_back(self):
+        kind = fault_cells.CellDriver._latency_kind
+        self.assertEqual(kind('coordinator-self-fence', None), ('self-fence', None))
+        self.assertEqual(kind('owner-row', 5), ('row', None))
+        source, reason = kind('owner-row', None)
+        self.assertIsNone(source)
+        self.assertIn('no wall clock', reason)
+        source, reason = kind(None, None)
+        self.assertIsNone(source)
+        self.assertIn('no typed refusal', reason)
+
+    def test_an_owner_row_without_a_clock_is_not_measured(self):
+        # No fallback to the self-fence bracket when the row clock is missing.
+        record = self.record(self.fence(
+            proof=self.proof(),
+            refusal_kind='owner-row', fence_reject_kind=None,
+            window=None, reason='the refusal row has no wall clock (no summary.json), '
+                                'so the fence-reject time is not measurable'))
+        self.assertFalse(record['ok'])
+        detail = [check for check in record['checks']
+                  if check['check'] == 'fence latency measured or bounded'][0]
+        self.assertFalse(detail['ok'])
+        self.assertIn('no wall clock', detail['detail']['reason'])
 
     def test_the_owner_row_kind_keeps_the_completion_order_proof(self):
         rows_ = self.ROWS + [dict(phase='measurement', outcome='unknown_mutation',

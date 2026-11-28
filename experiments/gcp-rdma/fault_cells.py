@@ -1991,17 +1991,22 @@ class CellDriver:
             stale_after=result['stale_success_after_fence'],
             owner_fence=result['owner_fence'])
         result['stale_rows_clean'] = result['stale_rows']['clean']
+        latency_kind, latency_reason = self._latency_kind(refusal_kind, wall)
+        result['fence_reject_kind'] = latency_kind
         result['fence_reject_ms'] = (
-            None if wall is None or result['fence_unix_ns'] is None
-            else (wall - result['fence_unix_ns']) / 1e6)
+            (wall - result['fence_unix_ns']) / 1e6
+            if latency_kind == 'row' and result['fence_unix_ns'] is not None
+            else None)
         result['fence_reject_window_ms'] = None
-        result['fence_reject_reason'] = None
-        if wall is None:
+        result['fence_reject_reason'] = latency_reason
+        if latency_kind == 'self-fence':
             result['self_fence_log_unix_ns'] = self._log_mtime_ns(child)
             result['fence_reject_window_ms'], result['fence_reject_reason'] = (
                 self._self_fence_window(
                     result['fence_unix_ns'], resumed_ns=result.get('resumed_unix_ns'),
                     log_ns=result['self_fence_log_unix_ns']))
+        elif latency_kind == 'row' and result['fence_unix_ns'] is None:
+            result['fence_reject_reason'] = 'the fence instant is missing'
         result.update(self.fence_audit(child))
         result['stale_rows_exclusive'], result['stale_rows_reason'] = self._exclusive(
             refusal_kind, result['stale_success_after_fence'],
@@ -2112,12 +2117,18 @@ class CellDriver:
     def _self_fence_window(fence_ns, *, resumed_ns, log_ns, baseline_ns=None):
         """Bound fence -> refusal for a self-fence, which has no sample row.
 
-        The writer cannot refuse before `resumed_ns` (it was stopped) and cannot
-        run after its final log write (`log_ns`). The fence instant is bracketed
-        by the owner snapshots: `(baseline_ns, fence_ns]` for a contention cell,
-        or exactly `fence_ns` for a write-protect cell. The plan requires the
-        fence-reject time to be recorded, so a missing part is a named failure
-        and never a silent pass.
+        The refusal is observable only after the release: the writer is stopped
+        until `resumed_ns`, and the typed causal line that ends its run is part
+        of the final log write, so the log must be written **at or after** the
+        release. A log mtime before it proves nothing and is rejected: a stale
+        or truncated log must never read as a post-release refusal.
+
+        The fence instant is bracketed by the owner snapshots: `(baseline_ns,
+        fence_ns]` for a contention cell, or exactly `fence_ns` for a
+        write-protect cell. The interval spans the harness pause, so it is
+        reported as such (`includes_pause`) and the post-release part is kept
+        separately (`post_release_upper_ms`); it bounds the latency, it does not
+        measure the engine's detection.
         """
         if fence_ns is None or resumed_ns is None or log_ns is None:
             missing = [name for name, value in (('fence', fence_ns),
@@ -2126,16 +2137,39 @@ class CellDriver:
                        if value is None]
             return None, ('the self-fence instant is not measurable: '
                           + ', '.join(missing) + ' is missing')
+        if log_ns < resumed_ns:
+            return None, ('the final log write precedes the release, so it cannot '
+                          'contain a post-release refusal')
         upper_ref = fence_ns if baseline_ns is None else baseline_ns
         lower = (resumed_ns - fence_ns) / 1e6
         upper = (log_ns - upper_ref) / 1e6
         if lower < 0 or upper < lower:
             return None, ('the self-fence bracket is inconsistent: the release or the '
                           'final log write precedes the fence')
-        return dict(lower_ms=lower, upper_ms=upper, includes_pause=False,
+        return dict(lower_ms=lower, upper_ms=upper, includes_pause=True,
+                    post_release_upper_ms=(log_ns - resumed_ns) / 1e6,
                     basis=('stale writer release to its final log write, bracketed '
-                           'by the owner snapshots' if baseline_ns is not None else
-                           'stale writer release to its final log write')), None
+                           'by the owner snapshots; spans the harness pause' if
+                           baseline_ns is not None else
+                           'stale writer release to its final log write; spans the '
+                           'harness pause')), None
+
+    @staticmethod
+    def _latency_kind(refusal_kind, wall):
+        """Which latency source is valid for this refusal, or why none is.
+
+        A self-fence has no row, so only its release-to-log bracket applies. An
+        owner-row refusal needs its own row clock; a missing clock is not a
+        reason to fall back to the self-fence bracket.
+        """
+        if refusal_kind == 'coordinator-self-fence':
+            return 'self-fence', None
+        if refusal_kind == 'owner-row' and wall is not None:
+            return 'row', None
+        if refusal_kind is None:
+            return None, ('no typed refusal, so no fence instant is defined')
+        return None, ('the refusal row has no wall clock (no summary.json), so the '
+                      'fence-reject time is not measurable')
 
     @staticmethod
     def _exclusive(refusal_kind, stale_after, *, new_authority, owner_fence=None,
@@ -2293,15 +2327,17 @@ class CellDriver:
             stale_after=result['stale_success_after_fence'],
             owner_fence=result['owner_fence'])
         result['stale_rows_clean'] = result['stale_rows']['clean']
+        latency_kind, latency_reason = self._latency_kind(refusal_kind, wall)
+        result['fence_reject_kind'] = latency_kind
         result['fence_reject_ms'] = None
         result['fence_reject_window_ms'] = None
-        result['fence_reject_reason'] = None
-        if wall is not None:
+        result['fence_reject_reason'] = latency_reason
+        if latency_kind == 'row':
             result['fence_reject_window_ms'], result['fence_reject_reason'] = (
                 self._contend_window(
                     result['fence_unix_ns'], (baseline or {}).get('unix_ns'), wall,
                     result.get('resumed_unix_ns'), result.get('pause_ms')))
-        else:
+        elif latency_kind == 'self-fence':
             result['self_fence_log_unix_ns'] = self._log_mtime_ns(child)
             result['fence_reject_window_ms'], result['fence_reject_reason'] = (
                 self._self_fence_window(
@@ -2601,11 +2637,13 @@ def fence_record(driver):
             'fence latency measured or bounded',
             fence.get('fence_reject_ms') is not None or window is not None,
             dict(kind=fence.get('refusal_kind'),
+                 source=fence.get('fence_reject_kind'),
                  exact_ms=fence.get('fence_reject_ms'),
                  window=window,
                  resume_reject_ms=fence.get('resume_reject_ms'),
                  pause_ms=fence.get('pause_ms'),
                  fence_owner_unix_ns=fence.get('fence_owner_unix_ns'),
+                 self_fence_log_unix_ns=fence.get('self_fence_log_unix_ns'),
                  reason=fence.get('fence_reject_reason'))))
     if case in ('lapse', 'sealed'):
         checks.append(mechanism._check('write-protect apply latency measured',
